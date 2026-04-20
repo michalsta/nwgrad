@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools", "scikit-build-core", "nanobind"]
+build-backend = "scikit_build_core.build"
+
+
+[project]
+name = "nwgrad"
+dependencies = ["numpy"]
+description = "nwgrad is a high-performance library for computing BLOSUM matrix gradient on alignments."
+version = "0.1.0"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{name = "Michał Startek"}]
+readme = "README.md"
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.6",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Development Status :: 4 - Beta",
+    "Operating System :: OS Independent",
+]
+keywords = ["BLOSUM", "gradient", "alignments", "Nanobind", "C++", "Python"]
+
+[project.urls]
+Homepage = "https://github.com/michalsta/nanobind_module_skeleton"
+Repository = "https://github.com/michalsta/nanobind_module_skeleton"
+
+
+[project.optional-dependencies]
+pytest = ["pytest", "biopython"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/Python"]
+
+[tool.cibuildwheel]
+enable = ["pypy"]
+skip = ["cp36-*", "cp37-*", "pp37-*"]
+test-command = "python -m pytest {project}/tests/Python"
+test-extras = ["pytest"]
+
+[tool.scikit-build.sdist]
+exclude = [
+    "tests/",
+    "dist/",
+    ".github/",
+    ".vscode/",
+    ".pytest_cache/",
+    "src/nwgrad/__pycache__/",
+    "reinstall.sh",
+    ".coverage",
+]
