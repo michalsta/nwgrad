@@ -126,7 +126,12 @@ struct Aligner {
         if constexpr (AB == AlignBand::GuideBanded) {
             if (guide_j.empty()) {
                 guide_j_.resize(static_cast<size_t>(m_ + 1));
-                for (int i = 0; i <= m_; ++i) guide_j_[i] = i;
+                if (m_ > 0)
+                    for (int i = 0; i <= m_; ++i)
+                        guide_j_[i] = static_cast<int>(
+                            std::llround(static_cast<double>(i) * n_ / m_));
+                else
+                    guide_j_[0] = 0;
             } else {
                 guide_j_ = std::move(guide_j);
             }
