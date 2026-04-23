@@ -29,7 +29,7 @@ from typing import List, Tuple
 import numpy as np
 import pytest
 import nwgrad
-from test_blosum import BLOSUM62
+from test_subst_matrix import BLOSUM62
 
 AA_ORDER = "ACDEFGHIKLMNPQRSTVWY"
 
@@ -86,8 +86,8 @@ PARAMS = Params()
 
 # ── helpers ────────────────────────────────────────────────────────────────────
 
-def make_blosum() -> nwgrad.BlosumMatrix:
-    return nwgrad.BlosumMatrix(np.asarray(BLOSUM62, dtype=np.float64))
+def make_blosum() -> nwgrad.SubstMatrix:
+    return nwgrad.SubstMatrix(np.asarray(BLOSUM62, dtype=np.float64))
 
 
 def random_seqs(rng: np.random.Generator, n: int, lo: int, hi: int) -> List[str]:

@@ -15,12 +15,12 @@ DP table, rather than on the main diagonal.  Tests here verify:
 import numpy as np
 import pytest
 import nwgrad
-from test_blosum import BLOSUM62
+from test_subst_matrix import BLOSUM62
 
 
 @pytest.fixture(scope="module")
 def blosum():
-    return nwgrad.BlosumMatrix(BLOSUM62)
+    return nwgrad.SubstMatrix(BLOSUM62)
 
 
 @pytest.fixture(scope="module")
@@ -28,7 +28,7 @@ def unit():
     """Identity substitution matrix: score 1 for match, 0 for mismatch."""
     mat = np.zeros((20, 20), dtype=np.float64)
     np.fill_diagonal(mat, 1.0)
-    return nwgrad.BlosumMatrix(mat)
+    return nwgrad.SubstMatrix(mat)
 
 
 # ── guide_j_from_aligned ──────────────────────────────────────────────────────

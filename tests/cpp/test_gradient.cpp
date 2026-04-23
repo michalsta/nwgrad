@@ -1,11 +1,11 @@
 #include "catch.hpp"
 #include "aligner.hpp"
 
-static BlosumMatrix unit_matrix() {
+static SubstMatrix unit_matrix() {
     std::array<double, 400> src{};
     for (int i = 0; i < 20; ++i)
         src[i * 20 + i] = 1.0;
-    return BlosumMatrix(src.data());
+    return SubstMatrix(src.data());
 }
 
 static void zero_grad(double g[256][256]) {

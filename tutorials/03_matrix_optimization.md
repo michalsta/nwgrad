@@ -31,7 +31,7 @@ AA_ORDER = "ACDEFGHIKLMNPQRSTVWY"
 # ... define BLOSUM62 array as in Tutorial 1 ...
 
 # Start from BLOSUM62 as the initial matrix
-matrix = BLOSUM62.copy()
+mat_array = BLOSUM62.copy()
 ```
 
 ## Constructing a toy training set
@@ -44,7 +44,6 @@ rng = np.random.default_rng(0)
 alphabet = list(AA_ORDER)
 
 def mutate(seq, rate=0.1):
-    """Randomly substitute residues at the given rate."""
     chars = list(seq)
     for i in range(len(chars)):
         if rng.random() < rate:
@@ -60,170 +59,154 @@ seqs_a = base_seqs
 seqs_b = [mutate(s, rate=0.15) for s in base_seqs]
 ```
 
-## Objective and gradient
+## Building the batch
 
-We maximise the sum of alignment log-partition functions over the training set.
-This is equivalent to maximising the log-likelihood of the observed pairs under
-a model that weights alignments by their Boltzmann probability.
+`SeqPair` objects are constructed once and reused across all optimisation
+iterations. Only the matrix changes between iterations — the sequences and
+alignment mode are fixed.
 
 ```python
-def objective_and_grad(matrix_flat, seqs_a, seqs_b,
-                       gap_open=11.0, gap_extend=1.0, n_threads=4):
-    """
-    Returns (-total_log_z, -gradient) for minimisation with scipy.
-    matrix_flat: (400,) float64 — the upper triangle is the free parameters;
-    we enforce symmetry explicitly.
-    """
-    # Reconstruct symmetric 20×20 matrix
-    mat20 = matrix_flat.reshape(20, 20)
-    mat20 = (mat20 + mat20.T) / 2  # enforce symmetry
+mat = nwgrad.SubstMatrix(mat_array)
 
-    bm = nwgrad.BlosumMatrix(mat20)
-
-    aligner = nwgrad.BatchAligner(
-        matrix=bm,
-        gap_open=gap_open, gap_extend=gap_extend,
+batch = nwgrad.SeqPairBatch(n_threads=4)
+for a, b in zip(seqs_a, seqs_b):
+    batch.add(nwgrad.SeqPair(
+        a, b, mat,
+        gap_open=11.0, gap_extend=1.0,
         gap_model="affine", mode="global",
         grad_mode="soft",
-        n_threads=n_threads,
-    )
-    result = aligner.align(seqs_a, seqs_b)
-
-    total_log_z = float(np.array(result.scores).sum())
-    grad = np.array(result.grad)  # shape (20, 20), sum over batch
-
-    # Symmetrise gradient (because we symmetrised the matrix)
-    grad = (grad + grad.T) / 2
-
-    return -total_log_z, -grad.ravel()
+    ))
 ```
 
 ## Gradient descent loop
 
 ```python
+LEARNING_RATE = 1e-4
+BANDWIDTH = 30   # banded DP half-width for iterations 2+
+
+for step in range(50):
+    # First step: full DP (no path yet). Subsequent steps: banded DP.
+    bw = 0 if step == 0 else BANDWIDTH
+    total_log_z = batch.score_and_grad(bandwidth=bw)
+
+    # Summed gradient over all pairs → (20, 20)
+    grad = batch.compute_grad()
+
+    mat_array += LEARNING_RATE * grad   # gradient ascent on log Z
+    batch.set_matrix(nwgrad.SubstMatrix(mat_array))
+
+    if step % 10 == 0:
+        print(f"step {step:3d}  total log Z = {total_log_z:.2f}")
+```
+
+`batch.set_matrix()` invalidates cached scores and gradients on all pairs but
+preserves the alignment paths, so the next `score_and_grad(bandwidth=bw)` uses
+banded DP instead of a full re-alignment.
+
+## Using scipy L-BFGS-B
+
+For second-order methods that call an objective function repeatedly:
+
+```python
 from scipy.optimize import minimize
 
-x0 = BLOSUM62.ravel().copy()
+def objective_and_grad(matrix_flat):
+    batch.set_matrix(nwgrad.SubstMatrix(matrix_flat.reshape(20, 20)))
 
-# A few steps of L-BFGS-B
+    total_log_z = batch.score_and_grad()
+    grad = batch.compute_grad()
+
+    return -float(total_log_z), -grad.ravel()
+
 result = minimize(
     fun=objective_and_grad,
-    x0=x0,
-    args=(seqs_a, seqs_b),
+    x0=mat_array.ravel(),
     method="L-BFGS-B",
     jac=True,
     options={"maxiter": 50, "ftol": 1e-10, "gtol": 1e-6, "disp": True},
 )
 
-optimised_matrix = result.x.reshape(20, 20)
-optimised_matrix = (optimised_matrix + optimised_matrix.T) / 2
-print("Optimised matrix diagonal:", np.diag(optimised_matrix))
+optimised = result.x.reshape(20, 20)
+print("Optimised matrix diagonal:", np.diag(optimised))
 ```
 
-## Manual SGD loop
+Note: L-BFGS-B calls the objective many times per step, so using `bandwidth=0`
+(full DP) on every call is safer than banding when the matrix changes
+substantially between calls.
 
-For full control — useful when the training set is large and you want mini-batches:
+## Mini-batch SGD
+
+For large datasets, process pairs in mini-batches. Build a separate
+`SeqPairBatch` per mini-batch, or use index slicing with a single large batch:
 
 ```python
-LEARNING_RATE = 1e-4
 BATCH_SIZE = 64
-N_EPOCHS = 5
-n_threads = 4
+LR = 1e-4
+all_pairs = list(range(len(seqs_a)))
 
-matrix = BLOSUM62.copy()
-indices = np.arange(len(seqs_a))
-
-for epoch in range(N_EPOCHS):
-    rng.shuffle(indices)
+for epoch in range(5):
+    rng.shuffle(all_pairs)
     total_loss = 0.0
 
-    for start in range(0, len(indices), BATCH_SIZE):
-        batch = indices[start:start + BATCH_SIZE]
-        ba = [seqs_a[i] for i in batch]
-        bb = [seqs_b[i] for i in batch]
+    for start in range(0, len(all_pairs), BATCH_SIZE):
+        idx = all_pairs[start:start + BATCH_SIZE]
+        mat = nwgrad.SubstMatrix(mat_array)
 
-        bm = nwgrad.BlosumMatrix((matrix + matrix.T) / 2)
-        aligner = nwgrad.BatchAligner(
-            matrix=bm, gap_open=11.0, gap_extend=1.0,
-            gap_model="affine", mode="global",
-            grad_mode="soft", n_threads=n_threads,
-        )
-        result = aligner.align(ba, bb)
+        mini_batch = nwgrad.SeqPairBatch(n_threads=4)
+        for i in idx:
+            mini_batch.add(nwgrad.SeqPair(
+                seqs_a[i], seqs_b[i], mat,
+                gap_open=11.0, gap_extend=1.0,
+                gap_model="affine", mode="global", grad_mode="soft",
+            ))
 
-        loss = -float(np.array(result.scores).sum())
-        grad = -np.array(result.grad)  # shape (20, 20)
-        grad = (grad + grad.T) / 2     # symmetrise
+        loss = -mini_batch.score_and_grad()
+        grad = -mini_batch.compute_grad()
 
-        matrix -= LEARNING_RATE * grad
+        mat_array -= LR * grad
         total_loss += loss
 
     print(f"Epoch {epoch+1}: loss={total_loss:.2f}")
 
-# Symmetrise and export
-final_matrix = (matrix + matrix.T) / 2
-print("Final diagonal:", np.diag(final_matrix))
+print("Final diagonal:", np.diag(mat_array))
 ```
 
 ## Checking the gradient numerically
 
-Before running optimisation, it is good practice to verify that the soft gradient
-is consistent with finite differences on a small example:
+Before running optimisation, verify that the soft gradient is consistent with
+finite differences on a small example:
 
 ```python
 a, b = "ACDE", "ACDF"
 EPS = 1e-5
 
-log_z, grad = nwgrad.nw_affine_soft_grad(a, b, nwgrad.BlosumMatrix(BLOSUM62),
-                                          gap_open=11.0, gap_extend=1.0)
-grad = np.array(grad)
+sp = nwgrad.SeqPair(a, b, nwgrad.SubstMatrix(BLOSUM62),
+                    gap_open=11.0, gap_extend=1.0,
+                    gap_model="affine", mode="global", grad_mode="soft")
+sp.align_full()
+sp.compute_grad()
+log_z = sp.score
+grad  = sp.grad.copy()
 
 # Check entry (0, 0) — A-A substitution
 i, j = 0, 0
 m_plus  = BLOSUM62.copy(); m_plus[i, j]  += EPS; m_plus[j, i]  += EPS
 m_minus = BLOSUM62.copy(); m_minus[i, j] -= EPS; m_minus[j, i] -= EPS
 
-lz_plus,  _ = nwgrad.nw_affine_soft_grad(a, b, nwgrad.BlosumMatrix(m_plus),
-                                          gap_open=11.0, gap_extend=1.0)
-lz_minus, _ = nwgrad.nw_affine_soft_grad(a, b, nwgrad.BlosumMatrix(m_minus),
-                                          gap_open=11.0, gap_extend=1.0)
+sp_p = nwgrad.SeqPair(a, b, nwgrad.SubstMatrix(m_plus),
+                      gap_open=11.0, gap_extend=1.0,
+                      gap_model="affine", mode="global", grad_mode="soft")
+sp_p.align_full()
 
-numerical  = (lz_plus - lz_minus) / (2 * EPS)
-analytical = grad[i, j] + grad[j, i]  # both entries updated by the perturbation
+sp_m = nwgrad.SeqPair(a, b, nwgrad.SubstMatrix(m_minus),
+                      gap_open=11.0, gap_extend=1.0,
+                      gap_model="affine", mode="global", grad_mode="soft")
+sp_m.align_full()
+
+numerical  = (sp_p.score - sp_m.score) / (2 * EPS)
+analytical = grad[i, j] + grad[j, i]   # both entries changed by the perturbation
 print(f"Numerical:  {numerical:.8f}")
 print(f"Analytical: {analytical:.8f}")
-```
-
-## Using the hard subgradient
-
-The hard subgradient can be used with subgradient methods. The step size must
-be annealed because the subgradient is not a descent direction in general.
-
-```python
-# Polyak-style step size schedule
-def polyak_step(t, initial=1e-2, decay=0.99):
-    return initial * (decay ** t)
-
-matrix = BLOSUM62.copy()
-aligner_cfg = dict(
-    gap_open=11.0, gap_extend=1.0,
-    gap_model="affine", mode="global",
-    grad_mode="hard", n_threads=4,
-)
-
-for t in range(200):
-    bm = nwgrad.BlosumMatrix((matrix + matrix.T) / 2)
-    aligner = nwgrad.BatchAligner(matrix=bm, **aligner_cfg)
-    result = aligner.align(seqs_a, seqs_b)
-
-    # Maximise total score: gradient ascent
-    grad = np.array(result.grad)
-    grad = (grad + grad.T) / 2
-
-    lr = polyak_step(t)
-    matrix += lr * grad
-
-    if t % 20 == 0:
-        print(f"Step {t:3d}  lr={lr:.5f}  total_score={np.array(result.scores).sum():.1f}")
 ```
 
 ## Constraints and regularisation
@@ -232,9 +215,9 @@ In practice you may want to:
 
 - **Regularise toward BLOSUM62** to prevent degenerate solutions:
   ```python
-  reg_loss  = 0.01 * np.sum((matrix - BLOSUM62) ** 2)
-  reg_grad  = 0.02 * (matrix - BLOSUM62)
-  total_grad = soft_grad + reg_grad
+  reg_loss = 0.01 * np.sum((mat_array - BLOSUM62) ** 2)
+  reg_grad = 0.02 * (mat_array - BLOSUM62)
+  grad += reg_grad
   ```
 
 - **Fix the diagonal** (self-substitution scores) and only optimise off-diagonal:
@@ -244,6 +227,32 @@ In practice you may want to:
 
 - **Project onto the cone** of symmetric positive-semidefinite matrices after each
   step to maintain a valid log-odds interpretation.
+
+## Using the hard subgradient
+
+The hard subgradient can be used with subgradient methods. The step size must
+be annealed because the subgradient is not a descent direction in general.
+
+```python
+batch_hard = nwgrad.SeqPairBatch(n_threads=4)
+for a, b in zip(seqs_a, seqs_b):
+    batch_hard.add(nwgrad.SeqPair(
+        a, b, nwgrad.SubstMatrix(mat_array),
+        gap_open=11.0, gap_extend=1.0,
+        gap_model="affine", mode="global", grad_mode="hard",
+    ))
+
+for t in range(200):
+    lr = 1e-2 * (0.99 ** t)
+    total = batch_hard.score_and_grad()
+    grad  = batch_hard.compute_grad()
+
+    mat_array += lr * grad
+    batch_hard.set_matrix(nwgrad.SubstMatrix(mat_array))
+
+    if t % 20 == 0:
+        print(f"step {t:3d}  lr={lr:.5f}  total_score={total:.1f}")
+```
 
 ## Summary
 

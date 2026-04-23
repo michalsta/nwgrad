@@ -8,7 +8,7 @@ Gaps do not contribute.
 import numpy as np
 import pytest
 import nwgrad
-from test_blosum import BLOSUM62
+from test_subst_matrix import BLOSUM62
 
 AA_ORDER = "ACDEFGHIKLMNPQRSTVWY"
 
@@ -96,7 +96,7 @@ def grad_to_dict(g20):
 
 @pytest.fixture(scope="module")
 def blosum():
-    return nwgrad.BlosumMatrix(BLOSUM62)
+    return nwgrad.SubstMatrix(BLOSUM62)
 
 
 # ── Test pairs ───────────────────────────────────────────────────────────────

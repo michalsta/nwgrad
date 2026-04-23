@@ -1,16 +1,16 @@
 #include "catch.hpp"
 #include "aligner.hpp"
 
-static BlosumMatrix unit_matrix() {
+static SubstMatrix unit_matrix() {
     std::array<double, 400> src{};
     for (int i = 0; i < 20; ++i)
         src[i * 20 + i] = 1.0;
-    return BlosumMatrix(src.data());
+    return SubstMatrix(src.data());
 }
 
 // Score helpers
 template<GapModel GM, AlignMode AM>
-static double score_full(const BlosumMatrix& mat, const char* a, const char* b,
+static double score_full(const SubstMatrix& mat, const char* a, const char* b,
                           double gap_ext, double gap_open = 0.0) {
     Aligner<GM, AM, AlignBand::Full> al;
     al.set_problem(a, b, mat, gap_ext, gap_open);
@@ -19,7 +19,7 @@ static double score_full(const BlosumMatrix& mat, const char* a, const char* b,
 }
 
 template<GapModel GM, AlignMode AM>
-static double score_banded(const BlosumMatrix& mat, const char* a, const char* b,
+static double score_banded(const SubstMatrix& mat, const char* a, const char* b,
                              double gap_ext, double gap_open, int band) {
     Aligner<GM, AM, AlignBand::GuideBanded> al;
     al.set_problem(a, b, mat, gap_ext, gap_open, band);

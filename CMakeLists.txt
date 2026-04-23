@@ -40,7 +40,7 @@ install(DIRECTORY src/nwgrad/cpp/nwgrad DESTINATION nwgrad/cpp
 # ── C++ unit tests (Catch2 v2, vendored single header) ───────────────────────
 add_executable(nwgrad_tests
     tests/cpp/main.cpp
-    tests/cpp/test_blosum.cpp
+    tests/cpp/test_subst_matrix.cpp
     tests/cpp/test_aligner.cpp
     tests/cpp/test_gradient.cpp
     tests/cpp/test_batch.cpp

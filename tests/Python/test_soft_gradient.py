@@ -14,7 +14,7 @@ The soft gradient replaces max with log-sum-exp, so:
 import numpy as np
 import pytest
 import nwgrad
-from test_blosum import BLOSUM62
+from test_subst_matrix import BLOSUM62
 
 AA_ORDER = "ACDEFGHIKLMNPQRSTVWY"
 
@@ -25,7 +25,7 @@ EPS = 1e-5
 
 @pytest.fixture(scope="module")
 def blosum():
-    return nwgrad.BlosumMatrix(BLOSUM62)
+    return nwgrad.SubstMatrix(BLOSUM62)
 
 
 def aa_idx(c):
@@ -33,18 +33,19 @@ def aa_idx(c):
 
 
 def make_mat(arr20):
-    return nwgrad.BlosumMatrix(np.asarray(arr20, dtype=np.float64))
+    return nwgrad.SubstMatrix(np.asarray(arr20, dtype=np.float64))
 
 
 def perturb_entry(mat20, i, j, eps):
-    """Return BlosumMatrix with the entry controlling s(AA[i],AA[j]) perturbed by eps.
+    """Return SubstMatrix with both s(AA[i],AA[j]) and s(AA[j],AA[i]) perturbed by eps.
 
-    BlosumMatrix uses the lower-triangle element (row >= col) as the canonical
-    value; both mat[a][b] and mat[b][a] are set from it.  We therefore perturb
-    only m[max(i,j), min(i,j)] to avoid double-counting on the diagonal.
+    Perturbs both (i,j) and (j,i) symmetrically so the test measures
+    the combined finite difference matching grad[i,j] + grad[j,i].
     """
     m = mat20.copy()
-    m[max(i, j), min(i, j)] += eps
+    m[i, j] += eps
+    if i != j:
+        m[j, i] += eps
     return make_mat(m)
 
 
@@ -99,7 +100,7 @@ def test_grad_nonneg_and_bounded(a, b, name, soft_fn, score_fn, kw, blosum):
 # ── 3. numerical gradient check (central finite differences) ─────────────────
 # For each nonzero grad entry (i,j), verify:
 #   (log_Z(s+eps) - log_Z(s-eps)) / (2*eps)  ≈  grad[i,j] + grad[j,i]
-# (symmetry of BlosumMatrix means perturbing (i,j) also perturbs (j,i))
+# where the perturbation symmetrically shifts both M[i,j] and M[j,i].
 
 @pytest.mark.parametrize("name,soft_fn,score_fn,kw", SOFT_ALIGNERS,
                           ids=[x[0] for x in SOFT_ALIGNERS])
@@ -160,7 +161,7 @@ def test_low_temperature_limit(a, b, name, soft_fn, _score_fn, kw):
 
 def test_batch_soft_grad_matches_single():
     """BatchAligner soft should match summed single-pair soft grads."""
-    mat = nwgrad.BlosumMatrix(BLOSUM62)
+    mat = nwgrad.SubstMatrix(BLOSUM62)
     pairs = [("ACDE", "ACDF"), ("MADEEKLF", "MADEEKLF"), ("A", "A")]
 
     ba = nwgrad.BatchAligner(

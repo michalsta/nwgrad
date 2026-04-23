@@ -7,7 +7,7 @@
 #include <vector>
 
 #include "aligner.hpp"
-#include "blosum.hpp"
+#include "subst_matrix.hpp"
 
 // ── Internal per-(GapModel, AlignMode) state ─────────────────────────────────
 // Holds one Full and one GuideBanded aligner, reusing their DP buffers across
@@ -43,7 +43,7 @@ enum class GradMode { None, Hard, Soft };
 //   - set_matrix() clears score_valid and grad_valid; path_valid stays (guide still usable)
 //   - align_full() / realign_banded() set path_valid + score_valid, clear grad_valid
 //   - compute_grad() requires score_valid and grad_mode != None
-//   - BlosumMatrix pointed to by matrix_ must outlive this object
+//   - SubstMatrix pointed to by matrix_ must outlive this object
 
 struct SeqPair {
     using StateVar = std::variant<
@@ -54,7 +54,7 @@ struct SeqPair {
     >;
 
     SeqPair(std::string a, std::string b,
-            const BlosumMatrix& mat,
+            const SubstMatrix& mat,
             double gap_open, double gap_extend,
             GapModel gm, AlignMode am,
             GradMode grad_mode = GradMode::Hard)
@@ -76,7 +76,7 @@ struct SeqPair {
     // realign_banded() remains callable after this — it will re-score the
     // existing guide path under the new matrix.
     // The new matrix must outlive this SeqPair.
-    void set_matrix(const BlosumMatrix& mat) {
+    void set_matrix(const SubstMatrix& mat) {
         matrix_ = &mat;
         score_valid_ = false;
         grad_valid_  = false;
@@ -240,7 +240,7 @@ struct SeqPair {
 
 private:
     std::string          seq_a_, seq_b_;
-    const BlosumMatrix*  matrix_;
+    const SubstMatrix*  matrix_;
     double               gap_open_, gap_extend_;
     GradMode             grad_mode_;
 

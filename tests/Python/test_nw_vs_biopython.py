@@ -38,12 +38,12 @@ def bio_blosum62():
 
 @pytest.fixture(scope="module")
 def blosum(bio_blosum62):
-    """nwgrad BlosumMatrix built from the same values as bio_blosum62."""
+    """nwgrad SubstMatrix built from the same values as bio_blosum62."""
     arr = np.array(
         [[bio_blosum62[a, b] for b in AA_ORDER] for a in AA_ORDER],
         dtype=np.float64,
     )
-    return nwgrad.BlosumMatrix(arr)
+    return nwgrad.SubstMatrix(arr)
 
 
 def make_bio_aligner(bio_matrix, gap_extend: float) -> Align.PairwiseAligner:

@@ -8,7 +8,7 @@
 #include <utility>
 #include <vector>
 
-#include "blosum.hpp"
+#include "subst_matrix.hpp"
 
 enum class GapModel  { Linear, Affine };
 enum class AlignMode { Global, Local  };
@@ -110,7 +110,7 @@ struct Aligner {
 
     // ── Public pipeline API — own internal buffer ─────────────────────────────
 
-    void set_problem(std::string_view a, std::string_view b, const BlosumMatrix& mat,
+    void set_problem(std::string_view a, std::string_view b, const SubstMatrix& mat,
                      double gap_extend, double gap_open = 0.0, int band = 0,
                      std::vector<int> guide_j = {}) {
         seq_a_      = a;
@@ -265,7 +265,7 @@ private:
 
     // ── Problem state ─────────────────────────────────────────────────────────
     std::string_view    seq_a_, seq_b_;
-    const BlosumMatrix* matrix_     = nullptr;
+    const SubstMatrix*  matrix_     = nullptr;
     double              gap_extend_ = 0.0;
     double              gap_open_   = 0.0;
     int                 band_       = 0;

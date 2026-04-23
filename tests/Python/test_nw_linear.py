@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 import nwgrad
-from test_blosum import BLOSUM62
+from test_subst_matrix import BLOSUM62
 
 # ── Pure-Python reference NW (linear gap) ────────────────────────────────────
 
@@ -24,7 +24,7 @@ def ref_nw_linear(a, b, matrix, gap_extend):
 
 @pytest.fixture(scope="module")
 def blosum():
-    return nwgrad.BlosumMatrix(BLOSUM62)
+    return nwgrad.SubstMatrix(BLOSUM62)
 
 
 # ── Correctness vs. reference ─────────────────────────────────────────────────

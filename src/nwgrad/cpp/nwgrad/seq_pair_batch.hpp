@@ -7,7 +7,7 @@
 #include <thread>
 #include <vector>
 
-#include "blosum.hpp"
+#include "subst_matrix.hpp"
 #include "seq_pair.hpp"
 
 // SeqPairBatch holds non-owning pointers to SeqPair objects.
@@ -39,7 +39,7 @@ struct SeqPairBatch {
 
     // Set matrix on all pairs (O(1) per pair — no threading needed).
     // Clears score_valid and grad_valid on every pair; path_valid is preserved.
-    void set_matrix(const BlosumMatrix& mat) {
+    void set_matrix(const SubstMatrix& mat) {
         for (auto& sp : pairs) sp->set_matrix(mat);
     }
 

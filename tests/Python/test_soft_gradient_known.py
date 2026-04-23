@@ -27,7 +27,7 @@ AA_ORDER = "ACDEFGHIKLMNPQRSTVWY"
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 def make_mat(arr20):
-    return nwgrad.BlosumMatrix(np.asarray(arr20, dtype=np.float64))
+    return nwgrad.SubstMatrix(np.asarray(arr20, dtype=np.float64))
 
 
 def zero_mat():
@@ -131,7 +131,7 @@ def grad_to_dict(grad_arr):
 #   grad[X][Y] = exp(s) / (exp(s) + 2·exp(−2g))
 # ══════════════════════════════════════════════════════════════════════════════
 
-from test_blosum import BLOSUM62
+from test_subst_matrix import BLOSUM62
 
 SINGLE_CHAR_GLOBAL = [
     # (seq_a, seq_b, pair)

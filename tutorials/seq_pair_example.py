@@ -54,7 +54,7 @@ rng = random.Random(SEED)
 seqs = [random_seq(SEQ_LEN, rng) for _ in range(N_SEQS)]
 
 blosum_arr = make_blosum62()
-mat = nwgrad.BlosumMatrix(blosum_arr)
+mat = nwgrad.SubstMatrix(blosum_arr)
 
 score_label = "log Z" if GRAD_MODE == "soft" else "score"
 print(f"Config: {GAP_MODEL} gap, {ALIGN_MODE} align, {GRAD_MODE} grad")
@@ -70,6 +70,7 @@ for i in range(N_SEQS):
             gap_model=GAP_MODEL, mode=ALIGN_MODE, grad_mode=GRAD_MODE,
         ))
 
+print(batch[7])
 print(f"\nSequence pairs: {len(batch)}  ({N_SEQS} sequences, upper triangle)")
 print(f"Threads: {batch.n_threads}")
 
@@ -90,7 +91,7 @@ if GRAD_MODE != "none":
 
     # gradient step: update the substitution matrix
     new_blosum_arr = blosum_arr + LR * grad_sum
-    new_mat = nwgrad.BlosumMatrix(new_blosum_arr)
+    new_mat = nwgrad.SubstMatrix(new_blosum_arr)
     batch.set_matrix(new_mat)
 else:
     print("(grad_mode=none — skipping gradient step, reusing matrix)")

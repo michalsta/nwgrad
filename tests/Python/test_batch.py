@@ -7,7 +7,7 @@ safety (multi-thread results equal single-thread), and basic API surface.
 import numpy as np
 import pytest
 import nwgrad
-from test_blosum import BLOSUM62
+from test_subst_matrix import BLOSUM62
 
 AA_ORDER = "ACDEFGHIKLMNPQRSTVWY"
 
@@ -26,7 +26,7 @@ PAIRS = [
 
 @pytest.fixture(scope="module")
 def blosum():
-    return nwgrad.BlosumMatrix(BLOSUM62)
+    return nwgrad.SubstMatrix(BLOSUM62)
 
 
 # ── Single-threaded correctness ───────────────────────────────────────────────

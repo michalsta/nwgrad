@@ -45,7 +45,7 @@ def blosum(bio_blosum62):
         [[bio_blosum62[a, b] for b in AA_ORDER] for a in AA_ORDER],
         dtype=np.float64,
     )
-    return nwgrad.BlosumMatrix(arr)
+    return nwgrad.SubstMatrix(arr)
 
 
 def make_bio_aligner(bio_matrix, gap_open: float, gap_extend: float) -> Align.PairwiseAligner:

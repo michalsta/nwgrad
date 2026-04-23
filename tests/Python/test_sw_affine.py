@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 import nwgrad
-from test_blosum import BLOSUM62
+from test_subst_matrix import BLOSUM62
 
 # ── Pure-Python reference SW (affine gap) ────────────────────────────────────
 
@@ -51,7 +51,7 @@ def ref_sw_affine(a, b, matrix, gap_open, gap_extend):
 
 @pytest.fixture(scope="module")
 def blosum():
-    return nwgrad.BlosumMatrix(BLOSUM62)
+    return nwgrad.SubstMatrix(BLOSUM62)
 
 
 # ── Correctness vs. reference ─────────────────────────────────────────────────
@@ -129,5 +129,5 @@ def test_empty_vs_seq(blosum):
 def test_no_positive_scoring_pairs(blosum):
     """All-negative matrix → SW returns 0."""
     arr = np.full((20, 20), -10.0)
-    bad_mat = nwgrad.BlosumMatrix(arr)
+    bad_mat = nwgrad.SubstMatrix(arr)
     assert nwgrad.sw_score_affine("ACDE", "ACDE", bad_mat, 1.0, 0.5) == pytest.approx(0.0)

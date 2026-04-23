@@ -1,35 +1,22 @@
 """Empirical gradient tests — finite-difference verification.
 
-For a hard subgradient G of score s(M) where M is a SYMMETRIC substitution matrix:
+For a hard subgradient G of score s(M):
 
     s(M + ε·δ) − s(M)  =  ε · ⟨G, δ⟩
 
 exactly when ε is small enough that the optimal alignment path is unchanged.
 
-SYMMETRY NOTE
--------------
-BlosumMatrix stores double[256][256] and enforces symmetry during construction:
-for each (i, j) pair it writes both mat[a][b] = v AND mat[b][a] = v.
-Iterating i from 0..19 means the (i=row, j=col) pass is later than (i=col, j=row)
-for row > col, so the LOWER TRIANGLE of the numpy input determines the final value.
-
-Consequence: if the perturbation δ is asymmetric, BlosumMatrix will silently drop
-the asymmetric part and only store the lower-triangle component.  All perturbations
-in these tests must therefore be symmetric — i.e. δ[i,j] = δ[j,i].
-
-The effective gradient with respect to a SYMMETRIC matrix has:
-  G_eff[i,j] = G[i,j] + G[j,i]   (i ≠ j)
-  G_eff[i,i] = G[i,i]             (diagonal unchanged)
-i.e. G_eff = G + G.T - diag(G).
-
-For any symmetric δ:  Δs = ε · ⟨G, δ⟩ = ε · ⟨G_eff/2 + diag_correction, δ⟩
-                           = ε · np.dot(G.ravel(), δ.ravel())  (since ⟨G, δ⟩ = ⟨G.T, δ⟩ for sym δ)
+SubstMatrix supports fully asymmetric matrices: M[a,b] and M[b,a] are stored
+and used independently.  Perturbing a single entry M[i,j] by ε changes the
+score by ε·G[i,j]; perturbing both M[i,j] and M[j,i] symmetrically changes it
+by ε·(G[i,j] + G[j,i]).  These tests use the symmetric perturbation convention
+to match the behaviour expected from BLOSUM62 (which is itself symmetric).
 """
 
 import numpy as np
 import pytest
 import nwgrad
-from test_blosum import BLOSUM62
+from test_subst_matrix import BLOSUM62
 
 AA_ORDER = "ACDEFGHIKLMNPQRSTVWY"
 EPS = 1e-5   # small enough that identity-pair path won't shift
@@ -70,7 +57,7 @@ GENERAL_PAIRS = [
 
 @pytest.fixture(scope="module")
 def blosum():
-    return nwgrad.BlosumMatrix(BLOSUM62)
+    return nwgrad.SubstMatrix(BLOSUM62)
 
 
 def sym(delta):
@@ -78,17 +65,13 @@ def sym(delta):
     return (delta + delta.T) / 2.0
 
 
-def make_blosum(mat20):
-    """Construct a BlosumMatrix from a 20×20 float64 array."""
-    return nwgrad.BlosumMatrix(np.asarray(mat20, dtype=np.float64))
+def make_subst_matrix(mat20):
+    return nwgrad.SubstMatrix(np.asarray(mat20, dtype=np.float64))
 
 
 def perturb(delta, eps=EPS):
-    """Return a new BlosumMatrix with BLOSUM62 + eps * sym(delta).
-
-    Symmetrises delta before adding so the BlosumMatrix round-trip is exact.
-    """
-    return make_blosum(BLOSUM62 + eps * sym(delta))
+    """Return a new SubstMatrix with BLOSUM62 + eps * sym(delta)."""
+    return make_subst_matrix(BLOSUM62 + eps * sym(delta))
 
 
 def expected_delta(g, delta, eps=EPS):

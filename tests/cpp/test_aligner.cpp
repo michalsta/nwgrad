@@ -2,16 +2,16 @@
 #include "aligner.hpp"
 
 // Unit substitution matrix: match=1, mismatch=0
-static BlosumMatrix unit_matrix() {
+static SubstMatrix unit_matrix() {
     std::array<double, 400> src{};
     for (int i = 0; i < 20; ++i)
         src[i * 20 + i] = 1.0;
-    return BlosumMatrix(src.data());
+    return SubstMatrix(src.data());
 }
 
 // Convenience: set problem, run viterbi, return score.
 template<GapModel GM, AlignMode AM>
-static double score(Aligner<GM,AM>& al, const BlosumMatrix& mat,
+static double score(Aligner<GM,AM>& al, const SubstMatrix& mat,
                     const char* a, const char* b,
                     double gap_extend, double gap_open = 0.0) {
     al.set_problem(a, b, mat, gap_extend, gap_open);

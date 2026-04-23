@@ -32,48 +32,58 @@ BLOSUM62 = np.array([
 
 
 @pytest.fixture
-def blosum():
-    return nwgrad.BlosumMatrix(BLOSUM62)
+def mat():
+    return nwgrad.SubstMatrix(BLOSUM62)
 
 
-def test_round_trip(blosum):
-    recovered = blosum.to_matrix()
+def test_round_trip(mat):
+    recovered = mat.to_matrix()
     assert recovered.shape == (20, 20)
     assert recovered.dtype == np.float64
     np.testing.assert_array_equal(recovered, BLOSUM62)
 
 
-def test_score_diagonal(blosum):
-    # Diagonal entries: self-substitution scores.
+def test_score_diagonal(mat):
     for i, aa in enumerate(AA_ORDER):
         expected = BLOSUM62[i, i]
-        assert blosum.score(aa, aa) == pytest.approx(expected), f"diagonal mismatch for {aa}"
+        assert mat.score(aa, aa) == pytest.approx(expected), f"diagonal mismatch for {aa}"
 
 
-def test_score_spot_checks(blosum):
+def test_score_spot_checks(mat):
     # A-C: 0, W-W: 11, D-E: 2
-    assert blosum.score('A', 'C') == pytest.approx(0.0)
-    assert blosum.score('W', 'W') == pytest.approx(11.0)
-    assert blosum.score('D', 'E') == pytest.approx(2.0)
+    assert mat.score('A', 'C') == pytest.approx(0.0)
+    assert mat.score('W', 'W') == pytest.approx(11.0)
+    assert mat.score('D', 'E') == pytest.approx(2.0)
 
 
-def test_symmetry(blosum):
+def test_blosum62_is_symmetric(mat):
+    # BLOSUM62 happens to be symmetric; verify round-trip preserves that.
     for i, a in enumerate(AA_ORDER):
         for j, b in enumerate(AA_ORDER):
-            assert blosum.score(a, b) == pytest.approx(blosum.score(b, a)), \
-                f"symmetry failed for ({a}, {b})"
+            assert mat.score(a, b) == pytest.approx(mat.score(b, a)), \
+                f"BLOSUM62 symmetry failed for ({a}, {b})"
 
 
-def test_score_bad_input(blosum):
+def test_asymmetric_matrix():
+    # SubstMatrix must preserve asymmetric values exactly.
+    arr = np.zeros((20, 20), dtype=np.float64)
+    arr[0, 1] = 3.0   # A→C
+    arr[1, 0] = 7.0   # C→A
+    sm = nwgrad.SubstMatrix(arr)
+    assert sm.score('A', 'C') == pytest.approx(3.0)
+    assert sm.score('C', 'A') == pytest.approx(7.0)
+
+
+def test_score_bad_input(mat):
     with pytest.raises(Exception):
-        blosum.score('AA', 'C')
+        mat.score('AA', 'C')
     with pytest.raises(Exception):
-        blosum.score('A', '')
+        mat.score('A', '')
 
 
 def test_independent_instances():
-    # Modifying the source array after construction must not affect BlosumMatrix.
+    # Modifying the source array after construction must not affect SubstMatrix.
     arr = BLOSUM62.copy()
-    bm = nwgrad.BlosumMatrix(arr)
+    sm = nwgrad.SubstMatrix(arr)
     arr[0, 0] = 999.0
-    assert bm.score('A', 'A') == pytest.approx(4.0)
+    assert sm.score('A', 'A') == pytest.approx(4.0)

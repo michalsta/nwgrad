@@ -127,7 +127,7 @@ def main(argv=None):
     seqs_a, mean_len, min_len, max_len = generate_seqs(rng, args.n, args.seq_len)
     seqs_b, _, _, _                    = generate_seqs(rng, args.n, args.seq_len)
 
-    blosum = nwgrad.BlosumMatrix(BLOSUM62)
+    blosum = nwgrad.SubstMatrix(BLOSUM62)
 
     go = args.gap_open if args.gap_model == "affine" else 0.0
     ge = args.gap_extend

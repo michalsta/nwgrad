@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 import nwgrad
-from test_blosum import BLOSUM62
+from test_subst_matrix import BLOSUM62
 
 # ── Pure-Python reference SW (linear gap) ────────────────────────────────────
 
@@ -27,7 +27,7 @@ def ref_sw_linear(a, b, matrix, gap_extend):
 
 @pytest.fixture(scope="module")
 def blosum():
-    return nwgrad.BlosumMatrix(BLOSUM62)
+    return nwgrad.SubstMatrix(BLOSUM62)
 
 
 # ── Correctness vs. reference ─────────────────────────────────────────────────
@@ -116,5 +116,5 @@ def test_no_positive_scoring_pairs(blosum):
     """When all substitution scores are negative, SW returns 0."""
     # Build a matrix of all -10s
     arr = np.full((20, 20), -10.0)
-    bad_mat = nwgrad.BlosumMatrix(arr)
+    bad_mat = nwgrad.SubstMatrix(arr)
     assert nwgrad.sw_score("ACDE", "ACDE", bad_mat, 1.0) == pytest.approx(0.0)

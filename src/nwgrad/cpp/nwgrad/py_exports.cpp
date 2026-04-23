@@ -6,7 +6,7 @@
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
-#include "blosum.hpp"
+#include "subst_matrix.hpp"
 #include "aligner.hpp"
 #include "batch.hpp"
 #include "seq_pair.hpp"
@@ -54,19 +54,19 @@ static std::vector<int> make_guide(const std::string& aligned_a,
 NB_MODULE(nwgrad_ext, m) {
     m.doc() = "nwgrad C++ nanobind module";
 
-    // ── BlosumMatrix ─────────────────────────────────────────────────────────
-    nb::class_<BlosumMatrix>(m, "BlosumMatrix")
+    // ── SubstMatrix ─────────────────────────────────────────────────────────
+    nb::class_<SubstMatrix>(m, "SubstMatrix")
         .def(
             "__init__",
-            [](BlosumMatrix* self, nb_arr_f64 arr) {
-                new (self) BlosumMatrix(arr.data());
+            [](SubstMatrix* self, nb_arr_f64 arr) {
+                new (self) SubstMatrix(arr.data());
             },
             nb::arg("matrix"),
             "Construct from a (20, 20) float64 numpy array in canonical AA order "
             "(ACDEFGHIKLMNPQRSTVWY).")
         .def(
             "score",
-            [](const BlosumMatrix& self, const std::string& a, const std::string& b) {
+            [](const SubstMatrix& self, const std::string& a, const std::string& b) {
                 if (a.size() != 1 || b.size() != 1)
                     throw std::invalid_argument("score() expects single-character strings");
                 return self.score(a[0], b[0]);
@@ -75,7 +75,7 @@ NB_MODULE(nwgrad_ext, m) {
             "Return substitution score for amino acids a and b.")
         .def(
             "to_matrix",
-            [](const BlosumMatrix& self) {
+            [](const SubstMatrix& self) {
                 double* buf = new double[400];
                 self.to_array(buf);
                 nb::capsule owner(buf, [](void* p) noexcept { delete[] static_cast<double*>(p); });
@@ -100,7 +100,7 @@ NB_MODULE(nwgrad_ext, m) {
     m.def(
         "nw_score",
         [](const std::string& a, const std::string& b,
-           const BlosumMatrix& mat, double gap_extend, int band,
+           const SubstMatrix& mat, double gap_extend, int band,
            const std::string& aligned_a, const std::string& aligned_b) {
             auto gj = make_guide(aligned_a, aligned_b);
             WITH_ALIGNER(Linear, Global, band, gj, {
@@ -118,7 +118,7 @@ NB_MODULE(nwgrad_ext, m) {
     m.def(
         "sw_score",
         [](const std::string& a, const std::string& b,
-           const BlosumMatrix& mat, double gap_extend, int band,
+           const SubstMatrix& mat, double gap_extend, int band,
            const std::string& aligned_a, const std::string& aligned_b) {
             auto gj = make_guide(aligned_a, aligned_b);
             WITH_ALIGNER(Linear, Local, band, gj, {
@@ -134,7 +134,7 @@ NB_MODULE(nwgrad_ext, m) {
     m.def(
         "nw_score_affine",
         [](const std::string& a, const std::string& b,
-           const BlosumMatrix& mat, double gap_open, double gap_extend, int band,
+           const SubstMatrix& mat, double gap_open, double gap_extend, int band,
            const std::string& aligned_a, const std::string& aligned_b) {
             auto gj = make_guide(aligned_a, aligned_b);
             WITH_ALIGNER(Affine, Global, band, gj, {
@@ -151,7 +151,7 @@ NB_MODULE(nwgrad_ext, m) {
     m.def(
         "sw_score_affine",
         [](const std::string& a, const std::string& b,
-           const BlosumMatrix& mat, double gap_open, double gap_extend, int band,
+           const SubstMatrix& mat, double gap_open, double gap_extend, int band,
            const std::string& aligned_a, const std::string& aligned_b) {
             auto gj = make_guide(aligned_a, aligned_b);
             WITH_ALIGNER(Affine, Local, band, gj, {
@@ -170,7 +170,7 @@ NB_MODULE(nwgrad_ext, m) {
     m.def(
         "nw_grad",
         [](const std::string& a, const std::string& b,
-           const BlosumMatrix& mat, double gap_extend, int band,
+           const SubstMatrix& mat, double gap_extend, int band,
            const std::string& aligned_a, const std::string& aligned_b) {
             auto gj = make_guide(aligned_a, aligned_b);
             WITH_ALIGNER(Linear, Global, band, gj, {
@@ -188,7 +188,7 @@ NB_MODULE(nwgrad_ext, m) {
     m.def(
         "sw_grad",
         [](const std::string& a, const std::string& b,
-           const BlosumMatrix& mat, double gap_extend, int band,
+           const SubstMatrix& mat, double gap_extend, int band,
            const std::string& aligned_a, const std::string& aligned_b) {
             auto gj = make_guide(aligned_a, aligned_b);
             WITH_ALIGNER(Linear, Local, band, gj, {
@@ -206,7 +206,7 @@ NB_MODULE(nwgrad_ext, m) {
     m.def(
         "nw_affine_grad",
         [](const std::string& a, const std::string& b,
-           const BlosumMatrix& mat, double gap_open, double gap_extend, int band,
+           const SubstMatrix& mat, double gap_open, double gap_extend, int band,
            const std::string& aligned_a, const std::string& aligned_b) {
             auto gj = make_guide(aligned_a, aligned_b);
             WITH_ALIGNER(Affine, Global, band, gj, {
@@ -225,7 +225,7 @@ NB_MODULE(nwgrad_ext, m) {
     m.def(
         "sw_affine_grad",
         [](const std::string& a, const std::string& b,
-           const BlosumMatrix& mat, double gap_open, double gap_extend, int band,
+           const SubstMatrix& mat, double gap_open, double gap_extend, int band,
            const std::string& aligned_a, const std::string& aligned_b) {
             auto gj = make_guide(aligned_a, aligned_b);
             WITH_ALIGNER(Affine, Local, band, gj, {
@@ -246,7 +246,7 @@ NB_MODULE(nwgrad_ext, m) {
     m.def(
         "nw_soft_grad",
         [](const std::string& a, const std::string& b,
-           const BlosumMatrix& mat, double gap_extend, int band,
+           const SubstMatrix& mat, double gap_extend, int band,
            const std::string& aligned_a, const std::string& aligned_b) {
             auto gj = make_guide(aligned_a, aligned_b);
             WITH_ALIGNER(Linear, Global, band, gj, {
@@ -264,7 +264,7 @@ NB_MODULE(nwgrad_ext, m) {
     m.def(
         "sw_soft_grad",
         [](const std::string& a, const std::string& b,
-           const BlosumMatrix& mat, double gap_extend, int band,
+           const SubstMatrix& mat, double gap_extend, int band,
            const std::string& aligned_a, const std::string& aligned_b) {
             auto gj = make_guide(aligned_a, aligned_b);
             WITH_ALIGNER(Linear, Local, band, gj, {
@@ -282,7 +282,7 @@ NB_MODULE(nwgrad_ext, m) {
     m.def(
         "nw_affine_soft_grad",
         [](const std::string& a, const std::string& b,
-           const BlosumMatrix& mat, double gap_open, double gap_extend, int band,
+           const SubstMatrix& mat, double gap_open, double gap_extend, int band,
            const std::string& aligned_a, const std::string& aligned_b) {
             auto gj = make_guide(aligned_a, aligned_b);
             WITH_ALIGNER(Affine, Global, band, gj, {
@@ -301,7 +301,7 @@ NB_MODULE(nwgrad_ext, m) {
     m.def(
         "sw_affine_soft_grad",
         [](const std::string& a, const std::string& b,
-           const BlosumMatrix& mat, double gap_open, double gap_extend, int band,
+           const SubstMatrix& mat, double gap_open, double gap_extend, int band,
            const std::string& aligned_a, const std::string& aligned_b) {
             auto gj = make_guide(aligned_a, aligned_b);
             WITH_ALIGNER(Affine, Local, band, gj, {
@@ -341,7 +341,7 @@ NB_MODULE(nwgrad_ext, m) {
         .def(
             "__init__",
             [](BatchAligner* self,
-               const BlosumMatrix& matrix,
+               const SubstMatrix& matrix,
                double gap_open,
                double gap_extend,
                int    band,
@@ -411,7 +411,7 @@ NB_MODULE(nwgrad_ext, m) {
             "__init__",
             [](SeqPair* self,
                const std::string& seq_a, const std::string& seq_b,
-               const BlosumMatrix& mat,
+               const SubstMatrix& mat,
                double gap_open, double gap_extend,
                const std::string& gap_model,
                const std::string& mode,
@@ -442,7 +442,7 @@ NB_MODULE(nwgrad_ext, m) {
              "caller-supplied buffers and does not require this.")
         .def(
             "set_matrix",
-            [](SeqPair& self, const BlosumMatrix& mat) { self.set_matrix(mat); },
+            [](SeqPair& self, const SubstMatrix& mat) { self.set_matrix(mat); },
             nb::arg("matrix"),
             "Swap the substitution matrix.  Invalidates cached score and gradient.\n"
             "The matrix object must remain alive as long as this SeqPair uses it.")
@@ -523,7 +523,7 @@ NB_MODULE(nwgrad_ext, m) {
              "Required before align_full() / realign_banded(); not needed for score_and_grad().")
         .def(
             "set_matrix",
-            [](SeqPairBatch& self, const BlosumMatrix& mat) {
+            [](SeqPairBatch& self, const SubstMatrix& mat) {
                 self.set_matrix(mat);
             },
             nb::arg("matrix"),

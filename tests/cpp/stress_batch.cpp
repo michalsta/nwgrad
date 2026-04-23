@@ -27,7 +27,7 @@
 
 // ── BLOSUM62 (canonical AA order: ACDEFGHIKLMNPQRSTVWY) ──────────────────────
 
-// Row = first AA, col = second AA; AA_ORDER is from blosum.hpp.
+// Row = first AA, col = second AA; AA_ORDER is from subst_matrix.hpp.
 static const double BLOSUM62[20][20] = {
     { 4,  0, -2, -1, -2,  0, -2, -1, -1, -1, -1, -2, -1, -1, -1,  1,  0,  0, -3, -2},
     { 0,  9, -3, -4, -2, -3, -3, -1, -3, -1, -1, -3, -3, -3, -3, -1, -1, -1, -2, -2},
@@ -51,12 +51,12 @@ static const double BLOSUM62[20][20] = {
     {-2, -2, -3, -2,  3, -3,  2, -1, -2, -1, -1, -2, -3, -1, -2, -2, -2, -1,  2,  7},
 };
 
-static BlosumMatrix make_blosum62() {
+static SubstMatrix make_blosum62() {
     double flat[400];
     for (int i = 0; i < 20; ++i)
         for (int j = 0; j < 20; ++j)
             flat[i * 20 + j] = BLOSUM62[i][j];
-    return BlosumMatrix(flat);
+    return SubstMatrix(flat);
 }
 
 // ── argument parsing ──────────────────────────────────────────────────────────
@@ -283,7 +283,7 @@ int main(int argc, char** argv) {
         problems.push_back({seqs_a[static_cast<size_t>(i)],
                             seqs_b[static_cast<size_t>(i)]});
 
-    BlosumMatrix blosum = make_blosum62();
+    SubstMatrix blosum = make_blosum62();
     double go = (a.gap_model == GapModel::Affine) ? a.gap_open : 0.0;
 
     print_header(a);

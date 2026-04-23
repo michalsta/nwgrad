@@ -11,7 +11,7 @@ pip install nwgrad
 
 ## The substitution matrix
 
-All alignment functions require a `BlosumMatrix` constructed from a `(20, 20)` float64
+All alignment functions require a `SubstMatrix` constructed from a `(20, 20)` float64
 numpy array. The row/column order is the canonical 20 amino-acid alphabet:
 
 ```
@@ -49,7 +49,7 @@ BLOSUM62 = np.array([
     [-2, -2, -3, -2,  3, -3,  2, -1, -2, -1, -1, -2, -3, -1, -2, -2, -2, -1,  2,  7],
 ], dtype=np.float64)
 
-blosum62 = nwgrad.BlosumMatrix(BLOSUM62)
+blosum62 = nwgrad.SubstMatrix(BLOSUM62)
 ```
 
 The matrix is copied into an internal 256×256 ASCII-indexed table on construction.
@@ -65,61 +65,41 @@ print(blosum62.score('D', 'E'))   # 2.0
 recovered = blosum62.to_matrix()  # shape (20, 20), dtype float64
 ```
 
-## Global alignment (Needleman-Wunsch)
+## Aligning a sequence pair with `SeqPair`
 
-### Affine gap penalty
-
-The affine gap model charges `gap_open + gap_extend * k` for a gap of length `k`.
-This is the standard model for protein alignment.
+`SeqPair` is the primary interface for single-pair alignment. It holds the
+sequences, matrix reference, and cached alignment state, and can be reused
+efficiently across multiple matrix updates.
 
 ```python
-a = "PLEASANTLY"
-b = "MEANLY"
-
-score = nwgrad.nw_score_affine(a, b, blosum62, gap_open=11.0, gap_extend=1.0)
-print(f"NW affine score: {score}")  # 8.0
+sp = nwgrad.SeqPair(
+    "PLEASANTLY", "MEANLY", blosum62,
+    gap_open=11.0, gap_extend=1.0,
+    gap_model="affine",   # "linear" | "affine"
+    mode="global",        # "global" (NW) | "local" (SW)
+    grad_mode="hard",     # "hard" | "soft" | "none"
+)
 ```
 
-### Linear gap penalty
-
-The linear gap model charges `gap_extend * k` for a gap of length `k`.
+### Computing the score
 
 ```python
-score = nwgrad.nw_score(a, b, blosum62, gap_extend=1.0)
-print(f"NW linear score: {score}")
+sp.align_full()
+print(sp.score)   # 8.0
 ```
 
-## Local alignment (Smith-Waterman)
+`align_full()` runs the full O(m×n) DP and caches the alignment path (`guide_j`).
+
+### Computing the hard subgradient
 
 ```python
-score = nwgrad.sw_score_affine(a, b, blosum62, gap_open=11.0, gap_extend=1.0)
-print(f"SW affine score: {score}")
-
-score = nwgrad.sw_score(a, b, blosum62, gap_extend=1.0)
-print(f"SW linear score: {score}")
-```
-
-Local alignment scores are always ≥ 0 (a zero-length local alignment is valid).
-
-## Computing the hard subgradient
-
-The gradient functions return `(score, grad)` where `grad` is a `(20, 20)` numpy array.
-
-```python
-score, grad = nwgrad.nw_affine_grad("PLEASANTLY", "MEANLY", blosum62,
-                                    gap_open=11.0, gap_extend=1.0)
-
-print(f"Score: {score}")
-print(f"Grad shape: {grad.shape}")   # (20, 20)
-print(f"Grad dtype: {grad.dtype}")   # float64
-print(f"Grad sum: {grad.sum()}")     # number of matched positions
+sp.compute_grad()
+grad = sp.grad     # (20, 20) numpy array
 ```
 
 `grad[i, j]` counts how many times amino acid `AA_ORDER[i]` is aligned to
-`AA_ORDER[j]` in the optimal alignment traceback. This is the subgradient of
-`score` with respect to `matrix[i, j]`.
-
-To inspect which substitutions occur:
+`AA_ORDER[j]` in the optimal traceback. This is the subgradient of the score
+with respect to `matrix[i, j]`.
 
 ```python
 for i, a in enumerate(AA_ORDER):
@@ -128,39 +108,89 @@ for i, a in enumerate(AA_ORDER):
             print(f"  {a}-{b}: {int(grad[i, j])}")
 ```
 
-## Computing the soft (differentiable) gradient
+### Computing the soft (differentiable) gradient
 
-The soft gradient replaces `max` with `log-sum-exp` in the DP recurrence.
-It returns the log-partition function `log Z = log Σ exp(score(alignment))` and
-the expected substitution counts under the Boltzmann distribution over alignments.
+Construct with `grad_mode="soft"` to use the forward-backward algorithm instead
+of Viterbi traceback. The score becomes `log Z = log Σ exp(score(alignment))`
+summed over all alignments, and the gradient is the expected substitution counts
+under the Boltzmann distribution — the true gradient of `log Z` with respect to
+the matrix.
 
 ```python
-log_z, soft_grad = nwgrad.nw_affine_soft_grad("PLEASANTLY", "MEANLY", blosum62,
-                                               gap_open=11.0, gap_extend=1.0)
+sp_soft = nwgrad.SeqPair(
+    "PLEASANTLY", "MEANLY", blosum62,
+    gap_open=11.0, gap_extend=1.0,
+    gap_model="affine", mode="global",
+    grad_mode="soft",
+)
+sp_soft.align_full()
+print(sp_soft.score)    # log Z — always >= hard score
 
-print(f"log Z: {log_z}")            # always >= hard score
-print(f"soft_grad sum: {soft_grad.sum()}")  # fractional, <= min(len(a), len(b))
+sp_soft.compute_grad()
+soft_grad = sp_soft.grad   # fractional, shape (20, 20)
+print(f"soft_grad sum: {soft_grad.sum()}")  # <= min(len(a), len(b))
 ```
 
-The soft gradient is the true gradient of `log_z` with respect to the substitution
-matrix — verified by central finite differences in the test suite. It is suitable
-for gradient-based optimisation of the substitution matrix.
+The soft gradient is the right choice for gradient-based optimisation — it is
+everywhere differentiable (the hard subgradient is not differentiable at score ties).
 
-## Summary of single-pair functions
+### All four alignment modes
 
-| Function | Returns | Gap model |
+```python
+for gap_model in ("linear", "affine"):
+    for mode in ("global", "local"):
+        kw = dict(gap_extend=1.0)
+        if gap_model == "affine":
+            kw["gap_open"] = 11.0
+        sp = nwgrad.SeqPair("PLEASANTLY", "MEANLY", blosum62,
+                            gap_model=gap_model, mode=mode, **kw)
+        sp.align_full()
+        print(f"{gap_model:6s} {mode:6s}  score={sp.score:.1f}")
+```
+
+Local alignment scores are always ≥ 0 (a zero-length local alignment is valid).
+
+## Updating the matrix
+
+After a gradient step the matrix changes but the alignment path is still a
+reasonable guide. `set_matrix()` swaps the matrix in O(1) and preserves the
+cached path, so `realign_banded()` can re-score cheaply around it instead of
+running the full O(m×n) DP again.
+
+```python
+new_mat_array = BLOSUM62 + 0.1 * grad
+new_blosum = nwgrad.SubstMatrix(new_mat_array)
+
+sp.set_matrix(new_blosum)      # clears score/grad; path_valid stays True
+sp.realign_banded(bandwidth=20)
+sp.compute_grad()
+print(sp.score, sp.grad.sum())
+```
+
+The `bandwidth` parameter is the half-width of the band in cells. If the true
+optimal path lies outside the band, the result is silently sub-optimal.
+
+## State flags
+
+```python
+sp.path_valid   # guide_j is usable (realign_banded is callable)
+sp.score_valid  # score matches current matrix and path
+sp.grad_valid   # grad is populated
+sp.dp_valid     # DP tables are still in memory (compute_grad is callable)
+```
+
+`compute_grad()` requires both `score_valid` and `dp_valid`. After
+`score_and_grad()` via `SeqPairBatch` (see Tutorial 2), `dp_valid` is `False`
+but `grad_valid` is already `True`.
+
+## Summary
+
+| `grad_mode` | `score` | `grad` |
 |---|---|---|
-| `nw_score(a, b, mat, gap_extend)` | `float` | Linear, global |
-| `sw_score(a, b, mat, gap_extend)` | `float` | Linear, local |
-| `nw_score_affine(a, b, mat, gap_open, gap_extend)` | `float` | Affine, global |
-| `sw_score_affine(a, b, mat, gap_open, gap_extend)` | `float` | Affine, local |
-| `nw_grad(a, b, mat, gap_extend)` | `(float, grad)` | Linear, global |
-| `sw_grad(a, b, mat, gap_extend)` | `(float, grad)` | Linear, local |
-| `nw_affine_grad(a, b, mat, gap_open, gap_extend)` | `(float, grad)` | Affine, global |
-| `sw_affine_grad(a, b, mat, gap_open, gap_extend)` | `(float, grad)` | Affine, local |
-| `nw_soft_grad(a, b, mat, gap_extend)` | `(log_z, grad)` | Linear, global |
-| `sw_soft_grad(a, b, mat, gap_extend)` | `(log_z, grad)` | Linear, local |
-| `nw_affine_soft_grad(a, b, mat, gap_open, gap_extend)` | `(log_z, grad)` | Affine, global |
-| `sw_affine_soft_grad(a, b, mat, gap_open, gap_extend)` | `(log_z, grad)` | Affine, local |
+| `"hard"` | Viterbi alignment score | Substitution-pair counts (integer-valued) |
+| `"soft"` | Log-partition function `log Z` | Expected counts (differentiable) |
+| `"none"` | Viterbi alignment score | `compute_grad()` throws |
 
-Next: [Tutorial 2 — Batch alignment and multithreading](02_batch_alignment.md)
+The soft gradient satisfies `log_z ≥ hard_score`. At high matrix scale (low temperature), `log_z → score` and `soft_grad → hard_grad`.
+
+Next: [Tutorial 2 — Batch alignment with SeqPairBatch](02_batch_alignment.md)

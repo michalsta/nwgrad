@@ -19,28 +19,28 @@ Coverage:
 import numpy as np
 import pytest
 import nwgrad
-from test_blosum import BLOSUM62
+from test_subst_matrix import BLOSUM62
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 
 @pytest.fixture(scope="module")
 def blosum():
-    return nwgrad.BlosumMatrix(BLOSUM62)
+    return nwgrad.SubstMatrix(BLOSUM62)
 
 
 @pytest.fixture(scope="module")
 def blosum2():
     """A slightly perturbed matrix for set_matrix() tests."""
     arr = BLOSUM62 + 0.5
-    return nwgrad.BlosumMatrix(arr)
+    return nwgrad.SubstMatrix(arr)
 
 
 @pytest.fixture(scope="module")
 def unit():
     mat = np.zeros((20, 20), dtype=np.float64)
     np.fill_diagonal(mat, 1.0)
-    return nwgrad.BlosumMatrix(mat)
+    return nwgrad.SubstMatrix(mat)
 
 
 PAIRS = [

@@ -20,7 +20,7 @@ struct BatchResult {
 };
 
 struct BatchAligner {
-    BlosumMatrix matrix;
+    SubstMatrix matrix;
     double gap_open;
     double gap_extend;
     int    band;       // 0 = full DP; > 0 = banded with this half-width
@@ -30,7 +30,7 @@ struct BatchAligner {
     GradMode grad_mode;
     int n_threads;
 
-    BatchAligner(BlosumMatrix mat, double go, double ge, int band,
+    BatchAligner(SubstMatrix mat, double go, double ge, int band,
                  GapModel gm, AlignMode am, GradMode gd, int nt)
         : matrix(std::move(mat)), gap_open(go), gap_extend(ge), band(band),
           gap_model(gm), align_mode(am), grad_mode(gd), n_threads(nt) {}
