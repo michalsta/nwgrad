@@ -3,14 +3,15 @@ import pytest
 import nwgrad
 from test_subst_matrix import BLOSUM62
 
+
+def make_params(gap_extend, gap_open=0.0):
+    return nwgrad.AlignParams(BLOSUM62, gap_open_a=gap_open, gap_extend_a=gap_extend,
+                                        gap_open_b=gap_open, gap_extend_b=gap_extend)
+
+
 # ── Pure-Python reference NW (affine gap) ────────────────────────────────────
 
 def ref_nw_affine(a, b, matrix, gap_open, gap_extend):
-    """
-    Reference Needleman-Wunsch with affine gap penalty.
-    gap_cost(k) = gap_open + gap_extend * k
-    Tables: M (match), X (gap in b / consuming a), Y (gap in a / consuming b).
-    """
     NEG_INF = float("-inf")
     m, n = len(a), len(b)
 
@@ -28,15 +29,14 @@ def ref_nw_affine(a, b, matrix, gap_open, gap_extend):
         for j in range(1, n + 1):
             diag  = max(M[i-1][j-1], X[i-1][j-1], Y[i-1][j-1])
             M[i][j] = diag + matrix.score(a[i-1], b[j-1])
-
             X[i][j] = max(
                 M[i-1][j] - gap_open - gap_extend,
                 X[i-1][j] - gap_extend,
-                Y[i-1][j] - gap_open - gap_extend,  # Y→X switch
+                Y[i-1][j] - gap_open - gap_extend,
             )
             Y[i][j] = max(
                 M[i][j-1] - gap_open - gap_extend,
-                X[i][j-1] - gap_open - gap_extend,  # X→Y switch
+                X[i][j-1] - gap_open - gap_extend,
                 Y[i][j-1] - gap_extend,
             )
 
@@ -47,8 +47,6 @@ def ref_nw_affine(a, b, matrix, gap_open, gap_extend):
 def blosum():
     return nwgrad.SubstMatrix(BLOSUM62)
 
-
-# ── Correctness vs. reference ─────────────────────────────────────────────────
 
 PAIRS = [
     ("A",          "A"),
@@ -69,60 +67,50 @@ GAP_PARAMS = [(0.0, 1.0), (1.0, 0.5), (2.0, 1.0), (5.0, 2.0)]
 @pytest.mark.parametrize("a,b", PAIRS)
 def test_matches_reference(a, b, gap_open, gap_extend, blosum):
     expected = ref_nw_affine(a, b, blosum, gap_open, gap_extend)
-    got      = nwgrad.nw_score_affine(a, b, blosum, gap_open, gap_extend)
+    got      = nwgrad.nw_score_affine(a, b, make_params(gap_extend, gap_open))
     assert got == pytest.approx(expected, abs=1e-9), (
         f"nw_score_affine({a!r},{b!r}, open={gap_open}, ext={gap_extend}): "
         f"got {got}, expected {expected}"
     )
 
 
-# ── Linear is a special case of affine (gap_open = 0) ────────────────────────
-
 @pytest.mark.parametrize("a,b", PAIRS)
-def test_affine_with_zero_open_matches_linear(a, b, blosum):
-    """Affine with gap_open=0 should equal linear."""
+def test_affine_with_zero_open_matches_linear(a, b):
     gap = 1.0
-    assert nwgrad.nw_score_affine(a, b, blosum, 0.0, gap) == pytest.approx(
-        nwgrad.nw_score(a, b, blosum, gap), abs=1e-9
+    assert nwgrad.nw_score_affine(a, b, make_params(gap, 0.0)) == pytest.approx(
+        nwgrad.nw_score(a, b, make_params(gap)), abs=1e-9
     )
 
 
-# ── Structural properties ─────────────────────────────────────────────────────
-
 @pytest.mark.parametrize("a,b", PAIRS)
-def test_symmetric(a, b, blosum):
+def test_symmetric(a, b):
     gap_open, gap_extend = 1.0, 0.5
-    assert nwgrad.nw_score_affine(a, b, blosum, gap_open, gap_extend) == pytest.approx(
-        nwgrad.nw_score_affine(b, a, blosum, gap_open, gap_extend), abs=1e-9
+    assert nwgrad.nw_score_affine(a, b, make_params(gap_extend, gap_open)) == pytest.approx(
+        nwgrad.nw_score_affine(b, a, make_params(gap_extend, gap_open)), abs=1e-9
     )
 
 
 @pytest.mark.parametrize("a,b", PAIRS)
-def test_higher_open_lowers_score(a, b, blosum):
-    """Higher gap_open should not increase the score (gaps become more expensive)."""
+def test_higher_open_lowers_score(a, b):
     gap_extend = 0.5
-    score_low  = nwgrad.nw_score_affine(a, b, blosum, 0.0, gap_extend)
-    score_high = nwgrad.nw_score_affine(a, b, blosum, 5.0, gap_extend)
+    score_low  = nwgrad.nw_score_affine(a, b, make_params(gap_extend, 0.0))
+    score_high = nwgrad.nw_score_affine(a, b, make_params(gap_extend, 5.0))
     assert score_low >= score_high
 
 
-# ── Edge cases ────────────────────────────────────────────────────────────────
-
 def test_identity_score(blosum):
-    """Aligning a sequence with itself: sum of diagonal BLOSUM62 scores."""
     seq = "ACDEFG"
     AA_ORDER = "ACDEFGHIKLMNPQRSTVWY"
     expected = sum(BLOSUM62[AA_ORDER.index(c), AA_ORDER.index(c)] for c in seq)
-    assert nwgrad.nw_score_affine(seq, seq, blosum, 1.0, 0.5) == pytest.approx(expected)
+    assert nwgrad.nw_score_affine(seq, seq, make_params(0.5, 1.0)) == pytest.approx(expected)
 
 
-def test_empty_vs_empty(blosum):
-    assert nwgrad.nw_score_affine("", "", blosum, 1.0, 0.5) == pytest.approx(0.0)
+def test_empty_vs_empty():
+    assert nwgrad.nw_score_affine("", "", make_params(0.5, 1.0)) == pytest.approx(0.0)
 
 
-def test_empty_vs_seq(blosum):
-    """Empty vs length-n sequence: costs gap_open + n * gap_extend."""
+def test_empty_vs_seq():
     seq = "ACDE"
     expected = -(1.0 + len(seq) * 0.5)
-    assert nwgrad.nw_score_affine("", seq, blosum, 1.0, 0.5) == pytest.approx(expected)
-    assert nwgrad.nw_score_affine(seq, "", blosum, 1.0, 0.5) == pytest.approx(expected)
+    assert nwgrad.nw_score_affine("", seq, make_params(0.5, 1.0)) == pytest.approx(expected)
+    assert nwgrad.nw_score_affine(seq, "", make_params(0.5, 1.0)) == pytest.approx(expected)

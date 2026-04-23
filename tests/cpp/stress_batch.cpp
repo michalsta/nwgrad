@@ -237,7 +237,7 @@ static void print_seq_stats(const std::vector<std::string>& seqs) {
 }
 
 static void print_run(int n_threads, double elapsed, const std::vector<double>& scores,
-                      const double grad[256][256], bool has_grad) {
+                      const AlignParams& grad, bool has_grad) {
     double mn = *std::min_element(scores.begin(), scores.end());
     double mx = *std::max_element(scores.begin(), scores.end());
     double mean = std::accumulate(scores.begin(), scores.end(), 0.0)
@@ -252,7 +252,7 @@ static void print_run(int n_threads, double elapsed, const std::vector<double>& 
         double grad_sum = 0.0;
         for (int i = 0; i < 256; ++i)
             for (int j = 0; j < 256; ++j)
-                grad_sum += grad[i][j];
+                grad_sum += grad.matrix.mat[i][j];
         std::printf("  grad_sum=%.0f", grad_sum);
     }
     std::printf("\n");
@@ -286,13 +286,18 @@ int main(int argc, char** argv) {
     SubstMatrix blosum = make_blosum62();
     double go = (a.gap_model == GapModel::Affine) ? a.gap_open : 0.0;
 
+    AlignParams params;
+    params.matrix       = blosum;
+    params.gap_open_a   = params.gap_open_b   = go;
+    params.gap_extend_a = params.gap_extend_b = a.gap_extend;
+
     print_header(a);
     print_seq_stats(seqs_a);
 
     bool has_grad = (a.grad_mode != BatchAligner::GradMode::None);
 
     for (int n_threads : a.n_threads) {
-        BatchAligner aligner(blosum, go, a.gap_extend, /*band=*/0,
+        BatchAligner aligner(params, /*band=*/0,
                              a.gap_model, a.align_mode, a.grad_mode, n_threads);
 
         if (a.warmup) {

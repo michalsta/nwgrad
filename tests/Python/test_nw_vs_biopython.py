@@ -37,13 +37,23 @@ def bio_blosum62():
 
 
 @pytest.fixture(scope="module")
-def blosum(bio_blosum62):
-    """nwgrad SubstMatrix built from the same values as bio_blosum62."""
-    arr = np.array(
+def blosum_arr(bio_blosum62):
+    """20×20 numpy array of BLOSUM62 values aligned to AA_ORDER."""
+    return np.array(
         [[bio_blosum62[a, b] for b in AA_ORDER] for a in AA_ORDER],
         dtype=np.float64,
     )
-    return nwgrad.SubstMatrix(arr)
+
+
+@pytest.fixture(scope="module")
+def blosum(blosum_arr):
+    return nwgrad.SubstMatrix(blosum_arr)
+
+
+def make_params(blosum_arr, gap_extend):
+    return nwgrad.AlignParams(blosum_arr,
+                               gap_open_a=0.0, gap_extend_a=gap_extend,
+                               gap_open_b=0.0, gap_extend_b=gap_extend)
 
 
 def make_bio_aligner(bio_matrix, gap_extend: float) -> Align.PairwiseAligner:
@@ -82,10 +92,10 @@ GAP_EXTENDS = [0.5, 1.0, 2.0, 5.0]
 
 @pytest.mark.parametrize("gap_extend", GAP_EXTENDS)
 @pytest.mark.parametrize("a,b", PAIRS)
-def test_score_matches_biopython(a, b, gap_extend, blosum, bio_blosum62):
+def test_score_matches_biopython(a, b, gap_extend, blosum_arr, bio_blosum62):
     bio_aligner = make_bio_aligner(bio_blosum62, gap_extend)
     expected = bio_aligner.score(a, b)
-    got = nwgrad.nw_score(a, b, blosum, gap_extend)
+    got = nwgrad.nw_score(a, b, make_params(blosum_arr, gap_extend))
     assert got == pytest.approx(expected, abs=1e-9), (
         f"nw_score({a!r}, {b!r}, gap={gap_extend}): got {got}, expected {expected}"
     )
@@ -93,11 +103,12 @@ def test_score_matches_biopython(a, b, gap_extend, blosum, bio_blosum62):
 
 @pytest.mark.parametrize("gap_extend", GAP_EXTENDS)
 @pytest.mark.parametrize("a,b", PAIRS)
-def test_symmetric_vs_biopython(a, b, gap_extend, blosum, bio_blosum62):
+def test_symmetric_vs_biopython(a, b, gap_extend, blosum_arr, bio_blosum62):
     """Both implementations should give the same score when sequences are swapped."""
     bio_aligner = make_bio_aligner(bio_blosum62, gap_extend)
-    fwd = nwgrad.nw_score(a, b, blosum, gap_extend)
-    rev = nwgrad.nw_score(b, a, blosum, gap_extend)
+    p = make_params(blosum_arr, gap_extend)
+    fwd = nwgrad.nw_score(a, b, p)
+    rev = nwgrad.nw_score(b, a, p)
     bio_fwd = bio_aligner.score(a, b)
     bio_rev = bio_aligner.score(b, a)
     assert fwd  == pytest.approx(bio_fwd,  abs=1e-9)

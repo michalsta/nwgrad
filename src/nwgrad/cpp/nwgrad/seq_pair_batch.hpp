@@ -7,7 +7,7 @@
 #include <thread>
 #include <vector>
 
-#include "subst_matrix.hpp"
+#include "align_params.hpp"
 #include "seq_pair.hpp"
 
 // SeqPairBatch holds non-owning pointers to SeqPair objects.
@@ -37,10 +37,10 @@ struct SeqPairBatch {
         parallel_for(pairs.size(), [&](size_t i) { pairs[i]->alloc_dp(); });
     }
 
-    // Set matrix on all pairs (O(1) per pair — no threading needed).
+    // Set params on all pairs (O(1) per pair — no threading needed).
     // Clears score_valid and grad_valid on every pair; path_valid is preserved.
-    void set_matrix(const SubstMatrix& mat) {
-        for (auto& sp : pairs) sp->set_matrix(mat);
+    void set_params(const AlignParams& params) {
+        for (auto& sp : pairs) sp->set_params(params);
     }
 
     // Drop DP tables on all pairs in parallel to free O(mn) memory per pair.
@@ -74,34 +74,30 @@ struct SeqPairBatch {
     }
 
     // Compute gradient on all pairs in parallel.
-    // Fills grad_out with the summed 256×256 gradient over all pairs.
+    // Returns the summed AlignParams gradient over all pairs.
     // If a pair already has grad_valid() == true (e.g. after score_and_grad_with_dp),
     // its cached gradient is used directly without rerunning the DP.
-    void compute_grad(double grad_out[256][256]) {
+    AlignParams compute_grad() {
         const size_t N = pairs.size();
         std::atomic<size_t> idx{0};
         std::mutex grad_mutex;
-        std::memset(grad_out, 0, 256 * 256 * sizeof(double));
+        AlignParams grad_out{};
 
         auto worker = [&]() {
-            double local[256][256]{};
+            AlignParams local{};
             while (true) {
                 size_t i = idx.fetch_add(1, std::memory_order_relaxed);
                 if (i >= N) break;
                 if (!pairs[i]->grad_valid())
                     pairs[i]->compute_grad();
-                const auto& g = pairs[i]->grad();
-                for (int r = 0; r < 256; ++r)
-                    for (int c = 0; c < 256; ++c)
-                        local[r][c] += g[r][c];
+                local += pairs[i]->grad();
             }
             std::lock_guard<std::mutex> lock(grad_mutex);
-            for (int r = 0; r < 256; ++r)
-                for (int c = 0; c < 256; ++c)
-                    grad_out[r][c] += local[r][c];
+            grad_out += local;
         };
 
         run_workers(N, worker);
+        return grad_out;
     }
 
     // Full-pipeline batch operation using per-thread DpBuffers.

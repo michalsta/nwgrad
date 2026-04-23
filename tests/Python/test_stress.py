@@ -86,8 +86,10 @@ PARAMS = Params()
 
 # ── helpers ────────────────────────────────────────────────────────────────────
 
-def make_blosum() -> nwgrad.SubstMatrix:
-    return nwgrad.SubstMatrix(np.asarray(BLOSUM62, dtype=np.float64))
+def make_params(gap_extend, gap_open=0.0):
+    return nwgrad.AlignParams(np.asarray(BLOSUM62, dtype=np.float64),
+                               gap_open_a=gap_open, gap_extend_a=gap_extend,
+                               gap_open_b=gap_open, gap_extend_b=gap_extend)
 
 
 def random_seqs(rng: np.random.Generator, n: int, lo: int, hi: int) -> List[str]:
@@ -99,64 +101,59 @@ def random_seqs(rng: np.random.Generator, n: int, lo: int, hi: int) -> List[str]
     ]
 
 
-def _ref(blosum, gap_model="affine", mode="global", gap_open=11.0, gap_extend=1.0,
-         grad_mode="hard"):
-    return nwgrad.BatchAligner(matrix=blosum, gap_open=gap_open, gap_extend=gap_extend,
-                               gap_model=gap_model, mode=mode,
+def _ref(params, gap_model="affine", mode="global", grad_mode="hard"):
+    return nwgrad.BatchAligner(params=params, gap_model=gap_model, mode=mode,
                                grad_mode=grad_mode, n_threads=1)
 
 
-def _multi(blosum, n_threads, gap_model="affine", mode="global",
-           gap_open=11.0, gap_extend=1.0, grad_mode="hard"):
-    return nwgrad.BatchAligner(matrix=blosum, gap_open=gap_open, gap_extend=gap_extend,
-                               gap_model=gap_model, mode=mode,
+def _multi(params, n_threads, gap_model="affine", mode="global", grad_mode="hard"):
+    return nwgrad.BatchAligner(params=params, gap_model=gap_model, mode=mode,
                                grad_mode=grad_mode, n_threads=n_threads)
 
 
 # ── check_* functions (no pytest deps, called by both wrappers and CLI) ────────
 
-def check_score_determinism(seqs_a, seqs_b, blosum, n_threads, p: Params = PARAMS,
+def check_score_determinism(seqs_a, seqs_b, n_threads, p: Params = PARAMS,
                              gap_model="affine", mode="global"):
     go, ge = (p.gap_open, p.gap_extend) if gap_model == "affine" else (0.0, p.gap_extend)
-    ref = _ref(blosum, gap_model, mode, go, ge, grad_mode="none").align(seqs_a, seqs_b)
-    got = _multi(blosum, n_threads, gap_model, mode, go, ge, grad_mode="none").align(seqs_a, seqs_b)
+    params = make_params(ge, go)
+    ref = _ref(params, gap_model, mode, grad_mode="none").align(seqs_a, seqs_b)
+    got = _multi(params, n_threads, gap_model, mode, grad_mode="none").align(seqs_a, seqs_b)
     np.testing.assert_array_equal(
         np.array(got.scores), np.array(ref.scores),
         err_msg=f"scores differ: {gap_model}/{mode} n_threads={n_threads}",
     )
 
 
-def check_grad_determinism(seqs_a, seqs_b, blosum, n_threads, p: Params = PARAMS):
-    go, ge = p.gap_open, p.gap_extend
-    ref = _ref(blosum, gap_open=go, gap_extend=ge, grad_mode="hard").align(seqs_a, seqs_b)
-    got = _multi(blosum, n_threads, gap_open=go, gap_extend=ge, grad_mode="hard").align(seqs_a, seqs_b)
+def check_grad_determinism(seqs_a, seqs_b, n_threads, p: Params = PARAMS):
+    params = make_params(p.gap_extend, p.gap_open)
+    ref = _ref(params, grad_mode="hard").align(seqs_a, seqs_b)
+    got = _multi(params, n_threads, grad_mode="hard").align(seqs_a, seqs_b)
     np.testing.assert_array_equal(
-        np.array(got.grad), np.array(ref.grad),
+        got.grad.matrix.to_matrix(), ref.grad.matrix.to_matrix(),
         err_msg=f"gradient differs at n_threads={n_threads}",
     )
 
 
-def check_batch_grad_equals_sum_of_singles(seqs_a, seqs_b, blosum,
+def check_batch_grad_equals_sum_of_singles(seqs_a, seqs_b,
                                            gap_model, mode, gap_open, gap_extend, grad_fn,
                                            p: Params = PARAMS):
+    params = make_params(gap_extend, gap_open)
     expected = np.zeros((20, 20))
     for a, b in zip(seqs_a, seqs_b):
-        if gap_model == "linear":
-            _, g = grad_fn(a, b, blosum, gap_extend)
-        else:
-            _, g = grad_fn(a, b, blosum, gap_open, gap_extend)
-        expected += np.array(g)
+        _, g = grad_fn(a, b, params)
+        expected += g.matrix.to_matrix()
 
-    ba = nwgrad.BatchAligner(matrix=blosum, gap_open=gap_open, gap_extend=gap_extend,
-                             gap_model=gap_model, mode=mode, grad_mode="hard", n_threads=4)
+    ba = nwgrad.BatchAligner(params=params, gap_model=gap_model, mode=mode,
+                             grad_mode="hard", n_threads=4)
     result = ba.align(seqs_a, seqs_b)
-    np.testing.assert_allclose(np.array(result.grad), expected, atol=1e-10,
+    np.testing.assert_allclose(result.grad.matrix.to_matrix(), expected, atol=1e-10,
                                 err_msg=f"grad mismatch: {gap_model}/{mode}")
 
 
-def check_concurrent_scores(seqs_a, seqs_b, blosum, n_concurrent: int, p: Params = PARAMS):
-    aligner = nwgrad.BatchAligner(matrix=blosum, gap_open=p.gap_open, gap_extend=p.gap_extend,
-                                   gap_model="affine", mode="global",
+def check_concurrent_scores(seqs_a, seqs_b, n_concurrent: int, p: Params = PARAMS):
+    params = make_params(p.gap_extend, p.gap_open)
+    aligner = nwgrad.BatchAligner(params=params, gap_model="affine", mode="global",
                                    grad_mode="none", n_threads=2)
     ref_scores = np.array(aligner.align(seqs_a, seqs_b).scores)
 
@@ -181,13 +178,13 @@ def check_concurrent_scores(seqs_a, seqs_b, blosum, n_concurrent: int, p: Params
                                        err_msg=f"thread {i} scores diverged")
 
 
-def check_concurrent_gradients(seqs_a, seqs_b, blosum, n_concurrent: int, p: Params = PARAMS):
-    aligner = nwgrad.BatchAligner(matrix=blosum, gap_open=p.gap_open, gap_extend=p.gap_extend,
-                                   gap_model="affine", mode="global",
+def check_concurrent_gradients(seqs_a, seqs_b, n_concurrent: int, p: Params = PARAMS):
+    params = make_params(p.gap_extend, p.gap_open)
+    aligner = nwgrad.BatchAligner(params=params, gap_model="affine", mode="global",
                                    grad_mode="hard", n_threads=4)
     ref = aligner.align(seqs_a, seqs_b)
     ref_scores = np.array(ref.scores)
-    ref_grad = np.array(ref.grad)
+    ref_grad = ref.grad.matrix.to_matrix()
 
     score_results = [None] * n_concurrent
     grad_results = [None] * n_concurrent
@@ -197,7 +194,7 @@ def check_concurrent_gradients(seqs_a, seqs_b, blosum, n_concurrent: int, p: Par
         try:
             r = aligner.align(seqs_a, seqs_b)
             score_results[idx] = np.array(r.scores)
-            grad_results[idx] = np.array(r.grad)
+            grad_results[idx] = r.grad.matrix.to_matrix()
         except Exception as e:
             errors.append(e)
 
@@ -215,47 +212,44 @@ def check_concurrent_gradients(seqs_a, seqs_b, blosum, n_concurrent: int, p: Par
                                        err_msg=f"concurrent thread {i}: gradient differs")
 
 
-def check_long_seq_determinism(seqs_a, seqs_b, blosum, n_threads, p: Params = PARAMS):
-    go, ge = p.gap_open, p.gap_extend
-    ref = _ref(blosum, gap_open=go, gap_extend=ge, grad_mode="hard").align(seqs_a, seqs_b)
-    got = _multi(blosum, n_threads, gap_open=go, gap_extend=ge, grad_mode="hard").align(seqs_a, seqs_b)
+def check_long_seq_determinism(seqs_a, seqs_b, n_threads, p: Params = PARAMS):
+    params = make_params(p.gap_extend, p.gap_open)
+    ref = _ref(params, grad_mode="hard").align(seqs_a, seqs_b)
+    got = _multi(params, n_threads, grad_mode="hard").align(seqs_a, seqs_b)
     np.testing.assert_array_equal(np.array(got.scores), np.array(ref.scores),
                                    err_msg=f"long-seq scores differ at n_threads={n_threads}")
-    np.testing.assert_array_equal(np.array(got.grad), np.array(ref.grad),
+    np.testing.assert_array_equal(got.grad.matrix.to_matrix(), ref.grad.matrix.to_matrix(),
                                    err_msg=f"long-seq gradient differs at n_threads={n_threads}")
 
 
-def check_very_long_no_crash(seqs_a, seqs_b, blosum, p: Params = PARAMS):
-    result = nwgrad.BatchAligner(matrix=blosum, gap_open=p.gap_open, gap_extend=p.gap_extend,
-                                  gap_model="affine", mode="global",
+def check_very_long_no_crash(seqs_a, seqs_b, p: Params = PARAMS):
+    params = make_params(p.gap_extend, p.gap_open)
+    result = nwgrad.BatchAligner(params=params, gap_model="affine", mode="global",
                                   grad_mode="hard", n_threads=4).align(seqs_a, seqs_b)
     scores = np.array(result.scores)
     assert scores.shape == (len(seqs_a),), f"wrong score shape: {scores.shape}"
     assert np.all(np.isfinite(scores)), "non-finite scores in very-long batch"
-    assert np.array(result.grad).shape == (20, 20)
+    assert result.grad.matrix.to_matrix().shape == (20, 20)
 
 
-def check_soft_grad_determinism(seqs_a, seqs_b, blosum, n_threads, p: Params = PARAMS):
-    go, ge = p.gap_open, p.gap_extend
-    ref = nwgrad.BatchAligner(matrix=blosum, gap_open=go, gap_extend=ge,
-                               gap_model="affine", mode="global",
+def check_soft_grad_determinism(seqs_a, seqs_b, n_threads, p: Params = PARAMS):
+    params = make_params(p.gap_extend, p.gap_open)
+    ref = nwgrad.BatchAligner(params=params, gap_model="affine", mode="global",
                                grad_mode="soft", n_threads=1).align(seqs_a, seqs_b)
-    got = nwgrad.BatchAligner(matrix=blosum, gap_open=go, gap_extend=ge,
-                               gap_model="affine", mode="global",
+    got = nwgrad.BatchAligner(params=params, gap_model="affine", mode="global",
                                grad_mode="soft", n_threads=n_threads).align(seqs_a, seqs_b)
     np.testing.assert_allclose(np.array(got.scores), np.array(ref.scores), atol=1e-10,
                                 err_msg=f"soft scores differ at n_threads={n_threads}")
-    np.testing.assert_allclose(np.array(got.grad), np.array(ref.grad), atol=1e-10,
+    np.testing.assert_allclose(got.grad.matrix.to_matrix(), ref.grad.matrix.to_matrix(),
+                                atol=1e-10,
                                 err_msg=f"soft gradient differs at n_threads={n_threads}")
 
 
-def check_soft_geq_hard(seqs_a, seqs_b, blosum, p: Params = PARAMS):
-    go, ge = p.gap_open, p.gap_extend
-    hard_res = nwgrad.BatchAligner(matrix=blosum, gap_open=go, gap_extend=ge,
-                                    gap_model="affine", mode="global",
+def check_soft_geq_hard(seqs_a, seqs_b, p: Params = PARAMS):
+    params = make_params(p.gap_extend, p.gap_open)
+    hard_res = nwgrad.BatchAligner(params=params, gap_model="affine", mode="global",
                                     grad_mode="none", n_threads=4).align(seqs_a, seqs_b)
-    soft_res = nwgrad.BatchAligner(matrix=blosum, gap_open=go, gap_extend=ge,
-                                    gap_model="affine", mode="global",
+    soft_res = nwgrad.BatchAligner(params=params, gap_model="affine", mode="global",
                                     grad_mode="soft", n_threads=4).align(seqs_a, seqs_b)
     hard_scores = np.array(hard_res.scores)
     soft_scores = np.array(soft_res.scores)
@@ -266,44 +260,44 @@ def check_soft_geq_hard(seqs_a, seqs_b, blosum, p: Params = PARAMS):
     )
 
 
-def check_hard_grad_integer(seqs_a, seqs_b, blosum, p: Params = PARAMS):
-    go, ge = p.gap_open, p.gap_extend
-    result = nwgrad.BatchAligner(matrix=blosum, gap_open=go, gap_extend=ge,
-                                  gap_model="affine", mode="global",
+def check_hard_grad_integer(seqs_a, seqs_b, p: Params = PARAMS):
+    params = make_params(p.gap_extend, p.gap_open)
+    result = nwgrad.BatchAligner(params=params, gap_model="affine", mode="global",
                                   grad_mode="hard", n_threads=4).align(seqs_a, seqs_b)
-    g = np.array(result.grad)
+    g = result.grad.matrix.to_matrix()
     assert (g >= 0).all(), "negative entries in hard gradient"
     assert np.allclose(g, np.round(g), atol=1e-9), "hard gradient is not integer-valued"
 
 
-def check_reproducibility(blosum, p: Params = PARAMS):
+def check_reproducibility(p: Params = PARAMS):
+    params = make_params(p.gap_extend, p.gap_open)
+
     def run():
         rng = np.random.default_rng(12345)
         seqs_a = random_seqs(rng, 300, p.large_lo, p.large_hi)
         seqs_b = random_seqs(rng, 300, p.large_lo, p.large_hi)
-        return nwgrad.BatchAligner(matrix=blosum, gap_open=p.gap_open, gap_extend=p.gap_extend,
-                                    gap_model="affine", mode="global",
+        return nwgrad.BatchAligner(params=params, gap_model="affine", mode="global",
                                     grad_mode="hard", n_threads=4).align(seqs_a, seqs_b)
 
     r1, r2 = run(), run()
     np.testing.assert_array_equal(np.array(r1.scores), np.array(r2.scores))
-    np.testing.assert_array_equal(np.array(r1.grad),   np.array(r2.grad))
+    np.testing.assert_array_equal(r1.grad.matrix.to_matrix(), r2.grad.matrix.to_matrix())
 
 
-def check_more_threads_than_pairs(blosum, p: Params = PARAMS):
+def check_more_threads_than_pairs(p: Params = PARAMS):
+    params = make_params(p.gap_extend, p.gap_open)
     rng = np.random.default_rng(p.seed + 7)
     seqs_a = random_seqs(rng, 3, p.large_lo, p.large_hi)
     seqs_b = random_seqs(rng, 3, p.large_lo, p.large_hi)
-    go, ge = p.gap_open, p.gap_extend
-    ref = _ref(blosum, gap_open=go, gap_extend=ge, grad_mode="hard").align(seqs_a, seqs_b)
-    got = _multi(blosum, 16, gap_open=go, gap_extend=ge, grad_mode="hard").align(seqs_a, seqs_b)
+    ref = _ref(params, grad_mode="hard").align(seqs_a, seqs_b)
+    got = _multi(params, 16, grad_mode="hard").align(seqs_a, seqs_b)
     np.testing.assert_array_equal(np.array(got.scores), np.array(ref.scores))
-    np.testing.assert_array_equal(np.array(got.grad),   np.array(ref.grad))
+    np.testing.assert_array_equal(got.grad.matrix.to_matrix(), ref.grad.matrix.to_matrix())
 
 
-def check_throughput(seqs_a, seqs_b, blosum, limit: float, p: Params = PARAMS):
-    aligner = nwgrad.BatchAligner(matrix=blosum, gap_open=p.gap_open, gap_extend=p.gap_extend,
-                                   gap_model="affine", mode="global",
+def check_throughput(seqs_a, seqs_b, limit: float, p: Params = PARAMS):
+    params = make_params(p.gap_extend, p.gap_open)
+    aligner = nwgrad.BatchAligner(params=params, gap_model="affine", mode="global",
                                    grad_mode="hard", n_threads=8)
     t0 = time.monotonic()
     result = aligner.align(seqs_a, seqs_b)
@@ -313,29 +307,28 @@ def check_throughput(seqs_a, seqs_b, blosum, limit: float, p: Params = PARAMS):
     return elapsed
 
 
-def check_grad_symmetry_symmetric_input(seqs, blosum, grad_mode: str, p: Params = PARAMS):
-    go, ge = p.gap_open, p.gap_extend
-    result = nwgrad.BatchAligner(matrix=blosum, gap_open=go, gap_extend=ge,
-                                  gap_model="affine", mode="global",
+def check_grad_symmetry_symmetric_input(seqs, grad_mode: str, p: Params = PARAMS):
+    params = make_params(p.gap_extend, p.gap_open)
+    result = nwgrad.BatchAligner(params=params, gap_model="affine", mode="global",
                                   grad_mode=grad_mode, n_threads=4).align(seqs, seqs)
-    g = np.array(result.grad)
+    g = result.grad.matrix.to_matrix()
     np.testing.assert_allclose(g, g.T, atol=1e-10,
                                 err_msg=f"{grad_mode} gradient not symmetric on symmetric input")
 
 
-def check_concurrent_different_aligners(seqs_a, seqs_b, blosum, p: Params = PARAMS):
+def check_concurrent_different_aligners(seqs_a, seqs_b, p: Params = PARAMS):
     go, ge = p.gap_open, p.gap_extend
     configs = [
-        dict(gap_model="affine",  mode="global", gap_open=go,  gap_extend=ge,
+        dict(params=make_params(ge, go),  gap_model="affine",  mode="global",
              grad_mode="hard",  n_threads=2),
-        dict(gap_model="affine",  mode="local",  gap_open=go,  gap_extend=ge,
+        dict(params=make_params(ge, go),  gap_model="affine",  mode="local",
              grad_mode="none",  n_threads=2),
-        dict(gap_model="linear", mode="global", gap_open=0.0, gap_extend=ge,
+        dict(params=make_params(ge, 0.0), gap_model="linear",  mode="global",
              grad_mode="hard",  n_threads=2),
-        dict(gap_model="linear", mode="local",  gap_open=0.0, gap_extend=ge,
+        dict(params=make_params(ge, 0.0), gap_model="linear",  mode="local",
              grad_mode="soft",  n_threads=2),
     ]
-    refs = [np.array(nwgrad.BatchAligner(matrix=blosum, **cfg).align(seqs_a, seqs_b).scores)
+    refs = [np.array(nwgrad.BatchAligner(**cfg).align(seqs_a, seqs_b).scores)
             for cfg in configs]
 
     results = [None] * len(configs)
@@ -344,7 +337,7 @@ def check_concurrent_different_aligners(seqs_a, seqs_b, blosum, p: Params = PARA
     def run(idx, cfg):
         try:
             results[idx] = np.array(
-                nwgrad.BatchAligner(matrix=blosum, **cfg).align(seqs_a, seqs_b).scores
+                nwgrad.BatchAligner(**cfg).align(seqs_a, seqs_b).scores
             )
         except Exception as e:
             errors.append((idx, e))
@@ -362,11 +355,6 @@ def check_concurrent_different_aligners(seqs_a, seqs_b, blosum, p: Params = PARA
 
 
 # ── pytest fixtures ─────────────────────────────────────────────────────────────
-
-@pytest.fixture(scope="module")
-def blosum():
-    return make_blosum()
-
 
 @pytest.fixture(scope="module")
 def large_batch():
@@ -407,20 +395,20 @@ def grad_singles_batch():
 
 # 1. Score determinism — large batch
 @pytest.mark.parametrize("n_threads", PARAMS.thread_counts)
-def test_score_determinism_large_batch(n_threads, blosum, large_batch):
-    check_score_determinism(*large_batch, blosum, n_threads)
+def test_score_determinism_large_batch(n_threads, large_batch):
+    check_score_determinism(*large_batch, n_threads)
 
 
 # 2. Score determinism — XL batch
 @pytest.mark.parametrize("n_threads", PARAMS.thread_counts)
-def test_score_determinism_xl_batch(n_threads, blosum, xl_batch):
-    check_score_determinism(*xl_batch, blosum, n_threads)
+def test_score_determinism_xl_batch(n_threads, xl_batch):
+    check_score_determinism(*xl_batch, n_threads)
 
 
 # 3. Gradient determinism — large batch
 @pytest.mark.parametrize("n_threads", PARAMS.thread_counts)
-def test_grad_determinism_large_batch(n_threads, blosum, large_batch):
-    check_grad_determinism(*large_batch, blosum, n_threads)
+def test_grad_determinism_large_batch(n_threads, large_batch):
+    check_grad_determinism(*large_batch, n_threads)
 
 
 # 4. All four gap_model × mode combinations
@@ -432,8 +420,8 @@ def test_grad_determinism_large_batch(n_threads, blosum, large_batch):
 ])
 @pytest.mark.parametrize("n_threads", [4, 8])
 def test_all_modes_score_determinism(n_threads, gap_model, mode, gap_open, gap_extend,
-                                     blosum, large_batch):
-    check_score_determinism(*large_batch, blosum, n_threads, gap_model=gap_model, mode=mode)
+                                     large_batch):
+    check_score_determinism(*large_batch, n_threads, gap_model=gap_model, mode=mode)
 
 
 # 5. Gradient == sum of singles
@@ -443,83 +431,83 @@ def test_all_modes_score_determinism(n_threads, gap_model, mode, gap_open, gap_e
     ("affine", "local",  11.0, 1.0, nwgrad.sw_affine_grad),
 ])
 def test_batch_grad_equals_sum_of_singles(gap_model, mode, gap_open, gap_extend,
-                                          grad_fn, blosum, grad_singles_batch):
+                                          grad_fn, grad_singles_batch):
     check_batch_grad_equals_sum_of_singles(
-        *grad_singles_batch, blosum, gap_model, mode, gap_open, gap_extend, grad_fn)
+        *grad_singles_batch, gap_model, mode, gap_open, gap_extend, grad_fn)
 
 
 # 6. Python-level concurrent callers
-def test_concurrent_python_threads_scores(blosum, large_batch):
-    check_concurrent_scores(*large_batch, blosum, PARAMS.n_concurrent_score)
+def test_concurrent_python_threads_scores(large_batch):
+    check_concurrent_scores(*large_batch, PARAMS.n_concurrent_score)
 
 
-def test_concurrent_python_threads_gradients(blosum):
+def test_concurrent_python_threads_gradients():
     rng = np.random.default_rng(PARAMS.seed + 99)
     seqs_a = random_seqs(rng, 500, PARAMS.large_lo, PARAMS.large_hi)
     seqs_b = random_seqs(rng, 500, PARAMS.large_lo, PARAMS.large_hi)
-    check_concurrent_gradients(seqs_a, seqs_b, blosum, PARAMS.n_concurrent_grad)
+    check_concurrent_gradients(seqs_a, seqs_b, PARAMS.n_concurrent_grad)
 
 
 # 7. Long sequences
 @pytest.mark.parametrize("n_threads", [4, 8])
-def test_long_sequences_score_determinism(n_threads, blosum, long_batch):
-    check_long_seq_determinism(*long_batch, blosum, n_threads)
+def test_long_sequences_score_determinism(n_threads, long_batch):
+    check_long_seq_determinism(*long_batch, n_threads)
 
 
-def test_very_long_sequences_no_crash(blosum, vlong_batch):
-    check_very_long_no_crash(*vlong_batch, blosum)
+def test_very_long_sequences_no_crash(vlong_batch):
+    check_very_long_no_crash(*vlong_batch)
 
 
 # 8. Soft gradient determinism
 @pytest.mark.parametrize("n_threads", [2, 4, 8])
-def test_soft_grad_determinism_large_batch(n_threads, blosum, large_batch):
-    check_soft_grad_determinism(*large_batch, blosum, n_threads)
+def test_soft_grad_determinism_large_batch(n_threads, large_batch):
+    check_soft_grad_determinism(*large_batch, n_threads)
 
 
 # 9. soft >= hard score
-def test_soft_score_geq_hard_score_large_batch(blosum, large_batch):
-    check_soft_geq_hard(*large_batch, blosum)
+def test_soft_score_geq_hard_score_large_batch(large_batch):
+    check_soft_geq_hard(*large_batch)
 
 
 # 10. Hard gradient non-negative and integer-valued
-def test_hard_grad_integer_valued_large_batch(blosum, large_batch):
-    check_hard_grad_integer(*large_batch, blosum)
+def test_hard_grad_integer_valued_large_batch(large_batch):
+    check_hard_grad_integer(*large_batch)
 
 
 # 11. Reproducibility
-def test_reproducibility(blosum):
-    check_reproducibility(blosum)
+def test_reproducibility():
+    check_reproducibility()
 
 
 # 12. n_threads > batch_size
-def test_more_threads_than_pairs(blosum):
-    check_more_threads_than_pairs(blosum)
+def test_more_threads_than_pairs():
+    check_more_threads_than_pairs()
 
 
 # 13. Throughput smoke test
-def test_throughput_does_not_regress(blosum, xl_batch):
-    check_throughput(*xl_batch, blosum, PARAMS.throughput_limit)
+def test_throughput_does_not_regress(xl_batch):
+    check_throughput(*xl_batch, PARAMS.throughput_limit)
 
 
 # 14. Gradient symmetry on symmetric input
-def test_hard_grad_symmetry_symmetric_input(blosum):
+def test_hard_grad_symmetry_symmetric_input():
     rng = np.random.default_rng(PARAMS.seed + 100)
     seqs = random_seqs(rng, 300, PARAMS.large_lo, PARAMS.large_hi)
-    check_grad_symmetry_symmetric_input(seqs, blosum, "hard")
+    check_grad_symmetry_symmetric_input(seqs, "hard")
 
 
-def test_soft_grad_symmetry_symmetric_input(blosum):
+def test_soft_grad_symmetry_symmetric_input():
     rng = np.random.default_rng(PARAMS.seed + 101)
     seqs = random_seqs(rng, 200, PARAMS.large_lo, PARAMS.large_hi)
-    check_grad_symmetry_symmetric_input(seqs, blosum, "soft")
+    check_grad_symmetry_symmetric_input(seqs, "soft")
 
 
 # 15. Concurrent different aligners
-def test_concurrent_different_aligners(blosum):
+def test_concurrent_different_aligners():
     rng = np.random.default_rng(PARAMS.seed + 55)
     seqs_a = random_seqs(rng, 200, PARAMS.large_lo, PARAMS.large_hi)
     seqs_b = random_seqs(rng, 200, PARAMS.large_lo, PARAMS.large_hi)
-    check_concurrent_different_aligners(seqs_a, seqs_b, blosum)
+    check_concurrent_different_aligners(seqs_a, seqs_b)
 
 
 # ── CLI runner ──────────────────────────────────────────────────────────────────
@@ -618,8 +606,6 @@ def main(argv=None):
     want = args.test
     v = args.verbose
 
-    blosum = make_blosum()
-
     # Pre-generate all batches once.
     print(f"Generating batches (seed={p.seed:#x}) …")
     rng = np.random.default_rng(p.seed)
@@ -653,17 +639,17 @@ def main(argv=None):
         print("── Score determinism (large batch) ──────────────────────────────")
         for nt in p.thread_counts:
             run(f"score_determinism_large[n_threads={nt}]",
-                lambda nt=nt: check_score_determinism(large_a, large_b, blosum, nt, p))
+                lambda nt=nt: check_score_determinism(large_a, large_b, nt, p))
         print("── Score determinism (XL batch) ─────────────────────────────────")
         for nt in p.thread_counts:
             run(f"score_determinism_xl[n_threads={nt}]",
-                lambda nt=nt: check_score_determinism(xl_a, xl_b, blosum, nt, p))
+                lambda nt=nt: check_score_determinism(xl_a, xl_b, nt, p))
 
     if do("grad_determinism"):
         print("── Gradient determinism (large batch) ───────────────────────────")
         for nt in p.thread_counts:
             run(f"grad_determinism_large[n_threads={nt}]",
-                lambda nt=nt: check_grad_determinism(large_a, large_b, blosum, nt, p))
+                lambda nt=nt: check_grad_determinism(large_a, large_b, nt, p))
 
     if do("all_modes"):
         print("── All gap_model × mode combinations ────────────────────────────")
@@ -677,7 +663,7 @@ def main(argv=None):
             for gm, mode, go, ge in combos:
                 run(f"all_modes[{gm}/{mode},n_threads={nt}]",
                     lambda nt=nt, gm=gm, mode=mode: check_score_determinism(
-                        large_a, large_b, blosum, nt, p, gap_model=gm, mode=mode))
+                        large_a, large_b, nt, p, gap_model=gm, mode=mode))
 
     if do("grad_singles"):
         print("── Gradient == sum of singles ────────────────────────────────────")
@@ -689,68 +675,67 @@ def main(argv=None):
         for gm, mode, go, ge, fn in singles_combos:
             run(f"grad_singles[{gm}/{mode}]",
                 lambda gm=gm, mode=mode, go=go, ge=ge, fn=fn:
-                    check_batch_grad_equals_sum_of_singles(gs_a, gs_b, blosum, gm, mode, go, ge, fn, p))
+                    check_batch_grad_equals_sum_of_singles(gs_a, gs_b, gm, mode, go, ge, fn, p))
 
     if do("concurrent_scores"):
         print("── Concurrent Python threads (scores) ───────────────────────────")
         run("concurrent_scores",
-            lambda: check_concurrent_scores(large_a, large_b, blosum, p.n_concurrent_score, p))
+            lambda: check_concurrent_scores(large_a, large_b, p.n_concurrent_score, p))
 
     if do("concurrent_grads"):
         print("── Concurrent Python threads (gradients) ────────────────────────")
         run("concurrent_gradients",
-            lambda: check_concurrent_gradients(conc_a, conc_b, blosum, p.n_concurrent_grad, p))
+            lambda: check_concurrent_gradients(conc_a, conc_b, p.n_concurrent_grad, p))
 
     if do("long_seqs"):
         print("── Long sequences ────────────────────────────────────────────────")
         for nt in [4, 8]:
             run(f"long_seq_determinism[n_threads={nt}]",
-                lambda nt=nt: check_long_seq_determinism(long_a, long_b, blosum, nt, p))
+                lambda nt=nt: check_long_seq_determinism(long_a, long_b, nt, p))
         run("very_long_no_crash",
-            lambda: check_very_long_no_crash(vlong_a, vlong_b, blosum, p))
+            lambda: check_very_long_no_crash(vlong_a, vlong_b, p))
 
     if do("soft"):
         print("── Soft gradient ─────────────────────────────────────────────────")
         for nt in [2, 4, 8]:
             run(f"soft_grad_determinism[n_threads={nt}]",
-                lambda nt=nt: check_soft_grad_determinism(large_a, large_b, blosum, nt, p))
+                lambda nt=nt: check_soft_grad_determinism(large_a, large_b, nt, p))
         run("soft_geq_hard",
-            lambda: check_soft_geq_hard(large_a, large_b, blosum, p))
+            lambda: check_soft_geq_hard(large_a, large_b, p))
 
     if do("integer_grad"):
         print("── Hard gradient integer-valued ──────────────────────────────────")
         run("hard_grad_integer",
-            lambda: check_hard_grad_integer(large_a, large_b, blosum, p))
+            lambda: check_hard_grad_integer(large_a, large_b, p))
 
     if do("reproducibility"):
         print("── Reproducibility ───────────────────────────────────────────────")
-        run("reproducibility", lambda: check_reproducibility(blosum, p))
+        run("reproducibility", lambda: check_reproducibility(p))
 
     if do("more_threads"):
         print("── n_threads > batch_size ────────────────────────────────────────")
-        run("more_threads_than_pairs", lambda: check_more_threads_than_pairs(blosum, p))
+        run("more_threads_than_pairs", lambda: check_more_threads_than_pairs(p))
 
     if do("throughput"):
         print("── Throughput ────────────────────────────────────────────────────")
         run(f"throughput[n={p.n_xl}, limit={p.throughput_limit}s]",
-            lambda: check_throughput(xl_a, xl_b, blosum, p.throughput_limit, p))
+            lambda: check_throughput(xl_a, xl_b, p.throughput_limit, p))
 
     if do("symmetry"):
         print("── Gradient symmetry on symmetric input ──────────────────────────")
         run("hard_grad_symmetry",
-            lambda: check_grad_symmetry_symmetric_input(sym_seqs, blosum, "hard", p))
+            lambda: check_grad_symmetry_symmetric_input(sym_seqs, "hard", p))
         run("soft_grad_symmetry",
-            lambda: check_grad_symmetry_symmetric_input(sym_seqs, blosum, "soft", p))
+            lambda: check_grad_symmetry_symmetric_input(sym_seqs, "soft", p))
 
     if do("concurrent_aligners"):
         print("── Concurrent different aligners ─────────────────────────────────")
         run("concurrent_different_aligners",
-            lambda: check_concurrent_different_aligners(cd_a, cd_b, blosum, p))
+            lambda: check_concurrent_different_aligners(cd_a, cd_b, p))
 
     # Summary
     n_pass = sum(1 for _, ok, _, _ in results if ok)
     n_fail = sum(1 for _, ok, _, _ in results if not ok)
-    total  = time.monotonic()
     print(f"\n{'─' * 60}")
     print(f"{n_pass} passed, {n_fail} failed  ({len(results)} total)")
     if n_fail:

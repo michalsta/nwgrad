@@ -3,13 +3,19 @@ import pytest
 import nwgrad
 from test_subst_matrix import BLOSUM62
 
+
+def make_params(gap_extend, gap_open=0.0, matrix_arr=None):
+    arr = BLOSUM62 if matrix_arr is None else matrix_arr
+    return nwgrad.AlignParams(arr, gap_open_a=gap_open, gap_extend_a=gap_extend,
+                                   gap_open_b=gap_open, gap_extend_b=gap_extend)
+
+
 # ── Pure-Python reference SW (linear gap) ────────────────────────────────────
 
 def ref_sw_linear(a, b, matrix, gap_extend):
     """Reference Smith-Waterman with linear gap penalty."""
     m, n = len(a), len(b)
     H = [[0.0] * (n + 1) for _ in range(m + 1)]
-    # Boundary rows/cols remain 0 for local alignment.
     best = 0.0
     for i in range(1, m + 1):
         for j in range(1, n + 1):
@@ -42,7 +48,6 @@ PAIRS = [
     ("PLEASANTLY", "MEANLY"),
     ("ACDEFGHIKL", "CDEFGHIKLM"),
     ("MADEEKLF",   "MADEEKLF"),
-    # sequences with no positive-scoring alignment
     ("ACDE",       "NPQR"),
 ]
 
@@ -50,71 +55,56 @@ PAIRS = [
 def test_matches_reference(a, b, blosum):
     gap = 1.0
     expected = ref_sw_linear(a, b, blosum, gap)
-    got = nwgrad.sw_score(a, b, blosum, gap)
+    got = nwgrad.sw_score(a, b, make_params(gap))
     assert got == pytest.approx(expected), (
         f"sw_score({a!r}, {b!r}) = {got}, expected {expected}"
     )
 
 
-# ── Structural properties ─────────────────────────────────────────────────────
-
 @pytest.mark.parametrize("a,b", PAIRS)
-def test_score_nonnegative(a, b, blosum):
-    """Local alignment score is always >= 0."""
-    assert nwgrad.sw_score(a, b, blosum, 1.0) >= 0.0
+def test_score_nonnegative(a, b):
+    assert nwgrad.sw_score(a, b, make_params(1.0)) >= 0.0
 
 
 @pytest.mark.parametrize("a,b", PAIRS)
-def test_symmetric(a, b, blosum):
-    """sw_score is symmetric."""
+def test_symmetric(a, b):
     gap = 1.0
-    assert nwgrad.sw_score(a, b, blosum, gap) == pytest.approx(
-        nwgrad.sw_score(b, a, blosum, gap)
+    assert nwgrad.sw_score(a, b, make_params(gap)) == pytest.approx(
+        nwgrad.sw_score(b, a, make_params(gap))
     )
 
 
 @pytest.mark.parametrize("a,b", PAIRS)
-def test_local_ge_global(a, b, blosum):
-    """Local score >= global score (local can always ignore bad flanking regions)."""
+def test_local_ge_global(a, b):
     gap = 1.0
-    assert nwgrad.sw_score(a, b, blosum, gap) >= nwgrad.nw_score(a, b, blosum, gap)
+    assert nwgrad.sw_score(a, b, make_params(gap)) >= nwgrad.nw_score(a, b, make_params(gap))
 
-
-# ── Identity and single-char cases ───────────────────────────────────────────
 
 def test_identity_score(blosum):
-    """Aligning a sequence with itself: local == global (no benefit from trimming)."""
     seq = "ACDEFG"
     AA_ORDER = "ACDEFGHIKLMNPQRSTVWY"
     expected = sum(BLOSUM62[AA_ORDER.index(c), AA_ORDER.index(c)] for c in seq)
-    assert nwgrad.sw_score(seq, seq, blosum, 1.0) == pytest.approx(expected)
+    assert nwgrad.sw_score(seq, seq, make_params(1.0)) == pytest.approx(expected)
 
 
-def test_single_char_same(blosum):
-    assert nwgrad.sw_score("A", "A", blosum, 1.0) == pytest.approx(4.0)
+def test_single_char_same():
+    assert nwgrad.sw_score("A", "A", make_params(1.0)) == pytest.approx(4.0)
 
 
-def test_single_char_diff_nonneg(blosum):
-    """score(A, C) = 0 (BLOSUM62 A-C = 0, and local can choose empty alignment)."""
-    assert nwgrad.sw_score("A", "C", blosum, 1.0) == pytest.approx(0.0)
+def test_single_char_diff_nonneg():
+    assert nwgrad.sw_score("A", "C", make_params(1.0)) == pytest.approx(0.0)
 
 
-# ── Edge cases ────────────────────────────────────────────────────────────────
-
-def test_empty_vs_empty(blosum):
-    assert nwgrad.sw_score("", "", blosum, 1.0) == pytest.approx(0.0)
+def test_empty_vs_empty():
+    assert nwgrad.sw_score("", "", make_params(1.0)) == pytest.approx(0.0)
 
 
-def test_empty_vs_seq(blosum):
-    """Aligning empty string to anything: local score is 0 (empty alignment)."""
+def test_empty_vs_seq():
     seq = "ACDE"
-    assert nwgrad.sw_score("", seq, blosum, 1.0) == pytest.approx(0.0)
-    assert nwgrad.sw_score(seq, "", blosum, 1.0) == pytest.approx(0.0)
+    assert nwgrad.sw_score("", seq, make_params(1.0)) == pytest.approx(0.0)
+    assert nwgrad.sw_score(seq, "", make_params(1.0)) == pytest.approx(0.0)
 
 
-def test_no_positive_scoring_pairs(blosum):
-    """When all substitution scores are negative, SW returns 0."""
-    # Build a matrix of all -10s
+def test_no_positive_scoring_pairs():
     arr = np.full((20, 20), -10.0)
-    bad_mat = nwgrad.SubstMatrix(arr)
-    assert nwgrad.sw_score("ACDE", "ACDE", bad_mat, 1.0) == pytest.approx(0.0)
+    assert nwgrad.sw_score("ACDE", "ACDE", make_params(1.0, matrix_arr=arr)) == pytest.approx(0.0)

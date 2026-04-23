@@ -15,6 +15,8 @@ static constexpr std::string_view AA_ORDER = "ACDEFGHIKLMNPQRSTVWY";
 struct SubstMatrix {
     double mat[256][256]{};  // zero-initialised
 
+    SubstMatrix() noexcept = default;
+
     // Construct from a caller-supplied 20×20 row-major array (canonical AA order).
     explicit SubstMatrix(const double* src20x20) {
         for (int i = 0; i < 20; ++i) {

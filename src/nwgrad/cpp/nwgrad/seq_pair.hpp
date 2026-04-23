@@ -6,8 +6,8 @@
 #include <variant>
 #include <vector>
 
+#include "align_params.hpp"
 #include "aligner.hpp"
-#include "subst_matrix.hpp"
 
 // ── Internal per-(GapModel, AlignMode) state ─────────────────────────────────
 // Holds one Full and one GuideBanded aligner, reusing their DP buffers across
@@ -54,12 +54,11 @@ struct SeqPair {
     >;
 
     SeqPair(std::string a, std::string b,
-            const SubstMatrix& mat,
-            double gap_open, double gap_extend,
+            const AlignParams& params,
             GapModel gm, AlignMode am,
             GradMode grad_mode = GradMode::Hard)
         : seq_a_(std::move(a)), seq_b_(std::move(b)),
-          matrix_(&mat), gap_open_(gap_open), gap_extend_(gap_extend),
+          params_(&params),
           grad_mode_(grad_mode)
     {
         if      (gm == GapModel::Linear && am == AlignMode::Global)
@@ -72,12 +71,12 @@ struct SeqPair {
             state_.emplace<SeqPairState<GapModel::Affine, AlignMode::Local>>();
     }
 
-    // Swap substitution matrix.  Invalidates score and gradient; path stays.
+    // Swap alignment parameters.  Invalidates score and gradient; path stays.
     // realign_banded() remains callable after this — it will re-score the
-    // existing guide path under the new matrix.
-    // The new matrix must outlive this SeqPair.
-    void set_matrix(const SubstMatrix& mat) {
-        matrix_ = &mat;
+    // existing guide path under the new params.
+    // The new params must outlive this SeqPair.
+    void set_params(const AlignParams& params) {
+        params_ = &params;
         score_valid_ = false;
         grad_valid_  = false;
     }
@@ -101,7 +100,7 @@ struct SeqPair {
     // then forward-backward; score returns log Z.
     void align_full() {
         std::visit([&](auto& st) {
-            st.full_al.set_problem(seq_a_, seq_b_, *matrix_, gap_extend_, gap_open_);
+            st.full_al.set_problem(seq_a_, seq_b_, *params_);
             run_dp(st.full_al);
         }, state_);
         last_banded_  = false;
@@ -121,8 +120,7 @@ struct SeqPair {
             throw std::logic_error(
                 "nwgrad: call align_full() before realign_banded()");
         std::visit([&](auto& st) {
-            st.band_al.set_problem(seq_a_, seq_b_, *matrix_, gap_extend_, gap_open_,
-                                   bandwidth, guide_j_);
+            st.band_al.set_problem(seq_a_, seq_b_, *params_, bandwidth, guide_j_);
             run_dp(st.band_al);
         }, state_);
         last_banded_  = true;
@@ -140,23 +138,22 @@ struct SeqPair {
     void score_and_grad_with_dp(DpBuffer& buf, int bandwidth = 0) {
         std::visit([&](auto& st) {
             // Full viterbi: always needed for guide_j when banding, or as the sole DP.
-            st.full_al.set_problem(seq_a_, seq_b_, *matrix_, gap_extend_, gap_open_);
+            st.full_al.set_problem(seq_a_, seq_b_, *params_);
             run_dp_with_buf(st.full_al, buf);
 
             if (bandwidth > 0) {
                 // Banded DP around the guide_j extracted above.
-                st.band_al.set_problem(seq_a_, seq_b_, *matrix_, gap_extend_, gap_open_,
-                                       bandwidth, guide_j_);
+                st.band_al.set_problem(seq_a_, seq_b_, *params_, bandwidth, guide_j_);
                 run_dp_with_buf(st.band_al, buf);
                 last_banded_ = true;
                 if (grad_mode_ != GradMode::None) {
-                    std::memset(grad_, 0, sizeof(grad_));
+                    grad_ = AlignParams{};
                     grad_with_buf(st.band_al, buf);
                 }
             } else {
                 last_banded_ = false;
                 if (grad_mode_ != GradMode::None) {
-                    std::memset(grad_, 0, sizeof(grad_));
+                    grad_ = AlignParams{};
                     grad_with_buf(st.full_al, buf);
                 }
             }
@@ -190,7 +187,7 @@ struct SeqPair {
         if (grad_mode_ == GradMode::None)
             throw std::logic_error(
                 "nwgrad: grad_mode is None; construct with Hard or Soft to enable gradients");
-        std::memset(grad_, 0, sizeof(grad_));
+        grad_ = AlignParams{};
         std::visit([&](auto& st) {
             if (grad_mode_ == GradMode::Hard) {
                 if (last_banded_) st.band_al.hard_grad(grad_);
@@ -212,7 +209,7 @@ struct SeqPair {
         return score_;
     }
 
-    const double (&grad() const)[256][256] {
+    const AlignParams& grad() const {
         if (!grad_valid_)
             throw std::logic_error(
                 "nwgrad: gradient not computed; call compute_grad() first");
@@ -240,8 +237,7 @@ struct SeqPair {
 
 private:
     std::string          seq_a_, seq_b_;
-    const SubstMatrix*  matrix_;
-    double               gap_open_, gap_extend_;
+    const AlignParams*   params_;
     GradMode             grad_mode_;
 
     bool             path_valid_   = false;
@@ -251,8 +247,8 @@ private:
     double           score_        = 0.0;
     std::vector<int> guide_j_;
 
-    bool   grad_valid_ = false;
-    double grad_[256][256]{};
+    bool        grad_valid_ = false;
+    AlignParams grad_{};
 
     StateVar state_;
 
@@ -282,7 +278,7 @@ private:
         }
     }
 
-    // Accumulate grad from `al` using external `buf` into grad_[].
+    // Accumulate grad from `al` using external `buf` into grad_.
     template<typename Al>
     void grad_with_buf(Al& al, DpBuffer& buf) {
         if (grad_mode_ == GradMode::Hard) al.hard_grad(buf, grad_);

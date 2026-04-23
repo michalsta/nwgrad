@@ -6,7 +6,7 @@
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
-#include "subst_matrix.hpp"
+#include "align_params.hpp"
 #include "aligner.hpp"
 #include "batch.hpp"
 #include "seq_pair.hpp"
@@ -15,35 +15,21 @@
 namespace nb = nanobind;
 using nb_arr_f64    = nb::ndarray<double, nb::shape<20, 20>, nb::c_contig, nb::device::cpu>;
 using nb_arr_f64_1d = nb::ndarray<nb::numpy, double, nb::ndim<1>>;
-using nb_arr_f64_2d = nb::ndarray<nb::numpy, double, nb::shape<20, 20>>;
-
-static nb_arr_f64_2d grad_to_numpy(const double g[256][256]) {
-    double* buf = new double[400];
-    for (int i = 0; i < 20; ++i)
-        for (int j = 0; j < 20; ++j)
-            buf[i * 20 + j] =
-                g[static_cast<unsigned char>(AA_ORDER[i])]
-                 [static_cast<unsigned char>(AA_ORDER[j])];
-    nb::capsule owner(buf, [](void* p) noexcept { delete[] static_cast<double*>(p); });
-    return nb_arr_f64_2d(buf, {20, 20}, owner);
-}
 
 // ── Aligner factory: picks Full or GuideBanded at runtime. ───────────────────
-// guide_j may be empty (→ trivial diagonal guide) or provided by the caller.
 
-#define WITH_ALIGNER(GM, AM, band, guide_j, body)                                         \
-    do {                                                                                   \
-        DpBuffer _buf;                                                                     \
-        if ((band) > 0 || !(guide_j).empty()) {                                           \
-            Aligner<GapModel::GM, AlignMode::AM, AlignBand::GuideBanded> al;              \
-            body                                                                            \
-        } else {                                                                            \
-            Aligner<GapModel::GM, AlignMode::AM, AlignBand::Full> al;                     \
-            body                                                                            \
-        }                                                                                   \
+#define WITH_ALIGNER(GM, AM, band, guide_j, body)                                        \
+    do {                                                                                  \
+        DpBuffer _buf;                                                                    \
+        if ((band) > 0 || !(guide_j).empty()) {                                          \
+            Aligner<GapModel::GM, AlignMode::AM, AlignBand::GuideBanded> al;             \
+            body                                                                           \
+        } else {                                                                           \
+            Aligner<GapModel::GM, AlignMode::AM, AlignBand::Full> al;                    \
+            body                                                                           \
+        }                                                                                  \
     } while (0)
 
-// Helper: compute guide_j from optional aligned strings.
 static std::vector<int> make_guide(const std::string& aligned_a,
                                     const std::string& aligned_b) {
     if (!aligned_a.empty() && !aligned_b.empty())
@@ -54,7 +40,7 @@ static std::vector<int> make_guide(const std::string& aligned_a,
 NB_MODULE(nwgrad_ext, m) {
     m.doc() = "nwgrad C++ nanobind module";
 
-    // ── SubstMatrix ─────────────────────────────────────────────────────────
+    // ── SubstMatrix ──────────────────────────────────────────────────────────
     nb::class_<SubstMatrix>(m, "SubstMatrix")
         .def(
             "__init__",
@@ -83,7 +69,50 @@ NB_MODULE(nwgrad_ext, m) {
             },
             "Export as a (20, 20) float64 numpy array in canonical AA order.");
 
-    // ── Guide alignment utility ───────────────────────────────────────────────
+    // ── AlignParams ──────────────────────────────────────────────────────────
+    nb::class_<AlignParams>(m, "AlignParams")
+        .def(
+            "__init__",
+            [](AlignParams* self, nb_arr_f64 arr,
+               double gap_open_a, double gap_extend_a,
+               double gap_open_b, double gap_extend_b) {
+                new (self) AlignParams();
+                self->matrix       = SubstMatrix(arr.data());
+                self->gap_open_a   = gap_open_a;
+                self->gap_extend_a = gap_extend_a;
+                self->gap_open_b   = gap_open_b;
+                self->gap_extend_b = gap_extend_b;
+            },
+            nb::arg("matrix"),
+            nb::arg("gap_open_a")   = 0.0,
+            nb::arg("gap_extend_a") = 0.0,
+            nb::arg("gap_open_b")   = 0.0,
+            nb::arg("gap_extend_b") = 0.0,
+            "Alignment parameters bundling a substitution matrix with asymmetric gap costs.\n"
+            "  gap_open_a / gap_extend_a : penalties for gaps in sequence A (Y state)\n"
+            "  gap_open_b / gap_extend_b : penalties for gaps in sequence B (X state)\n"
+            "All values default to 0.0 (usable as a zero gradient accumulator).")
+        .def_prop_rw(
+            "matrix",
+            [](const AlignParams& self) { return self.matrix; },
+            [](AlignParams& self, const SubstMatrix& mat) { self.matrix = mat; })
+        .def_rw("gap_open_a",   &AlignParams::gap_open_a)
+        .def_rw("gap_extend_a", &AlignParams::gap_extend_a)
+        .def_rw("gap_open_b",   &AlignParams::gap_open_b)
+        .def_rw("gap_extend_b", &AlignParams::gap_extend_b)
+        .def("__add__",  [](const AlignParams& a, const AlignParams& b) { return a + b; })
+        .def("__iadd__", [](AlignParams& a, const AlignParams& b) -> AlignParams& { a += b; return a; },
+             nb::rv_policy::reference)
+        .def("__mul__",  [](const AlignParams& a, double s) { return a * s; })
+        .def("__rmul__", [](const AlignParams& a, double s) { return a * s; })
+        .def("__imul__", [](AlignParams& a, double s) -> AlignParams& { a *= s; return a; },
+             nb::rv_policy::reference)
+        .def("__neg__",  [](const AlignParams& a) { return -a; })
+        .def("__sub__",  [](const AlignParams& a, const AlignParams& b) { return a - b; })
+        .def("__isub__", [](AlignParams& a, const AlignParams& b) -> AlignParams& { a -= b; return a; },
+             nb::rv_policy::reference);
+
+    // ── Guide alignment utility ──────────────────────────────────────────────
     m.def(
         "guide_j_from_aligned",
         [](const std::string& a_aligned, const std::string& b_aligned) {
@@ -92,230 +121,221 @@ NB_MODULE(nwgrad_ext, m) {
         nb::arg("a_aligned"), nb::arg("b_aligned"),
         "Convert a pair of aligned strings (using '-' for gaps) to a guide_j vector.\n"
         "Returns a list of length m+1 where guide_j[i] = column j after consuming i\n"
-        "characters of a.  Pass to single-pair functions as aligned_a/aligned_b or\n"
-        "to BatchAligner.align as aligned_a/aligned_b lists.");
+        "characters of a.");
 
-    // ── Single-pair score functions ───────────────────────────────────────────
+    // ── Single-pair score functions ──────────────────────────────────────────
 
     m.def(
         "nw_score",
         [](const std::string& a, const std::string& b,
-           const SubstMatrix& mat, double gap_extend, int band,
+           const AlignParams& params, int band,
            const std::string& aligned_a, const std::string& aligned_b) {
             auto gj = make_guide(aligned_a, aligned_b);
             WITH_ALIGNER(Linear, Global, band, gj, {
-                al.set_problem(a, b, mat, gap_extend, 0.0, band, gj);
+                al.set_problem(a, b, params, band, gj);
                 al.compute_viterbi(_buf);
                 return al.score();
             });
         },
-        nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("matrix"), nb::arg("gap_extend"),
+        nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("params"),
         nb::arg("band") = 0, nb::arg("aligned_a") = "", nb::arg("aligned_b") = "",
-        "Needleman-Wunsch global alignment score (linear gap penalty).\n"
-        "band=0 and no aligned strings → full DP.\n"
-        "band>0 → diagonal banded DP.  Supply aligned_a/aligned_b for guide-banded DP.");
+        "Needleman-Wunsch global alignment score (linear gap penalty).");
 
     m.def(
         "sw_score",
         [](const std::string& a, const std::string& b,
-           const SubstMatrix& mat, double gap_extend, int band,
+           const AlignParams& params, int band,
            const std::string& aligned_a, const std::string& aligned_b) {
             auto gj = make_guide(aligned_a, aligned_b);
             WITH_ALIGNER(Linear, Local, band, gj, {
-                al.set_problem(a, b, mat, gap_extend, 0.0, band, gj);
+                al.set_problem(a, b, params, band, gj);
                 al.compute_viterbi(_buf);
                 return al.score();
             });
         },
-        nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("matrix"), nb::arg("gap_extend"),
+        nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("params"),
         nb::arg("band") = 0, nb::arg("aligned_a") = "", nb::arg("aligned_b") = "",
         "Smith-Waterman local alignment score (linear gap penalty).");
 
     m.def(
         "nw_score_affine",
         [](const std::string& a, const std::string& b,
-           const SubstMatrix& mat, double gap_open, double gap_extend, int band,
+           const AlignParams& params, int band,
            const std::string& aligned_a, const std::string& aligned_b) {
             auto gj = make_guide(aligned_a, aligned_b);
             WITH_ALIGNER(Affine, Global, band, gj, {
-                al.set_problem(a, b, mat, gap_extend, gap_open, band, gj);
+                al.set_problem(a, b, params, band, gj);
                 al.compute_viterbi(_buf);
                 return al.score();
             });
         },
-        nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("matrix"),
-        nb::arg("gap_open"), nb::arg("gap_extend"), nb::arg("band") = 0,
-        nb::arg("aligned_a") = "", nb::arg("aligned_b") = "",
+        nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("params"),
+        nb::arg("band") = 0, nb::arg("aligned_a") = "", nb::arg("aligned_b") = "",
         "Needleman-Wunsch global alignment score (affine gap penalty).");
 
     m.def(
         "sw_score_affine",
         [](const std::string& a, const std::string& b,
-           const SubstMatrix& mat, double gap_open, double gap_extend, int band,
+           const AlignParams& params, int band,
            const std::string& aligned_a, const std::string& aligned_b) {
             auto gj = make_guide(aligned_a, aligned_b);
             WITH_ALIGNER(Affine, Local, band, gj, {
-                al.set_problem(a, b, mat, gap_extend, gap_open, band, gj);
+                al.set_problem(a, b, params, band, gj);
                 al.compute_viterbi(_buf);
                 return al.score();
             });
         },
-        nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("matrix"),
-        nb::arg("gap_open"), nb::arg("gap_extend"), nb::arg("band") = 0,
-        nb::arg("aligned_a") = "", nb::arg("aligned_b") = "",
+        nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("params"),
+        nb::arg("band") = 0, nb::arg("aligned_a") = "", nb::arg("aligned_b") = "",
         "Smith-Waterman local alignment score (affine gap penalty).");
 
-    // ── Single-pair hard gradient functions ───────────────────────────────────
+    // ── Single-pair hard gradient functions ─────────────────────────────────
 
     m.def(
         "nw_grad",
         [](const std::string& a, const std::string& b,
-           const SubstMatrix& mat, double gap_extend, int band,
+           const AlignParams& params, int band,
            const std::string& aligned_a, const std::string& aligned_b) {
             auto gj = make_guide(aligned_a, aligned_b);
             WITH_ALIGNER(Linear, Global, band, gj, {
-                al.set_problem(a, b, mat, gap_extend, 0.0, band, gj);
+                al.set_problem(a, b, params, band, gj);
                 al.compute_viterbi(_buf);
-                double grad[256][256]{};
+                AlignParams grad{};
                 al.hard_grad(_buf, grad);
-                return nb::make_tuple(al.score(), grad_to_numpy(grad));
+                return nb::make_tuple(al.score(), grad);
             });
         },
-        nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("matrix"), nb::arg("gap_extend"),
+        nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("params"),
         nb::arg("band") = 0, nb::arg("aligned_a") = "", nb::arg("aligned_b") = "",
-        "NW global alignment: returns (score, grad[20,20]) — hard subgradient (linear gap).");
+        "NW global: returns (score, AlignParams grad) — hard subgradient (linear gap).");
 
     m.def(
         "sw_grad",
         [](const std::string& a, const std::string& b,
-           const SubstMatrix& mat, double gap_extend, int band,
+           const AlignParams& params, int band,
            const std::string& aligned_a, const std::string& aligned_b) {
             auto gj = make_guide(aligned_a, aligned_b);
             WITH_ALIGNER(Linear, Local, band, gj, {
-                al.set_problem(a, b, mat, gap_extend, 0.0, band, gj);
+                al.set_problem(a, b, params, band, gj);
                 al.compute_viterbi(_buf);
-                double grad[256][256]{};
+                AlignParams grad{};
                 al.hard_grad(_buf, grad);
-                return nb::make_tuple(al.score(), grad_to_numpy(grad));
+                return nb::make_tuple(al.score(), grad);
             });
         },
-        nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("matrix"), nb::arg("gap_extend"),
+        nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("params"),
         nb::arg("band") = 0, nb::arg("aligned_a") = "", nb::arg("aligned_b") = "",
-        "SW local alignment: returns (score, grad[20,20]) — hard subgradient (linear gap).");
+        "SW local: returns (score, AlignParams grad) — hard subgradient (linear gap).");
 
     m.def(
         "nw_affine_grad",
         [](const std::string& a, const std::string& b,
-           const SubstMatrix& mat, double gap_open, double gap_extend, int band,
+           const AlignParams& params, int band,
            const std::string& aligned_a, const std::string& aligned_b) {
             auto gj = make_guide(aligned_a, aligned_b);
             WITH_ALIGNER(Affine, Global, band, gj, {
-                al.set_problem(a, b, mat, gap_extend, gap_open, band, gj);
+                al.set_problem(a, b, params, band, gj);
                 al.compute_viterbi(_buf);
-                double grad[256][256]{};
+                AlignParams grad{};
                 al.hard_grad(_buf, grad);
-                return nb::make_tuple(al.score(), grad_to_numpy(grad));
+                return nb::make_tuple(al.score(), grad);
             });
         },
-        nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("matrix"),
-        nb::arg("gap_open"), nb::arg("gap_extend"), nb::arg("band") = 0,
-        nb::arg("aligned_a") = "", nb::arg("aligned_b") = "",
-        "NW global alignment: returns (score, grad[20,20]) — hard subgradient (affine gap).");
+        nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("params"),
+        nb::arg("band") = 0, nb::arg("aligned_a") = "", nb::arg("aligned_b") = "",
+        "NW global: returns (score, AlignParams grad) — hard subgradient (affine gap).");
 
     m.def(
         "sw_affine_grad",
         [](const std::string& a, const std::string& b,
-           const SubstMatrix& mat, double gap_open, double gap_extend, int band,
+           const AlignParams& params, int band,
            const std::string& aligned_a, const std::string& aligned_b) {
             auto gj = make_guide(aligned_a, aligned_b);
             WITH_ALIGNER(Affine, Local, band, gj, {
-                al.set_problem(a, b, mat, gap_extend, gap_open, band, gj);
+                al.set_problem(a, b, params, band, gj);
                 al.compute_viterbi(_buf);
-                double grad[256][256]{};
+                AlignParams grad{};
                 al.hard_grad(_buf, grad);
-                return nb::make_tuple(al.score(), grad_to_numpy(grad));
+                return nb::make_tuple(al.score(), grad);
             });
         },
-        nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("matrix"),
-        nb::arg("gap_open"), nb::arg("gap_extend"), nb::arg("band") = 0,
-        nb::arg("aligned_a") = "", nb::arg("aligned_b") = "",
-        "SW local alignment: returns (score, grad[20,20]) — hard subgradient (affine gap).");
+        nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("params"),
+        nb::arg("band") = 0, nb::arg("aligned_a") = "", nb::arg("aligned_b") = "",
+        "SW local: returns (score, AlignParams grad) — hard subgradient (affine gap).");
 
-    // ── Single-pair soft gradient functions ───────────────────────────────────
+    // ── Single-pair soft gradient functions ─────────────────────────────────
 
     m.def(
         "nw_soft_grad",
         [](const std::string& a, const std::string& b,
-           const SubstMatrix& mat, double gap_extend, int band,
+           const AlignParams& params, int band,
            const std::string& aligned_a, const std::string& aligned_b) {
             auto gj = make_guide(aligned_a, aligned_b);
             WITH_ALIGNER(Linear, Global, band, gj, {
-                al.set_problem(a, b, mat, gap_extend, 0.0, band, gj);
+                al.set_problem(a, b, params, band, gj);
                 al.compute_forward_back(_buf);
-                double grad[256][256]{};
+                AlignParams grad{};
                 al.soft_grad(_buf, grad);
-                return nb::make_tuple(al.log_z(), grad_to_numpy(grad));
+                return nb::make_tuple(al.log_z(), grad);
             });
         },
-        nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("matrix"), nb::arg("gap_extend"),
+        nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("params"),
         nb::arg("band") = 0, nb::arg("aligned_a") = "", nb::arg("aligned_b") = "",
-        "NW global: returns (log_Z, expected_counts[20,20]) — soft gradient (linear gap).");
+        "NW global: returns (log_Z, AlignParams grad) — soft gradient (linear gap).");
 
     m.def(
         "sw_soft_grad",
         [](const std::string& a, const std::string& b,
-           const SubstMatrix& mat, double gap_extend, int band,
+           const AlignParams& params, int band,
            const std::string& aligned_a, const std::string& aligned_b) {
             auto gj = make_guide(aligned_a, aligned_b);
             WITH_ALIGNER(Linear, Local, band, gj, {
-                al.set_problem(a, b, mat, gap_extend, 0.0, band, gj);
+                al.set_problem(a, b, params, band, gj);
                 al.compute_forward_back(_buf);
-                double grad[256][256]{};
+                AlignParams grad{};
                 al.soft_grad(_buf, grad);
-                return nb::make_tuple(al.log_z(), grad_to_numpy(grad));
+                return nb::make_tuple(al.log_z(), grad);
             });
         },
-        nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("matrix"), nb::arg("gap_extend"),
+        nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("params"),
         nb::arg("band") = 0, nb::arg("aligned_a") = "", nb::arg("aligned_b") = "",
-        "SW local: returns (log_Z, expected_counts[20,20]) — soft gradient (linear gap).");
+        "SW local: returns (log_Z, AlignParams grad) — soft gradient (linear gap).");
 
     m.def(
         "nw_affine_soft_grad",
         [](const std::string& a, const std::string& b,
-           const SubstMatrix& mat, double gap_open, double gap_extend, int band,
+           const AlignParams& params, int band,
            const std::string& aligned_a, const std::string& aligned_b) {
             auto gj = make_guide(aligned_a, aligned_b);
             WITH_ALIGNER(Affine, Global, band, gj, {
-                al.set_problem(a, b, mat, gap_extend, gap_open, band, gj);
+                al.set_problem(a, b, params, band, gj);
                 al.compute_forward_back(_buf);
-                double grad[256][256]{};
+                AlignParams grad{};
                 al.soft_grad(_buf, grad);
-                return nb::make_tuple(al.log_z(), grad_to_numpy(grad));
+                return nb::make_tuple(al.log_z(), grad);
             });
         },
-        nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("matrix"),
-        nb::arg("gap_open"), nb::arg("gap_extend"), nb::arg("band") = 0,
-        nb::arg("aligned_a") = "", nb::arg("aligned_b") = "",
-        "NW global: returns (log_Z, expected_counts[20,20]) — soft gradient (affine gap).");
+        nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("params"),
+        nb::arg("band") = 0, nb::arg("aligned_a") = "", nb::arg("aligned_b") = "",
+        "NW global: returns (log_Z, AlignParams grad) — soft gradient (affine gap).");
 
     m.def(
         "sw_affine_soft_grad",
         [](const std::string& a, const std::string& b,
-           const SubstMatrix& mat, double gap_open, double gap_extend, int band,
+           const AlignParams& params, int band,
            const std::string& aligned_a, const std::string& aligned_b) {
             auto gj = make_guide(aligned_a, aligned_b);
             WITH_ALIGNER(Affine, Local, band, gj, {
-                al.set_problem(a, b, mat, gap_extend, gap_open, band, gj);
+                al.set_problem(a, b, params, band, gj);
                 al.compute_forward_back(_buf);
-                double grad[256][256]{};
+                AlignParams grad{};
                 al.soft_grad(_buf, grad);
-                return nb::make_tuple(al.log_z(), grad_to_numpy(grad));
+                return nb::make_tuple(al.log_z(), grad);
             });
         },
-        nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("matrix"),
-        nb::arg("gap_open"), nb::arg("gap_extend"), nb::arg("band") = 0,
-        nb::arg("aligned_a") = "", nb::arg("aligned_b") = "",
-        "SW local: returns (log_Z, expected_counts[20,20]) — soft gradient (affine gap).");
+        nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("params"),
+        nb::arg("band") = 0, nb::arg("aligned_a") = "", nb::arg("aligned_b") = "",
+        "SW local: returns (log_Z, AlignParams grad) — soft gradient (affine gap).");
 
     // ── BatchResult ──────────────────────────────────────────────────────────
     nb::class_<BatchResult>(m, "BatchResult")
@@ -332,18 +352,16 @@ NB_MODULE(nwgrad_ext, m) {
             "Alignment scores, shape (N,).")
         .def_prop_ro(
             "grad",
-            [](const BatchResult& self) { return grad_to_numpy(self.grad); },
-            nb::rv_policy::move,
-            "Summed gradient over the batch, shape (20, 20).");
+            [](const BatchResult& self) -> const AlignParams& { return self.grad; },
+            nb::rv_policy::reference_internal,
+            "Summed gradient over the batch as an AlignParams object.");
 
     // ── BatchAligner ─────────────────────────────────────────────────────────
     nb::class_<BatchAligner>(m, "BatchAligner")
         .def(
             "__init__",
             [](BatchAligner* self,
-               const SubstMatrix& matrix,
-               double gap_open,
-               double gap_extend,
+               const AlignParams& params,
                int    band,
                const std::string& gap_model,
                const std::string& mode,
@@ -355,11 +373,9 @@ NB_MODULE(nwgrad_ext, m) {
                 if      (grad_mode == "hard") gd = BatchAligner::GradMode::Hard;
                 else if (grad_mode == "soft") gd = BatchAligner::GradMode::Soft;
                 else                          gd = BatchAligner::GradMode::None;
-                new (self) BatchAligner(matrix, gap_open, gap_extend, band, gm, am, gd, n_threads);
+                new (self) BatchAligner(params, band, gm, am, gd, n_threads);
             },
-            nb::arg("matrix"),
-            nb::arg("gap_open")   = 11.0,
-            nb::arg("gap_extend") = 1.0,
+            nb::arg("params"),
             nb::arg("band")       = 0,
             nb::arg("gap_model")  = "affine",
             nb::arg("mode")       = "global",
@@ -369,8 +385,7 @@ NB_MODULE(nwgrad_ext, m) {
             "  gap_model : \"linear\" | \"affine\"\n"
             "  mode      : \"global\" | \"local\"\n"
             "  grad_mode : \"hard\" | \"soft\" | \"none\"\n"
-            "  band      : 0 = full DP (default); >0 = banded half-width\n"
-            "              (diagonal band when no guide supplied; guide-centered otherwise)")
+            "  band      : 0 = full DP; >0 = banded half-width")
         .def(
             "align",
             [](const BatchAligner& self,
@@ -402,8 +417,7 @@ NB_MODULE(nwgrad_ext, m) {
             nb::arg("sequences_b"),
             nb::arg("aligned_a") = std::vector<std::string>{},
             nb::arg("aligned_b") = std::vector<std::string>{},
-            "Align N sequence pairs.  Returns a BatchResult with .scores and .grad.\n"
-            "Supply aligned_a/aligned_b (lists of gapped strings) for guide-banded DP.");
+            "Align N sequence pairs.  Returns a BatchResult with .scores and .grad.");
 
     // ── SeqPair ───────────────────────────────────────────────────────────────
     nb::class_<SeqPair>(m, "SeqPair")
@@ -411,8 +425,7 @@ NB_MODULE(nwgrad_ext, m) {
             "__init__",
             [](SeqPair* self,
                const std::string& seq_a, const std::string& seq_b,
-               const SubstMatrix& mat,
-               double gap_open, double gap_extend,
+               const AlignParams& params,
                const std::string& gap_model,
                const std::string& mode,
                const std::string& grad_mode) {
@@ -422,76 +435,61 @@ NB_MODULE(nwgrad_ext, m) {
                 if      (grad_mode == "hard") gd = GradMode::Hard;
                 else if (grad_mode == "soft") gd = GradMode::Soft;
                 else                          gd = GradMode::None;
-                new (self) SeqPair(seq_a, seq_b, mat, gap_open, gap_extend, gm, am, gd);
+                new (self) SeqPair(seq_a, seq_b, params, gm, am, gd);
             },
-            nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("matrix"),
-            nb::arg("gap_open") = 11.0, nb::arg("gap_extend") = 1.0,
+            nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("params"),
             nb::arg("gap_model") = "affine", nb::arg("mode") = "global",
             nb::arg("grad_mode") = "hard",
-            "Persistent sequence pair.  Call align_full() to compute the initial\n"
-            "alignment, then realign_banded(bw) for cheap re-alignment, and\n"
-            "compute_grad() to populate the gradient cache.\n"
+            "Persistent sequence pair.\n"
             "  gap_model : \"linear\" | \"affine\"\n"
             "  mode      : \"global\" | \"local\"\n"
-            "  grad_mode : \"hard\" (Viterbi, subgradient)\n"
-            "            | \"soft\" (Viterbi + forward-backward, expected counts)\n"
-            "            | \"none\" (score only, compute_grad() unavailable)")
+            "  grad_mode : \"hard\" | \"soft\" | \"none\"")
         .def("alloc_dp", &SeqPair::alloc_dp,
-             "Pre-allocate own DP tables for the fixed sequences.  Must be called\n"
-             "before align_full() / realign_banded().  score_and_grad_with_dp() uses\n"
-             "caller-supplied buffers and does not require this.")
+             "Pre-allocate own DP tables for the fixed sequences.")
         .def(
-            "set_matrix",
-            [](SeqPair& self, const SubstMatrix& mat) { self.set_matrix(mat); },
-            nb::arg("matrix"),
-            "Swap the substitution matrix.  Invalidates cached score and gradient.\n"
-            "The matrix object must remain alive as long as this SeqPair uses it.")
-        .def("align_full",    &SeqPair::align_full,
+            "set_params",
+            [](SeqPair& self, const AlignParams& params) { self.set_params(params); },
+            nb::arg("params"),
+            "Swap alignment parameters.  Invalidates cached score and gradient.\n"
+            "The params object must remain alive as long as this SeqPair uses it.")
+        .def("align_full",     &SeqPair::align_full,
              "Full DP alignment.  Updates score and alignment path; clears gradient cache.")
         .def("realign_banded", &SeqPair::realign_banded, nb::arg("bandwidth"),
-             "Banded DP centred on the current alignment path.  Requires align_full()\n"
-             "to have been called first.  Clears gradient cache.")
-        .def("compute_grad",  &SeqPair::compute_grad,
-             "Compute and cache the hard subgradient from the current alignment.")
+             "Banded DP centred on the current alignment path.")
+        .def("compute_grad",   &SeqPair::compute_grad,
+             "Compute and cache the gradient from the current alignment.")
         .def("drop_dp", &SeqPair::drop_dp,
-             "Free DP table memory (O(mn) per pair).  Cached score, gradient, and\n"
-             "guide_j remain valid.  compute_grad() will throw until the next\n"
-             "align_full() or realign_banded() call.")
+             "Free DP table memory.  Cached score, gradient, and guide_j remain valid.")
         .def_prop_ro(
             "score",
             [](const SeqPair& self) -> nb::object {
                 if (!self.score_valid()) return nb::none();
                 return nb::cast(self.score());
             },
-            "Alignment score under the current matrix, or None if not yet computed.")
+            "Alignment score, or None if not yet computed.")
         .def_prop_ro(
             "grad",
             [](const SeqPair& self) -> nb::object {
                 if (!self.grad_valid()) return nb::none();
-                return nb::cast(grad_to_numpy(self.grad()));
+                return nb::cast(self.grad());
             },
-            nb::rv_policy::move,
-            "Gradient as a (20, 20) float64 numpy array, or None if not computed.")
+            nb::rv_policy::copy,
+            "Gradient as an AlignParams object, or None if not computed.")
         .def_prop_ro(
             "guide_j",
             [](const SeqPair& self) -> nb::object {
                 if (!self.path_valid()) return nb::none();
-                const auto& gj = self.guide_j();
-                return nb::cast(std::vector<int>(gj));
+                return nb::cast(std::vector<int>(self.guide_j()));
             },
             "Current alignment as a guide_j vector (length m+1), or None.")
-        .def_prop_ro("path_valid",  &SeqPair::path_valid,
-                     "True if guide_j exists (realign_banded() is callable).")
-        .def_prop_ro("score_valid", &SeqPair::score_valid,
-                     "True if score matches the current matrix and alignment path.")
-        .def_prop_ro("grad_valid",  &SeqPair::grad_valid,
-                     "True if the gradient cache is valid.")
-        .def_prop_ro("dp_valid",    &SeqPair::dp_valid,
-                     "True if DP tables are in memory (compute_grad() is callable).")
+        .def_prop_ro("path_valid",  &SeqPair::path_valid)
+        .def_prop_ro("score_valid", &SeqPair::score_valid)
+        .def_prop_ro("grad_valid",  &SeqPair::grad_valid)
+        .def_prop_ro("dp_valid",    &SeqPair::dp_valid)
         .def_prop_ro("seq_a", [](const SeqPair& s) { return s.seq_a(); })
         .def_prop_ro("seq_b", [](const SeqPair& s) { return s.seq_b(); });
 
-    // ── SeqPairBatch ──────────────────────────────────────────────────────────
+    // ── SeqPairBatch ─────────────────────────────────────────────────────────
     nb::class_<SeqPairBatch>(m, "SeqPairBatch")
         .def(
             "__init__",
@@ -505,7 +503,7 @@ NB_MODULE(nwgrad_ext, m) {
             "add",
             [](SeqPairBatch& self, SeqPair* sp) { self.add(sp); },
             nb::arg("seq_pair"),
-            nb::keep_alive<1, 2>(),   // keep seq_pair alive as long as batch is alive
+            nb::keep_alive<1, 2>(),
             "Append a SeqPair to the batch.")
         .def("__len__", &SeqPairBatch::size)
         .def(
@@ -519,50 +517,36 @@ NB_MODULE(nwgrad_ext, m) {
             nb::rv_policy::reference,
             nb::arg("i"))
         .def("alloc_dp", [](SeqPairBatch& self) { self.alloc_dp(); },
-             "Pre-allocate own DP tables on all pairs in parallel.\n"
-             "Required before align_full() / realign_banded(); not needed for score_and_grad().")
+             "Pre-allocate own DP tables on all pairs in parallel.")
         .def(
-            "set_matrix",
-            [](SeqPairBatch& self, const SubstMatrix& mat) {
-                self.set_matrix(mat);
-            },
-            nb::arg("matrix"),
-            "Set the substitution matrix on all pairs (clears score and grad caches).")
+            "set_params",
+            [](SeqPairBatch& self, const AlignParams& params) { self.set_params(params); },
+            nb::arg("params"),
+            "Set alignment parameters on all pairs (clears score and grad caches).")
         .def(
             "align_full",
             [](SeqPairBatch& self) { return self.align_full(); },
             "Full DP alignment of all pairs in parallel.  Returns sum of scores.")
         .def(
             "realign_banded",
-            [](SeqPairBatch& self, int bandwidth) {
-                return self.realign_banded(bandwidth);
-            },
+            [](SeqPairBatch& self, int bandwidth) { return self.realign_banded(bandwidth); },
             nb::arg("bandwidth"),
             "Banded realignment of all pairs in parallel.  Returns sum of scores.")
         .def(
             "compute_grad",
-            [](SeqPairBatch& self) {
-                double grad[256][256]{};
-                self.compute_grad(grad);
-                return grad_to_numpy(grad);
-            },
+            [](SeqPairBatch& self) { return self.compute_grad(); },
             nb::rv_policy::move,
             "Compute gradient on all pairs in parallel.\n"
-            "Returns summed gradient as a (20, 20) float64 numpy array.")
+            "Returns summed gradient as an AlignParams object.")
         .def(
             "score_and_grad",
             [](SeqPairBatch& self, int bandwidth) { return self.score_and_grad(bandwidth); },
             nb::arg("bandwidth") = 0,
             "Full-pipeline batch operation using per-thread DP buffers.\n"
-            "For each pair: runs full DP (+ banded DP if bandwidth > 0), computes\n"
-            "grad, saves score + guide_j + grad to the SeqPair.  The pairs' own DP\n"
-            "tables are never allocated; dp_valid stays False after this call.\n"
-            "Returns sum of scores.  Call compute_grad() afterwards to get the\n"
-            "summed gradient.")
+            "Returns sum of scores.")
         .def(
             "drop_dp",
             [](SeqPairBatch& self) { self.drop_dp(); },
-            "Drop DP tables on all pairs in parallel.  Frees O(mn) memory per pair.\n"
-            "Cached scores, gradients, and guide_j vectors are preserved.")
+            "Drop DP tables on all pairs in parallel.")
         .def_prop_ro("n_threads", [](const SeqPairBatch& s) { return s.n_threads; });
 }

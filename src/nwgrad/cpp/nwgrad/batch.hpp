@@ -6,6 +6,7 @@
 #include <thread>
 #include <vector>
 
+#include "align_params.hpp"
 #include "aligner.hpp"
 
 struct ProblemInstance {
@@ -16,13 +17,11 @@ struct ProblemInstance {
 
 struct BatchResult {
     std::vector<double> scores;
-    double grad[256][256]{};
+    AlignParams grad;
 };
 
 struct BatchAligner {
-    SubstMatrix matrix;
-    double gap_open;
-    double gap_extend;
+    AlignParams params;
     int    band;       // 0 = full DP; > 0 = banded with this half-width
     GapModel  gap_model;
     AlignMode align_mode;
@@ -30,9 +29,9 @@ struct BatchAligner {
     GradMode grad_mode;
     int n_threads;
 
-    BatchAligner(SubstMatrix mat, double go, double ge, int band,
+    BatchAligner(AlignParams p, int band,
                  GapModel gm, AlignMode am, GradMode gd, int nt)
-        : matrix(std::move(mat)), gap_open(go), gap_extend(ge), band(band),
+        : params(std::move(p)), band(band),
           gap_model(gm), align_mode(am), grad_mode(gd), n_threads(nt) {}
 
     BatchResult align(const std::vector<ProblemInstance>& problems) const {
@@ -46,13 +45,11 @@ struct BatchAligner {
         std::mutex grad_mutex;
 
         auto worker = [&]() {
-            double local_grad[256][256]{};
+            AlignParams local_grad{};
             dispatch_worker(problems, N, work_idx, result.scores, local_grad);
             if (grad_mode != GradMode::None) {
                 std::lock_guard<std::mutex> lock(grad_mutex);
-                for (int r = 0; r < 256; ++r)
-                    for (int c = 0; c < 256; ++c)
-                        result.grad[r][c] += local_grad[r][c];
+                result.grad += local_grad;
             }
         };
 
@@ -74,7 +71,7 @@ private:
         size_t N,
         std::atomic<size_t>& work_idx,
         std::vector<double>& scores,
-        double local_grad[256][256]) const
+        AlignParams& local_grad) const
     {
         Aligner<GM, AM, AB> al;
         DpBuffer buf;  // reused across iterations; grows to the largest pair seen
@@ -82,7 +79,7 @@ private:
             size_t idx = work_idx.fetch_add(1, std::memory_order_relaxed);
             if (idx >= N) break;
             const auto& p = problems[idx];
-            al.set_problem(p.seq_a, p.seq_b, matrix, gap_extend, gap_open, band, p.guide_j);
+            al.set_problem(p.seq_a, p.seq_b, params, band, p.guide_j);
 
             if (grad_mode == GradMode::Hard) {
                 al.compute_viterbi(buf);
@@ -104,7 +101,7 @@ private:
         size_t N,
         std::atomic<size_t>& work_idx,
         std::vector<double>& scores,
-        double local_grad[256][256]) const
+        AlignParams& local_grad) const
     {
         const bool banded = (band > 0) || (!problems.empty() && !problems[0].guide_j.empty());
 #define DISPATCH(GM, AM) \

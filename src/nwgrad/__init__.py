@@ -1,5 +1,5 @@
 from .nwgrad_ext import (
-    SubstMatrix,
+    SubstMatrix, AlignParams,
     guide_j_from_aligned,
     nw_score, sw_score, nw_score_affine, sw_score_affine,
     nw_grad, sw_grad, nw_affine_grad, sw_affine_grad,

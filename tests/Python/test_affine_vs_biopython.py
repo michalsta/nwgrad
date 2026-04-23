@@ -1,20 +1,5 @@
 """
 Cross-validation of nwgrad.nw_score_affine against Bio.Align.PairwiseAligner (global NW).
-
-Gap model mapping
------------------
-Our model:       gap_cost(k) = gap_open + gap_extend * k
-BioPython model: gap_cost(k) = open + extend * (k-1)
-
-Solving for BioPython parameters:
-  open + extend*(k-1) = gap_open + gap_extend*k
-  => extend = gap_extend
-  => open   = gap_open + gap_extend
-
-So:  open_gap_score   = -(gap_open + gap_extend)
-     extend_gap_score = -gap_extend
-
-BioPython cannot align empty sequences, so those edge cases are excluded.
 """
 
 import numpy as np
@@ -40,21 +25,20 @@ def bio_blosum62():
 
 
 @pytest.fixture(scope="module")
-def blosum(bio_blosum62):
-    arr = np.array(
+def blosum_arr(bio_blosum62):
+    return np.array(
         [[bio_blosum62[a, b] for b in AA_ORDER] for a in AA_ORDER],
         dtype=np.float64,
     )
-    return nwgrad.SubstMatrix(arr)
+
+
+def make_params(blosum_arr, gap_extend, gap_open=0.0):
+    return nwgrad.AlignParams(blosum_arr,
+                               gap_open_a=gap_open, gap_extend_a=gap_extend,
+                               gap_open_b=gap_open, gap_extend_b=gap_extend)
 
 
 def make_bio_aligner(bio_matrix, gap_open: float, gap_extend: float) -> Align.PairwiseAligner:
-    """
-    BioPython global NW aligner matching our affine model.
-    Our:       gap_cost(k) = gap_open + gap_extend * k
-    BioPython: gap_cost(k) = open + extend*(k-1)
-    => open_gap_score = -(gap_open + gap_extend), extend_gap_score = -gap_extend
-    """
     aligner = Align.PairwiseAligner()
     aligner.mode = "global"
     aligner.substitution_matrix = bio_matrix
@@ -83,10 +67,10 @@ GAP_PARAMS = [(0.0, 0.5), (0.0, 1.0), (1.0, 0.5), (2.0, 1.0), (5.0, 2.0), (11.0,
 
 @pytest.mark.parametrize("gap_open,gap_extend", GAP_PARAMS)
 @pytest.mark.parametrize("a,b", PAIRS)
-def test_score_matches_biopython(a, b, gap_open, gap_extend, blosum, bio_blosum62):
+def test_score_matches_biopython(a, b, gap_open, gap_extend, blosum_arr, bio_blosum62):
     bio_aligner = make_bio_aligner(bio_blosum62, gap_open, gap_extend)
     expected = bio_aligner.score(a, b)
-    got = nwgrad.nw_score_affine(a, b, blosum, gap_open, gap_extend)
+    got = nwgrad.nw_score_affine(a, b, make_params(blosum_arr, gap_extend, gap_open))
     assert got == pytest.approx(expected, abs=1e-9), (
         f"nw_score_affine({a!r},{b!r}, open={gap_open}, ext={gap_extend}): "
         f"got {got}, expected {expected}"
@@ -95,10 +79,11 @@ def test_score_matches_biopython(a, b, gap_open, gap_extend, blosum, bio_blosum6
 
 @pytest.mark.parametrize("gap_open,gap_extend", GAP_PARAMS)
 @pytest.mark.parametrize("a,b", PAIRS)
-def test_symmetric_vs_biopython(a, b, gap_open, gap_extend, blosum, bio_blosum62):
+def test_symmetric_vs_biopython(a, b, gap_open, gap_extend, blosum_arr, bio_blosum62):
     bio_aligner = make_bio_aligner(bio_blosum62, gap_open, gap_extend)
-    fwd = nwgrad.nw_score_affine(a, b, blosum, gap_open, gap_extend)
-    rev = nwgrad.nw_score_affine(b, a, blosum, gap_open, gap_extend)
+    p = make_params(blosum_arr, gap_extend, gap_open)
+    fwd = nwgrad.nw_score_affine(a, b, p)
+    rev = nwgrad.nw_score_affine(b, a, p)
     assert fwd == pytest.approx(bio_aligner.score(a, b), abs=1e-9)
     assert rev == pytest.approx(bio_aligner.score(b, a), abs=1e-9)
     assert fwd == pytest.approx(rev, abs=1e-9)

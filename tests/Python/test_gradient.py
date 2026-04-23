@@ -1,9 +1,4 @@
-"""Step 5: hard-subgradient tests for nw_grad, sw_grad, nw_affine_grad, sw_affine_grad.
-
-Each *_grad function returns (score, grad_20x20) where grad[i,j] counts how
-many times AA_ORDER[i] was aligned to AA_ORDER[j] in the optimal traceback.
-Gaps do not contribute.
-"""
+"""Hard-subgradient tests for nw_grad, sw_grad, nw_affine_grad, sw_affine_grad."""
 
 import numpy as np
 import pytest
@@ -12,14 +7,25 @@ from test_subst_matrix import BLOSUM62
 
 AA_ORDER = "ACDEFGHIKLMNPQRSTVWY"
 
-# ── Pure-Python reference implementations ────────────────────────────────────
+
+def make_params(gap_extend, gap_open=0.0, matrix_arr=None):
+    arr = BLOSUM62 if matrix_arr is None else matrix_arr
+    return nwgrad.AlignParams(arr, gap_open_a=gap_open, gap_extend_a=gap_extend,
+                                   gap_open_b=gap_open, gap_extend_b=gap_extend)
+
+
+def grad_matrix(g):
+    """Return the 20×20 substitution gradient as a numpy array."""
+    return g.matrix.to_matrix()
+
 
 def _aa_idx(c):
     return AA_ORDER.index(c)
 
 
+# ── Pure-Python reference implementations ────────────────────────────────────
+
 def ref_nw_linear_grad(a, b, matrix, gap_extend):
-    """Returns (score, Counter of (aa_a, aa_b) pairs)."""
     m, n = len(a), len(b)
     H = [[0.0] * (n + 1) for _ in range(m + 1)]
     for i in range(m + 1):
@@ -33,8 +39,6 @@ def ref_nw_linear_grad(a, b, matrix, gap_extend):
                 H[i-1][j]   - gap_extend,
                 H[i][j-1]   - gap_extend,
             )
-
-    # Traceback
     pairs = {}
     i, j = m, n
     while i > 0 or j > 0:
@@ -66,7 +70,6 @@ def ref_sw_linear_grad(a, b, matrix, gap_extend):
             if v > best_score:
                 best_score = v
                 best_i, best_j = i, j
-
     pairs = {}
     i, j = best_i, best_j
     while H[i][j] > 0:
@@ -82,7 +85,6 @@ def ref_sw_linear_grad(a, b, matrix, gap_extend):
 
 
 def grad_to_dict(g20):
-    """Convert 20×20 numpy grad array to {(aa_a, aa_b): count} skipping zeros."""
     d = {}
     for i in range(20):
         for j in range(20):
@@ -92,14 +94,10 @@ def grad_to_dict(g20):
     return d
 
 
-# ── Fixtures ─────────────────────────────────────────────────────────────────
-
 @pytest.fixture(scope="module")
 def blosum():
     return nwgrad.SubstMatrix(BLOSUM62)
 
-
-# ── Test pairs ───────────────────────────────────────────────────────────────
 
 PAIRS = [
     ("A",          "A"),
@@ -111,117 +109,110 @@ PAIRS = [
     ("MADEEKLF",   "MADEEKLF"),
 ]
 
-# ── Step 5a: NW linear gradient ──────────────────────────────────────────────
+# ── NW linear gradient ───────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("a,b", PAIRS)
-def test_nw_grad_score_matches(a, b, blosum):
-    """Score returned by nw_grad must match nw_score."""
+def test_nw_grad_score_matches(a, b):
     gap = 1.0
-    score_ref = nwgrad.nw_score(a, b, blosum, gap)
-    score_g, _ = nwgrad.nw_grad(a, b, blosum, gap)
+    score_ref = nwgrad.nw_score(a, b, make_params(gap))
+    score_g, _ = nwgrad.nw_grad(a, b, make_params(gap))
     assert score_g == pytest.approx(score_ref)
 
 
 @pytest.mark.parametrize("a,b", PAIRS)
 def test_nw_grad_counts_match_reference(a, b, blosum):
     gap = 1.0
-    _, g = nwgrad.nw_grad(a, b, blosum, gap)
+    _, g = nwgrad.nw_grad(a, b, make_params(gap))
     ref_score, ref_pairs = ref_nw_linear_grad(a, b, blosum, gap)
-    got_pairs = grad_to_dict(np.array(g))
+    got_pairs = grad_to_dict(grad_matrix(g))
     assert got_pairs == ref_pairs
 
 
-def test_nw_grad_identity(blosum):
-    """Aligning seq with itself: every character is a self-substitution."""
+def test_nw_grad_identity():
     seq = "ACDEF"
-    _, g = nwgrad.nw_grad(seq, seq, blosum, 1.0)
-    g = np.array(g)
+    _, g = nwgrad.nw_grad(seq, seq, make_params(1.0))
+    gm = grad_matrix(g)
     for c in seq:
         i = _aa_idx(c)
-        assert g[i, i] == pytest.approx(1.0)
-    assert g.sum() == pytest.approx(len(seq))
+        assert gm[i, i] == pytest.approx(1.0)
+    assert gm.sum() == pytest.approx(len(seq))
 
 
-def test_nw_grad_all_gaps(blosum):
-    """Aligning "" to a sequence: no substitutions → zero gradient."""
-    _, g = nwgrad.nw_grad("", "ACDE", blosum, 1.0)
-    assert np.array(g).sum() == pytest.approx(0.0)
+def test_nw_grad_all_gaps():
+    _, g = nwgrad.nw_grad("", "ACDE", make_params(1.0))
+    assert grad_matrix(g).sum() == pytest.approx(0.0)
 
 
-def test_nw_grad_shape(blosum):
-    _, g = nwgrad.nw_grad("ACDE", "ACDE", blosum, 1.0)
-    assert np.array(g).shape == (20, 20)
+def test_nw_grad_shape():
+    _, g = nwgrad.nw_grad("ACDE", "ACDE", make_params(1.0))
+    assert grad_matrix(g).shape == (20, 20)
 
 
-# ── Step 5b: SW linear gradient ──────────────────────────────────────────────
+# ── SW linear gradient ───────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("a,b", PAIRS)
-def test_sw_grad_score_matches(a, b, blosum):
+def test_sw_grad_score_matches(a, b):
     gap = 1.0
-    score_ref = nwgrad.sw_score(a, b, blosum, gap)
-    score_g, _ = nwgrad.sw_grad(a, b, blosum, gap)
+    score_ref = nwgrad.sw_score(a, b, make_params(gap))
+    score_g, _ = nwgrad.sw_grad(a, b, make_params(gap))
     assert score_g == pytest.approx(score_ref)
 
 
 @pytest.mark.parametrize("a,b", PAIRS)
 def test_sw_grad_counts_match_reference(a, b, blosum):
     gap = 1.0
-    _, g = nwgrad.sw_grad(a, b, blosum, gap)
+    _, g = nwgrad.sw_grad(a, b, make_params(gap))
     _, ref_pairs = ref_sw_linear_grad(a, b, blosum, gap)
-    got_pairs = grad_to_dict(np.array(g))
+    got_pairs = grad_to_dict(grad_matrix(g))
     assert got_pairs == ref_pairs
 
 
-# ── Step 5c: NW affine gradient ──────────────────────────────────────────────
+# ── NW affine gradient ───────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("a,b", PAIRS)
-def test_nw_affine_grad_score_matches(a, b, blosum):
-    score_ref = nwgrad.nw_score_affine(a, b, blosum, gap_open=11.0, gap_extend=1.0)
-    score_g, _ = nwgrad.nw_affine_grad(a, b, blosum, gap_open=11.0, gap_extend=1.0)
+def test_nw_affine_grad_score_matches(a, b):
+    score_ref = nwgrad.nw_score_affine(a, b, make_params(1.0, 11.0))
+    score_g, _ = nwgrad.nw_affine_grad(a, b, make_params(1.0, 11.0))
     assert score_g == pytest.approx(score_ref)
 
 
 @pytest.mark.parametrize("a,b", PAIRS)
-def test_sw_affine_grad_score_matches(a, b, blosum):
-    score_ref = nwgrad.sw_score_affine(a, b, blosum, gap_open=11.0, gap_extend=1.0)
-    score_g, _ = nwgrad.sw_affine_grad(a, b, blosum, gap_open=11.0, gap_extend=1.0)
+def test_sw_affine_grad_score_matches(a, b):
+    score_ref = nwgrad.sw_score_affine(a, b, make_params(1.0, 11.0))
+    score_g, _ = nwgrad.sw_affine_grad(a, b, make_params(1.0, 11.0))
     assert score_g == pytest.approx(score_ref)
 
 
-# ── Step 5d: Gradient sanity checks ──────────────────────────────────────────
+# ── Gradient sanity checks ───────────────────────────────────────────────────
 
-def test_nw_affine_grad_identity(blosum):
-    """Identity alignment: every position should be a self-pair."""
+def test_nw_affine_grad_identity():
     seq = "ACDEFG"
-    _, g = nwgrad.nw_affine_grad(seq, seq, blosum, gap_open=11.0, gap_extend=1.0)
-    g = np.array(g)
+    _, g = nwgrad.nw_affine_grad(seq, seq, make_params(1.0, 11.0))
+    gm = grad_matrix(g)
     for c in seq:
         i = _aa_idx(c)
-        assert g[i, i] == pytest.approx(1.0)
-    assert g.sum() == pytest.approx(len(seq))
+        assert gm[i, i] == pytest.approx(1.0)
+    assert gm.sum() == pytest.approx(len(seq))
 
 
-@pytest.mark.parametrize("fn,kw", [
-    (nwgrad.nw_grad,        {"gap_extend": 1.0}),
-    (nwgrad.sw_grad,        {"gap_extend": 1.0}),
-    (nwgrad.nw_affine_grad, {"gap_open": 11.0, "gap_extend": 1.0}),
-    (nwgrad.sw_affine_grad, {"gap_open": 11.0, "gap_extend": 1.0}),
+@pytest.mark.parametrize("fn,params", [
+    (nwgrad.nw_grad,        make_params(1.0)),
+    (nwgrad.sw_grad,        make_params(1.0)),
+    (nwgrad.nw_affine_grad, make_params(1.0, 11.0)),
+    (nwgrad.sw_affine_grad, make_params(1.0, 11.0)),
 ])
-def test_grad_nonnegative(fn, kw, blosum):
-    """Gradient counts must be non-negative integers."""
-    _, g = fn("PLEASANTLY", "MEANLY", blosum, **kw)
-    g = np.array(g)
-    assert (g >= 0).all()
-    # counts should be whole numbers
-    assert np.allclose(g, np.round(g))
+def test_grad_nonnegative(fn, params):
+    _, g = fn("PLEASANTLY", "MEANLY", params)
+    gm = grad_matrix(g)
+    assert (gm >= 0).all()
+    assert np.allclose(gm, np.round(gm))
 
 
-@pytest.mark.parametrize("fn,kw", [
-    (nwgrad.nw_grad,        {"gap_extend": 1.0}),
-    (nwgrad.nw_affine_grad, {"gap_open": 11.0, "gap_extend": 1.0}),
+@pytest.mark.parametrize("fn,params", [
+    (nwgrad.nw_grad,        make_params(1.0)),
+    (nwgrad.nw_affine_grad, make_params(1.0, 11.0)),
 ])
-def test_grad_sum_le_min_len(fn, kw, blosum):
-    """Number of matched positions ≤ min(len(a), len(b))."""
+def test_grad_sum_le_min_len(fn, params):
     a, b = "PLEASANTLY", "MEANLY"
-    _, g = fn(a, b, blosum, **kw)
-    assert np.array(g).sum() <= min(len(a), len(b))
+    _, g = fn(a, b, params)
+    assert grad_matrix(g).sum() <= min(len(a), len(b))

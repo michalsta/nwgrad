@@ -3,6 +3,11 @@ import pytest
 import nwgrad
 from test_subst_matrix import BLOSUM62
 
+
+def make_params(gap_extend, gap_open=0.0):
+    return nwgrad.AlignParams(BLOSUM62, gap_open_a=gap_open, gap_extend_a=gap_extend,
+                                        gap_open_b=gap_open, gap_extend_b=gap_extend)
+
 # ── Pure-Python reference NW (linear gap) ────────────────────────────────────
 
 def ref_nw_linear(a, b, matrix, gap_extend):
@@ -45,7 +50,7 @@ PAIRS = [
 def test_matches_reference(a, b, blosum):
     gap = 1.0
     expected = ref_nw_linear(a, b, blosum, gap)
-    got = nwgrad.nw_score(a, b, blosum, gap)
+    got = nwgrad.nw_score(a, b, make_params(gap))
     assert got == pytest.approx(expected), f"nw_score({a!r}, {b!r}) = {got}, expected {expected}"
 
 
@@ -53,8 +58,8 @@ def test_matches_reference(a, b, blosum):
 def test_symmetric(a, b, blosum):
     """Reversing both sequences gives the same score."""
     gap = 1.0
-    assert nwgrad.nw_score(a, b, blosum, gap) == pytest.approx(
-        nwgrad.nw_score(b, a, blosum, gap)
+    assert nwgrad.nw_score(a, b, make_params(gap)) == pytest.approx(
+        nwgrad.nw_score(b, a, make_params(gap))
     )
 
 
@@ -65,7 +70,7 @@ def test_identity_score(blosum):
     seq = "ACDEFG"
     AA_ORDER = "ACDEFGHIKLMNPQRSTVWY"
     expected = sum(BLOSUM62[AA_ORDER.index(c), AA_ORDER.index(c)] for c in seq)
-    assert nwgrad.nw_score(seq, seq, blosum, 1.0) == pytest.approx(expected)
+    assert nwgrad.nw_score(seq, seq, make_params(1.0)) == pytest.approx(expected)
 
 
 # ── Gap penalty ───────────────────────────────────────────────────────────────
@@ -73,28 +78,28 @@ def test_identity_score(blosum):
 def test_gap_penalty_scaling(blosum):
     """Higher gap penalty should reduce (or equal) the score for mismatched-length seqs."""
     a, b = "ACDEFG", "ACDE"
-    score_low  = nwgrad.nw_score(a, b, blosum, gap_extend=0.1)
-    score_high = nwgrad.nw_score(a, b, blosum, gap_extend=10.0)
+    score_low  = nwgrad.nw_score(a, b, make_params(0.1))
+    score_high = nwgrad.nw_score(a, b, make_params(10.0))
     assert score_low >= score_high
 
 
 def test_single_char_same(blosum):
-    assert nwgrad.nw_score("A", "A", blosum, 1.0) == pytest.approx(4.0)
+    assert nwgrad.nw_score("A", "A", make_params(1.0)) == pytest.approx(4.0)
 
 
 def test_single_char_diff(blosum):
     # max(score(A,C)=0, gap+gap=-2) = 0
-    assert nwgrad.nw_score("A", "C", blosum, 1.0) == pytest.approx(0.0)
+    assert nwgrad.nw_score("A", "C", make_params(1.0)) == pytest.approx(0.0)
 
 
 # ── Edge cases ────────────────────────────────────────────────────────────────
 
 def test_empty_vs_empty(blosum):
-    assert nwgrad.nw_score("", "", blosum, 1.0) == pytest.approx(0.0)
+    assert nwgrad.nw_score("", "", make_params(1.0)) == pytest.approx(0.0)
 
 
 def test_empty_vs_seq(blosum):
     """Aligning empty string to a sequence of length n costs n * gap_extend."""
     seq = "ACDE"
-    assert nwgrad.nw_score("", seq, blosum, 2.0) == pytest.approx(-len(seq) * 2.0)
-    assert nwgrad.nw_score(seq, "", blosum, 2.0) == pytest.approx(-len(seq) * 2.0)
+    assert nwgrad.nw_score("", seq, make_params(2.0)) == pytest.approx(-len(seq) * 2.0)
+    assert nwgrad.nw_score(seq, "", make_params(2.0)) == pytest.approx(-len(seq) * 2.0)
