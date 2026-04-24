@@ -1,105 +1,105 @@
+"""Global NW score tests — correctness verified against Bio.Align.PairwiseAligner."""
+
 import numpy as np
 import pytest
 import nwgrad
+from Bio import Align
+from Bio.Align import substitution_matrices
 from test_subst_matrix import BLOSUM62
+
+AA_ORDER = "ACDEFGHIKLMNPQRSTVWY"
+
+pytest.importorskip("Bio", reason="biopython not installed")
 
 
 def make_params(gap_extend, gap_open=0.0):
     return nwgrad.AlignParams(BLOSUM62, gap_open_a=gap_open, gap_extend_a=gap_extend,
                                         gap_open_b=gap_open, gap_extend_b=gap_extend)
 
-# ── Pure-Python reference NW (linear gap) ────────────────────────────────────
-
-def ref_nw_linear(a, b, matrix, gap_extend):
-    """Reference Needleman-Wunsch with linear gap penalty."""
-    m, n = len(a), len(b)
-    H = [[0.0] * (n + 1) for _ in range(m + 1)]
-    for i in range(m + 1):
-        H[i][0] = -i * gap_extend
-    for j in range(n + 1):
-        H[0][j] = -j * gap_extend
-    for i in range(1, m + 1):
-        for j in range(1, n + 1):
-            diag = H[i-1][j-1] + matrix.score(a[i-1], b[j-1])
-            up   = H[i-1][j]   - gap_extend
-            left = H[i][j-1]   - gap_extend
-            H[i][j] = max(diag, up, left)
-    return H[m][n]
-
 
 @pytest.fixture(scope="module")
-def blosum():
-    return nwgrad.SubstMatrix(BLOSUM62)
+def bio_blosum62():
+    m = substitution_matrices.Array(alphabet=AA_ORDER, dims=2)
+    for i, a in enumerate(AA_ORDER):
+        for j, b in enumerate(AA_ORDER):
+            m[a, b] = BLOSUM62[i, j]
+    return m
 
 
-# ── Correctness vs. reference ─────────────────────────────────────────────────
+def make_bio_aligner(bio_matrix, gap_extend):
+    """Global NW aligner with linear gap penalty matching our model (gap_cost = k * gap_extend)."""
+    aligner = Align.PairwiseAligner()
+    aligner.mode = "global"
+    aligner.substitution_matrix = bio_matrix
+    aligner.open_gap_score = -gap_extend
+    aligner.extend_gap_score = -gap_extend
+    return aligner
+
+
+# ── Correctness vs. BioPython ─────────────────────────────────────────────────
 
 PAIRS = [
-    ("A",          "A"),
-    ("A",          "C"),
-    ("ACDE",       "ACDE"),
-    ("ACDE",       "ACDF"),
-    ("A",          "AC"),
-    ("ACDEFG",     "ACDE"),
-    ("PLEASANTLY", "MEANLY"),
-    ("ACDEFGHIKL", "CDEFGHIKLM"),
-    ("MADEEKLF",   "MADEEKLF"),
+    ("A",           "A"),
+    ("A",           "C"),
+    ("A",           "AC"),
+    ("ACDE",        "ACDE"),
+    ("ACDE",        "ACDF"),
+    ("ACDEFG",      "ACDE"),
+    ("PLEASANTLY",  "MEANLY"),
+    ("ACDEFGHIKL",  "CDEFGHIKLM"),
+    ("MADEEKLF",    "MADEEKLF"),
+    ("MADEEKLF",    "MADE"),
+    ("ACDEFGHIKLMN","ACDEFGHIKLMN"),
+    ("ACDEFGHIKLMN","NPQRSTVWY"),
 ]
 
-@pytest.mark.parametrize("a,b", PAIRS)
-def test_matches_reference(a, b, blosum):
-    gap = 1.0
-    expected = ref_nw_linear(a, b, blosum, gap)
-    got = nwgrad.nw_score(a, b, make_params(gap))
-    assert got == pytest.approx(expected), f"nw_score({a!r}, {b!r}) = {got}, expected {expected}"
+GAP_EXTENDS = [0.5, 1.0, 2.0, 5.0]
 
 
+@pytest.mark.parametrize("gap_extend", GAP_EXTENDS)
 @pytest.mark.parametrize("a,b", PAIRS)
-def test_symmetric(a, b, blosum):
-    """Reversing both sequences gives the same score."""
-    gap = 1.0
-    assert nwgrad.nw_score(a, b, make_params(gap)) == pytest.approx(
-        nwgrad.nw_score(b, a, make_params(gap))
+def test_matches_biopython(a, b, gap_extend, bio_blosum62):
+    expected = make_bio_aligner(bio_blosum62, gap_extend).score(a, b)
+    got = nwgrad.nw_score(a, b, make_params(gap_extend))
+    assert got == pytest.approx(expected, abs=1e-9), (
+        f"nw_score({a!r}, {b!r}, gap={gap_extend}): got {got}, expected {expected}"
     )
 
 
-# ── Identity alignment ────────────────────────────────────────────────────────
+@pytest.mark.parametrize("gap_extend", GAP_EXTENDS)
+@pytest.mark.parametrize("a,b", PAIRS)
+def test_symmetric_vs_biopython(a, b, gap_extend, bio_blosum62):
+    bio = make_bio_aligner(bio_blosum62, gap_extend)
+    p = make_params(gap_extend)
+    assert nwgrad.nw_score(a, b, p) == pytest.approx(bio.score(a, b), abs=1e-9)
+    assert nwgrad.nw_score(b, a, p) == pytest.approx(bio.score(b, a), abs=1e-9)
+    assert nwgrad.nw_score(a, b, p) == pytest.approx(nwgrad.nw_score(b, a, p), abs=1e-9)
 
-def test_identity_score(blosum):
+
+# ── Identity score ────────────────────────────────────────────────────────────
+
+def test_identity_score():
     """Aligning a sequence with itself yields the sum of its self-substitution scores."""
     seq = "ACDEFG"
-    AA_ORDER = "ACDEFGHIKLMNPQRSTVWY"
     expected = sum(BLOSUM62[AA_ORDER.index(c), AA_ORDER.index(c)] for c in seq)
     assert nwgrad.nw_score(seq, seq, make_params(1.0)) == pytest.approx(expected)
 
 
 # ── Gap penalty ───────────────────────────────────────────────────────────────
 
-def test_gap_penalty_scaling(blosum):
+def test_gap_penalty_scaling():
     """Higher gap penalty should reduce (or equal) the score for mismatched-length seqs."""
     a, b = "ACDEFG", "ACDE"
-    score_low  = nwgrad.nw_score(a, b, make_params(0.1))
-    score_high = nwgrad.nw_score(a, b, make_params(10.0))
-    assert score_low >= score_high
+    assert nwgrad.nw_score(a, b, make_params(0.1)) >= nwgrad.nw_score(a, b, make_params(10.0))
 
 
-def test_single_char_same(blosum):
-    assert nwgrad.nw_score("A", "A", make_params(1.0)) == pytest.approx(4.0)
+# ── Edge cases (empty sequences — BioPython cannot align these) ───────────────
 
-
-def test_single_char_diff(blosum):
-    # max(score(A,C)=0, gap+gap=-2) = 0
-    assert nwgrad.nw_score("A", "C", make_params(1.0)) == pytest.approx(0.0)
-
-
-# ── Edge cases ────────────────────────────────────────────────────────────────
-
-def test_empty_vs_empty(blosum):
+def test_empty_vs_empty():
     assert nwgrad.nw_score("", "", make_params(1.0)) == pytest.approx(0.0)
 
 
-def test_empty_vs_seq(blosum):
-    """Aligning empty string to a sequence of length n costs n * gap_extend."""
+def test_empty_vs_seq():
     seq = "ACDE"
     assert nwgrad.nw_score("", seq, make_params(2.0)) == pytest.approx(-len(seq) * 2.0)
     assert nwgrad.nw_score(seq, "", make_params(2.0)) == pytest.approx(-len(seq) * 2.0)
