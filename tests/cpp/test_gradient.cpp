@@ -1,6 +1,7 @@
 #include "catch.hpp"
 #include "align_params.hpp"
 #include "aligner.hpp"
+#include <cstring>
 
 static AlignParams unit_params(double gap_extend, double gap_open = 0.0) {
     std::array<double, 400> src{};
@@ -21,11 +22,18 @@ static double sum_grad(const AlignParams& g) {
     return s;
 }
 
+template<GapModel GM, AlignMode AM>
+static void setup_aligner(Aligner<GM,AM>& al, const char* a, const char* b, const AlignParams& p) {
+    al.alloc_buf();
+    al.set_problem(a, b, p);
+}
+
 // ── Linear / Global ──────────────────────────────────────────────────────────
 
 TEST_CASE("Gradient linear global: identical sequences — all matches", "[gradient][linear][global]") {
     auto p = unit_params(1.0);
     Aligner<GapModel::Linear, AlignMode::Global> al;
+    al.alloc_buf();
     al.set_problem("ACDE", "ACDE", p);
     al.compute_viterbi();
     AlignParams grad{};
@@ -42,6 +50,7 @@ TEST_CASE("Gradient linear global: identical sequences — all matches", "[gradi
 TEST_CASE("Gradient linear global: gaps produce zero gradient contribution", "[gradient][linear][global]") {
     auto p = unit_params(1.0);
     Aligner<GapModel::Linear, AlignMode::Global> al;
+    al.alloc_buf();
     al.set_problem("A", "", p);
     al.compute_viterbi();
     AlignParams grad{};
@@ -52,6 +61,7 @@ TEST_CASE("Gradient linear global: gaps produce zero gradient contribution", "[g
 TEST_CASE("Gradient linear global: repeated calls accumulate", "[gradient][linear][global]") {
     auto p = unit_params(1.0);
     Aligner<GapModel::Linear, AlignMode::Global> al;
+    al.alloc_buf();
     AlignParams grad{};
 
     al.set_problem("AA", "AA", p);
@@ -68,6 +78,7 @@ TEST_CASE("Gradient linear global: repeated calls accumulate", "[gradient][linea
 TEST_CASE("Gradient linear global: one-gap alignment has correct count", "[gradient][linear][global]") {
     auto p = unit_params(0.5);
     Aligner<GapModel::Linear, AlignMode::Global> al;
+    al.alloc_buf();
     al.set_problem("ADE", "ACDE", p);
     al.compute_viterbi();
     AlignParams grad{};
@@ -80,6 +91,7 @@ TEST_CASE("Gradient linear global: one-gap alignment has correct count", "[gradi
 TEST_CASE("Gradient linear local: only matching region contributes", "[gradient][linear][local]") {
     auto p = unit_params(1.0);
     Aligner<GapModel::Linear, AlignMode::Local> al;
+    al.alloc_buf();
     al.set_problem("ADE", "MMMADEM", p);
     al.compute_viterbi();
     AlignParams grad{};
@@ -95,6 +107,7 @@ TEST_CASE("Gradient linear local: only matching region contributes", "[gradient]
 TEST_CASE("Gradient linear local: no match gives zero gradient", "[gradient][linear][local]") {
     auto p = unit_params(1.0);
     Aligner<GapModel::Linear, AlignMode::Local> al;
+    al.alloc_buf();
     al.set_problem("AAAA", "CCCC", p);
     al.compute_viterbi();
     AlignParams grad{};
@@ -107,6 +120,7 @@ TEST_CASE("Gradient linear local: no match gives zero gradient", "[gradient][lin
 TEST_CASE("Gradient affine global: identical sequences", "[gradient][affine][global]") {
     auto p = unit_params(1.0, 10.0);
     Aligner<GapModel::Affine, AlignMode::Global> al;
+    al.alloc_buf();
     al.set_problem("ACDE", "ACDE", p);
     al.compute_viterbi();
     AlignParams grad{};
@@ -119,6 +133,7 @@ TEST_CASE("Gradient affine global: identical sequences", "[gradient][affine][glo
 TEST_CASE("Gradient affine global: gap produces no gradient", "[gradient][affine][global]") {
     auto p = unit_params(1.0, 10.0);
     Aligner<GapModel::Affine, AlignMode::Global> al;
+    al.alloc_buf();
     al.set_problem("A", "", p);
     al.compute_viterbi();
     AlignParams grad{};
@@ -131,6 +146,7 @@ TEST_CASE("Gradient affine global: gap produces no gradient", "[gradient][affine
 TEST_CASE("Gradient affine local: finds and counts local match", "[gradient][affine][local]") {
     auto p = unit_params(1.0, 10.0);
     Aligner<GapModel::Affine, AlignMode::Local> al;
+    al.alloc_buf();
     al.set_problem("ADE", "MMMADEM", p);
     al.compute_viterbi();
     AlignParams grad{};

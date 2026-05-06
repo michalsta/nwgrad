@@ -1,6 +1,7 @@
 #include "catch.hpp"
 #include "align_params.hpp"
 #include "aligner.hpp"
+#include <cstring>
 
 static AlignParams unit_params(double gap_extend, double gap_open = 0.0) {
     std::array<double, 400> src{};
@@ -16,6 +17,7 @@ static AlignParams unit_params(double gap_extend, double gap_open = 0.0) {
 template<GapModel GM, AlignMode AM>
 static double score(Aligner<GM,AM>& al, const AlignParams& params,
                     const char* a, const char* b) {
+    al.alloc_buf();
     al.set_problem(a, b, params);
     al.compute_viterbi();
     return al.score();

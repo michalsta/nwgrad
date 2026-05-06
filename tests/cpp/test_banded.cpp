@@ -1,6 +1,7 @@
 #include "catch.hpp"
 #include "align_params.hpp"
 #include "aligner.hpp"
+#include <cstring>
 
 static AlignParams unit_params(double gap_extend, double gap_open = 0.0) {
     std::array<double, 400> src{};
@@ -16,6 +17,7 @@ static AlignParams unit_params(double gap_extend, double gap_open = 0.0) {
 template<GapModel GM, AlignMode AM>
 static double score_full(const AlignParams& p, const char* a, const char* b) {
     Aligner<GM, AM, AlignBand::Full> al;
+    al.alloc_buf();
     al.set_problem(a, b, p);
     al.compute_viterbi();
     return al.score();
@@ -24,6 +26,7 @@ static double score_full(const AlignParams& p, const char* a, const char* b) {
 template<GapModel GM, AlignMode AM>
 static double score_banded(const AlignParams& p, const char* a, const char* b, int band) {
     Aligner<GM, AM, AlignBand::GuideBanded> al;
+    al.alloc_buf();
     al.set_problem(a, b, p, band);
     al.compute_viterbi();
     return al.score();
@@ -93,6 +96,7 @@ static double sum_grad(const AlignParams& g) {
 TEST_CASE("Banded hard grad: identical sequences", "[banded][gradient]") {
     auto p = unit_params(1.0);
     Aligner<GapModel::Linear, AlignMode::Global, AlignBand::GuideBanded> al;
+    al.alloc_buf();
     al.set_problem("ACDE", "ACDE", p, 0);
     al.compute_viterbi();
     AlignParams grad{};
@@ -108,11 +112,13 @@ TEST_CASE("Banded hard grad: matches full DP grad", "[banded][gradient]") {
     Aligner<GapModel::Linear, AlignMode::Global, AlignBand::Full>        full;
     Aligner<GapModel::Linear, AlignMode::Global, AlignBand::GuideBanded> banded;
 
+    full.alloc_buf();
     full.set_problem("ADE", "ACDE", pfull);
     full.compute_viterbi();
     AlignParams gfull{};
     full.hard_grad(gfull);
 
+    banded.alloc_buf();
     banded.set_problem("ADE", "ACDE", pbanded, 2);
     banded.compute_viterbi();
     AlignParams gbanded{};
@@ -129,11 +135,13 @@ TEST_CASE("Banded soft grad: wide band matches full for global linear", "[banded
     Aligner<GapModel::Linear, AlignMode::Global, AlignBand::Full>        full;
     Aligner<GapModel::Linear, AlignMode::Global, AlignBand::GuideBanded> banded;
 
+    full.alloc_buf();
     full.set_problem("ACDE", "ACDE", p);
     full.compute_forward_back();
     AlignParams gfull{};
     full.soft_grad(gfull);
 
+    banded.alloc_buf();
     banded.set_problem("ACDE", "ACDE", p, 100);
     banded.compute_forward_back();
     AlignParams gbanded{};
@@ -179,9 +187,11 @@ TEST_CASE("Guide-banded: correct guide, band=0, unequal sequences", "[banded][gu
     Aligner<GapModel::Linear, AlignMode::Global, AlignBand::Full>        full;
     Aligner<GapModel::Linear, AlignMode::Global, AlignBand::GuideBanded> guided;
 
+    full.alloc_buf();
     full.set_problem("ACDE", "ADE", p);
     full.compute_viterbi();
 
+    guided.alloc_buf();
     guided.set_problem("ACDE", "ADE", p, 0, gj);
     guided.compute_viterbi();
 
@@ -194,9 +204,11 @@ TEST_CASE("Guide-banded: wide band around trivial guide matches full DP", "[band
     Aligner<GapModel::Linear, AlignMode::Global, AlignBand::Full>        full;
     Aligner<GapModel::Linear, AlignMode::Global, AlignBand::GuideBanded> guided;
 
+    full.alloc_buf();
     full.set_problem("MMMADE", "ADE", p);
     full.compute_viterbi();
 
+    guided.alloc_buf();
     guided.set_problem("MMMADE", "ADE", p, 100);
     guided.compute_viterbi();
 
@@ -212,9 +224,11 @@ TEST_CASE("Guide-banded: endpoint always reachable for complete guide", "[banded
     Aligner<GapModel::Linear, AlignMode::Global, AlignBand::Full>        full;
     Aligner<GapModel::Linear, AlignMode::Global, AlignBand::GuideBanded> guided;
 
+    full.alloc_buf();
     full.set_problem("ACDEFG", "DE", p);
     full.compute_viterbi();
 
+    guided.alloc_buf();
     guided.set_problem("ACDEFG", "DE", p, 0, gj);
     guided.compute_viterbi();
 

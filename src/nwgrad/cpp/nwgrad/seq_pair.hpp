@@ -81,17 +81,13 @@ struct SeqPair {
         grad_valid_  = false;
     }
 
-    // Pre-allocate own DP tables for the fixed sequences.
-    // Must be called before align_full() / realign_banded() / compute_grad().
+    // Allocate own DP buffer shells. Must be called before align_full() / realign_banded() / compute_grad().
     // score_and_grad_with_dp() uses caller-supplied buffers and never needs this.
-    // Allocates fwdbwd tables only for GradMode::Soft; skips them otherwise.
+    // Buffers grow implicitly as needed.
     void alloc_dp() {
-        int m = static_cast<int>(seq_a_.size());
-        int n = static_cast<int>(seq_b_.size());
-        bool need_fwdbwd = (grad_mode_ == GradMode::Soft);
-        std::visit([m, n, need_fwdbwd](auto& st) {
-            st.full_al.alloc_own_buf(m, n, need_fwdbwd);
-            st.band_al.alloc_own_buf(m, n, need_fwdbwd);
+        std::visit([](auto& st) {
+            st.full_al.alloc_buf();
+            st.band_al.alloc_buf();
         }, state_);
     }
 

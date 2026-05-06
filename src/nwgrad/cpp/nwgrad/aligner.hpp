@@ -147,26 +147,16 @@ struct Aligner {
         any_fwdbwd_done_  = false;
     }
 
-    // Pre-allocate the own DP buffer for sequences of length m×n.
-    // Must be called before compute_viterbi() / compute_forward_back() with own buffer.
-    // with_fwdbwd=false skips forward-backward tables (sufficient for hard/no-grad modes).
-    void alloc_own_buf(int m, int n, bool with_fwdbwd = true) {
-        size_t sz = static_cast<size_t>(m + 1) * static_cast<size_t>(n + 1);
-        if constexpr (GM == GapModel::Linear) {
-            own_buf_.H.resize(sz);
-            if (with_fwdbwd) { own_buf_.F.resize(sz); own_buf_.B.resize(sz); }
-        } else {
-            own_buf_.VM.resize(sz); own_buf_.VX.resize(sz); own_buf_.VY.resize(sz);
-            if (with_fwdbwd) {
-                own_buf_.FM.resize(sz); own_buf_.FX.resize(sz); own_buf_.FY.resize(sz);
-                own_buf_.BM.resize(sz); own_buf_.BX.resize(sz); own_buf_.BY.resize(sz);
-            }
-        }
+    // Allocate an empty buffer shell. Must be called once before compute_viterbi()
+    // / compute_forward_back() with own buffer. Buffers grow implicitly as needed.
+    void alloc_buf() {
+        own_buf_allocated_ = true;
     }
 
     void compute_viterbi() {
         check_problem();
-        ensure_viterbi_buf(own_buf_);
+        check_own_buf_allocated();
+        ensure_viterbi_buf(own_buf_);  // Grow if needed
         if constexpr (GM == GapModel::Linear) viterbi_linear(own_buf_);
         else                                   viterbi_affine(own_buf_);
         viterbi_done_ = any_viterbi_done_ = true;
@@ -174,7 +164,8 @@ struct Aligner {
 
     void compute_forward_back() {
         check_problem();
-        ensure_fwdbwd_buf(own_buf_);
+        check_own_buf_allocated();
+        ensure_fwdbwd_buf(own_buf_);  // Grow if needed
         if constexpr (GM == GapModel::Linear) fwdbwd_linear(own_buf_);
         else                                   fwdbwd_affine(own_buf_);
         fwdbwd_done_ = any_fwdbwd_done_ = true;
@@ -216,14 +207,14 @@ struct Aligner {
     }
 
     // Release own DP table memory and reset computed-state flags.
-    // set_problem() must be called again before the next DP run.
+    // The buffer shell remains allocated; set_problem() must be called for next DP run.
     void free_dp() noexcept {
         own_buf_.clear();
-        problem_set_      = false;
-        viterbi_done_     = false;
-        fwdbwd_done_      = false;
+        problem_set_     = false;
+        viterbi_done_    = false;
+        fwdbwd_done_     = false;
         any_viterbi_done_ = false;
-        any_fwdbwd_done_  = false;
+        any_fwdbwd_done_ = false;
     }
 
     // ── Extended API — caller-supplied DpBuffer ───────────────────────────────
@@ -235,7 +226,7 @@ struct Aligner {
 
     void compute_viterbi(DpBuffer& buf) {
         check_problem();
-        ensure_viterbi_buf(buf);
+        ensure_viterbi_buf(buf);  // Grow if needed (allows implicit growth from size 0)
         if constexpr (GM == GapModel::Linear) viterbi_linear(buf);
         else                                   viterbi_affine(buf);
         any_viterbi_done_ = true;
@@ -243,7 +234,7 @@ struct Aligner {
 
     void compute_forward_back(DpBuffer& buf) {
         check_problem();
-        ensure_fwdbwd_buf(buf);
+        ensure_fwdbwd_buf(buf);  // Grow if needed (allows implicit growth from size 0)
         if constexpr (GM == GapModel::Linear) fwdbwd_linear(buf);
         else                                   fwdbwd_affine(buf);
         any_fwdbwd_done_ = true;
@@ -275,11 +266,12 @@ private:
     size_t              stride_ = 0, sz_ = 0;
     std::vector<int>    guide_j_;  // used only when AB == GuideBanded
 
-    bool problem_set_      = false;
-    bool viterbi_done_     = false;  // own_buf_ has valid viterbi data
-    bool fwdbwd_done_      = false;  // own_buf_ has valid fwdbwd data
-    bool any_viterbi_done_ = false;  // viterbi scalar results are valid (either buffer)
-    bool any_fwdbwd_done_  = false;  // fwdbwd scalar results are valid (either buffer)
+    bool problem_set_       = false;
+    bool own_buf_allocated_ = false; // own buffer shell has been allocated
+    bool viterbi_done_      = false; // own_buf_ has valid viterbi data
+    bool fwdbwd_done_       = false; // own_buf_ has valid fwdbwd data
+    bool any_viterbi_done_  = false; // viterbi scalar results are valid (either buffer)
+    bool any_fwdbwd_done_   = false; // fwdbwd scalar results are valid (either buffer)
 
     // ── Scalar results (written by every compute_viterbi / compute_forward_back)
     double viterbi_score_ = 0.0;
@@ -307,28 +299,41 @@ private:
             throw std::logic_error("nwgrad: call compute_forward_back() first");
     }
 
-    // Throw if own_buf_ viterbi tables are too small (not pre-allocated).
-    void check_own_viterbi_buf() const {
-        bool ok;
-        if constexpr (GM == GapModel::Linear)
-            ok = (own_buf_.H.size() >= sz_);
-        else
-            ok = (own_buf_.VM.size() >= sz_);
-        if (!ok)
+    // Throw if own buffer shell has never been allocated.
+    void check_own_buf_allocated() const {
+        if (!own_buf_allocated_)
             throw std::logic_error(
-                "nwgrad: own DP buffer not allocated; call alloc_dp() first");
+                "nwgrad: own DP buffer not allocated; call alloc_buf() before compute_viterbi() / compute_forward_back()");
     }
 
-    // Throw if own_buf_ fwdbwd tables are too small (not pre-allocated).
-    void check_own_fwdbwd_buf() const {
-        bool ok;
+    // Throw if external viterbi buffer has never been allocated (size is 0).
+    // After initial allocation, buffers may grow implicitly as needed.
+    void check_external_viterbi_buf(const DpBuffer& buf) const {
+        bool allocated;
         if constexpr (GM == GapModel::Linear)
-            ok = (own_buf_.F.size() >= sz_);
+            allocated = (buf.H.size() > 0);
         else
-            ok = (own_buf_.FM.size() >= sz_);
-        if (!ok)
+            allocated = (buf.VM.size() > 0);
+        if (!allocated) {
+            std::string gap_model_str = (GM == GapModel::Linear) ? "linear" : "affine";
             throw std::logic_error(
-                "nwgrad: own DP buffer not allocated; call alloc_dp() first");
+                "nwgrad: external viterbi DP buffer not allocated; provide a pre-allocated buffer or allocate with buf.H.resize(sz) before compute_viterbi(buf)");
+        }
+    }
+
+    // Throw if external forward-backward buffer has never been allocated (size is 0).
+    // After initial allocation, buffers may grow implicitly as needed.
+    void check_external_fwdbwd_buf(const DpBuffer& buf) const {
+        bool allocated;
+        if constexpr (GM == GapModel::Linear)
+            allocated = (buf.F.size() > 0);
+        else
+            allocated = (buf.FM.size() > 0);
+        if (!allocated) {
+            std::string gap_model_str = (GM == GapModel::Linear) ? "linear" : "affine";
+            throw std::logic_error(
+                "nwgrad: external forward-backward DP buffer not allocated; provide a pre-allocated buffer or allocate with buf.F.resize(sz) before compute_forward_back(buf)");
+        }
     }
 
     // Grow external buffer to fit current problem (thread-owned path).

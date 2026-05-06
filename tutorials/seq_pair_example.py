@@ -87,6 +87,7 @@ total_score = batch.score_and_grad()
 print(f"\nSum of {score_label} (full DP, pass 1): {total_score:.3f}")
 
 grad_sum = batch.compute_grad()   # sums the cached per-pair gradients; no DP needed
+print(grad_sum)
 grad_mat_arr = grad_sum.matrix.to_matrix()
 print(f"Gradient sum — min: {grad_mat_arr.min():.3f}  max: {grad_mat_arr.max():.3f}  "
       f"total: {grad_mat_arr.sum():.1f}")
