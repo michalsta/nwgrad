@@ -7,3 +7,4 @@ from .nwgrad_ext import (
     BatchAligner, BatchResult,
     SeqPair, SeqPairBatch,
 )
+from . import matrices
