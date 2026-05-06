@@ -89,10 +89,10 @@ for step in range(50):
     bw = 0 if step == 0 else BANDWIDTH
     total_log_z = batch.score_and_grad(bandwidth=bw)
 
-    # Summed gradient over all pairs → (20, 20)
+    # Summed gradient over all pairs → AlignParams
     grad = batch.compute_grad()
 
-    mat_array += LEARNING_RATE * grad   # gradient ascent on log Z
+    mat_array += LEARNING_RATE * grad.matrix.to_matrix()   # gradient ascent on log Z
     batch.set_matrix(nwgrad.SubstMatrix(mat_array))
 
     if step % 10 == 0:
@@ -110,13 +110,15 @@ For second-order methods that call an objective function repeatedly:
 ```python
 from scipy.optimize import minimize
 
+N = len(AA_ORDER)   # 20 for amino acids; change to match your alphabet
+
 def objective_and_grad(matrix_flat):
-    batch.set_matrix(nwgrad.SubstMatrix(matrix_flat.reshape(20, 20)))
+    batch.set_matrix(nwgrad.SubstMatrix(matrix_flat.reshape(N, N)))
 
     total_log_z = batch.score_and_grad()
     grad = batch.compute_grad()
 
-    return -float(total_log_z), -grad.ravel()
+    return -float(total_log_z), -grad.matrix.to_matrix().ravel()
 
 result = minimize(
     fun=objective_and_grad,
@@ -126,7 +128,7 @@ result = minimize(
     options={"maxiter": 50, "ftol": 1e-10, "gtol": 1e-6, "disp": True},
 )
 
-optimised = result.x.reshape(20, 20)
+optimised = result.x.reshape(N, N)
 print("Optimised matrix diagonal:", np.diag(optimised))
 ```
 
@@ -161,9 +163,9 @@ for epoch in range(5):
             ))
 
         loss = -mini_batch.score_and_grad()
-        grad = -mini_batch.compute_grad()
+        grad = mini_batch.compute_grad()
 
-        mat_array -= LR * grad
+        mat_array -= LR * grad.matrix.to_matrix()
         total_loss += loss
 
     print(f"Epoch {epoch+1}: loss={total_loss:.2f}")
@@ -186,7 +188,7 @@ sp = nwgrad.SeqPair(a, b, nwgrad.SubstMatrix(BLOSUM62),
 sp.align_full()
 sp.compute_grad()
 log_z = sp.score
-grad  = sp.grad.copy()
+grad  = sp.grad.matrix.to_matrix().copy()
 
 # Check entry (0, 0) — A-A substitution
 i, j = 0, 0
@@ -222,7 +224,8 @@ In practice you may want to:
 
 - **Fix the diagonal** (self-substitution scores) and only optimise off-diagonal:
   ```python
-  grad[np.diag_indices(20)] = 0
+  grad_mat = grad.matrix.to_matrix()
+  grad_mat[np.diag_indices(grad_mat.shape[0])] = 0
   ```
 
 - **Project onto the cone** of symmetric positive-semidefinite matrices after each

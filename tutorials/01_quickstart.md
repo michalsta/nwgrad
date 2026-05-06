@@ -11,8 +11,9 @@ pip install nwgrad
 
 ## The substitution matrix
 
-All alignment functions require a `SubstMatrix` constructed from a `(20, 20)` float64
-numpy array. The row/column order is the canonical 20 amino-acid alphabet:
+All alignment functions require a `SubstMatrix` constructed from an `(N, N)` float64
+numpy array and an alphabet string of length `N`. The default alphabet is the canonical
+20 amino-acid order:
 
 ```
 ACDEFGHIKLMNPQRSTVWY
@@ -50,6 +51,8 @@ BLOSUM62 = np.array([
 ], dtype=np.float64)
 
 blosum62 = nwgrad.SubstMatrix(BLOSUM62)
+# Equivalent explicit form:
+# blosum62 = nwgrad.SubstMatrix(BLOSUM62, alphabet="ACDEFGHIKLMNPQRSTVWY")
 ```
 
 The matrix is copied into an internal 256×256 ASCII-indexed table on construction.
@@ -61,9 +64,40 @@ print(blosum62.score('A', 'A'))   # 4.0
 print(blosum62.score('W', 'W'))   # 11.0
 print(blosum62.score('D', 'E'))   # 2.0
 
-# Round-trip back to numpy
-recovered = blosum62.to_matrix()  # shape (20, 20), dtype float64
+# Inspect alphabet
+print(blosum62.size)       # 20
+print(blosum62.alphabet)   # "ACDEFGHIKLMNPQRSTVWY"
+
+# Round-trip back to numpy — shape is (N, N) = (20, 20) for the default alphabet
+recovered = blosum62.to_matrix()
 ```
+
+### Custom alphabets
+
+Pass any square numpy array and a matching alphabet string to work with non-standard
+residues, DNA, RNA, or codon tables:
+
+```python
+# 4×4 DNA matrix: match=2, mismatch=-1
+DNA_ORDER = "ACGT"
+dna_matrix = np.eye(4, dtype=np.float64) * 3 - 1   # diagonal 2, off-diagonal -1
+dna_sm = nwgrad.SubstMatrix(dna_matrix, alphabet=DNA_ORDER)
+
+print(dna_sm.size)       # 4
+print(dna_sm.alphabet)   # "ACGT"
+print(dna_sm.score('A', 'A'))   # 2.0
+print(dna_sm.score('A', 'C'))   # -1.0
+
+# Align DNA sequences with a linear-gap model
+params = nwgrad.AlignParams(dna_matrix, alphabet=DNA_ORDER,
+                             gap_extend_a=-2.0, gap_extend_b=-2.0)
+score, grad = nwgrad.nw_grad("ACGTACGT", "ACGTACGT", params)
+print(score)                         # 16.0 (8 perfect matches × 2)
+print(grad.matrix.to_matrix())       # 4×4 identity (one count per match position)
+print(grad.matrix.alphabet)          # "ACGT"
+```
+
+The gradient matrix shape always matches the alphabet: `to_matrix()` returns `(N, N)`.
 
 ## Aligning a sequence pair with `SeqPair`
 
@@ -94,11 +128,11 @@ print(sp.score)   # 8.0
 
 ```python
 sp.compute_grad()
-grad = sp.grad     # (20, 20) numpy array
+grad = sp.grad     # AlignParams object
 ```
 
-`grad[i, j]` counts how many times amino acid `AA_ORDER[i]` is aligned to
-`AA_ORDER[j]` in the optimal traceback. This is the subgradient of the score
+`grad.matrix.to_matrix()[i, j]` counts how many times `alphabet[i]` is aligned to
+`alphabet[j]` in the optimal traceback. This is the subgradient of the score
 with respect to `matrix[i, j]`.
 
 ```python
@@ -127,8 +161,9 @@ sp_soft.align_full()
 print(sp_soft.score)    # log Z — always >= hard score
 
 sp_soft.compute_grad()
-soft_grad = sp_soft.grad   # fractional, shape (20, 20)
-print(f"soft_grad sum: {soft_grad.sum()}")  # <= min(len(a), len(b))
+soft_grad = sp_soft.grad                         # AlignParams object
+soft_mat  = sp_soft.grad.matrix.to_matrix()      # fractional, shape (N, N)
+print(f"soft_grad sum: {soft_mat.sum()}")  # <= min(len(a), len(b))
 ```
 
 The soft gradient is the right choice for gradient-based optimisation — it is
@@ -158,7 +193,7 @@ cached path, so `realign_banded()` can re-score cheaply around it instead of
 running the full O(m×n) DP again.
 
 ```python
-new_mat_array = BLOSUM62 + 0.1 * grad
+new_mat_array = BLOSUM62 + 0.1 * grad.matrix.to_matrix()
 new_blosum = nwgrad.SubstMatrix(new_mat_array)
 
 sp.set_matrix(new_blosum)      # clears score/grad; path_valid stays True

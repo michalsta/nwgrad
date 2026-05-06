@@ -60,9 +60,9 @@ print(f"Sum of log Z: {total_log_z:.3f}")
 for sp in pairs:
     print(f"  score={sp.score:.2f}  grad_valid={sp.grad_valid}")
 
-# Sum gradients across all pairs → (20, 20) numpy array
+# Sum gradients across all pairs → AlignParams
 grad = batch.compute_grad()
-print(f"Gradient shape: {grad.shape}")   # (20, 20)
+print(f"Gradient matrix shape: {grad.matrix.to_matrix().shape}")   # (N, N)
 ```
 
 `compute_grad()` reads the cached per-pair gradients. No DP work is done if all

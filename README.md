@@ -37,8 +37,11 @@ Requires Python ≥ 3.8 and a C++20 compiler (GCC 11+ or Clang 13+).
 import numpy as np
 import nwgrad
 
-# BLOSUM62 — 20×20 float64, canonical AA order: ACDEFGHIKLMNPQRSTVWY
+# BLOSUM62 — 20×20 float64, canonical AA order (default alphabet)
 blosum62 = nwgrad.SubstMatrix(BLOSUM62_ARRAY)
+
+# DNA — 4×4 float64 with explicit alphabet
+dna_mat = nwgrad.SubstMatrix(np.eye(4) * 2 - 1, alphabet="ACGT")
 ```
 
 ### Single pair — `SeqPair`
@@ -56,7 +59,7 @@ sp.align_full()
 print(sp.score)           # 8.0
 
 sp.compute_grad()
-print(sp.grad)            # (20, 20) numpy array — substitution-pair counts
+print(sp.grad)            # AlignParams — use .matrix.to_matrix() for the (N, N) array
 ```
 
 After updating the matrix, `realign_banded()` re-scores the pair cheaply around the existing alignment path:
@@ -83,7 +86,7 @@ for sp in pairs:
 # Align all pairs in parallel; score and grad are cached on each SeqPair
 total_log_z = batch.score_and_grad()
 
-# Sum gradients across all pairs → (20, 20) numpy array
+# Sum gradients across all pairs → AlignParams
 grad = batch.compute_grad()
 
 # Update matrix and re-run with banded DP around the existing paths
@@ -99,15 +102,19 @@ grad = batch.compute_grad()
 ### `SubstMatrix`
 
 ```python
-nwgrad.SubstMatrix(matrix: np.ndarray)
+nwgrad.SubstMatrix(matrix: np.ndarray, alphabet: str = "ACDEFGHIKLMNPQRSTVWY")
 ```
 
-Constructs a substitution matrix from a `(20, 20)` float64 numpy array in canonical amino acid order (`ACDEFGHIKLMNPQRSTVWY`). Stored internally as a `double[256][256]` ASCII-indexed table for O(1) lookup without char-to-index mapping. Asymmetric matrices are fully supported.
+Constructs a substitution matrix from an `(N, N)` float64 numpy array where `N = len(alphabet)`. The default alphabet is the 20 canonical amino acids (`ACDEFGHIKLMNPQRSTVWY`), giving the same 20×20 behaviour as before. Any square matrix with a matching alphabet string is accepted — including DNA (`"ACGT"`), extended amino acids, or any other symbol set.
+
+Stored internally as a `double[256][256]` ASCII-indexed table for O(1) lookup without char-to-index mapping. Asymmetric matrices are fully supported.
 
 | Member | Description |
 |---|---|
 | `score(a, b)` | Substitution score for single characters `a`, `b` |
-| `to_matrix()` | Export as `(20, 20)` float64 numpy array |
+| `to_matrix()` | Export as `(N, N)` float64 numpy array in alphabet order |
+| `size` | Alphabet size `N` |
+| `alphabet` | The alphabet string (length `N`) |
 
 ---
 
@@ -141,7 +148,7 @@ Persistent sequence-pair object. Sequences and alignment mode are fixed at const
 | Property | Type | Description |
 |---|---|---|
 | `score` | `float \| None` | Alignment score (or `log Z` for soft), or `None` if not computed |
-| `grad` | `np.ndarray[20,20] \| None` | Gradient, or `None` if not computed |
+| `grad` | `AlignParams \| None` | Gradient, or `None` if not computed |
 | `guide_j` | `list[int] \| None` | Alignment path (length m+1), or `None` if not computed |
 | `seq_a`, `seq_b` | `str` | The fixed sequences |
 | `path_valid` | `bool` | `guide_j` is usable as a banding guide |
@@ -174,7 +181,7 @@ nwgrad.SeqPairBatch(n_threads=0)
 | `add(seq_pair)` | — | Append a `SeqPair` |
 | `set_matrix(matrix)` | — | Call `set_matrix()` on all pairs |
 | `score_and_grad(bandwidth=0)` | `float` (sum of scores) | Full-pipeline parallel alignment. Uses per-thread DP buffers (pair-owned tables are never allocated). If `bandwidth > 0`, runs a full DP for the guide path then a banded DP. Results are cached on each `SeqPair`. |
-| `compute_grad()` | `np.ndarray[20,20]` | Sum cached per-pair gradients. No DP work if all `grad_valid` are already true. |
+| `compute_grad()` | `AlignParams` | Sum cached per-pair gradients. No DP work if all `grad_valid` are already true. |
 | `align_full()` | `float` (sum of scores) | Full DP on all pairs in parallel using pair-owned buffers. Call `alloc_dp()` first. |
 | `realign_banded(bandwidth)` | `float` (sum of scores) | Banded DP on all pairs in parallel using pair-owned buffers. |
 | `alloc_dp()` | — | Pre-allocate pair-owned DP tables in parallel. |
@@ -197,8 +204,8 @@ for a, b in zip(seqs_a, seqs_b):
 
 for step in range(n_steps):
     total_log_z = batch.score_and_grad(bandwidth=bw if step > 0 else 0)
-    grad = batch.compute_grad()       # (20, 20)
-    mat_array += lr * grad
+    grad = batch.compute_grad()
+    mat_array += lr * grad.matrix.to_matrix()
     batch.set_matrix(nwgrad.SubstMatrix(mat_array))
 ```
 
@@ -229,7 +236,7 @@ Aligns each pair `(sequences_a[i], sequences_b[i])`.
 | Attribute | Type | Description |
 |---|---|---|
 | `scores` | `np.ndarray[N]` float64 | Score (or log-partition for soft) per pair |
-| `grad` | `np.ndarray[20,20]` float64 | Gradient summed over all pairs |
+| `grad` | `AlignParams` | Gradient summed over all pairs |
 
 ---
 
@@ -246,7 +253,7 @@ Stateless functions that create and destroy their DP tables on every call. Usefu
 | `nw_score_affine(a, b, matrix, gap_open, gap_extend)` | Affine | Global (NW) |
 | `sw_score_affine(a, b, matrix, gap_open, gap_extend)` | Affine | Local (SW) |
 
-**Hard gradient** — return `(score: float, grad: np.ndarray[20,20])`:
+**Hard gradient** — return `(score: float, grad: AlignParams)`:
 
 | Function | Gap model | Alignment |
 |---|---|---|
@@ -255,7 +262,7 @@ Stateless functions that create and destroy their DP tables on every call. Usefu
 | `nw_affine_grad(a, b, matrix, gap_open, gap_extend)` | Affine | Global |
 | `sw_affine_grad(a, b, matrix, gap_open, gap_extend)` | Affine | Local |
 
-**Soft gradient** — return `(log_z: float, grad: np.ndarray[20,20])`:
+**Soft gradient** — return `(log_z: float, grad: AlignParams)`:
 
 | Function | Gap model | Alignment |
 |---|---|---|
