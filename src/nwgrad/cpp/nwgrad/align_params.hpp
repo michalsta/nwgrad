@@ -25,6 +25,7 @@ struct AlignParams {
 
     AlignParams operator+(const AlignParams& o) const {
         AlignParams r;
+        r.matrix.order_ = matrix.order_;
         for (int i = 0; i < 256; ++i)
             for (int j = 0; j < 256; ++j)
                 r.matrix.mat[i][j] = matrix.mat[i][j] + o.matrix.mat[i][j];
@@ -48,6 +49,7 @@ struct AlignParams {
 
     AlignParams operator*(double s) const {
         AlignParams r;
+        r.matrix.order_ = matrix.order_;
         for (int i = 0; i < 256; ++i)
             for (int j = 0; j < 256; ++j)
                 r.matrix.mat[i][j] = matrix.mat[i][j] * s;

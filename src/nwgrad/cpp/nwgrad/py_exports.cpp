@@ -13,7 +13,7 @@
 #include "seq_pair_batch.hpp"
 
 namespace nb = nanobind;
-using nb_arr_f64    = nb::ndarray<double, nb::shape<20, 20>, nb::c_contig, nb::device::cpu>;
+using nb_arr_f64    = nb::ndarray<double, nb::ndim<2>, nb::c_contig, nb::device::cpu>;
 using nb_arr_f64_1d = nb::ndarray<nb::numpy, double, nb::ndim<1>>;
 
 // ── Aligner factory: picks Full or GuideBanded at runtime. ───────────────────
@@ -44,12 +44,18 @@ NB_MODULE(nwgrad_ext, m) {
     nb::class_<SubstMatrix>(m, "SubstMatrix")
         .def(
             "__init__",
-            [](SubstMatrix* self, nb_arr_f64 arr) {
-                new (self) SubstMatrix(arr.data());
+            [](SubstMatrix* self, nb_arr_f64 arr, const std::string& alphabet) {
+                if (arr.shape(0) != arr.shape(1))
+                    throw std::invalid_argument("matrix must be square");
+                if (static_cast<size_t>(alphabet.size()) != arr.shape(0))
+                    throw std::invalid_argument("alphabet length must match matrix size");
+                new (self) SubstMatrix(arr.data(), alphabet);
             },
             nb::arg("matrix"),
-            "Construct from a (20, 20) float64 numpy array in canonical AA order "
-            "(ACDEFGHIKLMNPQRSTVWY).")
+            nb::arg("alphabet") = std::string(AA_ORDER),
+            "Construct from an (N, N) float64 numpy array.\n"
+            "alphabet: string of N symbols in row/column order "
+            "(default: canonical AA order ACDEFGHIKLMNPQRSTVWY).")
         .def(
             "score",
             [](const SubstMatrix& self, const std::string& a, const std::string& b) {
@@ -58,40 +64,51 @@ NB_MODULE(nwgrad_ext, m) {
                 return self.score(a[0], b[0]);
             },
             nb::arg("a"), nb::arg("b"),
-            "Return substitution score for amino acids a and b.")
+            "Return substitution score for the two given single-character strings.")
         .def(
             "to_matrix",
             [](const SubstMatrix& self) {
-                double* buf = new double[400];
+                int n = self.size();
+                double* buf = new double[n * n];
                 self.to_array(buf);
                 nb::capsule owner(buf, [](void* p) noexcept { delete[] static_cast<double*>(p); });
-                return nb::ndarray<nb::numpy, double, nb::shape<20, 20>>(buf, {20, 20}, owner);
+                size_t shape[2] = {static_cast<size_t>(n), static_cast<size_t>(n)};
+                return nb::ndarray<nb::numpy, double>(buf, 2, shape, owner);
             },
-            "Export as a (20, 20) float64 numpy array in canonical AA order.");
+            "Export as an (N, N) float64 numpy array in alphabet order.")
+        .def_prop_ro("size",     &SubstMatrix::size,  "Alphabet size N.")
+        .def_prop_ro("alphabet", [](const SubstMatrix& s) { return s.order(); },
+                     "Alphabet string (length N) defining row/column order.");
 
     // ── AlignParams ──────────────────────────────────────────────────────────
     nb::class_<AlignParams>(m, "AlignParams")
         .def(
             "__init__",
-            [](AlignParams* self, nb_arr_f64 arr,
+            [](AlignParams* self, nb_arr_f64 arr, const std::string& alphabet,
                double gap_open_a, double gap_extend_a,
                double gap_open_b, double gap_extend_b) {
+                if (arr.shape(0) != arr.shape(1))
+                    throw std::invalid_argument("matrix must be square");
+                if (static_cast<size_t>(alphabet.size()) != arr.shape(0))
+                    throw std::invalid_argument("alphabet length must match matrix size");
                 new (self) AlignParams();
-                self->matrix       = SubstMatrix(arr.data());
+                self->matrix       = SubstMatrix(arr.data(), alphabet);
                 self->gap_open_a   = gap_open_a;
                 self->gap_extend_a = gap_extend_a;
                 self->gap_open_b   = gap_open_b;
                 self->gap_extend_b = gap_extend_b;
             },
             nb::arg("matrix"),
+            nb::arg("alphabet")     = std::string(AA_ORDER),
             nb::arg("gap_open_a")   = 0.0,
             nb::arg("gap_extend_a") = 0.0,
             nb::arg("gap_open_b")   = 0.0,
             nb::arg("gap_extend_b") = 0.0,
             "Alignment parameters bundling a substitution matrix with asymmetric gap costs.\n"
+            "  alphabet    : symbol order for the N×N matrix (default: canonical AA order)\n"
             "  gap_open_a / gap_extend_a : penalties for gaps in sequence A (Y state)\n"
             "  gap_open_b / gap_extend_b : penalties for gaps in sequence B (X state)\n"
-            "All values default to 0.0 (usable as a zero gradient accumulator).")
+            "All gap values default to 0.0 (usable as a zero gradient accumulator).")
         .def_prop_rw(
             "matrix",
             [](const AlignParams& self) { return self.matrix; },
@@ -200,7 +217,8 @@ NB_MODULE(nwgrad_ext, m) {
             WITH_ALIGNER(Linear, Global, band, gj, {
                 al.set_problem(a, b, params, band, gj);
                 al.compute_viterbi(_buf);
-                AlignParams grad{};
+                AlignParams grad;
+                grad.matrix.order_ = params.matrix.order_;
                 al.hard_grad(_buf, grad);
                 return nb::make_tuple(al.score(), grad);
             });
@@ -218,7 +236,8 @@ NB_MODULE(nwgrad_ext, m) {
             WITH_ALIGNER(Linear, Local, band, gj, {
                 al.set_problem(a, b, params, band, gj);
                 al.compute_viterbi(_buf);
-                AlignParams grad{};
+                AlignParams grad;
+                grad.matrix.order_ = params.matrix.order_;
                 al.hard_grad(_buf, grad);
                 return nb::make_tuple(al.score(), grad);
             });
@@ -236,7 +255,8 @@ NB_MODULE(nwgrad_ext, m) {
             WITH_ALIGNER(Affine, Global, band, gj, {
                 al.set_problem(a, b, params, band, gj);
                 al.compute_viterbi(_buf);
-                AlignParams grad{};
+                AlignParams grad;
+                grad.matrix.order_ = params.matrix.order_;
                 al.hard_grad(_buf, grad);
                 return nb::make_tuple(al.score(), grad);
             });
@@ -254,7 +274,8 @@ NB_MODULE(nwgrad_ext, m) {
             WITH_ALIGNER(Affine, Local, band, gj, {
                 al.set_problem(a, b, params, band, gj);
                 al.compute_viterbi(_buf);
-                AlignParams grad{};
+                AlignParams grad;
+                grad.matrix.order_ = params.matrix.order_;
                 al.hard_grad(_buf, grad);
                 return nb::make_tuple(al.score(), grad);
             });
@@ -274,7 +295,8 @@ NB_MODULE(nwgrad_ext, m) {
             WITH_ALIGNER(Linear, Global, band, gj, {
                 al.set_problem(a, b, params, band, gj);
                 al.compute_forward_back(_buf);
-                AlignParams grad{};
+                AlignParams grad;
+                grad.matrix.order_ = params.matrix.order_;
                 al.soft_grad(_buf, grad);
                 return nb::make_tuple(al.log_z(), grad);
             });
@@ -292,7 +314,8 @@ NB_MODULE(nwgrad_ext, m) {
             WITH_ALIGNER(Linear, Local, band, gj, {
                 al.set_problem(a, b, params, band, gj);
                 al.compute_forward_back(_buf);
-                AlignParams grad{};
+                AlignParams grad;
+                grad.matrix.order_ = params.matrix.order_;
                 al.soft_grad(_buf, grad);
                 return nb::make_tuple(al.log_z(), grad);
             });
@@ -310,7 +333,8 @@ NB_MODULE(nwgrad_ext, m) {
             WITH_ALIGNER(Affine, Global, band, gj, {
                 al.set_problem(a, b, params, band, gj);
                 al.compute_forward_back(_buf);
-                AlignParams grad{};
+                AlignParams grad;
+                grad.matrix.order_ = params.matrix.order_;
                 al.soft_grad(_buf, grad);
                 return nb::make_tuple(al.log_z(), grad);
             });
@@ -328,7 +352,8 @@ NB_MODULE(nwgrad_ext, m) {
             WITH_ALIGNER(Affine, Local, band, gj, {
                 al.set_problem(a, b, params, band, gj);
                 al.compute_forward_back(_buf);
-                AlignParams grad{};
+                AlignParams grad;
+                grad.matrix.order_ = params.matrix.order_;
                 al.soft_grad(_buf, grad);
                 return nb::make_tuple(al.log_z(), grad);
             });
