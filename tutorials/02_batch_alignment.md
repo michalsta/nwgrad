@@ -24,15 +24,20 @@ changes. Compared to looping over `SeqPair` objects in Python:
 import numpy as np
 import nwgrad
 
-# ... construct blosum62 as in Tutorial 1 ...
+# ... construct blosum62 and BLOSUM62 array as in Tutorial 1 ...
 
 seqs_a = ["PLEASANTLY", "ACDEFGHIKL", "MADEEKLF", "ACDE"]
 seqs_b = ["MEANLY",     "CDEFGHIKLM", "MADEEKLF", "ACDF"]
 
-# Build SeqPair objects once; they will be reused across iterations
+# AlignParams bundles the matrix with gap penalties.
+params = nwgrad.AlignParams(BLOSUM62,
+                             gap_open_a=11.0, gap_extend_a=1.0,
+                             gap_open_b=11.0, gap_extend_b=1.0)
+
+# Build SeqPair objects once; they will be reused across iterations.
+# SeqPair stores a reference to params — keep it alive.
 pairs = [
-    nwgrad.SeqPair(a, b, blosum62,
-                   gap_open=11.0, gap_extend=1.0,
+    nwgrad.SeqPair(a, b, params,
                    gap_model="affine",
                    mode="global",
                    grad_mode="soft")
@@ -81,8 +86,11 @@ for step in range(20):
     total = batch.score_and_grad(bandwidth=30 if step > 0 else 0)
     grad  = batch.compute_grad()
 
-    mat_array += 0.01 * grad
-    batch.set_matrix(nwgrad.SubstMatrix(mat_array))
+    mat_array += 0.01 * grad.matrix.to_matrix()
+    params = nwgrad.AlignParams(mat_array,
+                                 gap_open_a=11.0, gap_extend_a=1.0,
+                                 gap_open_b=11.0, gap_extend_b=1.0)
+    batch.set_params(params)
 
     print(f"step {step:2d}  total log Z = {total:.2f}")
 ```
@@ -110,10 +118,11 @@ Use `"none"` when you only need scores — it skips the traceback/backward pass.
 construction time. You can mix modes in the same batch if needed.
 
 ```python
+params_lin = nwgrad.AlignParams(BLOSUM62, gap_extend_a=1.0, gap_extend_b=1.0)
 batch_lin_global = nwgrad.SeqPairBatch(n_threads=4)
 for a, b in zip(seqs_a, seqs_b):
     batch_lin_global.add(nwgrad.SeqPair(
-        a, b, blosum62, gap_extend=1.0,
+        a, b, params_lin,
         gap_model="linear", mode="global", grad_mode="hard",
     ))
 
@@ -128,6 +137,9 @@ accumulations are merged under a mutex at join time, and floating-point addition
 order is deterministic within each thread.
 
 ```python
+params_orig = nwgrad.AlignParams(BLOSUM62,
+                                  gap_open_a=11.0, gap_extend_a=1.0,
+                                  gap_open_b=11.0, gap_extend_b=1.0)
 ref_total = None
 for n in [1, 2, 4, 8]:
     b = nwgrad.SeqPairBatch(n_threads=n)
@@ -135,7 +147,7 @@ for n in [1, 2, 4, 8]:
         b.add(sp)
     # Re-run from a clean state
     for sp in pairs:
-        sp.set_matrix(blosum62)
+        sp.set_params(params_orig)
     total = b.score_and_grad()
     grad  = b.compute_grad()
     if ref_total is None:
@@ -154,12 +166,14 @@ sequence against every other:
 ```python
 sequences = ["ACDEFG", "MADEEKLF", "PLEASANTLY", "ACDE", "CDEFGHIKLM"]
 
+params_ava = nwgrad.AlignParams(BLOSUM62,
+                                 gap_open_a=11.0, gap_extend_a=1.0,
+                                 gap_open_b=11.0, gap_extend_b=1.0)
 batch = nwgrad.SeqPairBatch(n_threads=4)
 for i in range(len(sequences)):
     for j in range(i + 1, len(sequences)):
         batch.add(nwgrad.SeqPair(
-            sequences[i], sequences[j], blosum62,
-            gap_open=11.0, gap_extend=1.0,
+            sequences[i], sequences[j], params_ava,
             gap_model="affine", mode="global", grad_mode="soft",
         ))
 

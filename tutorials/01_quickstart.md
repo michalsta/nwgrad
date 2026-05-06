@@ -90,7 +90,7 @@ print(dna_sm.score('A', 'C'))   # -1.0
 
 # Align DNA sequences with a linear-gap model
 params = nwgrad.AlignParams(dna_matrix, alphabet=DNA_ORDER,
-                             gap_extend_a=-2.0, gap_extend_b=-2.0)
+                             gap_extend_a=2.0, gap_extend_b=2.0)
 score, grad = nwgrad.nw_grad("ACGTACGT", "ACGTACGT", params)
 print(score)                         # 16.0 (8 perfect matches × 2)
 print(grad.matrix.to_matrix())       # 4×4 identity (one count per match position)
@@ -102,25 +102,41 @@ The gradient matrix shape always matches the alphabet: `to_matrix()` returns `(N
 ## Aligning a sequence pair with `SeqPair`
 
 `SeqPair` is the primary interface for single-pair alignment. It holds the
-sequences, matrix reference, and cached alignment state, and can be reused
+sequences, alignment parameters, and cached alignment state, and can be reused
 efficiently across multiple matrix updates.
 
+`SeqPair` takes an `AlignParams` object that bundles the substitution matrix
+with gap penalties. Construct one before creating the pair:
+
 ```python
+params = nwgrad.AlignParams(
+    BLOSUM62,
+    gap_open_a=11.0, gap_extend_a=1.0,   # gap penalties for sequence A
+    gap_open_b=11.0, gap_extend_b=1.0,   # gap penalties for sequence B
+)
+
 sp = nwgrad.SeqPair(
-    "PLEASANTLY", "MEANLY", blosum62,
-    gap_open=11.0, gap_extend=1.0,
+    "PLEASANTLY", "MEANLY", params,
     gap_model="affine",   # "linear" | "affine"
     mode="global",        # "global" (NW) | "local" (SW)
     grad_mode="hard",     # "hard" | "soft" | "none"
 )
 ```
 
+`SeqPair` stores a reference to the `AlignParams` object — keep it alive for
+the lifetime of the pair.
+
 ### Computing the score
 
 ```python
+sp.alloc_dp()     # allocate own DP buffer before the first alignment
 sp.align_full()
-print(sp.score)   # 8.0
+print(sp.score)   # -3.0
 ```
+
+`alloc_dp()` must be called once before `align_full()`. It is not needed when
+using `SeqPairBatch.score_and_grad()`, which allocates per-thread buffers
+instead.
 
 `align_full()` runs the full O(m×n) DP and caches the alignment path (`guide_j`).
 
@@ -152,11 +168,11 @@ the matrix.
 
 ```python
 sp_soft = nwgrad.SeqPair(
-    "PLEASANTLY", "MEANLY", blosum62,
-    gap_open=11.0, gap_extend=1.0,
+    "PLEASANTLY", "MEANLY", params,
     gap_model="affine", mode="global",
     grad_mode="soft",
 )
+sp_soft.alloc_dp()
 sp_soft.align_full()
 print(sp_soft.score)    # log Z — always >= hard score
 
@@ -174,11 +190,13 @@ everywhere differentiable (the hard subgradient is not differentiable at score t
 ```python
 for gap_model in ("linear", "affine"):
     for mode in ("global", "local"):
-        kw = dict(gap_extend=1.0)
+        kw = dict(gap_extend_a=1.0, gap_extend_b=1.0)
         if gap_model == "affine":
-            kw["gap_open"] = 11.0
-        sp = nwgrad.SeqPair("PLEASANTLY", "MEANLY", blosum62,
-                            gap_model=gap_model, mode=mode, **kw)
+            kw["gap_open_a"] = kw["gap_open_b"] = 11.0
+        p = nwgrad.AlignParams(BLOSUM62, **kw)
+        sp = nwgrad.SeqPair("PLEASANTLY", "MEANLY", p,
+                            gap_model=gap_model, mode=mode)
+        sp.alloc_dp()
         sp.align_full()
         print(f"{gap_model:6s} {mode:6s}  score={sp.score:.1f}")
 ```
@@ -188,19 +206,23 @@ Local alignment scores are always ≥ 0 (a zero-length local alignment is valid)
 ## Updating the matrix
 
 After a gradient step the matrix changes but the alignment path is still a
-reasonable guide. `set_matrix()` swaps the matrix in O(1) and preserves the
-cached path, so `realign_banded()` can re-score cheaply around it instead of
-running the full O(m×n) DP again.
+reasonable guide. `set_params()` swaps the parameters and preserves the cached
+path, so `realign_banded()` can re-score cheaply around it instead of running
+the full O(m×n) DP again.
 
 ```python
 new_mat_array = BLOSUM62 + 0.1 * grad.matrix.to_matrix()
-new_blosum = nwgrad.SubstMatrix(new_mat_array)
+new_params = nwgrad.AlignParams(new_mat_array,
+                                gap_open_a=11.0, gap_extend_a=1.0,
+                                gap_open_b=11.0, gap_extend_b=1.0)
 
-sp.set_matrix(new_blosum)      # clears score/grad; path_valid stays True
+sp.set_params(new_params)      # clears score/grad; path_valid stays True
 sp.realign_banded(bandwidth=20)
 sp.compute_grad()
-print(sp.score, sp.grad.sum())
+print(sp.score, sp.grad.matrix.to_matrix().sum())
 ```
+
+`new_params` must remain alive for as long as `sp` uses it.
 
 The `bandwidth` parameter is the half-width of the band in cells. If the true
 optimal path lies outside the band, the result is silently sub-optimal.

@@ -62,17 +62,18 @@ seqs_b = [mutate(s, rate=0.15) for s in base_seqs]
 ## Building the batch
 
 `SeqPair` objects are constructed once and reused across all optimisation
-iterations. Only the matrix changes between iterations — the sequences and
-alignment mode are fixed.
+iterations. Only the matrix (inside `AlignParams`) changes between iterations —
+the sequences and alignment mode are fixed.
 
 ```python
-mat = nwgrad.SubstMatrix(mat_array)
+params = nwgrad.AlignParams(mat_array,
+                             gap_open_a=11.0, gap_extend_a=1.0,
+                             gap_open_b=11.0, gap_extend_b=1.0)
 
 batch = nwgrad.SeqPairBatch(n_threads=4)
 for a, b in zip(seqs_a, seqs_b):
     batch.add(nwgrad.SeqPair(
-        a, b, mat,
-        gap_open=11.0, gap_extend=1.0,
+        a, b, params,
         gap_model="affine", mode="global",
         grad_mode="soft",
     ))
@@ -93,15 +94,19 @@ for step in range(50):
     grad = batch.compute_grad()
 
     mat_array += LEARNING_RATE * grad.matrix.to_matrix()   # gradient ascent on log Z
-    batch.set_matrix(nwgrad.SubstMatrix(mat_array))
+    params = nwgrad.AlignParams(mat_array,
+                                 gap_open_a=11.0, gap_extend_a=1.0,
+                                 gap_open_b=11.0, gap_extend_b=1.0)
+    batch.set_params(params)
 
     if step % 10 == 0:
         print(f"step {step:3d}  total log Z = {total_log_z:.2f}")
 ```
 
-`batch.set_matrix()` invalidates cached scores and gradients on all pairs but
+`batch.set_params()` invalidates cached scores and gradients on all pairs but
 preserves the alignment paths, so the next `score_and_grad(bandwidth=bw)` uses
-banded DP instead of a full re-alignment.
+banded DP instead of a full re-alignment. Keep `params` alive until after the
+next `score_and_grad()` call.
 
 ## Using scipy L-BFGS-B
 
@@ -113,7 +118,10 @@ from scipy.optimize import minimize
 N = len(AA_ORDER)   # 20 for amino acids; change to match your alphabet
 
 def objective_and_grad(matrix_flat):
-    batch.set_matrix(nwgrad.SubstMatrix(matrix_flat.reshape(N, N)))
+    p = nwgrad.AlignParams(matrix_flat.reshape(N, N),
+                            gap_open_a=11.0, gap_extend_a=1.0,
+                            gap_open_b=11.0, gap_extend_b=1.0)
+    batch.set_params(p)
 
     total_log_z = batch.score_and_grad()
     grad = batch.compute_grad()
@@ -152,13 +160,14 @@ for epoch in range(5):
 
     for start in range(0, len(all_pairs), BATCH_SIZE):
         idx = all_pairs[start:start + BATCH_SIZE]
-        mat = nwgrad.SubstMatrix(mat_array)
+        p = nwgrad.AlignParams(mat_array,
+                                gap_open_a=11.0, gap_extend_a=1.0,
+                                gap_open_b=11.0, gap_extend_b=1.0)
 
         mini_batch = nwgrad.SeqPairBatch(n_threads=4)
         for i in idx:
             mini_batch.add(nwgrad.SeqPair(
-                seqs_a[i], seqs_b[i], mat,
-                gap_open=11.0, gap_extend=1.0,
+                seqs_a[i], seqs_b[i], p,
                 gap_model="affine", mode="global", grad_mode="soft",
             ))
 
@@ -182,9 +191,13 @@ finite differences on a small example:
 a, b = "ACDE", "ACDF"
 EPS = 1e-5
 
-sp = nwgrad.SeqPair(a, b, nwgrad.SubstMatrix(BLOSUM62),
-                    gap_open=11.0, gap_extend=1.0,
+def make_params(mat):
+    return nwgrad.AlignParams(mat, gap_open_a=11.0, gap_extend_a=1.0,
+                               gap_open_b=11.0, gap_extend_b=1.0)
+
+sp = nwgrad.SeqPair(a, b, make_params(BLOSUM62),
                     gap_model="affine", mode="global", grad_mode="soft")
+sp.alloc_dp()
 sp.align_full()
 sp.compute_grad()
 log_z = sp.score
@@ -195,14 +208,16 @@ i, j = 0, 0
 m_plus  = BLOSUM62.copy(); m_plus[i, j]  += EPS; m_plus[j, i]  += EPS
 m_minus = BLOSUM62.copy(); m_minus[i, j] -= EPS; m_minus[j, i] -= EPS
 
-sp_p = nwgrad.SeqPair(a, b, nwgrad.SubstMatrix(m_plus),
-                      gap_open=11.0, gap_extend=1.0,
+p_plus  = make_params(m_plus)
+sp_p = nwgrad.SeqPair(a, b, p_plus,
                       gap_model="affine", mode="global", grad_mode="soft")
+sp_p.alloc_dp()
 sp_p.align_full()
 
-sp_m = nwgrad.SeqPair(a, b, nwgrad.SubstMatrix(m_minus),
-                      gap_open=11.0, gap_extend=1.0,
+p_minus = make_params(m_minus)
+sp_m = nwgrad.SeqPair(a, b, p_minus,
                       gap_model="affine", mode="global", grad_mode="soft")
+sp_m.alloc_dp()
 sp_m.align_full()
 
 numerical  = (sp_p.score - sp_m.score) / (2 * EPS)
@@ -237,11 +252,13 @@ The hard subgradient can be used with subgradient methods. The step size must
 be annealed because the subgradient is not a descent direction in general.
 
 ```python
+params_hard = nwgrad.AlignParams(mat_array,
+                                  gap_open_a=11.0, gap_extend_a=1.0,
+                                  gap_open_b=11.0, gap_extend_b=1.0)
 batch_hard = nwgrad.SeqPairBatch(n_threads=4)
 for a, b in zip(seqs_a, seqs_b):
     batch_hard.add(nwgrad.SeqPair(
-        a, b, nwgrad.SubstMatrix(mat_array),
-        gap_open=11.0, gap_extend=1.0,
+        a, b, params_hard,
         gap_model="affine", mode="global", grad_mode="hard",
     ))
 
@@ -250,8 +267,11 @@ for t in range(200):
     total = batch_hard.score_and_grad()
     grad  = batch_hard.compute_grad()
 
-    mat_array += lr * grad
-    batch_hard.set_matrix(nwgrad.SubstMatrix(mat_array))
+    mat_array += lr * grad.matrix.to_matrix()
+    params_hard = nwgrad.AlignParams(mat_array,
+                                      gap_open_a=11.0, gap_extend_a=1.0,
+                                      gap_open_b=11.0, gap_extend_b=1.0)
+    batch_hard.set_params(params_hard)
 
     if t % 20 == 0:
         print(f"step {t:3d}  lr={lr:.5f}  total_score={total:.1f}")
