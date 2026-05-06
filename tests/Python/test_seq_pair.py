@@ -107,19 +107,20 @@ ALL_CONFIGS = [
 # ── SeqPair: allocation lifecycle ─────────────────────────────────────────────
 
 class TestExplicitAlloc:
-    """alloc_dp() is an optimization hint; align_full auto-allocates if needed."""
+    """alloc_dp() is required before align_full() / realign_banded()."""
 
-    def test_align_full_without_alloc_works(self, blosum):
+    def test_align_full_without_alloc_raises(self, blosum):
         sp = nwgrad.SeqPair("ACDE", "ACDE", blosum)
-        sp.align_full()  # auto-allocates
-        assert sp.score_valid
+        with pytest.raises(RuntimeError):
+            sp.align_full()
 
-    def test_realign_banded_after_drop_dp_works(self, blosum):
+    def test_realign_banded_after_drop_dp_requires_alloc(self, blosum):
         sp = nwgrad.SeqPair("ACDE", "ACDE", blosum)
         sp.alloc_dp()
         sp.align_full()
         sp.drop_dp()
-        sp.realign_banded(10)  # auto-reallocates
+        sp.alloc_dp()
+        sp.realign_banded(10)
         assert sp.score_valid
 
     def test_align_full_after_alloc_succeeds(self, blosum):
@@ -128,11 +129,11 @@ class TestExplicitAlloc:
         sp.align_full()
         assert sp.score_valid
 
-    def test_batch_align_full_without_alloc_works(self, blosum):
+    def test_batch_align_full_without_alloc_raises(self, blosum):
         batch = nwgrad.SeqPairBatch(n_threads=1)
         batch.add(nwgrad.SeqPair("ACDE", "ACDE", blosum))
-        batch.align_full()  # auto-allocates
-        assert batch[0].score_valid
+        with pytest.raises(RuntimeError):
+            batch.align_full()
 
     def test_batch_align_full_after_alloc_succeeds(self, blosum):
         batch = nwgrad.SeqPairBatch(n_threads=1)
