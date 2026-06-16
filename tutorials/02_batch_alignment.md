@@ -23,19 +23,18 @@ changes. Compared to looping over `SeqPair` objects in Python:
 ```python
 import numpy as np
 import nwgrad
-
-# ... construct blosum62 and BLOSUM62 array as in Tutorial 1 ...
+from nwgrad.matrices import BLOSUM62   # a SubstMatrix, NCBI 23-symbol alphabet
 
 seqs_a = ["PLEASANTLY", "ACDEFGHIKL", "MADEEKLF", "ACDE"]
 seqs_b = ["MEANLY",     "CDEFGHIKLM", "MADEEKLF", "ACDF"]
 
-# AlignParams bundles the matrix with gap penalties.
+# AlignParams bundles the matrix with gap penalties.  Pass the SubstMatrix
+# directly — its alphabet travels with it.
 params = nwgrad.AlignParams(BLOSUM62,
-                             gap_open_a=11.0, gap_extend_a=1.0,
-                             gap_open_b=11.0, gap_extend_b=1.0)
+                            gap_open_a=11.0, gap_extend_a=1.0,
+                            gap_open_b=11.0, gap_extend_b=1.0)
 
 # Build SeqPair objects once; they will be reused across iterations.
-# SeqPair stores a reference to params — keep it alive.
 pairs = [
     nwgrad.SeqPair(a, b, params,
                    gap_model="affine",
@@ -49,8 +48,8 @@ for sp in pairs:
     batch.add(sp)
 ```
 
-`SeqPairBatch` holds non-owning references to `SeqPair` objects — each `SeqPair`
-must remain alive for the lifetime of the batch.
+`batch.add()` keeps each `SeqPair` (and, transitively, its `AlignParams`) alive
+for the lifetime of the batch.
 
 ## `score_and_grad()`
 
@@ -80,16 +79,17 @@ to all pairs at once. The alignment paths are preserved so the next call to
 `score_and_grad(bandwidth=bw)` can use banded DP instead of full DP:
 
 ```python
-mat_array = BLOSUM62.copy()
+alphabet  = BLOSUM62.alphabet
+mat_array = BLOSUM62.to_matrix()        # learnable array, in `alphabet` order
 
 for step in range(20):
     total = batch.score_and_grad(bandwidth=30 if step > 0 else 0)
     grad  = batch.compute_grad()
 
-    mat_array += 0.01 * grad.matrix.to_matrix()
-    params = nwgrad.AlignParams(mat_array,
-                                 gap_open_a=11.0, gap_extend_a=1.0,
-                                 gap_open_b=11.0, gap_extend_b=1.0)
+    mat_array += 0.01 * grad.matrix.to_matrix()   # grad is in the same alphabet order
+    params = nwgrad.AlignParams(nwgrad.SubstMatrix(mat_array, alphabet),
+                                gap_open_a=11.0, gap_extend_a=1.0,
+                                gap_open_b=11.0, gap_extend_b=1.0)
     batch.set_params(params)
 
     print(f"step {step:2d}  total log Z = {total:.2f}")

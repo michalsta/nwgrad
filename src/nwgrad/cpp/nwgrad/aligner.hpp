@@ -4,6 +4,7 @@
 #include <cmath>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -196,6 +197,14 @@ struct Aligner {
         return guide_j_from_viterbi(own_buf_);
     }
 
+    // Reconstruct the gapped aligned sequences (a, b) from the Viterbi traceback.
+    // Each string uses '-' for gaps and the two are of equal length.  Works for
+    // both global (full-length) and local (matched sub-region only) alignment.
+    std::pair<std::string, std::string> aligned() const {
+        check_viterbi();
+        return aligned(own_buf_);
+    }
+
     void hard_grad(AlignParams& grad) const {
         check_viterbi();
         hard_grad(own_buf_, grad);
@@ -243,6 +252,13 @@ struct Aligner {
     std::vector<int> guide_j_from_viterbi(const DpBuffer& buf) const {
         if constexpr (GM == GapModel::Linear) return guide_j_linear(buf);
         else                                   return guide_j_affine(buf);
+    }
+
+    std::pair<std::string, std::string> aligned(const DpBuffer& buf) const {
+        std::string a, b;
+        if constexpr (GM == GapModel::Linear) aligned_linear(buf, a, b);
+        else                                   aligned_affine(buf, a, b);
+        return {std::move(a), std::move(b)};
     }
 
     void hard_grad(const DpBuffer& buf, AlignParams& grad) const {
@@ -563,6 +579,31 @@ private:
         return path;
     }
 
+    void aligned_linear(const DpBuffer& buf, std::string& a, std::string& b) const {
+        int i = (AM == AlignMode::Global) ? m_ : best_i_;
+        int j = (AM == AlignMode::Global) ? n_ : best_j_;
+
+        while (true) {
+            if (i == 0 && j == 0) break;
+            if constexpr (AM == AlignMode::Local)
+                if (rat(buf.H, i, j) <= 0.0) break;
+            if (i > 0 && j > 0 &&
+                rat(buf.H, i, j) == rat(buf.H, i-1, j-1) + params_->matrix.score(seq_a_[i-1], seq_b_[j-1]))
+            {
+                a.push_back(seq_a_[i-1]); b.push_back(seq_b_[j-1]);
+                --i; --j;
+            } else if (i > 0 && rat(buf.H, i, j) == rat(buf.H, i-1, j) - params_->gap_extend_b) {
+                a.push_back(seq_a_[i-1]); b.push_back('-');  // gap in B
+                --i;
+            } else {
+                a.push_back('-'); b.push_back(seq_b_[j-1]);  // gap in A
+                --j;
+            }
+        }
+        std::reverse(a.begin(), a.end());
+        std::reverse(b.begin(), b.end());
+    }
+
     void hard_grad_linear(const DpBuffer& buf, AlignParams& grad) const {
         int i = (AM == AlignMode::Global) ? m_ : best_i_;
         int j = (AM == AlignMode::Global) ? n_ : best_j_;
@@ -697,6 +738,46 @@ private:
         traceback_affine_impl(buf, [&](int i, int j) { path.emplace_back(i, j); });
         std::reverse(path.begin(), path.end());
         return path;
+    }
+
+    void aligned_affine(const DpBuffer& buf, std::string& a, std::string& b) const {
+        int i = best_i_, j = best_j_;
+        TBTable tbl = best_tbl_;
+
+        while (true) {
+            if (i == 0 && j == 0) break;
+            if constexpr (AM == AlignMode::Local)
+                if (tbl == TBTable::M && rat(buf.VM, i, j) <= 0.0) break;
+
+            if (tbl == TBTable::M) {
+                a.push_back(seq_a_[i-1]); b.push_back(seq_b_[j-1]);
+                double vm = rat(buf.VM,i-1,j-1), vx = rat(buf.VX,i-1,j-1), vy = rat(buf.VY,i-1,j-1);
+                --i; --j;
+                if      (vm >= vx && vm >= vy) tbl = TBTable::M;
+                else if (vx >= vy)             tbl = TBTable::X;
+                else                            tbl = TBTable::Y;
+            } else if (tbl == TBTable::X) {
+                a.push_back(seq_a_[i-1]); b.push_back('-');  // gap in B
+                double fm = rat(buf.VM,i-1,j) - params_->gap_open_b - params_->gap_extend_b;
+                double fx = rat(buf.VX,i-1,j) - params_->gap_extend_b;
+                double fy = rat(buf.VY,i-1,j) - params_->gap_open_b - params_->gap_extend_b;
+                --i;
+                if      (fm >= fx && fm >= fy) tbl = TBTable::M;
+                else if (fx >= fy)             tbl = TBTable::X;
+                else                            tbl = TBTable::Y;
+            } else {
+                a.push_back('-'); b.push_back(seq_b_[j-1]);  // gap in A
+                double fm = rat(buf.VM,i,j-1) - params_->gap_open_a - params_->gap_extend_a;
+                double fx = rat(buf.VX,i,j-1) - params_->gap_open_a - params_->gap_extend_a;
+                double fy = rat(buf.VY,i,j-1) - params_->gap_extend_a;
+                --j;
+                if      (fm >= fx && fm >= fy) tbl = TBTable::M;
+                else if (fx >= fy)             tbl = TBTable::X;
+                else                            tbl = TBTable::Y;
+            }
+        }
+        std::reverse(a.begin(), a.end());
+        std::reverse(b.begin(), b.end());
     }
 
     void hard_grad_affine(const DpBuffer& buf, AlignParams& grad) const {

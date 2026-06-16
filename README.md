@@ -37,22 +37,26 @@ Requires Python ≥ 3.8 and a C++20 compiler (GCC 11+ or Clang 13+).
 import numpy as np
 import nwgrad
 
-# BLOSUM62 — 20×20 float64, canonical AA order (default alphabet)
-blosum62 = nwgrad.SubstMatrix(BLOSUM62_ARRAY)
+# Predefined matrices ship as ready-to-use SubstMatrix objects (they carry
+# their own alphabet, so you never have to specify the symbol order yourself):
+from nwgrad.matrices import BLOSUM62        # SubstMatrix, NCBI 23-symbol alphabet
+print(BLOSUM62.alphabet)                    # 'ARNDCQEGHILKMFPSTWYVBZX'
 
-# DNA — 4×4 float64 with explicit alphabet
+# Or build one from your own (N, N) array.  A SubstMatrix always pairs a matrix
+# with the alphabet that indexes its rows/columns:
 dna_mat = nwgrad.SubstMatrix(np.eye(4) * 2 - 1, alphabet="ACGT")
 ```
 
 ### Single pair — `SeqPair`
 
 `SeqPair` takes an `AlignParams` object that bundles the substitution matrix
-with gap penalties:
+with gap penalties.  Pass a `SubstMatrix` directly — its alphabet travels with
+it, so amino acids map to matrix cells unambiguously:
 
 ```python
-params = nwgrad.AlignParams(BLOSUM62_ARRAY,
-                             gap_open_a=11.0, gap_extend_a=1.0,
-                             gap_open_b=11.0, gap_extend_b=1.0)
+params = nwgrad.AlignParams(BLOSUM62,
+                            gap_open_a=11.0, gap_extend_a=1.0,
+                            gap_open_b=11.0, gap_extend_b=1.0)
 
 sp = nwgrad.SeqPair(
     "PLEASANTLY", "MEANLY", params,
@@ -61,20 +65,30 @@ sp = nwgrad.SeqPair(
     grad_mode="hard",     # "hard" | "soft" | "none"
 )
 
-sp.alloc_dp()    # required before align_full(); not needed for SeqPairBatch.score_and_grad()
-sp.align_full()
-print(sp.score)           # -3.0
+# Align, then read the score and a printable alignment:
+score, grad = sp.score_and_grad()   # one call: allocates DP, aligns, computes grad
+print(score)
+print(sp.formatted())               # PLEASANTLY / match line / -MEAN---LY
+print(sp.aligned())                 # ('PLEASANTLY', '-MEAN---LY')
 
-sp.compute_grad()
-print(sp.grad)            # AlignParams — use .matrix.to_matrix() for the (N, N) array
+# `grad` is an AlignParams; inspect it as a dict:
+g = grad.to_dict()
+print(g["matrix"].shape, g["gap_open_a"], g["gap_extend_b"])
 ```
+
+`align_full()` (the DP) and `compute_grad()` (reading the gradient off the
+cached DP tables) are exposed separately so you can re-align many times and only
+pay for the gradient when you need it; `score_and_grad()` above just fuses the
+common case.  The hard gradient is a subgradient read from the Viterbi path; the
+soft gradient (`grad_mode="soft"`) is the exact gradient of the log-partition
+function via forward–backward.
 
 After updating the matrix, `realign_banded()` re-scores the pair cheaply around the existing alignment path:
 
 ```python
-new_params = nwgrad.AlignParams(new_mat_array,
-                                 gap_open_a=11.0, gap_extend_a=1.0,
-                                 gap_open_b=11.0, gap_extend_b=1.0)
+new_params = nwgrad.AlignParams(new_subst_matrix,
+                                gap_open_a=11.0, gap_extend_a=1.0,
+                                gap_open_b=11.0, gap_extend_b=1.0)
 sp.set_params(new_params)
 sp.realign_banded(bandwidth=20)
 sp.compute_grad()
@@ -83,9 +97,11 @@ sp.compute_grad()
 ### Batch — `SeqPairBatch`
 
 ```python
-params = nwgrad.AlignParams(BLOSUM62_ARRAY,
-                             gap_open_a=11.0, gap_extend_a=1.0,
-                             gap_open_b=11.0, gap_extend_b=1.0)
+from nwgrad.matrices import BLOSUM62
+
+params = nwgrad.AlignParams(BLOSUM62,
+                            gap_open_a=11.0, gap_extend_a=1.0,
+                            gap_open_b=11.0, gap_extend_b=1.0)
 pairs = [
     nwgrad.SeqPair(a, b, params,
                    gap_model="affine", mode="global", grad_mode="soft")
@@ -103,9 +119,9 @@ total_log_z = batch.score_and_grad()
 grad = batch.compute_grad()
 
 # Update matrix and re-run with banded DP around the existing paths
-new_params = nwgrad.AlignParams(new_mat_array,
-                                 gap_open_a=11.0, gap_extend_a=1.0,
-                                 gap_open_b=11.0, gap_extend_b=1.0)
+new_params = nwgrad.AlignParams(new_subst_matrix,
+                                gap_open_a=11.0, gap_extend_a=1.0,
+                                gap_open_b=11.0, gap_extend_b=1.0)
 batch.set_params(new_params)
 total_log_z = batch.score_and_grad(bandwidth=20)
 grad = batch.compute_grad()
@@ -132,6 +148,42 @@ Stored internally as a `double[256][256]` ASCII-indexed table for O(1) lookup wi
 | `size` | Alphabet size `N` |
 | `alphabet` | The alphabet string (length `N`) |
 
+**Predefined matrices** are available from `nwgrad.matrices` as ready-to-use
+`SubstMatrix` objects (each already carrying the correct alphabet):
+`BLOSUM45/50/62/80/90`, `PAM30/70/250`, `VTML40/80/160/200`, and `NUC44` (DNA).
+
+```python
+from nwgrad.matrices import BLOSUM62
+BLOSUM62.alphabet            # 'ARNDCQEGHILKMFPSTWYVBZX'
+BLOSUM62.to_matrix()         # (23, 23) float64 array
+```
+
+---
+
+### `AlignParams`
+
+```python
+nwgrad.AlignParams(matrix, gap_open_a=0.0, gap_extend_a=0.0,
+                           gap_open_b=0.0, gap_extend_b=0.0)
+# or, from a raw array + explicit alphabet:
+nwgrad.AlignParams(array, alphabet="ACDEFGHIKLMNPQRSTVWY", gap_open_a=0.0, ...)
+```
+
+Bundles a substitution matrix with (possibly asymmetric) gap penalties. The
+first form takes a `SubstMatrix` directly and is preferred — the alphabet
+travels with the matrix, so there is no risk of mismatching the symbol order.
+Suffix `_a` penalties apply to gaps in sequence A, `_b` to gaps in sequence B.
+
+| Member | Description |
+|---|---|
+| `matrix` | The `SubstMatrix` (read/write) |
+| `gap_open_a` / `gap_extend_a` / `gap_open_b` / `gap_extend_b` | Gap penalties (read/write) |
+| `to_dict()` | Return `{"matrix": (N,N) array, "alphabet": str, "gap_open_a": …, …}` |
+| `+ - * ` | Element-wise arithmetic over all fields (for gradient-descent updates) |
+
+`AlignParams` is also the gradient type returned by `SeqPair.grad` /
+`compute_grad()`; `to_dict()` is the easy way to inspect a computed gradient.
+
 ---
 
 ### `SeqPair`
@@ -147,8 +199,8 @@ nwgrad.SeqPair(
 
 Persistent sequence-pair object. Sequences and alignment mode are fixed at
 construction; the alignment parameters can be swapped cheaply via `set_params()`.
-`SeqPair` stores a reference to the `AlignParams` object — keep it alive for
-the lifetime of the pair.
+The pair holds its `AlignParams` alive automatically, so you don't need to keep
+a separate reference to it.
 
 **Methods:**
 
@@ -158,8 +210,11 @@ the lifetime of the pair.
 | `align_full()` | Full DP alignment. Sets `score` and `guide_j`; clears `grad`. |
 | `realign_banded(bandwidth)` | Banded DP around the current path. Requires prior `align_full()`. Sets `score`; clears `grad`. |
 | `compute_grad()` | Compute and cache the gradient from the current alignment. Requires `align_full()` or `realign_banded()` to have been called first. |
-| `set_params(params)` | Swap alignment parameters. Clears `score` and `grad`; preserves `guide_j`. The new `AlignParams` must outlive the pair. |
-| `drop_dp()` | Free O(m×n) DP table memory. Cached `score`, `grad`, and `guide_j` survive. |
+| `score_and_grad()` | Convenience: `alloc_dp()` + `align_full()` + `compute_grad()` in one call. Returns `(score, grad)`. |
+| `aligned()` | Return the alignment as a pair of gapped strings `(seq_a, seq_b)`. Requires the DP tables (call before `drop_dp()`). |
+| `formatted(width=60)` | Pretty-printed alignment block (seq A / match line / seq B), wrapped at `width` columns (`0` = no wrap). |
+| `set_params(params)` | Swap alignment parameters. Clears `score` and `grad`; preserves `guide_j`. |
+| `drop_dp()` | Free O(m×n) DP table memory. Cached `score`, `grad`, and `guide_j` survive (but `aligned()` / `compute_grad()` then need a re-align). |
 
 **Properties:**
 
@@ -190,7 +245,7 @@ the lifetime of the pair.
 nwgrad.SeqPairBatch(n_threads=0)
 ```
 
-`n_threads=0` (default) uses `hardware_concurrency`. Holds non-owning references to `SeqPair` objects — each `SeqPair` must remain alive for the lifetime of the batch.
+`n_threads=0` (default) uses `hardware_concurrency`. `add()` keeps each `SeqPair` (and, transitively, its `AlignParams`) alive for the lifetime of the batch.
 
 **Methods:**
 
@@ -214,20 +269,28 @@ nwgrad.SeqPairBatch(n_threads=0)
 **Typical optimization loop:**
 
 ```python
+from nwgrad.matrices import BLOSUM62
+
+# Learnable matrix starts from BLOSUM62; keep its alphabet to stay consistent.
+alphabet = BLOSUM62.alphabet
+mat_array = BLOSUM62.to_matrix()
+
 # Build pairs once
-params = nwgrad.AlignParams(mat_array, gap_open_a=11.0, gap_extend_a=1.0,
-                             gap_open_b=11.0, gap_extend_b=1.0)
+params = nwgrad.AlignParams(nwgrad.SubstMatrix(mat_array, alphabet),
+                            gap_open_a=11.0, gap_extend_a=1.0,
+                            gap_open_b=11.0, gap_extend_b=1.0)
 batch = nwgrad.SeqPairBatch(n_threads=8)
 for a, b in zip(seqs_a, seqs_b):
     batch.add(nwgrad.SeqPair(a, b, params,
-                              gap_model="affine", mode="global", grad_mode="soft"))
+                             gap_model="affine", mode="global", grad_mode="soft"))
 
 for step in range(n_steps):
     total_log_z = batch.score_and_grad(bandwidth=bw if step > 0 else 0)
     grad = batch.compute_grad()
-    mat_array += lr * grad.matrix.to_matrix()
-    params = nwgrad.AlignParams(mat_array, gap_open_a=11.0, gap_extend_a=1.0,
-                                 gap_open_b=11.0, gap_extend_b=1.0)
+    mat_array += lr * grad.matrix.to_matrix()   # both in `alphabet` order
+    params = nwgrad.AlignParams(nwgrad.SubstMatrix(mat_array, alphabet),
+                                gap_open_a=11.0, gap_extend_a=1.0,
+                                gap_open_b=11.0, gap_extend_b=1.0)
     batch.set_params(params)
 ```
 

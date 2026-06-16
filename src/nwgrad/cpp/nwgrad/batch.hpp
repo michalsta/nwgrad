@@ -38,6 +38,7 @@ struct BatchAligner {
         const size_t N = problems.size();
         BatchResult result;
         result.scores.resize(N, 0.0);
+        result.grad.matrix.order_ = params.matrix.order_;  // export grad in the matrix's alphabet
 
         if (N == 0) return result;
 

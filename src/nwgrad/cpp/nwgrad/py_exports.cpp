@@ -1,8 +1,10 @@
+#include <algorithm>
 #include <string>
 #include <vector>
 
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
+#include <nanobind/stl/pair.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
@@ -35,6 +37,30 @@ static std::vector<int> make_guide(const std::string& aligned_a,
     if (!aligned_a.empty() && !aligned_b.empty())
         return guide_j_from_aligned(aligned_a, aligned_b);
     return {};
+}
+
+// Pretty-print two gapped, equal-length aligned strings as a 3-line block
+// (sequence A / match line / sequence B), wrapped at `width` columns.
+// The match line uses '|' for identity, '.' for a mismatch, ' ' for a gap.
+static std::string format_alignment(const std::string& a, const std::string& b,
+                                    int width) {
+    std::string match;
+    match.reserve(a.size());
+    for (size_t k = 0; k < a.size(); ++k) {
+        if      (a[k] == '-' || b[k] == '-') match.push_back(' ');
+        else if (a[k] == b[k])               match.push_back('|');
+        else                                  match.push_back('.');
+    }
+    if (width <= 0) width = static_cast<int>(a.size());
+    std::string out;
+    for (size_t off = 0; off < a.size(); off += static_cast<size_t>(width)) {
+        size_t len = std::min(static_cast<size_t>(width), a.size() - off);
+        out += a.substr(off, len);     out += '\n';
+        out += match.substr(off, len); out += '\n';
+        out += b.substr(off, len);
+        if (off + len < a.size()) out += "\n\n";
+    }
+    return out;
 }
 
 NB_MODULE(nwgrad_ext, m) {
@@ -109,6 +135,44 @@ NB_MODULE(nwgrad_ext, m) {
             "  gap_open_a / gap_extend_a : penalties for gaps in sequence A (Y state)\n"
             "  gap_open_b / gap_extend_b : penalties for gaps in sequence B (X state)\n"
             "All gap values default to 0.0 (usable as a zero gradient accumulator).")
+        .def(
+            "__init__",
+            [](AlignParams* self, const SubstMatrix& matrix,
+               double gap_open_a, double gap_extend_a,
+               double gap_open_b, double gap_extend_b) {
+                new (self) AlignParams();
+                self->matrix       = matrix;
+                self->gap_open_a   = gap_open_a;
+                self->gap_extend_a = gap_extend_a;
+                self->gap_open_b   = gap_open_b;
+                self->gap_extend_b = gap_extend_b;
+            },
+            nb::arg("matrix"),
+            nb::arg("gap_open_a")   = 0.0,
+            nb::arg("gap_extend_a") = 0.0,
+            nb::arg("gap_open_b")   = 0.0,
+            nb::arg("gap_extend_b") = 0.0,
+            "Construct from a SubstMatrix (which carries its own alphabet) plus gap costs.\n"
+            "Preferred over the (array, alphabet) form — no risk of an alphabet mismatch.")
+        .def(
+            "to_dict",
+            [](const AlignParams& self) {
+                int n = self.matrix.size();
+                double* buf = new double[n * n];
+                self.matrix.to_array(buf);
+                nb::capsule owner(buf, [](void* p) noexcept { delete[] static_cast<double*>(p); });
+                size_t shape[2] = {static_cast<size_t>(n), static_cast<size_t>(n)};
+                nb::dict d;
+                d["matrix"]       = nb::ndarray<nb::numpy, double>(buf, 2, shape, owner);
+                d["alphabet"]     = self.matrix.order();
+                d["gap_open_a"]   = self.gap_open_a;
+                d["gap_extend_a"] = self.gap_extend_a;
+                d["gap_open_b"]   = self.gap_open_b;
+                d["gap_extend_b"] = self.gap_extend_b;
+                return d;
+            },
+            "Return the parameters as a dict: 'matrix' (N×N array), 'alphabet', and the\n"
+            "four gap fields. Convenient for inspecting a gradient.")
         .def_prop_rw(
             "matrix",
             [](const AlignParams& self) { return self.matrix; },
@@ -465,6 +529,7 @@ NB_MODULE(nwgrad_ext, m) {
             nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("params"),
             nb::arg("gap_model") = "affine", nb::arg("mode") = "global",
             nb::arg("grad_mode") = "hard",
+            nb::keep_alive<1, 4>(),  // keep `params` alive as long as the SeqPair
             "Persistent sequence pair.\n"
             "  gap_model : \"linear\" | \"affine\"\n"
             "  mode      : \"global\" | \"local\"\n"
@@ -475,16 +540,31 @@ NB_MODULE(nwgrad_ext, m) {
             "set_params",
             [](SeqPair& self, const AlignParams& params) { self.set_params(params); },
             nb::arg("params"),
-            "Swap alignment parameters.  Invalidates cached score and gradient.\n"
-            "The params object must remain alive as long as this SeqPair uses it.")
+            nb::keep_alive<1, 2>(),  // keep the new `params` alive as long as the SeqPair
+            "Swap alignment parameters.  Invalidates cached score and gradient.")
         .def("align_full",     &SeqPair::align_full,
              "Full DP alignment.  Updates score and alignment path; clears gradient cache.")
         .def("realign_banded", &SeqPair::realign_banded, nb::arg("bandwidth"),
              "Banded DP centred on the current alignment path.")
         .def("compute_grad",   &SeqPair::compute_grad,
              "Compute and cache the gradient from the current alignment.")
+        .def("score_and_grad", &SeqPair::score_and_grad,
+             "Convenience: allocate DP, align, and compute the gradient in one call.\n"
+             "Returns (score, AlignParams grad).  Raises if grad_mode is \"none\".")
         .def("drop_dp", &SeqPair::drop_dp,
              "Free DP table memory.  Cached score, gradient, and guide_j remain valid.")
+        .def("aligned", &SeqPair::aligned,
+             "Return the alignment as a pair of gapped strings (seq_a, seq_b).\n"
+             "Requires the DP tables (call align_full() first, before any drop_dp()).")
+        .def(
+            "formatted",
+            [](const SeqPair& self, int width) {
+                auto [a, b] = self.aligned();
+                return format_alignment(a, b, width);
+            },
+            nb::arg("width") = 60,
+            "Pretty-printed alignment block (seq_a / match line / seq_b),\n"
+            "wrapped at `width` columns (0 = no wrapping).")
         .def_prop_ro(
             "score",
             [](const SeqPair& self) -> nb::object {
@@ -547,6 +627,7 @@ NB_MODULE(nwgrad_ext, m) {
             "set_params",
             [](SeqPairBatch& self, const AlignParams& params) { self.set_params(params); },
             nb::arg("params"),
+            nb::keep_alive<1, 2>(),  // keep `params` alive for the batch (and its pairs)
             "Set alignment parameters on all pairs (clears score and grad caches).")
         .def(
             "align_full",

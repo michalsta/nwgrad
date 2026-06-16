@@ -55,6 +55,12 @@ blosum62 = nwgrad.SubstMatrix(BLOSUM62)
 # blosum62 = nwgrad.SubstMatrix(BLOSUM62, alphabet="ACDEFGHIKLMNPQRSTVWY")
 ```
 
+> **Tip:** common matrices ship ready-to-use — `from nwgrad.matrices import
+> BLOSUM62, PAM250, NUC44` — each already a `SubstMatrix` carrying its own
+> alphabet. We build one by hand here only to show the `(array, alphabet)` form.
+> (The packaged `BLOSUM62` uses the 23-symbol NCBI alphabet, so its array differs
+> from the 20×20 one above.)
+
 The matrix is copied into an internal 256×256 ASCII-indexed table on construction.
 Subsequent modifications to `BLOSUM62` have no effect on `blosum62`.
 
@@ -123,8 +129,8 @@ sp = nwgrad.SeqPair(
 )
 ```
 
-`SeqPair` stores a reference to the `AlignParams` object — keep it alive for
-the lifetime of the pair.
+The pair keeps its `AlignParams` alive automatically — you don't need to hold a
+separate reference to `params`.
 
 ### Computing the score
 
@@ -140,11 +146,33 @@ instead.
 
 `align_full()` runs the full O(m×n) DP and caches the alignment path (`guide_j`).
 
+### Inspecting the alignment
+
+Once aligned, read back the gapped sequences or pretty-print them:
+
+```python
+print(sp.aligned())     # ('PLEASANTLY', '-MEAN---LY')
+print(sp.formatted())   # PLEASANTLY
+                        #  .||.   ||
+                        # -MEAN---LY
+```
+
 ### Computing the hard subgradient
 
 ```python
 sp.compute_grad()
 grad = sp.grad     # AlignParams object
+
+# Or do both in one call:
+score, grad = sp.score_and_grad()
+```
+
+`grad` is an `AlignParams`. Its `to_dict()` gives a quick, inspectable view:
+
+```python
+g = grad.to_dict()
+# {'matrix': (N, N) array, 'alphabet': str,
+#  'gap_open_a': ..., 'gap_extend_a': ..., 'gap_open_b': ..., 'gap_extend_b': ...}
 ```
 
 `grad.matrix.to_matrix()[i, j]` counts how many times `alphabet[i]` is aligned to
@@ -152,10 +180,11 @@ grad = sp.grad     # AlignParams object
 with respect to `matrix[i, j]`.
 
 ```python
+gmat = grad.matrix.to_matrix()
 for i, a in enumerate(AA_ORDER):
     for j, b in enumerate(AA_ORDER):
-        if grad[i, j] > 0:
-            print(f"  {a}-{b}: {int(grad[i, j])}")
+        if gmat[i, j] > 0:
+            print(f"  {a}-{b}: {int(gmat[i, j])}")
 ```
 
 ### Computing the soft (differentiable) gradient
@@ -222,7 +251,7 @@ sp.compute_grad()
 print(sp.score, sp.grad.matrix.to_matrix().sum())
 ```
 
-`new_params` must remain alive for as long as `sp` uses it.
+`set_params()` keeps `new_params` alive automatically.
 
 The `bandwidth` parameter is the half-width of the band in cells. If the true
 optimal path lies outside the band, the result is silently sub-optimal.

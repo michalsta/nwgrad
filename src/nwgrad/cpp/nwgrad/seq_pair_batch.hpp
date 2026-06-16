@@ -97,6 +97,7 @@ struct SeqPairBatch {
         };
 
         run_workers(N, worker);
+        if (N > 0) grad_out.matrix.order_ = pairs[0]->grad().matrix.order_;
         return grad_out;
     }
 

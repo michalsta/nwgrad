@@ -3,6 +3,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -144,12 +145,14 @@ struct SeqPair {
                 last_banded_ = true;
                 if (grad_mode_ != GradMode::None) {
                     grad_ = AlignParams{};
+                    grad_.matrix.order_ = params_->matrix.order_;
                     grad_with_buf(st.band_al, buf);
                 }
             } else {
                 last_banded_ = false;
                 if (grad_mode_ != GradMode::None) {
                     grad_ = AlignParams{};
+                    grad_.matrix.order_ = params_->matrix.order_;
                     grad_with_buf(st.full_al, buf);
                 }
             }
@@ -184,6 +187,7 @@ struct SeqPair {
             throw std::logic_error(
                 "nwgrad: grad_mode is None; construct with Hard or Soft to enable gradients");
         grad_ = AlignParams{};
+        grad_.matrix.order_ = params_->matrix.order_;
         std::visit([&](auto& st) {
             if (grad_mode_ == GradMode::Hard) {
                 if (last_banded_) st.band_al.hard_grad(grad_);
@@ -194,6 +198,15 @@ struct SeqPair {
             }
         }, state_);
         grad_valid_ = true;
+    }
+
+    // Convenience: align then compute the gradient in one call, returning both.
+    // Allocates the DP buffers if needed.  Throws if grad_mode == None.
+    std::pair<double, AlignParams> score_and_grad() {
+        alloc_dp();
+        align_full();
+        compute_grad();
+        return {score_, grad_};
     }
 
     // ── Accessors ─────────────────────────────────────────────────────────────
@@ -210,6 +223,25 @@ struct SeqPair {
             throw std::logic_error(
                 "nwgrad: gradient not computed; call compute_grad() first");
         return grad_;
+    }
+
+    // The current alignment as a pair of gapped strings (a, b).
+    // Requires the DP tables to be present (i.e. align_full() / realign_banded()
+    // was called and drop_dp() has not been called since).  For GradMode::Soft
+    // this returns the Viterbi (maximum-score) alignment.
+    std::pair<std::string, std::string> aligned() const {
+        if (!path_valid_)
+            throw std::logic_error(
+                "nwgrad: alignment not computed; call align_full() first");
+        if (!dp_valid_)
+            throw std::logic_error(
+                "nwgrad: DP tables have been dropped; call align_full() or realign_banded() first");
+        std::pair<std::string, std::string> out;
+        std::visit([&](auto& st) {
+            if (last_banded_) out = st.band_al.aligned();
+            else              out = st.full_al.aligned();
+        }, state_);
+        return out;
     }
 
     // The current alignment as a guide_j vector (length m+1).
