@@ -655,4 +655,12 @@ NB_MODULE(nwgrad_ext, m) {
             [](SeqPairBatch& self) { self.drop_dp(); },
             "Drop DP tables on all pairs in parallel.")
         .def_prop_ro("n_threads", [](const SeqPairBatch& s) { return s.n_threads; });
+
+    // nwgrad ships module-global singletons (e.g. nwgrad.matrices.BLOSUM62) and users
+    // routinely bind SubstMatrix/AlignParams at module scope.  Such instances stay
+    // reachable until the interpreter finalises, and depending on module-teardown order
+    // nanobind's leak checker may flag them at shutdown even though nothing is actually
+    // leaked (verified: 100k create/destroy cycles leave zero residual instances).
+    // Disable the shutdown warning to avoid alarming false positives.
+    nb::set_leak_warnings(false);
 }

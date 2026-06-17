@@ -101,9 +101,10 @@ struct DpBuffer {
 //
 // AlignBand::GuideBanded: band of half-width `band` centered on a reference alignment.
 //   guide_j[i] = the column the guide visits after consuming i chars of a.
-//   If guide_j is omitted (or empty), the trivial diagonal guide guide_j[i] = i is
-//   used — identical in effect to the old diagonal-only banded DP, but works correctly
-//   for unequal-length sequences when band >= |m-n|.
+//   If guide_j is omitted (or empty), a proportional diagonal guide
+//   guide_j[i] = round(i * n / m) is used.  Unlike a literal guide_j[i] = i, this
+//   tracks the main diagonal of the rectangular DP, so it stays centred for
+//   unequal-length sequences without requiring band >= |m-n|.
 //   For a custom guide, compute it with guide_j_from_aligned(a_aligned, b_aligned);
 //   the endpoint (m, n) is always in-band as long as the guide is a complete alignment.
 //
@@ -146,6 +147,7 @@ struct Aligner {
         fwdbwd_done_      = false;
         any_viterbi_done_ = false;
         any_fwdbwd_done_  = false;
+        fwdbwd_is_newest_ = false;
     }
 
     // Allocate an empty buffer shell. Must be called once before compute_viterbi()
@@ -161,6 +163,7 @@ struct Aligner {
         if constexpr (GM == GapModel::Linear) viterbi_linear(own_buf_);
         else                                   viterbi_affine(own_buf_);
         viterbi_done_ = any_viterbi_done_ = true;
+        fwdbwd_is_newest_ = false;
     }
 
     void compute_forward_back() {
@@ -170,10 +173,14 @@ struct Aligner {
         if constexpr (GM == GapModel::Linear) fwdbwd_linear(own_buf_);
         else                                   fwdbwd_affine(own_buf_);
         fwdbwd_done_ = any_fwdbwd_done_ = true;
+        fwdbwd_is_newest_ = true;
     }
 
-    // Returns the most recent viterbi score or log Z, regardless of which buffer was used.
+    // Returns the score from whichever DP ran most recently (Viterbi score or log Z),
+    // regardless of which buffer was used.
     double score() const {
+        if (fwdbwd_is_newest_) { if (any_fwdbwd_done_)  return log_z_; }
+        else                   { if (any_viterbi_done_) return viterbi_score_; }
         if (any_viterbi_done_) return viterbi_score_;
         if (any_fwdbwd_done_)  return log_z_;
         throw std::logic_error(
@@ -224,6 +231,7 @@ struct Aligner {
         fwdbwd_done_     = false;
         any_viterbi_done_ = false;
         any_fwdbwd_done_ = false;
+        fwdbwd_is_newest_ = false;
     }
 
     // ── Extended API — caller-supplied DpBuffer ───────────────────────────────
@@ -239,6 +247,7 @@ struct Aligner {
         if constexpr (GM == GapModel::Linear) viterbi_linear(buf);
         else                                   viterbi_affine(buf);
         any_viterbi_done_ = true;
+        fwdbwd_is_newest_ = false;
     }
 
     void compute_forward_back(DpBuffer& buf) {
@@ -247,6 +256,7 @@ struct Aligner {
         if constexpr (GM == GapModel::Linear) fwdbwd_linear(buf);
         else                                   fwdbwd_affine(buf);
         any_fwdbwd_done_ = true;
+        fwdbwd_is_newest_ = true;
     }
 
     std::vector<int> guide_j_from_viterbi(const DpBuffer& buf) const {
@@ -288,6 +298,7 @@ private:
     bool fwdbwd_done_       = false; // own_buf_ has valid fwdbwd data
     bool any_viterbi_done_  = false; // viterbi scalar results are valid (either buffer)
     bool any_fwdbwd_done_   = false; // fwdbwd scalar results are valid (either buffer)
+    bool fwdbwd_is_newest_  = false; // true if forward-back ran more recently than viterbi
 
     // ── Scalar results (written by every compute_viterbi / compute_forward_back)
     double viterbi_score_ = 0.0;
