@@ -22,8 +22,9 @@ enum class AlignBand { Full,   GuideBanded };
 // guide_j[i] = the column j in the DP table after consuming i characters of a.
 // Pass the result to Aligner::set_problem when using AlignBand::GuideBanded.
 //
-// When no explicit guide is given to set_problem, the trivial alignment
-// guide_j[i] = i is used, which is equivalent to the old diagonal banded DP.
+// When no explicit guide is given to set_problem, a proportional guide
+// guide_j[i] = round(i * n / m) is used, tracking the main diagonal of the
+// rectangular DP matrix.
 
 inline std::vector<int> guide_j_from_aligned(std::string_view a_aligned,
                                               std::string_view b_aligned) {
@@ -179,10 +180,8 @@ struct Aligner {
     // Returns the score from whichever DP ran most recently (Viterbi score or log Z),
     // regardless of which buffer was used.
     double score() const {
-        if (fwdbwd_is_newest_) { if (any_fwdbwd_done_)  return log_z_; }
-        else                   { if (any_viterbi_done_) return viterbi_score_; }
+        if (fwdbwd_is_newest_) return log_z_;
         if (any_viterbi_done_) return viterbi_score_;
-        if (any_fwdbwd_done_)  return log_z_;
         throw std::logic_error(
             "nwgrad: call compute_viterbi() or compute_forward_back() before score()");
     }
