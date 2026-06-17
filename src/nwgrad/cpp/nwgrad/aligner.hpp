@@ -109,9 +109,12 @@ struct DpBuffer {
 //   For a custom guide, compute it with guide_j_from_aligned(a_aligned, b_aligned);
 //   the endpoint (m, n) is always in-band as long as the guide is a complete alignment.
 //
-// In GuideBanded mode the full (m+1)×(n+1) table is still allocated; only the fill
-// and backward loops are restricted.  Out-of-band cells are initialised to NEG_INF
-// so they cannot corrupt max/lse operations along band edges.
+// In GuideBanded mode the full (m+1)×(n+1) table is still allocated (peak memory is
+// unchanged), but the per-call init fill and the DP/backward loops are all restricted
+// to the band, so the work per re-alignment is O(m·band) rather than O(m·n).  Only the
+// band region (plus a one-column margin and adjacent-row overlap, see band_row_span)
+// is initialised to NEG_INF; band-edge reads therefore always land on an initialised
+// cell and cannot corrupt max/lse operations with stale data from a previous problem.
 
 template<GapModel GM, AlignMode AM, AlignBand AB = AlignBand::Full>
 struct Aligner {
@@ -429,10 +432,45 @@ private:
         else                                  return jhi(0);
     }
 
-    // Fill vec[0..sz_) with NEG_INF for GuideBanded (no-op for Full).
+    // Inclusive column window [lo, hi] that must be initialised for row i in
+    // GuideBanded mode.  It is the union of row i's band with its neighbours'
+    // bands, widened by one column on each side.  The neighbour union covers the
+    // cells row i±1 read from / write into row i (the recurrence reads row i-1,
+    // the backward pass writes into row i-1); the one-column margin covers the
+    // NEG_INF guard cell just left of each band edge, so every band-edge read
+    // lands on an initialised cell rather than stale data from a previous problem.
+    void band_row_span(int i, int& lo, int& hi) const noexcept {
+        lo = jlo0(i); hi = jhi0(i);
+        if (i > 0)  { lo = std::min(lo, jlo0(i - 1)); hi = std::max(hi, jhi0(i - 1)); }
+        if (i < m_) { lo = std::min(lo, jlo0(i + 1)); hi = std::max(hi, jhi0(i + 1)); }
+        lo = std::max(0,  lo - 1);
+        hi = std::min(n_, hi + 1);
+    }
+
+    // GuideBanded: NEG_INF-fill only the band region (O(m·band)).  Full: no-op —
+    // the linear forward tables need no pre-fill (every in-band cell is written).
     void banded_fill(std::vector<double>& vec) const {
-        if constexpr (AB == AlignBand::GuideBanded)
-            std::fill(vec.begin(), vec.begin() + static_cast<ptrdiff_t>(sz_), NEG_INF);
+        if constexpr (AB == AlignBand::GuideBanded) {
+            for (int i = 0; i <= m_; ++i) {
+                int lo, hi; band_row_span(i, lo, hi);
+                double* row = vec.data() + static_cast<size_t>(i) * stride_;
+                std::fill(row + lo, row + hi + 1, NEG_INF);
+            }
+        }
+    }
+
+    // Fill `vec` with `value`.  Full: the whole (m+1)×(n+1) table.  GuideBanded:
+    // only the band region (O(m·band)).
+    void band_fill(std::vector<double>& vec, double value) const {
+        if constexpr (AB == AlignBand::Full) {
+            std::fill(vec.begin(), vec.begin() + static_cast<ptrdiff_t>(sz_), value);
+        } else {
+            for (int i = 0; i <= m_; ++i) {
+                int lo, hi; band_row_span(i, lo, hi);
+                double* row = vec.data() + static_cast<size_t>(i) * stride_;
+                std::fill(row + lo, row + hi + 1, value);
+            }
+        }
     }
 
     // ── guide_j extraction helpers ────────────────────────────────────────────
@@ -643,9 +681,9 @@ private:
     // ═════════════════════════════════════════════════════════════════════════
 
     void viterbi_affine(DpBuffer& buf) {
-        std::fill(buf.VM.begin(), buf.VM.begin() + static_cast<ptrdiff_t>(sz_), NEG_INF);
-        std::fill(buf.VX.begin(), buf.VX.begin() + static_cast<ptrdiff_t>(sz_), NEG_INF);
-        std::fill(buf.VY.begin(), buf.VY.begin() + static_cast<ptrdiff_t>(sz_), NEG_INF);
+        band_fill(buf.VM, NEG_INF);
+        band_fill(buf.VX, NEG_INF);
+        band_fill(buf.VY, NEG_INF);
 
         if constexpr (AM == AlignMode::Global) {
             at(buf.VM, 0, 0) = 0.0;
@@ -880,10 +918,10 @@ private:
 
         // ── Backward ──
         if constexpr (AM == AlignMode::Global) {
-            std::fill(buf.B.begin(), buf.B.begin() + static_cast<ptrdiff_t>(sz_), NEG_INF);
+            band_fill(buf.B, NEG_INF);
             at(buf.B, m_, n_) = 0.0;
         } else {
-            std::fill(buf.B.begin(), buf.B.begin() + static_cast<ptrdiff_t>(sz_), 0.0);
+            band_fill(buf.B, 0.0);
         }
 
         for (int i = m_; i >= 0; --i) {
@@ -944,9 +982,9 @@ private:
 
     void fwdbwd_affine(DpBuffer& buf) {
         // ── Forward ──
-        std::fill(buf.FM.begin(), buf.FM.begin()+static_cast<ptrdiff_t>(sz_), NEG_INF);
-        std::fill(buf.FX.begin(), buf.FX.begin()+static_cast<ptrdiff_t>(sz_), NEG_INF);
-        std::fill(buf.FY.begin(), buf.FY.begin()+static_cast<ptrdiff_t>(sz_), NEG_INF);
+        band_fill(buf.FM, NEG_INF);
+        band_fill(buf.FX, NEG_INF);
+        band_fill(buf.FY, NEG_INF);
 
         if constexpr (AM == AlignMode::Global) {
             at(buf.FM, 0, 0) = 0.0;
@@ -988,14 +1026,14 @@ private:
 
         // ── Backward ──
         if constexpr (AM == AlignMode::Global) {
-            std::fill(buf.BM.begin(), buf.BM.begin()+static_cast<ptrdiff_t>(sz_), NEG_INF);
-            std::fill(buf.BX.begin(), buf.BX.begin()+static_cast<ptrdiff_t>(sz_), NEG_INF);
-            std::fill(buf.BY.begin(), buf.BY.begin()+static_cast<ptrdiff_t>(sz_), NEG_INF);
+            band_fill(buf.BM, NEG_INF);
+            band_fill(buf.BX, NEG_INF);
+            band_fill(buf.BY, NEG_INF);
             at(buf.BM,m_,n_) = 0.0; at(buf.BX,m_,n_) = 0.0; at(buf.BY,m_,n_) = 0.0;
         } else {
-            std::fill(buf.BM.begin(), buf.BM.begin()+static_cast<ptrdiff_t>(sz_), 0.0);
-            std::fill(buf.BX.begin(), buf.BX.begin()+static_cast<ptrdiff_t>(sz_), 0.0);
-            std::fill(buf.BY.begin(), buf.BY.begin()+static_cast<ptrdiff_t>(sz_), 0.0);
+            band_fill(buf.BM, 0.0);
+            band_fill(buf.BX, 0.0);
+            band_fill(buf.BY, 0.0);
         }
 
         for (int i = m_; i >= 0; --i) {
