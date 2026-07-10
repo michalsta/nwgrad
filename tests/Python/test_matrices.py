@@ -7,6 +7,7 @@ Values cross-checked against:
 import numpy as np
 import pytest
 import nwgrad
+from nwgrad import matrices
 from nwgrad.matrices import (
     BLOSUM45, BLOSUM50, BLOSUM62, BLOSUM80, BLOSUM90,
     PAM30, PAM70, PAM250,
@@ -15,19 +16,22 @@ from nwgrad.matrices import (
 )
 
 
-_AA_MATS = [BLOSUM45, BLOSUM50, BLOSUM62, BLOSUM80, BLOSUM90,
-            PAM30, PAM70, PAM250, VTML40, VTML80, VTML160, VTML200]
+# Parametrize over matrix *names* rather than the SubstMatrix objects themselves:
+# passing bound instances as parametrize values makes pytest retain them for the
+# whole session, which trips nanobind's leak checker at interpreter shutdown.
+_AA_MAT_NAMES = ["BLOSUM45", "BLOSUM50", "BLOSUM62", "BLOSUM80", "BLOSUM90",
+                 "PAM30", "PAM70", "PAM250", "VTML40", "VTML80", "VTML160", "VTML200"]
 _AA_ALPHABET = "ARNDCQEGHILKMFPSTWYVBZX"
 
 
 class TestShapesAndAlphabets:
-    @pytest.mark.parametrize("mat", _AA_MATS)
-    def test_aa_alphabet(self, mat):
-        assert mat.alphabet == _AA_ALPHABET
+    @pytest.mark.parametrize("name", _AA_MAT_NAMES)
+    def test_aa_alphabet(self, name):
+        assert getattr(matrices, name).alphabet == _AA_ALPHABET
 
-    @pytest.mark.parametrize("mat", _AA_MATS)
-    def test_aa_shape(self, mat):
-        assert mat.to_matrix().shape == (23, 23)
+    @pytest.mark.parametrize("name", _AA_MAT_NAMES)
+    def test_aa_shape(self, name):
+        assert getattr(matrices, name).to_matrix().shape == (23, 23)
 
     def test_nuc44_alphabet(self):
         assert NUC44.alphabet == "ATGCSWRYKMBVHDN"

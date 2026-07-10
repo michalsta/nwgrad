@@ -94,8 +94,10 @@ def grad_to_dict(g20):
     return d
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def blosum():
+    # Function-scoped on purpose: a module-scoped SubstMatrix would be retained by
+    # pytest for the whole session and trip nanobind's leak checker at shutdown.
     return nwgrad.SubstMatrix(BLOSUM62)
 
 
@@ -195,24 +197,27 @@ def test_nw_affine_grad_identity():
     assert gm.sum() == pytest.approx(len(seq))
 
 
-@pytest.mark.parametrize("fn,params", [
-    (nwgrad.nw_grad,        make_params(1.0)),
-    (nwgrad.sw_grad,        make_params(1.0)),
-    (nwgrad.nw_affine_grad, make_params(1.0, 11.0)),
-    (nwgrad.sw_affine_grad, make_params(1.0, 11.0)),
+# Parametrize over the grad-function name and gap args rather than prebuilt
+# AlignParams objects: passing bound instances as parametrize values makes pytest
+# retain them for the whole session, tripping nanobind's leak checker at shutdown.
+@pytest.mark.parametrize("fn_name,gap_open", [
+    ("nw_grad",        0.0),
+    ("sw_grad",        0.0),
+    ("nw_affine_grad", 11.0),
+    ("sw_affine_grad", 11.0),
 ])
-def test_grad_nonnegative(fn, params):
-    _, g = fn("PLEASANTLY", "MEANLY", params)
+def test_grad_nonnegative(fn_name, gap_open):
+    _, g = getattr(nwgrad, fn_name)("PLEASANTLY", "MEANLY", make_params(1.0, gap_open))
     gm = grad_matrix(g)
     assert (gm >= 0).all()
     assert np.allclose(gm, np.round(gm))
 
 
-@pytest.mark.parametrize("fn,params", [
-    (nwgrad.nw_grad,        make_params(1.0)),
-    (nwgrad.nw_affine_grad, make_params(1.0, 11.0)),
+@pytest.mark.parametrize("fn_name,gap_open", [
+    ("nw_grad",        0.0),
+    ("nw_affine_grad", 11.0),
 ])
-def test_grad_sum_le_min_len(fn, params):
+def test_grad_sum_le_min_len(fn_name, gap_open):
     a, b = "PLEASANTLY", "MEANLY"
-    _, g = fn(a, b, params)
+    _, g = getattr(nwgrad, fn_name)(a, b, make_params(1.0, gap_open))
     assert grad_matrix(g).sum() <= min(len(a), len(b))
