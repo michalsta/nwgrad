@@ -1001,8 +1001,11 @@ class TestSeqPairBatchAPI:
         batch = nwgrad.SeqPairBatch(n_threads=1)
         assert batch.realign_banded(10) == pytest.approx(0.0)
 
-    def test_empty_batch_compute_grad_returns_zeros(self):
+    def test_empty_batch_compute_grad_raises(self):
+        # The sum of no gradients has no alphabet, and there is nothing in scope
+        # to infer one from.  This used to return a zero gradient shaped (20, 20)
+        # -- the protein default -- so an empty DNA batch silently handed back a
+        # protein-shaped answer.
         batch = nwgrad.SeqPairBatch(n_threads=1)
-        g = grad_matrix(batch.compute_grad())
-        assert g.shape == (20, 20)
-        assert g.sum() == pytest.approx(0.0)
+        with pytest.raises(RuntimeError, match="empty batch"):
+            batch.compute_grad()

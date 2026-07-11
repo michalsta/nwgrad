@@ -131,15 +131,51 @@ grad = batch.compute_grad()
 
 ## API Reference
 
+### `Alphabet`
+
+```python
+nwgrad.Alphabet.get(symbols: str) -> Alphabet
+```
+
+The character↔index mapping that a matrix, its gradients, and its sequences all share. Alphabets are **interned**: `Alphabet.get("ACGT") is nwgrad.DNA`, so two matrices are compatible exactly when their alphabets are the same object.
+
+Named alphabets:
+
+| Constant | Symbols | N |
+|---|---|---|
+| `nwgrad.DNA` | `ACGT` | 4 |
+| `nwgrad.DNA_N` | `ACGTN` | 5 |
+| `nwgrad.RNA` | `ACGU` | 4 |
+| `nwgrad.RNA_N` | `ACGUN` | 5 |
+| `nwgrad.PROTEIN` | the canonical 20 | 20 |
+| `nwgrad.PROTEIN_X` | + `X` (unknown) | 21 |
+| `nwgrad.PROTEIN_UO` | + `U` (selenocysteine), `O` (pyrrolysine) | 22 |
+| `nwgrad.PROTEIN_UOX` | + `U`, `O`, `X` | 23 |
+
+Extensions **append at the end**, so the canonical 20 keep indices 0–19 and a 20×20 BLOSUM62 embeds as the top-left block of any extended alphabet. An `Alphabet` governs legality and ordering only — scoring is entirely the matrix's job, including for `X` and `N`.
+
+For anything not listed, build your own: `nwgrad.Alphabet.get("ACGTRYSWKM")`.
+
+| Member | Description |
+|---|---|
+| `symbols` | The symbol string, in index order |
+| `size`, `len(a)` | Number of symbols `N` |
+| `index_of(c)` | Index of `c`, or `-1` if absent |
+| `contains(c)` | Whether `c` is in the alphabet |
+| `encode(s)` | Validate and encode to indices; raises `ValueError` on any foreign character |
+| `decode(indices)` | Inverse of `encode` |
+
 ### `SubstMatrix`
 
 ```python
 nwgrad.SubstMatrix(matrix: np.ndarray, alphabet: str = "ACDEFGHIKLMNPQRSTVWY")
 ```
 
-Constructs a substitution matrix from an `(N, N)` float64 numpy array where `N = len(alphabet)`. The default alphabet is the 20 canonical amino acids (`ACDEFGHIKLMNPQRSTVWY`), giving the same 20×20 behaviour as before. Any square matrix with a matching alphabet string is accepted — including DNA (`"ACGT"`), extended amino acids, or any other symbol set.
+Constructs a substitution matrix from an `(N, N)` float64 numpy array where `N = len(alphabet)`. The default alphabet is the 20 canonical amino acids (`ACDEFGHIKLMNPQRSTVWY`). Any square matrix with a matching alphabet is accepted — including DNA (`"ACGT"`), extended amino acids, or any other symbol set. You may pass an `Alphabet` object instead of a string.
 
-Stored internally as a `double[256][256]` ASCII-indexed table for O(1) lookup without char-to-index mapping. Asymmetric matrices are fully supported.
+Stored as a dense `N × N` block indexed by alphabet position — 16 doubles for DNA. Sequences are validated and encoded to indices once, at the boundary, so the DP inner loop is a single O(1) lookup and never touches a character. Asymmetric matrices are fully supported.
+
+Characters outside the alphabet **raise `ValueError`**; they are not silently scored as zero. Case is significant — `'d'` is not `'D'`, so soft-masked FASTA must be upper-cased by the caller.
 
 | Member | Description |
 |---|---|

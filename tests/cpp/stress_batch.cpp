@@ -250,9 +250,9 @@ static void print_run(int n_threads, double elapsed, const std::vector<double>& 
 
     if (has_grad) {
         double grad_sum = 0.0;
-        for (int i = 0; i < 256; ++i)
-            for (int j = 0; j < 256; ++j)
-                grad_sum += grad.matrix.mat[i][j];
+        for (int i = 0; i < 20; ++i)
+            for (int j = 0; j < 20; ++j)
+                grad_sum += grad.matrix.at(i, j);
         std::printf("  grad_sum=%.0f", grad_sum);
     }
     std::printf("\n");
@@ -286,7 +286,7 @@ int main(int argc, char** argv) {
     SubstMatrix blosum = make_blosum62();
     double go = (a.gap_model == GapModel::Affine) ? a.gap_open : 0.0;
 
-    AlignParams params;
+    AlignParams params(Alphabet::protein());
     params.matrix       = blosum;
     params.gap_open_a   = params.gap_open_b   = go;
     params.gap_extend_a = params.gap_extend_b = a.gap_extend;

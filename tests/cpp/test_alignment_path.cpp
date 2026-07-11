@@ -25,8 +25,7 @@ static AlignParams path_params(double open_a, double ext_a,
         for (int j = 0; j < 20; ++j)
             src[i * 20 + j] = (i == j) ? 2.0 : -1.0;
 
-    AlignParams p;
-    p.matrix       = SubstMatrix(src.data());
+    AlignParams p(SubstMatrix(src.data()));
     p.gap_open_a   = open_a;
     p.gap_extend_a = ext_a;
     p.gap_open_b   = open_b;
@@ -148,7 +147,9 @@ TEST_CASE("alignment(): a gap in A shows up as a skipped B index",
     auto p = path_params(0.5, 0.5, 20.0, 20.0);
     Aligner<GapModel::Affine, AlignMode::Global> al;
     al.alloc_buf();
-    al.set_problem("WKLM", "WKXLM", p);
+    // 'C' is the inserted residue: any symbol differing from its neighbours will
+    // do, but it has to be in the alphabet.
+    al.set_problem("WKLM", "WKCLM", p);
     al.compute_viterbi();
 
     const auto path = al.alignment();
@@ -158,7 +159,7 @@ TEST_CASE("alignment(): a gap in A shows up as a skipped B index",
     REQUIRE(gb.find('-') == std::string::npos);
     REQUIRE(path == pairs_from_gapped(ga, gb));
 
-    // every A index is matched; exactly one B index (the inserted X) is skipped
+    // every A index is matched; exactly one B index (the inserted C) is skipped
     REQUIRE(path.size() == 4);
 }
 

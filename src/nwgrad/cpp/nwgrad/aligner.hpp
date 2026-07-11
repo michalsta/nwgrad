@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <limits>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -121,13 +123,36 @@ struct Aligner {
 
     // ── Public pipeline API — own internal buffer ─────────────────────────────
 
+    // Convenience: take characters, validate and encode them against the params'
+    // alphabet into aligner-owned buffers.  An out-of-alphabet character throws.
+    //
+    // Callers that align the same sequences repeatedly should encode once and
+    // use the span overload below — SeqPair does exactly that, so a banded
+    // re-alignment under a new matrix costs no re-encoding.
     void set_problem(std::string_view a, std::string_view b,
                      const AlignParams& params,
                      int band = 0,
                      std::vector<int> guide_j = {}) {
-        seq_a_  = a;
-        seq_b_  = b;
+        const Alphabet& alpha = params.matrix.alphabet();
+        a_own_ = alpha.encode(a);
+        b_own_ = alpha.encode(b);
+        set_problem(std::span<const uint8_t>(a_own_),
+                    std::span<const uint8_t>(b_own_),
+                    params, band, std::move(guide_j));
+    }
+
+    // Sequences arrive already encoded to alphabet indices — the DP never sees a
+    // char.  Encoding (and validation) happens once, at the boundary, in SeqPair
+    // / BatchAligner.  The spans must outlive the DP calls that follow.
+    void set_problem(std::span<const uint8_t> a, std::span<const uint8_t> b,
+                     const AlignParams& params,
+                     int band = 0,
+                     std::vector<int> guide_j = {}) {
+        a_idx_  = a;
+        b_idx_  = b;
         params_ = &params;
+        blk_    = params.matrix.data();
+        nalpha_ = params.matrix.size();
         band_   = band;
         m_      = static_cast<int>(a.size());
         n_      = static_cast<int>(b.size());
@@ -287,8 +312,13 @@ private:
     static constexpr double NEG_INF = -std::numeric_limits<double>::infinity();
 
     // ── Problem state ─────────────────────────────────────────────────────────
-    std::string_view    seq_a_, seq_b_;
+    std::span<const uint8_t> a_idx_, b_idx_;   // alphabet indices, not characters
+    // Backing store for the string_view overload of set_problem(); empty when
+    // the caller supplied encoded spans directly.
+    std::vector<uint8_t> a_own_, b_own_;
     const AlignParams*  params_     = nullptr;
+    const double*       blk_        = nullptr; // params_->matrix.data(), cached
+    int                 nalpha_     = 0;       // params_->matrix.size(), cached
     int                 band_       = 0;
     int                 m_ = 0, n_ = 0;
     size_t              stride_ = 0, sz_ = 0;
@@ -391,6 +421,39 @@ private:
     }
     double rat(const std::vector<double>& t, int i, int j) const {
         return t[static_cast<size_t>(i) * stride_ + static_cast<size_t>(j)];
+    }
+
+    // ── Substitution lookup (the DP hot path) ─────────────────────────────────
+    // Offset of the (a[i-1], b[j-1]) cell in an n_alpha × n_alpha block.  DP
+    // coordinates are 1-based, so i-1 / j-1 index the sequences.
+    size_t sub_off(int i, int j) const noexcept {
+        return static_cast<size_t>(a_idx_[static_cast<size_t>(i) - 1]) *
+                   static_cast<size_t>(nalpha_) +
+               static_cast<size_t>(b_idx_[static_cast<size_t>(j) - 1]);
+    }
+
+    // Substitution score for a[i-1] against b[j-1].
+    double sub(int i, int j) const noexcept { return blk_[sub_off(i, j)]; }
+
+    // The characters behind those indices — used only to render alignments.
+    char sym_a(int i) const noexcept {
+        return params_->matrix.alphabet().symbol_at(
+            static_cast<int>(a_idx_[static_cast<size_t>(i) - 1]));
+    }
+    char sym_b(int j) const noexcept {
+        return params_->matrix.alphabet().symbol_at(
+            static_cast<int>(b_idx_[static_cast<size_t>(j) - 1]));
+    }
+
+    // The gradient's matrix block, checked to be over the same alphabet as the
+    // params.  Checked once per grad call, not once per cell.
+    double* grad_block(AlignParams& grad) const {
+        if (&grad.matrix.alphabet() != &params_->matrix.alphabet())
+            throw std::invalid_argument(
+                "nwgrad: gradient alphabet \"" + grad.matrix.alphabet().symbols() +
+                "\" does not match params alphabet \"" +
+                params_->matrix.alphabet().symbols() + "\"");
+        return grad.matrix.data();
     }
 
     // ── Band helpers ──────────────────────────────────────────────────────────
@@ -505,7 +568,7 @@ private:
             if constexpr (AM == AlignMode::Global) { if (i == 0 && j == 0) break; }
             else                                    { if (rat(buf.H, i, j) <= 0.0) break; }
             if (i > 0 && j > 0 &&
-                rat(buf.H, i, j) == rat(buf.H, i-1, j-1) + params_->matrix.score(seq_a_[i-1], seq_b_[j-1]))
+                rat(buf.H, i, j) == rat(buf.H, i-1, j-1) + sub(i, j))
             {
                 --i; --j;
                 gj[static_cast<size_t>(i)] = j;
@@ -588,7 +651,7 @@ private:
         for (int i = 1; i <= m_; ++i) {
             for (int j = jlo(i); j <= jhi(i); ++j) {
                 double v = std::max({
-                    rat(buf.H, i-1, j-1) + params_->matrix.score(seq_a_[i-1], seq_b_[j-1]),
+                    rat(buf.H, i-1, j-1) + sub(i, j),
                     rat(buf.H, i-1, j)   - params_->gap_extend_b,  // gap in B (advance i)
                     rat(buf.H, i,   j-1) - params_->gap_extend_a,  // gap in A (advance j)
                 });
@@ -613,7 +676,7 @@ private:
             if constexpr (AM == AlignMode::Local)
                 if (rat(buf.H, i, j) <= 0.0) break;
             if (i > 0 && j > 0 &&
-                rat(buf.H, i, j) == rat(buf.H, i-1, j-1) + params_->matrix.score(seq_a_[i-1], seq_b_[j-1]))
+                rat(buf.H, i, j) == rat(buf.H, i-1, j-1) + sub(i, j))
             {
                 path.emplace_back(i-1, j-1);
                 --i; --j;
@@ -636,15 +699,15 @@ private:
             if constexpr (AM == AlignMode::Local)
                 if (rat(buf.H, i, j) <= 0.0) break;
             if (i > 0 && j > 0 &&
-                rat(buf.H, i, j) == rat(buf.H, i-1, j-1) + params_->matrix.score(seq_a_[i-1], seq_b_[j-1]))
+                rat(buf.H, i, j) == rat(buf.H, i-1, j-1) + sub(i, j))
             {
-                a.push_back(seq_a_[i-1]); b.push_back(seq_b_[j-1]);
+                a.push_back(sym_a(i)); b.push_back(sym_b(j));
                 --i; --j;
             } else if (i > 0 && rat(buf.H, i, j) == rat(buf.H, i-1, j) - params_->gap_extend_b) {
-                a.push_back(seq_a_[i-1]); b.push_back('-');  // gap in B
+                a.push_back(sym_a(i)); b.push_back('-');  // gap in B
                 --i;
             } else {
-                a.push_back('-'); b.push_back(seq_b_[j-1]);  // gap in A
+                a.push_back('-'); b.push_back(sym_b(j));  // gap in A
                 --j;
             }
         }
@@ -653,6 +716,7 @@ private:
     }
 
     void hard_grad_linear(const DpBuffer& buf, AlignParams& grad) const {
+        double* gblk = grad_block(grad);
         int i = (AM == AlignMode::Global) ? m_ : best_i_;
         int j = (AM == AlignMode::Global) ? n_ : best_j_;
 
@@ -661,10 +725,9 @@ private:
             if constexpr (AM == AlignMode::Local)
                 if (rat(buf.H, i, j) <= 0.0) break;
             if (i > 0 && j > 0 &&
-                rat(buf.H, i, j) == rat(buf.H, i-1, j-1) + params_->matrix.score(seq_a_[i-1], seq_b_[j-1]))
+                rat(buf.H, i, j) == rat(buf.H, i-1, j-1) + sub(i, j))
             {
-                grad.matrix.mat[static_cast<unsigned char>(seq_a_[i-1])]
-                               [static_cast<unsigned char>(seq_b_[j-1])] += 1.0;
+                gblk[sub_off(i, j)] += 1.0;
                 --i; --j;
             } else if (i > 0 && rat(buf.H, i, j) == rat(buf.H, i-1, j) - params_->gap_extend_b) {
                 grad.gap_extend_b -= 1.0;   // the score subtracts this penalty
@@ -705,7 +768,7 @@ private:
         for (int i = 1; i <= m_; ++i) {
             for (int j = jlo(i); j <= jhi(i); ++j) {
                 double diag  = std::max({rat(buf.VM,i-1,j-1), rat(buf.VX,i-1,j-1), rat(buf.VY,i-1,j-1)});
-                double m_val = diag + params_->matrix.score(seq_a_[i-1], seq_b_[j-1]);
+                double m_val = diag + sub(i, j);
                 // X state: gap in B (advance i), uses gap_b params
                 double x_val = std::max({
                     rat(buf.VM,i-1,j) - params_->gap_open_b - params_->gap_extend_b,
@@ -798,14 +861,14 @@ private:
                 if (tbl == TBTable::M && rat(buf.VM, i, j) <= 0.0) break;
 
             if (tbl == TBTable::M) {
-                a.push_back(seq_a_[i-1]); b.push_back(seq_b_[j-1]);
+                a.push_back(sym_a(i)); b.push_back(sym_b(j));
                 double vm = rat(buf.VM,i-1,j-1), vx = rat(buf.VX,i-1,j-1), vy = rat(buf.VY,i-1,j-1);
                 --i; --j;
                 if      (vm >= vx && vm >= vy) tbl = TBTable::M;
                 else if (vx >= vy)             tbl = TBTable::X;
                 else                            tbl = TBTable::Y;
             } else if (tbl == TBTable::X) {
-                a.push_back(seq_a_[i-1]); b.push_back('-');  // gap in B
+                a.push_back(sym_a(i)); b.push_back('-');  // gap in B
                 double fm = rat(buf.VM,i-1,j) - params_->gap_open_b - params_->gap_extend_b;
                 double fx = rat(buf.VX,i-1,j) - params_->gap_extend_b;
                 double fy = rat(buf.VY,i-1,j) - params_->gap_open_b - params_->gap_extend_b;
@@ -814,7 +877,7 @@ private:
                 else if (fx >= fy)             tbl = TBTable::X;
                 else                            tbl = TBTable::Y;
             } else {
-                a.push_back('-'); b.push_back(seq_b_[j-1]);  // gap in A
+                a.push_back('-'); b.push_back(sym_b(j));  // gap in A
                 double fm = rat(buf.VM,i,j-1) - params_->gap_open_a - params_->gap_extend_a;
                 double fx = rat(buf.VX,i,j-1) - params_->gap_open_a - params_->gap_extend_a;
                 double fy = rat(buf.VY,i,j-1) - params_->gap_extend_a;
@@ -829,6 +892,7 @@ private:
     }
 
     void hard_grad_affine(const DpBuffer& buf, AlignParams& grad) const {
+        double* gblk = grad_block(grad);
         int i = best_i_, j = best_j_;
         TBTable tbl = best_tbl_;
 
@@ -838,8 +902,7 @@ private:
                 if (tbl == TBTable::M && rat(buf.VM, i, j) <= 0.0) break;
 
             if (tbl == TBTable::M) {
-                grad.matrix.mat[static_cast<unsigned char>(seq_a_[i-1])]
-                               [static_cast<unsigned char>(seq_b_[j-1])] += 1.0;
+                gblk[sub_off(i, j)] += 1.0;
                 double vm = rat(buf.VM,i-1,j-1), vx = rat(buf.VX,i-1,j-1), vy = rat(buf.VY,i-1,j-1);
                 --i; --j;
                 if      (vm >= vx && vm >= vy) tbl = TBTable::M;
@@ -898,7 +961,7 @@ private:
         for (int i = 1; i <= m_; ++i) {
             for (int j = jlo(i); j <= jhi(i); ++j) {
                 double v = lse3(
-                    rat(buf.F, i-1, j-1) + params_->matrix.score(seq_a_[i-1], seq_b_[j-1]),
+                    rat(buf.F, i-1, j-1) + sub(i, j),
                     rat(buf.F, i-1, j)   - params_->gap_extend_b,
                     rat(buf.F, i,   j-1) - params_->gap_extend_a
                 );
@@ -930,7 +993,7 @@ private:
                 if (bval == NEG_INF) continue;
                 if (i > 0 && j > 0)
                     at(buf.B,i-1,j-1) = lse2(rat(buf.B,i-1,j-1),
-                                              bval + params_->matrix.score(seq_a_[i-1], seq_b_[j-1]));
+                                              bval + sub(i, j));
                 if (i > 0)
                     at(buf.B,i-1,j)   = lse2(rat(buf.B,i-1,j),   bval - params_->gap_extend_b);
                 if (j > 0)
@@ -940,16 +1003,16 @@ private:
     }
 
     void soft_grad_linear(const DpBuffer& buf, AlignParams& grad) const {
+        double* gblk = grad_block(grad);
         // Matrix gradient: match steps (i-1,j-1) → (i,j)
         for (int i = 1; i <= m_; ++i) {
             for (int j = jlo(i); j <= jhi(i); ++j) {
                 double bval = rat(buf.B, i, j);
                 if (bval == NEG_INF) continue;
                 double log_p = rat(buf.F, i-1, j-1)
-                               + params_->matrix.score(seq_a_[i-1], seq_b_[j-1])
+                               + sub(i, j)
                                + bval - log_z_;
-                grad.matrix.mat[static_cast<unsigned char>(seq_a_[i-1])]
-                               [static_cast<unsigned char>(seq_b_[j-1])] += std::exp(log_p);
+                gblk[sub_off(i, j)] += std::exp(log_p);
             }
         }
 
@@ -1001,7 +1064,7 @@ private:
         for (int i = 1; i <= m_; ++i) {
             for (int j = jlo(i); j <= jhi(i); ++j) {
                 double diag  = lse3(rat(buf.FM,i-1,j-1), rat(buf.FX,i-1,j-1), rat(buf.FY,i-1,j-1));
-                double m_val = diag + params_->matrix.score(seq_a_[i-1], seq_b_[j-1]);
+                double m_val = diag + sub(i, j);
                 double x_val = lse3(
                     rat(buf.FM,i-1,j) - params_->gap_open_b - params_->gap_extend_b,
                     rat(buf.FX,i-1,j)                       - params_->gap_extend_b,
@@ -1041,7 +1104,7 @@ private:
                 double bm = rat(buf.BM,i,j), bx = rat(buf.BX,i,j), by = rat(buf.BY,i,j);
 
                 if (bm != NEG_INF && i > 0 && j > 0) {
-                    double contrib = bm + params_->matrix.score(seq_a_[i-1], seq_b_[j-1]);
+                    double contrib = bm + sub(i, j);
                     at(buf.BM,i-1,j-1) = lse2(rat(buf.BM,i-1,j-1), contrib);
                     at(buf.BX,i-1,j-1) = lse2(rat(buf.BX,i-1,j-1), contrib);
                     at(buf.BY,i-1,j-1) = lse2(rat(buf.BY,i-1,j-1), contrib);
@@ -1067,15 +1130,15 @@ private:
     }
 
     void soft_grad_affine(const DpBuffer& buf, AlignParams& grad) const {
+        double* gblk = grad_block(grad);
         // Matrix gradient: match steps
         for (int i = 1; i <= m_; ++i) {
             for (int j = jlo(i); j <= jhi(i); ++j) {
                 double bm = rat(buf.BM, i, j);
                 if (bm == NEG_INF) continue;
                 double pred  = lse3(rat(buf.FM,i-1,j-1), rat(buf.FX,i-1,j-1), rat(buf.FY,i-1,j-1));
-                double log_p = pred + params_->matrix.score(seq_a_[i-1], seq_b_[j-1]) + bm - log_z_;
-                grad.matrix.mat[static_cast<unsigned char>(seq_a_[i-1])]
-                               [static_cast<unsigned char>(seq_b_[j-1])] += std::exp(log_p);
+                double log_p = pred + sub(i, j) + bm - log_z_;
+                gblk[sub_off(i, j)] += std::exp(log_p);
             }
         }
 

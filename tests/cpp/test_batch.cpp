@@ -6,8 +6,7 @@ static AlignParams unit_params(double gap_extend = 1.0, double gap_open = 0.0) {
     std::array<double, 400> src{};
     for (int i = 0; i < 20; ++i)
         src[i * 20 + i] = 1.0;
-    AlignParams p;
-    p.matrix       = SubstMatrix(src.data());
+    AlignParams p(SubstMatrix(src.data()));
     p.gap_extend_a = p.gap_extend_b = gap_extend;
     p.gap_open_a   = p.gap_open_b   = gap_open;
     return p;
@@ -42,10 +41,10 @@ TEST_CASE("BatchAligner: gradient matches GradAligner single-threaded", "[batch]
     std::vector<ProblemInstance> problems{{a, b, {}}};
     auto result = ba.align(problems);
 
-    REQUIRE(result.grad.matrix.mat[(unsigned char)'A'][(unsigned char)'A'] == Approx(1.0));
-    REQUIRE(result.grad.matrix.mat[(unsigned char)'C'][(unsigned char)'C'] == Approx(1.0));
-    REQUIRE(result.grad.matrix.mat[(unsigned char)'D'][(unsigned char)'D'] == Approx(1.0));
-    REQUIRE(result.grad.matrix.mat[(unsigned char)'E'][(unsigned char)'E'] == Approx(1.0));
+    REQUIRE(result.grad.matrix.at(Alphabet::protein().index_of('A'), Alphabet::protein().index_of('A')) == Approx(1.0));
+    REQUIRE(result.grad.matrix.at(Alphabet::protein().index_of('C'), Alphabet::protein().index_of('C')) == Approx(1.0));
+    REQUIRE(result.grad.matrix.at(Alphabet::protein().index_of('D'), Alphabet::protein().index_of('D')) == Approx(1.0));
+    REQUIRE(result.grad.matrix.at(Alphabet::protein().index_of('E'), Alphabet::protein().index_of('E')) == Approx(1.0));
 }
 
 TEST_CASE("BatchAligner: multi-thread scores match single-thread", "[batch]") {
@@ -80,9 +79,9 @@ TEST_CASE("BatchAligner: multi-thread gradient matches single-thread", "[batch]"
     auto r1 = single.align(problems);
     auto r2 = multi.align(problems);
 
-    for (int i = 0; i < 256; ++i)
-        for (int j = 0; j < 256; ++j)
-            REQUIRE(r1.grad.matrix.mat[i][j] == Approx(r2.grad.matrix.mat[i][j]));
+    for (int i = 0; i < 20; ++i)
+        for (int j = 0; j < 20; ++j)
+            REQUIRE(r1.grad.matrix.at(i, j) == Approx(r2.grad.matrix.at(i, j)));
 }
 
 TEST_CASE("BatchAligner: no gradient mode skips accumulation", "[batch]") {
@@ -93,9 +92,9 @@ TEST_CASE("BatchAligner: no gradient mode skips accumulation", "[batch]") {
 
     REQUIRE(result.scores[0] == Approx(4.0));
     double total = 0.0;
-    for (int i = 0; i < 256; ++i)
-        for (int j = 0; j < 256; ++j)
-            total += result.grad.matrix.mat[i][j];
+    for (int i = 0; i < 20; ++i)
+        for (int j = 0; j < 20; ++j)
+            total += result.grad.matrix.at(i, j);
     REQUIRE(total == Approx(0.0));
 }
 

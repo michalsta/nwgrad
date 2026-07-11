@@ -18,8 +18,7 @@ static AlignParams unit_params() {
     for (int i = 0; i < 20; ++i)
         src[i * 20 + i] = 1.0;
 
-    AlignParams p;
-    p.matrix       = SubstMatrix(src.data());
+    AlignParams p(SubstMatrix(src.data()));
     p.gap_open_a   = 2.0;
     p.gap_extend_a = 1.0;
     p.gap_open_b   = 2.0;
@@ -77,7 +76,7 @@ TEST_CASE("Aligner: traceback before compute_viterbi() throws",
     REQUIRE_THROWS_AS(al.alignment(), std::logic_error);
     REQUIRE_THROWS_AS(al.aligned(),   std::logic_error);
 
-    AlignParams grad;
+    AlignParams grad(Alphabet::protein());
     REQUIRE_THROWS_AS(al.hard_grad(grad), std::logic_error);
 }
 
@@ -89,7 +88,7 @@ TEST_CASE("Aligner: soft_grad() before forward-backward throws",
     al.set_problem("WKLM", "WKLM", p);
     al.compute_viterbi();   // the *other* DP does not satisfy soft_grad
 
-    AlignParams grad;
+    AlignParams grad(Alphabet::protein());
     REQUIRE_THROWS_AS(al.soft_grad(grad), std::logic_error);
 
     al.compute_forward_back();

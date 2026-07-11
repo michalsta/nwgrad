@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -54,13 +55,18 @@ struct SeqPair {
         SeqPairState<GapModel::Affine, AlignMode::Local>
     >;
 
-    SeqPair(std::string a, std::string b,
+    // Sequences are validated and encoded to alphabet indices here, once, using
+    // the params' alphabet.  An out-of-alphabet character throws.  Everything
+    // downstream — the DP, the gradient — works on indices only.
+    SeqPair(std::string_view a, std::string_view b,
             const AlignParams& params,
             GapModel gm, AlignMode am,
             GradMode grad_mode = GradMode::Hard)
-        : seq_a_(std::move(a)), seq_b_(std::move(b)),
+        : a_idx_(params.matrix.alphabet().encode(a)),
+          b_idx_(params.matrix.alphabet().encode(b)),
           params_(&params),
-          grad_mode_(grad_mode)
+          grad_mode_(grad_mode),
+          grad_(params.matrix.alphabet())
     {
         if      (gm == GapModel::Linear && am == AlignMode::Global)
             state_.emplace<SeqPairState<GapModel::Linear, AlignMode::Global>>();
@@ -76,7 +82,17 @@ struct SeqPair {
     // realign_banded() remains callable after this — it will re-score the
     // existing guide path under the new params.
     // The new params must outlive this SeqPair.
+    //
+    // The new params must be over the same alphabet: the sequences were encoded
+    // to indices under the old one, and those indices would silently mean
+    // different residues under a different alphabet.
     void set_params(const AlignParams& params) {
+        if (&params.matrix.alphabet() != &params_->matrix.alphabet())
+            throw std::invalid_argument(
+                "nwgrad: set_params() cannot change the alphabet (\"" +
+                params_->matrix.alphabet().symbols() + "\" -> \"" +
+                params.matrix.alphabet().symbols() +
+                "\"); construct a new SeqPair instead");
         params_ = &params;
         score_valid_ = false;
         grad_valid_  = false;
@@ -97,7 +113,7 @@ struct SeqPair {
     // then forward-backward; score returns log Z.
     void align_full() {
         std::visit([&](auto& st) {
-            st.full_al.set_problem(seq_a_, seq_b_, *params_);
+            st.full_al.set_problem(a_idx_, b_idx_, *params_);
             run_dp(st.full_al);
         }, state_);
         last_banded_  = false;
@@ -117,7 +133,7 @@ struct SeqPair {
             throw std::logic_error(
                 "nwgrad: call align_full() before realign_banded()");
         std::visit([&](auto& st) {
-            st.band_al.set_problem(seq_a_, seq_b_, *params_, bandwidth, guide_j_);
+            st.band_al.set_problem(a_idx_, b_idx_, *params_, bandwidth, guide_j_);
             run_dp(st.band_al);
         }, state_);
         last_banded_  = true;
@@ -135,24 +151,22 @@ struct SeqPair {
     void score_and_grad_with_dp(DpBuffer& buf, int bandwidth = 0) {
         std::visit([&](auto& st) {
             // Full viterbi: always needed for guide_j when banding, or as the sole DP.
-            st.full_al.set_problem(seq_a_, seq_b_, *params_);
+            st.full_al.set_problem(a_idx_, b_idx_, *params_);
             run_dp_with_buf(st.full_al, buf);
 
             if (bandwidth > 0) {
                 // Banded DP around the guide_j extracted above.
-                st.band_al.set_problem(seq_a_, seq_b_, *params_, bandwidth, guide_j_);
+                st.band_al.set_problem(a_idx_, b_idx_, *params_, bandwidth, guide_j_);
                 run_dp_with_buf(st.band_al, buf);
                 last_banded_ = true;
                 if (grad_mode_ != GradMode::None) {
-                    grad_ = AlignParams{};
-                    grad_.matrix.order_ = params_->matrix.order_;
+                    grad_.zero();
                     grad_with_buf(st.band_al, buf);
                 }
             } else {
                 last_banded_ = false;
                 if (grad_mode_ != GradMode::None) {
-                    grad_ = AlignParams{};
-                    grad_.matrix.order_ = params_->matrix.order_;
+                    grad_.zero();
                     grad_with_buf(st.full_al, buf);
                 }
             }
@@ -186,8 +200,7 @@ struct SeqPair {
         if (grad_mode_ == GradMode::None)
             throw std::logic_error(
                 "nwgrad: grad_mode is None; construct with Hard or Soft to enable gradients");
-        grad_ = AlignParams{};
-        grad_.matrix.order_ = params_->matrix.order_;
+        grad_.zero();
         std::visit([&](auto& st) {
             if (grad_mode_ == GradMode::Hard) {
                 if (last_banded_) st.band_al.hard_grad(grad_);
@@ -260,11 +273,14 @@ struct SeqPair {
 
     GradMode grad_mode() const noexcept { return grad_mode_; }
 
-    const std::string& seq_a() const noexcept { return seq_a_; }
-    const std::string& seq_b() const noexcept { return seq_b_; }
+    // Decoded on demand: only the encoded indices are stored.
+    std::string seq_a() const { return params_->matrix.alphabet().decode(a_idx_); }
+    std::string seq_b() const { return params_->matrix.alphabet().decode(b_idx_); }
+
+    const Alphabet& alphabet() const noexcept { return params_->matrix.alphabet(); }
 
 private:
-    std::string          seq_a_, seq_b_;
+    std::vector<uint8_t> a_idx_, b_idx_;   // alphabet indices, not characters
     const AlignParams*   params_;
     GradMode             grad_mode_;
 
@@ -276,7 +292,7 @@ private:
     std::vector<int> guide_j_;
 
     bool        grad_valid_ = false;
-    AlignParams grad_{};
+    AlignParams grad_;
 
     StateVar state_;
 

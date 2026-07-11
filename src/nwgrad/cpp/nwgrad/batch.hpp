@@ -1,13 +1,17 @@
 #pragma once
 
 #include <atomic>
+#include <cstdint>
 #include <mutex>
+#include <stdexcept>
+#include <string>
 #include <string_view>
 #include <thread>
 #include <vector>
 
 #include "align_params.hpp"
 #include "aligner.hpp"
+#include "parallel.hpp"
 
 struct ProblemInstance {
     std::string_view seq_a;
@@ -18,6 +22,8 @@ struct ProblemInstance {
 struct BatchResult {
     std::vector<double> scores;
     AlignParams grad;
+
+    explicit BatchResult(const Alphabet& alpha) : grad(alpha) {}
 };
 
 struct BatchAligner {
@@ -36,9 +42,8 @@ struct BatchAligner {
 
     BatchResult align(const std::vector<ProblemInstance>& problems) const {
         const size_t N = problems.size();
-        BatchResult result;
+        BatchResult result(params.matrix.alphabet());
         result.scores.resize(N, 0.0);
-        result.grad.matrix.order_ = params.matrix.order_;  // export grad in the matrix's alphabet
 
         if (N == 0) return result;
 
@@ -46,7 +51,7 @@ struct BatchAligner {
         std::mutex grad_mutex;
 
         auto worker = [&]() {
-            AlignParams local_grad{};
+            AlignParams local_grad = AlignParams::zeros_like(params);
             dispatch_worker(problems, N, work_idx, result.scores, local_grad);
             if (grad_mode != GradMode::None) {
                 std::lock_guard<std::mutex> lock(grad_mutex);
@@ -55,17 +60,38 @@ struct BatchAligner {
         };
 
         int actual_threads = std::min<int>(n_threads, static_cast<int>(N));
-        std::vector<std::thread> threads;
-        threads.reserve(static_cast<size_t>(actual_threads - 1));
-        for (int t = 0; t < actual_threads - 1; ++t)
-            threads.emplace_back(worker);
-        worker();
-        for (auto& t : threads) t.join();
+        run_workers_guarded(actual_threads, worker);
 
         return result;
     }
 
 private:
+    // Validate and encode one sequence into `out`.  An out-of-alphabet character
+    // throws, naming the pair and which of the two sequences it was in — the
+    // aligner's own message could only name a position in an anonymous string.
+    // The throw happens on a worker thread and is rethrown to the caller by
+    // run_workers_guarded().
+    static void encode_into(const Alphabet& alpha, std::string_view s,
+                            std::vector<uint8_t>& out, size_t pair_idx, char which) {
+        out.clear();
+        out.reserve(s.size());
+        for (size_t k = 0; k < s.size(); ++k) {
+            int i = alpha.index_of(s[k]);
+            if (i < 0) {
+                std::string msg = "nwgrad: pair ";
+                msg += std::to_string(pair_idx);
+                msg += ", sequence ";
+                msg += which;
+                msg += ": character '";
+                msg += s[k];
+                msg += "' at position " + std::to_string(k) +
+                       " is not in alphabet \"" + alpha.symbols() + "\"";
+                throw std::invalid_argument(msg);
+            }
+            out.push_back(static_cast<uint8_t>(i));
+        }
+    }
+
     template<GapModel GM, AlignMode AM, AlignBand AB>
     void work_loop(
         const std::vector<ProblemInstance>& problems,
@@ -76,11 +102,17 @@ private:
     {
         Aligner<GM, AM, AB> al;
         DpBuffer buf;  // reused across iterations; grows to the largest pair seen
+        const Alphabet& alpha = params.matrix.alphabet();
+        // Encoding buffers, reused across iterations: the batch never
+        // materialises all N encoded sequences at once.
+        std::vector<uint8_t> a_enc, b_enc;
         while (true) {
             size_t idx = work_idx.fetch_add(1, std::memory_order_relaxed);
             if (idx >= N) break;
             const auto& p = problems[idx];
-            al.set_problem(p.seq_a, p.seq_b, params, band, p.guide_j);
+            encode_into(alpha, p.seq_a, a_enc, idx, 'a');
+            encode_into(alpha, p.seq_b, b_enc, idx, 'b');
+            al.set_problem(a_enc, b_enc, params, band, p.guide_j);
 
             if (grad_mode == GradMode::Hard) {
                 al.compute_viterbi(buf);

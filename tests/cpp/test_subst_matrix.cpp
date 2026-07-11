@@ -1,6 +1,8 @@
 #include "catch.hpp"
 #include "subst_matrix.hpp"
 
+#include <stdexcept>
+
 // Build a flat 20×20 identity-like matrix for predictable round-trip tests.
 static std::array<double, 400> make_flat(double diag, double off) {
     std::array<double, 400> m{};
@@ -44,11 +46,18 @@ TEST_CASE("SubstMatrix preserves asymmetric values", "[subst_matrix]") {
     REQUIRE(sm.score('C', 'A') == Approx(7.0));
 }
 
-TEST_CASE("SubstMatrix non-AA entries are zero", "[subst_matrix]") {
+TEST_CASE("SubstMatrix rejects characters outside the alphabet", "[subst_matrix]") {
     auto src = make_flat(1.0, 1.0);
     SubstMatrix sm(src.data());
-    // '*' is not in AA_ORDER
-    REQUIRE(sm.score('*', 'A') == Approx(0.0));
-    REQUIRE(sm.score('A', '*') == Approx(0.0));
-    REQUIRE(sm.score('*', '*') == Approx(0.0));
+
+    // '*' is not in AA_ORDER.  The 256x256 ASCII table used to have a cell for
+    // it, so it scored a silent 0.0 -- an out-of-alphabet residue would quietly
+    // align at no cost instead of being reported.  There is no such cell now,
+    // and no such silence.
+    REQUIRE_THROWS_AS(sm.score('*', 'A'), std::invalid_argument);
+    REQUIRE_THROWS_AS(sm.score('A', '*'), std::invalid_argument);
+    REQUIRE_THROWS_AS(sm.score('*', '*'), std::invalid_argument);
+
+    // Case is significant: lowercase is out of alphabet like any other symbol.
+    REQUIRE_THROWS_AS(sm.score('a', 'A'), std::invalid_argument);
 }

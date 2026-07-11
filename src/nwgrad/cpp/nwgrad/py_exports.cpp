@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -31,6 +32,33 @@ using nb_arr_f64_1d = nb::ndarray<nb::numpy, double, nb::ndim<1>>;
             body                                                                           \
         }                                                                                  \
     } while (0)
+
+// The convenience functions still take plain `str`: they validate and encode
+// against the params' alphabet here, at the boundary.  An out-of-alphabet
+// character throws.  The encoded vectors must outlive the set_problem() call,
+// so they live in the caller's frame.
+struct EncodedPair {
+    std::vector<uint8_t> a, b;
+    EncodedPair(std::string_view sa, std::string_view sb, const AlignParams& p)
+        : a(p.matrix.alphabet().encode(sa)), b(p.matrix.alphabet().encode(sb)) {}
+};
+
+// Hold a reference to the params a SeqPair / SeqPairBatch currently points at.
+//
+// C++ stores params as a bare pointer, so Python must keep the object alive.
+// nb::keep_alive<1,2> is the obvious tool and the wrong one here, twice over:
+//
+//   - It appends to a linked list that nanobind walks on every call to
+//     deduplicate (nb_type.cpp:1585), so K swaps cost O(K^2).
+//   - It never releases.  A gradient-descent loop builds a fresh AlignParams
+//     each step, so every superseded one stays pinned for the object's life.
+//
+// Only the *current* params needs to be alive — C++ has already dropped the
+// pointer to the old one.  So overwrite a single attribute: O(1), and the
+// superseded params is released on the spot.
+static void keep_current_params(nb::object owner, nb::object params) {
+    owner.attr("_params") = params;
+}
 
 static std::vector<int> make_guide(const std::string& aligned_a,
                                     const std::string& aligned_b) {
@@ -66,6 +94,55 @@ static std::string format_alignment(const std::string& a, const std::string& b,
 NB_MODULE(nwgrad_ext, m) {
     m.doc() = "nwgrad C++ nanobind module";
 
+    // ── Alphabet ─────────────────────────────────────────────────────────────
+    // Interned and immortal on the C++ side, so nanobind must never take
+    // ownership: every binding hands back a reference to the one true instance.
+    nb::class_<Alphabet>(m, "Alphabet")
+        .def_static(
+            "get",
+            [](const std::string& symbols) -> const Alphabet& {
+                return Alphabet::get(symbols);
+            },
+            nb::arg("symbols"),
+            nb::rv_policy::reference,
+            "Return the interned Alphabet for `symbols`, creating it if new.\n"
+            "Calling this twice with the same symbols returns the same object.")
+        .def_prop_ro("symbols", [](const Alphabet& a) { return a.symbols(); },
+                     "The symbol string, in index order.")
+        .def_prop_ro("size", &Alphabet::size, "Number of symbols, N.")
+        .def("index_of", &Alphabet::index_of, nb::arg("c"),
+             "Index of character `c`, or -1 if it is not in this alphabet.")
+        .def("contains", &Alphabet::contains, nb::arg("c"))
+        .def("encode",
+             [](const Alphabet& self, const std::string& s) { return self.encode(s); },
+             nb::arg("s"),
+             "Validate and encode `s` to a list of alphabet indices.\n"
+             "Raises ValueError on any character outside the alphabet.\n"
+             "Case is significant: 'd' is not 'D'.")
+        .def("decode",
+             [](const Alphabet& self, const std::vector<uint8_t>& idx) {
+                 return self.decode(idx);
+             },
+             nb::arg("indices"))
+        .def("__len__", &Alphabet::size)
+        .def("__eq__", [](const Alphabet& a, const Alphabet& b) { return &a == &b; },
+             nb::is_operator())
+        .def("__repr__", [](const Alphabet& a) {
+            return "Alphabet(\"" + a.symbols() + "\")";
+        });
+
+    // Named alphabets.  Extensions append at the end, so the canonical 20 amino
+    // acids keep indices 0-19 and an existing 20x20 matrix (BLOSUM62, PAM, ...)
+    // embeds as the top-left block of any extended one.
+    m.attr("DNA")         = nb::cast(&Alphabet::dna(),         nb::rv_policy::reference);
+    m.attr("DNA_N")       = nb::cast(&Alphabet::dna_n(),       nb::rv_policy::reference);
+    m.attr("RNA")         = nb::cast(&Alphabet::rna(),         nb::rv_policy::reference);
+    m.attr("RNA_N")       = nb::cast(&Alphabet::rna_n(),       nb::rv_policy::reference);
+    m.attr("PROTEIN")     = nb::cast(&Alphabet::protein(),     nb::rv_policy::reference);
+    m.attr("PROTEIN_X")   = nb::cast(&Alphabet::protein_x(),   nb::rv_policy::reference);
+    m.attr("PROTEIN_UO")  = nb::cast(&Alphabet::protein_uo(),  nb::rv_policy::reference);
+    m.attr("PROTEIN_UOX") = nb::cast(&Alphabet::protein_uox(), nb::rv_policy::reference);
+
     // ── SubstMatrix ──────────────────────────────────────────────────────────
     nb::class_<SubstMatrix>(m, "SubstMatrix")
         .def(
@@ -75,7 +152,7 @@ NB_MODULE(nwgrad_ext, m) {
                     throw std::invalid_argument("matrix must be square");
                 if (static_cast<size_t>(alphabet.size()) != arr.shape(0))
                     throw std::invalid_argument("alphabet length must match matrix size");
-                new (self) SubstMatrix(arr.data(), alphabet);
+                new (self) SubstMatrix(arr.data(), Alphabet::get(alphabet));
             },
             nb::arg("matrix"),
             nb::arg("alphabet") = std::string(AA_ORDER),
@@ -117,12 +194,8 @@ NB_MODULE(nwgrad_ext, m) {
                     throw std::invalid_argument("matrix must be square");
                 if (static_cast<size_t>(alphabet.size()) != arr.shape(0))
                     throw std::invalid_argument("alphabet length must match matrix size");
-                new (self) AlignParams();
-                self->matrix       = SubstMatrix(arr.data(), alphabet);
-                self->gap_open_a   = gap_open_a;
-                self->gap_extend_a = gap_extend_a;
-                self->gap_open_b   = gap_open_b;
-                self->gap_extend_b = gap_extend_b;
+                new (self) AlignParams(SubstMatrix(arr.data(), Alphabet::get(alphabet)),
+                                       gap_open_a, gap_extend_a, gap_open_b, gap_extend_b);
             },
             nb::arg("matrix"),
             nb::arg("alphabet")     = std::string(AA_ORDER),
@@ -140,12 +213,8 @@ NB_MODULE(nwgrad_ext, m) {
             [](AlignParams* self, const SubstMatrix& matrix,
                double gap_open_a, double gap_extend_a,
                double gap_open_b, double gap_extend_b) {
-                new (self) AlignParams();
-                self->matrix       = matrix;
-                self->gap_open_a   = gap_open_a;
-                self->gap_extend_a = gap_extend_a;
-                self->gap_open_b   = gap_open_b;
-                self->gap_extend_b = gap_extend_b;
+                new (self) AlignParams(matrix, gap_open_a, gap_extend_a,
+                                       gap_open_b, gap_extend_b);
             },
             nb::arg("matrix"),
             nb::arg("gap_open_a")   = 0.0,
@@ -176,7 +245,14 @@ NB_MODULE(nwgrad_ext, m) {
         .def_prop_rw(
             "matrix",
             [](const AlignParams& self) { return self.matrix; },
-            [](AlignParams& self, const SubstMatrix& mat) { self.matrix = mat; })
+            [](AlignParams& self, const SubstMatrix& mat) {
+                if (&mat.alphabet() != &self.matrix.alphabet())
+                    throw std::invalid_argument(
+                        "nwgrad: cannot assign a matrix over alphabet \"" +
+                        mat.alphabet().symbols() + "\" to params over \"" +
+                        self.matrix.alphabet().symbols() + "\"");
+                self.matrix = mat;
+            })
         .def_rw("gap_open_a",   &AlignParams::gap_open_a)
         .def_rw("gap_extend_a", &AlignParams::gap_extend_a)
         .def_rw("gap_open_b",   &AlignParams::gap_open_b)
@@ -212,8 +288,9 @@ NB_MODULE(nwgrad_ext, m) {
            const AlignParams& params, int band,
            const std::string& aligned_a, const std::string& aligned_b) {
             auto gj = make_guide(aligned_a, aligned_b);
+            EncodedPair enc(a, b, params);
             WITH_ALIGNER(Linear, Global, band, gj, {
-                al.set_problem(a, b, params, band, gj);
+                al.set_problem(enc.a, enc.b, params, band, gj);
                 al.compute_viterbi(_buf);
                 return al.score();
             });
@@ -228,8 +305,9 @@ NB_MODULE(nwgrad_ext, m) {
            const AlignParams& params, int band,
            const std::string& aligned_a, const std::string& aligned_b) {
             auto gj = make_guide(aligned_a, aligned_b);
+            EncodedPair enc(a, b, params);
             WITH_ALIGNER(Linear, Local, band, gj, {
-                al.set_problem(a, b, params, band, gj);
+                al.set_problem(enc.a, enc.b, params, band, gj);
                 al.compute_viterbi(_buf);
                 return al.score();
             });
@@ -244,8 +322,9 @@ NB_MODULE(nwgrad_ext, m) {
            const AlignParams& params, int band,
            const std::string& aligned_a, const std::string& aligned_b) {
             auto gj = make_guide(aligned_a, aligned_b);
+            EncodedPair enc(a, b, params);
             WITH_ALIGNER(Affine, Global, band, gj, {
-                al.set_problem(a, b, params, band, gj);
+                al.set_problem(enc.a, enc.b, params, band, gj);
                 al.compute_viterbi(_buf);
                 return al.score();
             });
@@ -260,8 +339,9 @@ NB_MODULE(nwgrad_ext, m) {
            const AlignParams& params, int band,
            const std::string& aligned_a, const std::string& aligned_b) {
             auto gj = make_guide(aligned_a, aligned_b);
+            EncodedPair enc(a, b, params);
             WITH_ALIGNER(Affine, Local, band, gj, {
-                al.set_problem(a, b, params, band, gj);
+                al.set_problem(enc.a, enc.b, params, band, gj);
                 al.compute_viterbi(_buf);
                 return al.score();
             });
@@ -278,11 +358,11 @@ NB_MODULE(nwgrad_ext, m) {
            const AlignParams& params, int band,
            const std::string& aligned_a, const std::string& aligned_b) {
             auto gj = make_guide(aligned_a, aligned_b);
+            EncodedPair enc(a, b, params);
             WITH_ALIGNER(Linear, Global, band, gj, {
-                al.set_problem(a, b, params, band, gj);
+                al.set_problem(enc.a, enc.b, params, band, gj);
                 al.compute_viterbi(_buf);
-                AlignParams grad;
-                grad.matrix.order_ = params.matrix.order_;
+                AlignParams grad = AlignParams::zeros_like(params);
                 al.hard_grad(_buf, grad);
                 return nb::make_tuple(al.score(), grad);
             });
@@ -297,11 +377,11 @@ NB_MODULE(nwgrad_ext, m) {
            const AlignParams& params, int band,
            const std::string& aligned_a, const std::string& aligned_b) {
             auto gj = make_guide(aligned_a, aligned_b);
+            EncodedPair enc(a, b, params);
             WITH_ALIGNER(Linear, Local, band, gj, {
-                al.set_problem(a, b, params, band, gj);
+                al.set_problem(enc.a, enc.b, params, band, gj);
                 al.compute_viterbi(_buf);
-                AlignParams grad;
-                grad.matrix.order_ = params.matrix.order_;
+                AlignParams grad = AlignParams::zeros_like(params);
                 al.hard_grad(_buf, grad);
                 return nb::make_tuple(al.score(), grad);
             });
@@ -316,11 +396,11 @@ NB_MODULE(nwgrad_ext, m) {
            const AlignParams& params, int band,
            const std::string& aligned_a, const std::string& aligned_b) {
             auto gj = make_guide(aligned_a, aligned_b);
+            EncodedPair enc(a, b, params);
             WITH_ALIGNER(Affine, Global, band, gj, {
-                al.set_problem(a, b, params, band, gj);
+                al.set_problem(enc.a, enc.b, params, band, gj);
                 al.compute_viterbi(_buf);
-                AlignParams grad;
-                grad.matrix.order_ = params.matrix.order_;
+                AlignParams grad = AlignParams::zeros_like(params);
                 al.hard_grad(_buf, grad);
                 return nb::make_tuple(al.score(), grad);
             });
@@ -335,11 +415,11 @@ NB_MODULE(nwgrad_ext, m) {
            const AlignParams& params, int band,
            const std::string& aligned_a, const std::string& aligned_b) {
             auto gj = make_guide(aligned_a, aligned_b);
+            EncodedPair enc(a, b, params);
             WITH_ALIGNER(Affine, Local, band, gj, {
-                al.set_problem(a, b, params, band, gj);
+                al.set_problem(enc.a, enc.b, params, band, gj);
                 al.compute_viterbi(_buf);
-                AlignParams grad;
-                grad.matrix.order_ = params.matrix.order_;
+                AlignParams grad = AlignParams::zeros_like(params);
                 al.hard_grad(_buf, grad);
                 return nb::make_tuple(al.score(), grad);
             });
@@ -356,11 +436,11 @@ NB_MODULE(nwgrad_ext, m) {
            const AlignParams& params, int band,
            const std::string& aligned_a, const std::string& aligned_b) {
             auto gj = make_guide(aligned_a, aligned_b);
+            EncodedPair enc(a, b, params);
             WITH_ALIGNER(Linear, Global, band, gj, {
-                al.set_problem(a, b, params, band, gj);
+                al.set_problem(enc.a, enc.b, params, band, gj);
                 al.compute_forward_back(_buf);
-                AlignParams grad;
-                grad.matrix.order_ = params.matrix.order_;
+                AlignParams grad = AlignParams::zeros_like(params);
                 al.soft_grad(_buf, grad);
                 return nb::make_tuple(al.log_z(), grad);
             });
@@ -375,11 +455,11 @@ NB_MODULE(nwgrad_ext, m) {
            const AlignParams& params, int band,
            const std::string& aligned_a, const std::string& aligned_b) {
             auto gj = make_guide(aligned_a, aligned_b);
+            EncodedPair enc(a, b, params);
             WITH_ALIGNER(Linear, Local, band, gj, {
-                al.set_problem(a, b, params, band, gj);
+                al.set_problem(enc.a, enc.b, params, band, gj);
                 al.compute_forward_back(_buf);
-                AlignParams grad;
-                grad.matrix.order_ = params.matrix.order_;
+                AlignParams grad = AlignParams::zeros_like(params);
                 al.soft_grad(_buf, grad);
                 return nb::make_tuple(al.log_z(), grad);
             });
@@ -394,11 +474,11 @@ NB_MODULE(nwgrad_ext, m) {
            const AlignParams& params, int band,
            const std::string& aligned_a, const std::string& aligned_b) {
             auto gj = make_guide(aligned_a, aligned_b);
+            EncodedPair enc(a, b, params);
             WITH_ALIGNER(Affine, Global, band, gj, {
-                al.set_problem(a, b, params, band, gj);
+                al.set_problem(enc.a, enc.b, params, band, gj);
                 al.compute_forward_back(_buf);
-                AlignParams grad;
-                grad.matrix.order_ = params.matrix.order_;
+                AlignParams grad = AlignParams::zeros_like(params);
                 al.soft_grad(_buf, grad);
                 return nb::make_tuple(al.log_z(), grad);
             });
@@ -413,11 +493,11 @@ NB_MODULE(nwgrad_ext, m) {
            const AlignParams& params, int band,
            const std::string& aligned_a, const std::string& aligned_b) {
             auto gj = make_guide(aligned_a, aligned_b);
+            EncodedPair enc(a, b, params);
             WITH_ALIGNER(Affine, Local, band, gj, {
-                al.set_problem(a, b, params, band, gj);
+                al.set_problem(enc.a, enc.b, params, band, gj);
                 al.compute_forward_back(_buf);
-                AlignParams grad;
-                grad.matrix.order_ = params.matrix.order_;
+                AlignParams grad = AlignParams::zeros_like(params);
                 al.soft_grad(_buf, grad);
                 return nb::make_tuple(al.log_z(), grad);
             });
@@ -509,7 +589,11 @@ NB_MODULE(nwgrad_ext, m) {
             "Align N sequence pairs.  Returns a BatchResult with .scores and .grad.");
 
     // ── SeqPair ───────────────────────────────────────────────────────────────
-    nb::class_<SeqPair>(m, "SeqPair")
+    // dynamic_attr() so set_params() can park a *replaceable* reference to the
+    // current params on the instance; see the comment there.  An instance with
+    // no attribute set carries only a null dict pointer, so the 2.5M-SeqPair
+    // case pays 8 bytes each and no dict.
+    nb::class_<SeqPair>(m, "SeqPair", nb::dynamic_attr())
         .def(
             "__init__",
             [](SeqPair* self,
@@ -529,7 +613,11 @@ NB_MODULE(nwgrad_ext, m) {
             nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("params"),
             nb::arg("gap_model") = "affine", nb::arg("mode") = "global",
             nb::arg("grad_mode") = "hard",
-            nb::keep_alive<1, 4>(),  // keep `params` alive as long as the SeqPair
+            // Keeps the initial `params` alive; a SeqPair whose params is never
+            // swapped would otherwise hold a dangling pointer.  keep_alive is
+            // fine *here* — one patient, registered once, so it stays O(1).  It
+            // is set_params() that must not use it; see keep_current_params().
+            nb::keep_alive<1, 4>(),
             "Persistent sequence pair.\n"
             "  gap_model : \"linear\" | \"affine\"\n"
             "  mode      : \"global\" | \"local\"\n"
@@ -538,9 +626,13 @@ NB_MODULE(nwgrad_ext, m) {
              "Pre-allocate own DP tables for the fixed sequences.")
         .def(
             "set_params",
-            [](SeqPair& self, const AlignParams& params) { self.set_params(params); },
+            [](nb::object self_obj, nb::object params_obj) {
+                SeqPair& self = nb::cast<SeqPair&>(self_obj);
+                // Validates the alphabet; throws before we take a reference.
+                self.set_params(nb::cast<const AlignParams&>(params_obj));
+                keep_current_params(self_obj, params_obj);
+            },
             nb::arg("params"),
-            nb::keep_alive<1, 2>(),  // keep the new `params` alive as long as the SeqPair
             "Swap alignment parameters.  Invalidates cached score and gradient.")
         .def("align_full",     &SeqPair::align_full,
              "Full DP alignment.  Updates score and alignment path; clears gradient cache.")
@@ -595,7 +687,7 @@ NB_MODULE(nwgrad_ext, m) {
         .def_prop_ro("seq_b", [](const SeqPair& s) { return s.seq_b(); });
 
     // ── SeqPairBatch ─────────────────────────────────────────────────────────
-    nb::class_<SeqPairBatch>(m, "SeqPairBatch")
+    nb::class_<SeqPairBatch>(m, "SeqPairBatch", nb::dynamic_attr())
         .def(
             "__init__",
             [](SeqPairBatch* self, int n_threads) {
@@ -606,9 +698,27 @@ NB_MODULE(nwgrad_ext, m) {
             "  n_threads=0 (default) uses hardware_concurrency.")
         .def(
             "add",
-            [](SeqPairBatch& self, SeqPair* sp) { self.add(sp); },
+            [](nb::object self_obj, nb::object sp_obj) {
+                SeqPairBatch& self = nb::cast<SeqPairBatch&>(self_obj);
+                // Validates the alphabet against the batch's first pair; throws
+                // before we take a reference to anything.
+                self.add(nb::cast<SeqPair*>(sp_obj));
+
+                // The batch holds SeqPairs by raw pointer, so each one must be
+                // kept alive for as long as the batch is.  nb::keep_alive<1,2>
+                // does that, but nanobind keeps a nurse's patients in a singly
+                // linked list that it walks on every call to deduplicate — so
+                // the k-th add() walks k nodes and N adds cost O(N^2).  At
+                // Manakov's 2.5M pairs that is hours.  A Python list append is
+                // O(1) and keeps the same reference for the same lifetime.
+                nb::list refs;
+                if (nb::hasattr(self_obj, "_keepalive"))
+                    refs = nb::borrow<nb::list>(self_obj.attr("_keepalive"));
+                else
+                    self_obj.attr("_keepalive") = refs;
+                refs.append(sp_obj);
+            },
             nb::arg("seq_pair"),
-            nb::keep_alive<1, 2>(),
             "Append a SeqPair to the batch.")
         .def("__len__", &SeqPairBatch::size)
         .def(
@@ -625,9 +735,15 @@ NB_MODULE(nwgrad_ext, m) {
              "Pre-allocate own DP tables on all pairs in parallel.")
         .def(
             "set_params",
-            [](SeqPairBatch& self, const AlignParams& params) { self.set_params(params); },
+            [](nb::object self_obj, nb::object params_obj) {
+                SeqPairBatch& self = nb::cast<SeqPairBatch&>(self_obj);
+                // Sets params on every pair in C++, so the pairs do not each
+                // take their own Python reference — the batch holds the one that
+                // keeps `params` alive on their behalf.
+                self.set_params(nb::cast<const AlignParams&>(params_obj));
+                keep_current_params(self_obj, params_obj);
+            },
             nb::arg("params"),
-            nb::keep_alive<1, 2>(),  // keep `params` alive for the batch (and its pairs)
             "Set alignment parameters on all pairs (clears score and grad caches).")
         .def(
             "align_full",

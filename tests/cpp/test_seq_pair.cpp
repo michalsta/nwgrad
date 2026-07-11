@@ -28,8 +28,7 @@ static AlignParams asym_params(double open_a, double ext_a,
         for (int j = 0; j < 20; ++j)
             src[i * 20 + j] = (i == j) ? 2.0 : -1.0;
 
-    AlignParams p;
-    p.matrix       = SubstMatrix(src.data());
+    AlignParams p(SubstMatrix(src.data()));
     p.gap_open_a   = open_a;
     p.gap_extend_a = ext_a;
     p.gap_open_b   = open_b;
@@ -165,9 +164,9 @@ TEST_CASE("SeqPair: score_and_grad matches align_full + compute_grad", "[seq_pai
     REQUIRE(grad.gap_extend_a == Approx(a.grad().gap_extend_a));
     REQUIRE(grad.gap_open_b   == Approx(a.grad().gap_open_b));
     REQUIRE(grad.gap_extend_b == Approx(a.grad().gap_extend_b));
-    for (int i = 0; i < 256; ++i)
-        for (int j = 0; j < 256; ++j)
-            REQUIRE(grad.matrix.mat[i][j] == Approx(a.grad().matrix.mat[i][j]));
+    for (int i = 0; i < 20; ++i)
+        for (int j = 0; j < 20; ++j)
+            REQUIRE(grad.matrix.at(i, j) == Approx(a.grad().matrix.at(i, j)));
 }
 
 TEST_CASE("SeqPair: aligned() strings reconstruct the sequences", "[seq_pair]") {
@@ -298,7 +297,7 @@ TEST_CASE("SeqPairBatch: compute_grad sums the per-pair gradients",
     batch.align_full();
     const AlignParams total = batch.compute_grad();
 
-    AlignParams expected;
+    AlignParams expected(Alphabet::protein());
     for (size_t i = 0; i < c.as.size(); ++i) {
         SeqPair one(c.as[i], c.bs[i], p,
                     GapModel::Affine, AlignMode::Global, GradMode::Hard);
@@ -309,9 +308,9 @@ TEST_CASE("SeqPairBatch: compute_grad sums the per-pair gradients",
     REQUIRE(total.gap_extend_a == Approx(expected.gap_extend_a));
     REQUIRE(total.gap_open_b   == Approx(expected.gap_open_b));
     REQUIRE(total.gap_extend_b == Approx(expected.gap_extend_b));
-    for (int i = 0; i < 256; ++i)
-        for (int j = 0; j < 256; ++j)
-            REQUIRE(total.matrix.mat[i][j] == Approx(expected.matrix.mat[i][j]));
+    for (int i = 0; i < 20; ++i)
+        for (int j = 0; j < 20; ++j)
+            REQUIRE(total.matrix.at(i, j) == Approx(expected.matrix.at(i, j)));
 }
 
 TEST_CASE("SeqPairBatch: score_and_grad matches align_full + compute_grad",
@@ -344,10 +343,10 @@ TEST_CASE("SeqPairBatch: score_and_grad matches align_full + compute_grad",
     REQUIRE(total_fused == Approx(total_stepwise));
     REQUIRE(grad_fused.gap_open_b   == Approx(grad_stepwise.gap_open_b));
     REQUIRE(grad_fused.gap_extend_b == Approx(grad_stepwise.gap_extend_b));
-    for (int i = 0; i < 256; ++i)
-        for (int j = 0; j < 256; ++j)
-            REQUIRE(grad_fused.matrix.mat[i][j] ==
-                    Approx(grad_stepwise.matrix.mat[i][j]));
+    for (int i = 0; i < 20; ++i)
+        for (int j = 0; j < 20; ++j)
+            REQUIRE(grad_fused.matrix.at(i, j) ==
+                    Approx(grad_stepwise.matrix.at(i, j)));
 }
 
 TEST_CASE("SeqPairBatch: set_params then realign_banded", "[seq_pair_batch][banded]") {
@@ -379,15 +378,20 @@ TEST_CASE("SeqPairBatch: set_params then realign_banded", "[seq_pair_batch][band
     for (auto& sp : pairs) REQUIRE_FALSE(sp.dp_valid());
 }
 
-TEST_CASE("SeqPairBatch: an empty batch is harmless", "[seq_pair_batch]") {
+TEST_CASE("SeqPairBatch: an empty batch has no gradient", "[seq_pair_batch]") {
     SeqPairBatch batch(2);
     REQUIRE(batch.size() == 0);
+
+    // Scoring an empty batch is still a no-op summing to zero.
     batch.alloc_dp();
     REQUIRE(batch.align_full() == Approx(0.0));
 
-    const AlignParams grad = batch.compute_grad();
-    REQUIRE(grad.gap_open_a == Approx(0.0));
-    REQUIRE(grad.gap_extend_b == Approx(0.0));
+    // The gradient is not: the sum of no gradients has no alphabet, and there
+    // is nothing in scope to infer one from.  Returning a zero gradient would
+    // mean labelling it with a guessed alphabet -- which is what this did
+    // before, always claiming the 20-AA default even for a DNA batch.
+    REQUIRE_THROWS_AS(batch.compute_grad(), std::logic_error);
+    REQUIRE_THROWS_AS(batch.alphabet(),     std::logic_error);
 }
 
 TEST_CASE("SeqPairBatch: single-threaded and multi-threaded agree",
@@ -414,7 +418,7 @@ TEST_CASE("SeqPairBatch: single-threaded and multi-threaded agree",
     REQUIRE(total8 == Approx(total1));
     REQUIRE(grad8.gap_open_a   == Approx(grad1.gap_open_a));
     REQUIRE(grad8.gap_extend_b == Approx(grad1.gap_extend_b));
-    for (int i = 0; i < 256; ++i)
-        for (int j = 0; j < 256; ++j)
-            REQUIRE(grad8.matrix.mat[i][j] == Approx(grad1.matrix.mat[i][j]));
+    for (int i = 0; i < 20; ++i)
+        for (int j = 0; j < 20; ++j)
+            REQUIRE(grad8.matrix.at(i, j) == Approx(grad1.matrix.at(i, j)));
 }

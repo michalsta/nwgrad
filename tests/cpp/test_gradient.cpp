@@ -7,8 +7,7 @@ static AlignParams unit_params(double gap_extend, double gap_open = 0.0) {
     std::array<double, 400> src{};
     for (int i = 0; i < 20; ++i)
         src[i * 20 + i] = 1.0;
-    AlignParams p;
-    p.matrix       = SubstMatrix(src.data());
+    AlignParams p(SubstMatrix(src.data()));
     p.gap_extend_a = p.gap_extend_b = gap_extend;
     p.gap_open_a   = p.gap_open_b   = gap_open;
     return p;
@@ -16,9 +15,9 @@ static AlignParams unit_params(double gap_extend, double gap_open = 0.0) {
 
 static double sum_grad(const AlignParams& g) {
     double s = 0.0;
-    for (int i = 0; i < 256; ++i)
-        for (int j = 0; j < 256; ++j)
-            s += g.matrix.mat[i][j];
+    for (int i = 0; i < 20; ++i)
+        for (int j = 0; j < 20; ++j)
+            s += g.matrix.at(i, j);
     return s;
 }
 
@@ -36,14 +35,14 @@ TEST_CASE("Gradient linear global: identical sequences — all matches", "[gradi
     al.alloc_buf();
     al.set_problem("ACDE", "ACDE", p);
     al.compute_viterbi();
-    AlignParams grad{};
+    AlignParams grad(Alphabet::protein());
     al.hard_grad(grad);
 
     REQUIRE(al.score() == Approx(4.0));
-    REQUIRE(grad.matrix.mat[(unsigned char)'A'][(unsigned char)'A'] == Approx(1.0));
-    REQUIRE(grad.matrix.mat[(unsigned char)'C'][(unsigned char)'C'] == Approx(1.0));
-    REQUIRE(grad.matrix.mat[(unsigned char)'D'][(unsigned char)'D'] == Approx(1.0));
-    REQUIRE(grad.matrix.mat[(unsigned char)'E'][(unsigned char)'E'] == Approx(1.0));
+    REQUIRE(grad.matrix.at(Alphabet::protein().index_of('A'), Alphabet::protein().index_of('A')) == Approx(1.0));
+    REQUIRE(grad.matrix.at(Alphabet::protein().index_of('C'), Alphabet::protein().index_of('C')) == Approx(1.0));
+    REQUIRE(grad.matrix.at(Alphabet::protein().index_of('D'), Alphabet::protein().index_of('D')) == Approx(1.0));
+    REQUIRE(grad.matrix.at(Alphabet::protein().index_of('E'), Alphabet::protein().index_of('E')) == Approx(1.0));
     REQUIRE(sum_grad(grad) == Approx(4.0));
 }
 
@@ -53,7 +52,7 @@ TEST_CASE("Gradient linear global: gaps produce zero gradient contribution", "[g
     al.alloc_buf();
     al.set_problem("A", "", p);
     al.compute_viterbi();
-    AlignParams grad{};
+    AlignParams grad(Alphabet::protein());
     al.hard_grad(grad);
     REQUIRE(sum_grad(grad) == Approx(0.0));
 }
@@ -62,7 +61,7 @@ TEST_CASE("Gradient linear global: repeated calls accumulate", "[gradient][linea
     auto p = unit_params(1.0);
     Aligner<GapModel::Linear, AlignMode::Global> al;
     al.alloc_buf();
-    AlignParams grad{};
+    AlignParams grad(Alphabet::protein());
 
     al.set_problem("AA", "AA", p);
     al.compute_viterbi();
@@ -72,7 +71,7 @@ TEST_CASE("Gradient linear global: repeated calls accumulate", "[gradient][linea
     al.compute_viterbi();
     al.hard_grad(grad);
 
-    REQUIRE(grad.matrix.mat[(unsigned char)'A'][(unsigned char)'A'] == Approx(4.0));
+    REQUIRE(grad.matrix.at(Alphabet::protein().index_of('A'), Alphabet::protein().index_of('A')) == Approx(4.0));
 }
 
 TEST_CASE("Gradient linear global: one-gap alignment has correct count", "[gradient][linear][global]") {
@@ -81,7 +80,7 @@ TEST_CASE("Gradient linear global: one-gap alignment has correct count", "[gradi
     al.alloc_buf();
     al.set_problem("ADE", "ACDE", p);
     al.compute_viterbi();
-    AlignParams grad{};
+    AlignParams grad(Alphabet::protein());
     al.hard_grad(grad);
     REQUIRE(sum_grad(grad) == Approx(3.0));
 }
@@ -94,14 +93,14 @@ TEST_CASE("Gradient linear local: only matching region contributes", "[gradient]
     al.alloc_buf();
     al.set_problem("ADE", "MMMADEM", p);
     al.compute_viterbi();
-    AlignParams grad{};
+    AlignParams grad(Alphabet::protein());
     al.hard_grad(grad);
 
     REQUIRE(sum_grad(grad) == Approx(3.0));
-    REQUIRE(grad.matrix.mat[(unsigned char)'A'][(unsigned char)'A'] == Approx(1.0));
-    REQUIRE(grad.matrix.mat[(unsigned char)'D'][(unsigned char)'D'] == Approx(1.0));
-    REQUIRE(grad.matrix.mat[(unsigned char)'E'][(unsigned char)'E'] == Approx(1.0));
-    REQUIRE(grad.matrix.mat[(unsigned char)'M'][(unsigned char)'M'] == Approx(0.0));
+    REQUIRE(grad.matrix.at(Alphabet::protein().index_of('A'), Alphabet::protein().index_of('A')) == Approx(1.0));
+    REQUIRE(grad.matrix.at(Alphabet::protein().index_of('D'), Alphabet::protein().index_of('D')) == Approx(1.0));
+    REQUIRE(grad.matrix.at(Alphabet::protein().index_of('E'), Alphabet::protein().index_of('E')) == Approx(1.0));
+    REQUIRE(grad.matrix.at(Alphabet::protein().index_of('M'), Alphabet::protein().index_of('M')) == Approx(0.0));
 }
 
 TEST_CASE("Gradient linear local: no match gives zero gradient", "[gradient][linear][local]") {
@@ -110,7 +109,7 @@ TEST_CASE("Gradient linear local: no match gives zero gradient", "[gradient][lin
     al.alloc_buf();
     al.set_problem("AAAA", "CCCC", p);
     al.compute_viterbi();
-    AlignParams grad{};
+    AlignParams grad(Alphabet::protein());
     al.hard_grad(grad);
     REQUIRE(sum_grad(grad) == Approx(0.0));
 }
@@ -123,7 +122,7 @@ TEST_CASE("Gradient affine global: identical sequences", "[gradient][affine][glo
     al.alloc_buf();
     al.set_problem("ACDE", "ACDE", p);
     al.compute_viterbi();
-    AlignParams grad{};
+    AlignParams grad(Alphabet::protein());
     al.hard_grad(grad);
 
     REQUIRE(al.score() == Approx(4.0));
@@ -136,7 +135,7 @@ TEST_CASE("Gradient affine global: gap produces no gradient", "[gradient][affine
     al.alloc_buf();
     al.set_problem("A", "", p);
     al.compute_viterbi();
-    AlignParams grad{};
+    AlignParams grad(Alphabet::protein());
     al.hard_grad(grad);
     REQUIRE(sum_grad(grad) == Approx(0.0));
 }
@@ -149,7 +148,7 @@ TEST_CASE("Gradient affine local: finds and counts local match", "[gradient][aff
     al.alloc_buf();
     al.set_problem("ADE", "MMMADEM", p);
     al.compute_viterbi();
-    AlignParams grad{};
+    AlignParams grad(Alphabet::protein());
     al.hard_grad(grad);
     REQUIRE(sum_grad(grad) == Approx(3.0));
 }

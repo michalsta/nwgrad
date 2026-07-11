@@ -7,8 +7,7 @@ static AlignParams unit_params(double gap_extend, double gap_open = 0.0) {
     std::array<double, 400> src{};
     for (int i = 0; i < 20; ++i)
         src[i * 20 + i] = 1.0;
-    AlignParams p;
-    p.matrix       = SubstMatrix(src.data());
+    AlignParams p(SubstMatrix(src.data()));
     p.gap_extend_a = p.gap_extend_b = gap_extend;
     p.gap_open_a   = p.gap_open_b   = gap_open;
     return p;
@@ -87,9 +86,9 @@ TEST_CASE("Banded affine global: identical sequences, band=0", "[banded][affine]
 
 static double sum_grad(const AlignParams& g) {
     double s = 0.0;
-    for (int i = 0; i < 256; ++i)
-        for (int j = 0; j < 256; ++j)
-            s += g.matrix.mat[i][j];
+    for (int i = 0; i < 20; ++i)
+        for (int j = 0; j < 20; ++j)
+            s += g.matrix.at(i, j);
     return s;
 }
 
@@ -99,10 +98,10 @@ TEST_CASE("Banded hard grad: identical sequences", "[banded][gradient]") {
     al.alloc_buf();
     al.set_problem("ACDE", "ACDE", p, 0);
     al.compute_viterbi();
-    AlignParams grad{};
+    AlignParams grad(Alphabet::protein());
     al.hard_grad(grad);
     REQUIRE(sum_grad(grad) == Approx(4.0));
-    REQUIRE(grad.matrix.mat[(unsigned char)'A'][(unsigned char)'A'] == Approx(1.0));
+    REQUIRE(grad.matrix.at(Alphabet::protein().index_of('A'), Alphabet::protein().index_of('A')) == Approx(1.0));
 }
 
 TEST_CASE("Banded hard grad: matches full DP grad", "[banded][gradient]") {
@@ -115,13 +114,13 @@ TEST_CASE("Banded hard grad: matches full DP grad", "[banded][gradient]") {
     full.alloc_buf();
     full.set_problem("ADE", "ACDE", pfull);
     full.compute_viterbi();
-    AlignParams gfull{};
+    AlignParams gfull(Alphabet::protein());
     full.hard_grad(gfull);
 
     banded.alloc_buf();
     banded.set_problem("ADE", "ACDE", pbanded, 2);
     banded.compute_viterbi();
-    AlignParams gbanded{};
+    AlignParams gbanded(Alphabet::protein());
     banded.hard_grad(gbanded);
 
     REQUIRE(sum_grad(gfull) == Approx(sum_grad(gbanded)));
@@ -138,13 +137,13 @@ TEST_CASE("Banded soft grad: wide band matches full for global linear", "[banded
     full.alloc_buf();
     full.set_problem("ACDE", "ACDE", p);
     full.compute_forward_back();
-    AlignParams gfull{};
+    AlignParams gfull(Alphabet::protein());
     full.soft_grad(gfull);
 
     banded.alloc_buf();
     banded.set_problem("ACDE", "ACDE", p, 100);
     banded.compute_forward_back();
-    AlignParams gbanded{};
+    AlignParams gbanded(Alphabet::protein());
     banded.soft_grad(gbanded);
 
     REQUIRE(full.log_z()    == Approx(banded.log_z()).epsilon(1e-9));

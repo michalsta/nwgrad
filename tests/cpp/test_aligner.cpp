@@ -7,8 +7,7 @@ static AlignParams unit_params(double gap_extend, double gap_open = 0.0) {
     std::array<double, 400> src{};
     for (int i = 0; i < 20; ++i)
         src[i * 20 + i] = 1.0;
-    AlignParams p;
-    p.matrix       = SubstMatrix(src.data());
+    AlignParams p(SubstMatrix(src.data()));
     p.gap_extend_a = p.gap_extend_b = gap_extend;
     p.gap_open_a   = p.gap_open_b   = gap_open;
     return p;

@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "align_params.hpp"
+#include "parallel.hpp"
 #include "seq_pair.hpp"
 
 // SeqPairBatch holds non-owning pointers to SeqPair objects.
@@ -19,11 +20,27 @@ struct SeqPairBatch {
     explicit SeqPairBatch(int nt = 0)
         : n_threads(nt > 0 ? nt : default_threads()) {}
 
+    // Every pair in a batch must share an alphabet: their gradients are summed,
+    // and summing across alphabets is meaningless.  Checked here, on the
+    // caller's thread, at the point of the mistake — rather than deep inside a
+    // worker where the diagnostic would be useless.
     void add(SeqPair* sp) {
+        if (!pairs.empty() && &sp->alphabet() != &pairs.front()->alphabet())
+            throw std::invalid_argument(
+                "nwgrad: SeqPair over alphabet \"" + sp->alphabet().symbols() +
+                "\" cannot join a batch over alphabet \"" +
+                pairs.front()->alphabet().symbols() + "\"");
         pairs.push_back(sp);
     }
 
     size_t size() const noexcept { return pairs.size(); }
+
+    // The alphabet shared by every pair in the batch.  Throws if empty.
+    const Alphabet& alphabet() const {
+        if (pairs.empty())
+            throw std::logic_error("nwgrad: empty batch has no alphabet");
+        return pairs.front()->alphabet();
+    }
 
     SeqPair& operator[](size_t i) { return *pairs[i]; }
     const SeqPair& operator[](size_t i) const { return *pairs[i]; }
@@ -77,14 +94,17 @@ struct SeqPairBatch {
     // Returns the summed AlignParams gradient over all pairs.
     // If a pair already has grad_valid() == true (e.g. after score_and_grad_with_dp),
     // its cached gradient is used directly without rerunning the DP.
+    // Throws on an empty batch: the sum has no alphabet, and a zero gradient
+    // labelled with a guessed one would be a silent wrong answer.
     AlignParams compute_grad() {
+        const Alphabet& alpha = alphabet();   // throws if empty
         const size_t N = pairs.size();
         std::atomic<size_t> idx{0};
         std::mutex grad_mutex;
-        AlignParams grad_out{};
+        AlignParams grad_out(alpha);
 
         auto worker = [&]() {
-            AlignParams local{};
+            AlignParams local(alpha);
             while (true) {
                 size_t i = idx.fetch_add(1, std::memory_order_relaxed);
                 if (i >= N) break;
@@ -97,7 +117,6 @@ struct SeqPairBatch {
         };
 
         run_workers(N, worker);
-        if (N > 0) grad_out.matrix.order_ = pairs[0]->grad().matrix.order_;
         return grad_out;
     }
 
@@ -149,11 +168,6 @@ private:
     void run_workers(size_t N, Worker& worker) {
         if (N == 0) return;
         int actual = std::min<int>(n_threads, static_cast<int>(N));
-        std::vector<std::thread> threads;
-        threads.reserve(static_cast<size_t>(actual - 1));
-        for (int t = 0; t < actual - 1; ++t)
-            threads.emplace_back(worker);
-        worker();
-        for (auto& t : threads) t.join();
+        run_workers_guarded(actual, worker);
     }
 };
