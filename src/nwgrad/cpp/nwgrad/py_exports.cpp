@@ -143,6 +143,12 @@ NB_MODULE(nwgrad_ext, m) {
     m.attr("PROTEIN_UO")  = nb::cast(&Alphabet::protein_uo(),  nb::rv_policy::reference);
     m.attr("PROTEIN_UOX") = nb::cast(&Alphabet::protein_uox(), nb::rv_policy::reference);
 
+    // The alphabets nwgrad.matrices is expressed in.  Different orderings, not
+    // extensions: NCBI columns run ARNDCQEG..., so BLOSUM62 does not embed in
+    // PROTEIN_X.
+    m.attr("NCBI_PROTEIN") = nb::cast(&Alphabet::ncbi_protein(), nb::rv_policy::reference);
+    m.attr("IUPAC_DNA")    = nb::cast(&Alphabet::iupac_dna(),    nb::rv_policy::reference);
+
     // ── SubstMatrix ──────────────────────────────────────────────────────────
     nb::class_<SubstMatrix>(m, "SubstMatrix")
         .def(
@@ -207,7 +213,9 @@ NB_MODULE(nwgrad_ext, m) {
             "  alphabet    : symbol order for the N×N matrix (default: canonical AA order)\n"
             "  gap_open_a / gap_extend_a : penalties for gaps in sequence A (Y state)\n"
             "  gap_open_b / gap_extend_b : penalties for gaps in sequence B (X state)\n"
-            "All gap values default to 0.0 (usable as a zero gradient accumulator).")
+            "All gap values default to 0.0.  An AlignParams always has an alphabet:\n"
+            "to build a zero gradient accumulator, use one of the matrices you are\n"
+            "already aligning with rather than a default-constructed AlignParams.")
         .def(
             "__init__",
             [](AlignParams* self, const SubstMatrix& matrix,

@@ -27,10 +27,15 @@ import numpy as np
 
 from .nwgrad_ext import SubstMatrix
 
-# Alphabet shared by all NCBI protein matrices (ARNDCQEGHILKMFPSTWYVBZX)
+# Alphabet shared by all NCBI protein matrices (ARNDCQEGHILKMFPSTWYVBZX).
+# Exposed as nwgrad.NCBI_PROTEIN.  Note this is a *different ordering* from
+# nwgrad.PROTEIN ("ACDEFGHIKLMNPQRSTVWY"), not an extension of it: NCBI orders
+# its columns ARNDCQEG..., so these matrices do not embed in nwgrad.PROTEIN_X.
+# Mixing the two throws rather than silently misreading the columns.
 _AA = "ARNDCQEGHILKMFPSTWYVBZX"
 
-# IUPAC DNA ambiguity alphabet used by NUC.4.4
+# IUPAC DNA ambiguity alphabet used by NUC.4.4.  Exposed as nwgrad.IUPAC_DNA;
+# likewise a different ordering from nwgrad.DNA ("ACGT").
 _DNA = "ATGCSWRYKMBVHDN"
 
 # ---------------------------------------------------------------------------

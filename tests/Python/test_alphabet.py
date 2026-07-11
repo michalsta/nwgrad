@@ -90,6 +90,36 @@ def test_alphabet_symbol_limit():
         nwgrad.Alphabet.get("".join(chr(c) for c in range(1, 130)))
 
 
+def test_shipped_matrices_use_the_named_alphabets():
+    """nwgrad.matrices is in NCBI / IUPAC column order, which is a different
+    ordering from PROTEIN / DNA -- not an extension of them."""
+    from nwgrad.matrices import BLOSUM62, PAM250, VTML80, NUC44
+
+    for m in (BLOSUM62, PAM250, VTML80):
+        assert m.alphabet == nwgrad.NCBI_PROTEIN.symbols
+        assert m.size == 23
+    assert NUC44.alphabet == nwgrad.IUPAC_DNA.symbols
+    assert NUC44.size == 15
+
+
+def test_blosum62_does_not_embed_in_protein_x():
+    """The docs used to claim a 20x20 BLOSUM embeds in the top-left block of an
+    extended alphabet.  True of the ordering, false of the BLOSUM this repo
+    ships: NCBI runs ARNDCQEG..., not alphabetically."""
+    from nwgrad.matrices import BLOSUM62
+    assert nwgrad.NCBI_PROTEIN.symbols[:20] != nwgrad.PROTEIN.symbols
+    assert BLOSUM62.alphabet != nwgrad.PROTEIN_X.symbols
+
+    # And the mismatch is loud, not silent.
+    ncbi = nwgrad.AlignParams(BLOSUM62, gap_extend_a=1.0, gap_extend_b=1.0)
+    canon = nwgrad.AlignParams(nwgrad.SubstMatrix(AA_ARR),  # PROTEIN order
+                               gap_extend_a=1.0, gap_extend_b=1.0)
+    _s1, g_ncbi = nwgrad.sw_grad("ARND", "ARND", ncbi)
+    _s2, g_canon = nwgrad.sw_grad("ACDE", "ACDE", canon)
+    with pytest.raises(ValueError, match="different alphabets"):
+        g_ncbi + g_canon
+
+
 # ── Validation is loud ────────────────────────────────────────────────────────
 
 def test_encode_rejects_out_of_alphabet_char():

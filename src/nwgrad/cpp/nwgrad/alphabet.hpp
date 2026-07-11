@@ -49,6 +49,14 @@ public:
     static const Alphabet& protein_uo()   { return get(std::string(AA20) + "UO");  }
     static const Alphabet& protein_uox()  { return get(std::string(AA20) + "UOX"); }
 
+    // The alphabets the matrices shipped in nwgrad.matrices are actually
+    // expressed in.  These are *different orderings* from protein()/dna() above,
+    // not extensions of them: NCBI orders its columns ARNDCQEG..., not
+    // alphabetically, so a BLOSUM62 does not embed in protein_x().  Combining a
+    // matrix over one with a gradient over the other throws, which is the point.
+    static const Alphabet& ncbi_protein() { return get("ARNDCQEGHILKMFPSTWYVBZX"); }
+    static const Alphabet& iupac_dna()    { return get("ATGCSWRYKMBVHDN"); }
+
     int size() const noexcept { return n_; }
     const std::string& symbols() const noexcept { return symbols_; }
 

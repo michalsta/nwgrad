@@ -151,8 +151,14 @@ Named alphabets:
 | `nwgrad.PROTEIN_X` | + `X` (unknown) | 21 |
 | `nwgrad.PROTEIN_UO` | + `U` (selenocysteine), `O` (pyrrolysine) | 22 |
 | `nwgrad.PROTEIN_UOX` | + `U`, `O`, `X` | 23 |
+| `nwgrad.NCBI_PROTEIN` | `ARNDCQEGHILKMFPSTWYVBZX` | 23 |
+| `nwgrad.IUPAC_DNA` | `ATGCSWRYKMBVHDN` | 15 |
 
-Extensions **append at the end**, so the canonical 20 keep indices 0–19 and a 20×20 BLOSUM62 embeds as the top-left block of any extended alphabet. An `Alphabet` governs legality and ordering only — scoring is entirely the matrix's job, including for `X` and `N`.
+Extensions **append at the end**, so the canonical 20 keep indices 0–19 and a 20×20 matrix *in that order* embeds as the top-left block of any extended one.
+
+**The matrices in `nwgrad.matrices` use a different ordering.** BLOSUM, PAM and VTML are all in NCBI column order (`NCBI_PROTEIN`), and `NUC44` is in IUPAC order (`IUPAC_DNA`). These are *not* extensions of `PROTEIN` / `DNA` — BLOSUM62 does not embed in `PROTEIN_X`. Combining a matrix over one alphabet with a gradient over another raises, rather than silently misreading the columns.
+
+An `Alphabet` governs legality and ordering only — scoring is entirely the matrix's job, including for `X` and `N`.
 
 For anything not listed, build your own: `nwgrad.Alphabet.get("ACGTRYSWKM")`.
 
