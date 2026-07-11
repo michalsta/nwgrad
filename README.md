@@ -24,7 +24,7 @@ pip install nwgrad
 Or from source:
 
 ```bash
-git clone https://github.com/your-org/nwgrad
+git clone https://github.com/michalsta/nwgrad
 cd nwgrad
 pip install .
 ```

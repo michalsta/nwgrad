@@ -9,7 +9,7 @@ def module_main():
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="nwgrad: A module that prints Hello World message."
+        description="nwgrad: sequence alignment with substitution-matrix gradients."
     )
     parser.add_argument("--version", "-v", action="version", version=__version__)
     parser.add_argument(
