@@ -41,10 +41,14 @@ install(DIRECTORY src/nwgrad/cpp/nwgrad DESTINATION nwgrad/cpp
 add_executable(nwgrad_tests
     tests/cpp/main.cpp
     tests/cpp/test_subst_matrix.cpp
+    tests/cpp/test_align_params.cpp
     tests/cpp/test_aligner.cpp
+    tests/cpp/test_alignment_path.cpp
+    tests/cpp/test_preconditions.cpp
     tests/cpp/test_gradient.cpp
     tests/cpp/test_batch.cpp
     tests/cpp/test_banded.cpp
+    tests/cpp/test_seq_pair.cpp
 )
 target_include_directories(nwgrad_tests PRIVATE
     src/nwgrad/cpp/nwgrad
