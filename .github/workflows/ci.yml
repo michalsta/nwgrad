@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cpp:
+    name: C++ tests (${{ matrix.compiler }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - compiler: gcc
+            cc: gcc
+            cxx: g++
+          - compiler: clang
+            cc: clang
+            cxx: clang++
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # CMakeLists does find_package(nanobind) for the extension target, so even a
+      # tests-only configure needs it on the prefix path.
+      - name: Install nanobind
+        run: pip install nanobind
+
+      # The C++ test binary is not reachable through the Python package, so it
+      # only ever runs here: SeqPair/SeqPairBatch from C++, Aligner::alignment(),
+      # the precondition throws, and the AlignParams operators.
+      - name: Configure
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+          -Dnanobind_DIR="$(python -m nanobind --cmake_dir)"
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  python:
+    name: Python tests (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install
+        run: pip install -e ".[dev]"
+
+      - name: Test
+        run: pytest tests/Python/ -q
+
+  headers:
+    name: Header-only consumer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install
+        run: pip install -e ".[dev]"
+
+      # The library is advertised as header-only, with `python -m nwgrad --include`
+      # giving the include path.  Compile against it exactly as a consumer would,
+      # so a header that only compiles inside this repo's own build fails here.
+      - name: Compile against the advertised include path
+        run: |
+          printf '#include <nwgrad/seq_pair_batch.hpp>\nint main() { return 0; }\n' > consumer.cpp
+          c++ -std=c++20 -Wall -Wextra -I "$(python -m nwgrad --include)" consumer.cpp -o consumer
+          ./consumer

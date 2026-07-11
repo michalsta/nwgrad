@@ -667,10 +667,10 @@ private:
                                [static_cast<unsigned char>(seq_b_[j-1])] += 1.0;
                 --i; --j;
             } else if (i > 0 && rat(buf.H, i, j) == rat(buf.H, i-1, j) - params_->gap_extend_b) {
-                grad.gap_extend_b += 1.0;
+                grad.gap_extend_b -= 1.0;   // the score subtracts this penalty
                 --i;
             } else {
-                grad.gap_extend_a += 1.0;
+                grad.gap_extend_a -= 1.0;
                 --j;
             }
         }
@@ -847,7 +847,7 @@ private:
                 else                            tbl = TBTable::Y;
             } else if (tbl == TBTable::X) {
                 // X state: gap in B (advance i), uses gap_b params
-                grad.gap_extend_b += 1.0;
+                grad.gap_extend_b -= 1.0;   // the score subtracts this penalty
                 double fm = rat(buf.VM,i-1,j) - params_->gap_open_b - params_->gap_extend_b;
                 double fx = rat(buf.VX,i-1,j)                       - params_->gap_extend_b;
                 double fy = rat(buf.VY,i-1,j) - params_->gap_open_b - params_->gap_extend_b;
@@ -856,11 +856,11 @@ private:
                 if      (fm >= fx && fm >= fy) prev = TBTable::M;
                 else if (fx >= fy)             prev = TBTable::X;
                 else                            prev = TBTable::Y;
-                if (prev != TBTable::X) grad.gap_open_b += 1.0;  // gap opening
+                if (prev != TBTable::X) grad.gap_open_b -= 1.0;  // gap opening
                 tbl = prev;
             } else {
                 // Y state: gap in A (advance j), uses gap_a params
-                grad.gap_extend_a += 1.0;
+                grad.gap_extend_a -= 1.0;
                 double fm = rat(buf.VM,i,j-1) - params_->gap_open_a - params_->gap_extend_a;
                 double fx = rat(buf.VX,i,j-1) - params_->gap_open_a - params_->gap_extend_a;
                 double fy = rat(buf.VY,i,j-1)                       - params_->gap_extend_a;
@@ -869,7 +869,7 @@ private:
                 if      (fm >= fx && fm >= fy) prev = TBTable::M;
                 else if (fx >= fy)             prev = TBTable::X;
                 else                            prev = TBTable::Y;
-                if (prev != TBTable::Y) grad.gap_open_a += 1.0;  // gap opening
+                if (prev != TBTable::Y) grad.gap_open_a -= 1.0;  // gap opening
                 tbl = prev;
             }
         }
@@ -960,7 +960,7 @@ private:
                 if (bval == NEG_INF) continue;
                 double fval = rat(buf.F, i-1, j);
                 if (fval == NEG_INF) continue;
-                grad.gap_extend_b += std::exp(fval - params_->gap_extend_b + bval - log_z_);
+                grad.gap_extend_b -= std::exp(fval - params_->gap_extend_b + bval - log_z_);
             }
         }
 
@@ -971,7 +971,7 @@ private:
                 if (bval == NEG_INF) continue;
                 double fval = rat(buf.F, i, j-1);
                 if (fval == NEG_INF) continue;
-                grad.gap_extend_a += std::exp(fval - params_->gap_extend_a + bval - log_z_);
+                grad.gap_extend_a -= std::exp(fval - params_->gap_extend_a + bval - log_z_);
             }
         }
     }
@@ -1084,7 +1084,7 @@ private:
             for (int j = jlo0(i); j <= jhi0(i); ++j) {
                 double fx = rat(buf.FX, i, j), bx = rat(buf.BX, i, j);
                 if (fx == NEG_INF || bx == NEG_INF) continue;
-                grad.gap_extend_b += std::exp(fx + bx - log_z_);
+                grad.gap_extend_b -= std::exp(fx + bx - log_z_);
             }
         }
 
@@ -1093,7 +1093,7 @@ private:
             for (int j = std::max(1, jlo0(i)); j <= jhi0(i); ++j) {
                 double fy = rat(buf.FY, i, j), by = rat(buf.BY, i, j);
                 if (fy == NEG_INF || by == NEG_INF) continue;
-                grad.gap_extend_a += std::exp(fy + by - log_z_);
+                grad.gap_extend_a -= std::exp(fy + by - log_z_);
             }
         }
 
@@ -1106,7 +1106,7 @@ private:
                 double log_open = lse2(fm, fy_prev)
                                   - params_->gap_open_b - params_->gap_extend_b
                                   + bx - log_z_;
-                if (log_open > -700) grad.gap_open_b += std::exp(log_open);
+                if (log_open > -700) grad.gap_open_b -= std::exp(log_open);
             }
         }
 
@@ -1119,7 +1119,7 @@ private:
                 double log_open = lse2(fm, fx_prev)
                                   - params_->gap_open_a - params_->gap_extend_a
                                   + by - log_z_;
-                if (log_open > -700) grad.gap_open_a += std::exp(log_open);
+                if (log_open > -700) grad.gap_open_a -= std::exp(log_open);
             }
         }
     }

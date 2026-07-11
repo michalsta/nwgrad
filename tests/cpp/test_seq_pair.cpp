@@ -200,9 +200,10 @@ TEST_CASE("SeqPair: GradMode::Soft scores the log-partition function", "[seq_pai
 
     soft.compute_grad();
     REQUIRE(soft.grad_valid());
-    // Soft gap counts are expectations, so generally fractional but non-negative.
-    REQUIRE(soft.grad().gap_extend_a >= 0.0);
-    REQUIRE(soft.grad().gap_extend_b >= 0.0);
+    // Gap derivatives are negated expected counts: raising a penalty lowers the
+    // score, so d(log Z)/d(gap penalty) can never be positive.
+    REQUIRE(soft.grad().gap_extend_a <= 0.0);
+    REQUIRE(soft.grad().gap_extend_b <= 0.0);
 }
 
 TEST_CASE("SeqPair: GradMode::None still scores but refuses a gradient", "[seq_pair]") {

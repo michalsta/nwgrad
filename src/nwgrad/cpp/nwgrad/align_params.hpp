@@ -10,6 +10,13 @@
 // All fields default to 0.0, which is the correct zero-initialiser for use
 // as a gradient accumulator.  For alignment, supply non-zero gap costs.
 //
+// When an AlignParams holds a gradient (as returned by hard_grad / soft_grad),
+// every field — the matrix entries and all four gap fields alike — is a
+// derivative of the score with respect to that parameter.  Because the score
+// *subtracts* the gap penalties, the gap fields of a gradient come out negative
+// where the matrix fields come out positive; that asymmetry is the point, and it
+// is what makes a single update rule correct for the whole struct.
+//
 // Addition and scalar multiplication operate element-wise over all fields,
 // enabling gradient-descent update loops:
 //   params = params - learning_rate * grad;

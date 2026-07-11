@@ -193,9 +193,11 @@ def test_hard_gradient_counts_match_bruteforce(generic_matrix, a, b, oa, ea, ob,
     got_matrix, got_oa, got_ea, got_ob, got_eb = _grad_arrays(grad)
     pairs, exp_oa, exp_ea, exp_ob, exp_eb = bf.global_hard_counts(a, b, p, affine=True)
 
+    # the oracle returns counts; the gap penalties are subtracted from the score,
+    # so their derivatives are the negated counts
     np.testing.assert_allclose(got_matrix, _pairs_to_matrix(pairs), atol=1e-9)
     assert (got_oa, got_ea, got_ob, got_eb) == pytest.approx(
-        (exp_oa, exp_ea, exp_ob, exp_eb))
+        (-exp_oa, -exp_ea, -exp_ob, -exp_eb))
 
 
 @pytest.mark.parametrize("a,b,oa,ea,ob,eb", CORPUS)
@@ -209,20 +211,19 @@ def test_soft_gradient_expected_counts_match_bruteforce(
 
     np.testing.assert_allclose(got_matrix, _pairs_to_matrix(pairs), atol=1e-9)
     assert (got_oa, got_ea, got_ob, got_eb) == pytest.approx(
-        (exp_oa, exp_ea, exp_ob, exp_eb))
+        (-exp_oa, -exp_ea, -exp_ob, -exp_eb))
 
 
 @pytest.mark.parametrize("gap_param", ["gap_open_a", "gap_extend_a",
                                        "gap_open_b", "gap_extend_b"])
-def test_gap_gradient_is_a_count_not_a_score_derivative(matrix, gap_param):
-    """Pins the sign convention of the gap components of the gradient.
+def test_gap_gradient_is_a_true_score_derivative(matrix, gap_param):
+    """Every field of the gradient is d(score)/d(that field) — gaps included.
 
-    The matrix component is a true derivative of the score, but the four gap
-    components are reported as *counts* — i.e. the negation of d(score)/d(param),
-    because the score subtracts the penalties.  The two halves of AlignParams
-    therefore carry opposite signs, which matters to anyone writing the update
-    loop that align_params.hpp advertises.  This test exists to make any change
-    to that convention deliberate rather than silent.
+    The gap fields are the ones that are easy to get wrong: the score *subtracts*
+    the penalties, so their derivatives are negative where the matrix derivatives
+    are positive.  Reporting positive gap counts here (the obvious implementation,
+    and what the library used to do) makes a single update rule move the matrix
+    and the gap costs in opposite directions with respect to the score.
     """
     a, b = "ACGTACGT", "AGTACT"
     base = dict(gap_open_a=5.0, gap_extend_a=1.0, gap_open_b=5.0, gap_extend_b=1.0)
@@ -235,11 +236,11 @@ def test_gap_gradient_is_a_count_not_a_score_derivative(matrix, gap_param):
     score_eps = nwgrad.nw_score_affine(a, b, params(matrix, **bumped))
     d_score = (score_eps - score) / eps
 
-    assert grad.to_dict()[gap_param] == pytest.approx(-d_score, abs=1e-4)
+    assert grad.to_dict()[gap_param] == pytest.approx(d_score, abs=1e-4)
 
 
 def test_matrix_gradient_is_a_true_score_derivative(matrix):
-    """Counterpart to the test above: the matrix half has the opposite sign."""
+    """The matrix half, under the same finite-difference check."""
     a, b = "ACGTACGT", "AGTACT"
     kw = dict(gap_open_a=5.0, gap_extend_a=1.0, gap_open_b=5.0, gap_extend_b=1.0)
     score, grad = nwgrad.nw_affine_grad(a, b, params(matrix, **kw))
@@ -252,6 +253,28 @@ def test_matrix_gradient_is_a_true_score_derivative(matrix):
     d_score = (nwgrad.nw_score_affine(a, b, bumped) - score) / eps
 
     assert grad.to_dict()["matrix"][0, 0] == pytest.approx(d_score, abs=1e-4)
+
+
+@pytest.mark.parametrize("soft", [False, True])
+def test_gradient_ascent_step_increases_the_score(matrix, soft):
+    """The property that was actually broken: one update rule, one direction.
+
+    Stepping *along* the gradient must raise the score (and the log-partition
+    function) for every field at once.  Under the old counts convention the gap
+    fields pulled the other way, so this failed as soon as an alignment used a gap.
+    """
+    a, b = "ACGTACGTAA", "AGTACTG"
+    p = params(matrix, 4.0, 0.5, 1.5, 2.0)
+
+    grad_fn = nwgrad.nw_affine_soft_grad if soft else nwgrad.nw_affine_grad
+    score, grad = grad_fn(a, b, p)
+
+    # a gap-bearing alignment, or the test is vacuous
+    assert grad.to_dict()["gap_extend_b"] != 0.0
+
+    stepped = p + 0.01 * grad
+    new_score, _ = grad_fn(a, b, stepped)
+    assert new_score > score
 
 
 # ── Asymmetric penalties survive the higher-level entry points ───────────────

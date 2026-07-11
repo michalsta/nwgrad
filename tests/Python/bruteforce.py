@@ -101,8 +101,13 @@ def _counts(path, a, b, affine):
     """Feature counts of one path: matrix pair counts and gap counts.
 
     Returns (pairs, opens_a, extends_a, opens_b, extends_b) where `pairs` maps
-    (char_a, char_b) -> multiplicity.  These are exactly the quantities the
-    library reports as the gap components of the gradient.
+    (char_a, char_b) -> multiplicity.  All five are plain non-negative counts.
+
+    Note these are *counts*, not derivatives.  Because every parameter enters the
+    score linearly, d(score)/d(param) is the parameter's multiplier: for a matrix
+    entry that is +count, but for a gap penalty it is -count, since the score
+    subtracts the penalties.  Callers comparing against the library's gradient
+    must negate the four gap counts.
     """
     pairs = {}
     opens_a = extends_a = opens_b = extends_b = 0
