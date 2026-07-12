@@ -53,6 +53,51 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
+  sanitizers:
+    name: C++ tests (${{ matrix.compiler }}, ASan+UBSan)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - compiler: gcc
+            cc: gcc
+            cxx: g++
+          - compiler: clang
+            cc: clang
+            cxx: clang++
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+      # CMake passes -fno-sanitize-recover=all, so a violation aborts rather than
+      # printing and carrying on; these just make the abort legible.
+      UBSAN_OPTIONS: print_stacktrace=1
+      ASAN_OPTIONS: detect_stack_use_after_return=1
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install nanobind
+        run: pip install nanobind
+
+      # The DP indexes a raw double* with encoded sequence indices and the batch
+      # code hands spans across threads, so out-of-bounds reads here would be
+      # silent. ASan and UBSan are what make them loud.
+      - name: Configure
+        run: >
+          cmake -S . -B build-san -DCMAKE_BUILD_TYPE=Debug
+          -DNWGRAD_SANITIZE=ON
+          -Dnanobind_DIR="$(python -m nanobind --cmake_dir)"
+
+      - name: Build
+        run: cmake --build build-san --target nwgrad_tests -j"$(nproc)"
+
+      - name: Test
+        run: ctest --test-dir build-san --output-on-failure
+
   python:
     name: Python tests (${{ matrix.python-version }})
     runs-on: ubuntu-latest

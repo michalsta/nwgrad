@@ -15,7 +15,7 @@ changes. Compared to looping over `SeqPair` objects in Python:
    (sized to the largest pair) and reuses it across all assigned pairs. Peak
    memory is `n_threads × max(m×n)`, not `N × max(m×n)`.
 3. **Path reuse** — alignment paths (guide_j) are cached on each `SeqPair`.
-   After `set_matrix()`, `score_and_grad(bandwidth=bw)` runs a cheap banded DP
+   After `set_params()`, `score_and_grad(bandwidth=bw)` runs a cheap banded DP
    around the old path rather than a full DP.
 
 ## Basic usage
@@ -74,7 +74,7 @@ pairs already have `grad_valid == True`.
 
 ## Updating the matrix and banded re-alignment
 
-After a gradient step, call `set_matrix()` on the batch to push the new matrix
+After a gradient step, call `set_params()` on the batch to push the new parameters
 to all pairs at once. The alignment paths are preserved so the next call to
 `score_and_grad(bandwidth=bw)` can use banded DP instead of full DP:
 
@@ -108,9 +108,12 @@ sub-optimal. Wider bands are safer but slower.
 |---|---|---|
 | `"soft"` | log-partition `log Z` | Expected substitution counts (differentiable) |
 | `"hard"` | Viterbi alignment score | Substitution-pair counts (integer-valued) |
-| `"none"` | Viterbi alignment score | Zero matrix |
+| `"none"` | Viterbi alignment score | Raises |
 
-Use `"none"` when you only need scores — it skips the traceback/backward pass.
+Use `"none"` when you only need scores — it skips the traceback/backward pass. It
+does not produce a zero gradient: `compute_grad()` on a `"none"` pair (or on a batch
+containing one) raises, rather than handing back a zero that would quietly cancel
+out of a sum.
 
 ## All four alignment modes
 
@@ -132,9 +135,10 @@ grad  = batch_lin_global.compute_grad()
 
 ## Thread count and reproducibility
 
-Results are identical regardless of thread count — per-thread gradient
-accumulations are merged under a mutex at join time, and floating-point addition
-order is deterministic within each thread.
+Results agree across thread counts to floating-point rounding, not bit-for-bit.
+Pairs are handed to threads by an atomic counter and the per-thread gradient
+accumulations are merged in whatever order the threads reach the mutex at join, so
+the summation order varies from run to run. Compare with a tolerance:
 
 ```python
 params_orig = nwgrad.AlignParams(BLOSUM62,

@@ -16,8 +16,7 @@ Usage::
     from nwgrad.matrices import BLOSUM62
 
     params = nwgrad.AlignParams(
-        BLOSUM62.to_matrix(),
-        alphabet=BLOSUM62.alphabet,
+        BLOSUM62,          # a SubstMatrix; its alphabet travels with it
         gap_open_a=11.0, gap_extend_a=1.0,
         gap_open_b=11.0, gap_extend_b=1.0,
     )

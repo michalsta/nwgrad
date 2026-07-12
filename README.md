@@ -177,7 +177,7 @@ For anything not listed, build your own: `nwgrad.Alphabet.get("ACGTRYSWKM")`.
 nwgrad.SubstMatrix(matrix: np.ndarray, alphabet: str = "ACDEFGHIKLMNPQRSTVWY")
 ```
 
-Constructs a substitution matrix from an `(N, N)` float64 numpy array where `N = len(alphabet)`. The default alphabet is the 20 canonical amino acids (`ACDEFGHIKLMNPQRSTVWY`). Any square matrix with a matching alphabet is accepted — including DNA (`"ACGT"`), extended amino acids, or any other symbol set. You may pass an `Alphabet` object instead of a string.
+Constructs a substitution matrix from an `(N, N)` float64 numpy array where `N = len(alphabet)`. The default alphabet is the 20 canonical amino acids (`ACDEFGHIKLMNPQRSTVWY`). Any square matrix with a matching alphabet is accepted — including DNA (`"ACGT"`), extended amino acids, or any other symbol set. The alphabet is given as a string; if you are holding an `Alphabet` object, pass its `.symbols`.
 
 Stored as a dense `N × N` block indexed by alphabet position — 16 doubles for DNA. Sequences are validated and encoded to indices once, at the boundary, so the DP inner loop is a single O(1) lookup and never touches a character. Asymmetric matrices are fully supported.
 
@@ -225,6 +225,16 @@ Suffix `_a` penalties apply to gaps in sequence A, `_b` to gaps in sequence B.
 
 `AlignParams` is also the gradient type returned by `SeqPair.grad` /
 `compute_grad()`; `to_dict()` is the easy way to inspect a computed gradient.
+
+**Sign convention.** Every field of a gradient — the matrix entries *and* the four
+gap fields — is the derivative of the score with respect to that field. The score
+*subtracts* gap penalties, so a gradient's gap fields come out non-positive while
+its matrix fields come out non-negative. That is what lets one update rule move
+the whole struct in the ascent direction:
+
+```python
+params = params + lr * grad    # element-wise over matrix and all four gap fields
+```
 
 ---
 
@@ -302,6 +312,10 @@ nwgrad.SeqPairBatch(n_threads=0)
 | `alloc_dp()` | — | Pre-allocate pair-owned DP tables in parallel. |
 | `drop_dp()` | — | Free pair-owned DP tables in parallel. |
 
+The batch is also a sequence: `len(batch)` is the number of pairs and `batch[i]`
+returns the `i`-th `SeqPair` (negative indices allowed), so per-pair results can be
+read back without keeping a separate list.
+
 **Properties:**
 
 | Property | Type | Description |
@@ -344,9 +358,8 @@ Stateless batch alignment: constructs a fresh DP buffer per call and does not pr
 
 ```python
 nwgrad.BatchAligner(
-    matrix,
-    gap_open=11.0,
-    gap_extend=1.0,
+    params,               # AlignParams — matrix and gap penalties together
+    band=0,               # 0 = full DP; >0 = banded half-width
     gap_model="affine",   # "linear" | "affine"
     mode="global",        # "global" | "local"
     grad_mode="hard",     # "hard" | "soft" | "none"
@@ -354,9 +367,10 @@ nwgrad.BatchAligner(
 )
 ```
 
-**`.align(sequences_a, sequences_b) -> BatchResult`**
+**`.align(sequences_a, sequences_b, aligned_a=[], aligned_b=[]) -> BatchResult`**
 
-Aligns each pair `(sequences_a[i], sequences_b[i])`.
+Aligns each pair `(sequences_a[i], sequences_b[i])`. `aligned_a` / `aligned_b`, if
+given, are gapped alignment strings (one per pair) used as banding guides.
 
 ### `BatchResult`
 
@@ -371,32 +385,51 @@ Aligns each pair `(sequences_a[i], sequences_b[i])`.
 
 Stateless functions that create and destroy their DP tables on every call. Useful for one-off alignments; prefer `SeqPair` / `SeqPairBatch` for loops over many pairs or iterative optimization.
 
+All twelve share the same signature — the gap penalties live in the `AlignParams`,
+not in the argument list, so the linear and affine variants differ only in which of
+its gap fields they read:
+
+```python
+f(seq_a, seq_b, params, band=0, aligned_a="", aligned_b="")
+```
+
+`band > 0` (or a non-empty `aligned_a` / `aligned_b` guide pair) runs a banded DP
+instead of the full one. The sequences are plain `str` and are validated and
+encoded against `params`'s alphabet on the way in.
+
 **Score only** — return `float`:
 
 | Function | Gap model | Alignment |
 |---|---|---|
-| `nw_score(a, b, matrix, gap_extend)` | Linear | Global (NW) |
-| `sw_score(a, b, matrix, gap_extend)` | Linear | Local (SW) |
-| `nw_score_affine(a, b, matrix, gap_open, gap_extend)` | Affine | Global (NW) |
-| `sw_score_affine(a, b, matrix, gap_open, gap_extend)` | Affine | Local (SW) |
+| `nw_score` | Linear | Global (NW) |
+| `sw_score` | Linear | Local (SW) |
+| `nw_score_affine` | Affine | Global (NW) |
+| `sw_score_affine` | Affine | Local (SW) |
 
 **Hard gradient** — return `(score: float, grad: AlignParams)`:
 
 | Function | Gap model | Alignment |
 |---|---|---|
-| `nw_grad(a, b, matrix, gap_extend)` | Linear | Global |
-| `sw_grad(a, b, matrix, gap_extend)` | Linear | Local |
-| `nw_affine_grad(a, b, matrix, gap_open, gap_extend)` | Affine | Global |
-| `sw_affine_grad(a, b, matrix, gap_open, gap_extend)` | Affine | Local |
+| `nw_grad` | Linear | Global |
+| `sw_grad` | Linear | Local |
+| `nw_affine_grad` | Affine | Global |
+| `sw_affine_grad` | Affine | Local |
 
 **Soft gradient** — return `(log_z: float, grad: AlignParams)`:
 
 | Function | Gap model | Alignment |
 |---|---|---|
-| `nw_soft_grad(a, b, matrix, gap_extend)` | Linear | Global |
-| `sw_soft_grad(a, b, matrix, gap_extend)` | Linear | Local |
-| `nw_affine_soft_grad(a, b, matrix, gap_open, gap_extend)` | Affine | Global |
-| `sw_affine_soft_grad(a, b, matrix, gap_open, gap_extend)` | Affine | Local |
+| `nw_soft_grad` | Linear | Global |
+| `sw_soft_grad` | Linear | Local |
+| `nw_affine_soft_grad` | Affine | Global |
+| `sw_affine_soft_grad` | Affine | Local |
+
+(Note the naming is irregular: the affine *score* functions suffix `_affine`, while
+the affine *gradient* functions infix it.)
+
+```python
+score, grad = nwgrad.nw_affine_grad("PLEASANTLY", "MEANLY", params)
+```
 
 ---
 
@@ -434,13 +467,20 @@ pip install -e ".[dev]"
 pytest tests/Python/
 ```
 
-C++ unit tests (requires CMake):
+C++ unit tests (requires CMake). The extension target does `find_package(nanobind)`,
+so even a tests-only configure needs nanobind discoverable:
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug \
+      -Dnanobind_DIR="$(python -m nanobind --cmake_dir)"
 cmake --build build
 ctest --test-dir build
 ```
+
+`-DNWGRAD_SANITIZE=ON` builds the C++ tests with AddressSanitizer and
+UndefinedBehaviorSanitizer (`-fno-sanitize-recover=all`, so the first violation
+fails the run rather than printing and carrying on). CI runs this under both GCC
+and Clang.
 
 ## License
 

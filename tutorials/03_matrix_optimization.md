@@ -114,6 +114,30 @@ preserves the alignment paths, so the next `score_and_grad(bandwidth=bw)` uses
 banded DP instead of a full re-alignment. The batch keeps `params` alive
 automatically.
 
+## Learning the gap penalties too
+
+The gradient is an `AlignParams`, so it carries `∂log Z/∂gap_open_a` and the three
+other gap derivatives alongside the matrix. Because the score *subtracts* penalties,
+those fields come out non-positive where the matrix fields come out non-negative —
+which is exactly what makes one element-wise update correct for the whole struct:
+
+```python
+params = make_params(mat_array)
+batch.set_params(params)
+
+for step in range(50):
+    total_log_z = batch.score_and_grad(bandwidth=0 if step == 0 else BANDWIDTH)
+    grad = batch.compute_grad()
+
+    params = params + LEARNING_RATE * grad   # matrix and all four gap fields at once
+    batch.set_params(params)
+```
+
+Ascending `log Z` this way *lowers* the gap penalties (their derivatives are
+negative), which is the direction that makes the observed alignments more probable.
+If you want the gap costs held fixed, keep updating the array as in the loop above
+and rebuild `AlignParams` with the original penalties.
+
 ## Using scipy L-BFGS-B
 
 For second-order methods that call an objective function repeatedly:
@@ -176,7 +200,9 @@ for epoch in range(5):
         loss = -mini_batch.score_and_grad()
         grad = mini_batch.compute_grad()
 
-        mat_array -= LR * grad.matrix.to_matrix()
+        # grad is ∂log Z/∂S, and the loss is -log Z, so descending the loss means
+        # *adding* the gradient — same direction as the ascent loop above.
+        mat_array += LR * grad.matrix.to_matrix()
         total_loss += loss
 
     print(f"Epoch {epoch+1}: loss={total_loss:.2f}")
@@ -228,18 +254,24 @@ print(f"Analytical: {analytical:.8f}")
 
 In practice you may want to:
 
-- **Regularise toward BLOSUM62** to prevent degenerate solutions:
+- **Regularise toward BLOSUM62** to prevent degenerate solutions. Do this on the
+  array: `grad` is an `AlignParams` and only adds to another `AlignParams`, not to
+  a numpy array.
   ```python
+  grad_mat = grad.matrix.to_matrix()          # (N, N) copy, in ALPHABET order
   reg_loss = 0.01 * np.sum((mat_array - blosum_arr) ** 2)
-  reg_grad = 0.02 * (mat_array - blosum_arr)
-  grad += reg_grad
+  grad_mat -= 0.02 * (mat_array - blosum_arr)  # penalise drift from BLOSUM62
+  mat_array += LEARNING_RATE * grad_mat
   ```
 
 - **Fix the diagonal** (self-substitution scores) and only optimise off-diagonal:
   ```python
   grad_mat = grad.matrix.to_matrix()
   grad_mat[np.diag_indices(grad_mat.shape[0])] = 0
+  mat_array += LEARNING_RATE * grad_mat
   ```
+
+  `to_matrix()` returns a fresh array, so editing it does not touch `grad`.
 
 - **Project onto the cone** of symmetric positive-semidefinite matrices after each
   step to maintain a valid log-odds interpretation.

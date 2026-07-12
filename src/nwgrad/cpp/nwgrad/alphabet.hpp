@@ -163,15 +163,26 @@ private:
 // the library stays header-only; `inline` gives one shared instance across all
 // translation units.
 inline const Alphabet& Alphabet::get(std::string_view symbols) {
-    static std::mutex                                        mu;
-    static std::map<std::string, const Alphabet*, std::less<>> registry;
+    static std::mutex mu;
+
+    // The registry itself is deliberately leaked, not merely its contents.  A
+    // plain function-local static map would be destroyed during static
+    // teardown, which would orphan every Alphabet it owns -- and an Alphabet*
+    // held by some other static (a SubstMatrix at namespace scope, say) may
+    // still be dereferenced at that point, with destruction order between them
+    // unspecified.  Immortality is the contract this class advertises, so it
+    // has to hold all the way through exit.
+    //
+    // It is also what LeakSanitizer needs: the map is reachable from a root for
+    // the whole run, so the Alphabets it points at are "still reachable" rather
+    // than leaked.
+    static auto* registry = new std::map<std::string, const Alphabet*, std::less<>>();
 
     std::lock_guard<std::mutex> lock(mu);
-    auto it = registry.find(symbols);
-    if (it != registry.end()) return *it->second;
+    auto it = registry->find(symbols);
+    if (it != registry->end()) return *it->second;
 
-    // Deliberately never deleted -- see the header comment.
     const Alphabet* a = new Alphabet(symbols);
-    registry.emplace(std::string(symbols), a);
+    registry->emplace(std::string(symbols), a);
     return *a;
 }

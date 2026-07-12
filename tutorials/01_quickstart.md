@@ -61,7 +61,8 @@ blosum62 = nwgrad.SubstMatrix(BLOSUM62)
 > (The packaged `BLOSUM62` uses the 23-symbol NCBI alphabet, so its array differs
 > from the 20×20 one above.)
 
-The matrix is copied into an internal 256×256 ASCII-indexed table on construction.
+The matrix is copied into an internal dense `N × N` block indexed by alphabet
+position (so a DNA matrix is 16 doubles, not a sparse corner of an ASCII table).
 Subsequent modifications to `BLOSUM62` have no effect on `blosum62`.
 
 ```python
@@ -99,9 +100,13 @@ params = nwgrad.AlignParams(dna_matrix, alphabet=DNA_ORDER,
                              gap_extend_a=2.0, gap_extend_b=2.0)
 score, grad = nwgrad.nw_grad("ACGTACGT", "ACGTACGT", params)
 print(score)                         # 16.0 (8 perfect matches × 2)
-print(grad.matrix.to_matrix())       # 4×4 identity (one count per match position)
+print(grad.matrix.to_matrix())       # diag(2, 2, 2, 2): each base matched twice
 print(grad.matrix.alphabet)          # "ACGT"
 ```
+
+`grad.matrix.to_matrix()[i, j]` is the number of times `alphabet[i]` was aligned to
+`alphabet[j]`, so the eight matches here fall two apiece onto the four diagonal
+entries — *not* one per match position.
 
 The gradient matrix shape always matches the alphabet: `to_matrix()` returns `(N, N)`.
 
@@ -172,8 +177,14 @@ score, grad = sp.score_and_grad()
 ```python
 g = grad.to_dict()
 # {'matrix': (N, N) array, 'alphabet': str,
-#  'gap_open_a': ..., 'gap_extend_a': ..., 'gap_open_b': ..., 'gap_extend_b': ...}
+#  'gap_open_a': 0.0, 'gap_extend_a': 0.0, 'gap_open_b': -2.0, 'gap_extend_b': -4.0}
 ```
+
+Every field is a derivative of the score with respect to that field. The score
+*subtracts* gap penalties, so the gap fields of a gradient are non-positive (here
+the alignment opens two gaps in B, four columns' worth) while the matrix fields are
+non-negative. This is what makes one update rule — `params + lr * grad` — correct
+for the matrix and the gap costs at once.
 
 `grad.matrix.to_matrix()[i, j]` counts how many times `alphabet[i]` is aligned to
 `alphabet[j]` in the optimal traceback. This is the subgradient of the score

@@ -37,6 +37,26 @@ install(TARGETS nwgrad_ext LIBRARY DESTINATION nwgrad)
 install(DIRECTORY src/nwgrad/cpp/nwgrad DESTINATION nwgrad/cpp
     FILES_MATCHING PATTERN "*.hpp" PATTERN "*.h")
 
+# ── Sanitizers (opt-in; CI builds the C++ tests with these) ──────────────────
+#
+# -fno-sanitize-recover=all is the flag that makes this worth anything: by
+# default UBSan prints a diagnostic and carries on, so the test binary would
+# still exit 0 and CI would stay green on undefined behaviour.  With it, the
+# first violation aborts and ctest fails.
+option(NWGRAD_SANITIZE
+    "Build the C++ tests with AddressSanitizer + UndefinedBehaviorSanitizer" OFF)
+
+if (NWGRAD_SANITIZE)
+    if (NOT CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        message(FATAL_ERROR "NWGRAD_SANITIZE requires GCC or Clang")
+    endif()
+    set(NWGRAD_SANITIZE_FLAGS
+        -fsanitize=address,undefined
+        -fno-sanitize-recover=all
+        -fno-omit-frame-pointer
+        -g)
+endif()
+
 # ── C++ unit tests (Catch2 v2, vendored single header) ───────────────────────
 add_executable(nwgrad_tests
     tests/cpp/main.cpp
@@ -60,6 +80,12 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
 endif()
 find_package(Threads REQUIRED)
 target_link_libraries(nwgrad_tests PRIVATE Threads::Threads)
+
+# Sanitizers must be passed to both the compile and the link step.
+if (NWGRAD_SANITIZE)
+    target_compile_options(nwgrad_tests PRIVATE ${NWGRAD_SANITIZE_FLAGS})
+    target_link_options(nwgrad_tests PRIVATE ${NWGRAD_SANITIZE_FLAGS})
+endif()
 
 enable_testing()
 add_test(NAME cpp_tests COMMAND nwgrad_tests)
