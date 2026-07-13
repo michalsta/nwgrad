@@ -47,6 +47,31 @@ struct BatchAligner {
 
         if (N == 0) return result;
 
+        // dispatch_worker picks one AlignBand for the whole batch by looking at
+        // problems[0].guide_j — AlignBand is a compile-time Aligner parameter,
+        // so one worker loop can't switch between Full and GuideBanded per
+        // problem. That is fine when band > 0 (every problem gets banded, with
+        // an auto diagonal guide filling in for any empty guide_j) or when no
+        // problem carries a guide_j at all. It silently drops every guide past
+        // problems[0] when band == 0 and only *some* problems carry one — the
+        // dropped problems still get the correct (full-DP) score, just not the
+        // banding they were given, with no diagnostic. Reject that case here,
+        // on the caller's thread, before any work is dispatched.
+        if (band == 0) {
+            bool any_guided = false, any_unguided = false;
+            for (const auto& p : problems) {
+                if (p.guide_j.empty()) any_unguided = true;
+                else                   any_guided   = true;
+            }
+            if (any_guided && any_unguided)
+                throw std::invalid_argument(
+                    "nwgrad: mixed batch with band == 0 — some problems carry a "
+                    "guide_j and others don't. All problems in one align() call "
+                    "must either all supply a guide_j or none of them; split "
+                    "into separate align() calls, or set band > 0 so an unguided "
+                    "problem gets an automatic diagonal guide instead.");
+        }
+
         std::atomic<size_t> work_idx{0};
         std::mutex grad_mutex;
 
@@ -136,6 +161,9 @@ private:
         std::vector<double>& scores,
         AlignParams& local_grad) const
     {
+        // Safe to decide from problems[0] alone: align() has already rejected any
+        // batch that mixes guided and unguided problems under band == 0, so every
+        // problem here agrees with problems[0] on whether it carries a guide_j.
         const bool banded = (band > 0) || (!problems.empty() && !problems[0].guide_j.empty());
 #define DISPATCH(GM, AM) \
         if (gap_model == GapModel::GM && align_mode == AlignMode::AM) { \

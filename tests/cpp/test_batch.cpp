@@ -98,6 +98,43 @@ TEST_CASE("BatchAligner: no gradient mode skips accumulation", "[batch]") {
     REQUIRE(total == Approx(0.0));
 }
 
+TEST_CASE("BatchAligner: mixed guided/unguided problems throw when band == 0", "[batch]") {
+    auto ba = make_aligner(2);
+    std::vector<ProblemInstance> problems{
+        {"ACDE", "ACDE", {}},                                    // unguided
+        {"ACDE", "ACDE", guide_j_from_aligned("ACDE", "ACDE")},  // guided
+    };
+    REQUIRE_THROWS_AS(ba.align(problems), std::invalid_argument);
+}
+
+TEST_CASE("BatchAligner: all-unguided batch with band == 0 does not throw", "[batch]") {
+    auto ba = make_aligner(2);
+    std::vector<ProblemInstance> problems{
+        {"ACDE", "ACDE", {}},
+        {"ADE",  "ACDE", {}},
+    };
+    REQUIRE_NOTHROW(ba.align(problems));
+}
+
+TEST_CASE("BatchAligner: all-guided batch with band == 0 does not throw", "[batch]") {
+    auto ba = make_aligner(2);
+    std::vector<ProblemInstance> problems{
+        {"ACDE", "ACDE", guide_j_from_aligned("ACDE", "ACDE")},
+        {"ADE",  "ADE",  guide_j_from_aligned("ADE",  "ADE")},
+    };
+    REQUIRE_NOTHROW(ba.align(problems));
+}
+
+TEST_CASE("BatchAligner: mixed guided/unguided problems do not throw when band > 0", "[batch]") {
+    auto ba = make_aligner(2);
+    ba.band = 2;
+    std::vector<ProblemInstance> problems{
+        {"ACDE", "ACDE", {}},
+        {"ACDE", "ACDE", guide_j_from_aligned("ACDE", "ACDE")},
+    };
+    REQUIRE_NOTHROW(ba.align(problems));
+}
+
 TEST_CASE("BatchAligner: scores are indexed correctly (not scrambled by threading)", "[batch]") {
     std::vector<std::string> seqs_a = {"A", "AC", "ACD", "ACDE"};
     std::vector<std::string> seqs_b = {"A", "AC", "ACD", "ACDE"};
