@@ -7,6 +7,7 @@
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/pair.h>
 #include <nanobind/stl/string.h>
+#include <nanobind/stl/string_view.h>
 #include <nanobind/stl/vector.h>
 
 #include "align_params.hpp"
@@ -728,6 +729,63 @@ NB_MODULE(nwgrad_ext, m) {
             },
             nb::arg("seq_pair"),
             "Append a SeqPair to the batch.")
+        .def(
+            "add_many",
+            [](nb::object self_obj,
+               const std::vector<std::string_view>& seqs_a,
+               const std::vector<std::string_view>& seqs_b,
+               nb::object params_obj,
+               const std::string& gap_model,
+               const std::string& mode,
+               const std::string& grad_mode) {
+                SeqPairBatch& self = nb::cast<SeqPairBatch&>(self_obj);
+                const AlignParams& params = nb::cast<const AlignParams&>(params_obj);
+                GapModel  gm = (gap_model == "affine") ? GapModel::Affine : GapModel::Linear;
+                AlignMode am = (mode      == "local")  ? AlignMode::Local : AlignMode::Global;
+                GradMode  gd;
+                if      (grad_mode == "hard") gd = GradMode::Hard;
+                else if (grad_mode == "soft") gd = GradMode::Soft;
+                else                          gd = GradMode::None;
+
+                // The string_views point into the argument lists' str objects.
+                // We hold the GIL throughout — add_many()'s workers touch no
+                // Python — so nothing can free or move them mid-call.
+                self.add_many(seqs_a, seqs_b, params, gm, am, gd);
+
+                // These pairs are owned by C++ and hold a bare pointer to
+                // `params`, and unlike a hand-built SeqPair none of them holds a
+                // Python reference of its own.  keep_current_params() alone is
+                // not enough: a second add_many() with different params would
+                // overwrite the single `_params` slot and free the first, leaving
+                // the first call's pairs pointing at a corpse.  So append to a
+                // list — one entry per add_many() call, not per step of a
+                // training loop, so this does not grow without bound.
+                nb::list refs;
+                if (nb::hasattr(self_obj, "_owned_params"))
+                    refs = nb::borrow<nb::list>(self_obj.attr("_owned_params"));
+                else
+                    self_obj.attr("_owned_params") = refs;
+                refs.append(params_obj);
+            },
+            nb::arg("seqs_a"), nb::arg("seqs_b"), nb::arg("params"),
+            nb::arg("gap_model") = "affine",
+            nb::arg("mode")      = "global",
+            nb::arg("grad_mode") = "hard",
+            "Bulk-construct N SeqPairs in C++ and append them to the batch.\n"
+            "\n"
+            "Equivalent to constructing each SeqPair in Python and calling add()\n"
+            "on it, but the pairs never become Python objects: for large N this\n"
+            "is the difference between seconds and tens of seconds, and it drops\n"
+            "the per-pair memory to what C++ actually needs.  Per-pair results\n"
+            "remain fully available through batch[i].score / .grad / .aligned().\n"
+            "\n"
+            "  gap_model : \"linear\" | \"affine\"\n"
+            "  mode      : \"global\" | \"local\"\n"
+            "  grad_mode : \"hard\" | \"soft\" | \"none\"\n"
+            "\n"
+            "Raises if the two lists differ in length, if a sequence contains a\n"
+            "character outside the params' alphabet, or if that alphabet differs\n"
+            "from the batch's.  In every such case the batch is left unchanged.")
         .def("__len__", &SeqPairBatch::size)
         .def(
             "__getitem__",

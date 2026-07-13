@@ -58,6 +58,7 @@ add_executable(nwgrad_tests
     tests/cpp/test_batch.cpp
     tests/cpp/test_banded.cpp
     tests/cpp/test_seq_pair.cpp
+    tests/cpp/test_add_many.cpp
 )
 target_include_directories(nwgrad_tests PRIVATE
     src/nwgrad/cpp/nwgrad

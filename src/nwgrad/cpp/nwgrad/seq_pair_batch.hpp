@@ -1,9 +1,11 @@
 #pragma once
 
 #include <atomic>
+#include <memory>
 #include <mutex>
 #include <numeric>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -11,14 +13,29 @@
 #include "parallel.hpp"
 #include "seq_pair.hpp"
 
-// SeqPairBatch holds non-owning pointers to SeqPair objects.
+// SeqPairBatch holds non-owning pointers to SeqPair objects added via add().
 // On the Python side, nb::keep_alive ensures each added SeqPair outlives the batch.
+//
+// Pairs created by add_many() are the exception: the batch owns those outright
+// (see owned_), because they never exist as Python objects at all.
 struct SeqPairBatch {
     std::vector<SeqPair*> pairs;
     int n_threads;
 
     explicit SeqPairBatch(int nt = 0)
         : n_threads(nt > 0 ? nt : default_threads()) {}
+
+    // Non-copyable.  It never was, meaningfully — a copy would duplicate the raw
+    // pointers in `pairs` and alias every borrowed SeqPair.  But it has to be
+    // *said*, not merely true: std::vector<unique_ptr<T>> still advertises a copy
+    // constructor (declared, ill-formed only if instantiated), so
+    // is_copy_constructible_v<SeqPairBatch> stayed true and nanobind emitted a
+    // copy thunk for it, which failed to compile inside the STL.  Moves are fine:
+    // unique_ptr keeps every SeqPair at a fixed address, so `pairs` stays valid.
+    SeqPairBatch(const SeqPairBatch&)            = delete;
+    SeqPairBatch& operator=(const SeqPairBatch&) = delete;
+    SeqPairBatch(SeqPairBatch&&)                 = default;
+    SeqPairBatch& operator=(SeqPairBatch&&)      = default;
 
     // Every pair in a batch must share an alphabet: their gradients are summed,
     // and summing across alphabets is meaningless.  Checked here, on the
@@ -31,6 +48,68 @@ struct SeqPairBatch {
                 "\" cannot join a batch over alphabet \"" +
                 pairs.front()->alphabet().symbols() + "\"");
         pairs.push_back(sp);
+    }
+
+    // Bulk-construct N pairs in C++, in parallel, and append them.  The batch
+    // owns them; they are reachable exactly like added ones, via operator[].
+    //
+    // This exists because constructing the pairs one at a time from Python is
+    // the dominant cost of a large batch and almost none of it is alignment.
+    // Measured on 2.5M pairs (22x50 nt): ~5.0s of C++ construction, ~6.6s of
+    // nanobind wrapper objects, ~2.7s of add()'s keep-alive bookkeeping, and
+    // ~3.3s of cyclic GC re-walking 2.5M live containers — against 6.4s for the
+    // DP those pairs exist to feed.  Here the pairs never become Python objects,
+    // so the last three costs do not arise and the first is threaded.
+    //
+    // `params` must outlive the batch, exactly as for a SeqPair built by hand.
+    void add_many(const std::vector<std::string_view>& seqs_a,
+                  const std::vector<std::string_view>& seqs_b,
+                  const AlignParams& params,
+                  GapModel gm, AlignMode am, GradMode gd) {
+        if (seqs_a.size() != seqs_b.size())
+            throw std::invalid_argument(
+                "nwgrad: add_many() needs seqs_a and seqs_b of equal length (got " +
+                std::to_string(seqs_a.size()) + " and " +
+                std::to_string(seqs_b.size()) + ")");
+
+        // Same eager, caller-thread alphabet check add() makes: a worker must
+        // never be the one to discover a mismatch.
+        if (!pairs.empty() &&
+            &params.matrix.alphabet() != &pairs.front()->alphabet())
+            throw std::invalid_argument(
+                "nwgrad: SeqPair over alphabet \"" +
+                params.matrix.alphabet().symbols() +
+                "\" cannot join a batch over alphabet \"" +
+                pairs.front()->alphabet().symbols() + "\"");
+
+        const size_t N = seqs_a.size();
+        if (N == 0) return;
+
+        // Construct into a staging vector first.  An out-of-alphabet character
+        // throws inside a worker; run_workers_guarded rethrows it on this
+        // thread, `staged` unwinds, and the batch is left exactly as it was.
+        // Writing it straight into `pairs` would leave a half-filled batch
+        // behind a raised exception.
+        std::vector<std::unique_ptr<SeqPair>> staged(N);
+        std::atomic<size_t> idx{0};
+        auto worker = [&]() {
+            while (true) {
+                size_t i = idx.fetch_add(1, std::memory_order_relaxed);
+                if (i >= N) break;
+                staged[i] = std::make_unique<SeqPair>(seqs_a[i], seqs_b[i],
+                                                      params, gm, am, gd);
+            }
+        };
+        run_workers(N, worker);
+
+        // unique_ptr keeps each SeqPair at a fixed address, so growing owned_
+        // never invalidates the raw pointers in `pairs`.
+        owned_.reserve(owned_.size() + N);
+        pairs.reserve(pairs.size() + N);
+        for (auto& up : staged) {
+            pairs.push_back(up.get());
+            owned_.push_back(std::move(up));
+        }
     }
 
     size_t size() const noexcept { return pairs.size(); }
@@ -145,6 +224,10 @@ struct SeqPairBatch {
     }
 
 private:
+    // Pairs built by add_many(), owned by the batch.  `pairs` holds raw pointers
+    // into these; unique_ptr keeps the addresses stable as the vector grows.
+    std::vector<std::unique_ptr<SeqPair>> owned_;
+
     static int default_threads() noexcept {
         unsigned int hw = std::thread::hardware_concurrency();
         return hw > 0 ? static_cast<int>(hw) : 1;
