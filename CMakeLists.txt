@@ -35,15 +35,35 @@ install(DIRECTORY src/nwgrad/cpp/nwgrad DESTINATION nwgrad/cpp
 option(NWGRAD_SANITIZE
     "Build the C++ tests with AddressSanitizer + UndefinedBehaviorSanitizer" OFF)
 
-if (NWGRAD_SANITIZE)
+# The C++ tests exercise the headers.  They cannot exercise the *bindings*: in
+# C++ the caller owns the AlignParams and scoping keeps it honest, so the
+# bare-pointer-with-no-owner hazard simply does not arise there.  It arises only
+# once Python holds the other end of the lifetime — which is exactly the layer
+# that was never under a sanitizer.  This builds the extension itself with them,
+# so pytest runs against an instrumented nwgrad_ext.
+option(NWGRAD_SANITIZE_EXT
+    "Build the Python extension (nwgrad_ext) with sanitizers" OFF)
+
+# Which sanitizers, for either option.  Split so ASan and UBSan can run as
+# separate CI jobs: ASan needs an LD_PRELOAD dance and must give up leak
+# detection inside CPython, UBSan needs neither.
+set(NWGRAD_SANITIZERS "address,undefined" CACHE STRING
+    "Comma-separated -fsanitize list for NWGRAD_SANITIZE / NWGRAD_SANITIZE_EXT")
+
+if (NWGRAD_SANITIZE OR NWGRAD_SANITIZE_EXT)
     if (NOT CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
         message(FATAL_ERROR "NWGRAD_SANITIZE requires GCC or Clang")
     endif()
     set(NWGRAD_SANITIZE_FLAGS
-        -fsanitize=address,undefined
+        -fsanitize=${NWGRAD_SANITIZERS}
         -fno-sanitize-recover=all
         -fno-omit-frame-pointer
         -g)
+endif()
+
+if (NWGRAD_SANITIZE_EXT)
+    target_compile_options(nwgrad_ext PRIVATE ${NWGRAD_SANITIZE_FLAGS})
+    target_link_options(nwgrad_ext PRIVATE ${NWGRAD_SANITIZE_FLAGS})
 endif()
 
 # ── C++ unit tests (Catch2 v2, vendored single header) ───────────────────────

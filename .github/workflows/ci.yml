@@ -118,6 +118,72 @@ jobs:
       - name: Test
         run: pytest tests/Python/ -q
 
+  python-sanitize:
+    # The C++ ASan job exercises the headers.  It cannot exercise the *bindings*:
+    # in C++ the caller owns the AlignParams and scoping keeps it honest, so the
+    # bare-pointer-with-no-owner hazard does not arise there.  It arises only once
+    # Python holds the other end of the lifetime — the layer that was, until this
+    # job, never under a sanitizer.  SeqPairBatch.add_many() lives entirely in it:
+    # the pairs are owned by C++ and hold a bare pointer to params that no Python
+    # object of theirs keeps alive.
+    #
+    # Verified to work rather than assumed: against a binding that pins params in
+    # a single slot instead of a list, this job fails with
+    #   ERROR: AddressSanitizer: heap-use-after-free ... READ of size 8 ... thread T3
+    # from test_dropping_params_after_two_add_many_calls.
+    name: Python tests (${{ matrix.sanitizer }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address, undefined]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # -fno-sanitize-recover=all (set in CMakeLists) is what makes this worth
+      # anything: UBSan otherwise prints a diagnostic, carries on, and lets pytest
+      # exit 0 over undefined behaviour.
+      - name: Install with an instrumented extension
+        env:
+          CC: gcc
+          CXX: g++
+        run: |
+          pip install -e ".[dev]" \
+            --config-settings=cmake.define.NWGRAD_SANITIZE_EXT=ON \
+            --config-settings=cmake.define.NWGRAD_SANITIZERS=${{ matrix.sanitizer }} \
+            --config-settings=cmake.build-type=Debug
+
+      - name: Test
+        run: |
+          if [ "${{ matrix.sanitizer }}" = "address" ]; then
+            # ASan's runtime must be loaded before CPython's.  libstdc++ must be
+            # preloaded WITH it: CPython does not link libstdc++, so ASan's
+            # __cxa_throw interceptor finds no real symbol to forward to and dies
+            # on the first C++ exception our bindings throw with
+            #   CHECK failed: asan_interceptors.cpp "real___cxa_throw != 0"
+            #
+            # detect_leaks=0 is a real concession, not a formality: it gives up
+            # LeakSanitizer, which is exactly what would catch a leaked staged
+            # pair in add_many()'s throw path.  LSan cannot tell our leaks from
+            # CPython's and numpy's intentional allocations in an uninstrumented
+            # interpreter.  That check is not lost — it lives in the C++ ASan job,
+            # where test_add_many.cpp throws from a worker mid-construction.
+            export LD_PRELOAD="$(gcc -print-file-name=libasan.so):$(gcc -print-file-name=libstdc++.so)"
+            export ASAN_OPTIONS=detect_leaks=0
+          else
+            export UBSAN_OPTIONS=print_stacktrace=1
+          fi
+          # -s (no capture) is load-bearing.  Both sanitizers abort() the process
+          # on a finding, and pytest's capture has replaced fd 2 with a buffer
+          # that dies with it — so a captured run fails with a red tick and a
+          # completely empty log.  Verified: with capture on, the injected
+          # use-after-free produced rc=1 and zero bytes of output.
+          pytest tests/Python/ -q -s
+
   headers:
     name: Header-only consumer
     runs-on: ubuntu-latest
