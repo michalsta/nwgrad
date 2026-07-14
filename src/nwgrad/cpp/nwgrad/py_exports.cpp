@@ -22,14 +22,28 @@ using nb_arr_f64_1d = nb::ndarray<nb::numpy, double, nb::ndim<1>>;
 
 // ── Aligner factory: picks Full or GuideBanded at runtime. ───────────────────
 
+// "scalar" (default) | "simd".  The two Viterbi kernels write bit-identical tables,
+// so this is a speed knob and never a correctness one.  Anything unrecognised is a
+// typo, and a typo that silently gave you the slow path would be undetectable — so
+// it throws.
+inline DpKernel parse_kernel(const std::string& k) {
+    if (k == "scalar") return DpKernel::Scalar;
+    if (k == "simd")   return DpKernel::Simd;
+    throw std::invalid_argument(
+        "nwgrad: kernel must be \"scalar\" or \"simd\", got \"" + k + "\"");
+}
+
 #define WITH_ALIGNER(GM, AM, band, guide_j, body)                                        \
     do {                                                                                  \
         DpBuffer _buf;                                                                    \
+        const DpKernel _kern = parse_kernel(kernel);                                      \
         if ((band) > 0 || !(guide_j).empty()) {                                          \
             Aligner<GapModel::GM, AlignMode::AM, AlignBand::GuideBanded> al;             \
+            al.set_kernel(_kern);                                                          \
             body                                                                           \
         } else {                                                                           \
             Aligner<GapModel::GM, AlignMode::AM, AlignBand::Full> al;                    \
+            al.set_kernel(_kern);                                                          \
             body                                                                           \
         }                                                                                  \
     } while (0)
@@ -280,6 +294,21 @@ NB_MODULE(nwgrad_ext, m) {
 
     // ── Guide alignment utility ──────────────────────────────────────────────
     m.def(
+        "simd_isa",
+        []() { return std::string(nwgrad_simd::active_isa()); },
+        "Which instruction set the simd Viterbi kernel selected on this CPU:\n"
+        "\"baseline\" | \"avx\" | \"avx2\" | \"avx512\".\n"
+        "\n"
+        "Worth checking before you conclude the simd kernel did not help.  Prebuilt\n"
+        "wheels are compiled for the x86-64 baseline, so \"baseline\" means SSE2 —\n"
+        "two doubles per vector.  A modern CPU should report \"avx2\" or better.\n"
+        "\n"
+        "Plain \"avx\" is never selected automatically: it is a measured regression on\n"
+        "Bulldozer/Piledriver, whose FP unit splits every 256-bit operation into two\n"
+        "128-bit halves.  Set NWGRAD_ISA=baseline|avx|avx2|avx512 to override the\n"
+        "probe (an ISA this CPU cannot run falls back rather than crashing).");
+
+    m.def(
         "guide_j_from_aligned",
         [](const std::string& a_aligned, const std::string& b_aligned) {
             return guide_j_from_aligned(a_aligned, b_aligned);
@@ -295,7 +324,8 @@ NB_MODULE(nwgrad_ext, m) {
         "nw_score",
         [](const std::string& a, const std::string& b,
            const AlignParams& params, int band,
-           const std::string& aligned_a, const std::string& aligned_b) {
+           const std::string& aligned_a, const std::string& aligned_b,
+           const std::string& kernel) {
             auto gj = make_guide(aligned_a, aligned_b);
             EncodedPair enc(a, b, params);
             WITH_ALIGNER(Linear, Global, band, gj, {
@@ -306,13 +336,15 @@ NB_MODULE(nwgrad_ext, m) {
         },
         nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("params"),
         nb::arg("band") = 0, nb::arg("aligned_a") = "", nb::arg("aligned_b") = "",
+        nb::arg("kernel") = "scalar",
         "Needleman-Wunsch global alignment score (linear gap penalty).");
 
     m.def(
         "sw_score",
         [](const std::string& a, const std::string& b,
            const AlignParams& params, int band,
-           const std::string& aligned_a, const std::string& aligned_b) {
+           const std::string& aligned_a, const std::string& aligned_b,
+           const std::string& kernel) {
             auto gj = make_guide(aligned_a, aligned_b);
             EncodedPair enc(a, b, params);
             WITH_ALIGNER(Linear, Local, band, gj, {
@@ -323,13 +355,15 @@ NB_MODULE(nwgrad_ext, m) {
         },
         nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("params"),
         nb::arg("band") = 0, nb::arg("aligned_a") = "", nb::arg("aligned_b") = "",
+        nb::arg("kernel") = "scalar",
         "Smith-Waterman local alignment score (linear gap penalty).");
 
     m.def(
         "nw_score_affine",
         [](const std::string& a, const std::string& b,
            const AlignParams& params, int band,
-           const std::string& aligned_a, const std::string& aligned_b) {
+           const std::string& aligned_a, const std::string& aligned_b,
+           const std::string& kernel) {
             auto gj = make_guide(aligned_a, aligned_b);
             EncodedPair enc(a, b, params);
             WITH_ALIGNER(Affine, Global, band, gj, {
@@ -340,13 +374,15 @@ NB_MODULE(nwgrad_ext, m) {
         },
         nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("params"),
         nb::arg("band") = 0, nb::arg("aligned_a") = "", nb::arg("aligned_b") = "",
+        nb::arg("kernel") = "scalar",
         "Needleman-Wunsch global alignment score (affine gap penalty).");
 
     m.def(
         "sw_score_affine",
         [](const std::string& a, const std::string& b,
            const AlignParams& params, int band,
-           const std::string& aligned_a, const std::string& aligned_b) {
+           const std::string& aligned_a, const std::string& aligned_b,
+           const std::string& kernel) {
             auto gj = make_guide(aligned_a, aligned_b);
             EncodedPair enc(a, b, params);
             WITH_ALIGNER(Affine, Local, band, gj, {
@@ -357,6 +393,7 @@ NB_MODULE(nwgrad_ext, m) {
         },
         nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("params"),
         nb::arg("band") = 0, nb::arg("aligned_a") = "", nb::arg("aligned_b") = "",
+        nb::arg("kernel") = "scalar",
         "Smith-Waterman local alignment score (affine gap penalty).");
 
     // ── Single-pair hard gradient functions ─────────────────────────────────
@@ -365,7 +402,8 @@ NB_MODULE(nwgrad_ext, m) {
         "nw_grad",
         [](const std::string& a, const std::string& b,
            const AlignParams& params, int band,
-           const std::string& aligned_a, const std::string& aligned_b) {
+           const std::string& aligned_a, const std::string& aligned_b,
+           const std::string& kernel) {
             auto gj = make_guide(aligned_a, aligned_b);
             EncodedPair enc(a, b, params);
             WITH_ALIGNER(Linear, Global, band, gj, {
@@ -378,13 +416,15 @@ NB_MODULE(nwgrad_ext, m) {
         },
         nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("params"),
         nb::arg("band") = 0, nb::arg("aligned_a") = "", nb::arg("aligned_b") = "",
+        nb::arg("kernel") = "scalar",
         "NW global: returns (score, AlignParams grad) — hard subgradient (linear gap).");
 
     m.def(
         "sw_grad",
         [](const std::string& a, const std::string& b,
            const AlignParams& params, int band,
-           const std::string& aligned_a, const std::string& aligned_b) {
+           const std::string& aligned_a, const std::string& aligned_b,
+           const std::string& kernel) {
             auto gj = make_guide(aligned_a, aligned_b);
             EncodedPair enc(a, b, params);
             WITH_ALIGNER(Linear, Local, band, gj, {
@@ -397,13 +437,15 @@ NB_MODULE(nwgrad_ext, m) {
         },
         nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("params"),
         nb::arg("band") = 0, nb::arg("aligned_a") = "", nb::arg("aligned_b") = "",
+        nb::arg("kernel") = "scalar",
         "SW local: returns (score, AlignParams grad) — hard subgradient (linear gap).");
 
     m.def(
         "nw_affine_grad",
         [](const std::string& a, const std::string& b,
            const AlignParams& params, int band,
-           const std::string& aligned_a, const std::string& aligned_b) {
+           const std::string& aligned_a, const std::string& aligned_b,
+           const std::string& kernel) {
             auto gj = make_guide(aligned_a, aligned_b);
             EncodedPair enc(a, b, params);
             WITH_ALIGNER(Affine, Global, band, gj, {
@@ -416,13 +458,15 @@ NB_MODULE(nwgrad_ext, m) {
         },
         nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("params"),
         nb::arg("band") = 0, nb::arg("aligned_a") = "", nb::arg("aligned_b") = "",
+        nb::arg("kernel") = "scalar",
         "NW global: returns (score, AlignParams grad) — hard subgradient (affine gap).");
 
     m.def(
         "sw_affine_grad",
         [](const std::string& a, const std::string& b,
            const AlignParams& params, int band,
-           const std::string& aligned_a, const std::string& aligned_b) {
+           const std::string& aligned_a, const std::string& aligned_b,
+           const std::string& kernel) {
             auto gj = make_guide(aligned_a, aligned_b);
             EncodedPair enc(a, b, params);
             WITH_ALIGNER(Affine, Local, band, gj, {
@@ -435,6 +479,7 @@ NB_MODULE(nwgrad_ext, m) {
         },
         nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("params"),
         nb::arg("band") = 0, nb::arg("aligned_a") = "", nb::arg("aligned_b") = "",
+        nb::arg("kernel") = "scalar",
         "SW local: returns (score, AlignParams grad) — hard subgradient (affine gap).");
 
     // ── Single-pair soft gradient functions ─────────────────────────────────
@@ -443,7 +488,8 @@ NB_MODULE(nwgrad_ext, m) {
         "nw_soft_grad",
         [](const std::string& a, const std::string& b,
            const AlignParams& params, int band,
-           const std::string& aligned_a, const std::string& aligned_b) {
+           const std::string& aligned_a, const std::string& aligned_b,
+           const std::string& kernel) {
             auto gj = make_guide(aligned_a, aligned_b);
             EncodedPair enc(a, b, params);
             WITH_ALIGNER(Linear, Global, band, gj, {
@@ -456,13 +502,15 @@ NB_MODULE(nwgrad_ext, m) {
         },
         nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("params"),
         nb::arg("band") = 0, nb::arg("aligned_a") = "", nb::arg("aligned_b") = "",
+        nb::arg("kernel") = "scalar",
         "NW global: returns (log_Z, AlignParams grad) — soft gradient (linear gap).");
 
     m.def(
         "sw_soft_grad",
         [](const std::string& a, const std::string& b,
            const AlignParams& params, int band,
-           const std::string& aligned_a, const std::string& aligned_b) {
+           const std::string& aligned_a, const std::string& aligned_b,
+           const std::string& kernel) {
             auto gj = make_guide(aligned_a, aligned_b);
             EncodedPair enc(a, b, params);
             WITH_ALIGNER(Linear, Local, band, gj, {
@@ -475,13 +523,15 @@ NB_MODULE(nwgrad_ext, m) {
         },
         nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("params"),
         nb::arg("band") = 0, nb::arg("aligned_a") = "", nb::arg("aligned_b") = "",
+        nb::arg("kernel") = "scalar",
         "SW local: returns (log_Z, AlignParams grad) — soft gradient (linear gap).");
 
     m.def(
         "nw_affine_soft_grad",
         [](const std::string& a, const std::string& b,
            const AlignParams& params, int band,
-           const std::string& aligned_a, const std::string& aligned_b) {
+           const std::string& aligned_a, const std::string& aligned_b,
+           const std::string& kernel) {
             auto gj = make_guide(aligned_a, aligned_b);
             EncodedPair enc(a, b, params);
             WITH_ALIGNER(Affine, Global, band, gj, {
@@ -494,13 +544,15 @@ NB_MODULE(nwgrad_ext, m) {
         },
         nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("params"),
         nb::arg("band") = 0, nb::arg("aligned_a") = "", nb::arg("aligned_b") = "",
+        nb::arg("kernel") = "scalar",
         "NW global: returns (log_Z, AlignParams grad) — soft gradient (affine gap).");
 
     m.def(
         "sw_affine_soft_grad",
         [](const std::string& a, const std::string& b,
            const AlignParams& params, int band,
-           const std::string& aligned_a, const std::string& aligned_b) {
+           const std::string& aligned_a, const std::string& aligned_b,
+           const std::string& kernel) {
             auto gj = make_guide(aligned_a, aligned_b);
             EncodedPair enc(a, b, params);
             WITH_ALIGNER(Affine, Local, band, gj, {
@@ -513,6 +565,7 @@ NB_MODULE(nwgrad_ext, m) {
         },
         nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("params"),
         nb::arg("band") = 0, nb::arg("aligned_a") = "", nb::arg("aligned_b") = "",
+        nb::arg("kernel") = "scalar",
         "SW local: returns (log_Z, AlignParams grad) — soft gradient (affine gap).");
 
     // ── BatchResult ──────────────────────────────────────────────────────────
@@ -544,14 +597,16 @@ NB_MODULE(nwgrad_ext, m) {
                const std::string& gap_model,
                const std::string& mode,
                const std::string& grad_mode,
-               int n_threads) {
+               int n_threads,
+               const std::string& kernel) {
                 GapModel  gm = (gap_model == "affine") ? GapModel::Affine  : GapModel::Linear;
                 AlignMode am = (mode      == "local")  ? AlignMode::Local  : AlignMode::Global;
                 BatchAligner::GradMode gd;
                 if      (grad_mode == "hard") gd = BatchAligner::GradMode::Hard;
                 else if (grad_mode == "soft") gd = BatchAligner::GradMode::Soft;
                 else                          gd = BatchAligner::GradMode::None;
-                new (self) BatchAligner(params, band, gm, am, gd, n_threads);
+                new (self) BatchAligner(params, band, gm, am, gd, n_threads,
+                                        parse_kernel(kernel));
             },
             nb::arg("params"),
             nb::arg("band")       = 0,
@@ -559,11 +614,20 @@ NB_MODULE(nwgrad_ext, m) {
             nb::arg("mode")       = "global",
             nb::arg("grad_mode")  = "hard",
             nb::arg("n_threads")  = 1,
+            nb::arg("kernel")     = "scalar",
             "Create a BatchAligner.\n"
             "  gap_model : \"linear\" | \"affine\"\n"
             "  mode      : \"global\" | \"local\"\n"
             "  grad_mode : \"hard\" | \"soft\" | \"none\"\n"
-            "  band      : 0 = full DP; >0 = banded half-width")
+            "  band      : 0 = full DP; >0 = banded half-width\n"
+            "  kernel    : \"scalar\" | \"simd\" — which Viterbi fills the DP tables.\n"
+            "              The two are bit-exact: identical tables, identical\n"
+            "              alignments, identical gradients.  Purely a speed knob.\n"
+            "              It affects the Viterbi (hard-gradient) path only; soft\n"
+            "              gradients are computed by the same shared code either way,\n"
+            "              and the linear gap model has no simd kernel (its scalar\n"
+            "              loop is already at its latency floor), so \"simd\" is a\n"
+            "              no-op there.")
         .def(
             "align",
             [](const BatchAligner& self,
@@ -610,18 +674,20 @@ NB_MODULE(nwgrad_ext, m) {
                const AlignParams& params,
                const std::string& gap_model,
                const std::string& mode,
-               const std::string& grad_mode) {
+               const std::string& grad_mode,
+               const std::string& kernel) {
                 GapModel  gm = (gap_model == "affine") ? GapModel::Affine  : GapModel::Linear;
                 AlignMode am = (mode      == "local")  ? AlignMode::Local  : AlignMode::Global;
                 GradMode  gd;
                 if      (grad_mode == "hard") gd = GradMode::Hard;
                 else if (grad_mode == "soft") gd = GradMode::Soft;
                 else                          gd = GradMode::None;
-                new (self) SeqPair(seq_a, seq_b, params, gm, am, gd);
+                new (self) SeqPair(seq_a, seq_b, params, gm, am, gd,
+                                   parse_kernel(kernel));
             },
             nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("params"),
             nb::arg("gap_model") = "affine", nb::arg("mode") = "global",
-            nb::arg("grad_mode") = "hard",
+            nb::arg("grad_mode") = "hard", nb::arg("kernel") = "scalar",
             // Keeps the initial `params` alive; a SeqPair whose params is never
             // swapped would otherwise hold a dangling pointer.  keep_alive is
             // fine *here* — one patient, registered once, so it stays O(1).  It
@@ -630,7 +696,10 @@ NB_MODULE(nwgrad_ext, m) {
             "Persistent sequence pair.\n"
             "  gap_model : \"linear\" | \"affine\"\n"
             "  mode      : \"global\" | \"local\"\n"
-            "  grad_mode : \"hard\" | \"soft\" | \"none\"")
+            "  grad_mode : \"hard\" | \"soft\" | \"none\"\n"
+            "  kernel    : \"scalar\" | \"simd\" — bit-exact alternatives; a speed\n"
+            "              knob only.  Viterbi/hard-gradient path only; linear is\n"
+            "              a no-op (see BatchAligner).")
         .def("alloc_dp", &SeqPair::alloc_dp,
              "Pre-allocate own DP tables for the fixed sequences.")
         .def(

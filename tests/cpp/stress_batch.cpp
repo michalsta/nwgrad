@@ -73,6 +73,7 @@ struct Args {
     std::vector<int> n_threads = {4};
     uint64_t    seed        = 0;        // 0 = random
     bool        warmup      = false;
+    DpKernel    kernel      = DpKernel::Scalar;
 };
 
 [[noreturn]] static void usage(const char* prog, int exit_code = 0) {
@@ -89,6 +90,7 @@ struct Args {
         "  --gap-open F           gap-open penalty (default 11.0)\n"
         "  --gap-extend F         gap-extend penalty (default 1.0)\n"
         "  --n-threads T...       one or more thread counts (default 4)\n"
+        "  --kernel scalar|simd   Viterbi kernel (default scalar); bit-exact\n"
         "  --seed N               RNG seed (default: random)\n"
         "  --warmup               run a silent warmup pass before timing\n"
         "  --help                 show this message\n";
@@ -174,6 +176,11 @@ static Args parse_args(int argc, char** argv) {
                 throw std::invalid_argument(std::string("bad seed: ") + s);
             a.seed = v;
             seed_set = true;
+        } else if (std::strcmp(argv[i], "--kernel") == 0) {
+            need(1); ++i;
+            if      (std::strcmp(argv[i], "scalar") == 0) a.kernel = DpKernel::Scalar;
+            else if (std::strcmp(argv[i], "simd")   == 0) a.kernel = DpKernel::Simd;
+            else throw std::invalid_argument("unknown kernel: " + std::string(argv[i]));
         } else if (std::strcmp(argv[i], "--warmup") == 0) {
             a.warmup = true;
         } else {
@@ -217,9 +224,11 @@ static void print_header(const Args& a) {
     const char* grd = (a.grad_mode  == BatchAligner::GradMode::Hard) ? "hard"
                     : (a.grad_mode  == BatchAligner::GradMode::Soft) ? "soft" : "none";
 
-    std::printf("n=%d  seq_len=%s  gap_model=%s  mode=%s  grad_mode=%s"
+    const char* kn = (a.kernel == DpKernel::Simd) ? "simd" : "scalar";
+
+    std::printf("n=%d  seq_len=%s  gap_model=%s  mode=%s  grad_mode=%s  kernel=%s"
                 "  gap_open=%.1f  gap_extend=%.1f  seed=0x%016lx\n",
-                a.n, len_str.c_str(), gm, mo, grd,
+                a.n, len_str.c_str(), gm, mo, grd, kn,
                 a.gap_open, a.gap_extend, (unsigned long)a.seed);
 }
 
@@ -298,7 +307,8 @@ int main(int argc, char** argv) {
 
     for (int n_threads : a.n_threads) {
         BatchAligner aligner(params, /*band=*/0,
-                             a.gap_model, a.align_mode, a.grad_mode, n_threads);
+                             a.gap_model, a.align_mode, a.grad_mode, n_threads,
+                             a.kernel);
 
         if (a.warmup) {
             size_t warmup_n = std::min<size_t>(16, static_cast<size_t>(a.n));

@@ -34,11 +34,17 @@ struct BatchAligner {
     enum class GradMode { None, Hard, Soft };
     GradMode grad_mode;
     int n_threads;
+    // Which Viterbi fills the DP tables.  A runtime field, exactly like the three
+    // above — the two kernels are bit-exact, so this never changes a result, only a
+    // duration.  Keeping it off the template parameter list is what leaves the
+    // DISPATCH macro below at four arms rather than eight.
+    DpKernel kernel;
 
     BatchAligner(AlignParams p, int band,
-                 GapModel gm, AlignMode am, GradMode gd, int nt)
+                 GapModel gm, AlignMode am, GradMode gd, int nt,
+                 DpKernel k = DpKernel::Scalar)
         : params(std::move(p)), band(band),
-          gap_model(gm), align_mode(am), grad_mode(gd), n_threads(nt) {}
+          gap_model(gm), align_mode(am), grad_mode(gd), n_threads(nt), kernel(k) {}
 
     BatchResult align(const std::vector<ProblemInstance>& problems) const {
         const size_t N = problems.size();
@@ -126,6 +132,7 @@ private:
         AlignParams& local_grad) const
     {
         Aligner<GM, AM, AB> al;
+        al.set_kernel(kernel);
         DpBuffer buf;  // reused across iterations; grows to the largest pair seen
         const Alphabet& alpha = params.matrix.alphabet();
         // Encoding buffers, reused across iterations: the batch never

@@ -53,6 +53,153 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
+  arm:
+    # The simd Viterbi kernel has no x86 in it — it is restructured C++ that the
+    # compiler vectorizes, and the ISA dispatch table is x86-only scaffolding.  On
+    # AArch64 NEON is mandatory baseline, so the kernel simply vectorizes where it
+    # stands and the table has a single entry.  That is the path Apple Silicon takes.
+    #
+    # It is also the path most likely to rot unnoticed, because nobody develops on it.
+    # Two things are checked here that ubuntu-latest cannot check:
+    #   1. the kernel is still bit-exact when a *different compiler backend* vectorizes
+    #      it (the whole design rests on that, and NEON is not SSE2);
+    #   2. the vectorizer actually fired.  AArch64 has no gather instruction at all, so
+    #      without the query profile the row loop would silently stay scalar and the
+    #      kernel would be pure overhead.  Autovectorization is a hope, not a contract.
+    name: ARM64 / NEON (Apple Silicon's code path)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install nanobind
+        run: pip install nanobind
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+          -Dnanobind_DIR="$(python -m nanobind --cmake_dir)"
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      # Includes test_simd_bitexact, which asserts the NEON-vectorized tables are
+      # bit-identical to the scalar ones.  The NWGRAD_ISA cases are no-ops here (there
+      # is no dispatch on AArch64) and simply re-run baseline, which is harmless.
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      # The point of the query profile is that it makes the row loop vectorizable at
+      # all.  If this grep finds nothing, the profile is buying nothing on ARM and the
+      # simd kernel is doing extra work for no gain — which is a failure, not a nit.
+      - name: Assert the vectorizer actually fired (NEON)
+        run: |
+          printf '#include "aligner.hpp"\ntemplate struct Aligner<GapModel::Affine, AlignMode::Global, AlignBand::Full>;\n' > probe.cpp
+          g++ -std=c++20 -O3 -I src/nwgrad/cpp/nwgrad \
+              -fopt-info-vec-optimized -c probe.cpp -o /dev/null 2> vec.log || true
+          echo "--- vectorization report for aligner_simd.hpp ---"
+          grep "aligner_simd.hpp" vec.log || true
+          if ! grep -q "aligner_simd.hpp.*vectorized" vec.log; then
+            echo "::error::the simd row kernels did NOT vectorize on AArch64 —" \
+                 "the query profile is not doing its job and kernel=simd is pure overhead here"
+            exit 1
+          fi
+
+      - name: Python tests
+        run: |
+          pip install -e ".[dev]"
+          python -c "import nwgrad; print('simd_isa() ->', nwgrad.simd_isa())"
+          pytest tests/Python/ -q
+          # The strongest check there is: if the kernels really are bit-exact, the
+          # entire existing suite must pass through the simd one without a single
+          # tolerance being loosened.
+          NWGRAD_FORCE_KERNEL=simd pytest tests/Python/ -q
+
+  windows:
+    # The library had never been compiled with MSVC.  Nothing in it is Unix-specific,
+    # but "should compile" and "compiles" are different claims, and the simd header
+    # makes the gap wider: it carries `#pragma GCC target` regions and __builtin_cpu_*
+    # probes that MSVC has no equivalent for.  Those are #if'd out — MSVC takes the
+    # same single-entry fallback path as AArch64 — but an #if'd-out path that nobody
+    # ever compiles is exactly how a header-only library breaks for a consumer.
+    name: Windows / MSVC
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install nanobind
+        run: pip install nanobind
+
+      # nanobind reports a Windows path with backslashes, which bash eats before CMake
+      # ever sees them.  CMake accepts forward slashes on Windows, so normalise.
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -Dnanobind_DIR="$(python -m nanobind --cmake_dir | tr '\\' '/')"
+
+      # Only the test target.  stress_batch is a developer benchmark, not a shipped
+      # artifact, and it leans on glibc-isms (the %' printf group-separator flag) that
+      # MSVC does not have.  Letting it fail this job would bury a real portability
+      # finding under noise about a benchmark nobody installs.
+      #
+      # MSVC is a multi-config generator: the build type lives here, not in the
+      # configure step, and ctest needs -C to match.
+      - name: Build
+        run: cmake --build build --target nwgrad_tests --config Debug
+
+      - name: Test
+        run: ctest --test-dir build -C Debug --output-on-failure -R cpp_tests
+
+      - name: Python tests
+        run: |
+          pip install -e ".[dev]"
+          python -c "import nwgrad; print('simd_isa() ->', nwgrad.simd_isa())"
+          pytest tests/Python/ -q
+          NWGRAD_FORCE_KERNEL=simd pytest tests/Python/ -q
+
+  no-multiversion:
+    # The MSVC / AArch64 fallback path, compiled on x86 where it can actually be run
+    # under a sanitizer.  The Windows and ARM jobs above exercise this code, but on
+    # platforms where an out-of-bounds read in the row kernels would go unnoticed —
+    # neither has ASan here.  This job closes that gap cheaply: same single-entry
+    # table, same kernels, but with the sanitizers pointed at them.
+    name: C++ tests (single-ISA fallback path, ASan+UBSan)
+    runs-on: ubuntu-latest
+    env:
+      CXXFLAGS: -DNWGRAD_NO_MULTIVERSION=1
+      UBSAN_OPTIONS: print_stacktrace=1
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install nanobind
+        run: pip install nanobind
+
+      - name: Configure
+        run: >
+          cmake -S . -B build-nomv -DCMAKE_BUILD_TYPE=Debug
+          -DNWGRAD_SANITIZE=ON
+          -Dnanobind_DIR="$(python -m nanobind --cmake_dir)"
+
+      - name: Build
+        run: cmake --build build-nomv --target nwgrad_tests -j"$(nproc)"
+
+      - name: Test
+        run: ctest --test-dir build-nomv --output-on-failure
+
   sanitizers:
     name: C++ tests (${{ matrix.compiler }}, ASan+UBSan)
     runs-on: ubuntu-latest

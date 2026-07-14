@@ -79,6 +79,7 @@ add_executable(nwgrad_tests
     tests/cpp/test_banded.cpp
     tests/cpp/test_seq_pair.cpp
     tests/cpp/test_add_many.cpp
+    tests/cpp/test_simd_bitexact.cpp
 )
 target_include_directories(nwgrad_tests PRIVATE
     src/nwgrad/cpp/nwgrad
@@ -99,6 +100,22 @@ endif()
 
 enable_testing()
 add_test(NAME cpp_tests COMMAND nwgrad_tests)
+
+# ── The simd kernel, once per instruction set ────────────────────────────────
+#
+# The ISA is chosen once per process from a function-pointer table, so a single run
+# only ever exercises one of them.  These re-run the bit-exactness sweep with the
+# choice forced, which is what makes the AVX2 / AVX-512 clones *tested* rather than
+# merely compiled: a CI runner with AVX2 executes the AVX2 kernel here.
+#
+# An ISA the CPU cannot run falls back to baseline rather than trapping, so every one
+# of these is safe to run everywhere — it simply re-tests baseline on a machine that
+# lacks the hardware.  That is why they are unconditional.
+foreach(isa baseline avx avx2 avx512)
+    add_test(NAME cpp_tests_isa_${isa} COMMAND nwgrad_tests "[simd]")
+    set_tests_properties(cpp_tests_isa_${isa}
+        PROPERTIES ENVIRONMENT "NWGRAD_ISA=${isa}")
+endforeach()
 
 # ── C++ stress benchmark ──────────────────────────────────────────────────────
 add_executable(stress_batch tests/cpp/stress_batch.cpp)

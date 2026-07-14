@@ -17,6 +17,17 @@ enum class GapModel  { Linear, Affine };
 enum class AlignMode { Global, Local  };
 enum class AlignBand { Full,   GuideBanded };
 
+// Which Viterbi implementation fills the DP tables.  Scalar is the original and
+// the default; Simd is a vectorized rewrite that is *bit-exact* with it — the
+// tables it writes are identical down to the last bit, which is what lets the
+// exact-float-equality tracebacks below keep working unchanged.  The choice is a
+// runtime field, not a template parameter: the branch is taken once per
+// compute_viterbi() and amortized over m*n cells.
+//
+// The kernel selects the Viterbi (and hence hard_grad) path only.  Forward-backward
+// and soft_grad are computed by the same shared code either way.
+enum class DpKernel { Scalar, Simd };
+
 // ── Utility: convert a pair of aligned strings to a guide_j vector ────────────
 //
 // a_aligned, b_aligned: equal-length strings with '-' for gaps.
@@ -72,12 +83,20 @@ struct DpBuffer {
     std::vector<double> F, B;                     // linear forward-backward
     std::vector<double> FM, FX, FY, BM, BX, BY;  // affine forward-backward
 
+    // Used only by the Simd kernel.  `prof` is the query profile — the
+    // substitution scores of every alphabet symbol against sequence B, laid out
+    // contiguously in j so the DP row loop loads them with a vector load instead
+    // of a gather (Full mode).  `subbuf` is the per-row equivalent for banded
+    // mode, where a full-width profile would cost more than the banded DP itself.
+    std::vector<double> prof, subbuf;
+
     void clear() noexcept {
         auto clr = [](std::vector<double>& v) noexcept { v.clear(); v.shrink_to_fit(); };
         clr(H);
         clr(VM); clr(VX); clr(VY);
         clr(F);  clr(B);
         clr(FM); clr(FX); clr(FY); clr(BM); clr(BX); clr(BY);
+        clr(prof); clr(subbuf);
     }
 };
 
@@ -185,12 +204,17 @@ struct Aligner {
         own_buf_allocated_ = true;
     }
 
+    // Select the DP kernel.  Scalar (the default) and Simd write bit-identical
+    // tables; Simd is the vectorized one.  Affects compute_viterbi() only —
+    // compute_forward_back() is shared and ignores this.
+    void set_kernel(DpKernel k) noexcept { kernel_ = k; }
+    DpKernel kernel() const noexcept { return kernel_; }
+
     void compute_viterbi() {
         check_problem();
         check_own_buf_allocated();
         ensure_viterbi_buf(own_buf_);  // Grow if needed
-        if constexpr (GM == GapModel::Linear) viterbi_linear(own_buf_);
-        else                                   viterbi_affine(own_buf_);
+        run_viterbi(own_buf_);
         viterbi_done_ = any_viterbi_done_ = true;
         fwdbwd_is_newest_ = false;
     }
@@ -271,8 +295,7 @@ struct Aligner {
     void compute_viterbi(DpBuffer& buf) {
         check_problem();
         ensure_viterbi_buf(buf);  // Grow if needed (allows implicit growth from size 0)
-        if constexpr (GM == GapModel::Linear) viterbi_linear(buf);
-        else                                   viterbi_affine(buf);
+        run_viterbi(buf);
         any_viterbi_done_ = true;
         fwdbwd_is_newest_ = false;
     }
@@ -323,6 +346,8 @@ private:
     int                 m_ = 0, n_ = 0;
     size_t              stride_ = 0, sz_ = 0;
     std::vector<int>    guide_j_;  // used only when AB == GuideBanded
+
+    DpKernel kernel_ = DpKernel::Scalar;  // which Viterbi fills the tables
 
     bool problem_set_       = false;
     bool own_buf_allocated_ = false; // own buffer shell has been allocated
@@ -628,6 +653,42 @@ private:
         fill_guide_gaps(gj);
         return gj;
     }
+
+    // ── Kernel dispatch ───────────────────────────────────────────────────────
+    //
+    // The one place in the library where the scalar/simd choice exists.  The
+    // branch is taken once per DP, not once per cell.  The two kernels write
+    // bit-identical tables, so nothing downstream of here can tell them apart.
+    // The linear model has no Simd kernel — deliberately.  Its recurrence collapses
+    // to a single carry that is a pure latency chain (~6 cycles/cell, unbreakable by
+    // any vector width), and the scalar loop already runs at ~9 cycles/cell against
+    // that floor.  A vectorized linear kernel was written, measured at 0.90x, and
+    // deleted.  See the long note in aligner_simd.hpp.  DpKernel::Simd therefore
+    // remains a legal request for a linear aligner; it simply returns the fastest
+    // linear kernel there is, which is the scalar one.
+    void run_viterbi(DpBuffer& buf) {
+        if constexpr (GM == GapModel::Linear) {
+            viterbi_linear(buf);
+        } else {
+            if (kernel_ == DpKernel::Simd) viterbi_affine_simd(buf);
+            else                            viterbi_affine(buf);
+        }
+    }
+
+    // ── Simd kernel — defined out-of-line in aligner_simd.hpp ─────────────────
+    //
+    // Declared here, defined there, and that header is included at the bottom of
+    // this one so both are always visible at the point of instantiation.  The
+    // vectorization machinery (query profile, lazy-F, ISA dispatch) stays out of
+    // this file entirely.
+    void viterbi_affine_simd(DpBuffer& buf);
+
+    // Substitution scores for row i, contiguous in j over [lo, hi] — a vector
+    // load, not a gather.  Full mode serves a slice of the prebuilt query
+    // profile; banded mode gathers the row's short span into buf.subbuf, since a
+    // full-width profile would outcost the banded DP.  Defined in aligner_simd.hpp.
+    void build_profile(DpBuffer& buf) const;
+    const double* subrow(DpBuffer& buf, int i, int lo, int hi) const;
 
     // ═════════════════════════════════════════════════════════════════════════
     // Viterbi — Linear gap model
@@ -1187,3 +1248,8 @@ private:
         }
     }
 };
+
+// The Simd kernel's out-of-line definitions.  Included last, once Aligner is a
+// complete type, so every instantiation sees both kernels.
+#define NWGRAD_ALIGNER_HPP_INCLUDED 1
+#include "aligner_simd.hpp"
