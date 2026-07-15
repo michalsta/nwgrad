@@ -76,6 +76,15 @@ void check_bit_exact(const AlignParams& p, const std::string& a, const std::stri
     const double score_scalar = al.score();
     AlignParams grad_scalar = AlignParams::zeros_like(p);
     al.hard_grad(buf_scalar, grad_scalar);
+    // Snapshot the scalar tables in canonical row-major NOW, while the aligner is in
+    // row-major mode — the simd run below flips it to striped for the affine Full path.
+    std::vector<double> rmH, rmM, rmX, rmY;
+    if constexpr (GM == GapModel::Linear) rmH = al.to_row_major(buf_scalar.H);
+    else {
+        rmM = al.to_row_major(buf_scalar.VM);
+        rmX = al.to_row_major(buf_scalar.VX);
+        rmY = al.to_row_major(buf_scalar.VY);
+    }
 
     al.set_problem(a, b, p, band);
     al.set_kernel(DpKernel::Simd);
@@ -84,12 +93,14 @@ void check_bit_exact(const AlignParams& p, const std::string& a, const std::stri
     AlignParams grad_simd = AlignParams::zeros_like(p);
     al.hard_grad(buf_simd, grad_simd);
 
+    // Compare tables in canonical row-major: the simd Full kernel writes them striped,
+    // so to_row_major de-stripes buf_simd back to (m+1)×(n+1) order for the comparison.
     if constexpr (GM == GapModel::Linear) {
-        REQUIRE(first_bit_diff(buf_scalar.H, buf_simd.H, sz) == -1);
+        REQUIRE(first_bit_diff(rmH, al.to_row_major(buf_simd.H), sz) == -1);
     } else {
-        REQUIRE(first_bit_diff(buf_scalar.VM, buf_simd.VM, sz) == -1);
-        REQUIRE(first_bit_diff(buf_scalar.VX, buf_simd.VX, sz) == -1);
-        REQUIRE(first_bit_diff(buf_scalar.VY, buf_simd.VY, sz) == -1);
+        REQUIRE(first_bit_diff(rmM, al.to_row_major(buf_simd.VM), sz) == -1);
+        REQUIRE(first_bit_diff(rmX, al.to_row_major(buf_simd.VX), sz) == -1);
+        REQUIRE(first_bit_diff(rmY, al.to_row_major(buf_simd.VY), sz) == -1);
     }
 
     REQUIRE(std::bit_cast<uint64_t>(score_scalar) == std::bit_cast<uint64_t>(score_simd));

@@ -36,13 +36,20 @@ static void striped_affine_full(ViterbiJob& job) {
 
     const int seg = (n + W - 1) / W;
     const std::size_t sw = (std::size_t)seg * W;
-    const std::size_t stride = (std::size_t)n + 1;
-
-    if (buf.srows.size()  < 6 * sw) buf.srows.resize(6 * sw);
+    // VM/VX/VY hold the tables in STRIPED layout — one row of rowsz = sw + 1 doubles per
+    // i, written in place, so the traceback/hard-gradient read them striped with no
+    // per-row de-stripe copy.  Slot 0 is column 0 (the gap border); slots 1..sw are the
+    // striped columns 1..n, column j at 1 + ((j-1)%seg)*W + (j-1)/seg.  aligner.hpp's
+    // cell_index() computes the identical index — the two must stay in lockstep.
+    const std::size_t rowsz = sw + 1;
     if (buf.sopenv.size() < sw)     buf.sopenv.resize(sw);
     if (buf.sprof.size()  < (std::size_t)nalpha * sw) buf.sprof.resize((std::size_t)nalpha * sw);
-    const std::size_t vsz = (std::size_t)(m + 1) * stride;
+    const std::size_t vsz = (std::size_t)(m + 1) * rowsz;
     if (buf.VM.size() < vsz) { buf.VM.resize(vsz); buf.VX.resize(vsz); buf.VY.resize(vsz); }
+    // striped slot within a row (offset past slot 0) for DP column j in 1..n
+    auto scol = [seg, W](int j) -> std::size_t {
+        return (std::size_t)((j - 1) % seg) * W + (j - 1) / seg;
+    };
 
     // striped query profile: prof[c][s*W+l] = score(c, b[col(l,s)-1]), padding -> NINF
     for (int c = 0; c < nalpha; ++c) {
@@ -55,31 +62,26 @@ static void striped_affine_full(ViterbiJob& job) {
             }
     }
 
-    double* pM = buf.srows.data() + 0 * sw; double* pX = buf.srows.data() + 1 * sw;
-    double* pY = buf.srows.data() + 2 * sw; double* cM = buf.srows.data() + 3 * sw;
-    double* cX = buf.srows.data() + 4 * sw; double* cY = buf.srows.data() + 5 * sw;
     double* ov = buf.sopenv.data();
 
-    // row 0 (previous row for i=1), striped.  Global: VM=NINF, VY=Y-gap-open series.
-    // Local: VM=0 everywhere (an alignment may start anywhere), VX=VY=NINF.
-    for (std::size_t k = 0; k < sw; ++k) { pM[k] = K_NINF; pX[k] = K_NINF; pY[k] = K_NINF; }
-    for (int l = 0; l < W; ++l)
-        for (int s = 0; s < seg; ++s) {
-            const int j = l * seg + s + 1;
-            if (j <= n) {
-                if constexpr (Local) pM[(std::size_t)s * W + l] = 0.0;
-                else                 pY[(std::size_t)s * W + l] = -(go_a + j * ge_a);
-            }
-        }
-    // row 0 in the row-major output
+    // ── row 0, written striped straight into the tables (slot 0 = column 0) ──
+    // This doubles as the previous row for i = 1 (read at buf.VM row 0 + 1).  Global:
+    // VM = NINF, VY = the Y-gap-open series; Local: VM = 0 everywhere.
     {
-        double* r0M = buf.VM.data(); double* r0X = buf.VX.data(); double* r0Y = buf.VY.data();
-        if constexpr (Local) {
-            for (int j = 0; j <= n; ++j) { r0M[j] = 0.0; r0X[j] = K_NINF; r0Y[j] = K_NINF; }
-        } else {
-            r0M[0] = 0.0; r0X[0] = K_NINF; r0Y[0] = K_NINF;
-            for (int j = 1; j <= n; ++j) { r0M[j] = K_NINF; r0X[j] = K_NINF; r0Y[j] = -(go_a + j * ge_a); }
+        double* z0M = buf.VM.data(); double* z0X = buf.VX.data(); double* z0Y = buf.VY.data();
+        z0M[0] = 0.0; z0X[0] = K_NINF; z0Y[0] = K_NINF;                 // column 0
+        for (std::size_t k = 0; k < sw; ++k) {                          // columns 1..n default NINF
+            z0M[1 + k] = K_NINF; z0X[1 + k] = K_NINF; z0Y[1 + k] = K_NINF;
         }
+        for (int l = 0; l < W; ++l)
+            for (int s = 0; s < seg; ++s) {
+                const int j = l * seg + s + 1;
+                if (j <= n) {
+                    const std::size_t k = (std::size_t)s * W + l;
+                    if constexpr (Local) z0M[1 + k] = 0.0;
+                    else                 z0Y[1 + k] = -(go_a + j * ge_a);
+                }
+            }
     }
 
     const vd vgo_a(go_a), vge_a(ge_a), vgo_b(go_b), vge_b(ge_b);
@@ -96,10 +98,17 @@ static void striped_affine_full(ViterbiJob& job) {
         const double nbOpen = (std::max(nbM, nbX) - go_a) - ge_a;
         const double* sub = buf.sprof.data() + (std::size_t)a[i - 1] * sw;
 
-        double* rM = buf.VM.data() + (std::size_t)i * stride;
-        double* rX = buf.VX.data() + (std::size_t)i * stride;
-        double* rY = buf.VY.data() + (std::size_t)i * stride;
-        rM[0] = nbM; rX[0] = nbX; rY[0] = K_NINF;
+        // this row and the previous row, striped, written in place in the tables
+        double* cM = buf.VM.data() + (std::size_t)i * rowsz + 1;
+        double* cX = buf.VX.data() + (std::size_t)i * rowsz + 1;
+        double* cY = buf.VY.data() + (std::size_t)i * rowsz + 1;
+        const double* pM = buf.VM.data() + (std::size_t)(i - 1) * rowsz + 1;
+        const double* pX = buf.VX.data() + (std::size_t)(i - 1) * rowsz + 1;
+        const double* pY = buf.VY.data() + (std::size_t)(i - 1) * rowsz + 1;
+        // column 0 border of this row (slot 0)
+        buf.VM.data()[(std::size_t)i * rowsz] = nbM;
+        buf.VX.data()[(std::size_t)i * rowsz] = nbX;
+        buf.VY.data()[(std::size_t)i * rowsz] = K_NINF;
 
         if (seg > 0) {
             // ── carry-free: VM (diagonal, clamped to 0 for Local), VX (same column) ──
@@ -193,21 +202,12 @@ static void striped_affine_full(ViterbiJob& job) {
                 if (!changed) break;
             }
 
-            // ── de-stripe this row into row-major VM/VX/VY ──
-            for (int l = 0; l < W; ++l)
-                for (int s = 0; s < seg; ++s) {
-                    const int j = l * seg + s + 1;
-                    if (j <= n) {
-                        const std::size_t k = (std::size_t)s * W + l;
-                        rM[j] = cM[k]; rX[j] = cX[k]; rY[j] = cY[k];
-                    }
-                }
-
-            // ── Local: argmax over this row, in row-major (j ascending) order with the
-            // scalar kernel's M>X>Y tie-break and strict > — reproduces its bit-exact path.
+            // ── Local: argmax over this row, j ascending, reading the striped cells,
+            // with the scalar kernel's M>X>Y tie-break and strict > (bit-exact path) ──
             if constexpr (Local) {
                 for (int j = 1; j <= n; ++j) {
-                    const double mm = rM[j], xx = rX[j], yy = rY[j];
+                    const std::size_t k = scol(j);
+                    const double mm = cM[k], xx = cX[k], yy = cY[k];
                     const double here = std::max({mm, xx, yy});
                     if (here > best_local) {
                         best_local = here; best_i = i; best_j = j;
@@ -215,8 +215,6 @@ static void striped_affine_full(ViterbiJob& job) {
                     }
                 }
             }
-
-            std::swap(pM, cM); std::swap(pX, cX); std::swap(pY, cY);
         }
         bM = nbM; bX = nbX; bY = K_NINF;
     }
@@ -225,14 +223,18 @@ static void striped_affine_full(ViterbiJob& job) {
         job.score = best_local;
         job.best_i = best_i; job.best_j = best_j; job.best_tbl = best_tbl;
     } else {
-        const double fm = buf.VM[(std::size_t)m * stride + n];
-        const double fx = buf.VX[(std::size_t)m * stride + n];
-        const double fy = buf.VY[(std::size_t)m * stride + n];
+        // final cell (m, n), striped; column 0 (slot 0) when n == 0 (empty B)
+        const std::size_t fn = (n == 0) ? 0 : 1 + scol(n);
+        const double fm = buf.VM[(std::size_t)m * rowsz + fn];
+        const double fx = buf.VX[(std::size_t)m * rowsz + fn];
+        const double fy = buf.VY[(std::size_t)m * rowsz + fn];
         job.score = std::max({fm, fx, fy});
         job.best_i = m; job.best_j = n;
         job.best_tbl = (fm >= fx && fm >= fy) ? 0 : ((fx >= fy) ? 1 : 2);
     }
-    job.table_layout = 0;   // row-major (de-striped)
+    job.table_layout = 1;   // striped (seg/width below tell the traceback how to index)
+    job.seg = seg;
+    job.width = W;
 }
 
 // The registered entry for a level: dispatch Full by mode.  GuideBanded is not handled

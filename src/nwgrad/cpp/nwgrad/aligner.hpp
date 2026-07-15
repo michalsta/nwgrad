@@ -281,6 +281,7 @@ struct Aligner {
     void compute_forward_back(DpBuffer& buf) {
         check_problem();
         ensure_fwdbwd_buf(buf);  // Grow if needed (allows implicit growth from size 0)
+        tables_striped_ = false; // F/B are always row-major, even after a striped Viterbi
         if constexpr (GM == GapModel::Linear) fwdbwd_linear(buf);
         else                                   fwdbwd_affine(buf);
         any_fwdbwd_done_ = true;
@@ -304,6 +305,18 @@ struct Aligner {
         else                                   hard_grad_affine(buf, grad);
     }
 
+    // Introspection / testing: copy a DP table into canonical (m+1)×(n+1) row-major
+    // order, reading through the current layout (de-stripes when the simd Full kernel
+    // left it striped).  Used by the bit-exactness test to compare across layouts.
+    std::vector<double> to_row_major(const std::vector<double>& t) const {
+        const size_t rm_stride = static_cast<size_t>(n_) + 1;
+        std::vector<double> out(static_cast<size_t>(m_ + 1) * rm_stride);
+        for (int i = 0; i <= m_; ++i)
+            for (int j = 0; j <= n_; ++j)
+                out[static_cast<size_t>(i) * rm_stride + j] = rat(t, i, j);
+        return out;
+    }
+
     void soft_grad(const DpBuffer& buf, AlignParams& grad) const {
         if constexpr (GM == GapModel::Linear) soft_grad_linear(buf, grad);
         else                                   soft_grad_affine(buf, grad);
@@ -324,6 +337,16 @@ private:
     int                 m_ = 0, n_ = 0;
     size_t              stride_ = 0, sz_ = 0;
     std::vector<int>    guide_j_;  // used only when AB == GuideBanded
+
+    // ── Striped table layout ──────────────────────────────────────────────────
+    // The leveled simd Viterbi (affine Full) writes VM/VX/VY in Farrar striped layout
+    // to skip a per-row de-stripe copy.  When tables_striped_ is set, rat/at index those
+    // tables striped (cell_index); every row-major fill clears it.  striped_seg_ and
+    // striped_w_ come straight from the kernel (ViterbiJob.seg / .width); a striped row
+    // is striped_seg_*striped_w_ + 1 doubles, slot 0 being column 0.
+    bool   tables_striped_ = false;
+    int    striped_seg_    = 0;
+    int    striped_w_      = 1;
 
     DpKernel kernel_ = DpKernel::Scalar;  // which Viterbi fills the tables
 
@@ -419,11 +442,26 @@ private:
     }
 
     // ── Cell accessors ────────────────────────────────────────────────────────
+    // Every table access in the DP, the tracebacks and the gradient goes through these,
+    // so switching VM/VX/VY between row-major and striped is a change to cell_index alone.
+    // Striped layout MUST match the kernel in kernels_impl.inl: row size striped_seg_*
+    // striped_w_ + 1, slot 0 = column 0, column j (1..n) at 1 + ((j-1)%seg)*W + (j-1)/seg.
+    size_t cell_index(int i, int j) const noexcept {
+        if (tables_striped_) {
+            const size_t rowsz = static_cast<size_t>(striped_seg_) * striped_w_ + 1;
+            if (j == 0) return static_cast<size_t>(i) * rowsz;
+            const int jj = j - 1;
+            return static_cast<size_t>(i) * rowsz + 1 +
+                   static_cast<size_t>(jj % striped_seg_) * striped_w_ +
+                   static_cast<size_t>(jj / striped_seg_);
+        }
+        return static_cast<size_t>(i) * stride_ + static_cast<size_t>(j);
+    }
     double& at(std::vector<double>& t, int i, int j) const {
-        return t[static_cast<size_t>(i) * stride_ + static_cast<size_t>(j)];
+        return t[cell_index(i, j)];
     }
     double rat(const std::vector<double>& t, int i, int j) const {
-        return t[static_cast<size_t>(i) * stride_ + static_cast<size_t>(j)];
+        return t[cell_index(i, j)];
     }
 
     // ── Substitution lookup (the DP hot path) ─────────────────────────────────
@@ -645,6 +683,9 @@ private:
     // remains a legal request for a linear aligner; it simply returns the fastest
     // linear kernel there is, which is the scalar one.
     void run_viterbi(DpBuffer& buf) {
+        // Default to row-major; only the striped Full kernel (run_dispatched_affine) flips
+        // this back on.  Every other fill here writes VM/VX/VY row-major.
+        tables_striped_ = false;
         if constexpr (GM == GapModel::Linear) {
             viterbi_linear(buf);
         } else if (kernel_ == DpKernel::Simd) {
@@ -666,8 +707,8 @@ private:
     }
 
     // Build a plain ViterbiJob from Aligner state, run the dispatched (leveled) kernel,
-    // and copy its scalar results back.  The kernel fills buf.VM/VX/VY row-major
-    // (de-striped), so the traceback / hard_grad read the layout they expect.
+    // and copy its scalar results back.  The kernel fills buf.VM/VX/VY in STRIPED layout
+    // (table_layout == 1) and reports seg/width; rat/at then read them striped.
     void run_dispatched_affine(DpBuffer& buf, const LevelKernels& K) {
         ViterbiJob job{};
         job.a = a_idx_.data(); job.m = m_;
@@ -680,6 +721,13 @@ private:
         job.guide_j = nullptr; job.guide_len = 0;
         job.buf = &buf;
         K.viterbi(job);
+        // Adopt the layout the kernel produced (striped for the Full striped kernel).
+        if (job.table_layout == 1) {
+            tables_striped_ = true;
+            striped_seg_ = job.seg; striped_w_ = job.width;
+        } else {
+            tables_striped_ = false;
+        }
         viterbi_score_ = job.score;
         best_i_ = job.best_i; best_j_ = job.best_j;
         best_tbl_ = (job.best_tbl == 0) ? TBTable::M
