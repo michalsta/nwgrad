@@ -821,7 +821,8 @@ NB_MODULE(nwgrad_ext, m) {
                nb::object params_obj,
                const std::string& gap_model,
                const std::string& mode,
-               const std::string& grad_mode) {
+               const std::string& grad_mode,
+               const std::string& kernel) {
                 SeqPairBatch& self = nb::cast<SeqPairBatch&>(self_obj);
                 const AlignParams& params = nb::cast<const AlignParams&>(params_obj);
                 GapModel  gm = (gap_model == "affine") ? GapModel::Affine : GapModel::Linear;
@@ -830,11 +831,12 @@ NB_MODULE(nwgrad_ext, m) {
                 if      (grad_mode == "hard") gd = GradMode::Hard;
                 else if (grad_mode == "soft") gd = GradMode::Soft;
                 else                          gd = GradMode::None;
+                DpKernel  kn = parse_kernel(kernel);
 
                 // The string_views point into the argument lists' str objects.
                 // We hold the GIL throughout — add_many()'s workers touch no
                 // Python — so nothing can free or move them mid-call.
-                self.add_many(seqs_a, seqs_b, params, gm, am, gd);
+                self.add_many(seqs_a, seqs_b, params, gm, am, gd, kn);
 
                 // These pairs are owned by C++ and hold a bare pointer to
                 // `params`, and unlike a hand-built SeqPair none of them holds a
@@ -855,6 +857,7 @@ NB_MODULE(nwgrad_ext, m) {
             nb::arg("gap_model") = "affine",
             nb::arg("mode")      = "global",
             nb::arg("grad_mode") = "hard",
+            nb::arg("kernel")    = "scalar",
             "Bulk-construct N SeqPairs in C++ and append them to the batch.\n"
             "\n"
             "Equivalent to constructing each SeqPair in Python and calling add()\n"

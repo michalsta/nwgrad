@@ -65,7 +65,8 @@ struct SeqPairBatch {
     void add_many(const std::vector<std::string_view>& seqs_a,
                   const std::vector<std::string_view>& seqs_b,
                   const AlignParams& params,
-                  GapModel gm, AlignMode am, GradMode gd) {
+                  GapModel gm, AlignMode am, GradMode gd,
+                  DpKernel kernel = DpKernel::Scalar) {
         if (seqs_a.size() != seqs_b.size())
             throw std::invalid_argument(
                 "nwgrad: add_many() needs seqs_a and seqs_b of equal length (got " +
@@ -97,7 +98,7 @@ struct SeqPairBatch {
                 size_t i = idx.fetch_add(1, std::memory_order_relaxed);
                 if (i >= N) break;
                 staged[i] = std::make_unique<SeqPair>(seqs_a[i], seqs_b[i],
-                                                      params, gm, am, gd);
+                                                      params, gm, am, gd, kernel);
             }
         };
         run_workers(N, worker);

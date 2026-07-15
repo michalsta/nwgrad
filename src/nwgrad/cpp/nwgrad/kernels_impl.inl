@@ -10,11 +10,10 @@
 // (ViterbiJob) and uses std::simd on locals only.  Distinct native width per level
 // keeps the std::simd instantiations from COMDAT-folding across the level TUs.
 //
-// First cut: the striped kernel covers affine Global + Full (the hot path).  Local-Full
-// and GuideBanded fall through to the row-wise kernel (levelled the same way, added in
-// kernels_rowwise below).  The striped forward writes rolling striped rows and
-// de-stripes each finished row into the row-major VM/VX/VY, so the traceback/hard_grad
-// read the layout they already expect.
+// The striped kernel covers affine Full (Global + Local — Local adds M-clamp-to-0 and
+// an argmax).  GuideBanded still falls through to the row-wise kernel.  The striped
+// forward writes rolling striped rows and de-stripes each finished row into the
+// row-major VM/VX/VY, so the traceback/hard_grad read the layout they already expect.
 
 #ifndef NWGRAD_LEVEL_NS
 #  error "kernels_impl.inl must be included inside a level namespace by a level TU"
@@ -24,8 +23,9 @@ using vd = stdx::native_simd<double>;
 static constexpr int KW = (int)vd::size();     // native lane count for this level
 static constexpr double K_NINF = -std::numeric_limits<double>::infinity();
 
-// ── striped affine forward, Global + Full ─────────────────────────────────────
-static void striped_affine_global_full(ViterbiJob& job) {
+// ── striped affine forward, Full (Global if !Local, else Local) ───────────────
+template <bool Local>
+static void striped_affine_full(ViterbiJob& job) {
     const int m = job.m, n = job.n, W = KW;
     const int nalpha = job.nalpha;
     const double go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;
@@ -60,111 +60,153 @@ static void striped_affine_global_full(ViterbiJob& job) {
     double* cX = buf.srows.data() + 4 * sw; double* cY = buf.srows.data() + 5 * sw;
     double* ov = buf.sopenv.data();
 
-    // row 0 (previous row for i=1): VM/VX = NINF, VY = the Y-gap-open series, striped.
+    // row 0 (previous row for i=1), striped.  Global: VM=NINF, VY=Y-gap-open series.
+    // Local: VM=0 everywhere (an alignment may start anywhere), VX=VY=NINF.
     for (std::size_t k = 0; k < sw; ++k) { pM[k] = K_NINF; pX[k] = K_NINF; pY[k] = K_NINF; }
     for (int l = 0; l < W; ++l)
         for (int s = 0; s < seg; ++s) {
             const int j = l * seg + s + 1;
-            if (j <= n) pY[(std::size_t)s * W + l] = -(go_a + j * ge_a);
+            if (j <= n) {
+                if constexpr (Local) pM[(std::size_t)s * W + l] = 0.0;
+                else                 pY[(std::size_t)s * W + l] = -(go_a + j * ge_a);
+            }
         }
     // row 0 in the row-major output
     {
         double* r0M = buf.VM.data(); double* r0X = buf.VX.data(); double* r0Y = buf.VY.data();
-        r0M[0] = 0.0; r0X[0] = K_NINF; r0Y[0] = K_NINF;
-        for (int j = 1; j <= n; ++j) { r0M[j] = K_NINF; r0X[j] = K_NINF; r0Y[j] = -(go_a + j * ge_a); }
+        if constexpr (Local) {
+            for (int j = 0; j <= n; ++j) { r0M[j] = 0.0; r0X[j] = K_NINF; r0Y[j] = K_NINF; }
+        } else {
+            r0M[0] = 0.0; r0X[0] = K_NINF; r0Y[0] = K_NINF;
+            for (int j = 1; j <= n; ++j) { r0M[j] = K_NINF; r0X[j] = K_NINF; r0Y[j] = -(go_a + j * ge_a); }
+        }
     }
 
     const vd vgo_a(go_a), vge_a(ge_a), vgo_b(go_b), vge_b(ge_b);
-    double bM = 0.0, bX = K_NINF, bY = K_NINF;   // column-0 border of the previous row
+    const vd vzero(0.0);
+    // column-0 border of the previous row
+    double bM = Local ? 0.0 : 0.0, bX = K_NINF, bY = K_NINF;
+
+    double best_local = 0.0; int best_i = 0, best_j = 0, best_tbl = 0;
 
     for (int i = 1; i <= m; ++i) {
-        const double nbX = -(go_b + i * ge_b);   // column-0 border of this row
-        const double nbOpen = (nbX - go_a) - ge_a;
+        // column-0 border of this row
+        const double nbM = Local ? 0.0 : K_NINF;
+        const double nbX = Local ? K_NINF : -(go_b + i * ge_b);
+        const double nbOpen = (std::max(nbM, nbX) - go_a) - ge_a;
         const double* sub = buf.sprof.data() + (std::size_t)a[i - 1] * sw;
 
-        // ── carry-free: VM (diagonal), VX (same column) ──
-        for (int s = 0; s < seg; ++s) {
-            vd dM, dX, dY;
-            if (s == 0) {                              // segment boundary: shift + border
-                vd lM, lX, lY;
-                lM.copy_from(pM + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                lX.copy_from(pX + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                lY.copy_from(pY + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                dM = vd([&](int q) { return q == 0 ? bM : lM[q - 1]; });
-                dX = vd([&](int q) { return q == 0 ? bX : lX[q - 1]; });
-                dY = vd([&](int q) { return q == 0 ? bY : lY[q - 1]; });
-            } else {
-                dM.copy_from(pM + (std::size_t)(s - 1) * W, stdx::element_aligned);
-                dX.copy_from(pX + (std::size_t)(s - 1) * W, stdx::element_aligned);
-                dY.copy_from(pY + (std::size_t)(s - 1) * W, stdx::element_aligned);
-            }
-            vd sb; sb.copy_from(sub + (std::size_t)s * W, stdx::element_aligned);
-            vd vmv = stdx::max(stdx::max(dM, dX), dY) + sb;
-            vmv.copy_to(cM + (std::size_t)s * W, stdx::element_aligned);
-
-            vd uM, uX, uY;
-            uM.copy_from(pM + (std::size_t)s * W, stdx::element_aligned);
-            uX.copy_from(pX + (std::size_t)s * W, stdx::element_aligned);
-            uY.copy_from(pY + (std::size_t)s * W, stdx::element_aligned);
-            vd vxv = stdx::max(stdx::max((uM - vgo_b) - vge_b, uX - vge_b), (uY - vgo_b) - vge_b);
-            vxv.copy_to(cX + (std::size_t)s * W, stdx::element_aligned);
-            ((stdx::max(vmv, vxv) - vgo_a) - vge_a).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
-        }
-
-        // ── the carry: VY, same-lane striped chain + lazy-F ──
-        vd prev([&](int q) { return q == 0 ? bY : K_NINF; });
-        for (int s = 0; s < seg; ++s) {
-            vd O;
-            if (s == 0) {
-                vd lo; lo.copy_from(ov + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                O = vd([&](int q) { return q == 0 ? nbOpen : lo[q - 1]; });
-            } else {
-                O.copy_from(ov + (std::size_t)(s - 1) * W, stdx::element_aligned);
-            }
-            vd v = stdx::max(O, prev - vge_a);
-            v.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
-            prev = v;
-        }
-        for (int r = 0; seg > 0 && r < W; ++r) {   // seg==0 (empty B): no columns, no carry
-            vd last; last.copy_from(cY + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-            vd F([&](int q) { return q == 0 ? bY : last[q - 1]; });
-            F = F - vge_a;
-            bool changed = false;
-            for (int s = 0; s < seg; ++s) {
-                vd v; v.copy_from(cY + (std::size_t)s * W, stdx::element_aligned);
-                if (!stdx::any_of(F > v)) break;
-                v = stdx::max(v, F);
-                v.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
-                F = v - vge_a;
-                changed = true;
-            }
-            if (!changed) break;
-        }
-
-        // ── de-stripe this row into row-major VM/VX/VY ──
         double* rM = buf.VM.data() + (std::size_t)i * stride;
         double* rX = buf.VX.data() + (std::size_t)i * stride;
         double* rY = buf.VY.data() + (std::size_t)i * stride;
-        rM[0] = K_NINF; rX[0] = nbX; rY[0] = K_NINF;
-        for (int l = 0; l < W; ++l)
+        rM[0] = nbM; rX[0] = nbX; rY[0] = K_NINF;
+
+        if (seg > 0) {
+            // ── carry-free: VM (diagonal, clamped to 0 for Local), VX (same column) ──
             for (int s = 0; s < seg; ++s) {
-                const int j = l * seg + s + 1;
-                if (j <= n) {
-                    const std::size_t k = (std::size_t)s * W + l;
-                    rM[j] = cM[k]; rX[j] = cX[k]; rY[j] = cY[k];
+                vd dM, dX, dY;
+                if (s == 0) {
+                    vd lM, lX, lY;
+                    lM.copy_from(pM + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                    lX.copy_from(pX + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                    lY.copy_from(pY + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                    dM = vd([&](int q) { return q == 0 ? bM : lM[q - 1]; });
+                    dX = vd([&](int q) { return q == 0 ? bX : lX[q - 1]; });
+                    dY = vd([&](int q) { return q == 0 ? bY : lY[q - 1]; });
+                } else {
+                    dM.copy_from(pM + (std::size_t)(s - 1) * W, stdx::element_aligned);
+                    dX.copy_from(pX + (std::size_t)(s - 1) * W, stdx::element_aligned);
+                    dY.copy_from(pY + (std::size_t)(s - 1) * W, stdx::element_aligned);
+                }
+                vd sb; sb.copy_from(sub + (std::size_t)s * W, stdx::element_aligned);
+                vd vmv = stdx::max(stdx::max(dM, dX), dY) + sb;
+                if constexpr (Local) vmv = stdx::max(vmv, vzero);
+                vmv.copy_to(cM + (std::size_t)s * W, stdx::element_aligned);
+
+                vd uM, uX, uY;
+                uM.copy_from(pM + (std::size_t)s * W, stdx::element_aligned);
+                uX.copy_from(pX + (std::size_t)s * W, stdx::element_aligned);
+                uY.copy_from(pY + (std::size_t)s * W, stdx::element_aligned);
+                vd vxv = stdx::max(stdx::max((uM - vgo_b) - vge_b, uX - vge_b), (uY - vgo_b) - vge_b);
+                vxv.copy_to(cX + (std::size_t)s * W, stdx::element_aligned);
+                ((stdx::max(vmv, vxv) - vgo_a) - vge_a).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
+            }
+
+            // ── the carry: VY, same-lane striped chain + lazy-F ──
+            vd prev([&](int q) { return q == 0 ? bY : K_NINF; });
+            for (int s = 0; s < seg; ++s) {
+                vd O;
+                if (s == 0) {
+                    vd lo; lo.copy_from(ov + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                    O = vd([&](int q) { return q == 0 ? nbOpen : lo[q - 1]; });
+                } else {
+                    O.copy_from(ov + (std::size_t)(s - 1) * W, stdx::element_aligned);
+                }
+                vd v = stdx::max(O, prev - vge_a);
+                v.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
+                prev = v;
+            }
+            for (int r = 0; r < W; ++r) {
+                vd last; last.copy_from(cY + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                vd F([&](int q) { return q == 0 ? bY : last[q - 1]; });
+                F = F - vge_a;
+                bool changed = false;
+                for (int s = 0; s < seg; ++s) {
+                    vd v; v.copy_from(cY + (std::size_t)s * W, stdx::element_aligned);
+                    if (!stdx::any_of(F > v)) break;
+                    v = stdx::max(v, F);
+                    v.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
+                    F = v - vge_a;
+                    changed = true;
+                }
+                if (!changed) break;
+            }
+
+            // ── de-stripe this row into row-major VM/VX/VY ──
+            for (int l = 0; l < W; ++l)
+                for (int s = 0; s < seg; ++s) {
+                    const int j = l * seg + s + 1;
+                    if (j <= n) {
+                        const std::size_t k = (std::size_t)s * W + l;
+                        rM[j] = cM[k]; rX[j] = cX[k]; rY[j] = cY[k];
+                    }
+                }
+
+            // ── Local: argmax over this row, in row-major (j ascending) order with the
+            // scalar kernel's M>X>Y tie-break and strict > — reproduces its bit-exact path.
+            if constexpr (Local) {
+                for (int j = 1; j <= n; ++j) {
+                    const double mm = rM[j], xx = rX[j], yy = rY[j];
+                    const double here = std::max({mm, xx, yy});
+                    if (here > best_local) {
+                        best_local = here; best_i = i; best_j = j;
+                        best_tbl = (mm >= xx && mm >= yy) ? 0 : ((xx >= yy) ? 1 : 2);
+                    }
                 }
             }
 
-        std::swap(pM, cM); std::swap(pX, cX); std::swap(pY, cY);
-        bM = K_NINF; bX = nbX; bY = K_NINF;
+            std::swap(pM, cM); std::swap(pX, cX); std::swap(pY, cY);
+        }
+        bM = nbM; bX = nbX; bY = K_NINF;
     }
 
-    // Global result at (m, n), read from the row-major tables.
-    const double fm = buf.VM[(std::size_t)m * stride + n];
-    const double fx = buf.VX[(std::size_t)m * stride + n];
-    const double fy = buf.VY[(std::size_t)m * stride + n];
-    job.score = std::max({fm, fx, fy});
-    job.best_i = m; job.best_j = n;
-    job.best_tbl = (fm >= fx && fm >= fy) ? 0 : ((fx >= fy) ? 1 : 2);
+    if constexpr (Local) {
+        job.score = best_local;
+        job.best_i = best_i; job.best_j = best_j; job.best_tbl = best_tbl;
+    } else {
+        const double fm = buf.VM[(std::size_t)m * stride + n];
+        const double fx = buf.VX[(std::size_t)m * stride + n];
+        const double fy = buf.VY[(std::size_t)m * stride + n];
+        job.score = std::max({fm, fx, fy});
+        job.best_i = m; job.best_j = n;
+        job.best_tbl = (fm >= fx && fm >= fy) ? 0 : ((fx >= fy) ? 1 : 2);
+    }
     job.table_layout = 0;   // row-major (de-striped)
+}
+
+// The registered entry for a level: dispatch Full by mode.  GuideBanded is not handled
+// here (the caller routes it to the row-wise kernel).
+static void striped_full_entry(ViterbiJob& job) {
+    if (job.align_mode) striped_affine_full<true>(job);
+    else                striped_affine_full<false>(job);
 }

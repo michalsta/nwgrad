@@ -31,7 +31,7 @@ namespace {
 struct NwgradLevelRegistrar {
     NwgradLevelRegistrar() {
         LevelKernels k;
-        k.viterbi = &NWGRAD_LVL_NAME::striped_affine_global_full;   // Global+Full (first cut)
+        k.viterbi = &NWGRAD_LVL_NAME::striped_full_entry;   // affine Full: Global + Local
         register_level(NWGRAD_LVL_ENUM, k);
     }
 };

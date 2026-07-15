@@ -648,12 +648,12 @@ private:
         if constexpr (GM == GapModel::Linear) {
             viterbi_linear(buf);
         } else if (kernel_ == DpKernel::Simd) {
-            // Affine + Global + Full: use the fastest kernel — the leveled striped one,
-            // dispatched to the active ISA level.  If no level TU is linked (header-only
-            // single-level build) or the case is Local/GuideBanded, fall back to the
-            // always-present row-wise viterbi_affine_simd.  Both are bit-exact, so
+            // Affine + Full (Global or Local): use the fastest kernel — the leveled
+            // striped one, dispatched to the active ISA level.  If no level TU is linked
+            // (header-only single-level build) or the case is GuideBanded, fall back to
+            // the always-present row-wise viterbi_affine_simd.  Both are bit-exact, so
             // kernel="simd" behaves identically; only the speed differs.
-            if constexpr (AM == AlignMode::Global && AB == AlignBand::Full) {
+            if constexpr (AB == AlignBand::Full) {
                 const LevelKernels& K = active_kernels();
                 if (K.viterbi) { run_dispatched_affine(buf, K); return; }
             }
@@ -673,7 +673,8 @@ private:
         job.blk = blk_;        job.nalpha = nalpha_;
         job.go_a = params_->gap_open_a; job.ge_a = params_->gap_extend_a;
         job.go_b = params_->gap_open_b; job.ge_b = params_->gap_extend_b;
-        job.align_mode = 0; job.align_band = 0; job.band = 0;
+        job.align_mode = (AM == AlignMode::Local) ? 1 : 0;
+        job.align_band = 0; job.band = 0;
         job.guide_j = nullptr; job.guide_len = 0;
         job.buf = &buf;
         K.viterbi(job);
