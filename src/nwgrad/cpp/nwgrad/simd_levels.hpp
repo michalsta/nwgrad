@@ -119,8 +119,27 @@ struct ViterbiJob {
 
 using viterbi_fn = void (*)(ViterbiJob&);
 
+// Row-wise leaf kernels for the GuideBanded path.  viterbi_affine_simd (in
+// aligner_simd.hpp) owns the banded indexing and hands each of these one row's
+// worth of contiguous slices; they are the vectorized inner loops, compiled once
+// per level with that level's real -march.  Plain-typed, so they obey the ODR rule
+// (no std::simd crosses the boundary).  See aligner_simd.hpp for the bodies.
+using row_mx_fn = void (*)(double* __restrict, double* __restrict,
+                           const double* __restrict, const double* __restrict,
+                           const double* __restrict, const double* __restrict,
+                           int, int, double, double);
+using row_y_fn  = void (*)(double* __restrict, const double* __restrict,
+                           const double* __restrict, int, int, double, double);
+using row_m3_fn = double (*)(const double* __restrict, const double* __restrict,
+                             const double* __restrict, int, int);
+
 struct LevelKernels {
-    viterbi_fn viterbi = nullptr;
+    viterbi_fn viterbi = nullptr;        // striped affine Full (Global + Local)
+    row_mx_fn  row_mx_global = nullptr;  // row-wise banded leaf kernels ↓
+    row_mx_fn  row_mx_local  = nullptr;
+    row_y_fn   row_y  = nullptr;
+    row_m3_fn  row_m3 = nullptr;
+    int        row_block = 0;            // columns per interleaved block (per-µarch)
 };
 
 // One slot per possible level; index by (int)SimdLevel.  Populated by the level TUs'
@@ -130,9 +149,17 @@ inline LevelKernels* level_table() {
     return tbl;
 }
 
-inline void register_level(SimdLevel l, const LevelKernels& k) {
-    level_table()[(int)l] = k;
-}
+// Register a level's kernels.  Deliberately takes the pointers *individually*, not a
+// LevelKernels by value, and is defined out-of-line in simd_levels.cpp — which is
+// compiled at the x86-64 baseline.  Both facts are load-bearing: the level TUs are
+// compiled with -mavx512 etc. and their registrars run at static init on EVERY CPU,
+// so any code they emit must be baseline-legal.  If they built a LevelKernels locally,
+// GCC would zero-init its 56 bytes with an AVX512 GPR-broadcast (vpbroadcastd) and the
+// program would SIGILL at load on a non-AVX512 box.  Passing bare pointers keeps the
+// registrar to scalar `lea`s; the struct is assembled and stored here, in baseline code.
+void register_level(SimdLevel l, viterbi_fn viterbi,
+                    row_mx_fn row_mx_global, row_mx_fn row_mx_local,
+                    row_y_fn row_y, row_m3_fn row_m3, int row_block);
 
 // ── The active selection ──────────────────────────────────────────────────────
 //

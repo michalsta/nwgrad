@@ -33,7 +33,7 @@ def seq(rng, length):
 
 
 def test_simd_isa_is_reported():
-    assert nwgrad.simd_isa() in ("baseline", "avx", "avx2", "avx512")
+    assert nwgrad.simd_isa() in ("baseline", "avx2", "avx512", "neon")
 
 
 def test_bad_kernel_name_raises():

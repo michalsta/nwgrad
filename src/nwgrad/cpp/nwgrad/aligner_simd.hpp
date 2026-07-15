@@ -61,6 +61,17 @@
 // existing test suite is a valid verification of this file.  tests/cpp/test_simd_bitexact.cpp
 // asserts the tables bit-for-bit; if it ever fails, this reasoning is wrong and the
 // kernel is not safe to ship.
+//
+//
+// HOW THE ISA IS CHOSEN (there is now only one mechanism)
+//
+// The vectorized code is compiled once per instruction-set *level*, each level in
+// its own translation unit with that level's real -march flag (see simd_levels.hpp
+// and the level_*.cpp TUs).  This file holds no #pragma GCC target machinery and no
+// second ISA probe: the striped Full kernel and the row-wise GuideBanded leaf
+// kernels both come from the one LevelKernels table, resolved once by active_level()
+// and overridable via set_isa_level / NWGRAD_ISA.  A header-only consumer who links
+// no level TU gets nullptr kernels and falls back to the scalar path (run_viterbi).
 
 #ifndef NWGRAD_ALIGNER_HPP_INCLUDED
 #  error "aligner_simd.hpp is included from aligner.hpp; do not include it directly"
@@ -68,221 +79,13 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <cstdlib>
 #include <limits>
-#include <string>
 #include <vector>
 
+#include "simd_levels.hpp"
+
 namespace nwgrad_simd {
-
 inline constexpr double NEG_INF = -std::numeric_limits<double>::infinity();
-
-// ── Row kernels, stamped once per instruction set ─────────────────────────────
-//
-// The bodies live in macros, not in templates, so that each one can be *defined*
-// inside a `#pragma GCC target(...)` region — which is the only way to get the
-// compiler to emit AVX2 or AVX-512 for code in a header that must still load on a
-// CPU that has neither.  The same restructured C++ is compiled three or four times;
-// the compiler writes the vectors.  No intrinsic is hand-written anywhere.
-//
-// Selection is a function-pointer table, resolved once, NOT __attribute__((target_clones)).
-// target_clones needs GNU ifunc, which musl and macOS do not have, and would break the
-// musllinux and macOS wheels cibuildwheel already builds.  A plain table needs no ifunc
-// and works on GCC and Clang across Linux, macOS and musl alike.  The indirect call
-// costs a few cycles *per row*, against a row of hundreds of cells — it does not show up.
-//
-// On AArch64 none of this exists: NEON is mandatory baseline, so the kernels simply
-// vectorize where they stand and the table has exactly one entry.  MSVC has no such
-// pragma and likewise takes the single baseline entry.
-//
-// Bit-exactness survives the wider ISAs because the bodies contain only max, add and
-// subtract on doubles — every one of which is IEEE-exact at any width.  There is no
-// `a*b+c` anywhere, so there is nothing for FMA contraction to fuse and nothing for it
-// to round differently.  test_simd_bitexact.cpp checks this against whatever ISA the
-// running CPU selects, so CI on an AVX2 runner tests the AVX2 clone.
-
-// The multi-ISA machinery needs `#pragma GCC target`, which is GCC/Clang on x86 only.
-// Everywhere else — MSVC, and every AArch64 including Apple Silicon — the table has a
-// single entry and the kernels simply vectorize at whatever the target's baseline is.
-// On AArch64 that is NEON, which is mandatory, so Apple Silicon gets the full benefit
-// with none of this scaffolding.
-//
-// -DNWGRAD_NO_MULTIVERSION forces that single-entry path on a machine that could have
-// used the table.  It is not decoration: it is the only way to *compile and run* the
-// MSVC/AArch64 code path on a Linux x86 box, and an untested fallback path is how a
-// header-only library breaks on a platform nobody owns.
-#if !defined(NWGRAD_NO_MULTIVERSION) && \
-    defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
-#  define NWGRAD_X86_MULTIVERSION 1
-#endif
-
-// Columns per interleaved block; see the loop in viterbi_affine_simd.  The right value
-// is a property of the *microarchitecture*, not of the algorithm, so it rides in the
-// dispatch table alongside the kernels rather than being a compile-time constant — the
-// same binary must serve both.  Measured with stress_batch (the real library binary; a
-// microbenchmark gave code-layout artifacts larger than the effect):
-//
-//                        Opteron 6380 (SSE2)   i5-12500 (AVX2)
-//     unblocked                 1.33x                1.28x
-//     block =  64               1.17x                1.44x
-//     block = 128               1.27x                1.33x
-//     block = 256               1.36x                1.29x
-//
-// A narrow, shallow core wants long vector runs; a wide one wants short blocks, so that
-// block k+1's carry-free half can issue underneath block k's serial VY latency chain.
-// Guessing one number for both costs ~10% on whichever machine loses the coin toss.
-// NWGRAD_ROW_BLOCK overrides it for re-tuning on new hardware.
-#ifdef NWGRAD_ROW_BLOCK
-inline constexpr int BLOCK_BASELINE = NWGRAD_ROW_BLOCK;
-inline constexpr int BLOCK_WIDE     = NWGRAD_ROW_BLOCK;
-#else
-inline constexpr int BLOCK_BASELINE = 256;  // SSE2 / NEON / old cores
-inline constexpr int BLOCK_WIDE     = 64;   // AVX2+ implies a deep out-of-order window
-#endif
-
-// Parameter lists, shared between the definitions and the function-pointer types.
-#define NWGRAD_MX_ARGS                                                          \
-    double* __restrict vm_cur,       double* __restrict vx_cur,                 \
-    const double* __restrict vm_prev, const double* __restrict vx_prev,         \
-    const double* __restrict vy_prev, const double* __restrict subrow,          \
-    int lo, int hi, double go_b, double ge_b
-#define NWGRAD_Y_ARGS                                                           \
-    double* __restrict vy_cur,                                                  \
-    const double* __restrict vm_cur, const double* __restrict vx_cur,           \
-    int lo, int hi, double go_a, double ge_a
-#define NWGRAD_M3_ARGS                                                          \
-    const double* __restrict a, const double* __restrict b,                     \
-    const double* __restrict c, int lo, int hi
-
-// Affine, carry-free half: VM and VX read only row i-1, so they have no loop-carried
-// dependency at all and the whole row goes to the vector unit.  LOCAL is a 0/1 literal
-// the compiler folds away.
-//
-// The two subtractions in the X state are kept LEFT-ASSOCIATED — `(v - go_b) - ge_b`,
-// never `v - (go_b + ge_b)`.  Folding them would round differently and break the
-// bit-exactness the tracebacks depend on.
-#define NWGRAD_BODY_MX(LOCAL)                                                   \
-    for (int j = lo; j <= hi; ++j) {                                            \
-        double d = vm_prev[j - 1];                                              \
-        d = std::max(d, vx_prev[j - 1]);                                        \
-        d = std::max(d, vy_prev[j - 1]);                                        \
-        double mv = d + subrow[j];                                              \
-        if (LOCAL) mv = std::max(mv, 0.0);                                      \
-        double x = (vm_prev[j] - go_b) - ge_b;                                  \
-        x = std::max(x, vx_prev[j] - ge_b);                                     \
-        x = std::max(x, (vy_prev[j] - go_b) - ge_b);                            \
-        vm_cur[j] = mv;                                                         \
-        vx_cur[j] = x;                                                          \
-    }
-
-// Affine, the carry.  VY reads VM/VX of the *current* row at j-1 — already written
-// above, and independent of VY — plus its own left neighbour.  That last term is the
-// serial dependency no vectorizer can break, and it is deliberately left scalar.
-//
-// This is Farrar's lazy-F in exact form: one `- ge_a` per propagation step, the same
-// chain the scalar loop walks, hence a bit-identical fixpoint rather than a close one.
-#define NWGRAD_BODY_Y                                                           \
-    for (int j = lo; j <= hi; ++j) {                                            \
-        double open = (std::max(vm_cur[j - 1], vx_cur[j - 1]) - go_a) - ge_a;   \
-        vy_cur[j] = std::max(open, vy_cur[j - 1] - ge_a);                       \
-    }
-
-// Row maximum of max3(VM,VX,VY): a pure reduction.  Local mode needs an *argmax*, but
-// an argmax inside the DP loop blocks vectorization, so it is hoisted out — reduce
-// first, and rescan for the index only when the row actually beats the running best.
-#define NWGRAD_BODY_M3                                                          \
-    double best = NEG_INF;                                                      \
-    for (int j = lo; j <= hi; ++j)                                              \
-        best = std::max(best, std::max(a[j], std::max(b[j], c[j])));            \
-    return best;
-
-#define NWGRAD_STAMP(NS)                                                        \
-    namespace NS {                                                              \
-        inline void row_mx_global(NWGRAD_MX_ARGS) noexcept { NWGRAD_BODY_MX(0) } \
-        inline void row_mx_local (NWGRAD_MX_ARGS) noexcept { NWGRAD_BODY_MX(1) } \
-        inline void row_y        (NWGRAD_Y_ARGS)  noexcept { NWGRAD_BODY_Y }    \
-        inline double row_m3     (NWGRAD_M3_ARGS) noexcept { NWGRAD_BODY_M3 }   \
-    }
-
-// Whatever -march the translation unit was compiled with.  On AArch64 this is NEON;
-// on shipped x86 wheels it is the x86-64 baseline, i.e. SSE2.
-NWGRAD_STAMP(isa_baseline)
-
-#ifdef NWGRAD_X86_MULTIVERSION
-#  pragma GCC push_options
-#  pragma GCC target("avx")
-     NWGRAD_STAMP(isa_avx)
-#  pragma GCC pop_options
-
-#  pragma GCC push_options
-#  pragma GCC target("avx2,fma")
-     NWGRAD_STAMP(isa_avx2)
-#  pragma GCC pop_options
-
-#  pragma GCC push_options
-#  pragma GCC target("avx512f,avx512dq,avx512vl,avx512bw")
-     NWGRAD_STAMP(isa_avx512)
-#  pragma GCC pop_options
-#endif
-
-// ── The dispatch table ────────────────────────────────────────────────────────
-
-struct RowKernels {
-    void   (*mx_global)(NWGRAD_MX_ARGS);
-    void   (*mx_local) (NWGRAD_MX_ARGS);
-    void   (*y)        (NWGRAD_Y_ARGS);
-    double (*m3)       (NWGRAD_M3_ARGS);
-    const char* isa;
-    int    block;      // columns per interleaved block; see BLOCK_* above
-};
-
-#define NWGRAD_TABLE(NS, NAME, BLK) \
-    RowKernels{ &NS::row_mx_global, &NS::row_mx_local, &NS::row_y, &NS::row_m3, NAME, BLK }
-
-// NWGRAD_ISA overrides the CPU probe.  This is not a debugging afterthought: without
-// it the AVX-512 path would be unreachable on a machine that lacks it and therefore
-// untestable, and — more usefully — it is what lets a benchmark compare ISA levels on
-// one machine instead of guessing.  An unsupported request falls back rather than
-// crashing with SIGILL.
-inline RowKernels select_row_kernels() {
-#ifdef NWGRAD_X86_MULTIVERSION
-    __builtin_cpu_init();
-    const char* want = std::getenv("NWGRAD_ISA");
-    const bool has_avx    = __builtin_cpu_supports("avx");
-    const bool has_avx2   = __builtin_cpu_supports("avx2");
-    const bool has_avx512 = __builtin_cpu_supports("avx512f")
-                         && __builtin_cpu_supports("avx512vl")
-                         && __builtin_cpu_supports("avx512dq");
-
-    if (want) {
-        std::string w(want);
-        if (w == "baseline")                  return NWGRAD_TABLE(isa_baseline, "baseline", BLOCK_BASELINE);
-        if (w == "avx"    && has_avx)         return NWGRAD_TABLE(isa_avx,      "avx",      BLOCK_BASELINE);
-        if (w == "avx2"   && has_avx2)        return NWGRAD_TABLE(isa_avx2,     "avx2",     BLOCK_WIDE);
-        if (w == "avx512" && has_avx512)      return NWGRAD_TABLE(isa_avx512,   "avx512",   BLOCK_WIDE);
-        // Asked for something this CPU cannot run: fall through to the probe.
-    }
-
-    if (has_avx512) return NWGRAD_TABLE(isa_avx512, "avx512", BLOCK_WIDE);
-    if (has_avx2)   return NWGRAD_TABLE(isa_avx2,   "avx2",   BLOCK_WIDE);
-    // Deliberately NOT selecting plain AVX by default.  It is a measured regression on
-    // Bulldozer/Piledriver, whose FP unit cracks every 256-bit op into two 128-bit
-    // halves — so the wider registers buy nothing and cost extra uops.  AVX without
-    // AVX2 essentially means that family.  Reachable via NWGRAD_ISA=avx if you want to
-    // measure it; not chosen for you.
-#endif
-    return NWGRAD_TABLE(isa_baseline, "baseline", BLOCK_BASELINE);
-}
-
-// Resolved once, on first use.  A function-local static is thread-safe since C++11,
-// which matters: the batch workers all reach this concurrently.
-inline const RowKernels& row_kernels() {
-    static const RowKernels k = select_row_kernels();
-    return k;
-}
-
-inline const char* active_isa() { return row_kernels().isa; }
-
 }  // namespace nwgrad_simd
 
 
@@ -374,17 +177,22 @@ const double* Aligner<GM, AM, AB>::subrow(DpBuffer& buf, int i, int lo, int hi) 
 // compile.  DpKernel::Simd stays a legal request for a linear aligner — it simply
 // returns the fastest linear kernel that exists, which is the scalar one.
 // ═════════════════════════════════════════════════════════════════════════════
-// Viterbi (Simd) — Affine gap model
+// Viterbi (Simd) — Affine gap model, GuideBanded (and Full fallback)
 // ═════════════════════════════════════════════════════════════════════════════
 //
 // The affine model vectorizes *better* than the linear one, which is not obvious.
 // Two of its three tables (VM, VX) read only row i-1 and so are entirely carry-free;
 // only VY carries.  That is roughly three quarters of the per-cell work handed to the
 // vector unit, against only two thirds in the linear case.
-
+//
+// This function owns the banded indexing (band_fill / at / rat / jlo / jhi / stride_);
+// the vectorized inner loops are the leaf kernels in the LevelKernels table, compiled
+// per ISA level.  Full-band Global+Local is served by the faster striped kernel
+// (run_dispatched_affine); this path is taken for GuideBanded, and as the Full
+// fallback should the striped kernel ever be absent.
 template<GapModel GM, AlignMode AM, AlignBand AB>
-void Aligner<GM, AM, AB>::viterbi_affine_simd(DpBuffer& buf) {
-    using namespace nwgrad_simd;
+void Aligner<GM, AM, AB>::viterbi_affine_simd(DpBuffer& buf, const LevelKernels& K) {
+    using nwgrad_simd::NEG_INF;
 
     band_fill(buf.VM, NEG_INF);
     band_fill(buf.VX, NEG_INF);
@@ -409,10 +217,6 @@ void Aligner<GM, AM, AB>::viterbi_affine_simd(DpBuffer& buf) {
 
     best_i_ = 0; best_j_ = 0; best_tbl_ = TBTable::M;
     double best_local = 0.0;
-
-    // Resolved once per DP, not once per row: an indirect call per row is nothing
-    // against a row of hundreds of cells.
-    const RowKernels& K = row_kernels();
 
     for (int i = 1; i <= m_; ++i) {
         const int lo = jlo(i), hi = jhi(i);
@@ -442,18 +246,18 @@ void Aligner<GM, AM, AB>::viterbi_affine_simd(DpBuffer& buf) {
         // is independent of block k's carry and can issue underneath it, while each half
         // is still long enough to vectorize.  Bit-exactness is untouched — same
         // operations, same order; VY[base] reads VM/VX[base-1] from the block just done.
-        const int blk = K.block;
+        const int blk = K.row_block;
         for (int base = lo; base <= hi; base += blk) {
             const int end = std::min(base + blk - 1, hi);
             if constexpr (AM == AlignMode::Local)
-                K.mx_local (vm_cur, vx_cur, vm_prev, vx_prev, vy_prev, sr, base, end, go_b, ge_b);
+                K.row_mx_local (vm_cur, vx_cur, vm_prev, vx_prev, vy_prev, sr, base, end, go_b, ge_b);
             else
-                K.mx_global(vm_cur, vx_cur, vm_prev, vx_prev, vy_prev, sr, base, end, go_b, ge_b);
-            K.y(vy_cur, vm_cur, vx_cur, base, end, go_a, ge_a);
+                K.row_mx_global(vm_cur, vx_cur, vm_prev, vx_prev, vy_prev, sr, base, end, go_b, ge_b);
+            K.row_y(vy_cur, vm_cur, vx_cur, base, end, go_a, ge_a);
         }
 
         if constexpr (AM == AlignMode::Local) {
-            if (K.m3(vm_cur, vx_cur, vy_cur, lo, hi) > best_local) {
+            if (K.row_m3(vm_cur, vx_cur, vy_cur, lo, hi) > best_local) {
                 for (int j = lo; j <= hi; ++j) {
                     const double mv = vm_cur[j], xv = vx_cur[j], yv = vy_cur[j];
                     const double best_here = std::max(mv, std::max(xv, yv));

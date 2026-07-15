@@ -18,8 +18,12 @@ set(CMAKE_CXX_STANDARD 20)
 # libstdc++ (Apple libc++ / MSVC do not ship <experimental/simd>).
 set(NWGRAD_LEVEL_DIR src/nwgrad/cpp/nwgrad)
 set(NWGRAD_LEVEL_SOURCES "")
+# register_level lives in simd_levels.cpp, compiled at the plain baseline (no wide
+# flags below touch it): its struct build/store runs at static init on every CPU, so
+# it must be baseline-legal code.  See the note in simd_levels.hpp.
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
     set(NWGRAD_LEVEL_SOURCES
+        ${NWGRAD_LEVEL_DIR}/simd_levels.cpp
         ${NWGRAD_LEVEL_DIR}/level_baseline.cpp
         ${NWGRAD_LEVEL_DIR}/level_avx2.cpp
         ${NWGRAD_LEVEL_DIR}/level_avx512.cpp)
@@ -30,7 +34,9 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
         COMPILE_OPTIONS "-mavx512f;-mavx512dq;-mavx512vl;-mavx512bw")
 elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
     # NEON is mandatory baseline on AArch64 — one level, no runtime dispatch.
-    set(NWGRAD_LEVEL_SOURCES ${NWGRAD_LEVEL_DIR}/level_neon.cpp)
+    set(NWGRAD_LEVEL_SOURCES
+        ${NWGRAD_LEVEL_DIR}/simd_levels.cpp
+        ${NWGRAD_LEVEL_DIR}/level_neon.cpp)
 endif()
 
 nanobind_add_module(nwgrad_ext

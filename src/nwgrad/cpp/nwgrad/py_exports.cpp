@@ -292,21 +292,24 @@ NB_MODULE(nwgrad_ext, m) {
         .def("__isub__", [](AlignParams& a, const AlignParams& b) -> AlignParams& { a -= b; return a; },
              nb::rv_policy::reference);
 
-    // ── Guide alignment utility ──────────────────────────────────────────────
+    // ── SIMD ISA reporting ────────────────────────────────────────────────────
+    // A stable alias for get_isa_level(): both report the one ISA level that now
+    // drives every simd kernel (striped Full and row-wise banded alike).
     m.def(
         "simd_isa",
-        []() { return std::string(nwgrad_simd::active_isa()); },
-        "Which instruction set the simd Viterbi kernel selected on this CPU:\n"
-        "\"baseline\" | \"avx\" | \"avx2\" | \"avx512\".\n"
+        []() { return get_isa_level(); },
+        "Which instruction set the simd Viterbi kernels are dispatched to on this\n"
+        "CPU: \"baseline\" | \"avx2\" | \"avx512\" (x86) or \"neon\" (AArch64).  An alias\n"
+        "for get_isa_level().\n"
         "\n"
         "Worth checking before you conclude the simd kernel did not help.  Prebuilt\n"
         "wheels are compiled for the x86-64 baseline, so \"baseline\" means SSE2 —\n"
         "two doubles per vector.  A modern CPU should report \"avx2\" or better.\n"
         "\n"
-        "Plain \"avx\" is never selected automatically: it is a measured regression on\n"
-        "Bulldozer/Piledriver, whose FP unit splits every 256-bit operation into two\n"
-        "128-bit halves.  Set NWGRAD_ISA=baseline|avx|avx2|avx512 to override the\n"
-        "probe (an ISA this CPU cannot run falls back rather than crashing).");
+        "Plain \"avx\" is never selected: it is a measured regression on Bulldozer/\n"
+        "Piledriver, whose FP unit splits every 256-bit operation into two 128-bit\n"
+        "halves, so AVX-only CPUs run the baseline level.  Set NWGRAD_ISA, or call\n"
+        "set_isa_level(), to force a level (one the CPU cannot run falls back).");
 
     // ── Per-ISA-level dispatch for the striped affine kernel ──────────────────
     m.def("available_isa_levels", []() { return available_isa_levels(); },

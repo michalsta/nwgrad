@@ -648,16 +648,18 @@ private:
         if constexpr (GM == GapModel::Linear) {
             viterbi_linear(buf);
         } else if (kernel_ == DpKernel::Simd) {
-            // Affine + Full (Global or Local): use the fastest kernel — the leveled
-            // striped one, dispatched to the active ISA level.  If no level TU is linked
-            // (header-only single-level build) or the case is GuideBanded, fall back to
-            // the always-present row-wise viterbi_affine_simd.  Both are bit-exact, so
-            // kernel="simd" behaves identically; only the speed differs.
+            // One ISA table, resolved once, serves both simd kernels.  Full (Global or
+            // Local) takes the faster striped kernel; GuideBanded takes the row-wise
+            // one, whose vectorized leaf loops come from the same table.  Both are
+            // bit-exact against the scalar path, so kernel="simd" only changes speed.
+            // If no level TU is linked (header-only single-level build), every pointer
+            // in the table is null and we fall through to the scalar Viterbi.
+            const LevelKernels& K = active_kernels();
             if constexpr (AB == AlignBand::Full) {
-                const LevelKernels& K = active_kernels();
                 if (K.viterbi) { run_dispatched_affine(buf, K); return; }
             }
-            viterbi_affine_simd(buf);
+            if (K.row_mx_local) { viterbi_affine_simd(buf, K); return; }
+            viterbi_affine(buf);
         } else {
             viterbi_affine(buf);
         }
@@ -688,9 +690,9 @@ private:
     //
     // Declared here, defined there, and that header is included at the bottom of
     // this one so both are always visible at the point of instantiation.  The
-    // vectorization machinery (query profile, lazy-F, ISA dispatch) stays out of
-    // this file entirely.
-    void viterbi_affine_simd(DpBuffer& buf);
+    // vectorization machinery (query profile, lazy-F) stays out of this file
+    // entirely; K supplies the row-wise leaf kernels for the active ISA level.
+    void viterbi_affine_simd(DpBuffer& buf, const LevelKernels& K);
 
     // Substitution scores for row i, contiguous in j over [lo, hi] — a vector
     // load, not a gather.  Full mode serves a slice of the prebuilt query

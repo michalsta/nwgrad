@@ -23,16 +23,26 @@ namespace stdx = std::experimental;
 
 #define NWGRAD_LEVEL_NS NWGRAD_LVL_NAME
 namespace NWGRAD_LVL_NAME {
-#include "kernels_impl.inl"
+#include "kernels_impl.inl"       // striped affine Full kernel (defines KW)
+#include "row_kernel_impl.inl"    // row-wise banded leaf kernels (uses KW)
 }
 #undef NWGRAD_LEVEL_NS
 
 namespace {
 struct NwgradLevelRegistrar {
     NwgradLevelRegistrar() {
-        LevelKernels k;
-        k.viterbi = &NWGRAD_LVL_NAME::striped_full_entry;   // affine Full: Global + Local
-        register_level(NWGRAD_LVL_ENUM, k);
+        // Pass bare function addresses (scalar `lea`s), never a locally-built
+        // LevelKernels: this constructor runs at static init on every CPU, and in a
+        // -mavx512 TU a local struct zero-init would emit an AVX512 broadcast that
+        // SIGILLs on non-AVX512 hardware.  register_level assembles the struct in
+        // baseline code (simd_levels.cpp).
+        register_level(NWGRAD_LVL_ENUM,
+                       &NWGRAD_LVL_NAME::striped_full_entry,  // affine Full: Global + Local
+                       &NWGRAD_LVL_NAME::row_mx_global,       // affine GuideBanded: row-wise ↓
+                       &NWGRAD_LVL_NAME::row_mx_local,
+                       &NWGRAD_LVL_NAME::row_y,
+                       &NWGRAD_LVL_NAME::row_m3,
+                       NWGRAD_LVL_NAME::ROW_BLOCK);
     }
 };
 const NwgradLevelRegistrar nwgrad_level_registrar_instance;

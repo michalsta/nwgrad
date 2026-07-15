@@ -1,0 +1,24 @@
+// ── register_level: the one place the LevelKernels struct is assembled ─────────
+//
+// Compiled at the x86-64 baseline (no -mavx2/-mavx512), unlike the level_*.cpp TUs.
+// This is deliberate and load-bearing: the level TUs' static registrars call this at
+// load on EVERY CPU, so the 56-byte struct build + store must be baseline-legal code.
+// Were this inline in the header, it would be compiled into each level TU with that
+// TU's -march and could emit an AVX512 broadcast (vpbroadcastd) for the zero-init —
+// which SIGILLs at load on a CPU without AVX512.  See the note on the declaration in
+// simd_levels.hpp.
+
+#include "simd_levels.hpp"
+
+void register_level(SimdLevel l, viterbi_fn viterbi,
+                    row_mx_fn row_mx_global, row_mx_fn row_mx_local,
+                    row_y_fn row_y, row_m3_fn row_m3, int row_block) {
+    LevelKernels k;
+    k.viterbi       = viterbi;
+    k.row_mx_global = row_mx_global;
+    k.row_mx_local  = row_mx_local;
+    k.row_y         = row_y;
+    k.row_m3        = row_m3;
+    k.row_block     = row_block;
+    level_table()[(int)l] = k;
+}
