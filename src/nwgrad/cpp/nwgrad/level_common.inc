@@ -18,6 +18,13 @@ namespace stdx = std::experimental;
 #include <array>
 #include <limits>
 
+// For the AVX-512 mask-op workaround in kernels_impl.inl (clang + libstdc++ std::simd
+// bug).  Guarded identically to the workaround, and at global scope — intrinsics must
+// not be pulled into a namespace.  See the long note at that site.
+#if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
+#  include <immintrin.h>
+#endif
+
 #include "dp_buffer.hpp"
 #include "simd_levels.hpp"
 

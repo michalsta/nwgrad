@@ -153,7 +153,38 @@ static void striped_affine_full(ViterbiJob& job) {
                 bool changed = false;
                 for (int s = 0; s < seg; ++s) {
                     vd v; v.copy_from(cY + (std::size_t)s * W, stdx::element_aligned);
+                    // Lazy-F early-exit: stop once no lane of F exceeds v.  This is the
+                    // ONLY std::simd *mask* operation in the whole kernel, and libstdc++'s
+                    // <experimental/simd> fails to COMPILE it under clang at AVX-512 width.
+                    // Its 512-bit mask path (_MaskImplX86Mixin::_S_to_bits) asserts the
+                    // vector's 64-bit integer lane type equals __int_for_sizeof_t<8> ==
+                    // `long` (GCC's canonical 8-byte int), but clang canonicalizes that
+                    // lane as `long long`, so `static_assert(is_same_v<long long, long>)`
+                    // fires (experimental/bits/simd_x86.h:4232).  The `long` vs `long long`
+                    // choice is a fixed property of each compiler's type model, so it
+                    // reproduces on clang 18-22 / libstdc++ 13-15 and no version bump or
+                    // flag clears it (-fgnuc-version= only breaks the build elsewhere).
+                    // Only this mask path is affected — every other op here (max/+/-/loads)
+                    // compiles under clang — so we swap just this predicate for the
+                    // equivalent AVX-512 intrinsic, and only in a clang AVX-512 TU.
+                    // Bit-exact: `_CMP_GT_OQ` gives the same per-lane result as std::simd's
+                    // ordered `>` (NaN compares false either way), and this is only an
+                    // early-exit gate — `v = max(v, F)` below is unchanged, so at worst it
+                    // iterates once more and re-applies an idempotent max.  If a future
+                    // clang compiles the std::simd form, build with
+                    // -DNWGRAD_STD_SIMD_AVX512_MASK_OK to force it back (or delete this #if).
+#if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
+                    {
+                        alignas(64) double fa[8], va[8];
+                        F.copy_to(fa, stdx::element_aligned);
+                        v.copy_to(va, stdx::element_aligned);
+                        if (_mm512_cmp_pd_mask(_mm512_load_pd(fa),
+                                               _mm512_load_pd(va), _CMP_GT_OQ) == 0)
+                            break;
+                    }
+#else
                     if (!stdx::any_of(F > v)) break;
+#endif
                     v = stdx::max(v, F);
                     v.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
                     F = v - vge_a;

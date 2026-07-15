@@ -66,8 +66,10 @@ import subprocess
 import sys
 import time
 
-# The ISA levels the dispatch table knows about, weakest first.
-ISA_LEVELS = ["baseline", "avx", "avx2", "avx512"]
+# The ISA levels the dispatch table knows about, weakest first.  "neon" is the sole
+# AArch64 level (mandatory baseline, no dispatch); the x86 levels never appear there and
+# vice versa, so probing all of them and keeping whatever answers is harmless.
+ISA_LEVELS = ["baseline", "avx", "avx2", "avx512", "neon"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -117,13 +119,13 @@ def worker(args):
     params = nwgrad.AlignParams(BLOSUM62, args.gap_open, args.gap_extend,
                                 args.gap_open, args.gap_extend)
 
-    def aligner(kernel, threads):
-        return nwgrad.BatchAligner(params, band=0, gap_model=args.gap_model,
+    def aligner(kernel, threads, band):
+        return nwgrad.BatchAligner(params, band=band, gap_model=args.gap_model,
                                    mode=args.mode, grad_mode=args.grad_mode,
                                    n_threads=threads, kernel=kernel)
 
-    def time_once(kernel, threads, sa, sb):
-        al = aligner(kernel, threads)
+    def time_once(kernel, threads, band, sa, sb):
+        al = aligner(kernel, threads, band)
         t0 = time.perf_counter()
         res = al.align(sa, sb)
         return time.perf_counter() - t0, res
@@ -131,14 +133,20 @@ def worker(args):
     pool = SeqPool(args.seq_len, args.seed)
 
     out = []
-    for threads in args.threads:
+    # band selects WHICH simd kernel is exercised, and they are different code:
+    #   band == 0  -> striped, whole-row kernel (AlignBand::Full)
+    #   band  > 0  -> row-wise banded kernel    (AlignBand::GuideBanded, auto diagonal
+    #                 guide), the leaf loops dispatched through the leveled ISA table.
+    # Both are bit-exact against scalar; sweeping band covers the whole dispatched surface.
+    for band in args.band:
+      for threads in args.threads:
         # Auto-size the batch so one measurement is long enough to mean anything.
         # A 30ms run on a many-core NUMA box measures scheduling jitter, not the DP —
         # that mistake is what made the simd win look like it "evaporated at 60 threads".
         n = 256
         while True:
             sa, sb = pool.take(n)
-            dt, _ = time_once("scalar", threads, sa, sb)
+            dt, _ = time_once("scalar", threads, band, sa, sb)
             if dt >= args.min_time or n >= args.max_n:
                 break
             grow = max(2.0, min(8.0, args.min_time / max(dt, 1e-4)))
@@ -156,13 +164,13 @@ def worker(args):
         # Warm up every arm before timing any of them: first touch of the DP tables
         # takes page faults that would otherwise be billed entirely to whoever ran first.
         for a in arms:
-            time_once(kern[a], threads, sa, sb)
+            time_once(kern[a], threads, band, sa, sb)
 
         # Interleaved, minimum-of-repeats.  Drift hits all arms equally; interference
         # only ever adds time, so the minimum is the robust estimator.
         for _ in range(args.repeats):
             for a in arms:
-                dt, res = time_once(kern[a], threads, sa, sb)
+                dt, res = time_once(kern[a], threads, band, sa, sb)
                 best[a] = min(best[a], dt)
                 results[a] = res
 
@@ -176,9 +184,17 @@ def worker(args):
             mg = results["simd"].grad.matrix.to_matrix().tobytes()
             exact = exact and (sg == mg)
 
-        cells = n * (args.seq_len + 1) ** 2
+        # Cells actually computed: the full square for band 0, a diagonal stripe of
+        # width min(2*band+1, n+1) per row otherwise.  Getting this right keeps the
+        # Mcell/s numbers comparable between the Full and banded arms.
+        if band > 0:
+            width = min(2 * band + 1, args.seq_len + 1)
+            cells = n * (args.seq_len + 1) * width
+        else:
+            cells = n * (args.seq_len + 1) ** 2
         out.append({
             "isa": isa,
+            "band": band,
             "threads": threads,
             "n": n,
             "scalar_s": best["scalar"],
@@ -233,6 +249,7 @@ def run_isa(isa, args):
            "--gap-open", str(args.gap_open), "--gap-extend", str(args.gap_extend),
            "--repeats", str(args.repeats), "--min-time", str(args.min_time),
            "--max-n", str(args.max_n), "--seed", str(args.seed),
+           "--band", *[str(b) for b in args.band],
            "--threads", *[str(t) for t in args.threads]]
     proc = subprocess.run(cmd, env=env, capture_output=True, text=True)
     if proc.returncode != 0:
@@ -259,6 +276,9 @@ def main():
         description="Benchmark the scalar vs simd Viterbi kernels across ISA levels.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("--seq-len", type=int, default=200)
+    p.add_argument("--band", type=int, nargs="+", default=[0],
+                   help="band half-widths to sweep. 0 = striped Full kernel; "
+                        ">0 = row-wise banded kernel (auto diagonal guide)")
     p.add_argument("--threads", type=int, nargs="+", default=None,
                    help="thread counts to sweep (default: 1 and all cores)")
     p.add_argument("--gap-model", default="affine", choices=["affine", "linear"],
@@ -319,13 +339,14 @@ def main():
     print()
 
     # ── table ────────────────────────────────────────────────────────────────
-    hdr = (f"  {'ISA':<9} {'thr':>4} {'batch':>7} "
+    hdr = (f"  {'ISA':<9} {'band':>5} {'thr':>4} {'batch':>7} "
            f"{'scalar':>12} {'simd':>12} {'speedup':>8}  {'control':>8}  {'exact':<5}")
     print(hdr)
     print("  " + "-" * (len(hdr) - 2))
     for r in rows:
         warn = "" if 0.97 <= r["control_ratio"] <= 1.03 else "  <-- SUSPECT"
-        print(f"  {r['isa']:<9} {r['threads']:>4} {r['n']:>7} "
+        kind = "Full" if r["band"] == 0 else str(r["band"])
+        print(f"  {r['isa']:<9} {kind:>5} {r['threads']:>4} {r['n']:>7} "
               f"{r['scalar_pairs_s']:>9,.0f}/s {r['simd_pairs_s']:>9,.0f}/s "
               f"{r['speedup']:>7.2f}x  {r['control_ratio']:>7.2f}x  "
               f"{'yes' if r['exact'] else 'NO!!':<5}{warn}")

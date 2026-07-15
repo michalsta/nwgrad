@@ -5,7 +5,7 @@ from .nwgrad_ext import (
     NCBI_PROTEIN, IUPAC_DNA,
     SubstMatrix, AlignParams,
     guide_j_from_aligned,
-    simd_isa,
+    simd_isa, compiled_with,
     available_isa_levels, get_isa_level, set_isa_level,
     nw_score, sw_score, nw_score_affine, sw_score_affine,
     nw_grad, sw_grad, nw_affine_grad, sw_affine_grad,

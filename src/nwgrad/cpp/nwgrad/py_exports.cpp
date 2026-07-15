@@ -20,6 +20,26 @@ namespace nb = nanobind;
 using nb_arr_f64    = nb::ndarray<double, nb::ndim<2>, nb::c_contig, nb::device::cpu>;
 using nb_arr_f64_1d = nb::ndarray<nb::numpy, double, nb::ndim<1>>;
 
+// The compiler that built this extension, captured at compile time.  Exposed as
+// nwgrad.compiled_with() — a reliable way to tell which toolchain produced the loaded
+// binary (the .comment ELF section is stripped by some clang builds, and matters here
+// because gcc and clang differ measurably on the std::simd kernels).
+#if defined(__clang__)
+#  if defined(__apple_build_version__)
+#    define NWGRAD_COMPILER "Apple clang " __clang_version__
+#  else
+#    define NWGRAD_COMPILER "clang " __clang_version__
+#  endif
+#elif defined(__GNUC__)
+#  define NWGRAD_COMPILER "gcc " __VERSION__
+#elif defined(_MSC_VER)
+#  define NWGRAD_STR2(x) #x
+#  define NWGRAD_STR(x) NWGRAD_STR2(x)
+#  define NWGRAD_COMPILER "msvc " NWGRAD_STR(_MSC_VER)
+#else
+#  define NWGRAD_COMPILER "unknown"
+#endif
+
 // ── Aligner factory: picks Full or GuideBanded at runtime. ───────────────────
 
 // "scalar" (default) | "simd".  The two Viterbi kernels write bit-identical tables,
@@ -291,6 +311,15 @@ NB_MODULE(nwgrad_ext, m) {
         .def("__sub__",  [](const AlignParams& a, const AlignParams& b) { return a - b; })
         .def("__isub__", [](AlignParams& a, const AlignParams& b) -> AlignParams& { a -= b; return a; },
              nb::rv_policy::reference);
+
+    // ── Build provenance ──────────────────────────────────────────────────────
+    m.def(
+        "compiled_with",
+        []() { return std::string(NWGRAD_COMPILER); },
+        "The compiler and version that built this extension, e.g. \"gcc 15.2.1\" or\n"
+        "\"clang 18.1.3\".  Captured at compile time; the reliable way to tell which\n"
+        "toolchain produced the loaded binary (gcc and clang differ measurably on the\n"
+        "std::simd kernels, and clang strips the ELF .comment that would otherwise say).");
 
     // ── SIMD ISA reporting ────────────────────────────────────────────────────
     // A stable alias for get_isa_level(): both report the one ISA level that now
