@@ -308,6 +308,21 @@ NB_MODULE(nwgrad_ext, m) {
         "128-bit halves.  Set NWGRAD_ISA=baseline|avx|avx2|avx512 to override the\n"
         "probe (an ISA this CPU cannot run falls back rather than crashing).");
 
+    // ── Per-ISA-level dispatch for the striped affine kernel ──────────────────
+    m.def("available_isa_levels", []() { return available_isa_levels(); },
+          "The ISA levels this CPU can actually run, weakest first "
+          "(e.g. [\"baseline\", \"avx2\"]).");
+    m.def("get_isa_level", []() { return get_isa_level(); },
+          "The ISA level the striped affine kernel is currently dispatched to.");
+    m.def("set_isa_level", [](const std::string& name) { set_isa_level(name); },
+          nb::arg("level"),
+          "Force the striped kernel's ISA level (for testing).  You may force any\n"
+          "level the CPU supports — forcing *down* (e.g. \"baseline\" on an AVX2 box)\n"
+          "is how a level's bit-exactness is checked on capable hardware.  Forcing a\n"
+          "level the CPU cannot run raises ValueError (it would SIGILL).  NOT\n"
+          "thread-safe to change while work is in flight — set it before dispatching.\n"
+          "NWGRAD_ISA=<level> does the same before the module loads.");
+
     m.def(
         "guide_j_from_aligned",
         [](const std::string& a_aligned, const std::string& b_aligned) {

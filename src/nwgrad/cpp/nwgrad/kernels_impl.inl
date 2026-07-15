@@ -125,7 +125,7 @@ static void striped_affine_global_full(ViterbiJob& job) {
             v.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
             prev = v;
         }
-        for (int r = 0; r < W; ++r) {
+        for (int r = 0; seg > 0 && r < W; ++r) {   // seg==0 (empty B): no columns, no carry
             vd last; last.copy_from(cY + (std::size_t)(seg - 1) * W, stdx::element_aligned);
             vd F([&](int q) { return q == 0 ? bY : last[q - 1]; });
             F = F - vge_a;

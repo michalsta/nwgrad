@@ -71,43 +71,12 @@ static inline double lse3(double a, double b, double c) noexcept {
     return lse2(lse2(a, b), c);
 }
 
-// ── DpBuffer ──────────────────────────────────────────────────────────────────
-//
-// Holds all DP table vectors for one Aligner computation.
-// Lives either inside the Aligner (own_buf_) or externally (e.g. per-thread).
-// Vectors grow on demand and are never implicitly freed; call clear() to release.
+// DpBuffer (the DP table storage) now lives in its own header so the leveled kernel
+// TUs can include it without the whole Aligner.
+#include "dp_buffer.hpp"
 
-struct DpBuffer {
-    std::vector<double> H;                        // linear viterbi
-    std::vector<double> VM, VX, VY;               // affine viterbi
-    std::vector<double> F, B;                     // linear forward-backward
-    std::vector<double> FM, FX, FY, BM, BX, BY;  // affine forward-backward
-
-    // Used only by the Simd kernel.  `prof` is the query profile — the
-    // substitution scores of every alphabet symbol against sequence B, laid out
-    // contiguously in j so the DP row loop loads them with a vector load instead
-    // of a gather (Full mode).  `subbuf` is the per-row equivalent for banded
-    // mode, where a full-width profile would cost more than the banded DP itself.
-    std::vector<double> prof, subbuf;
-
-    // Used only by the striped affine kernel (leveled, in kernels_impl.inl).  It runs
-    // on rolling striped rows and de-stripes each finished row into the row-major
-    // VM/VX/VY above, so the traceback and hard_grad read the layout they expect and
-    // the existing tests validate it unchanged.  srows = 6 rolling rows
-    // {VM,VX,VY}×{prev,cur} in striped seg×W layout; sopenv = one striped openv row;
-    // sprof = the query profile in striped order.  All O(n), not O(m·n).
-    std::vector<double> srows, sopenv, sprof;
-
-    void clear() noexcept {
-        auto clr = [](std::vector<double>& v) noexcept { v.clear(); v.shrink_to_fit(); };
-        clr(H);
-        clr(VM); clr(VX); clr(VY);
-        clr(F);  clr(B);
-        clr(FM); clr(FX); clr(FY); clr(BM); clr(BX); clr(BY);
-        clr(prof); clr(subbuf);
-        clr(srows); clr(sopenv); clr(sprof);
-    }
-};
+// Runtime per-ISA-level dispatch table for the leveled affine kernels.
+#include "simd_levels.hpp"
 
 // ── Aligner ───────────────────────────────────────────────────────────────────
 //
@@ -678,10 +647,40 @@ private:
     void run_viterbi(DpBuffer& buf) {
         if constexpr (GM == GapModel::Linear) {
             viterbi_linear(buf);
+        } else if (kernel_ == DpKernel::Simd) {
+            // Affine + Global + Full: use the fastest kernel — the leveled striped one,
+            // dispatched to the active ISA level.  If no level TU is linked (header-only
+            // single-level build) or the case is Local/GuideBanded, fall back to the
+            // always-present row-wise viterbi_affine_simd.  Both are bit-exact, so
+            // kernel="simd" behaves identically; only the speed differs.
+            if constexpr (AM == AlignMode::Global && AB == AlignBand::Full) {
+                const LevelKernels& K = active_kernels();
+                if (K.viterbi) { run_dispatched_affine(buf, K); return; }
+            }
+            viterbi_affine_simd(buf);
         } else {
-            if (kernel_ == DpKernel::Simd) viterbi_affine_simd(buf);
-            else                            viterbi_affine(buf);
+            viterbi_affine(buf);
         }
+    }
+
+    // Build a plain ViterbiJob from Aligner state, run the dispatched (leveled) kernel,
+    // and copy its scalar results back.  The kernel fills buf.VM/VX/VY row-major
+    // (de-striped), so the traceback / hard_grad read the layout they expect.
+    void run_dispatched_affine(DpBuffer& buf, const LevelKernels& K) {
+        ViterbiJob job{};
+        job.a = a_idx_.data(); job.m = m_;
+        job.b = b_idx_.data(); job.n = n_;
+        job.blk = blk_;        job.nalpha = nalpha_;
+        job.go_a = params_->gap_open_a; job.ge_a = params_->gap_extend_a;
+        job.go_b = params_->gap_open_b; job.ge_b = params_->gap_extend_b;
+        job.align_mode = 0; job.align_band = 0; job.band = 0;
+        job.guide_j = nullptr; job.guide_len = 0;
+        job.buf = &buf;
+        K.viterbi(job);
+        viterbi_score_ = job.score;
+        best_i_ = job.best_i; best_j_ = job.best_j;
+        best_tbl_ = (job.best_tbl == 0) ? TBTable::M
+                  : (job.best_tbl == 1) ? TBTable::X : TBTable::Y;
     }
 
     // ── Simd kernel — defined out-of-line in aligner_simd.hpp ─────────────────

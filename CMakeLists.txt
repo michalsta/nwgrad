@@ -8,9 +8,35 @@ find_package(nanobind REQUIRED CONFIG)
 
 set(CMAKE_CXX_STANDARD 20)
 
+# ── Per-ISA-level kernel TUs ──────────────────────────────────────────────────
+#
+# The affine Viterbi kernels are compiled once per instruction-set level, each in its
+# own TU with that level's real -march flag, so std::simd picks the right register
+# width (a #pragma cannot widen std::simd — its ABI is fixed at instantiation, so a
+# genuine compile flag defining __AVX2__ etc. is required).  The level TUs register
+# their kernels at load; the extension dispatches at runtime.  std::simd needs
+# libstdc++ (Apple libc++ / MSVC do not ship <experimental/simd>).
+set(NWGRAD_LEVEL_DIR src/nwgrad/cpp/nwgrad)
+set(NWGRAD_LEVEL_SOURCES "")
+if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
+    set(NWGRAD_LEVEL_SOURCES
+        ${NWGRAD_LEVEL_DIR}/level_baseline.cpp
+        ${NWGRAD_LEVEL_DIR}/level_avx2.cpp
+        ${NWGRAD_LEVEL_DIR}/level_avx512.cpp)
+    # baseline is the x86-64 default (SSE2); the wider levels get their flags per-file
+    set_source_files_properties(${NWGRAD_LEVEL_DIR}/level_avx2.cpp    PROPERTIES
+        COMPILE_OPTIONS "-mavx2;-mfma")
+    set_source_files_properties(${NWGRAD_LEVEL_DIR}/level_avx512.cpp  PROPERTIES
+        COMPILE_OPTIONS "-mavx512f;-mavx512dq;-mavx512vl;-mavx512bw")
+elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+    # NEON is mandatory baseline on AArch64 — one level, no runtime dispatch.
+    set(NWGRAD_LEVEL_SOURCES ${NWGRAD_LEVEL_DIR}/level_neon.cpp)
+endif()
+
 nanobind_add_module(nwgrad_ext
     NB_STATIC NOMINSIZE
-    src/nwgrad/cpp/nwgrad/py_exports.cpp)
+    src/nwgrad/cpp/nwgrad/py_exports.cpp
+    ${NWGRAD_LEVEL_SOURCES})
 
 # Add -Wall -Wextra for Unix-style compilers (GCC/Clang)
 if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
@@ -80,6 +106,7 @@ add_executable(nwgrad_tests
     tests/cpp/test_seq_pair.cpp
     tests/cpp/test_add_many.cpp
     tests/cpp/test_simd_bitexact.cpp
+    ${NWGRAD_LEVEL_SOURCES}   # per-ISA kernel TUs, so kernel="simd" exercises the dispatched striped path
 )
 target_include_directories(nwgrad_tests PRIVATE
     src/nwgrad/cpp/nwgrad
