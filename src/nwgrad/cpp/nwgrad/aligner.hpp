@@ -90,6 +90,14 @@ struct DpBuffer {
     // mode, where a full-width profile would cost more than the banded DP itself.
     std::vector<double> prof, subbuf;
 
+    // Used only by the striped affine kernel (leveled, in kernels_impl.inl).  It runs
+    // on rolling striped rows and de-stripes each finished row into the row-major
+    // VM/VX/VY above, so the traceback and hard_grad read the layout they expect and
+    // the existing tests validate it unchanged.  srows = 6 rolling rows
+    // {VM,VX,VY}×{prev,cur} in striped seg×W layout; sopenv = one striped openv row;
+    // sprof = the query profile in striped order.  All O(n), not O(m·n).
+    std::vector<double> srows, sopenv, sprof;
+
     void clear() noexcept {
         auto clr = [](std::vector<double>& v) noexcept { v.clear(); v.shrink_to_fit(); };
         clr(H);
@@ -97,6 +105,7 @@ struct DpBuffer {
         clr(F);  clr(B);
         clr(FM); clr(FX); clr(FY); clr(BM); clr(BX); clr(BY);
         clr(prof); clr(subbuf);
+        clr(srows); clr(sopenv); clr(sprof);
     }
 };
 
