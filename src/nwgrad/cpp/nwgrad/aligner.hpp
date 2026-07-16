@@ -308,7 +308,7 @@ struct Aligner {
     // Introspection / testing: copy a DP table into canonical (m+1)×(n+1) row-major
     // order, reading through the current layout (de-stripes when the simd Full kernel
     // left it striped).  Used by the bit-exactness test to compare across layouts.
-    std::vector<double> to_row_major(const std::vector<double>& t) const {
+    std::vector<double> to_row_major(const DVec& t) const {
         const size_t rm_stride = static_cast<size_t>(n_) + 1;
         std::vector<double> out(static_cast<size_t>(m_ + 1) * rm_stride);
         for (int i = 0; i <= m_; ++i)
@@ -448,19 +448,24 @@ private:
     // striped_w_ + 1, slot 0 = column 0, column j (1..n) at 1 + ((j-1)%seg)*W + (j-1)/seg.
     size_t cell_index(int i, int j) const noexcept {
         if (tables_striped_) {
-            const size_t rowsz = static_cast<size_t>(striped_seg_) * striped_w_ + 1;
+            // rowsz = (seg+1)*W: slot 0 is column 0, slots [W, W+seg*W) are the striped
+            // columns 1..n (started at W so every W-wide access lands on an aligned
+            // address, given the 64-byte-aligned allocator), slots 1..W-1 pad.  Column j
+            // is at W + ((j-1)%seg)*W + (j-1)/seg.  Must match kernels_impl.inl exactly.
+            const size_t W = static_cast<size_t>(striped_w_);
+            const size_t rowsz = (static_cast<size_t>(striped_seg_) + 1) * W;
             if (j == 0) return static_cast<size_t>(i) * rowsz;
             const int jj = j - 1;
-            return static_cast<size_t>(i) * rowsz + 1 +
-                   static_cast<size_t>(jj % striped_seg_) * striped_w_ +
+            return static_cast<size_t>(i) * rowsz + W +
+                   static_cast<size_t>(jj % striped_seg_) * W +
                    static_cast<size_t>(jj / striped_seg_);
         }
         return static_cast<size_t>(i) * stride_ + static_cast<size_t>(j);
     }
-    double& at(std::vector<double>& t, int i, int j) const {
+    double& at(DVec& t, int i, int j) const {
         return t[cell_index(i, j)];
     }
-    double rat(const std::vector<double>& t, int i, int j) const {
+    double rat(const DVec& t, int i, int j) const {
         return t[cell_index(i, j)];
     }
 
@@ -553,7 +558,7 @@ private:
 
     // GuideBanded: NEG_INF-fill only the band region (O(m·band)).  Full: no-op —
     // the linear forward tables need no pre-fill (every in-band cell is written).
-    void banded_fill(std::vector<double>& vec) const {
+    void banded_fill(DVec& vec) const {
         if constexpr (AB == AlignBand::GuideBanded) {
             for (int i = 0; i <= m_; ++i) {
                 int lo, hi; band_row_span(i, lo, hi);
@@ -565,7 +570,7 @@ private:
 
     // Fill `vec` with `value`.  Full: the whole (m+1)×(n+1) table.  GuideBanded:
     // only the band region (O(m·band)).
-    void band_fill(std::vector<double>& vec, double value) const {
+    void band_fill(DVec& vec, double value) const {
         if constexpr (AB == AlignBand::Full) {
             std::fill(vec.begin(), vec.begin() + static_cast<ptrdiff_t>(sz_), value);
         } else {

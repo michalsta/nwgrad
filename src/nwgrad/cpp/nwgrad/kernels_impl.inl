@@ -36,12 +36,15 @@ static void striped_affine_full(ViterbiJob& job) {
 
     const int seg = (n + W - 1) / W;
     const std::size_t sw = (std::size_t)seg * W;
-    // VM/VX/VY hold the tables in STRIPED layout — one row of rowsz = sw + 1 doubles per
-    // i, written in place, so the traceback/hard-gradient read them striped with no
-    // per-row de-stripe copy.  Slot 0 is column 0 (the gap border); slots 1..sw are the
-    // striped columns 1..n, column j at 1 + ((j-1)%seg)*W + (j-1)/seg.  aligner.hpp's
-    // cell_index() computes the identical index — the two must stay in lockstep.
-    const std::size_t rowsz = sw + 1;
+    // VM/VX/VY hold the tables in STRIPED layout — one row of rowsz = (seg+1)*W doubles
+    // per i, written in place, so the traceback/hard-gradient read them striped with no
+    // per-row de-stripe copy.  Slot 0 is column 0 (the gap border); slots [W, W+sw) are
+    // the striped columns 1..n (started at W so every W-wide access is aligned given the
+    // 64-byte allocator — see dp_buffer.hpp), column j at W + ((j-1)%seg)*W + (j-1)/seg;
+    // slots 1..W-1 pad.  aligner.hpp's cell_index() computes the identical index — the
+    // two must stay in lockstep.
+    const std::size_t rowsz = (std::size_t)(seg + 1) * W;
+    const std::size_t off   = (std::size_t)W;   // striped columns start here (col 0 at 0)
     if (buf.sopenv.size() < sw)     buf.sopenv.resize(sw);
     if (buf.sprof.size()  < (std::size_t)nalpha * sw) buf.sprof.resize((std::size_t)nalpha * sw);
     const std::size_t vsz = (std::size_t)(m + 1) * rowsz;
@@ -65,21 +68,21 @@ static void striped_affine_full(ViterbiJob& job) {
     double* ov = buf.sopenv.data();
 
     // ── row 0, written striped straight into the tables (slot 0 = column 0) ──
-    // This doubles as the previous row for i = 1 (read at buf.VM row 0 + 1).  Global:
+    // This doubles as the previous row for i = 1 (read at buf.VM row 0 + off).  Global:
     // VM = NINF, VY = the Y-gap-open series; Local: VM = 0 everywhere.
     {
         double* z0M = buf.VM.data(); double* z0X = buf.VX.data(); double* z0Y = buf.VY.data();
         z0M[0] = 0.0; z0X[0] = K_NINF; z0Y[0] = K_NINF;                 // column 0
         for (std::size_t k = 0; k < sw; ++k) {                          // columns 1..n default NINF
-            z0M[1 + k] = K_NINF; z0X[1 + k] = K_NINF; z0Y[1 + k] = K_NINF;
+            z0M[off + k] = K_NINF; z0X[off + k] = K_NINF; z0Y[off + k] = K_NINF;
         }
         for (int l = 0; l < W; ++l)
             for (int s = 0; s < seg; ++s) {
                 const int j = l * seg + s + 1;
                 if (j <= n) {
                     const std::size_t k = (std::size_t)s * W + l;
-                    if constexpr (Local) z0M[1 + k] = 0.0;
-                    else                 z0Y[1 + k] = -(go_a + j * ge_a);
+                    if constexpr (Local) z0M[off + k] = 0.0;
+                    else                 z0Y[off + k] = -(go_a + j * ge_a);
                 }
             }
     }
@@ -99,12 +102,12 @@ static void striped_affine_full(ViterbiJob& job) {
         const double* sub = buf.sprof.data() + (std::size_t)a[i - 1] * sw;
 
         // this row and the previous row, striped, written in place in the tables
-        double* cM = buf.VM.data() + (std::size_t)i * rowsz + 1;
-        double* cX = buf.VX.data() + (std::size_t)i * rowsz + 1;
-        double* cY = buf.VY.data() + (std::size_t)i * rowsz + 1;
-        const double* pM = buf.VM.data() + (std::size_t)(i - 1) * rowsz + 1;
-        const double* pX = buf.VX.data() + (std::size_t)(i - 1) * rowsz + 1;
-        const double* pY = buf.VY.data() + (std::size_t)(i - 1) * rowsz + 1;
+        double* cM = buf.VM.data() + (std::size_t)i * rowsz + off;
+        double* cX = buf.VX.data() + (std::size_t)i * rowsz + off;
+        double* cY = buf.VY.data() + (std::size_t)i * rowsz + off;
+        const double* pM = buf.VM.data() + (std::size_t)(i - 1) * rowsz + off;
+        const double* pX = buf.VX.data() + (std::size_t)(i - 1) * rowsz + off;
+        const double* pY = buf.VY.data() + (std::size_t)(i - 1) * rowsz + off;
         // column 0 border of this row (slot 0)
         buf.VM.data()[(std::size_t)i * rowsz] = nbM;
         buf.VX.data()[(std::size_t)i * rowsz] = nbX;
@@ -224,7 +227,7 @@ static void striped_affine_full(ViterbiJob& job) {
         job.best_i = best_i; job.best_j = best_j; job.best_tbl = best_tbl;
     } else {
         // final cell (m, n), striped; column 0 (slot 0) when n == 0 (empty B)
-        const std::size_t fn = (n == 0) ? 0 : 1 + scol(n);
+        const std::size_t fn = (n == 0) ? 0 : off + scol(n);
         const double fm = buf.VM[(std::size_t)m * rowsz + fn];
         const double fx = buf.VX[(std::size_t)m * rowsz + fn];
         const double fy = buf.VY[(std::size_t)m * rowsz + fn];
