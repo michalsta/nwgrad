@@ -44,11 +44,9 @@ struct NwgradLevelRegistrar {
         // SIGILLs on non-AVX512 hardware.  register_level assembles the struct in
         // baseline code (simd_levels.cpp).
         register_level(NWGRAD_LVL_ENUM,
-                       &NWGRAD_LVL_NAME::striped_full_entry,  // affine Full: Global + Local
-                       &NWGRAD_LVL_NAME::row_mx_global,       // affine GuideBanded: row-wise ↓
-                       &NWGRAD_LVL_NAME::row_mx_local,
-                       &NWGRAD_LVL_NAME::row_y,
-                       &NWGRAD_LVL_NAME::row_m3,
+                       &NWGRAD_LVL_NAME::striped_full_entry,   // affine Full: Global + Local
+                       &NWGRAD_LVL_NAME::banded_row_global,    // affine GuideBanded: whole-row ↓
+                       &NWGRAD_LVL_NAME::banded_row_local,
                        NWGRAD_LVL_NAME::ROW_BLOCK);
     }
 };

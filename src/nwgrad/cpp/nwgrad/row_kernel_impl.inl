@@ -34,64 +34,66 @@ inline constexpr int ROW_BLOCK = (KW >= 4) ? 64 : 256;
 
 inline constexpr double ROW_NEG_INF = -std::numeric_limits<double>::infinity();
 
-// Affine, carry-free half: VM and VX read only row i-1, so there is no loop-carried
-// dependency and the whole row goes to the vector unit.  LOCAL is a 0/1 literal the
-// compiler folds away.
-#define NWGRAD_ROW_BODY_MX(LOCAL)                                               \
-    for (int j = lo; j <= hi; ++j) {                                            \
-        double d = vm_prev[j - 1];                                              \
-        d = std::max(d, vx_prev[j - 1]);                                        \
-        d = std::max(d, vy_prev[j - 1]);                                        \
-        double mv = d + subrow[j];                                              \
-        if (LOCAL) mv = std::max(mv, 0.0);                                      \
-        double x = (vm_prev[j] - go_b) - ge_b;                                  \
-        x = std::max(x, vx_prev[j] - ge_b);                                     \
-        x = std::max(x, (vy_prev[j] - go_b) - ge_b);                            \
-        vm_cur[j] = mv;                                                         \
-        vx_cur[j] = x;                                                          \
-    }
+// The whole banded row in ONE leveled call: the interleaved block loop (carry-free
+// VM/VX, then the serial VY carry, per block) and — for Local — the row's max3.
+//
+// This fuses what were three function-pointer calls per block (row_mx, row_y, row_m3)
+// into one call per row.  Two reasons it matters, both from the banded measurement:
+// the per-row indirect-call overhead dominates a narrow band (band 8 ≈ 1.06× before),
+// and keeping mx/y/max in one function lets the compiler optimize across them (register
+// allocation, scheduling) instead of at three opaque call boundaries.  Bit-exact:
+// identical operations in identical order.  `blk` is the interleave block size; the two
+// X subtractions stay left-associated, `(v-go)-ge`, never folded — the traceback
+// re-derives the path by exact float equality and depends on it.  LOCAL is a compile-
+// time literal (the two entries below); it folds the M-clamp-to-0 and the row max away.
+// VM/VX read only row i-1 (carry-free); VY carries within the row (Farrar lazy-F in
+// exact form — one `-ge_a` per step).  Returns max3 for Local (caller rescans for the
+// argmax only if it beats the running best); Global ignores the return.
+#define NWGRAD_BANDED_ROW_BODY(LOCAL)                                           \
+    for (int base = lo; base <= hi; base += blk) {                             \
+        const int end = (base + blk - 1 < hi) ? base + blk - 1 : hi;           \
+        for (int j = base; j <= end; ++j) {          /* carry-free VM, VX */   \
+            double d = vm_prev[j - 1];                                         \
+            d = std::max(d, vx_prev[j - 1]);                                   \
+            d = std::max(d, vy_prev[j - 1]);                                   \
+            double mv = d + subrow[j];                                         \
+            if (LOCAL) mv = std::max(mv, 0.0);                                 \
+            double x = (vm_prev[j] - go_b) - ge_b;                             \
+            x = std::max(x, vx_prev[j] - ge_b);                               \
+            x = std::max(x, (vy_prev[j] - go_b) - ge_b);                       \
+            vm_cur[j] = mv;                                                    \
+            vx_cur[j] = x;                                                     \
+        }                                                                     \
+        for (int j = base; j <= end; ++j) {          /* serial VY carry */     \
+            double open = (std::max(vm_cur[j - 1], vx_cur[j - 1]) - go_a) - ge_a; \
+            vy_cur[j] = std::max(open, vy_cur[j - 1] - ge_a);                  \
+        }                                                                     \
+    }                                                                         \
+    if (LOCAL) {                                                              \
+        double best = ROW_NEG_INF;                                            \
+        for (int j = lo; j <= hi; ++j)                                        \
+            best = std::max(best,                                             \
+                            std::max(vm_cur[j], std::max(vx_cur[j], vy_cur[j]))); \
+        return best;                                                          \
+    }                                                                         \
+    return ROW_NEG_INF;
 
-static void row_mx_global(
-    double* __restrict vm_cur,       double* __restrict vx_cur,
+static double banded_row_global(
+    double* __restrict vm_cur, double* __restrict vx_cur, double* __restrict vy_cur,
     const double* __restrict vm_prev, const double* __restrict vx_prev,
     const double* __restrict vy_prev, const double* __restrict subrow,
-    int lo, int hi, double go_b, double ge_b) noexcept {
-    NWGRAD_ROW_BODY_MX(0)
+    int lo, int hi, int blk,
+    double go_a, double ge_a, double go_b, double ge_b) noexcept {
+    NWGRAD_BANDED_ROW_BODY(0)
 }
 
-static void row_mx_local(
-    double* __restrict vm_cur,       double* __restrict vx_cur,
+static double banded_row_local(
+    double* __restrict vm_cur, double* __restrict vx_cur, double* __restrict vy_cur,
     const double* __restrict vm_prev, const double* __restrict vx_prev,
     const double* __restrict vy_prev, const double* __restrict subrow,
-    int lo, int hi, double go_b, double ge_b) noexcept {
-    NWGRAD_ROW_BODY_MX(1)
+    int lo, int hi, int blk,
+    double go_a, double ge_a, double go_b, double ge_b) noexcept {
+    NWGRAD_BANDED_ROW_BODY(1)
 }
 
-// Affine, the carry.  VY reads VM/VX of the *current* row at j-1 — already written
-// by the mx pass and independent of VY — plus its own left neighbour.  That last
-// term is the serial dependency no vectorizer can break, left deliberately scalar.
-// Farrar's lazy-F in exact form: one `- ge_a` per step, the chain the scalar loop
-// walks, hence a bit-identical fixpoint.
-static void row_y(
-    double* __restrict vy_cur,
-    const double* __restrict vm_cur, const double* __restrict vx_cur,
-    int lo, int hi, double go_a, double ge_a) noexcept {
-    for (int j = lo; j <= hi; ++j) {
-        double open = (std::max(vm_cur[j - 1], vx_cur[j - 1]) - go_a) - ge_a;
-        vy_cur[j] = std::max(open, vy_cur[j - 1] - ge_a);
-    }
-}
-
-// Row maximum of max3(VM,VX,VY): a pure reduction.  Local mode needs an argmax, but
-// an argmax inside the DP loop blocks vectorization — so it is hoisted out: reduce
-// here, and rescan for the index only when the row actually beats the running best.
-static double row_m3(
-    const double* __restrict a, const double* __restrict b,
-    const double* __restrict c, int lo, int hi) noexcept {
-    double best = ROW_NEG_INF;
-    for (int j = lo; j <= hi; ++j)
-        best = std::max(best, std::max(a[j], std::max(b[j], c[j])));
-    return best;
-}
-
-#undef NWGRAD_ROW_BODY_MX
+#undef NWGRAD_BANDED_ROW_BODY

@@ -119,27 +119,23 @@ struct ViterbiJob {
 
 using viterbi_fn = void (*)(ViterbiJob&);
 
-// Row-wise leaf kernels for the GuideBanded path.  viterbi_affine_simd (in
-// aligner_simd.hpp) owns the banded indexing and hands each of these one row's
-// worth of contiguous slices; they are the vectorized inner loops, compiled once
-// per level with that level's real -march.  Plain-typed, so they obey the ODR rule
-// (no std::simd crosses the boundary).  See aligner_simd.hpp for the bodies.
-using row_mx_fn = void (*)(double* __restrict, double* __restrict,
-                           const double* __restrict, const double* __restrict,
-                           const double* __restrict, const double* __restrict,
-                           int, int, double, double);
-using row_y_fn  = void (*)(double* __restrict, const double* __restrict,
-                           const double* __restrict, int, int, double, double);
-using row_m3_fn = double (*)(const double* __restrict, const double* __restrict,
-                             const double* __restrict, int, int);
+// Whole-row banded kernel for the GuideBanded path.  viterbi_affine_simd (in
+// aligner_simd.hpp) owns the banded indexing and hands this one row's worth of
+// contiguous slices; it runs the whole interleaved block loop (carry-free VM/VX, serial
+// VY carry) plus the Local row max in a single call, compiled once per level with that
+// level's real -march.  Plain-typed, so it obeys the ODR rule (no std::simd crosses the
+// boundary).  Returns max3 for the Local entry; Global's return is ignored.  Bodies in
+// row_kernel_impl.inl.
+using banded_row_fn = double (*)(double* __restrict, double* __restrict, double* __restrict,
+                                 const double* __restrict, const double* __restrict,
+                                 const double* __restrict, const double* __restrict,
+                                 int, int, int, double, double, double, double);
 
 struct LevelKernels {
-    viterbi_fn viterbi = nullptr;        // striped affine Full (Global + Local)
-    row_mx_fn  row_mx_global = nullptr;  // row-wise banded leaf kernels ↓
-    row_mx_fn  row_mx_local  = nullptr;
-    row_y_fn   row_y  = nullptr;
-    row_m3_fn  row_m3 = nullptr;
-    int        row_block = 0;            // columns per interleaved block (per-µarch)
+    viterbi_fn    viterbi = nullptr;            // striped affine Full (Global + Local)
+    banded_row_fn banded_row_global = nullptr;  // row-wise banded whole-row kernels ↓
+    banded_row_fn banded_row_local  = nullptr;
+    int           row_block = 0;                // columns per interleaved block (per-µarch)
 };
 
 // One slot per possible level; index by (int)SimdLevel.  Populated by the level TUs'
@@ -158,8 +154,8 @@ inline LevelKernels* level_table() {
 // program would SIGILL at load on a non-AVX512 box.  Passing bare pointers keeps the
 // registrar to scalar `lea`s; the struct is assembled and stored here, in baseline code.
 void register_level(SimdLevel l, viterbi_fn viterbi,
-                    row_mx_fn row_mx_global, row_mx_fn row_mx_local,
-                    row_y_fn row_y, row_m3_fn row_m3, int row_block);
+                    banded_row_fn banded_row_global, banded_row_fn banded_row_local,
+                    int row_block);
 
 // ── The active selection ──────────────────────────────────────────────────────
 //

@@ -246,18 +246,15 @@ void Aligner<GM, AM, AB>::viterbi_affine_simd(DpBuffer& buf, const LevelKernels&
         // is independent of block k's carry and can issue underneath it, while each half
         // is still long enough to vectorize.  Bit-exactness is untouched — same
         // operations, same order; VY[base] reads VM/VX[base-1] from the block just done.
+        // One leveled call runs the whole row (the interleaved block loop is inside the
+        // kernel now), instead of ~3 function-pointer calls per block — the per-row
+        // indirect-call overhead was what made a narrow band ≈ scalar.
         const int blk = K.row_block;
-        for (int base = lo; base <= hi; base += blk) {
-            const int end = std::min(base + blk - 1, hi);
-            if constexpr (AM == AlignMode::Local)
-                K.row_mx_local (vm_cur, vx_cur, vm_prev, vx_prev, vy_prev, sr, base, end, go_b, ge_b);
-            else
-                K.row_mx_global(vm_cur, vx_cur, vm_prev, vx_prev, vy_prev, sr, base, end, go_b, ge_b);
-            K.row_y(vy_cur, vm_cur, vx_cur, base, end, go_a, ge_a);
-        }
-
         if constexpr (AM == AlignMode::Local) {
-            if (K.row_m3(vm_cur, vx_cur, vy_cur, lo, hi) > best_local) {
+            const double rowmax = K.banded_row_local(
+                vm_cur, vx_cur, vy_cur, vm_prev, vx_prev, vy_prev, sr, lo, hi, blk,
+                go_a, ge_a, go_b, ge_b);
+            if (rowmax > best_local) {
                 for (int j = lo; j <= hi; ++j) {
                     const double mv = vm_cur[j], xv = vx_cur[j], yv = vy_cur[j];
                     const double best_here = std::max(mv, std::max(xv, yv));
@@ -269,6 +266,10 @@ void Aligner<GM, AM, AB>::viterbi_affine_simd(DpBuffer& buf, const LevelKernels&
                     }
                 }
             }
+        } else {
+            K.banded_row_global(
+                vm_cur, vx_cur, vy_cur, vm_prev, vx_prev, vy_prev, sr, lo, hi, blk,
+                go_a, ge_a, go_b, ge_b);
         }
     }
 

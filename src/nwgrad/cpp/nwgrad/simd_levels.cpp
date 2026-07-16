@@ -11,14 +11,12 @@
 #include "simd_levels.hpp"
 
 void register_level(SimdLevel l, viterbi_fn viterbi,
-                    row_mx_fn row_mx_global, row_mx_fn row_mx_local,
-                    row_y_fn row_y, row_m3_fn row_m3, int row_block) {
+                    banded_row_fn banded_row_global, banded_row_fn banded_row_local,
+                    int row_block) {
     LevelKernels k;
-    k.viterbi       = viterbi;
-    k.row_mx_global = row_mx_global;
-    k.row_mx_local  = row_mx_local;
-    k.row_y         = row_y;
-    k.row_m3        = row_m3;
-    k.row_block     = row_block;
+    k.viterbi          = viterbi;
+    k.banded_row_global = banded_row_global;
+    k.banded_row_local  = banded_row_local;
+    k.row_block         = row_block;
     level_table()[(int)l] = k;
 }

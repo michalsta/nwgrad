@@ -704,7 +704,7 @@ private:
             if constexpr (AB == AlignBand::Full) {
                 if (K.viterbi) { run_dispatched_affine(buf, K); return; }
             }
-            if (K.row_mx_local) { viterbi_affine_simd(buf, K); return; }
+            if (K.banded_row_local) { viterbi_affine_simd(buf, K); return; }
             viterbi_affine(buf);
         } else {
             viterbi_affine(buf);
