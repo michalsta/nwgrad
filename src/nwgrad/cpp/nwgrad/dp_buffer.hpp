@@ -6,31 +6,69 @@
 // boundary (see simd_levels.hpp).
 
 #include <cstddef>
+#include <cstdlib>
 #include <new>
 #include <vector>
+#if defined(__linux__)
+#  include <sys/mman.h>
+#endif
 
-// ── 64-byte-aligned allocator for the DP tables ───────────────────────────────
+// THP hinting is on by default; NWGRAD_HUGEPAGE=0 disables it (escape hatch, and the
+// A/B knob for measuring its effect — resolved once).
+inline bool nwgrad_hugepage_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("NWGRAD_HUGEPAGE");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+
+// ── aligned, huge-page-hinting allocator for the DP tables ────────────────────
 //
-// std::vector guarantees only 16-byte alignment, so on AVX2 every 256-bit (32-byte)
-// W-wide load/store into VM/VX/VY is misaligned and some split cache lines — a
-// measured ~15-18% loss on AVX2 (nothing on SSE2/NEON, where W=2 is 16 bytes and
-// 16-byte alignment already suffices).  A 64-byte base plus per-row padding to a
-// multiple of W (see rowsz in kernels_impl.inl / cell_index in aligner.hpp) keeps
-// every striped row's W-wide accesses off cache-line boundaries.  Uses C++17 aligned
-// operator new, so it is portable (no posix_memalign / _aligned_malloc split).
+// Two things it does, both measured:
+//
+// (1) 64-byte base alignment.  std::vector guarantees only 16-byte, so on AVX2 every
+//     256-bit (32-byte) W-wide load/store into VM/VX/VY is misaligned and some split
+//     cache lines — a ~15-18% loss on AVX2 (nothing on SSE2/NEON, where W=2 is 16
+//     bytes and 16-byte alignment already suffices).  A 64-byte base plus per-row
+//     padding to a multiple of W (see rowsz in kernels_impl.inl / cell_index) keeps
+//     every striped row's W-wide accesses off cache-line boundaries.
+//
+// (2) Transparent huge pages.  Our Linux boxes default THP to [madvise], so a plain
+//     std::vector never gets huge pages and the DP walk eats TLB misses.  An
+//     allocation >= the 2 MiB huge-page size is aligned to 2 MiB and MADV_HUGEPAGE'd,
+//     so it can be backed by huge pages.  The >= 2 MiB gate is not a tunable: a table
+//     smaller than a huge page CANNOT be backed by one (the page would run past the
+//     allocation), so a table only qualifies once it is that big (len ~512+).  Best-
+//     effort — madvise failing is ignored; Linux-only; a no-op elsewhere.
+//
+// Uses C++17 aligned operator new, so it is portable (no posix_memalign / _aligned_malloc
+// split).  deallocate recomputes the alignment from the size, so it always matches.
 template <class T, std::size_t Align = 64>
 struct AlignedAllocator {
     using value_type = T;
-    static constexpr std::align_val_t kAlign{Align};
+    static constexpr std::size_t kHugePage = std::size_t(2) << 20;   // 2 MiB (x86 THP)
+
+    static std::align_val_t align_of(std::size_t bytes) noexcept {
+        return bytes >= kHugePage ? std::align_val_t(kHugePage) : std::align_val_t(Align);
+    }
 
     AlignedAllocator() noexcept = default;
     template <class U> AlignedAllocator(const AlignedAllocator<U, Align>&) noexcept {}
 
     T* allocate(std::size_t n) {
         if (n == 0) return nullptr;
-        return static_cast<T*>(::operator new(n * sizeof(T), kAlign));
+        const std::size_t bytes = n * sizeof(T);
+        void* p = ::operator new(bytes, align_of(bytes));
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+        if (bytes >= kHugePage && nwgrad_hugepage_enabled())
+            ::madvise(p, bytes, MADV_HUGEPAGE);                       // best-effort
+#endif
+        return static_cast<T*>(p);
     }
-    void deallocate(T* p, std::size_t) noexcept { ::operator delete(p, kAlign); }
+    void deallocate(T* p, std::size_t n) noexcept {
+        ::operator delete(p, align_of(n * sizeof(T)));
+    }
 
     template <class U> struct rebind { using other = AlignedAllocator<U, Align>; };
     template <class U> bool operator==(const AlignedAllocator<U, Align>&) const noexcept { return true; }
