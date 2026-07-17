@@ -75,7 +75,7 @@ struct AlignedAllocator {
     template <class U> bool operator!=(const AlignedAllocator<U, Align>&) const noexcept { return false; }
 };
 
-// All DP double storage uses it.  at/rat/band_fill take DVec& accordingly.
+// The always-double DP storage (forward-backward / soft path) uses it.
 using DVec = std::vector<double, AlignedAllocator<double>>;
 
 // ── DpBuffer ──────────────────────────────────────────────────────────────────
@@ -83,33 +83,49 @@ using DVec = std::vector<double, AlignedAllocator<double>>;
 // Holds all DP table vectors for one Aligner computation.
 // Lives either inside the Aligner (own_buf_) or externally (e.g. per-thread).
 // Vectors grow on demand and are never implicitly freed; call clear() to release.
+//
+// Templated on the *Viterbi* scalar type T (float32 or the default double).  The
+// membrane between the two precisions runs right through this struct: the Viterbi
+// tables + query profiles are T (so a float32 kernel halves their footprint and
+// doubles its SIMD lane count), while the forward-backward / soft-gradient tables
+// are ALWAYS double — that path is log-sum-exp and stays in double regardless of the
+// Viterbi precision.  T=double gives back the original struct verbatim (TVec == DVec),
+// which is why `using DpBuffer = DpBufferT<double>` below leaves every existing
+// caller — and the on-disk double build — byte-for-byte unchanged.
+template <class T = double>
+struct DpBufferT {
+    using TVec = std::vector<T, AlignedAllocator<T>>;
 
-struct DpBuffer {
-    DVec H;                        // linear viterbi
-    DVec VM, VX, VY;               // affine viterbi
-    DVec F, B;                     // linear forward-backward
-    DVec FM, FX, FY, BM, BX, BY;  // affine forward-backward
+    TVec H;                        // linear viterbi
+    TVec VM, VX, VY;               // affine viterbi
+    DVec F, B;                     // linear forward-backward   (always double)
+    DVec FM, FX, FY, BM, BX, BY;  // affine forward-backward   (always double)
 
     // Used only by the Simd kernel.  `prof` is the query profile — the
     // substitution scores of every alphabet symbol against sequence B, laid out
     // contiguously in j so the DP row loop loads them with a vector load instead
     // of a gather (Full mode).  `subbuf` is the per-row equivalent for banded
     // mode, where a full-width profile would cost more than the banded DP itself.
-    DVec prof, subbuf;
+    TVec prof, subbuf;
 
     // Used only by the striped affine kernel (leveled, in kernels_impl.inl), which
     // writes VM/VX/VY directly in striped layout (no de-stripe copy).  `sopenv` is one
     // striped openv row (the VM/VX open values feeding the VY carry); `sprof` is the
     // query profile in striped order.  Both O(n), not O(m·n).
-    DVec sopenv, sprof;
+    TVec sopenv, sprof;
 
     void clear() noexcept {
-        auto clr = [](DVec& v) noexcept { v.clear(); v.shrink_to_fit(); };
-        clr(H);
-        clr(VM); clr(VX); clr(VY);
-        clr(F);  clr(B);
-        clr(FM); clr(FX); clr(FY); clr(BM); clr(BX); clr(BY);
-        clr(prof); clr(subbuf);
-        clr(sopenv); clr(sprof);
+        auto clrT = [](TVec& v) noexcept { v.clear(); v.shrink_to_fit(); };
+        auto clrD = [](DVec& v) noexcept { v.clear(); v.shrink_to_fit(); };
+        clrT(H);
+        clrT(VM); clrT(VX); clrT(VY);
+        clrD(F);  clrD(B);
+        clrD(FM); clrD(FX); clrD(FY); clrD(BM); clrD(BX); clrD(BY);
+        clrT(prof); clrT(subbuf);
+        clrT(sopenv); clrT(sprof);
     }
 };
+
+// The default (and, for the soft path, only) buffer type.  Aliasing rather than
+// renaming keeps every existing `DpBuffer` reference and the double build untouched.
+using DpBuffer = DpBufferT<double>;

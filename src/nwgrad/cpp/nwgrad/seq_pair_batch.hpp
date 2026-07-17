@@ -18,11 +18,18 @@
 //
 // Pairs created by add_many() are the exception: the batch owns those outright
 // (see owned_), because they never exist as Python objects at all.
-struct SeqPairBatch {
+template<class T = double>
+struct SeqPairBatchT {
+    // Viterbi precision T; SeqPair/DpBuffer shadow the global aliases so the members and
+    // worker buffers below are at this precision.  Python binds SeqPairBatchT<float> as
+    // `SeqPairBatch` (accepting `SeqPair` = SeqPairT<float>) and <double> as the *Double.
+    using SeqPair  = SeqPairT<T>;
+    using DpBuffer = DpBufferT<T>;
+
     std::vector<SeqPair*> pairs;
     int n_threads;
 
-    explicit SeqPairBatch(int nt = 0)
+    explicit SeqPairBatchT(int nt = 0)
         : n_threads(nt > 0 ? nt : default_threads()) {}
 
     // Non-copyable.  It never was, meaningfully — a copy would duplicate the raw
@@ -32,10 +39,10 @@ struct SeqPairBatch {
     // is_copy_constructible_v<SeqPairBatch> stayed true and nanobind emitted a
     // copy thunk for it, which failed to compile inside the STL.  Moves are fine:
     // unique_ptr keeps every SeqPair at a fixed address, so `pairs` stays valid.
-    SeqPairBatch(const SeqPairBatch&)            = delete;
-    SeqPairBatch& operator=(const SeqPairBatch&) = delete;
-    SeqPairBatch(SeqPairBatch&&)                 = default;
-    SeqPairBatch& operator=(SeqPairBatch&&)      = default;
+    SeqPairBatchT(const SeqPairBatchT&)            = delete;
+    SeqPairBatchT& operator=(const SeqPairBatchT&) = delete;
+    SeqPairBatchT(SeqPairBatchT&&)                 = default;
+    SeqPairBatchT& operator=(SeqPairBatchT&&)      = default;
 
     // Every pair in a batch must share an alphabet: their gradients are summed,
     // and summing across alphabets is meaningless.  Checked here, on the
@@ -255,3 +262,6 @@ private:
         run_workers_guarded(actual, worker);
     }
 };
+
+// Default (double) alias; Python binds SeqPairBatchT<float> as `SeqPairBatch`.
+using SeqPairBatch = SeqPairBatchT<double>;

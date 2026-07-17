@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -115,8 +116,18 @@ static inline double lse3(double a, double b, double c) noexcept {
 // is initialised to NEG_INF; band-edge reads therefore always land on an initialised
 // cell and cannot corrupt max/lse operations with stale data from a previous problem.
 
-template<GapModel GM, AlignMode AM, AlignBand AB = AlignBand::Full>
+template<GapModel GM, AlignMode AM, AlignBand AB = AlignBand::Full, class T = double>
 struct Aligner {
+
+    // Viterbi-precision buffer type.  T is the scalar precision of the Viterbi /
+    // hard-gradient DP: double by default, or float32 for ~2x SIMD lanes and half
+    // the table footprint.  This member alias deliberately *shadows* the global
+    // ::DpBuffer (= DpBufferT<double>) throughout the class body, so every DpBuffer&
+    // signature below already means "the buffer at this Aligner's precision" with no
+    // per-site edit.  For T=double it resolves to exactly the old type, which is what
+    // keeps the double build byte-for-byte unchanged.  The forward-backward / soft
+    // tables inside DpBufferT<T> are double regardless of T.
+    using DpBuffer = DpBufferT<T>;
 
     // ── Public pipeline API — own internal buffer ─────────────────────────────
 
@@ -150,6 +161,17 @@ struct Aligner {
         params_ = &params;
         blk_    = params.matrix.data();
         nalpha_ = params.matrix.size();
+        // The Viterbi-precision copy of the substitution block.  T=double aliases the
+        // master (no copy); float32 converts once per problem into blkT_storage_.
+        if constexpr (std::is_same_v<T, double>) {
+            blkT_ = blk_;
+        } else {
+            const std::size_t nn = static_cast<std::size_t>(nalpha_) * nalpha_;
+            blkT_storage_.resize(nn);
+            for (std::size_t k = 0; k < nn; ++k)
+                blkT_storage_[k] = static_cast<T>(blk_[k]);
+            blkT_ = blkT_storage_.data();
+        }
         band_   = band;
         m_      = static_cast<int>(a.size());
         n_      = static_cast<int>(b.size());
@@ -308,9 +330,11 @@ struct Aligner {
     // Introspection / testing: copy a DP table into canonical (m+1)×(n+1) row-major
     // order, reading through the current layout (de-stripes when the simd Full kernel
     // left it striped).  Used by the bit-exactness test to compare across layouts.
-    std::vector<double> to_row_major(const DVec& t) const {
+    template <class V>
+    std::vector<typename V::value_type> to_row_major(const V& t) const {
+        using E = typename V::value_type;
         const size_t rm_stride = static_cast<size_t>(n_) + 1;
-        std::vector<double> out(static_cast<size_t>(m_ + 1) * rm_stride);
+        std::vector<E> out(static_cast<size_t>(m_ + 1) * rm_stride);
         for (int i = 0; i <= m_; ++i)
             for (int j = 0; j <= n_; ++j)
                 out[static_cast<size_t>(i) * rm_stride + j] = rat(t, i, j);
@@ -331,7 +355,12 @@ private:
     // the caller supplied encoded spans directly.
     std::vector<uint8_t> a_own_, b_own_;
     const AlignParams*  params_     = nullptr;
-    const double*       blk_        = nullptr; // params_->matrix.data(), cached
+    const double*       blk_        = nullptr; // params_->matrix.data(), cached (double master)
+    // The substitution block in the Viterbi precision T.  For T=double it aliases blk_
+    // (zero copy); for float32 it points into blkT_storage_.  subT() reads it; sub()
+    // keeps reading the double master, so the soft path is untouched by T.
+    const T*            blkT_       = nullptr;
+    std::vector<T>      blkT_storage_;
     int                 nalpha_     = 0;       // params_->matrix.size(), cached
     int                 band_       = 0;
     int                 m_ = 0, n_ = 0;
@@ -462,10 +491,13 @@ private:
         }
         return static_cast<size_t>(i) * stride_ + static_cast<size_t>(j);
     }
-    double& at(DVec& t, int i, int j) const {
+    // Element-generic so they serve both the T-typed Viterbi tables (VM/VX/VY/H) and the
+    // always-double soft tables (F/B/FM..BY) from one definition; the layout switch in
+    // cell_index() is identical for either element type.
+    template <class V> typename V::value_type& at(V& t, int i, int j) const {
         return t[cell_index(i, j)];
     }
-    double rat(const DVec& t, int i, int j) const {
+    template <class V> typename V::value_type rat(const V& t, int i, int j) const {
         return t[cell_index(i, j)];
     }
 
@@ -478,8 +510,14 @@ private:
                static_cast<size_t>(b_idx_[static_cast<size_t>(j) - 1]);
     }
 
-    // Substitution score for a[i-1] against b[j-1].
+    // Substitution score for a[i-1] against b[j-1] (double master; used by the soft path).
     double sub(int i, int j) const noexcept { return blk_[sub_off(i, j)]; }
+
+    // Substitution score in the Viterbi precision T (reads the T-converted block).  The
+    // Viterbi fill and its tracebacks use this so the traceback float-equality
+    // re-derivation happens in the SAME precision the forward pass rounded in — which is
+    // load-bearing for bit-exactness when T=float.  For T=double it equals sub().
+    T subT(int i, int j) const noexcept { return blkT_[sub_off(i, j)]; }
 
     // The characters behind those indices — used only to render alignments.
     char sym_a(int i) const noexcept {
@@ -558,26 +596,29 @@ private:
 
     // GuideBanded: NEG_INF-fill only the band region (O(m·band)).  Full: no-op —
     // the linear forward tables need no pre-fill (every in-band cell is written).
-    void banded_fill(DVec& vec) const {
+    template <class V> void banded_fill(V& vec) const {
         if constexpr (AB == AlignBand::GuideBanded) {
             for (int i = 0; i <= m_; ++i) {
                 int lo, hi; band_row_span(i, lo, hi);
-                double* row = vec.data() + static_cast<size_t>(i) * stride_;
+                auto* row = vec.data() + static_cast<size_t>(i) * stride_;
                 std::fill(row + lo, row + hi + 1, NEG_INF);
             }
         }
     }
 
     // Fill `vec` with `value`.  Full: the whole (m+1)×(n+1) table.  GuideBanded:
-    // only the band region (O(m·band)).
-    void band_fill(DVec& vec, double value) const {
+    // only the band region (O(m·band)).  Element-generic; `value` is passed as double
+    // and std::fill converts it to the table's element type (NEG_INF stays -inf).
+    template <class V> void band_fill(V& vec, double value) const {
         if constexpr (AB == AlignBand::Full) {
-            std::fill(vec.begin(), vec.begin() + static_cast<ptrdiff_t>(sz_), value);
+            std::fill(vec.begin(), vec.begin() + static_cast<ptrdiff_t>(sz_),
+                      static_cast<typename V::value_type>(value));
         } else {
             for (int i = 0; i <= m_; ++i) {
                 int lo, hi; band_row_span(i, lo, hi);
-                double* row = vec.data() + static_cast<size_t>(i) * stride_;
-                std::fill(row + lo, row + hi + 1, value);
+                auto* row = vec.data() + static_cast<size_t>(i) * stride_;
+                std::fill(row + lo, row + hi + 1,
+                          static_cast<typename V::value_type>(value));
             }
         }
     }
@@ -637,6 +678,10 @@ private:
         int i = best_i_, j = best_j_;
         TBTable tbl = best_tbl_;
         gj[static_cast<size_t>(i)] = j;
+        const T go_a = static_cast<T>(params_->gap_open_a);
+        const T ge_a = static_cast<T>(params_->gap_extend_a);
+        const T go_b = static_cast<T>(params_->gap_open_b);
+        const T ge_b = static_cast<T>(params_->gap_extend_b);
 
         while (true) {
             if (i == 0 && j == 0) break;
@@ -644,7 +689,7 @@ private:
                 if (tbl == TBTable::M && rat(buf.VM, i, j) <= 0.0) break;
 
             if (tbl == TBTable::M) {
-                double vm = rat(buf.VM,i-1,j-1), vx = rat(buf.VX,i-1,j-1), vy = rat(buf.VY,i-1,j-1);
+                T vm = rat(buf.VM,i-1,j-1), vx = rat(buf.VX,i-1,j-1), vy = rat(buf.VY,i-1,j-1);
                 --i; --j;
                 gj[static_cast<size_t>(i)] = j;
                 if      (vm >= vx && vm >= vy) tbl = TBTable::M;
@@ -652,9 +697,9 @@ private:
                 else                            tbl = TBTable::Y;
             } else if (tbl == TBTable::X) {
                 // X state: gap in B (advance i), uses gap_b params
-                double fm = rat(buf.VM,i-1,j) - params_->gap_open_b - params_->gap_extend_b;
-                double fx = rat(buf.VX,i-1,j) - params_->gap_extend_b;
-                double fy = rat(buf.VY,i-1,j) - params_->gap_open_b - params_->gap_extend_b;
+                T fm = rat(buf.VM,i-1,j) - go_b - ge_b;
+                T fx = rat(buf.VX,i-1,j)        - ge_b;
+                T fy = rat(buf.VY,i-1,j) - go_b - ge_b;
                 --i;
                 gj[static_cast<size_t>(i)] = j;
                 if      (fm >= fx && fm >= fy) tbl = TBTable::M;
@@ -662,9 +707,9 @@ private:
                 else                            tbl = TBTable::Y;
             } else {
                 // Y state: gap in A (advance j), uses gap_a params
-                double fm = rat(buf.VM,i,j-1) - params_->gap_open_a - params_->gap_extend_a;
-                double fx = rat(buf.VX,i,j-1) - params_->gap_open_a - params_->gap_extend_a;
-                double fy = rat(buf.VY,i,j-1) - params_->gap_extend_a;
+                T fm = rat(buf.VM,i,j-1) - go_a - ge_a;
+                T fx = rat(buf.VX,i,j-1) - go_a - ge_a;
+                T fy = rat(buf.VY,i,j-1)        - ge_a;
                 --j;  // gap in a: i stays, no gj update
                 if      (fm >= fx && fm >= fy) tbl = TBTable::M;
                 else if (fx >= fy)             tbl = TBTable::X;
@@ -702,9 +747,19 @@ private:
             // in the table is null and we fall through to the scalar Viterbi.
             const LevelKernels& K = active_kernels();
             if constexpr (AB == AlignBand::Full) {
-                if (K.viterbi) { run_dispatched_affine(buf, K); return; }
+                // The striped Full kernel exists at both precisions (viterbi / viterbi_f).
+                if constexpr (std::is_same_v<T, double>) {
+                    if (K.viterbi)   { run_dispatched_affine(buf, K); return; }
+                } else {
+                    if (K.viterbi_f) { run_dispatched_affine(buf, K); return; }
+                }
             }
-            if (K.banded_row_local) { viterbi_affine_simd(buf, K); return; }
+            // The row-wise banded kernel is double-only for now; float banded falls back
+            // to the (T-templated) scalar fill.  Gated so viterbi_affine_simd — whose body
+            // is double-typed — is never instantiated for T=float.
+            if constexpr (std::is_same_v<T, double>) {
+                if (K.banded_row_local) { viterbi_affine_simd(buf, K); return; }
+            }
             viterbi_affine(buf);
         } else {
             viterbi_affine(buf);
@@ -715,17 +770,20 @@ private:
     // and copy its scalar results back.  The kernel fills buf.VM/VX/VY in STRIPED layout
     // (table_layout == 1) and reports seg/width; rat/at then read them striped.
     void run_dispatched_affine(DpBuffer& buf, const LevelKernels& K) {
-        ViterbiJob job{};
+        ViterbiJob<T> job{};
         job.a = a_idx_.data(); job.m = m_;
         job.b = b_idx_.data(); job.n = n_;
-        job.blk = blk_;        job.nalpha = nalpha_;
-        job.go_a = params_->gap_open_a; job.ge_a = params_->gap_extend_a;
-        job.go_b = params_->gap_open_b; job.ge_b = params_->gap_extend_b;
+        // blkT_ is the substitution block already in the Viterbi precision T (= blk_ when
+        // T is double); the penalties convert to T on assignment.
+        job.blk = blkT_;       job.nalpha = nalpha_;
+        job.go_a = static_cast<T>(params_->gap_open_a);   job.ge_a = static_cast<T>(params_->gap_extend_a);
+        job.go_b = static_cast<T>(params_->gap_open_b);   job.ge_b = static_cast<T>(params_->gap_extend_b);
         job.align_mode = (AM == AlignMode::Local) ? 1 : 0;
         job.align_band = 0; job.band = 0;
         job.guide_j = nullptr; job.guide_len = 0;
         job.buf = &buf;
-        K.viterbi(job);
+        if constexpr (std::is_same_v<T, double>) K.viterbi(job);
+        else                                     K.viterbi_f(job);
         // Adopt the layout the kernel produced (striped for the Full striped kernel).
         if (job.table_layout == 1) {
             tables_striped_ = true;
@@ -873,41 +931,50 @@ private:
         band_fill(buf.VX, NEG_INF);
         band_fill(buf.VY, NEG_INF);
 
+        // Gap penalties in the Viterbi precision T.  Converting once, up front, is what
+        // makes this scalar fill bit-exact with the T-typed simd kernel: both then do
+        // (v - go) - ge in T with the same left association, so their VM/VX/VY tables
+        // agree to the last bit (which the argmax tracebacks below depend on).
+        const T go_a = static_cast<T>(params_->gap_open_a);
+        const T ge_a = static_cast<T>(params_->gap_extend_a);
+        const T go_b = static_cast<T>(params_->gap_open_b);
+        const T ge_b = static_cast<T>(params_->gap_extend_b);
+
         if constexpr (AM == AlignMode::Global) {
-            at(buf.VM, 0, 0) = 0.0;
+            at(buf.VM, 0, 0) = static_cast<T>(0);
             const int bi = border_rows(), bj = border_cols();
             // VX along column 0: all gaps in B (consuming A), uses gap_b params
             for (int i = 1; i <= bi; ++i)
-                at(buf.VX, i, 0) = -(params_->gap_open_b + i * params_->gap_extend_b);
+                at(buf.VX, i, 0) = -(go_b + static_cast<T>(i) * ge_b);
             // VY along row 0: all gaps in A (consuming B), uses gap_a params
             for (int j = 1; j <= bj; ++j)
-                at(buf.VY, 0, j) = -(params_->gap_open_a + j * params_->gap_extend_a);
+                at(buf.VY, 0, j) = -(go_a + static_cast<T>(j) * ge_a);
         } else {
-            for (int i = 0; i <= m_; ++i) at(buf.VM, i, 0) = 0.0;
-            for (int j = 0; j <= n_; ++j) at(buf.VM, 0, j) = 0.0;
+            for (int i = 0; i <= m_; ++i) at(buf.VM, i, 0) = static_cast<T>(0);
+            for (int j = 0; j <= n_; ++j) at(buf.VM, 0, j) = static_cast<T>(0);
         }
 
         best_i_ = 0; best_j_ = 0; best_tbl_ = TBTable::M;
-        double best_local = 0.0;
+        T best_local = static_cast<T>(0);
 
         for (int i = 1; i <= m_; ++i) {
             for (int j = jlo(i); j <= jhi(i); ++j) {
-                double diag  = std::max({rat(buf.VM,i-1,j-1), rat(buf.VX,i-1,j-1), rat(buf.VY,i-1,j-1)});
-                double m_val = diag + sub(i, j);
+                T diag  = std::max({rat(buf.VM,i-1,j-1), rat(buf.VX,i-1,j-1), rat(buf.VY,i-1,j-1)});
+                T m_val = diag + subT(i, j);
                 // X state: gap in B (advance i), uses gap_b params
-                double x_val = std::max({
-                    rat(buf.VM,i-1,j) - params_->gap_open_b - params_->gap_extend_b,
-                    rat(buf.VX,i-1,j)                       - params_->gap_extend_b,
-                    rat(buf.VY,i-1,j) - params_->gap_open_b - params_->gap_extend_b});
+                T x_val = std::max({
+                    rat(buf.VM,i-1,j) - go_b - ge_b,
+                    rat(buf.VX,i-1,j)        - ge_b,
+                    rat(buf.VY,i-1,j) - go_b - ge_b});
                 // Y state: gap in A (advance j), uses gap_a params
-                double y_val = std::max({
-                    rat(buf.VM,i,j-1) - params_->gap_open_a - params_->gap_extend_a,
-                    rat(buf.VX,i,j-1) - params_->gap_open_a - params_->gap_extend_a,
-                    rat(buf.VY,i,j-1)                       - params_->gap_extend_a});
+                T y_val = std::max({
+                    rat(buf.VM,i,j-1) - go_a - ge_a,
+                    rat(buf.VX,i,j-1) - go_a - ge_a,
+                    rat(buf.VY,i,j-1)        - ge_a});
 
                 if constexpr (AM == AlignMode::Local) {
-                    m_val = std::max(m_val, 0.0);
-                    double best_here = std::max({m_val, x_val, y_val});
+                    m_val = std::max(m_val, static_cast<T>(0));
+                    T best_here = std::max({m_val, x_val, y_val});
                     if (best_here > best_local) {
                         best_local = best_here; best_i_ = i; best_j_ = j;
                         if      (m_val >= x_val && m_val >= y_val) best_tbl_ = TBTable::M;
@@ -921,7 +988,7 @@ private:
         }
 
         if constexpr (AM == AlignMode::Global) {
-            double vm = rat(buf.VM, m_, n_), vx = rat(buf.VX, m_, n_), vy = rat(buf.VY, m_, n_);
+            T vm = rat(buf.VM, m_, n_), vx = rat(buf.VX, m_, n_), vy = rat(buf.VY, m_, n_);
             viterbi_score_ = std::max({vm, vx, vy});
             best_i_ = m_; best_j_ = n_;
             if      (vm >= vx && vm >= vy) best_tbl_ = TBTable::M;
@@ -936,6 +1003,12 @@ private:
     void traceback_affine_impl(const DpBuffer& buf, EmitFn&& emit) const {
         int i = best_i_, j = best_j_;
         TBTable tbl = best_tbl_;
+        // Same T-precision penalties as the forward pass, so the predecessor argmax
+        // re-derived here reproduces the branch the fill took, bit for bit.
+        const T go_a = static_cast<T>(params_->gap_open_a);
+        const T ge_a = static_cast<T>(params_->gap_extend_a);
+        const T go_b = static_cast<T>(params_->gap_open_b);
+        const T ge_b = static_cast<T>(params_->gap_extend_b);
 
         while (true) {
             if (i == 0 && j == 0) break;
@@ -944,23 +1017,23 @@ private:
 
             if (tbl == TBTable::M) {
                 emit(i-1, j-1);
-                double vm = rat(buf.VM,i-1,j-1), vx = rat(buf.VX,i-1,j-1), vy = rat(buf.VY,i-1,j-1);
+                T vm = rat(buf.VM,i-1,j-1), vx = rat(buf.VX,i-1,j-1), vy = rat(buf.VY,i-1,j-1);
                 --i; --j;
                 if      (vm >= vx && vm >= vy) tbl = TBTable::M;
                 else if (vx >= vy)             tbl = TBTable::X;
                 else                            tbl = TBTable::Y;
             } else if (tbl == TBTable::X) {
-                double fm = rat(buf.VM,i-1,j) - params_->gap_open_b - params_->gap_extend_b;
-                double fx = rat(buf.VX,i-1,j) - params_->gap_extend_b;
-                double fy = rat(buf.VY,i-1,j) - params_->gap_open_b - params_->gap_extend_b;
+                T fm = rat(buf.VM,i-1,j) - go_b - ge_b;
+                T fx = rat(buf.VX,i-1,j)        - ge_b;
+                T fy = rat(buf.VY,i-1,j) - go_b - ge_b;
                 --i;
                 if      (fm >= fx && fm >= fy) tbl = TBTable::M;
                 else if (fx >= fy)             tbl = TBTable::X;
                 else                            tbl = TBTable::Y;
             } else {
-                double fm = rat(buf.VM,i,j-1) - params_->gap_open_a - params_->gap_extend_a;
-                double fx = rat(buf.VX,i,j-1) - params_->gap_open_a - params_->gap_extend_a;
-                double fy = rat(buf.VY,i,j-1) - params_->gap_extend_a;
+                T fm = rat(buf.VM,i,j-1) - go_a - ge_a;
+                T fx = rat(buf.VX,i,j-1) - go_a - ge_a;
+                T fy = rat(buf.VY,i,j-1)        - ge_a;
                 --j;
                 if      (fm >= fx && fm >= fy) tbl = TBTable::M;
                 else if (fx >= fy)             tbl = TBTable::X;
@@ -979,6 +1052,10 @@ private:
     void aligned_affine(const DpBuffer& buf, std::string& a, std::string& b) const {
         int i = best_i_, j = best_j_;
         TBTable tbl = best_tbl_;
+        const T go_a = static_cast<T>(params_->gap_open_a);
+        const T ge_a = static_cast<T>(params_->gap_extend_a);
+        const T go_b = static_cast<T>(params_->gap_open_b);
+        const T ge_b = static_cast<T>(params_->gap_extend_b);
 
         while (true) {
             if (i == 0 && j == 0) break;
@@ -987,25 +1064,25 @@ private:
 
             if (tbl == TBTable::M) {
                 a.push_back(sym_a(i)); b.push_back(sym_b(j));
-                double vm = rat(buf.VM,i-1,j-1), vx = rat(buf.VX,i-1,j-1), vy = rat(buf.VY,i-1,j-1);
+                T vm = rat(buf.VM,i-1,j-1), vx = rat(buf.VX,i-1,j-1), vy = rat(buf.VY,i-1,j-1);
                 --i; --j;
                 if      (vm >= vx && vm >= vy) tbl = TBTable::M;
                 else if (vx >= vy)             tbl = TBTable::X;
                 else                            tbl = TBTable::Y;
             } else if (tbl == TBTable::X) {
                 a.push_back(sym_a(i)); b.push_back('-');  // gap in B
-                double fm = rat(buf.VM,i-1,j) - params_->gap_open_b - params_->gap_extend_b;
-                double fx = rat(buf.VX,i-1,j) - params_->gap_extend_b;
-                double fy = rat(buf.VY,i-1,j) - params_->gap_open_b - params_->gap_extend_b;
+                T fm = rat(buf.VM,i-1,j) - go_b - ge_b;
+                T fx = rat(buf.VX,i-1,j)        - ge_b;
+                T fy = rat(buf.VY,i-1,j) - go_b - ge_b;
                 --i;
                 if      (fm >= fx && fm >= fy) tbl = TBTable::M;
                 else if (fx >= fy)             tbl = TBTable::X;
                 else                            tbl = TBTable::Y;
             } else {
                 a.push_back('-'); b.push_back(sym_b(j));  // gap in A
-                double fm = rat(buf.VM,i,j-1) - params_->gap_open_a - params_->gap_extend_a;
-                double fx = rat(buf.VX,i,j-1) - params_->gap_open_a - params_->gap_extend_a;
-                double fy = rat(buf.VY,i,j-1) - params_->gap_extend_a;
+                T fm = rat(buf.VM,i,j-1) - go_a - ge_a;
+                T fx = rat(buf.VX,i,j-1) - go_a - ge_a;
+                T fy = rat(buf.VY,i,j-1)        - ge_a;
                 --j;
                 if      (fm >= fx && fm >= fy) tbl = TBTable::M;
                 else if (fx >= fy)             tbl = TBTable::X;
@@ -1020,6 +1097,12 @@ private:
         double* gblk = grad_block(grad);
         int i = best_i_, j = best_j_;
         TBTable tbl = best_tbl_;
+        // T-precision penalties for the predecessor argmax; the gradient counts
+        // themselves accumulate into the double grad block, exact for integer counts.
+        const T go_a = static_cast<T>(params_->gap_open_a);
+        const T ge_a = static_cast<T>(params_->gap_extend_a);
+        const T go_b = static_cast<T>(params_->gap_open_b);
+        const T ge_b = static_cast<T>(params_->gap_extend_b);
 
         while (true) {
             if (i == 0 && j == 0) break;
@@ -1028,7 +1111,7 @@ private:
 
             if (tbl == TBTable::M) {
                 gblk[sub_off(i, j)] += 1.0;
-                double vm = rat(buf.VM,i-1,j-1), vx = rat(buf.VX,i-1,j-1), vy = rat(buf.VY,i-1,j-1);
+                T vm = rat(buf.VM,i-1,j-1), vx = rat(buf.VX,i-1,j-1), vy = rat(buf.VY,i-1,j-1);
                 --i; --j;
                 if      (vm >= vx && vm >= vy) tbl = TBTable::M;
                 else if (vx >= vy)             tbl = TBTable::X;
@@ -1036,9 +1119,9 @@ private:
             } else if (tbl == TBTable::X) {
                 // X state: gap in B (advance i), uses gap_b params
                 grad.gap_extend_b -= 1.0;   // the score subtracts this penalty
-                double fm = rat(buf.VM,i-1,j) - params_->gap_open_b - params_->gap_extend_b;
-                double fx = rat(buf.VX,i-1,j)                       - params_->gap_extend_b;
-                double fy = rat(buf.VY,i-1,j) - params_->gap_open_b - params_->gap_extend_b;
+                T fm = rat(buf.VM,i-1,j) - go_b - ge_b;
+                T fx = rat(buf.VX,i-1,j)        - ge_b;
+                T fy = rat(buf.VY,i-1,j) - go_b - ge_b;
                 --i;
                 TBTable prev;
                 if      (fm >= fx && fm >= fy) prev = TBTable::M;
@@ -1049,9 +1132,9 @@ private:
             } else {
                 // Y state: gap in A (advance j), uses gap_a params
                 grad.gap_extend_a -= 1.0;
-                double fm = rat(buf.VM,i,j-1) - params_->gap_open_a - params_->gap_extend_a;
-                double fx = rat(buf.VX,i,j-1) - params_->gap_open_a - params_->gap_extend_a;
-                double fy = rat(buf.VY,i,j-1)                       - params_->gap_extend_a;
+                T fm = rat(buf.VM,i,j-1) - go_a - ge_a;
+                T fx = rat(buf.VX,i,j-1) - go_a - ge_a;
+                T fy = rat(buf.VY,i,j-1)        - ge_a;
                 --j;
                 TBTable prev;
                 if      (fm >= fx && fm >= fy) prev = TBTable::M;

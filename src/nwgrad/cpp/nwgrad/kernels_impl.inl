@@ -2,41 +2,49 @@
 //
 // This file is #include'd once per ISA level, inside that level's namespace, by a
 // level TU that has already `#include <experimental/simd>` and the common headers
-// (so `stdx`, DpBuffer, ViterbiJob are all visible in the global namespace).  Compiled
-// with that level's real -march flag, so `stdx::native_simd<double>` here is the right
-// width: 2 (sse2/neon), 4 (avx2), 8 (avx512).
+// (so `stdx`, DpBufferT, ViterbiJob are all visible in the global namespace).  Compiled
+// with that level's real -march flag, so `stdx::native_simd<T>` here is the right
+// width: for T=double 2 (sse2/neon), 4 (avx2), 8 (avx512); for T=float it is doubled
+// (4 / 8 / 16), which is the whole point of the float32 precision — twice the lanes.
 //
 // THE ODR RULE: no std::simd type leaves this file.  Every entry takes plain data
-// (ViterbiJob) and uses std::simd on locals only.  Distinct native width per level
+// (ViterbiJob<T>) and uses std::simd on locals only.  Distinct native width per level
 // keeps the std::simd instantiations from COMDAT-folding across the level TUs.
 //
 // The striped kernel covers affine Full (Global + Local — Local adds M-clamp-to-0 and
-// an argmax).  GuideBanded still falls through to the row-wise kernel.  The striped
-// forward writes rolling striped rows and de-stripes each finished row into the
-// row-major VM/VX/VY, so the traceback/hard_grad read the layout they already expect.
+// an argmax) and is instantiated once per precision T (double and float).  GuideBanded
+// still falls through to the row-wise kernel.  The striped forward writes VM/VX/VY in
+// Farrar striped layout directly (no de-stripe copy); aligner.hpp's cell_index() reads
+// the same layout, so the traceback/hard_grad see the tables the fill wrote.
 
 #ifndef NWGRAD_LEVEL_NS
 #  error "kernels_impl.inl must be included inside a level namespace by a level TU"
 #endif
 
 using vd = stdx::native_simd<double>;
-static constexpr int KW = (int)vd::size();     // native lane count for this level
+static constexpr int KW = (int)vd::size();     // native double-lane count (row_kernel uses it)
 static constexpr double K_NINF = -std::numeric_limits<double>::infinity();
 
 // ── striped affine forward, Full (Global if !Local, else Local) ───────────────
-template <bool Local>
-static void striped_affine_full(ViterbiJob& job) {
-    const int m = job.m, n = job.n, W = KW;
+// Templated on the Viterbi precision T (double or float32).  vd / W / the -inf
+// sentinel are all local to T here, shadowing the file-scope double versions above.
+template <class T, bool Local>
+static void striped_affine_full(ViterbiJob<T>& job) {
+    using vd = stdx::native_simd<T>;
+    const int W = (int)vd::size();                       // native T-lane count for this level
+    const T K_NINF = -std::numeric_limits<T>::infinity();
+
+    const int m = job.m, n = job.n;
     const int nalpha = job.nalpha;
-    const double go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;
-    const double* blk = job.blk;
+    const T go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;
+    const T* blk = job.blk;
     const unsigned char* a = job.a;
     const unsigned char* b = job.b;
-    DpBuffer& buf = *job.buf;
+    DpBufferT<T>& buf = *job.buf;
 
     const int seg = (n + W - 1) / W;
     const std::size_t sw = (std::size_t)seg * W;
-    // VM/VX/VY hold the tables in STRIPED layout — one row of rowsz = (seg+1)*W doubles
+    // VM/VX/VY hold the tables in STRIPED layout — one row of rowsz = (seg+1)*W scalars
     // per i, written in place, so the traceback/hard-gradient read them striped with no
     // per-row de-stripe copy.  Slot 0 is column 0 (the gap border); slots [W, W+sw) are
     // the striped columns 1..n (started at W so every W-wide access is aligned given the
@@ -56,8 +64,8 @@ static void striped_affine_full(ViterbiJob& job) {
 
     // striped query profile: prof[c][s*W+l] = score(c, b[col(l,s)-1]), padding -> NINF
     for (int c = 0; c < nalpha; ++c) {
-        const double* row = blk + (std::size_t)c * nalpha;
-        double* dst = buf.sprof.data() + (std::size_t)c * sw;
+        const T* row = blk + (std::size_t)c * nalpha;
+        T* dst = buf.sprof.data() + (std::size_t)c * sw;
         for (int l = 0; l < W; ++l)
             for (int s = 0; s < seg; ++s) {
                 const int j = l * seg + s + 1;
@@ -65,14 +73,14 @@ static void striped_affine_full(ViterbiJob& job) {
             }
     }
 
-    double* ov = buf.sopenv.data();
+    T* ov = buf.sopenv.data();
 
     // ── row 0, written striped straight into the tables (slot 0 = column 0) ──
     // This doubles as the previous row for i = 1 (read at buf.VM row 0 + off).  Global:
     // VM = NINF, VY = the Y-gap-open series; Local: VM = 0 everywhere.
     {
-        double* z0M = buf.VM.data(); double* z0X = buf.VX.data(); double* z0Y = buf.VY.data();
-        z0M[0] = 0.0; z0X[0] = K_NINF; z0Y[0] = K_NINF;                 // column 0
+        T* z0M = buf.VM.data(); T* z0X = buf.VX.data(); T* z0Y = buf.VY.data();
+        z0M[0] = 0; z0X[0] = K_NINF; z0Y[0] = K_NINF;                   // column 0
         for (std::size_t k = 0; k < sw; ++k) {                          // columns 1..n default NINF
             z0M[off + k] = K_NINF; z0X[off + k] = K_NINF; z0Y[off + k] = K_NINF;
         }
@@ -81,33 +89,33 @@ static void striped_affine_full(ViterbiJob& job) {
                 const int j = l * seg + s + 1;
                 if (j <= n) {
                     const std::size_t k = (std::size_t)s * W + l;
-                    if constexpr (Local) z0M[off + k] = 0.0;
+                    if constexpr (Local) z0M[off + k] = 0;
                     else                 z0Y[off + k] = -(go_a + j * ge_a);
                 }
             }
     }
 
     const vd vgo_a(go_a), vge_a(ge_a), vgo_b(go_b), vge_b(ge_b);
-    const vd vzero(0.0);
+    const vd vzero(static_cast<T>(0));
     // column-0 border of the previous row
-    double bM = Local ? 0.0 : 0.0, bX = K_NINF, bY = K_NINF;
+    T bM = 0, bX = K_NINF, bY = K_NINF;
 
-    double best_local = 0.0; int best_i = 0, best_j = 0, best_tbl = 0;
+    T best_local = 0; int best_i = 0, best_j = 0, best_tbl = 0;
 
     for (int i = 1; i <= m; ++i) {
         // column-0 border of this row
-        const double nbM = Local ? 0.0 : K_NINF;
-        const double nbX = Local ? K_NINF : -(go_b + i * ge_b);
-        const double nbOpen = (std::max(nbM, nbX) - go_a) - ge_a;
-        const double* sub = buf.sprof.data() + (std::size_t)a[i - 1] * sw;
+        const T nbM = Local ? T(0) : K_NINF;
+        const T nbX = Local ? K_NINF : -(go_b + i * ge_b);
+        const T nbOpen = (std::max(nbM, nbX) - go_a) - ge_a;
+        const T* sub = buf.sprof.data() + (std::size_t)a[i - 1] * sw;
 
         // this row and the previous row, striped, written in place in the tables
-        double* cM = buf.VM.data() + (std::size_t)i * rowsz + off;
-        double* cX = buf.VX.data() + (std::size_t)i * rowsz + off;
-        double* cY = buf.VY.data() + (std::size_t)i * rowsz + off;
-        const double* pM = buf.VM.data() + (std::size_t)(i - 1) * rowsz + off;
-        const double* pX = buf.VX.data() + (std::size_t)(i - 1) * rowsz + off;
-        const double* pY = buf.VY.data() + (std::size_t)(i - 1) * rowsz + off;
+        T* cM = buf.VM.data() + (std::size_t)i * rowsz + off;
+        T* cX = buf.VX.data() + (std::size_t)i * rowsz + off;
+        T* cY = buf.VY.data() + (std::size_t)i * rowsz + off;
+        const T* pM = buf.VM.data() + (std::size_t)(i - 1) * rowsz + off;
+        const T* pX = buf.VX.data() + (std::size_t)(i - 1) * rowsz + off;
+        const T* pY = buf.VY.data() + (std::size_t)(i - 1) * rowsz + off;
         // column 0 border of this row (slot 0)
         buf.VM.data()[(std::size_t)i * rowsz] = nbM;
         buf.VX.data()[(std::size_t)i * rowsz] = nbX;
@@ -167,32 +175,32 @@ static void striped_affine_full(ViterbiJob& job) {
                     vd v; v.copy_from(cY + (std::size_t)s * W, stdx::element_aligned);
                     // Lazy-F early-exit: stop once no lane of F exceeds v.  This is the
                     // ONLY std::simd *mask* operation in the whole kernel, and libstdc++'s
-                    // <experimental/simd> fails to COMPILE it under clang at AVX-512 width.
-                    // Its 512-bit mask path (_MaskImplX86Mixin::_S_to_bits) asserts the
-                    // vector's 64-bit integer lane type equals __int_for_sizeof_t<8> ==
-                    // `long` (GCC's canonical 8-byte int), but clang canonicalizes that
-                    // lane as `long long`, so `static_assert(is_same_v<long long, long>)`
-                    // fires (experimental/bits/simd_x86.h:4232).  The `long` vs `long long`
-                    // choice is a fixed property of each compiler's type model, so it
-                    // reproduces on clang 18-22 / libstdc++ 13-15 and no version bump or
-                    // flag clears it (-fgnuc-version= only breaks the build elsewhere).
-                    // Only this mask path is affected — every other op here (max/+/-/loads)
-                    // compiles under clang — so we swap just this predicate for the
-                    // equivalent AVX-512 intrinsic, and only in a clang AVX-512 TU.
-                    // Bit-exact: `_CMP_GT_OQ` gives the same per-lane result as std::simd's
-                    // ordered `>` (NaN compares false either way), and this is only an
-                    // early-exit gate — `v = max(v, F)` below is unchanged, so at worst it
-                    // iterates once more and re-applies an idempotent max.  If a future
-                    // clang compiles the std::simd form, build with
-                    // -DNWGRAD_STD_SIMD_AVX512_MASK_OK to force it back (or delete this #if).
+                    // <experimental/simd> fails to COMPILE it under clang at AVX-512 width
+                    // *for T=double*.  Its 512-bit mask path (_MaskImplX86Mixin::_S_to_bits)
+                    // asserts the vector's 64-bit integer lane type equals
+                    // __int_for_sizeof_t<8> == `long` (GCC's canonical 8-byte int), but clang
+                    // canonicalizes that lane as `long long`, so
+                    // `static_assert(is_same_v<long long, long>)` fires
+                    // (experimental/bits/simd_x86.h:4232).  The `long` vs `long long` choice
+                    // is a fixed property of each compiler's type model, so it reproduces on
+                    // clang 18-22 / libstdc++ 13-15 and no version bump or flag clears it.
+                    // The T=float mask uses a 32-bit lane (__int_for_sizeof_t<4> == `int`,
+                    // which both compilers agree on), so only the double instantiation needs
+                    // the swap; float stays on the std::simd form.  Only this mask path is
+                    // affected — every other op here compiles under clang.  Bit-exact:
+                    // `_CMP_GT_OQ` matches std::simd's ordered `>` and this is only an
+                    // early-exit gate.  -DNWGRAD_STD_SIMD_AVX512_MASK_OK forces the std::simd
+                    // form back if a future clang compiles it.
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
-                    {
+                    if constexpr (std::is_same_v<T, double>) {
                         alignas(64) double fa[8], va[8];
                         F.copy_to(fa, stdx::element_aligned);
                         v.copy_to(va, stdx::element_aligned);
                         if (_mm512_cmp_pd_mask(_mm512_load_pd(fa),
                                                _mm512_load_pd(va), _CMP_GT_OQ) == 0)
                             break;
+                    } else {
+                        if (!stdx::any_of(F > v)) break;
                     }
 #else
                     if (!stdx::any_of(F > v)) break;
@@ -210,8 +218,8 @@ static void striped_affine_full(ViterbiJob& job) {
             if constexpr (Local) {
                 for (int j = 1; j <= n; ++j) {
                     const std::size_t k = scol(j);
-                    const double mm = cM[k], xx = cX[k], yy = cY[k];
-                    const double here = std::max({mm, xx, yy});
+                    const T mm = cM[k], xx = cX[k], yy = cY[k];
+                    const T here = std::max({mm, xx, yy});
                     if (here > best_local) {
                         best_local = here; best_i = i; best_j = j;
                         best_tbl = (mm >= xx && mm >= yy) ? 0 : ((xx >= yy) ? 1 : 2);
@@ -228,9 +236,9 @@ static void striped_affine_full(ViterbiJob& job) {
     } else {
         // final cell (m, n), striped; column 0 (slot 0) when n == 0 (empty B)
         const std::size_t fn = (n == 0) ? 0 : off + scol(n);
-        const double fm = buf.VM[(std::size_t)m * rowsz + fn];
-        const double fx = buf.VX[(std::size_t)m * rowsz + fn];
-        const double fy = buf.VY[(std::size_t)m * rowsz + fn];
+        const T fm = buf.VM[(std::size_t)m * rowsz + fn];
+        const T fx = buf.VX[(std::size_t)m * rowsz + fn];
+        const T fy = buf.VY[(std::size_t)m * rowsz + fn];
         job.score = std::max({fm, fx, fy});
         job.best_i = m; job.best_j = n;
         job.best_tbl = (fm >= fx && fm >= fy) ? 0 : ((fx >= fy) ? 1 : 2);
@@ -240,9 +248,10 @@ static void striped_affine_full(ViterbiJob& job) {
     job.width = W;
 }
 
-// The registered entry for a level: dispatch Full by mode.  GuideBanded is not handled
-// here (the caller routes it to the row-wise kernel).
-static void striped_full_entry(ViterbiJob& job) {
-    if (job.align_mode) striped_affine_full<true>(job);
-    else                striped_affine_full<false>(job);
+// The registered entry for a level, per precision: dispatch Full by mode.  GuideBanded
+// is not handled here (the caller routes it to the row-wise kernel).
+template <class T>
+static void striped_full_entry(ViterbiJob<T>& job) {
+    if (job.align_mode) striped_affine_full<T, true>(job);
+    else                striped_affine_full<T, false>(job);
 }

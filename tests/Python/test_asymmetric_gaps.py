@@ -228,12 +228,14 @@ def test_gap_gradient_is_a_true_score_derivative(matrix, gap_param):
     a, b = "ACGTACGT", "AGTACT"
     base = dict(gap_open_a=5.0, gap_extend_a=1.0, gap_open_b=5.0, gap_extend_b=1.0)
 
-    score, grad = nwgrad.nw_affine_grad(a, b, params(matrix, **base))
+    # Finite-difference derivative check against a random double matrix: use the _double
+    # variants, since float32's eps~1e-7 cannot resolve an eps=1e-6 bump / 1e-4 tolerance.
+    score, grad = nwgrad.nw_affine_grad_double(a, b, params(matrix, **base))
 
     eps = 1e-6
     bumped = dict(base)
     bumped[gap_param] += eps
-    score_eps = nwgrad.nw_score_affine(a, b, params(matrix, **bumped))
+    score_eps = nwgrad.nw_score_affine_double(a, b, params(matrix, **bumped))
     d_score = (score_eps - score) / eps
 
     assert grad.to_dict()[gap_param] == pytest.approx(d_score, abs=1e-4)
@@ -243,14 +245,15 @@ def test_matrix_gradient_is_a_true_score_derivative(matrix):
     """The matrix half, under the same finite-difference check."""
     a, b = "ACGTACGT", "AGTACT"
     kw = dict(gap_open_a=5.0, gap_extend_a=1.0, gap_open_b=5.0, gap_extend_b=1.0)
-    score, grad = nwgrad.nw_affine_grad(a, b, params(matrix, **kw))
+    # Double variants: finite differencing needs the double precision (see above).
+    score, grad = nwgrad.nw_affine_grad_double(a, b, params(matrix, **kw))
 
     eps = 1e-6
     bumped_arr = matrix.to_matrix().copy()
     bumped_arr[0, 0] += eps
     bumped = nwgrad.AlignParams(
         nwgrad.SubstMatrix(bumped_arr, alphabet=ALPHABET), **kw)
-    d_score = (nwgrad.nw_score_affine(a, b, bumped) - score) / eps
+    d_score = (nwgrad.nw_score_affine_double(a, b, bumped) - score) / eps
 
     assert grad.to_dict()["matrix"][0, 0] == pytest.approx(d_score, abs=1e-4)
 

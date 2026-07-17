@@ -112,6 +112,7 @@ add_executable(nwgrad_tests
     tests/cpp/test_seq_pair.cpp
     tests/cpp/test_add_many.cpp
     tests/cpp/test_simd_bitexact.cpp
+    tests/cpp/test_simd_bitexact_f32.cpp
     ${NWGRAD_LEVEL_SOURCES}   # per-ISA kernel TUs, so kernel="simd" exercises the dispatched striped path
 )
 target_include_directories(nwgrad_tests PRIVATE
@@ -158,3 +159,14 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
     target_compile_options(stress_batch PRIVATE -O3 -Wall -Wextra)
 endif()
 target_link_libraries(stress_batch PRIVATE Threads::Threads)
+
+# ── float32 vs double kernel benchmark ────────────────────────────────────────
+# Links the per-ISA level TUs, so kernel=Simd dispatches the real striped kernel at
+# both precisions (viterbi / viterbi_f) rather than the scalar header-only fallback.
+add_executable(bench_f32 tests/cpp/bench_f32.cpp ${NWGRAD_LEVEL_SOURCES})
+target_include_directories(bench_f32 PRIVATE src/nwgrad/cpp/nwgrad)
+target_compile_features(bench_f32 PRIVATE cxx_std_20)
+if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+    target_compile_options(bench_f32 PRIVATE -O3 -Wall -Wextra)
+endif()
+target_link_libraries(bench_f32 PRIVATE Threads::Threads)

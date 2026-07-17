@@ -103,8 +103,8 @@ inline constexpr double NEG_INF = -std::numeric_limits<double>::infinity();
 // per entry against a DP of O(m * n) at ~15 ops per cell — about 2.7/m, so ~5% at
 // m=50 and ~1% at m=200 — and it buys immunity to a whole class of staleness bugs
 // when the matrix changes under a SeqPair between re-alignments.
-template<GapModel GM, AlignMode AM, AlignBand AB>
-void Aligner<GM, AM, AB>::build_profile(DpBuffer& buf) const {
+template<GapModel GM, AlignMode AM, AlignBand AB, class T>
+void Aligner<GM, AM, AB, T>::build_profile(DpBuffer& buf) const {
     const size_t w = static_cast<size_t>(n_) + 1;
     const size_t need = static_cast<size_t>(nalpha_) * w;
     if (buf.prof.size() < need) buf.prof.resize(need);
@@ -123,8 +123,8 @@ void Aligner<GM, AM, AB>::build_profile(DpBuffer& buf) const {
 // Full mode hands back a slice of the profile.  Banded mode gathers the row's short
 // span instead: a full-width profile costs O(nalpha * n) against a banded DP of only
 // O(m * band), so for a narrow band it would outcost the thing it is accelerating.
-template<GapModel GM, AlignMode AM, AlignBand AB>
-const double* Aligner<GM, AM, AB>::subrow(DpBuffer& buf, int i, int lo, int hi) const {
+template<GapModel GM, AlignMode AM, AlignBand AB, class T>
+const double* Aligner<GM, AM, AB, T>::subrow(DpBuffer& buf, int i, int lo, int hi) const {
     if constexpr (AB == AlignBand::Full) {
         (void)lo; (void)hi;
         const size_t w = static_cast<size_t>(n_) + 1;
@@ -190,8 +190,8 @@ const double* Aligner<GM, AM, AB>::subrow(DpBuffer& buf, int i, int lo, int hi) 
 // per ISA level.  Full-band Global+Local is served by the faster striped kernel
 // (run_dispatched_affine); this path is taken for GuideBanded, and as the Full
 // fallback should the striped kernel ever be absent.
-template<GapModel GM, AlignMode AM, AlignBand AB>
-void Aligner<GM, AM, AB>::viterbi_affine_simd(DpBuffer& buf, const LevelKernels& K) {
+template<GapModel GM, AlignMode AM, AlignBand AB, class T>
+void Aligner<GM, AM, AB, T>::viterbi_affine_simd(DpBuffer& buf, const LevelKernels& K) {
     using nwgrad_simd::NEG_INF;
 
     band_fill(buf.VM, NEG_INF);

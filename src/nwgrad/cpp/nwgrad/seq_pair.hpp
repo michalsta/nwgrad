@@ -15,10 +15,10 @@
 // Holds one Full and one GuideBanded aligner, reusing their DP buffers across
 // repeated align_full() / realign_banded() calls on the same SeqPair.
 
-template<GapModel GM, AlignMode AM>
+template<GapModel GM, AlignMode AM, class T = double>
 struct SeqPairState {
-    Aligner<GM, AM, AlignBand::Full>        full_al;
-    Aligner<GM, AM, AlignBand::GuideBanded> band_al;
+    Aligner<GM, AM, AlignBand::Full,        T> full_al;
+    Aligner<GM, AM, AlignBand::GuideBanded, T> band_al;
 };
 
 enum class GradMode { None, Hard, Soft };
@@ -47,12 +47,18 @@ enum class GradMode { None, Hard, Soft };
 //   - compute_grad() requires score_valid and grad_mode != None
 //   - SubstMatrix pointed to by matrix_ must outlive this object
 
-struct SeqPair {
+template<class T = double>
+struct SeqPairT {
+    // Viterbi precision T (float32 default in the Python surface, double via the named
+    // *Double variant).  Shadows the global ::DpBuffer so DpBuffer& signatures below mean
+    // this precision's buffer with no per-site edit; the gradient/score stay double.
+    using DpBuffer = DpBufferT<T>;
+
     using StateVar = std::variant<
-        SeqPairState<GapModel::Linear, AlignMode::Global>,
-        SeqPairState<GapModel::Linear, AlignMode::Local>,
-        SeqPairState<GapModel::Affine, AlignMode::Global>,
-        SeqPairState<GapModel::Affine, AlignMode::Local>
+        SeqPairState<GapModel::Linear, AlignMode::Global, T>,
+        SeqPairState<GapModel::Linear, AlignMode::Local,  T>,
+        SeqPairState<GapModel::Affine, AlignMode::Global, T>,
+        SeqPairState<GapModel::Affine, AlignMode::Local,  T>
     >;
 
     // Sequences are validated and encoded to alphabet indices here, once, using
@@ -62,7 +68,7 @@ struct SeqPair {
     // are bit-exact, so it is purely a speed knob — and it is a runtime argument,
     // not a template parameter, so StateVar above stays at four arms instead of
     // eight.  See the note on DpKernel in aligner.hpp.
-    SeqPair(std::string_view a, std::string_view b,
+    SeqPairT(std::string_view a, std::string_view b,
             const AlignParams& params,
             GapModel gm, AlignMode am,
             GradMode grad_mode = GradMode::Hard,
@@ -75,13 +81,13 @@ struct SeqPair {
           grad_(params.matrix.alphabet())
     {
         if      (gm == GapModel::Linear && am == AlignMode::Global)
-            state_.emplace<SeqPairState<GapModel::Linear, AlignMode::Global>>();
+            state_.template emplace<SeqPairState<GapModel::Linear, AlignMode::Global, T>>();
         else if (gm == GapModel::Linear && am == AlignMode::Local)
-            state_.emplace<SeqPairState<GapModel::Linear, AlignMode::Local>>();
+            state_.template emplace<SeqPairState<GapModel::Linear, AlignMode::Local, T>>();
         else if (gm == GapModel::Affine && am == AlignMode::Global)
-            state_.emplace<SeqPairState<GapModel::Affine, AlignMode::Global>>();
+            state_.template emplace<SeqPairState<GapModel::Affine, AlignMode::Global, T>>();
         else
-            state_.emplace<SeqPairState<GapModel::Affine, AlignMode::Local>>();
+            state_.template emplace<SeqPairState<GapModel::Affine, AlignMode::Local, T>>();
 
         std::visit([kernel](auto& st) {
             st.full_al.set_kernel(kernel);
@@ -343,3 +349,7 @@ private:
         else                               al.soft_grad(buf, grad_);
     }
 };
+
+// The default (double) alias keeps every existing C++ user and test unchanged; the
+// Python surface binds SeqPairT<float> as `SeqPair` and SeqPairT<double> as `SeqPairDouble`.
+using SeqPair = SeqPairT<double>;

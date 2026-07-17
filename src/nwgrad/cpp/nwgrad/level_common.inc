@@ -17,6 +17,7 @@ namespace stdx = std::experimental;
 #include <algorithm>
 #include <array>
 #include <limits>
+#include <type_traits>
 
 // For the AVX-512 mask-op workaround in kernels_impl.inl (clang + libstdc++ std::simd
 // bug).  Guarded identically to the workaround, and at global scope — intrinsics must
@@ -44,7 +45,8 @@ struct NwgradLevelRegistrar {
         // SIGILLs on non-AVX512 hardware.  register_level assembles the struct in
         // baseline code (simd_levels.cpp).
         register_level(NWGRAD_LVL_ENUM,
-                       &NWGRAD_LVL_NAME::striped_full_entry,   // affine Full: Global + Local
+                       &NWGRAD_LVL_NAME::striped_full_entry<double>,  // affine Full double: G+L
+                       &NWGRAD_LVL_NAME::striped_full_entry<float>,   // affine Full float32: G+L
                        &NWGRAD_LVL_NAME::banded_row_global,    // affine GuideBanded: whole-row ↓
                        &NWGRAD_LVL_NAME::banded_row_local,
                        NWGRAD_LVL_NAME::ROW_BLOCK);

@@ -26,7 +26,12 @@ struct BatchResult {
     explicit BatchResult(const Alphabet& alpha) : grad(alpha) {}
 };
 
-struct BatchAligner {
+template<class T = double>
+struct BatchAlignerT {
+    // Viterbi precision T (float32 default in Python, double via BatchAlignerDouble).
+    // Shadows the global ::DpBuffer; AlignParams/scores stay double.
+    using DpBuffer = DpBufferT<T>;
+
     AlignParams params;
     int    band;       // 0 = full DP; > 0 = banded with this half-width
     GapModel  gap_model;
@@ -40,7 +45,7 @@ struct BatchAligner {
     // DISPATCH macro below at four arms rather than eight.
     DpKernel kernel;
 
-    BatchAligner(AlignParams p, int band,
+    BatchAlignerT(AlignParams p, int band,
                  GapModel gm, AlignMode am, GradMode gd, int nt,
                  DpKernel k = DpKernel::Scalar)
         : params(std::move(p)), band(band),
@@ -131,7 +136,7 @@ private:
         std::vector<double>& scores,
         AlignParams& local_grad) const
     {
-        Aligner<GM, AM, AB> al;
+        Aligner<GM, AM, AB, T> al;
         al.set_kernel(kernel);
         DpBuffer buf;  // reused across iterations; grows to the largest pair seen
         const Alphabet& alpha = params.matrix.alphabet();
@@ -185,3 +190,6 @@ private:
 #undef DISPATCH
     }
 };
+
+// Default (double) alias; Python binds BatchAlignerT<float> as `BatchAligner`.
+using BatchAligner = BatchAlignerT<double>;

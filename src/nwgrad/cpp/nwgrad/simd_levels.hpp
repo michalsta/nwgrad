@@ -26,7 +26,8 @@
 #include <string>
 #include <vector>
 
-struct DpBuffer;  // defined in aligner.hpp; only referenced by pointer here
+template <class T> struct DpBufferT;   // defined in dp_buffer.hpp; referenced by pointer
+using DpBuffer = DpBufferT<double>;    // ViterbiJob carries the double buffer for now
 
 // ── Levels ────────────────────────────────────────────────────────────────────
 // Ordered weakest → strongest within an architecture.  Plain AVX is deliberately
@@ -95,29 +96,34 @@ inline SimdLevel default_level() {
 // runs striped (Global+Full) or row-wise (the rest).  Plain-typed in and out.
 
 // Everything a forward pass needs, and everything it produces — no std::simd, no
-// Aligner, no templates: the only currency that crosses a level boundary.
+// Aligner: the only currency that crosses a level boundary.  Templated on the Viterbi
+// precision T (double or float32): the substitution block, gap penalties and DP buffer
+// are all T; the reported score stays double (a T score promotes to double exactly).
+template <class T>
 struct ViterbiJob {
     // problem (sequences already encoded to alphabet indices)
     const unsigned char* a; int m;
     const unsigned char* b; int n;
-    const double* blk; int nalpha;          // substitution block, row-major nalpha×nalpha
-    double go_a, ge_a, go_b, ge_b;          // gap penalties
+    const T* blk; int nalpha;               // substitution block, row-major nalpha×nalpha
+    T go_a, ge_a, go_b, ge_b;               // gap penalties (in the Viterbi precision)
     int   align_mode;                       // 0 = Global, 1 = Local
     int   align_band;                       // 0 = Full,   1 = GuideBanded
     int   band;                             // half-width (band>0)
     const int* guide_j; int guide_len;      // guide path for GuideBanded (may be null)
 
-    // scratch/output tables live in the caller's DpBuffer
-    DpBuffer* buf;
+    // scratch/output tables live in the caller's DpBufferT<T>
+    DpBufferT<T>* buf;
 
     // results
-    double  score;
+    double  score;                          // reported as double regardless of T
     int     best_i, best_j, best_tbl;       // best_tbl: 0=M 1=X 2=Y
     int     table_layout;                   // 0 = row-major VM/VX/VY, 1 = striped
     int     seg, width;                     // striping geometry (set when layout==1)
 };
 
-using viterbi_fn = void (*)(ViterbiJob&);
+// One striped-Full entry per precision.  Both are registered by each level TU.
+using viterbi_fn   = void (*)(ViterbiJob<double>&);
+using viterbi_fn_f = void (*)(ViterbiJob<float>&);
 
 // Whole-row banded kernel for the GuideBanded path.  viterbi_affine_simd (in
 // aligner_simd.hpp) owns the banded indexing and hands this one row's worth of
@@ -132,8 +138,9 @@ using banded_row_fn = double (*)(double* __restrict, double* __restrict, double*
                                  int, int, int, double, double, double, double);
 
 struct LevelKernels {
-    viterbi_fn    viterbi = nullptr;            // striped affine Full (Global + Local)
-    banded_row_fn banded_row_global = nullptr;  // row-wise banded whole-row kernels ↓
+    viterbi_fn    viterbi = nullptr;            // striped affine Full, double (Global + Local)
+    viterbi_fn_f  viterbi_f = nullptr;          // striped affine Full, float32
+    banded_row_fn banded_row_global = nullptr;  // row-wise banded whole-row kernels ↓ (double)
     banded_row_fn banded_row_local  = nullptr;
     int           row_block = 0;                // columns per interleaved block (per-µarch)
 };
@@ -153,7 +160,7 @@ inline LevelKernels* level_table() {
 // GCC would zero-init its 56 bytes with an AVX512 GPR-broadcast (vpbroadcastd) and the
 // program would SIGILL at load on a non-AVX512 box.  Passing bare pointers keeps the
 // registrar to scalar `lea`s; the struct is assembled and stored here, in baseline code.
-void register_level(SimdLevel l, viterbi_fn viterbi,
+void register_level(SimdLevel l, viterbi_fn viterbi, viterbi_fn_f viterbi_f,
                     banded_row_fn banded_row_global, banded_row_fn banded_row_local,
                     int row_block);
 

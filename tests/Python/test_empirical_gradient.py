@@ -20,11 +20,15 @@ def grad_matrix(g):
 
 
 # Each entry: (name, grad_fn, score_fn, gap_extend, gap_open)
+# These are finite-difference gradient checks against a random *double* matrix, so they
+# use the _double variants: float32's ~7 significant digits cannot match the numerical
+# derivative to the tolerance here (that is a property of finite differencing, not a bug
+# in the float32 kernel — its bit-exactness is proven in the C++ suite).
 ALIGNERS = [
-    ("nw_linear",  nwgrad.nw_grad,        nwgrad.nw_score,        1.0,  0.0),
-    ("sw_linear",  nwgrad.sw_grad,        nwgrad.sw_score,        1.0,  0.0),
-    ("nw_affine",  nwgrad.nw_affine_grad, nwgrad.nw_score_affine, 1.0, 11.0),
-    ("sw_affine",  nwgrad.sw_affine_grad, nwgrad.sw_score_affine, 1.0, 11.0),
+    ("nw_linear",  nwgrad.nw_grad_double,        nwgrad.nw_score_double,        1.0,  0.0),
+    ("sw_linear",  nwgrad.sw_grad_double,        nwgrad.sw_score_double,        1.0,  0.0),
+    ("nw_affine",  nwgrad.nw_affine_grad_double, nwgrad.nw_score_affine_double, 1.0, 11.0),
+    ("sw_affine",  nwgrad.sw_affine_grad_double, nwgrad.sw_score_affine_double, 1.0, 11.0),
 ]
 
 IDENTITY_PAIRS = [
