@@ -1,0 +1,136 @@
+name: Wheels
+
+# Build the distributable, runtime-dispatched wheels.  Each wheel is ONE binary that
+# carries every ISA level (baseline/AVX2/AVX-512 on x86, NEON on ARM) and picks one at
+# load — so the compiler choice below is about which toolchain generates the fastest
+# std::simd kernels, not about targeting a CPU.
+#
+# COMPILER POLICY — per-arch, because clang is NOT uniformly faster (measured):
+#   * x86_64 Linux  -> clang.  ~+36% over gcc on the std::simd kernels (AVX2), and the
+#     fastest float32 config measured anywhere.
+#   * aarch64 Linux -> gcc.    On NEON gcc beats clang by ~24%; clang would ship a
+#     slower ARM wheel.
+#   * macOS arm64   -> Homebrew gcc.  Apple's own clang ships libc++, which has NO
+#     <experimental/simd> at all, so the vectorized kernels cannot be built with the
+#     system toolchain; and gcc is the faster NEON backend besides.
+#   * Windows       -> MSVC.  No <experimental/simd>; the kernels take the scalar
+#     single-ISA fallback regardless of compiler, so there is no faster option.
+#
+# Deliberately NO LTO: register_level() must be emitted as baseline code (it runs at
+# static-init on every CPU, including ones without AVX-512), and LTO could hoist a wide
+# instruction into it and SIGILL at load.  That isolation — simd_levels.cpp compiled at
+# the plain baseline — is load-bearing and LTO would defeat it.  -O3 (scikit-build-core's
+# default Release) is the optimization; the per-ISA -march flags already live in
+# CMakeLists per level TU.
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+concurrency:
+  group: wheels-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build_wheels:
+    name: Wheels ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64 (clang)
+            runner: ubuntu-latest
+            archs: x86_64
+          - name: linux-aarch64 (gcc)
+            runner: ubuntu-24.04-arm
+            archs: aarch64
+          - name: macos-arm64 (gcc)
+            runner: macos-14
+            archs: arm64
+          - name: windows-x86_64 (msvc)
+            runner: windows-latest
+            archs: AMD64
+    steps:
+      - uses: actions/checkout@v4
+
+      # macOS: the system toolchain cannot build the kernels (Apple libc++ lacks
+      # <experimental/simd>).  Install Homebrew gcc and pin CC/CXX to the versioned
+      # binaries it drops (g++-15, g++-14, ... — resolved dynamically so a Homebrew
+      # bump does not break this).  LDFLAGS statically links libstdc++/libgcc so the
+      # wheel does not depend on Homebrew's copies at the user's runtime; CMake seeds
+      # CMAKE_SHARED_LINKER_FLAGS from LDFLAGS at first configure.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # macOS: the system toolchain cannot build the kernels (Apple libc++ lacks
+      # <experimental/simd>).  Install Homebrew gcc and pin CC/CXX to the versioned
+      # binaries it drops (g++-15, g++-14, ... — resolved dynamically so a Homebrew
+      # bump does not break this).  LDFLAGS statically links libstdc++/libgcc so the
+      # wheel does not depend on Homebrew's copies at the user's runtime; CMake seeds
+      # CMAKE_SHARED_LINKER_FLAGS from LDFLAGS at first configure.  The spaced LDFLAGS
+      # value is single-quoted because cibuildwheel splits its environment on spaces.
+      - name: Set up Homebrew gcc (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install gcc
+          GXX="$(ls "$(brew --prefix)"/bin/g++-[0-9]* | sort -V | tail -1)"
+          GCC="$(ls "$(brew --prefix)"/bin/gcc-[0-9]* | sort -V | tail -1)"
+          echo "Using $GXX / $GCC"
+          echo "CIBW_ENVIRONMENT_MACOS=CC=$GCC CXX=$GXX MACOSX_DEPLOYMENT_TARGET=11.0 LDFLAGS='-static-libstdc++ -static-libgcc'" >> "$GITHUB_ENV"
+
+      - name: Install cibuildwheel
+        run: python -m pip install cibuildwheel
+
+      - name: Build wheels
+        run: python -m cibuildwheel --output-dir wheelhouse
+        env:
+          CIBW_ARCHS: ${{ matrix.archs }}
+
+          # x86_64 Linux -> clang.  Install it in each build container (manylinux uses
+          # dnf/yum, musllinux uses apk); clang picks up the image's libstdc++, which on
+          # current manylinux/musllinux is new enough for <experimental/simd>.  aarch64
+          # Linux takes neither branch and builds with the image's default gcc.
+          CIBW_BEFORE_ALL_LINUX: >
+            if [ "$(uname -m)" = "x86_64" ]; then
+              (command -v dnf && dnf install -y clang) ||
+              (command -v yum && yum install -y clang) ||
+              (command -v apk && apk add --no-cache clang) ||
+              true;
+            fi
+          CIBW_ENVIRONMENT_LINUX: >
+            CC=$([ "$(uname -m)" = "x86_64" ] && echo clang || echo gcc)
+            CXX=$([ "$(uname -m)" = "x86_64" ] && echo clang++ || echo g++)
+
+          # Windows: MSVC default; nothing to override.  (CIBW_ENVIRONMENT_MACOS is set
+          # dynamically in the step above.)
+
+          # Every built wheel is import-tested and run through the full Python suite,
+          # including the forced-simd pass, so a wheel that dispatched a broken kernel
+          # for its host ISA fails here.  test-command / test-extras come from
+          # [tool.cibuildwheel] in pyproject.toml.
+          CIBW_TEST_COMMAND: >
+            python -c "import nwgrad; print('isa', nwgrad.simd_isa(), nwgrad.compiled_with())" &&
+            python -m pytest {project}/tests/Python -q
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.name }}
+          path: ./wheelhouse/*.whl
+
+  build_sdist:
+    name: sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Build sdist
+        run: pipx run build --sdist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: ./dist/*.tar.gz
