@@ -118,55 +118,6 @@ jobs:
           # tolerance being loosened.
           NWGRAD_FORCE_KERNEL=simd pytest tests/Python/ -q
 
-  windows:
-    # The library had never been compiled with MSVC.  Nothing in it is Unix-specific,
-    # but "should compile" and "compiles" are different claims, and the simd header
-    # makes the gap wider: it carries `#pragma GCC target` regions and __builtin_cpu_*
-    # probes that MSVC has no equivalent for.  Those are #if'd out — MSVC takes the
-    # same single-entry fallback path as AArch64 — but an #if'd-out path that nobody
-    # ever compiles is exactly how a header-only library breaks for a consumer.
-    name: Windows / MSVC
-    runs-on: windows-latest
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install nanobind
-        run: pip install nanobind
-
-      # nanobind reports a Windows path with backslashes, which bash eats before CMake
-      # ever sees them.  CMake accepts forward slashes on Windows, so normalise.
-      - name: Configure
-        run: >
-          cmake -S . -B build
-          -Dnanobind_DIR="$(python -m nanobind --cmake_dir | tr '\\' '/')"
-
-      # Only the test target.  stress_batch is a developer benchmark, not a shipped
-      # artifact, and it leans on glibc-isms (the %' printf group-separator flag) that
-      # MSVC does not have.  Letting it fail this job would bury a real portability
-      # finding under noise about a benchmark nobody installs.
-      #
-      # MSVC is a multi-config generator: the build type lives here, not in the
-      # configure step, and ctest needs -C to match.
-      - name: Build
-        run: cmake --build build --target nwgrad_tests --config Debug
-
-      - name: Test
-        run: ctest --test-dir build -C Debug --output-on-failure -R cpp_tests
-
-      - name: Python tests
-        run: |
-          pip install -e ".[dev]"
-          python -c "import nwgrad; print('simd_isa() ->', nwgrad.simd_isa())"
-          pytest tests/Python/ -q
-          NWGRAD_FORCE_KERNEL=simd pytest tests/Python/ -q
-
   no-multiversion:
     # The MSVC / AArch64 fallback path, compiled on x86 where it can actually be run
     # under a sanitizer.  The Windows and ARM jobs above exercise this code, but on
@@ -330,6 +281,13 @@ jobs:
           # completely empty log.  Verified: with capture on, the injected
           # use-after-free produced rc=1 and zero bytes of output.
           pytest tests/Python/ -q -s
+          # The same suite forced onto the simd kernel, still instrumented.  The striped
+          # Viterbi writes tables in a different layout and drives raw-pointer index
+          # arithmetic the scalar path never touches, so its memory bugs only show here.
+          # This is the pass that would have caught the striped-soft out-of-bounds
+          # (own-buffer forward-backward reading striped indices into row-major FB tables):
+          # on cheap x86, under ASan, on every PR — not just on the slow arm/windows jobs.
+          NWGRAD_FORCE_KERNEL=simd pytest tests/Python/ -q -s
 
   headers:
     name: Header-only consumer

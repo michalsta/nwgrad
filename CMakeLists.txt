@@ -21,6 +21,14 @@ set(NWGRAD_LEVEL_SOURCES "")
 # register_level lives in simd_levels.cpp, compiled at the plain baseline (no wide
 # flags below touch it): its struct build/store runs at static init on every CPU, so
 # it must be baseline-legal code.  See the note in simd_levels.hpp.
+#
+# There is deliberately no MSVC special-case here.  The level TUs #include
+# <experimental/simd>, which MSVC's STL does not ship, so a source build under MSVC fails
+# at that include — an honest compile error, not a silently-degraded scalar wheel.  The
+# library does not support Windows: its reason to exist is the vectorized kernels, and a
+# scalar-only build there would be slower than tools already available.  The gate is on
+# the CPU only, never the compiler, so the day MSVC ships <experimental/simd> this begins
+# to work with no change (mingw/gcc, which use libstdc++, already do).
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
     set(NWGRAD_LEVEL_SOURCES
         ${NWGRAD_LEVEL_DIR}/simd_levels.cpp

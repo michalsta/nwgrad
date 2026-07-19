@@ -1,6 +1,7 @@
 #include "catch.hpp"
 #include "align_params.hpp"
 #include "aligner.hpp"
+#include <array>
 #include <cstring>
 
 static AlignParams unit_params(double gap_extend, double gap_open = 0.0) {

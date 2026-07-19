@@ -13,8 +13,10 @@ name: Wheels
 #   * macOS arm64   -> Homebrew gcc.  Apple's own clang ships libc++, which has NO
 #     <experimental/simd> at all, so the vectorized kernels cannot be built with the
 #     system toolchain; and gcc is the faster NEON backend besides.
-#   * Windows       -> MSVC.  No <experimental/simd>; the kernels take the scalar
-#     single-ISA fallback regardless of compiler, so there is no faster option.
+#   * Windows       -> not built.  MSVC has no <experimental/simd>, so a Windows build
+#     has no vectorized kernels and would be slower than tools already available there.
+#     A source install under MSVC fails honestly at the missing header (by design — the
+#     level-TU gate in CMakeLists is on the CPU, never the compiler).
 #
 # Deliberately NO LTO: register_level() must be emitted as baseline code (it runs at
 # static-init on every CPU, including ones without AVX-512), and LTO could hoist a wide
@@ -49,9 +51,9 @@ jobs:
           - name: macos-arm64 (gcc)
             runner: macos-14
             archs: arm64
-          - name: windows-x86_64 (msvc)
-            runner: windows-latest
-            archs: AMD64
+          # No Windows: MSVC lacks <experimental/simd>, so a Windows build has no
+          # vectorized kernels and would be slower than tools already available there.
+          # A source install under MSVC fails honestly at the missing header.
     steps:
       - uses: actions/checkout@v4
 

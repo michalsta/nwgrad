@@ -1,6 +1,7 @@
 #include "catch.hpp"
 #include "align_params.hpp"
 #include "batch.hpp"
+#include <array>
 
 static AlignParams unit_params(double gap_extend = 1.0, double gap_open = 0.0) {
     std::array<double, 400> src{};

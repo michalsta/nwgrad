@@ -1,6 +1,7 @@
 #include "catch.hpp"
 #include "subst_matrix.hpp"
 
+#include <array>
 #include <stdexcept>
 
 // Build a flat 20×20 identity-like matrix for predictable round-trip tests.

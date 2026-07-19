@@ -223,6 +223,7 @@ struct Aligner {
         check_problem();
         check_own_buf_allocated();
         ensure_fwdbwd_buf(own_buf_);  // Grow if needed
+        tables_striped_ = false; // F/B are always row-major, even after a striped Viterbi
         if constexpr (GM == GapModel::Linear) fwdbwd_linear(own_buf_);
         else                                   fwdbwd_affine(own_buf_);
         fwdbwd_done_ = any_fwdbwd_done_ = true;
