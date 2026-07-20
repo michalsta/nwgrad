@@ -140,3 +140,79 @@ jobs:
         with:
           name: sdist
           path: ./dist/*.tar.gz
+
+  # Re-tests the ACTUAL uploaded .whl files, not the build-time copy cibuildwheel
+  # already tested inside the build job. Deliberately separate from build_wheels:
+  # it catches anything the upload/download round-trip could break, and it is what
+  # publish gates on, so a corrupt or mislabeled artifact fails closed instead of
+  # reaching PyPI. One wheel is built per (platform x CPython version); each is
+  # installed into a fresh interpreter of the matching version (via uv, which can
+  # provision arbitrary CPython versions on demand) and put through the full suite.
+  test_wheels:
+    name: Test wheels ${{ matrix.name }}
+    needs: build_wheels
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64 (clang)
+            runner: ubuntu-latest
+          - name: linux-aarch64 (gcc)
+            runner: ubuntu-24.04-arm
+          - name: macos-arm64 (gcc)
+            runner: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-${{ matrix.name }}
+          path: wheelhouse
+
+      - uses: astral-sh/setup-uv@v8.3.2
+
+      - name: Install and test each wheel with its matching interpreter
+        run: |
+          set -eu
+          for whl in wheelhouse/*.whl; do
+            # e.g. nwgrad-0.2.0-cp312-cp312-manylinux...whl -> tag "cp312" -> "3.12"
+            tag=$(basename "$whl" | cut -d- -f3)
+            pyver=$(echo "$tag" | sed -E 's/^cp([0-9])([0-9]+)$/\1.\2/')
+            echo "::group::$whl on Python $pyver"
+            uv venv ".venv-$tag" --python "$pyver"
+            uv pip install --python ".venv-$tag/bin/python" "${whl}[dev]"
+            ".venv-$tag/bin/python" -c "import nwgrad; print('isa', nwgrad.simd_isa(), nwgrad.compiled_with())"
+            ".venv-$tag/bin/python" -m pytest tests/Python -q
+            echo "::endgroup::"
+          done
+
+  # Trusted publishing (OIDC) -- no stored token. This repo+workflow must be
+  # registered as a trusted publisher on the PyPI project page first (Publishing ->
+  # Trusted Publishers -> Add: owner "michalsta", repo "nwgrad", workflow
+  # "wheels.yml", environment "pypi"). Gated on test_wheels so a wheel that fails
+  # its post-upload retest never reaches PyPI, and restricted to tag pushes so a
+  # manual workflow_dispatch run (used to test the build matrix) never publishes.
+  publish:
+    name: Publish to PyPI
+    needs: [test_wheels, build_sdist]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/nwgrad
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
