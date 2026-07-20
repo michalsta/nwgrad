@@ -45,24 +45,27 @@ jobs:
           - name: linux-x86_64 (clang)
             runner: ubuntu-latest
             archs: x86_64
+            cc: clang
+            cxx: clang++
           - name: linux-aarch64 (gcc)
             runner: ubuntu-24.04-arm
             archs: aarch64
+            cc: gcc
+            cxx: g++
           - name: macos-arm64 (gcc)
             runner: macos-14
             archs: arm64
+            # cc/cxx unused on macOS — CIBW_ENVIRONMENT_MACOS (set dynamically in the
+            # Homebrew step) pins the versioned Homebrew g++.  Placeholders keep the
+            # CIBW_ENVIRONMENT_LINUX template below from expanding to a bare "CC= CXX=".
+            cc: gcc
+            cxx: g++
           # No Windows: MSVC lacks <experimental/simd>, so a Windows build has no
           # vectorized kernels and would be slower than tools already available there.
           # A source install under MSVC fails honestly at the missing header.
     steps:
       - uses: actions/checkout@v4
 
-      # macOS: the system toolchain cannot build the kernels (Apple libc++ lacks
-      # <experimental/simd>).  Install Homebrew gcc and pin CC/CXX to the versioned
-      # binaries it drops (g++-15, g++-14, ... — resolved dynamically so a Homebrew
-      # bump does not break this).  LDFLAGS statically links libstdc++/libgcc so the
-      # wheel does not depend on Homebrew's copies at the user's runtime; CMake seeds
-      # CMAKE_SHARED_LINKER_FLAGS from LDFLAGS at first configure.
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -102,9 +105,10 @@ jobs:
               (command -v apk && apk add --no-cache clang) ||
               true;
             fi
-          CIBW_ENVIRONMENT_LINUX: >
-            CC=$([ "$(uname -m)" = "x86_64" ] && echo clang || echo gcc)
-            CXX=$([ "$(uname -m)" = "x86_64" ] && echo clang++ || echo g++)
+          # Plain NAME=value — cibuildwheel parses CIBW_ENVIRONMENT with bashlex and
+          # rejects command substitution ($(...)), so the compiler is chosen per matrix
+          # entry (the arms are already split by arch) rather than by a runtime uname test.
+          CIBW_ENVIRONMENT_LINUX: CC=${{ matrix.cc }} CXX=${{ matrix.cxx }}
 
           # Windows: MSVC default; nothing to override.  (CIBW_ENVIRONMENT_MACOS is set
           # dynamically in the step above.)
