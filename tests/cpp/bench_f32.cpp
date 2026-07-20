@@ -80,7 +80,7 @@ static double run_pass(bool grad,
             size_t i = next.fetch_add(1, std::memory_order_relaxed);
             if (i >= N) break;
             al.set_problem(std::span<const uint8_t>(A[i]), std::span<const uint8_t>(B[i]), p);
-            al.set_kernel(DpKernel::Simd);
+            al.set_kernel(kBackendAuto);
             al.compute_viterbi(buf);
             if (grad) al.hard_grad(buf, grad_acc);
         }

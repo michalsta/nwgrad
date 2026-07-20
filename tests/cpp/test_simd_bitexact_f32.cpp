@@ -12,7 +12,7 @@
 // exactly the tables the fill wrote, and the hard gradient is identical.
 //
 // It also confirms the float striped kernel is genuinely exercised: nwgrad_tests links
-// the level TUs, so active_kernels().viterbi_f is non-null and the Full path dispatches
+// the level TUs, so the level's float striped entry is registered and the Full path dispatches
 // to it rather than falling back to the scalar fill.
 
 #include "catch.hpp"
@@ -70,7 +70,7 @@ void check_bit_exact_f32(const AlignParams& p, const std::string& a, const std::
     DpBufferT<float> buf_scalar, buf_simd;
 
     al.set_problem(a, b, p);
-    al.set_kernel(DpKernel::Scalar);
+    al.set_kernel(kBackendScalar);
     al.compute_viterbi(buf_scalar);
     const double score_scalar = al.score();
     AlignParams grad_scalar = AlignParams::zeros_like(p);
@@ -81,7 +81,7 @@ void check_bit_exact_f32(const AlignParams& p, const std::string& a, const std::
     std::vector<float> rmY = al.to_row_major(buf_scalar.VY);
 
     al.set_problem(a, b, p);
-    al.set_kernel(DpKernel::Simd);
+    al.set_kernel(kBackendAuto);
     al.compute_viterbi(buf_simd);
     const double score_simd = al.score();
     AlignParams grad_simd = AlignParams::zeros_like(p);
@@ -119,7 +119,7 @@ TEST_CASE("f32 striped kernel is actually dispatched (not a scalar fallback)", "
     // scalar fill.  Prove it does not: the level's float striped entry is registered, and
     // a Simd run over a length that is not a multiple of the vector width leaves the table
     // in the padded striped layout (buffer larger than the row-major (m+1)(n+1)).
-    REQUIRE(active_kernels().viterbi_f != nullptr);
+    REQUIRE(level_kernels(best_simd_backend()).viterbi_f != nullptr);
 
     AlignParams p = int_params(11.0, 1.0, 11.0, 1.0);
     std::mt19937_64 rng(1234);
@@ -128,7 +128,7 @@ TEST_CASE("f32 striped kernel is actually dispatched (not a scalar fallback)", "
     Aligner<GapModel::Affine, AlignMode::Global, AlignBand::Full, float> al;
     DpBufferT<float> buf;
     al.set_problem(a, b, p);
-    al.set_kernel(DpKernel::Simd);
+    al.set_kernel(kBackendAuto);
     al.compute_viterbi(buf);
     const size_t row_major = (a.size() + 1) * (b.size() + 1);
     REQUIRE(buf.VM.size() > row_major);   // striped rows are padded to (seg+1)*W > (n+1)
@@ -148,11 +148,11 @@ TEST_CASE("f32 gives the correct score vs double — integer matrix", "[simd]") 
 
         Aligner<GapModel::Affine, AlignMode::Global, AlignBand::Full, double> ad;
         DpBufferT<double> bd;
-        ad.set_problem(a, b, p); ad.set_kernel(DpKernel::Simd); ad.compute_viterbi(bd);
+        ad.set_problem(a, b, p); ad.set_kernel(kBackendAuto); ad.compute_viterbi(bd);
 
         Aligner<GapModel::Affine, AlignMode::Global, AlignBand::Full, float> af;
         DpBufferT<float> bf;
-        af.set_problem(a, b, p); af.set_kernel(DpKernel::Simd); af.compute_viterbi(bf);
+        af.set_problem(a, b, p); af.set_kernel(kBackendAuto); af.compute_viterbi(bf);
 
         REQUIRE(af.score() == ad.score());   // integer optimum, exact in both
     }

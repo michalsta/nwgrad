@@ -69,8 +69,8 @@
 // its own translation unit with that level's real -march flag (see simd_levels.hpp
 // and the level_*.cpp TUs).  This file holds no #pragma GCC target machinery and no
 // second ISA probe: the striped Full kernel and the row-wise GuideBanded leaf
-// kernels both come from the one LevelKernels table, resolved once by active_level()
-// and overridable via set_isa_level / NWGRAD_ISA.  A header-only consumer who links
+// kernels both come from one LevelKernels table, selected by the aligner's backend (the
+// global default when "auto", overridable via set_isa_level / NWGRAD_ISA).  A header-only consumer who links
 // no level TU gets nullptr kernels and falls back to the scalar path (run_viterbi).
 
 #ifndef NWGRAD_ALIGNER_HPP_INCLUDED
@@ -174,7 +174,7 @@ const double* Aligner<GM, AM, AB, T>::subrow(DpBuffer& buf, int i, int lo, int h
 // straight to viterbi_linear() regardless of the kernel field.  This is what a runtime
 // kernel selector is *for*: a compile-time template parameter would have forced us
 // either to ship a kernel we know to be slower, or to make the configuration fail to
-// compile.  DpKernel::Simd stays a legal request for a linear aligner — it simply
+// compile.  A simd backend stays a legal request for a linear aligner — it simply
 // returns the fastest linear kernel that exists, which is the scalar one.
 // ═════════════════════════════════════════════════════════════════════════════
 // Viterbi (Simd) — Affine gap model, GuideBanded (and Full fallback)

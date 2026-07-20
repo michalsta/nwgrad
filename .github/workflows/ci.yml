@@ -87,8 +87,9 @@ jobs:
         run: cmake --build build -j"$(nproc)"
 
       # Includes test_simd_bitexact, which asserts the NEON-vectorized tables are
-      # bit-identical to the scalar ones.  The NWGRAD_ISA cases are no-ops here (there
-      # is no dispatch on AArch64) and simply re-run baseline, which is harmless.
+      # bit-identical to the scalar ones.  The NWGRAD_ISA cases are no-ops here (there is
+      # one level, neon; x86 level names resolve to auto = neon), so they simply re-run the
+      # neon level, which is harmless.
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
@@ -104,7 +105,7 @@ jobs:
           grep "aligner_simd.hpp" vec.log || true
           if ! grep -q "aligner_simd.hpp.*vectorized" vec.log; then
             echo "::error::the simd row kernels did NOT vectorize on AArch64 —" \
-                 "the query profile is not doing its job and kernel=simd is pure overhead here"
+                 "the query profile is not doing its job and a simd backend is pure overhead here"
             exit 1
           fi
 

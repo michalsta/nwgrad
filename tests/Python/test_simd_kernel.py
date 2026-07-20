@@ -33,15 +33,15 @@ def seq(rng, length):
 
 
 def test_simd_isa_is_reported():
-    assert nwgrad.simd_isa() in ("baseline", "avx2", "avx512", "neon")
+    assert nwgrad.simd_isa() in ("scalar_fallback", "sse2", "avx2", "avx512", "neon")
 
 
 def test_bad_kernel_name_raises():
     # A typo that silently selected the slow path would be undetectable by any test,
     # so it throws rather than falling back.
     p = params()
-    for bad in ("SIMD", "sse", "avx2", ""):
-        with pytest.raises(Exception, match="kernel"):
+    for bad in ("SIMD", "sse", "simd", "scalar", ""):
+        with pytest.raises(Exception, match="backend"):
             nwgrad.nw_score_affine("ACDE", "ACDE", p, kernel=bad)
 
 
@@ -52,7 +52,7 @@ def test_scores_are_exactly_equal(fn):
     f = getattr(nwgrad, fn)
     for _ in range(60):
         a, b = seq(rng, rng.randint(1, 80)), seq(rng, rng.randint(1, 80))
-        assert f(a, b, p, kernel="scalar") == f(a, b, p, kernel="simd")
+        assert f(a, b, p, kernel="scalar_fallback") == f(a, b, p, kernel="auto")
 
 
 @pytest.mark.parametrize("fn", ["nw_affine_grad", "sw_affine_grad"])
@@ -69,8 +69,8 @@ def test_hard_gradients_are_exactly_equal(fn):
     f = getattr(nwgrad, fn)
     for _ in range(40):
         a, b = seq(rng, rng.randint(2, 70)), seq(rng, rng.randint(2, 70))
-        s_scalar, g_scalar = f(a, b, p, kernel="scalar")
-        s_simd, g_simd = f(a, b, p, kernel="simd")
+        s_scalar, g_scalar = f(a, b, p, kernel="scalar_fallback")
+        s_simd, g_simd = f(a, b, p, kernel="auto")
 
         assert s_scalar == s_simd
         assert g_scalar.matrix.to_matrix().tobytes() == g_simd.matrix.to_matrix().tobytes()
@@ -87,14 +87,14 @@ def test_batch_aligner_kernels_agree():
     sb = [seq(rng, 60) for _ in range(200)]
 
     out = {}
-    for kern in ("scalar", "simd"):
+    for kern in ("scalar_fallback", "auto"):
         ba = nwgrad.BatchAligner(p, gap_model="affine", mode="global",
                                  grad_mode="hard", n_threads=4, kernel=kern)
         out[kern] = ba.align(sa, sb)
 
-    assert list(out["scalar"].scores) == list(out["simd"].scores)
-    assert (out["scalar"].grad.matrix.to_matrix().tobytes()
-            == out["simd"].grad.matrix.to_matrix().tobytes())
+    assert list(out["scalar_fallback"].scores) == list(out["auto"].scores)
+    assert (out["scalar_fallback"].grad.matrix.to_matrix().tobytes()
+            == out["auto"].grad.matrix.to_matrix().tobytes())
 
 
 def test_seq_pair_kernels_agree_including_banded_realign():
@@ -103,7 +103,7 @@ def test_seq_pair_kernels_agree_including_banded_realign():
     a, b = seq(rng, 120), seq(rng, 120)
 
     out = {}
-    for kern in ("scalar", "simd"):
+    for kern in ("scalar_fallback", "auto"):
         sp = nwgrad.SeqPair(a, b, p, gap_model="affine", mode="global",
                             grad_mode="hard", kernel=kern)
         sp.alloc_dp()
@@ -115,7 +115,7 @@ def test_seq_pair_kernels_agree_including_banded_realign():
         sp.realign_banded(12)
         out[kern] = (full, sp.score, sp.aligned())
 
-    assert out["scalar"] == out["simd"]
+    assert out["scalar_fallback"] == out["auto"]
 
 
 def test_linear_kernel_is_a_documented_no_op():
@@ -123,11 +123,11 @@ def test_linear_kernel_is_a_documented_no_op():
 
     Its recurrence collapses to a single carry that is a pure latency chain, and the
     scalar loop already sits on that floor — a vectorized version was written,
-    measured slower, and deleted.  kernel="simd" therefore stays *legal* for a linear
+    measured slower, and deleted.  kernel="auto" therefore stays *legal* for a linear
     aligner and quietly returns the fastest linear kernel there is.  It must not throw.
     """
     rng = random.Random(5)
     p = params(gap_open=0.0, gap_extend=1.0)
     for _ in range(20):
         a, b = seq(rng, rng.randint(1, 60)), seq(rng, rng.randint(1, 60))
-        assert nwgrad.nw_score(a, b, p, kernel="simd") == nwgrad.nw_score(a, b, p, kernel="scalar")
+        assert nwgrad.nw_score(a, b, p, kernel="auto") == nwgrad.nw_score(a, b, p, kernel="scalar_fallback")

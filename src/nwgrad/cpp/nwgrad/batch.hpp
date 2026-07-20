@@ -43,11 +43,11 @@ struct BatchAlignerT {
     // above — the two kernels are bit-exact, so this never changes a result, only a
     // duration.  Keeping it off the template parameter list is what leaves the
     // DISPATCH macro below at four arms rather than eight.
-    DpKernel kernel;
+    int kernel;   // Viterbi backend (kBackendAuto/kBackendScalar or a SimdLevel index)
 
     BatchAlignerT(AlignParams p, int band,
                  GapModel gm, AlignMode am, GradMode gd, int nt,
-                 DpKernel k = DpKernel::Scalar)
+                 int k = kBackendAuto)
         : params(std::move(p)), band(band),
           gap_model(gm), align_mode(am), grad_mode(gd), n_threads(nt), kernel(k) {}
 

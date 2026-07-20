@@ -150,10 +150,12 @@ add_test(NAME cpp_tests COMMAND nwgrad_tests)
 # choice forced, which is what makes the AVX2 / AVX-512 clones *tested* rather than
 # merely compiled: a CI runner with AVX2 executes the AVX2 kernel here.
 #
-# An ISA the CPU cannot run falls back to baseline rather than trapping, so every one
-# of these is safe to run everywhere — it simply re-tests baseline on a machine that
-# lacks the hardware.  That is why they are unconditional.
-foreach(isa baseline avx avx2 avx512)
+# An ISA the CPU cannot run resolves to auto (best available) rather than trapping, so
+# every one of these is safe to run everywhere — it simply re-tests the best level on a
+# machine that lacks the named hardware.  That is why they are unconditional.  Names are
+# the unified backend vocabulary (sse2 replaces the old "baseline"; neon is the AArch64
+# level, a no-op on x86).
+foreach(isa sse2 avx2 avx512 neon)
     add_test(NAME cpp_tests_isa_${isa} COMMAND nwgrad_tests "[simd]")
     set_tests_properties(cpp_tests_isa_${isa}
         PROPERTIES ENVIRONMENT "NWGRAD_ISA=${isa}")

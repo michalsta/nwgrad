@@ -18,16 +18,16 @@ enum class GapModel  { Linear, Affine };
 enum class AlignMode { Global, Local  };
 enum class AlignBand { Full,   GuideBanded };
 
-// Which Viterbi implementation fills the DP tables.  Scalar is the original and
-// the default; Simd is a vectorized rewrite that is *bit-exact* with it — the
-// tables it writes are identical down to the last bit, which is what lets the
-// exact-float-equality tracebacks below keep working unchanged.  The choice is a
-// runtime field, not a template parameter: the branch is taken once per
-// compute_viterbi() and amortized over m*n cells.
-//
-// The kernel selects the Viterbi (and hence hard_grad) path only.  Forward-backward
-// and soft_grad are computed by the same shared code either way.
-enum class DpKernel { Scalar, Simd };
+// Which Viterbi backend fills the DP tables is a runtime field (backend_, below), one of
+// the unified vocabulary in simd_levels.hpp: "scalar_fallback" (the original plain
+// kernel), "auto" (defer to the global default = best simd), or a named simd level
+// ("sse2"/"avx2"/"avx512"/"neon").  Every simd level is *bit-exact* with the scalar one —
+// identical tables to the last bit — which is what lets the exact-float-equality
+// tracebacks keep working unchanged; so the backend is a speed knob, never a correctness
+// one.  It selects the Viterbi (hence hard_grad) path only; forward-backward and soft_grad
+// are the same shared code either way.  Runtime, not a template parameter: the branch is
+// taken once per compute_viterbi() and amortized over m*n cells.  Backends are encoded as
+// ints (kBackendAuto / kBackendScalar / a SimdLevel index) so an aligner can store one.
 
 // ── Utility: convert a pair of aligned strings to a guide_j vector ────────────
 //
@@ -207,8 +207,11 @@ struct Aligner {
     // Select the DP kernel.  Scalar (the default) and Simd write bit-identical
     // tables; Simd is the vectorized one.  Affects compute_viterbi() only —
     // compute_forward_back() is shared and ignores this.
-    void set_kernel(DpKernel k) noexcept { kernel_ = k; }
-    DpKernel kernel() const noexcept { return kernel_; }
+    // Set the Viterbi backend: kBackendAuto (defer to the global default), kBackendScalar
+    // (scalar fallback), or a SimdLevel index.  simd_levels.hpp::parse_backend() turns the
+    // string vocabulary ("scalar_fallback"/"auto"/"sse2"/"avx2"/...) into this int.
+    void set_kernel(int backend) noexcept { backend_ = backend; }
+    int  kernel() const noexcept { return backend_; }
 
     void compute_viterbi() {
         check_problem();
@@ -378,7 +381,7 @@ private:
     int    striped_seg_    = 0;
     int    striped_w_      = 1;
 
-    DpKernel kernel_ = DpKernel::Scalar;  // which Viterbi fills the tables
+    int backend_ = kBackendAuto;  // which Viterbi backend fills the tables (default: auto)
 
     bool problem_set_       = false;
     bool own_buf_allocated_ = false; // own buffer shell has been allocated
@@ -721,50 +724,46 @@ private:
         return gj;
     }
 
-    // ── Kernel dispatch ───────────────────────────────────────────────────────
+    // ── Backend dispatch ──────────────────────────────────────────────────────
     //
-    // The one place in the library where the scalar/simd choice exists.  The
-    // branch is taken once per DP, not once per cell.  The two kernels write
-    // bit-identical tables, so nothing downstream of here can tell them apart.
-    // The linear model has no Simd kernel — deliberately.  Its recurrence collapses
-    // to a single carry that is a pure latency chain (~6 cycles/cell, unbreakable by
-    // any vector width), and the scalar loop already runs at ~9 cycles/cell against
-    // that floor.  A vectorized linear kernel was written, measured at 0.90x, and
-    // deleted.  See the long note in aligner_simd.hpp.  DpKernel::Simd therefore
-    // remains a legal request for a linear aligner; it simply returns the fastest
-    // linear kernel there is, which is the scalar one.
+    // The one place in the library where the scalar/simd choice exists.  The branch is
+    // taken once per DP, not once per cell.  Every simd level writes tables bit-identical
+    // to the scalar one, so nothing downstream can tell them apart.  The linear model has
+    // no simd kernel — deliberately.  Its recurrence collapses to a single carry that is a
+    // pure latency chain (~6 cycles/cell, unbreakable by any vector width), and the scalar
+    // loop already runs at ~9 cycles/cell against that floor.  A vectorized linear kernel
+    // was written, measured at 0.90x, and deleted.  So any simd backend is a legal request
+    // for a linear aligner; it simply runs the fastest linear kernel there is, the scalar.
     void run_viterbi(DpBuffer& buf) {
         // Default to row-major; only the striped Full kernel (run_dispatched_affine) flips
         // this back on.  Every other fill here writes VM/VX/VY row-major.
         tables_striped_ = false;
         if constexpr (GM == GapModel::Linear) {
-            viterbi_linear(buf);
-        } else if (kernel_ == DpKernel::Simd) {
-            // One ISA table, resolved once, serves both simd kernels.  Full (Global or
-            // Local) takes the faster striped kernel; GuideBanded takes the row-wise
-            // one, whose vectorized leaf loops come from the same table.  Both are
-            // bit-exact against the scalar path, so kernel="simd" only changes speed.
-            // If no level TU is linked (header-only single-level build), every pointer
-            // in the table is null and we fall through to the scalar Viterbi.
-            const LevelKernels& K = active_kernels();
-            if constexpr (AB == AlignBand::Full) {
-                // The striped Full kernel exists at both precisions (viterbi / viterbi_f).
-                if constexpr (std::is_same_v<T, double>) {
-                    if (K.viterbi)   { run_dispatched_affine(buf, K); return; }
-                } else {
-                    if (K.viterbi_f) { run_dispatched_affine(buf, K); return; }
-                }
-            }
-            // The row-wise banded kernel is double-only for now; float banded falls back
-            // to the (T-templated) scalar fill.  Gated so viterbi_affine_simd — whose body
-            // is double-typed — is never instantiated for T=float.
-            if constexpr (std::is_same_v<T, double>) {
-                if (K.banded_row_local) { viterbi_affine_simd(buf, K); return; }
-            }
-            viterbi_affine(buf);
-        } else {
-            viterbi_affine(buf);
+            viterbi_linear(buf);   // no simd linear kernel: every backend is scalar here
+            return;
         }
+        // Resolve this aligner's backend: auto -> the global default, then scalar or a level.
+        const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
+        if (backend == kBackendScalar) { viterbi_affine(buf); return; }
+
+        // A simd level: its kernels.  If that level's TU was not linked (header-only
+        // single-level build), every pointer is null and we fall through to scalar.
+        const LevelKernels& K = level_kernels(backend);
+        if constexpr (AB == AlignBand::Full) {
+            // The striped Full kernel exists at both precisions (viterbi / viterbi_f).
+            if constexpr (std::is_same_v<T, double>) {
+                if (K.viterbi)   { run_dispatched_affine(buf, K); return; }
+            } else {
+                if (K.viterbi_f) { run_dispatched_affine(buf, K); return; }
+            }
+        }
+        // The row-wise banded kernel is double-only for now; float banded falls back to the
+        // (T-templated) scalar fill.  Gated so viterbi_affine_simd — whose body is
+        // double-typed — is never instantiated for T=float.
+        if constexpr (std::is_same_v<T, double>) {
+            if (K.banded_row_local) { viterbi_affine_simd(buf, K); return; }
+        }
+        viterbi_affine(buf);
     }
 
     // Build a plain ViterbiJob from Aligner state, run the dispatched (leveled) kernel,

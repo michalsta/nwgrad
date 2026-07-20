@@ -49,12 +49,12 @@ inline const char* level_name(SimdLevel l) {
 #if defined(__aarch64__) || defined(_M_ARM64)
         case SimdLevel::Neon:     return "neon";
 #else
-        case SimdLevel::Baseline: return "baseline";
+        case SimdLevel::Baseline: return "sse2";
         case SimdLevel::Avx2:     return "avx2";
         case SimdLevel::Avx512:   return "avx512";
 #endif
     }
-    return "baseline";
+    return "sse2";
 }
 
 // ── What the CPU can actually run ─────────────────────────────────────────────
@@ -77,17 +77,39 @@ inline std::vector<SimdLevel> detect_available_levels() {
     return out;
 }
 
-// The strongest available level, honouring a NWGRAD_ISA override at first use.
-inline SimdLevel default_level() {
-    const auto avail = detect_available_levels();
-    SimdLevel best = avail.back();
-    if (const char* want = std::getenv("NWGRAD_ISA")) {
-        for (SimdLevel l : avail)
-            if (std::strcmp(level_name(l), want) == 0) best = l;
-        // an unsupported request silently keeps `best` — never select above the CPU.
-    }
-    return best;
+// ── Backend vocabulary ────────────────────────────────────────────────────────
+//
+// One unified vocabulary selects the Viterbi backend, per aligner and as a global
+// default: "scalar_fallback" (the plain scalar kernel), "auto" (the strongest simd
+// level the CPU can run), or a named simd level — "sse2"/"avx2"/"avx512" on x86,
+// "neon" on AArch64.  Backends are encoded as ints so an aligner can store one:
+//   kBackendAuto (-2)   defer to the global default (a per-aligner value only)
+//   kBackendScalar (-1) the scalar fallback
+//   0..                 a SimdLevel index — a simd kernel at that ISA level
+constexpr int kBackendAuto   = -2;
+constexpr int kBackendScalar = -1;
+
+// "scalar_fallback" | "auto" | a simd-level name the CPU can run → backend int.  Throws
+// on an unknown name, or a simd level this CPU cannot run (we never select above the
+// hardware — that would SIGILL).
+inline int parse_backend(const std::string& name) {
+    if (name == "scalar_fallback") return kBackendScalar;
+    if (name == "auto")            return kBackendAuto;
+    for (SimdLevel l : detect_available_levels())
+        if (name == level_name(l)) return (int)l;
+    throw std::invalid_argument(
+        "nwgrad: backend \"" + name + "\" is not available on this CPU — expected "
+        "\"scalar_fallback\", \"auto\", or a simd level this CPU runs (see available_isa_levels())");
 }
+
+inline std::string backend_name(int backend) {
+    if (backend == kBackendScalar) return "scalar_fallback";
+    if (backend == kBackendAuto)   return "auto";
+    return level_name((SimdLevel)backend);
+}
+
+// The strongest simd level the CPU can run — what "auto" resolves to.
+inline int best_simd_backend() { return (int)detect_available_levels().back(); }
 
 // ── The dispatch table ────────────────────────────────────────────────────────
 //
@@ -164,49 +186,62 @@ void register_level(SimdLevel l, viterbi_fn viterbi, viterbi_fn_f viterbi_f,
                     banded_row_fn banded_row_global, banded_row_fn banded_row_local,
                     int row_block);
 
-// ── The active selection ──────────────────────────────────────────────────────
+// ── The global default backend ────────────────────────────────────────────────
 //
-// Resolved once (lazily) to default_level(); overridable via set_isa_level for tests.
-// Changing it is NOT thread-safe — do it before dispatching work.
+// The backend used by any aligner whose backend is "auto".  Resolved lazily: NWGRAD_ISA
+// if set and valid (it may name "scalar_fallback" / "auto" / a level), otherwise "auto"
+// = the strongest simd level.  set_isa_level() changes it at runtime.  Changing it is
+// NOT thread-safe — do it before dispatching work.
+constexpr int kBackendUnset = -1000;
 
-inline std::atomic<int>& active_level_slot() {
-    static std::atomic<int> slot{-1};
+inline std::atomic<int>& default_backend_slot() {
+    static std::atomic<int> slot{kBackendUnset};
     return slot;
 }
 
-inline SimdLevel active_level() {
-    int v = active_level_slot().load(std::memory_order_relaxed);
-    if (v < 0) {
-        v = (int)default_level();
-        active_level_slot().store(v, std::memory_order_relaxed);
-    }
-    return (SimdLevel)v;
-}
-
-// Force a level.  Throws if the CPU cannot run it — we never select above hardware
-// (that would SIGILL); forcing *down* (e.g. baseline on an AVX2 box) is how per-level
-// bit-exactness is tested on capable hardware.
-inline void set_isa_level(const std::string& name) {
-    for (SimdLevel l : detect_available_levels())
-        if (name == level_name(l)) {
-            active_level_slot().store((int)l, std::memory_order_relaxed);
-            return;
+inline int global_default_backend() {
+    int v = default_backend_slot().load(std::memory_order_relaxed);
+    if (v == kBackendUnset) {
+        int b = best_simd_backend();   // "auto"
+        if (const char* want = std::getenv("NWGRAD_ISA")) {
+            try {
+                int parsed = parse_backend(want);
+                b = (parsed == kBackendAuto) ? best_simd_backend() : parsed;
+            } catch (const std::exception&) {
+                // Unknown/unavailable NWGRAD_ISA: keep auto (best simd), never throw at init.
+            }
         }
-    throw std::invalid_argument(
-        "nwgrad: ISA level \"" + name + "\" is not available on this CPU");
+        default_backend_slot().store(b, std::memory_order_relaxed);
+        v = b;
+    }
+    return v;   // kBackendScalar or a level index, never Auto/Unset
 }
 
-inline std::string get_isa_level() { return level_name(active_level()); }
+// Set the global default backend.  Accepts "scalar_fallback" | "auto" | a level the CPU
+// runs; throws on a level it cannot.  Forcing *down* (e.g. "sse2" on an AVX2 box) is how
+// a level's bit-exactness is tested on capable hardware.
+inline void set_isa_level(const std::string& name) {
+    int b = parse_backend(name);
+    if (b == kBackendAuto) b = best_simd_backend();
+    default_backend_slot().store(b, std::memory_order_relaxed);
+}
 
+inline std::string get_isa_level() { return backend_name(global_default_backend()); }
+
+// Every backend selectable on this CPU: the scalar fallback plus each simd level it can
+// run (weakest first).  "auto" is always settable but omitted here — it is a meta-value
+// that resolves to the strongest of these.
 inline std::vector<std::string> available_isa_levels() {
     std::vector<std::string> out;
+    out.push_back("scalar_fallback");
     for (SimdLevel l : detect_available_levels()) out.push_back(level_name(l));
     return out;
 }
 
-// The active level's kernels.  If the level TU for the active level was not linked
-// (e.g. a header-only single-level build), its slot may hold nullptrs — callers fall
-// back to the in-header scalar/templated path.
-inline const LevelKernels& active_kernels() {
-    return level_table()[(int)active_level()];
+// The kernels for a specific simd level (a 0.. SimdLevel index).  The DP resolves its
+// per-aligner backend to a level and calls this; if that level's TU was not linked (a
+// header-only single-level build), the slot holds nullptrs and the DP falls back to the
+// in-header scalar path.
+inline const LevelKernels& level_kernels(int level) {
+    return level_table()[level];
 }

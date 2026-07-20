@@ -42,16 +42,12 @@ using nb_arr_f64_1d = nb::ndarray<nb::numpy, double, nb::ndim<1>>;
 
 // ── Aligner factory: picks Full or GuideBanded at runtime. ───────────────────
 
-// "scalar" (default) | "simd".  The two Viterbi kernels write bit-identical tables,
-// so this is a speed knob and never a correctness one.  Anything unrecognised is a
-// typo, and a typo that silently gave you the slow path would be undetectable — so
-// it throws.
-inline DpKernel parse_kernel(const std::string& k) {
-    if (k == "scalar") return DpKernel::Scalar;
-    if (k == "simd")   return DpKernel::Simd;
-    throw std::invalid_argument(
-        "nwgrad: kernel must be \"scalar\" or \"simd\", got \"" + k + "\"");
-}
+// The `kernel=` string names the Viterbi backend: "auto" (default; best simd the CPU
+// runs), "scalar_fallback", or a named simd level ("sse2"/"avx2"/"avx512"/"neon").  Every
+// simd level is bit-exact with the scalar one, so it is a speed knob and never a
+// correctness one.  simd_levels.hpp::parse_backend() turns the string into a backend int
+// and throws on anything unrecognised or a level this CPU cannot run — a typo that
+// silently gave you the wrong path would be undetectable.
 
 // TYPE is the Viterbi precision (float32 by default in the Python surface, double via
 // the _double-suffixed variant).  The DP buffer and Aligner take that precision; params
@@ -59,7 +55,7 @@ inline DpKernel parse_kernel(const std::string& k) {
 #define WITH_ALIGNER_T(TYPE, GM, AM, band, guide_j, body)                                \
     do {                                                                                  \
         DpBufferT<TYPE> _buf;                                                             \
-        const DpKernel _kern = parse_kernel(kernel);                                      \
+        const int _kern = parse_backend(kernel);                                          \
         if ((band) > 0 || !(guide_j).empty()) {                                          \
             Aligner<GapModel::GM, AlignMode::AM, AlignBand::GuideBanded, TYPE> al;       \
             al.set_kernel(_kern);                                                          \
@@ -143,7 +139,7 @@ template<class T>
 static void bind_convenience(nb::module_& m, const std::string& sfx) {
 #define NWG_CONV_ARGS \
         nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("params"), nb::arg("band") = 0, \
-        nb::arg("aligned_a") = "", nb::arg("aligned_b") = "", nb::arg("kernel") = "scalar"
+        nb::arg("aligned_a") = "", nb::arg("aligned_b") = "", nb::arg("kernel") = "auto"
 #define NWG_SCORE(FN, GM, AM, DOC) \
     m.def((std::string(FN) + sfx).c_str(), \
         [](const std::string& a, const std::string& b, const AlignParams& params, int band, \
@@ -207,11 +203,11 @@ static void bind_batch_aligner(nb::module_& m, const char* name) {
                 if      (grad_mode == "hard") gd = BA::GradMode::Hard;
                 else if (grad_mode == "soft") gd = BA::GradMode::Soft;
                 else                          gd = BA::GradMode::None;
-                new (self) BA(params, band, gm, am, gd, n_threads, parse_kernel(kernel));
+                new (self) BA(params, band, gm, am, gd, n_threads, parse_backend(kernel));
             },
             nb::arg("params"), nb::arg("band") = 0, nb::arg("gap_model") = "affine",
             nb::arg("mode") = "global", nb::arg("grad_mode") = "hard",
-            nb::arg("n_threads") = 1, nb::arg("kernel") = "scalar",
+            nb::arg("n_threads") = 1, nb::arg("kernel") = "auto",
             "Create a BatchAligner.\n"
             "  gap_model : \"linear\" | \"affine\"\n"
             "  mode      : \"global\" | \"local\"\n"
@@ -267,11 +263,11 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
                 if      (grad_mode == "hard") gd = GradMode::Hard;
                 else if (grad_mode == "soft") gd = GradMode::Soft;
                 else                          gd = GradMode::None;
-                new (self) SP(seq_a, seq_b, params, gm, am, gd, parse_kernel(kernel));
+                new (self) SP(seq_a, seq_b, params, gm, am, gd, parse_backend(kernel));
             },
             nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("params"),
             nb::arg("gap_model") = "affine", nb::arg("mode") = "global",
-            nb::arg("grad_mode") = "hard", nb::arg("kernel") = "scalar",
+            nb::arg("grad_mode") = "hard", nb::arg("kernel") = "auto",
             nb::keep_alive<1, 4>(),
             "Persistent sequence pair.\n"
             "  gap_model : \"linear\" | \"affine\"\n"
@@ -381,7 +377,7 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
                 if      (grad_mode == "hard") gd = GradMode::Hard;
                 else if (grad_mode == "soft") gd = GradMode::Soft;
                 else                          gd = GradMode::None;
-                DpKernel  kn = parse_kernel(kernel);
+                int  kn = parse_backend(kernel);
                 self.add_many(seqs_a, seqs_b, params, gm, am, gd, kn);
                 nb::list refs;
                 if (nb::hasattr(self_obj, "_owned_params"))
@@ -392,7 +388,7 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             },
             nb::arg("seqs_a"), nb::arg("seqs_b"), nb::arg("params"),
             nb::arg("gap_model") = "affine", nb::arg("mode") = "global",
-            nb::arg("grad_mode") = "hard", nb::arg("kernel") = "scalar",
+            nb::arg("grad_mode") = "hard", nb::arg("kernel") = "auto",
             "Bulk-construct N SeqPairs in C++ and append them to the batch.\n"
             "Per-pair results remain available via batch[i].score / .grad / .aligned().")
         .def("__len__", &SPB::size)

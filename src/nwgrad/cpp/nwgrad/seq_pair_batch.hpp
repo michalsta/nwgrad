@@ -73,7 +73,7 @@ struct SeqPairBatchT {
                   const std::vector<std::string_view>& seqs_b,
                   const AlignParams& params,
                   GapModel gm, AlignMode am, GradMode gd,
-                  DpKernel kernel = DpKernel::Scalar) {
+                  int kernel = kBackendAuto) {
         if (seqs_a.size() != seqs_b.size())
             throw std::invalid_argument(
                 "nwgrad: add_many() needs seqs_a and seqs_b of equal length (got " +

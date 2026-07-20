@@ -64,15 +64,15 @@ struct SeqPairT {
     // Sequences are validated and encoded to alphabet indices here, once, using
     // the params' alphabet.  An out-of-alphabet character throws.  Everything
     // downstream — the DP, the gradient — works on indices only.
-    // `kernel` selects which Viterbi implementation fills the DP tables.  The two
-    // are bit-exact, so it is purely a speed knob — and it is a runtime argument,
-    // not a template parameter, so StateVar above stays at four arms instead of
-    // eight.  See the note on DpKernel in aligner.hpp.
+    // `kernel` is the Viterbi backend (an int: kBackendAuto/kBackendScalar or a SimdLevel
+    // index — see simd_levels.hpp).  Every simd level is bit-exact with the scalar one, so
+    // it is purely a speed knob — and it is a runtime argument, not a template parameter,
+    // so StateVar above stays at four arms instead of eight.  See the note in aligner.hpp.
     SeqPairT(std::string_view a, std::string_view b,
             const AlignParams& params,
             GapModel gm, AlignMode am,
             GradMode grad_mode = GradMode::Hard,
-            DpKernel kernel = DpKernel::Scalar)
+            int kernel = kBackendAuto)
         : a_idx_(params.matrix.alphabet().encode(a)),
           b_idx_(params.matrix.alphabet().encode(b)),
           params_(&params),
@@ -95,7 +95,7 @@ struct SeqPairT {
         }, state_);
     }
 
-    DpKernel kernel() const noexcept { return kernel_; }
+    int kernel() const noexcept { return kernel_; }
 
     // Swap alignment parameters.  Invalidates score and gradient; path stays.
     // realign_banded() remains callable after this — it will re-score the
@@ -302,7 +302,7 @@ private:
     std::vector<uint8_t> a_idx_, b_idx_;   // alphabet indices, not characters
     const AlignParams*   params_;
     GradMode             grad_mode_;
-    DpKernel             kernel_;
+    int                  kernel_;   // Viterbi backend, forwarded to each aligner
 
     bool             path_valid_   = false;
     bool             score_valid_  = false;

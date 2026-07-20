@@ -69,7 +69,7 @@ import time
 # The ISA levels the dispatch table knows about, weakest first.  "neon" is the sole
 # AArch64 level (mandatory baseline, no dispatch); the x86 levels never appear there and
 # vice versa, so probing all of them and keeping whatever answers is harmless.
-ISA_LEVELS = ["baseline", "avx", "avx2", "avx512", "neon"]
+ISA_LEVELS = ["sse2", "avx2", "avx512", "neon"]  # NWGRAD_ISA values; unknown -> auto
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -146,7 +146,7 @@ def worker(args):
         n = 256
         while True:
             sa, sb = pool.take(n)
-            dt, _ = time_once("scalar", threads, band, sa, sb)
+            dt, _ = time_once("scalar_fallback", threads, band, sa, sb)
             if dt >= args.min_time or n >= args.max_n:
                 break
             grow = max(2.0, min(8.0, args.min_time / max(dt, 1e-4)))
@@ -157,7 +157,7 @@ def worker(args):
         # Three arms.  "control" is scalar again: it must come out at 1.00x, and if it
         # does not, this harness is measuring itself and nothing below can be trusted.
         arms = ["scalar", "simd", "control"]
-        kern = {"scalar": "scalar", "simd": "simd", "control": "scalar"}
+        kern = {"scalar": "scalar_fallback", "simd": "auto", "control": "scalar_fallback"}
         best = {a: float("inf") for a in arms}
         results = {}
 
