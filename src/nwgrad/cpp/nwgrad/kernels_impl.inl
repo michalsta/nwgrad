@@ -58,7 +58,7 @@ static void striped_affine_full(ViterbiJob<T>& job) {
     const std::size_t vsz = (std::size_t)(m + 1) * rowsz;
     if (buf.VM.size() < vsz) { buf.VM.resize(vsz); buf.VX.resize(vsz); buf.VY.resize(vsz); }
     // striped slot within a row (offset past slot 0) for DP column j in 1..n
-    auto scol = [seg, W](int j) -> std::size_t {
+    auto scol = [seg](int j) -> std::size_t {
         return (std::size_t)((j - 1) % seg) * W + (j - 1) / seg;
     };
 

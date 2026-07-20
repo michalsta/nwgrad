@@ -289,7 +289,7 @@ int main(int argc, char** argv) {
     problems.reserve(static_cast<size_t>(a.n));
     for (int i = 0; i < a.n; ++i)
         problems.push_back({seqs_a[static_cast<size_t>(i)],
-                            seqs_b[static_cast<size_t>(i)]});
+                            seqs_b[static_cast<size_t>(i)], {}});
 
     SubstMatrix blosum = make_blosum62();
     double go = (a.gap_model == GapModel::Affine) ? a.gap_open : 0.0;
