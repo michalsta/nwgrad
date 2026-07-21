@@ -188,9 +188,18 @@ jobs:
                 continue
                 ;;
             esac
-            # e.g. nwgrad-0.2.0-cp312-cp312-manylinux...whl -> tag "cp312" -> "3.12"
-            tag=$(echo "$fname" | cut -d- -f3)
-            pyver=$(echo "$tag" | sed -E 's/^cp([0-9])([0-9]+)$/\1.\2/')
+            # Derived from the ABI tag (field 4), not the python tag (field 3): for a
+            # free-threaded wheel the two diverge, e.g.
+            # nwgrad-0.2.0-cp314-cp314t-manylinux...whl has python tag "cp314" but abi
+            # tag "cp314t" -- only the abi tag carries the free-threaded "t". Reading
+            # the python tag provisioned a normal 3.14 interpreter for a
+            # free-threaded-only wheel, and uv's install rejected it as an
+            # incompatible platform.
+            abi_tag=$(echo "$fname" | cut -d- -f4)
+            pyver=$(echo "$abi_tag" | sed -E 's/^cp([0-9])([0-9]+)t?$/\1.\2/')
+            case "$abi_tag" in
+              *t) pyver="${pyver}t" ;;
+            esac
             # Keyed on the full filename, not just the Python tag: a platform can ship
             # multiple wheels for the same tag (e.g. manylinux + musllinux cp310), and
             # those must not share a venv directory.
