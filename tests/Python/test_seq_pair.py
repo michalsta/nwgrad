@@ -600,7 +600,12 @@ class TestScoreAndGrad:
         batch_ref.alloc_dp()
         batch_ref.align_full()
         ref_total = batch_ref.realign_banded(bw)
-        new_total = batch_new.score_and_grad(bandwidth=bw)
+        # Two calls now, not one: the fused "full DP then banded DP" entry point
+        # was removed because banding around the full DP's OWN optimal path can
+        # never change the answer.  score_and_grad() establishes the guide;
+        # banded_grad() re-aligns around it.
+        batch_new.score_and_grad()
+        new_total = batch_new.banded_grad(bw)
         assert new_total == pytest.approx(ref_total, rel=1e-10)
 
     # ── gradient correctness ───────────────────────────────────────────────────
@@ -639,7 +644,8 @@ class TestScoreAndGrad:
         batch_ref.compute_grad()
         ref_grad = grad_matrix(batch_ref.compute_grad())
 
-        batch_new.score_and_grad(bandwidth=bw)
+        batch_new.score_and_grad()
+        batch_new.banded_grad(bw)
         new_grad = grad_matrix(batch_new.compute_grad())
 
         np.testing.assert_allclose(new_grad, ref_grad, atol=1e-10)
@@ -731,7 +737,7 @@ class TestScoreAndGrad:
 
     def test_guide_j_set_after_score_and_grad(self):
         batch, pairs_obj = self._make_batch()
-        batch.score_and_grad(bandwidth=15)
+        batch.score_and_grad()
         for sp in pairs_obj:
             gj = sp.guide_j
             assert gj is not None

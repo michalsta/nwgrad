@@ -164,30 +164,62 @@ struct SeqPairT {
     // Full align + grad using a caller-supplied DpBuffer (e.g. thread-owned).
     // Results (score, guide_j, grad) are saved to this SeqPair's cached fields.
     // The pair's own DP buffers are never touched; dp_valid_ stays false.
-    //   bandwidth == 0  →  full DP only.
-    //   bandwidth  > 0  →  full DP (for guide_j), then banded DP (for final score/grad).
     // Grad is computed only when grad_mode_ != None.
-    void score_and_grad_with_dp(DpBuffer& buf, int bandwidth = 0) {
+    //
+    // There is deliberately NO bandwidth parameter, and no fused "full DP then
+    // banded DP" entry point.  One existed and was removed: it ran the full DP,
+    // took the optimal path as a guide, and then re-ran a banded DP *around that
+    // same path*.  The optimum is inside that band by construction, so the second
+    // DP maximises over a subset that provably contains the maximiser and cannot
+    // return anything different.  Measured across 300 pairs it was bit-identical
+    // at every bandwidth tested including 1 -- same scores, same gradients -- and
+    // cost +7% at band=32 and +26% at band=128 for that identical answer.  The
+    // only state it changed was a last_banded_ flag.
+    //
+    // Banding is worth something only when the guide comes from a DIFFERENT
+    // matrix than the one being scored, which is the align-once / re-align-often
+    // training loop.  That is banded_grad_with_dp() below, and it is a separate
+    // path because it is a separate workload with its own cost shape.
+    void score_and_grad_with_dp(DpBuffer& buf) {
         std::visit([&](auto& st) {
-            // Full viterbi: always needed for guide_j when banding, or as the sole DP.
             st.full_al.set_problem(a_idx_, b_idx_, *params_);
             run_dp_with_buf(st.full_al, buf);
+            last_banded_ = false;
+            if (grad_mode_ != GradMode::None) {
+                grad_.zero();
+                grad_with_buf(st.full_al, buf);
+            }
+        }, state_);
+        path_valid_  = true;
+        score_valid_ = true;
+        grad_valid_  = (grad_mode_ != GradMode::None);
+        dp_valid_    = false;
+    }
 
-            if (bandwidth > 0) {
-                // Banded DP around the guide_j extracted above.
-                st.band_al.set_problem(a_idx_, b_idx_, *params_, bandwidth, guide_j_);
-                run_dp_with_buf(st.band_al, buf);
-                last_banded_ = true;
-                if (grad_mode_ != GradMode::None) {
-                    grad_.zero();
-                    grad_with_buf(st.band_al, buf);
-                }
-            } else {
-                last_banded_ = false;
-                if (grad_mode_ != GradMode::None) {
-                    grad_.zero();
-                    grad_with_buf(st.full_al, buf);
-                }
+    // Banded align + grad around the CACHED guide path, using a caller-supplied
+    // DpBuffer.  The counterpart to score_and_grad_with_dp() for the re-alignment
+    // half of a training loop: align once with the full DP, then call this after
+    // each matrix update.  No full DP is run, which is the entire point.
+    //
+    // Requires a guide: path_valid_ must already be true.  set_params() preserves
+    // path_valid_ precisely so this survives a matrix update.
+    //
+    // Like SeqPair::realign_banded(), this returns a SUBOPTIMAL score without
+    // complaint if the new matrix's optimal path has wandered outside the band.
+    // That is the trade being made, not a defect -- but it is real, and it is why
+    // this is not a drop-in substitute for the full DP.
+    void banded_grad_with_dp(DpBuffer& buf, int bandwidth) {
+        if (!path_valid_)
+            throw std::logic_error(
+                "nwgrad: banded_grad_with_dp() needs a guide path; run the full "
+                "score_and_grad_with_dp() (or align_full()) at least once first");
+        std::visit([&](auto& st) {
+            st.band_al.set_problem(a_idx_, b_idx_, *params_, bandwidth, guide_j_);
+            run_dp_with_buf(st.band_al, buf);
+            last_banded_ = true;
+            if (grad_mode_ != GradMode::None) {
+                grad_.zero();
+                grad_with_buf(st.band_al, buf);
             }
         }, state_);
         path_valid_  = true;
@@ -291,6 +323,11 @@ struct SeqPairT {
     bool dp_valid()    const noexcept { return dp_valid_;    }
 
     GradMode grad_mode() const noexcept { return grad_mode_; }
+
+    // Encoded lengths.  Exposed so a scheduler can cost a pair without decoding
+    // it: the full-square DP is (len_a+1)*(len_b+1) cells.
+    size_t len_a() const noexcept { return a_idx_.size(); }
+    size_t len_b() const noexcept { return b_idx_.size(); }
 
     // Decoded on demand: only the encoded indices are stored.
     std::string seq_a() const { return params_->matrix.alphabet().decode(a_idx_); }

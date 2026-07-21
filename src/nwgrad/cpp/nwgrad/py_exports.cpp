@@ -421,12 +421,42 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
         .def("compute_grad", [](SPB& self) { return self.compute_grad(); },
              nb::rv_policy::move,
              "Compute gradient on all pairs in parallel.  Returns summed AlignParams.")
-        .def("score_and_grad",
-             [](SPB& self, int bandwidth) { return self.score_and_grad(bandwidth); },
-             nb::arg("bandwidth") = 0,
-             "Full-pipeline batch op using per-thread DP buffers.  Returns sum of scores.")
+        .def("score_and_grad", [](SPB& self) { return self.score_and_grad(); },
+             "Full-DP batch op using per-thread DP buffers.  Returns sum of scores.")
+        .def("banded_grad",
+             [](SPB& self, int bandwidth) { return self.banded_grad(bandwidth); },
+             nb::arg("bandwidth"),
+             "Banded re-align + grad around each pair's cached guide path, using\n"
+             "per-thread DP buffers.  Run score_and_grad() once to establish guides,\n"
+             "then set_params() + banded_grad(bw) after each matrix update; no full\n"
+             "DP is run.  Returns sum of scores.  Uses its own LPT scheduler.")
         .def("drop_dp", [](SPB& self) { self.drop_dp(); },
              "Drop DP tables on all pairs in parallel.")
+        .def_prop_rw(
+            "schedule",
+            [](const SPB& s) { return s.sorted_schedule ? "sorted" : "dynamic"; },
+            [](SPB& s, const std::string& v) {
+                if      (v == "dynamic") s.sorted_schedule = false;
+                else if (v == "sorted")  s.sorted_schedule = true;
+                else throw nb::value_error(
+                    ("nwgrad: unknown schedule \"" + v +
+                     "\" (expected \"dynamic\" or \"sorted\")").c_str());
+            },
+            "Work-scheduling policy for score_and_grad().\n"
+            "  \"dynamic\" (default): one atomic counter, tasks in insertion order.\n"
+            "  \"sorted\": length-sorted equal-work chunks, one per thread, with a\n"
+            "     reserve of the smallest tasks for threads that finish early.\n"
+            "Bounds the DP memory high-water mark at sum-over-chunks rather than\n"
+            "n_threads * the global maximum.  Results are identical either way.")
+        .def_prop_rw(
+            "reserve_frac",
+            [](const SPB& s) { return s.reserve_frac; },
+            [](SPB& s, double v) { s.reserve_frac = v; },
+            "Fraction of total work held back as filler for early-finishing\n"
+            "threads under schedule=\"sorted\".  Default 0.0 (no reserve): a\n"
+            "300-arm sweep over 4 machines found no reserve was fastest on\n"
+            "tailed length distributions and immaterial on flat ones.  Raise it\n"
+            "only if your workload behaves unlike either.")
         .def_prop_ro("n_threads", [](const SPB& s) { return s.n_threads; });
 }
 
