@@ -176,14 +176,19 @@ jobs:
         run: |
           set -eu
           for whl in wheelhouse/*.whl; do
+            fname=$(basename "$whl" .whl)
             # e.g. nwgrad-0.2.0-cp312-cp312-manylinux...whl -> tag "cp312" -> "3.12"
-            tag=$(basename "$whl" | cut -d- -f3)
+            tag=$(echo "$fname" | cut -d- -f3)
             pyver=$(echo "$tag" | sed -E 's/^cp([0-9])([0-9]+)$/\1.\2/')
+            # Keyed on the full filename, not just the Python tag: a platform can ship
+            # multiple wheels for the same tag (e.g. manylinux + musllinux cp310), and
+            # those must not share a venv directory.
+            venvdir=".venv-$fname"
             echo "::group::$whl on Python $pyver"
-            uv venv ".venv-$tag" --python "$pyver"
-            uv pip install --python ".venv-$tag/bin/python" "${whl}[dev]"
-            ".venv-$tag/bin/python" -c "import nwgrad; print('isa', nwgrad.simd_isa(), nwgrad.compiled_with())"
-            ".venv-$tag/bin/python" -m pytest tests/Python -q
+            uv venv "$venvdir" --python "$pyver"
+            uv pip install --python "$venvdir/bin/python" "${whl}[dev]"
+            "$venvdir/bin/python" -c "import nwgrad; print('isa', nwgrad.simd_isa(), nwgrad.compiled_with())"
+            "$venvdir/bin/python" -m pytest tests/Python -q
             echo "::endgroup::"
           done
 
