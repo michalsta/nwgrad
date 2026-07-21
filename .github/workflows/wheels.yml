@@ -177,6 +177,17 @@ jobs:
           set -eu
           for whl in wheelhouse/*.whl; do
             fname=$(basename "$whl" .whl)
+            case "$fname" in
+              *-musllinux_*)
+                # musl-linked wheel; this runner's libc is glibc and has no musl
+                # runtime to execute it. cibuildwheel already builds AND tests this
+                # wheel natively inside its musllinux container at build time, so
+                # skipping it here loses no coverage -- it just isn't re-testable
+                # on this host.
+                echo "skip $whl: musllinux wheel, no musl runtime on this glibc runner"
+                continue
+                ;;
+            esac
             # e.g. nwgrad-0.2.0-cp312-cp312-manylinux...whl -> tag "cp312" -> "3.12"
             tag=$(echo "$fname" | cut -d- -f3)
             pyver=$(echo "$tag" | sed -E 's/^cp([0-9])([0-9]+)$/\1.\2/')
