@@ -478,10 +478,9 @@ private:
     // into these; unique_ptr keeps the addresses stable as the vector grows.
     std::vector<std::unique_ptr<SeqPair>> owned_;
 
-    static int default_threads() noexcept {
-        unsigned int hw = std::thread::hardware_concurrency();
-        return hw > 0 ? static_cast<int>(hw) : 1;
-    }
+    // Physical cores, not logical -- see parallel.hpp::physical_cores() for the
+    // measurements.  hardware_concurrency() costs up to 1.44x on an SMT host.
+    static int default_threads() noexcept { return default_thread_count(); }
 
     // Dispatch a lambda(size_t index) over [0, N) with per-index atomics.
     template<typename Fn>

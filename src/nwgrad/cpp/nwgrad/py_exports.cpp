@@ -346,7 +346,9 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             [](SPB* self, int n_threads) { new (self) SPB(n_threads); },
             nb::arg("n_threads") = 0,
             "Threaded batch of SeqPair objects.\n"
-            "  n_threads=0 (default) uses hardware_concurrency.")
+            "  n_threads=0 (default) uses the PHYSICAL core count (falling back to\n"
+            "  hardware_concurrency): this DP is stall-bound, so SMT siblings\n"
+            "  contend and the logical count measured up to 1.44x slower.")
         .def(
             "add",
             [](nb::object self_obj, nb::object sp_obj) {
