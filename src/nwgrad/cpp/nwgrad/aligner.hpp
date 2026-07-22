@@ -30,7 +30,25 @@ enum class AlignBand { Full,   GuideBanded };
 // The two are bit-identical — same score, alignment, guide_j and gradient, ties
 // included — because Pointers records exactly the argmax Scores would re-derive.
 // Affine Full only; the linear and banded paths always keep their score tables.
-enum class TracebackMode { Scores, Pointers };
+//
+//   Hirschberg  divide and conquer in O(n) memory: sweep to the middle row from both
+//               ends keeping only rolling rows, join them to find where the optimal
+//               path crosses, recurse on the two halves.  Nothing above the base case
+//               is ever materialized, so the footprint is a few rows rather than a
+//               table — ~0.9 MB for a 36,000 aa self-pair against 3.9 GB for Pointers.
+//               It pays ~2x the cell work for that (each level re-sweeps its half).
+//
+// *** Hirschberg is NOT bit-exact with the other two, by construction. ***
+//
+// The join picks a midpoint argmax, and that choice cannot reproduce the backward-greedy
+// M>X>Y tie-break the other two share, because the tie-break depends on the rows below
+// the split — which Hirschberg has already discarded.  Where the optimum is unique the
+// answers agree exactly; where alignments tie, it returns a DIFFERENT optimal path, hence
+// a valid but different subgradient (path score == Viterbi score, always).  It is
+// selectable for measurement; the equivalence tests deliberately do not include it.
+// Affine Full Global only for now — Local and the linear model throw rather than
+// silently falling back to a different algorithm than the caller asked for.
+enum class TracebackMode { Scores, Pointers, Hirschberg };
 
 // Which Viterbi backend fills the DP tables is a runtime field (backend_, below), one of
 // the unified vocabulary in simd_levels.hpp: "scalar_fallback" (the original plain
@@ -270,6 +288,8 @@ struct Aligner {
 
     std::vector<std::pair<int,int>> alignment() const {
         check_viterbi();
+        if constexpr (GM == GapModel::Affine)
+            if (hirschberg_) return alignment_hb();
         if constexpr (GM == GapModel::Linear) return traceback_linear(own_buf_);
         else                                   return traceback_affine(own_buf_);
     }
@@ -336,6 +356,9 @@ struct Aligner {
     }
 
     std::vector<int> guide_j_from_viterbi(const DpBuffer& buf) const {
+        // Hirschberg holds the path itself, so there is nothing to walk back — replay it.
+        if constexpr (GM == GapModel::Affine)
+            if (hirschberg_) return guide_j_affine_hb();
         if (pointers_) {
             if constexpr (GM == GapModel::Affine) return guide_j_affine_ptr(buf);
         }
@@ -345,14 +368,18 @@ struct Aligner {
 
     std::pair<std::string, std::string> aligned(const DpBuffer& buf) const {
         std::string a, b;
+        if constexpr (GM == GapModel::Affine)
+            if (hirschberg_) { aligned_hb(a, b); return {std::move(a), std::move(b)}; }
         if constexpr (GM == GapModel::Linear) aligned_linear(buf, a, b);
         else                                   aligned_affine(buf, a, b);
         return {std::move(a), std::move(b)};
     }
 
     void hard_grad(const DpBuffer& buf, AlignParams& grad) const {
-        if constexpr (GM == GapModel::Affine)
-            if (pointers_) { hard_grad_affine_ptr(buf, grad); return; }
+        if constexpr (GM == GapModel::Affine) {
+            if (hirschberg_) { hard_grad_affine_hb(grad); return; }
+            if (pointers_)   { hard_grad_affine_ptr(buf, grad); return; }
+        }
         if constexpr (GM == GapModel::Linear) hard_grad_linear(buf, grad);
         else                                   hard_grad_affine(buf, grad);
     }
@@ -413,6 +440,17 @@ private:
     bool   tables_striped_ = false;
     // Pointers mode: DM/DX/DY hold predecessor codes, VM/VX/VY are NOT retained.
     bool        pointers_ = false;
+    // Hirschberg mode: no tables at all survive the fill.  The recursion recovers the
+    // path directly, so hops_ IS the result — every consumer (gradient, alignment,
+    // guide_j) replays it instead of walking a table.  One byte per step, so a path
+    // is O(m+n) where a table would be O(m·n).
+    bool        hirschberg_ = false;
+    std::vector<unsigned char> hops_;   // 0=M diagonal, 1=X gap-in-b, 2=Y gap-in-a
+    // Rows per block at which the recursion stops splitting and runs the Pointers fill
+    // instead.  1 would be pure Hirschberg (minimum memory, maximum re-sweeping); a
+    // block of `cutoff` rows costs cutoff*n direction bytes and saves a level of
+    // recursion.  Tunable because the trade is a measured one, not a principled one.
+    int         hb_cutoff_ = 64;
     TracebackMode tb_ = TracebackMode::Pointers;
     int    striped_seg_    = 0;
     int    striped_w_      = 1;
@@ -499,8 +537,10 @@ private:
             // codes — so allocating them here would hand back the entire footprint
             // saving before the kernel ever runs.  Measured: skipping this is the
             // difference between B costing MORE memory than A and costing ~4x less.
+            // Hirschberg allocates even less: its scratch is O(n) rows sized on demand
+            // inside the recursion, and the whole point is that no O(m*n) table exists.
             if constexpr (AB == AlignBand::Full)
-                if (tb_ == TracebackMode::Pointers) return;
+                if (tb_ == TracebackMode::Pointers || tb_ == TracebackMode::Hirschberg) return;
             if (buf.VM.size() < sz_) { buf.VM.resize(sz_); buf.VX.resize(sz_); buf.VY.resize(sz_); }
         }
     }
@@ -864,6 +904,29 @@ private:
         // this back on.  Every other fill here writes VM/VX/VY row-major.
         tables_striped_ = false;
         pointers_     = false;
+        hirschberg_   = false;
+        // Hirschberg: divide and conquer, no tables above the base case.  It is a
+        // DIFFERENT algorithm with a different tie-break, not a faster spelling of the
+        // same one, so an unsupported combination throws instead of falling back — a
+        // silent substitution would make a benchmark of it meaningless and a gradient
+        // from it unattributable.
+        if (tb_ == TracebackMode::Hirschberg) {
+            if constexpr (GM != GapModel::Affine)
+                throw std::logic_error(
+                    "nwgrad: traceback=\"hirschberg\" is implemented for the affine gap "
+                    "model only (the linear model has no gap-open state to carry across "
+                    "a split)");
+            else if constexpr (AB != AlignBand::Full)
+                throw std::logic_error(
+                    "nwgrad: traceback=\"hirschberg\" is implemented for full DP only; a "
+                    "guide band already bounds memory, which is the only thing Hirschberg buys");
+            else if constexpr (AM != AlignMode::Global)
+                throw std::logic_error(
+                    "nwgrad: traceback=\"hirschberg\" is implemented for global alignment "
+                    "only (local needs a linear-space scan for the best cell and its start "
+                    "before the divide-and-conquer can begin)");
+            else { viterbi_affine_hirschberg(buf); return; }
+        }
         // Variant B: direction pointers + rolling rows, 3 B/cell instead of 12/24.
         // Full affine only; the banded and linear paths keep their score tables.
         // (the pointer kernels are chosen after the backend is resolved, below: every
@@ -1181,6 +1244,352 @@ private:
             viterbi_score_ = best_local;
         }
         pointers_ = true;
+    }
+
+    // ── Hirschberg / Myers-Miller: linear space, no retained tables ───────────
+    //
+    // Everything below works on a SUB-RECTANGLE of the DP: rows a[i0..i1), columns
+    // b[j0..j1), in the sequences' own 0-based coordinates.  Two boundary flags carry
+    // the affine state across a cut, and they are the whole reason this is Myers-Miller
+    // rather than plain Hirschberg:
+    //
+    //   in_x   the path is ALREADY inside a gap-in-b run when it enters this block, so
+    //          the block's first X move extends (-ge_b) instead of opening (-go_b-ge_b).
+    //   out_x  the path is still inside such a run when it leaves.
+    //
+    // Only X can straddle a row cut.  A Y move stays within its row, and the cut is
+    // between rows, so a Y run is wholly on one side of it — which is why there is no
+    // in_y/out_y.  Getting this wrong does not crash; it silently charges one extra
+    // gap open per crossing, so the score comes out slightly low.  The score assertion
+    // in the tests is what actually pins it.
+    //
+    // A block is entered in one of two states (in_x), so the DP's origin is seeded at
+    // whichever of M/X is legal: M[0][0]=0 for a fresh arrival, X[0][0]=0 to continue a
+    // run.  That single seed is the entire mechanism.
+
+    // Grow a scratch row vector to hold `n` elements.
+    static void hb_fit(typename DpBufferT<T>::TVec& v, std::size_t n) {
+        if (v.size() < n) v.resize(n);
+    }
+
+    // Forward sweep of rows (i0, i1], keeping two rolling rows.  On return the three
+    // out-pointers hold row i1 of the block, indexed by column offset c = j - j0.
+    // Costs (i1-i0)*(j1-j0) cells and O(j1-j0) memory: nothing is retained.
+    void hb_fwd(int i0, int i1, int j0, int j1, bool in_x,
+                T* pM, T* pX, T* pY, T* cM, T* cX, T* cY,
+                T*& oM, T*& oX, T*& oY) const {
+        const T go_a = static_cast<T>(params_->gap_open_a);
+        const T ge_a = static_cast<T>(params_->gap_extend_a);
+        const T go_b = static_cast<T>(params_->gap_open_b);
+        const T ge_b = static_cast<T>(params_->gap_extend_b);
+        const int W = j1 - j0;
+
+        // Row i0: the block's origin, then Y moves rightward along it.
+        pM[0] = in_x ? static_cast<T>(NEG_INF) : static_cast<T>(0);
+        pX[0] = in_x ? static_cast<T>(0)       : static_cast<T>(NEG_INF);
+        pY[0] = static_cast<T>(NEG_INF);
+        for (int c = 1; c <= W; ++c) {
+            pM[c] = static_cast<T>(NEG_INF);
+            pX[c] = static_cast<T>(NEG_INF);
+            pY[c] = std::max({pM[c-1] - go_a - ge_a, pX[c-1] - go_a - ge_a, pY[c-1] - ge_a});
+        }
+
+        for (int r = i0 + 1; r <= i1; ++r) {
+            cM[0] = static_cast<T>(NEG_INF);
+            cX[0] = std::max({pM[0] - go_b - ge_b, pX[0] - ge_b, pY[0] - go_b - ge_b});
+            cY[0] = static_cast<T>(NEG_INF);
+            for (int c = 1; c <= W; ++c) {
+                // subT is 1-based over the full sequences; row r consumes a[r-1].
+                cM[c] = std::max({pM[c-1], pX[c-1], pY[c-1]}) + subT(r, j0 + c);
+                cX[c] = std::max({pM[c] - go_b - ge_b, pX[c] - ge_b, pY[c] - go_b - ge_b});
+                cY[c] = std::max({cM[c-1] - go_a - ge_a, cX[c-1] - go_a - ge_a, cY[c-1] - ge_a});
+            }
+            std::swap(pM, cM); std::swap(pX, cX); std::swap(pY, cY);
+        }
+        oM = pM; oX = pX; oY = pY;      // after the last swap, p holds row i1
+    }
+
+    // Reverse sweep of rows [i0, i1), the mirror image of hb_fwd: it aligns the SUFFIX
+    // a[r..i1) with b[.. j1), so on return oS[c] is the best score of aligning
+    // a[i0..i1) with b[(j0+c)..j1) given the block's FIRST forward move has type S.
+    // out_x seeds the far end exactly as in_x seeds the near one.
+    void hb_rev(int i0, int i1, int j0, int j1, bool out_x,
+                T* pM, T* pX, T* pY, T* cM, T* cX, T* cY,
+                T*& oM, T*& oX, T*& oY) const {
+        const T go_a = static_cast<T>(params_->gap_open_a);
+        const T ge_a = static_cast<T>(params_->gap_extend_a);
+        const T go_b = static_cast<T>(params_->gap_open_b);
+        const T ge_b = static_cast<T>(params_->gap_extend_b);
+        const int W = j1 - j0;
+
+        // Reversed column offset d = j1 - j, so d grows leftward from the block's end.
+        pM[0] = out_x ? static_cast<T>(NEG_INF) : static_cast<T>(0);
+        pX[0] = out_x ? static_cast<T>(0)       : static_cast<T>(NEG_INF);
+        pY[0] = static_cast<T>(NEG_INF);
+        for (int d = 1; d <= W; ++d) {
+            pM[d] = static_cast<T>(NEG_INF);
+            pX[d] = static_cast<T>(NEG_INF);
+            pY[d] = std::max({pM[d-1] - go_a - ge_a, pX[d-1] - go_a - ge_a, pY[d-1] - ge_a});
+        }
+
+        for (int r = i1 - 1; r >= i0; --r) {
+            cM[0] = static_cast<T>(NEG_INF);
+            cX[0] = std::max({pM[0] - go_b - ge_b, pX[0] - ge_b, pY[0] - go_b - ge_b});
+            cY[0] = static_cast<T>(NEG_INF);
+            for (int d = 1; d <= W; ++d) {
+                // Mirrored diagonal: this step pairs a[r] with b[j1-d], i.e. subT(r+1, j1-d+1).
+                cM[d] = std::max({pM[d-1], pX[d-1], pY[d-1]}) + subT(r + 1, j1 - d + 1);
+                cX[d] = std::max({pM[d] - go_b - ge_b, pX[d] - ge_b, pY[d] - go_b - ge_b});
+                cY[d] = std::max({cM[d-1] - go_a - ge_a, cX[d-1] - go_a - ge_a, cY[d-1] - ge_a});
+            }
+            std::swap(pM, cM); std::swap(pX, cX); std::swap(pY, cY);
+        }
+        oM = pM; oX = pX; oY = pY;
+    }
+
+    // Base case: a block short enough to solve outright.  This is the Pointers fill,
+    // restricted to the sub-rectangle and seeded by in_x/out_x, recording one direction
+    // byte per cell per state and walking them back.  Appends the block's moves to hops_
+    // in forward order.  Memory is 3*(rows+1)*(cols+1) bytes, bounded by hb_cutoff_.
+    void hb_base(DpBuffer& buf, int i0, int i1, int j0, int j1,
+                 bool in_x, bool out_x) {
+        const T go_a = static_cast<T>(params_->gap_open_a);
+        const T ge_a = static_cast<T>(params_->gap_extend_a);
+        const T go_b = static_cast<T>(params_->gap_open_b);
+        const T ge_b = static_cast<T>(params_->gap_extend_b);
+        const int H = i1 - i0, W = j1 - j0;
+        if (H == 0 && W == 0) return;
+
+        const std::size_t stride = static_cast<std::size_t>(W) + 1;
+        const std::size_t plane  = static_cast<std::size_t>(H + 1) * stride;
+        hb_fit_b(buf.hbD, 3 * plane);
+        unsigned char* dM = buf.hbD.data();
+        unsigned char* dX = dM + plane;
+        unsigned char* dY = dX + plane;
+
+        // Score rows: two rolling is not enough here because Y reads the current row,
+        // but M/X read only the row above — the same shape as the Pointers fill.
+        hb_fit(buf.hfa, stride); hb_fit(buf.hfb, stride); hb_fit(buf.hfc, stride);
+        hb_fit(buf.hfd, stride); hb_fit(buf.hfe, stride); hb_fit(buf.hff, stride);
+        T* pM = buf.hfa.data(); T* pX = buf.hfb.data(); T* pY = buf.hfc.data();
+        T* cM = buf.hfd.data(); T* cX = buf.hfe.data(); T* cY = buf.hff.data();
+
+        auto pick = [](T vm, T vx, T vy) -> unsigned char {
+            if (vm >= vx && vm >= vy) return 0;
+            return (vx >= vy) ? 1 : 2;
+        };
+
+        pM[0] = in_x ? static_cast<T>(NEG_INF) : static_cast<T>(0);
+        pX[0] = in_x ? static_cast<T>(0)       : static_cast<T>(NEG_INF);
+        pY[0] = static_cast<T>(NEG_INF);
+        dM[0] = 3; dX[0] = 3; dY[0] = 3;
+        for (int c = 1; c <= W; ++c) {
+            pM[c] = static_cast<T>(NEG_INF);
+            pX[c] = static_cast<T>(NEG_INF);
+            const T uy = pM[c-1] - go_a - ge_a, vy = pX[c-1] - go_a - ge_a, wy = pY[c-1] - ge_a;
+            pY[c] = std::max({uy, vy, wy});
+            dM[c] = 3; dX[c] = 3; dY[static_cast<std::size_t>(c)] = pick(uy, vy, wy);
+        }
+
+        for (int r = 1; r <= H; ++r) {
+            const std::size_t rb = static_cast<std::size_t>(r) * stride;
+            const T ux0 = pM[0] - go_b - ge_b, vx0 = pX[0] - ge_b, wx0 = pY[0] - go_b - ge_b;
+            cM[0] = static_cast<T>(NEG_INF);
+            cX[0] = std::max({ux0, vx0, wx0});
+            cY[0] = static_cast<T>(NEG_INF);
+            dM[rb] = 3; dX[rb] = pick(ux0, vx0, wx0); dY[rb] = 3;
+            for (int c = 1; c <= W; ++c) {
+                const T dgM = pM[c-1], dgX = pX[c-1], dgY = pY[c-1];
+                cM[c] = std::max({dgM, dgX, dgY}) + subT(i0 + r, j0 + c);
+                const T ux = pM[c] - go_b - ge_b, vx = pX[c] - ge_b, wx = pY[c] - go_b - ge_b;
+                cX[c] = std::max({ux, vx, wx});
+                const T uy = cM[c-1] - go_a - ge_a, vy = cX[c-1] - go_a - ge_a, wy = cY[c-1] - ge_a;
+                cY[c] = std::max({uy, vy, wy});
+                dM[rb + c] = pick(dgM, dgX, dgY);
+                dX[rb + c] = pick(ux, vx, wx);
+                dY[rb + c] = pick(uy, vy, wy);
+            }
+            std::swap(pM, cM); std::swap(pX, cX); std::swap(pY, cY);
+        }
+
+        // Where does the block end?  out_x forces X; otherwise take the best of the three.
+        int r = H, c = W;
+        TBTable tbl;
+        if (out_x) tbl = TBTable::X;
+        else {
+            const T vm = pM[W], vx = pX[W], vy = pY[W];
+            tbl = (vm >= vx && vm >= vy) ? TBTable::M : ((vx >= vy) ? TBTable::X : TBTable::Y);
+        }
+
+        // Walk back, emitting moves; reverse at the end since we produce them backwards.
+        const std::size_t first = hops_.size();
+        while (r > 0 || c > 0) {
+            const std::size_t k = static_cast<std::size_t>(r) * stride + static_cast<std::size_t>(c);
+            unsigned char code;
+            if (tbl == TBTable::M)      { code = dM[k]; hops_.push_back(0); --r; --c; }
+            else if (tbl == TBTable::X) { code = dX[k]; hops_.push_back(1); --r; }
+            else                        { code = dY[k]; hops_.push_back(2); --c; }
+            tbl = (code == 1) ? TBTable::X : (code == 2 ? TBTable::Y : TBTable::M);
+        }
+        std::reverse(hops_.begin() + static_cast<std::ptrdiff_t>(first), hops_.end());
+    }
+
+    static void hb_fit_b(BVec& v, std::size_t n) { if (v.size() < n) v.resize(n); }
+
+    // The recursion.  Splits the block's rows in half, sweeps to the split row from both
+    // ends, and joins the two halves to find the column the optimal path crosses at.
+    void hb_solve(DpBuffer& buf, int i0, int i1, int j0, int j1, bool in_x, bool out_x) {
+        const int H = i1 - i0, W = j1 - j0;
+        if (H <= hb_cutoff_) { hb_base(buf, i0, i1, j0, j1, in_x, out_x); return; }
+
+        const int p = i0 + H / 2;
+        const std::size_t stride = static_cast<std::size_t>(W) + 1;
+        hb_fit(buf.hfa, stride); hb_fit(buf.hfb, stride); hb_fit(buf.hfc, stride);
+        hb_fit(buf.hfd, stride); hb_fit(buf.hfe, stride); hb_fit(buf.hff, stride);
+        hb_fit(buf.hra, stride); hb_fit(buf.hrb, stride); hb_fit(buf.hrc, stride);
+        hb_fit(buf.hrd, stride); hb_fit(buf.hre, stride); hb_fit(buf.hrf, stride);
+        hb_fit(buf.hsM, stride); hb_fit(buf.hsX, stride); hb_fit(buf.hsY, stride);
+
+        T *fM, *fX, *fY;
+        hb_fwd(i0, p, j0, j1, in_x,
+               buf.hfa.data(), buf.hfb.data(), buf.hfc.data(),
+               buf.hfd.data(), buf.hfe.data(), buf.hff.data(), fM, fX, fY);
+        // The reverse sweep reuses the same scratch pool, so copy the split row out first.
+        std::copy(fM, fM + stride, buf.hsM.data());
+        std::copy(fX, fX + stride, buf.hsX.data());
+        std::copy(fY, fY + stride, buf.hsY.data());
+        const T* FM = buf.hsM.data(); const T* FX = buf.hsX.data(); const T* FY = buf.hsY.data();
+
+        T *rM, *rX, *rY;
+        hb_rev(p, i1, j0, j1, out_x,
+               buf.hra.data(), buf.hrb.data(), buf.hrc.data(),
+               buf.hrd.data(), buf.hre.data(), buf.hrf.data(), rM, rX, rY);
+
+        // Join.  For each crossing column c the prefix ends in some state and the suffix
+        // begins in some state; every combination is a legal path, so the plain sum over
+        // the best of each is admissible.  The one case that is NOT a plain sum is an X
+        // run straddling the cut: both halves then charge the open, so one -go_b is
+        // refunded.  That refund is strictly positive, so taking the max over both forms
+        // picks it automatically wherever it applies.
+        const T go_b = static_cast<T>(params_->gap_open_b);
+        T best = static_cast<T>(NEG_INF);
+        int cstar = 0;
+        bool span = false;
+        for (int c = 0; c <= W; ++c) {
+            const int d = W - c;                       // reverse sweep is indexed leftward
+            const T f = std::max({FM[c], FX[c], FY[c]});
+            const T g = std::max({rM[d], rX[d], rY[d]});
+            const T plain = f + g;
+            if (plain > best) { best = plain; cstar = c; span = false; }
+            if (FX[c] > static_cast<T>(NEG_INF) && rX[d] > static_cast<T>(NEG_INF)) {
+                const T joined = FX[c] + rX[d] + go_b;
+                if (joined > best) { best = joined; cstar = c; span = true; }
+            }
+        }
+
+        const int jstar = j0 + cstar;
+        hb_solve(buf, i0, p, j0, jstar, in_x, span);
+        hb_solve(buf, p, i1, jstar, j1, span, out_x);
+    }
+
+    // Entry point: recover the whole path, then read the score back off it.  The score is
+    // recomputed from the path rather than taken from the join, which is a genuine check
+    // and not bookkeeping — if the affine boundary handling were wrong the two would
+    // disagree, and the tests compare this score against the other tracebacks'.
+    void viterbi_affine_hirschberg(DpBuffer& buf) {
+        hops_.clear();
+        hops_.reserve(static_cast<std::size_t>(m_ + n_));
+        hb_solve(buf, 0, m_, 0, n_, false, false);
+
+        // Replay for the score.  Also fixes best_i_/best_j_/best_tbl_, which the shared
+        // accessors still expect even though no table backs them here.
+        //
+        // Accumulate in T, not double.  The DP's own score is the path's prefix sum with
+        // a rounding at every step; replaying in double instead rounds nowhere and lands
+        // 1e-3 away under T=float — small, but enough to make "does Hirschberg agree with
+        // pointers" untestable by exact comparison, which is the one question worth asking
+        // of it.  Same precision, same order, same operations: identical paths now give
+        // identical scores to the bit, so any difference that remains is a real one.
+        const T go_a = static_cast<T>(params_->gap_open_a);
+        const T ge_a = static_cast<T>(params_->gap_extend_a);
+        const T go_b = static_cast<T>(params_->gap_open_b);
+        const T ge_b = static_cast<T>(params_->gap_extend_b);
+        T s = static_cast<T>(0);
+        int i = 0, j = 0;
+        unsigned char prev = 3;                     // 3 = no previous move
+        for (unsigned char op : hops_) {
+            if (op == 0) { ++i; ++j; s += subT(i, j); }
+            else if (op == 1) {
+                if (prev != 1) s -= go_b;
+                s -= ge_b; ++i;
+            } else {
+                if (prev != 2) s -= go_a;
+                s -= ge_a; ++j;
+            }
+            prev = op;
+        }
+        viterbi_score_ = static_cast<double>(s);
+        best_i_ = m_; best_j_ = n_;
+        best_tbl_ = hops_.empty() ? TBTable::M
+                  : (hops_.back() == 1 ? TBTable::X
+                     : (hops_.back() == 2 ? TBTable::Y : TBTable::M));
+        hirschberg_ = true;
+    }
+
+    // ── Consumers of a Hirschberg path ────────────────────────────────────────
+    // Each mirrors its table-walking twin, but replays hops_ forward instead of
+    // walking predecessors backward.  Same emissions, same gradient convention.
+
+    void hard_grad_affine_hb(AlignParams& grad) const {
+        double* gblk = grad_block(grad);
+        int i = 0, j = 0;
+        unsigned char prev = 3;
+        for (unsigned char op : hops_) {
+            if (op == 0) { ++i; ++j; gblk[sub_off(i, j)] += 1.0; }
+            else if (op == 1) {
+                if (prev != 1) grad.gap_open_b -= 1.0;
+                grad.gap_extend_b -= 1.0; ++i;
+            } else {
+                if (prev != 2) grad.gap_open_a -= 1.0;
+                grad.gap_extend_a -= 1.0; ++j;
+            }
+            prev = op;
+        }
+    }
+
+    std::vector<std::pair<int,int>> alignment_hb() const {
+        std::vector<std::pair<int,int>> path;
+        int i = 0, j = 0;
+        for (unsigned char op : hops_) {
+            if (op == 0)      { ++i; ++j; path.emplace_back(i, j); }
+            else if (op == 1) { ++i; }
+            else              { ++j; }
+        }
+        return path;
+    }
+
+    void aligned_hb(std::string& a, std::string& b) const {
+        a.clear(); b.clear();
+        int i = 0, j = 0;
+        for (unsigned char op : hops_) {
+            if (op == 0)      { ++i; ++j; a.push_back(sym_a(i)); b.push_back(sym_b(j)); }
+            else if (op == 1) { ++i; a.push_back(sym_a(i)); b.push_back('-'); }
+            else              { ++j; a.push_back('-');      b.push_back(sym_b(j)); }
+        }
+    }
+
+    std::vector<int> guide_j_affine_hb() const {
+        std::vector<int> gj(static_cast<std::size_t>(m_ + 1), -1);
+        gj[0] = 0;
+        int i = 0, j = 0;
+        for (unsigned char op : hops_) {
+            if (op == 0)      { ++i; ++j; gj[static_cast<std::size_t>(i)] = j; }
+            else if (op == 1) { ++i;      gj[static_cast<std::size_t>(i)] = j; }
+            else              { ++j; }
+        }
+        gj[static_cast<std::size_t>(m_)] = n_;
+        fill_guide_gaps(gj);
+        return gj;
     }
 
     void viterbi_affine(DpBuffer& buf) {

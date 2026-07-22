@@ -134,6 +134,21 @@ struct DpBufferT {
     BVec DM, DX, DY;
     TVec rM, rX, rY, qM, qX, qY;   // rolling current/previous rows (O(n), not O(mn))
 
+    // ── TracebackMode::Hirschberg: no table at all above the base case ────────
+    //
+    // The divide-and-conquer sweeps keep only rolling rows, so the whole recursion
+    // needs O(n) rather than O(m·n): six rows for the forward half, six for the
+    // reverse half, and three to hold the forward half's split row while the reverse
+    // half runs.  hbD is the base case's direction table -- the recursion bottoms out
+    // in the Pointers fill, so a block of at most `cutoff` rows is the largest thing
+    // ever materialized.  hops is the recovered path itself, one byte per step, which
+    // is what the gradient and the alignment are read from instead of tables.
+    TVec hfa, hfb, hfc, hfd, hfe, hff;   // forward rolling rows (M,X,Y) x (prev,cur)
+    TVec hra, hrb, hrc, hrd, hre, hrf;   // reverse rolling rows (M,X,Y) x (prev,cur)
+    TVec hsM, hsX, hsY;                  // forward half's split row, saved
+    BVec hbD;                            // base-case direction table (3 x block)
+    BVec hops;                           // the path: 0=M(diag) 1=X(gap in b) 2=Y(gap in a)
+
     void clear() noexcept {
         auto clrT = [](TVec& v) noexcept { v.clear(); v.shrink_to_fit(); };
         auto clrD = [](DVec& v) noexcept { v.clear(); v.shrink_to_fit(); };
@@ -146,6 +161,10 @@ struct DpBufferT {
         auto clrB = [](BVec& v) noexcept { v.clear(); v.shrink_to_fit(); };
         clrB(DM); clrB(DX); clrB(DY);
         clrT(rM); clrT(rX); clrT(rY); clrT(qM); clrT(qX); clrT(qY);
+        clrT(hfa); clrT(hfb); clrT(hfc); clrT(hfd); clrT(hfe); clrT(hff);
+        clrT(hra); clrT(hrb); clrT(hrc); clrT(hrd); clrT(hre); clrT(hrf);
+        clrT(hsM); clrT(hsX); clrT(hsY);
+        clrB(hbD); clrB(hops);
     }
 };
 

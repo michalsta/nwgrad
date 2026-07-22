@@ -100,14 +100,19 @@ static void keep_current_params(nb::object owner, nb::object params) {
 
 // Traceback vocabulary, mirroring gap_model= / mode= / grad_mode= / kernel=.
 static TracebackMode parse_traceback(const std::string& name) {
-    if (name == "pointers") return TracebackMode::Pointers;
-    if (name == "scores")   return TracebackMode::Scores;
+    if (name == "pointers")   return TracebackMode::Pointers;
+    if (name == "scores")     return TracebackMode::Scores;
+    if (name == "hirschberg") return TracebackMode::Hirschberg;
     throw nb::value_error(
         ("nwgrad: unknown traceback \"" + name +
-         "\" (expected \"pointers\" or \"scores\")").c_str());
+         "\" (expected \"pointers\", \"scores\" or \"hirschberg\")").c_str());
 }
 static const char* traceback_name(TracebackMode t) {
-    return t == TracebackMode::Pointers ? "pointers" : "scores";
+    switch (t) {
+        case TracebackMode::Pointers:   return "pointers";
+        case TracebackMode::Hirschberg: return "hirschberg";
+        default:                        return "scores";
+    }
 }
 
 static std::vector<int> make_guide(const std::string& aligned_a,
@@ -288,7 +293,8 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
             "  mode      : \"global\" | \"local\"\n"
             "  grad_mode : \"hard\" | \"soft\" | \"none\"\n"
             "  kernel    : \"scalar\" | \"simd\" — bit-exact speed knob (Viterbi path).\n"
-            "  traceback : \"pointers\" (default) | \"scores\" — see SeqPairBatch.")
+            "  traceback : \"pointers\" (default) | \"scores\" | \"hirschberg\" — see\n"
+            "     SeqPairBatch.traceback.")
         .def("alloc_dp", &SP::alloc_dp,
              "Pre-allocate own DP tables for the fixed sequences.")
         .def(
@@ -369,11 +375,17 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             "  n_threads=0 (default) uses the PHYSICAL core count (falling back to\n"
             "  hardware_concurrency): this DP is stall-bound, so SMT siblings\n"
             "  contend and the logical count measured up to 1.44x slower.\n"
-            "  traceback : \"pointers\" (default) | \"scores\" — what the DP retains in\n"
-            "     order to recover predecessors.  \"pointers\" records 1 byte/cell/state\n"
-            "     during the fill (3 B/cell); \"scores\" keeps VM/VX/VY and re-derives\n"
-            "     the argmax (12 B/cell).  Bit-identical; pointers is smaller and\n"
-            "     measured 1.4-2.2x faster.  Applies to pairs built by add_many().")
+            "  traceback : \"pointers\" (default) | \"scores\" | \"hirschberg\" — what the\n"
+            "     DP retains in order to recover predecessors.  \"pointers\" records 1\n"
+            "     byte/cell/state during the fill (3 B/cell); \"scores\" keeps VM/VX/VY\n"
+            "     and re-derives the argmax (12 B/cell).  Those two are bit-identical;\n"
+            "     pointers is smaller and measured 1.4-2.2x faster.\n"
+            "     \"hirschberg\" is divide-and-conquer in O(n) memory — no table at all\n"
+            "     above the base case — at ~2x the cell work.  It is NOT bit-exact:\n"
+            "     where alignments tie it returns a different optimal path, hence a\n"
+            "     valid but different subgradient.  Affine + global only; anything\n"
+            "     else throws rather than silently running a different algorithm.\n"
+            "     Applies to pairs built by add_many().")
         .def(
             "add",
             [](nb::object self_obj, nb::object sp_obj) {
