@@ -261,3 +261,39 @@ class TestBatchGuided:
         np.testing.assert_allclose(r_full.scores, r_guided.scores, atol=1e-12)
         np.testing.assert_allclose(r_full.grad.matrix.to_matrix(),
                                     r_guided.grad.matrix.to_matrix(), atol=1e-12)
+
+
+def test_narrow_band_does_not_crash():
+    """A band narrower than the path needs must be SUBOPTIMAL, never fatal.
+
+    Regression: with |m - n| far larger than the band, the guide band admits no route
+    back to the origin, so every predecessor in the traceback sat at -inf.  The
+    M>=X>=Y tie-break then chose M, which steps diagonally, so i or j went negative;
+    cell_index() turned that into a huge size_t and the walk read off the end of the
+    table.  `realign_banded(8)` on these two sequences segfaulted; band >= 64 did not.
+
+    The documented contract is that a too-narrow band "silently returns a suboptimal
+    score (no detection)" — so the assertion is that it returns *something* finite and
+    no better than the unbanded optimum, at every width down to 1.
+    """
+    import numpy as np
+    import nwgrad
+
+    aa = "ARNDCQEGHILKMFPSTWYV"
+    m = np.full((20, 20), -1.0)
+    np.fill_diagonal(m, 4.0)
+    params = nwgrad.AlignParams(nwgrad.SubstMatrix(m, alphabet=aa),
+                                gap_open_a=11.0, gap_extend_a=1.0,
+                                gap_open_b=11.0, gap_extend_b=1.0)
+    a, b = "A" * 22, "C" * 87                      # |m - n| = 65
+
+    for mode in ("global", "local"):
+        batch = nwgrad.SeqPairBatch(n_threads=1)
+        batch.add_many([a], [b], params, gap_model="affine", mode=mode,
+                       grad_mode="hard", kernel="auto")
+        batch.alloc_dp()
+        full = batch.align_full()
+        for band in (1, 2, 4, 8, 16, 32, 64, 128):
+            got = batch.realign_banded(band)
+            assert np.isfinite(got), f"{mode} band={band} -> {got}"
+            assert got <= full + 1e-9, f"{mode} band={band}: {got} beats unbanded {full}"

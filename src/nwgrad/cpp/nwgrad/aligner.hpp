@@ -691,6 +691,16 @@ private:
             if (i == 0 && j == 0) break;
             if constexpr (AM == AlignMode::Local)
                 if (tbl == TBTable::M && rat(buf.VM, i, j) <= 0.0) break;
+            // GuideBanded with a band narrower than the path needs: the band can fail
+            // to admit any route back to the origin, leaving every predecessor at
+            // -inf.  The M>=X>=Y tie-break then picks M, and M steps DIAGONALLY — so
+            // i or j goes negative, cell_index() turns that into a huge size_t, and
+            // the walk reads off the end of the table.  That was a segfault, not a
+            // suboptimal score (realign_banded: "A"*22 vs "C"*87 at band<=32).
+            // At a border only one move is legal; forcing it is what a well-formed
+            // DP would have chosen anyway, so valid alignments are unaffected.
+            if      (i == 0) tbl = TBTable::Y;   // row 0: only leftward moves remain
+            else if (j == 0) tbl = TBTable::X;   // col 0: only upward moves remain
 
             if (tbl == TBTable::M) {
                 T vm = rat(buf.VM,i-1,j-1), vx = rat(buf.VX,i-1,j-1), vy = rat(buf.VY,i-1,j-1);
@@ -1014,6 +1024,16 @@ private:
             if (i == 0 && j == 0) break;
             if constexpr (AM == AlignMode::Local)
                 if (tbl == TBTable::M && rat(buf.VM, i, j) <= 0.0) break;
+            // GuideBanded with a band narrower than the path needs: the band can fail
+            // to admit any route back to the origin, leaving every predecessor at
+            // -inf.  The M>=X>=Y tie-break then picks M, and M steps DIAGONALLY — so
+            // i or j goes negative, cell_index() turns that into a huge size_t, and
+            // the walk reads off the end of the table.  That was a segfault, not a
+            // suboptimal score (realign_banded: "A"*22 vs "C"*87 at band<=32).
+            // At a border only one move is legal; forcing it is what a well-formed
+            // DP would have chosen anyway, so valid alignments are unaffected.
+            if      (i == 0) tbl = TBTable::Y;   // row 0: only leftward moves remain
+            else if (j == 0) tbl = TBTable::X;   // col 0: only upward moves remain
 
             if (tbl == TBTable::M) {
                 emit(i-1, j-1);
@@ -1061,6 +1081,16 @@ private:
             if (i == 0 && j == 0) break;
             if constexpr (AM == AlignMode::Local)
                 if (tbl == TBTable::M && rat(buf.VM, i, j) <= 0.0) break;
+            // GuideBanded with a band narrower than the path needs: the band can fail
+            // to admit any route back to the origin, leaving every predecessor at
+            // -inf.  The M>=X>=Y tie-break then picks M, and M steps DIAGONALLY — so
+            // i or j goes negative, cell_index() turns that into a huge size_t, and
+            // the walk reads off the end of the table.  That was a segfault, not a
+            // suboptimal score (realign_banded: "A"*22 vs "C"*87 at band<=32).
+            // At a border only one move is legal; forcing it is what a well-formed
+            // DP would have chosen anyway, so valid alignments are unaffected.
+            if      (i == 0) tbl = TBTable::Y;   // row 0: only leftward moves remain
+            else if (j == 0) tbl = TBTable::X;   // col 0: only upward moves remain
 
             if (tbl == TBTable::M) {
                 a.push_back(sym_a(i)); b.push_back(sym_b(j));
@@ -1108,6 +1138,16 @@ private:
             if (i == 0 && j == 0) break;
             if constexpr (AM == AlignMode::Local)
                 if (tbl == TBTable::M && rat(buf.VM, i, j) <= 0.0) break;
+            // GuideBanded with a band narrower than the path needs: the band can fail
+            // to admit any route back to the origin, leaving every predecessor at
+            // -inf.  The M>=X>=Y tie-break then picks M, and M steps DIAGONALLY — so
+            // i or j goes negative, cell_index() turns that into a huge size_t, and
+            // the walk reads off the end of the table.  That was a segfault, not a
+            // suboptimal score (realign_banded: "A"*22 vs "C"*87 at band<=32).
+            // At a border only one move is legal; forcing it is what a well-formed
+            // DP would have chosen anyway, so valid alignments are unaffected.
+            if      (i == 0) tbl = TBTable::Y;   // row 0: only leftward moves remain
+            else if (j == 0) tbl = TBTable::X;   // col 0: only upward moves remain
 
             if (tbl == TBTable::M) {
                 gblk[sub_off(i, j)] += 1.0;
