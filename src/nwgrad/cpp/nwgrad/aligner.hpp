@@ -18,6 +18,20 @@ enum class GapModel  { Linear, Affine };
 enum class AlignMode { Global, Local  };
 enum class AlignBand { Full,   GuideBanded };
 
+// How the traceback recovers a cell's predecessor.
+//
+//   Scores    retain VM/VX/VY for the whole DP and RE-DERIVE the argmax by repeating
+//             the forward pass's comparison chain.  12 B/cell (float32).
+//   Pointers  record the predecessor as one byte per cell per state during the fill
+//             and simply FOLLOW it; scores then need only two rolling rows.
+//             3 B/cell — and measured 1.4-2.2x faster, because the footprint is what
+//             drives the page-fault cost that dominates the memory-bound regime.
+//
+// The two are bit-identical — same score, alignment, guide_j and gradient, ties
+// included — because Pointers records exactly the argmax Scores would re-derive.
+// Affine Full only; the linear and banded paths always keep their score tables.
+enum class TracebackMode { Scores, Pointers };
+
 // Which Viterbi backend fills the DP tables is a runtime field (backend_, below), one of
 // the unified vocabulary in simd_levels.hpp: "scalar_fallback" (the original plain
 // kernel), "auto" (defer to the global default = best simd), or a named simd level
@@ -211,12 +225,17 @@ struct Aligner {
     // (scalar fallback), or a SimdLevel index.  simd_levels.hpp::parse_backend() turns the
     // string vocabulary ("scalar_fallback"/"auto"/"sse2"/"avx2"/...) into this int.
     void set_kernel(int backend) noexcept { backend_ = backend; }
+    // How the traceback recovers predecessors — see TracebackMode.  Defaults to
+    // Pointers (smaller and faster); set Scores when you need VM/VX/VY to survive
+    // the fill, e.g. to compare tables across kernels.
+    void set_traceback(TracebackMode t) noexcept { tb_ = t; }
+    TracebackMode traceback() const noexcept { return tb_; }
     int  kernel() const noexcept { return backend_; }
 
     void compute_viterbi() {
         check_problem();
         check_own_buf_allocated();
-        ensure_viterbi_buf(own_buf_);  // Grow if needed
+        ensure_viterbi_ptruf(own_buf_);  // Grow if needed
         run_viterbi(own_buf_);
         viterbi_done_ = any_viterbi_done_ = true;
         fwdbwd_is_newest_ = false;
@@ -227,6 +246,7 @@ struct Aligner {
         check_own_buf_allocated();
         ensure_fwdbwd_buf(own_buf_);  // Grow if needed
         tables_striped_ = false; // F/B are always row-major, even after a striped Viterbi
+        pointers_ = false;     // and the soft path needs real score tables, not codes
         if constexpr (GM == GapModel::Linear) fwdbwd_linear(own_buf_);
         else                                   fwdbwd_affine(own_buf_);
         fwdbwd_done_ = any_fwdbwd_done_ = true;
@@ -298,7 +318,7 @@ struct Aligner {
 
     void compute_viterbi(DpBuffer& buf) {
         check_problem();
-        ensure_viterbi_buf(buf);  // Grow if needed (allows implicit growth from size 0)
+        ensure_viterbi_ptruf(buf);  // Grow if needed (allows implicit growth from size 0)
         run_viterbi(buf);
         any_viterbi_done_ = true;
         fwdbwd_is_newest_ = false;
@@ -308,6 +328,7 @@ struct Aligner {
         check_problem();
         ensure_fwdbwd_buf(buf);  // Grow if needed (allows implicit growth from size 0)
         tables_striped_ = false; // F/B are always row-major, even after a striped Viterbi
+        pointers_ = false;     // and the soft path needs real score tables, not codes
         if constexpr (GM == GapModel::Linear) fwdbwd_linear(buf);
         else                                   fwdbwd_affine(buf);
         any_fwdbwd_done_ = true;
@@ -315,6 +336,9 @@ struct Aligner {
     }
 
     std::vector<int> guide_j_from_viterbi(const DpBuffer& buf) const {
+        if (pointers_) {
+            if constexpr (GM == GapModel::Affine) return guide_j_affine_ptr(buf);
+        }
         if constexpr (GM == GapModel::Linear) return guide_j_linear(buf);
         else                                   return guide_j_affine(buf);
     }
@@ -327,6 +351,8 @@ struct Aligner {
     }
 
     void hard_grad(const DpBuffer& buf, AlignParams& grad) const {
+        if constexpr (GM == GapModel::Affine)
+            if (pointers_) { hard_grad_affine_ptr(buf, grad); return; }
         if constexpr (GM == GapModel::Linear) hard_grad_linear(buf, grad);
         else                                   hard_grad_affine(buf, grad);
     }
@@ -338,6 +364,13 @@ struct Aligner {
     std::vector<typename V::value_type> to_row_major(const V& t) const {
         using E = typename V::value_type;
         const size_t rm_stride = static_cast<size_t>(n_) + 1;
+        // Pointers leaves the score tables unallocated; say so rather than read
+        // past the end of an empty vector.
+        if (t.size() < cell_index(m_, n_) + 1)
+            throw std::logic_error(
+                "nwgrad: DP table is empty — TracebackMode::Pointers retains predecessor "
+                "codes, not score tables; use set_traceback(TracebackMode::Scores) to "
+                "inspect VM/VX/VY");
         std::vector<E> out(static_cast<size_t>(m_ + 1) * rm_stride);
         for (int i = 0; i <= m_; ++i)
             for (int j = 0; j <= n_; ++j)
@@ -378,6 +411,9 @@ private:
     // striped_w_ come straight from the kernel (ViterbiJob.seg / .width); a striped row
     // is striped_seg_*striped_w_ + 1 doubles, slot 0 being column 0.
     bool   tables_striped_ = false;
+    // Pointers mode: DM/DX/DY hold predecessor codes, VM/VX/VY are NOT retained.
+    bool        pointers_ = false;
+    TracebackMode tb_ = TracebackMode::Pointers;
     int    striped_seg_    = 0;
     int    striped_w_      = 1;
 
@@ -426,7 +462,7 @@ private:
 
     // Throw if external viterbi buffer has never been allocated (size is 0).
     // After initial allocation, buffers may grow implicitly as needed.
-    void check_external_viterbi_buf(const DpBuffer& buf) const {
+    void check_external_viterbi_ptruf(const DpBuffer& buf) const {
         bool allocated;
         if constexpr (GM == GapModel::Linear)
             allocated = (buf.H.size() > 0);
@@ -455,10 +491,16 @@ private:
     }
 
     // Grow external buffer to fit current problem (thread-owned path).
-    void ensure_viterbi_buf(DpBuffer& buf) const {
+    void ensure_viterbi_ptruf(DpBuffer& buf) const {
         if constexpr (GM == GapModel::Linear) {
             if (buf.H.size() < sz_) buf.H.resize(sz_);
         } else {
+            // Pointers mode never touches VM/VX/VY — it keeps two rolling rows and byte
+            // codes — so allocating them here would hand back the entire footprint
+            // saving before the kernel ever runs.  Measured: skipping this is the
+            // difference between B costing MORE memory than A and costing ~4x less.
+            if constexpr (AB == AlignBand::Full)
+                if (tb_ == TracebackMode::Pointers) return;
             if (buf.VM.size() < sz_) { buf.VM.resize(sz_); buf.VX.resize(sz_); buf.VY.resize(sz_); }
         }
     }
@@ -674,6 +716,79 @@ private:
         return gj;
     }
 
+    // ── variant-B tracebacks: read the recorded predecessor, do not re-derive ──
+    //
+    // These mirror guide_j_affine()/hard_grad_affine() step for step; the only
+    // change is where the predecessor comes from.  The forward pass recorded it
+    // with the same `>=` M>X>Y chain those functions run, so the walk is identical
+    // — including at ties, which is the property Hirschberg could not offer.
+    // Directions live in whatever layout the fill used -- row-major from the scalar
+    // B fill, striped from the leveled B kernel -- so index them through the same
+    // cell_index() the score tables use.  One copy of the striping arithmetic, not two.
+    unsigned char dcode(const BVec& d, int i, int j) const noexcept {
+        return d[cell_index(i, j)];
+    }
+
+    std::vector<int> guide_j_affine_ptr(const DpBuffer& buf) const {
+        std::vector<int> gj(static_cast<size_t>(m_ + 1), -1);
+        gj[0] = 0;
+        gj[static_cast<size_t>(m_)] = n_;
+        int i = best_i_, j = best_j_;
+        TBTable tbl = best_tbl_;
+        gj[static_cast<size_t>(i)] = j;
+        while (true) {
+            if (i == 0 && j == 0) break;
+            if constexpr (AM == AlignMode::Local)
+                if (tbl == TBTable::M && dcode(buf.DM, i, j) == 3) break;
+            // Same border guard as the score-table walks — see the note there.
+            if      (i == 0) tbl = TBTable::Y;
+            else if (j == 0) tbl = TBTable::X;
+            unsigned char c;
+            if (tbl == TBTable::M) {
+                c = dcode(buf.DM, i, j); --i; --j; gj[static_cast<size_t>(i)] = j;
+            } else if (tbl == TBTable::X) {
+                c = dcode(buf.DX, i, j); --i; gj[static_cast<size_t>(i)] = j;
+            } else {
+                c = dcode(buf.DY, i, j); --j;
+            }
+            tbl = (c == 1) ? TBTable::X : (c == 2 ? TBTable::Y : TBTable::M);
+        }
+        fill_guide_gaps(gj);
+        return gj;
+    }
+
+    void hard_grad_affine_ptr(const DpBuffer& buf, AlignParams& grad) const {
+        double* gblk = grad_block(grad);
+        int i = best_i_, j = best_j_;
+        TBTable tbl = best_tbl_;
+        while (true) {
+            if (i == 0 && j == 0) break;
+            if constexpr (AM == AlignMode::Local)
+                if (tbl == TBTable::M && dcode(buf.DM, i, j) == 3) break;
+            // Same border guard as the score-table walks — see the note there.
+            if      (i == 0) tbl = TBTable::Y;
+            else if (j == 0) tbl = TBTable::X;
+            unsigned char c;
+            if (tbl == TBTable::M) {
+                gblk[sub_off(i, j)] += 1.0;
+                c = dcode(buf.DM, i, j); --i; --j;
+                tbl = (c == 1) ? TBTable::X : (c == 2 ? TBTable::Y : TBTable::M);
+            } else if (tbl == TBTable::X) {
+                grad.gap_extend_b -= 1.0;
+                c = dcode(buf.DX, i, j); --i;
+                const TBTable prev = (c == 1) ? TBTable::X : (c == 2 ? TBTable::Y : TBTable::M);
+                if (prev != TBTable::X) grad.gap_open_b -= 1.0;
+                tbl = prev;
+            } else {
+                grad.gap_extend_a -= 1.0;
+                c = dcode(buf.DY, i, j); --j;
+                const TBTable prev = (c == 1) ? TBTable::X : (c == 2 ? TBTable::Y : TBTable::M);
+                if (prev != TBTable::Y) grad.gap_open_a -= 1.0;
+                tbl = prev;
+            }
+        }
+    }
+
     std::vector<int> guide_j_affine(const DpBuffer& buf) const {
         std::vector<int> gj(static_cast<size_t>(m_ + 1), -1);
         gj[0] = 0;
@@ -748,13 +863,23 @@ private:
         // Default to row-major; only the striped Full kernel (run_dispatched_affine) flips
         // this back on.  Every other fill here writes VM/VX/VY row-major.
         tables_striped_ = false;
+        pointers_     = false;
+        // Variant B: direction pointers + rolling rows, 3 B/cell instead of 12/24.
+        // Full affine only; the banded and linear paths keep their score tables.
+        // (the pointer kernels are chosen after the backend is resolved, below: every
+        // simd level has its own, and only the scalar path falls back here.)
         if constexpr (GM == GapModel::Linear) {
             viterbi_linear(buf);   // no simd linear kernel: every backend is scalar here
             return;
         }
         // Resolve this aligner's backend: auto -> the global default, then scalar or a level.
         const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
-        if (backend == kBackendScalar) { viterbi_affine(buf); return; }
+        // Pointers is Full-affine only; banded/linear always keep score tables.
+        const bool use_ptr = (tb_ == TracebackMode::Pointers) && (AB == AlignBand::Full);
+        if (backend == kBackendScalar) {
+            if (use_ptr) viterbi_affine_ptr(buf); else viterbi_affine(buf);
+            return;
+        }
 
         // A simd level: its kernels.  If that level's TU was not linked (header-only
         // single-level build), every pointer is null and we fall through to scalar.
@@ -762,10 +887,13 @@ private:
         if constexpr (AB == AlignBand::Full) {
             // The striped Full kernel exists at both precisions (viterbi / viterbi_f).
             if constexpr (std::is_same_v<T, double>) {
-                if (K.viterbi)   { run_dispatched_affine(buf, K); return; }
+                if (use_ptr && K.viterbi_ptr) { run_dispatched_affine(buf, K, true);  return; }
+                if (K.viterbi)             { run_dispatched_affine(buf, K, false); return; }
             } else {
-                if (K.viterbi_f) { run_dispatched_affine(buf, K); return; }
+                if (use_ptr && K.viterbi_ptr_f) { run_dispatched_affine(buf, K, true);  return; }
+                if (K.viterbi_f)             { run_dispatched_affine(buf, K, false); return; }
             }
+            if (use_ptr) { viterbi_affine_ptr(buf); return; }   // level lacks the ptr kernel
         }
         // The row-wise banded kernel is double-only for now; float banded falls back to the
         // (T-templated) scalar fill.  Gated so viterbi_affine_simd — whose body is
@@ -779,7 +907,7 @@ private:
     // Build a plain ViterbiJob from Aligner state, run the dispatched (leveled) kernel,
     // and copy its scalar results back.  The kernel fills buf.VM/VX/VY in STRIPED layout
     // (table_layout == 1) and reports seg/width; rat/at then read them striped.
-    void run_dispatched_affine(DpBuffer& buf, const LevelKernels& K) {
+    void run_dispatched_affine(DpBuffer& buf, const LevelKernels& K, bool use_ptr = false) {
         ViterbiJob<T> job{};
         job.a = a_idx_.data(); job.m = m_;
         job.b = b_idx_.data(); job.n = n_;
@@ -792,8 +920,9 @@ private:
         job.align_band = 0; job.band = 0;
         job.guide_j = nullptr; job.guide_len = 0;
         job.buf = &buf;
-        if constexpr (std::is_same_v<T, double>) K.viterbi(job);
-        else                                     K.viterbi_f(job);
+        if constexpr (std::is_same_v<T, double>) { if (use_ptr) K.viterbi_ptr(job); else K.viterbi(job); }
+        else                                     { if (use_ptr) K.viterbi_ptr_f(job); else K.viterbi_f(job); }
+        pointers_ = use_ptr;   // Pointers leaves codes, not score tables
         // Adopt the layout the kernel produced (striped for the Full striped kernel).
         if (job.table_layout == 1) {
             tables_striped_ = true;
@@ -936,6 +1065,124 @@ private:
     // Viterbi — Affine gap model
     // ═════════════════════════════════════════════════════════════════════════
 
+    // ── TracebackMode::Pointers: affine Viterbi, scalar reference ─────────────
+    //
+    // Computes the same DP as viterbi_affine() but retains, instead of three score
+    // tables, one byte per cell per state naming the predecessor the forward pass
+    // chose.  Scores live in two rolling rows, so the retained footprint is
+    // 3 B/cell against 12 (float32) / 24 (double).
+    //
+    // BIT-EXACTNESS is the whole contract, and it holds for a specific reason: the
+    // codes below are produced by the *identical* comparison chain the traceback
+    // would otherwise re-derive from the tables — `>=` in M, X, Y order.  Change
+    // one `>=` to `>` here and B silently returns a different (still valid)
+    // subgradient at ties, which is exactly the defect that disqualified Hirschberg.
+    //
+    // DM additionally carries code 3 = "VM <= 0 at this cell", which is how Local's
+    // `rat(VM,i,j) <= 0` stop survives having no VM table to consult.
+    //
+    // Borders are recorded too, not just the recurrence interior: the traceback
+    // walks column 0 and row 0 (X at (1,0) resolves to M, at (i>1,0) to X), and
+    // those cells are border-initialised, never visited by the main loop.
+    void viterbi_affine_ptr(DpBuffer& buf) {
+        const T go_a = static_cast<T>(params_->gap_open_a);
+        const T ge_a = static_cast<T>(params_->gap_extend_a);
+        const T go_b = static_cast<T>(params_->gap_open_b);
+        const T ge_b = static_cast<T>(params_->gap_extend_b);
+
+        const std::size_t stride = stride_;   // row-major, matches cell_index()
+        const std::size_t dsz    = static_cast<std::size_t>(m_ + 1) * stride;
+        if (buf.DM.size() < dsz) { buf.DM.resize(dsz); buf.DX.resize(dsz); buf.DY.resize(dsz); }
+        if (buf.rM.size() < stride) {
+            buf.rM.resize(stride); buf.rX.resize(stride); buf.rY.resize(stride);
+            buf.qM.resize(stride); buf.qX.resize(stride); buf.qY.resize(stride);
+        }
+        T* pM = buf.qM.data(); T* pX = buf.qX.data(); T* pY = buf.qY.data();  // row i-1
+        T* cM = buf.rM.data(); T* cX = buf.rX.data(); T* cY = buf.rY.data();  // row i
+        unsigned char* dM = buf.DM.data();
+        unsigned char* dX = buf.DX.data();
+        unsigned char* dY = buf.DY.data();
+
+        // Same three-way argmax the traceback runs, in one place so the two cannot drift.
+        auto pick = [](T vm, T vx, T vy) -> unsigned char {
+            if (vm >= vx && vm >= vy) return 0;
+            return (vx >= vy) ? 1 : 2;
+        };
+
+        // ── row 0 ────────────────────────────────────────────────────────────
+        for (std::size_t j = 0; j <= static_cast<std::size_t>(n_); ++j) {
+            if constexpr (AM == AlignMode::Local) { pM[j] = 0; pX[j] = NEG_INF; pY[j] = NEG_INF; }
+            else {
+                pM[j] = (j == 0) ? static_cast<T>(0) : NEG_INF;
+                pX[j] = NEG_INF;
+                pY[j] = (j == 0) ? NEG_INF : -(go_a + static_cast<T>(j) * ge_a);
+            }
+            dM[j] = (AM == AlignMode::Local || j == 0) ? 3 : 3;   // row 0 is a start
+            dX[j] = 0;
+            // Y along row 0 extends leftward: (0,1) opens from M(0,0), the rest extend Y.
+            dY[j] = (j <= 1) ? 0 : 2;
+        }
+        if constexpr (AM == AlignMode::Global) dM[0] = 3;
+
+        best_i_ = 0; best_j_ = 0; best_tbl_ = TBTable::M;
+        T best_local = static_cast<T>(0);
+
+        for (int i = 1; i <= m_; ++i) {
+            const std::size_t rb = static_cast<std::size_t>(i) * stride;
+            // column 0 of this row
+            if constexpr (AM == AlignMode::Local) { cM[0] = 0; cX[0] = NEG_INF; }
+            else { cM[0] = NEG_INF; cX[0] = -(go_b + static_cast<T>(i) * ge_b); }
+            cY[0] = NEG_INF;
+            dM[rb] = 3;
+            dX[rb] = (i <= 1) ? 0 : 1;    // (1,0) opens from M(0,0); deeper rows extend X
+            dY[rb] = 0;
+
+            for (int j = 1; j <= n_; ++j) {
+                const std::size_t k = static_cast<std::size_t>(j);
+                const T dgM = pM[k-1], dgX = pX[k-1], dgY = pY[k-1];
+                T m_val = std::max({dgM, dgX, dgY}) + subT(i, j);
+                unsigned char km = pick(dgM, dgX, dgY);
+
+                const T ux = pM[k] - go_b - ge_b, vx = pX[k] - ge_b, wx = pY[k] - go_b - ge_b;
+                const T x_val = std::max({ux, vx, wx});
+                const unsigned char kx = pick(ux, vx, wx);
+
+                const T uy = cM[k-1] - go_a - ge_a, vy = cX[k-1] - go_a - ge_a, wy = cY[k-1] - ge_a;
+                const T y_val = std::max({uy, vy, wy});
+                const unsigned char ky = pick(uy, vy, wy);
+
+                if constexpr (AM == AlignMode::Local) {
+                    m_val = std::max(m_val, static_cast<T>(0));
+                    const T best_here = std::max({m_val, x_val, y_val});
+                    if (best_here > best_local) {
+                        best_local = best_here; best_i_ = i; best_j_ = j;
+                        if      (m_val >= x_val && m_val >= y_val) best_tbl_ = TBTable::M;
+                        else if (x_val >= y_val)                    best_tbl_ = TBTable::X;
+                        else                                         best_tbl_ = TBTable::Y;
+                    }
+                    if (m_val <= static_cast<T>(0)) km = 3;   // traceback stops here
+                }
+
+                cM[k] = m_val; cX[k] = x_val; cY[k] = y_val;
+                dM[rb + k] = km; dX[rb + k] = kx; dY[rb + k] = ky;
+            }
+            std::swap(pM, cM); std::swap(pX, cX); std::swap(pY, cY);
+        }
+
+        if constexpr (AM == AlignMode::Global) {
+            const std::size_t k = static_cast<std::size_t>(n_);
+            const T vm = pM[k], vx = pX[k], vy = pY[k];       // pM is row m_ after the swap
+            viterbi_score_ = std::max({vm, vx, vy});
+            best_i_ = m_; best_j_ = n_;
+            if      (vm >= vx && vm >= vy) best_tbl_ = TBTable::M;
+            else if (vx >= vy)             best_tbl_ = TBTable::X;
+            else                            best_tbl_ = TBTable::Y;
+        } else {
+            viterbi_score_ = best_local;
+        }
+        pointers_ = true;
+    }
+
     void viterbi_affine(DpBuffer& buf) {
         band_fill(buf.VM, NEG_INF);
         band_fill(buf.VX, NEG_INF);
@@ -1013,6 +1260,30 @@ private:
     void traceback_affine_impl(const DpBuffer& buf, EmitFn&& emit) const {
         int i = best_i_, j = best_j_;
         TBTable tbl = best_tbl_;
+        // Variant B retains predecessor codes, not score tables — reading VM/VX/VY
+        // below would walk off an unallocated vector.  (It did: align_full() +
+        // aligned() segfaulted before this branch existed.)
+        if (pointers_) {
+            while (true) {
+                if (i == 0 && j == 0) break;
+                if constexpr (AM == AlignMode::Local)
+                    if (tbl == TBTable::M && dcode(buf.DM, i, j) == 3) break;
+                // Same border guard as the score-table walks — see the note there.
+                if      (i == 0) tbl = TBTable::Y;
+                else if (j == 0) tbl = TBTable::X;
+                unsigned char c;
+                if (tbl == TBTable::M) {
+                    emit(i - 1, j - 1);
+                    c = dcode(buf.DM, i, j); --i; --j;
+                } else if (tbl == TBTable::X) {
+                    c = dcode(buf.DX, i, j); --i;
+                } else {
+                    c = dcode(buf.DY, i, j); --j;
+                }
+                tbl = (c == 1) ? TBTable::X : (c == 2 ? TBTable::Y : TBTable::M);
+            }
+            return;
+        }
         // Same T-precision penalties as the forward pass, so the predecessor argmax
         // re-derived here reproduces the branch the fill took, bit for bit.
         const T go_a = static_cast<T>(params_->gap_open_a);
@@ -1072,6 +1343,34 @@ private:
     void aligned_affine(const DpBuffer& buf, std::string& a, std::string& b) const {
         int i = best_i_, j = best_j_;
         TBTable tbl = best_tbl_;
+        // Pointers: no score tables to read.  (This is the FOURTH copy of this walk
+        // in the file — guide_j, hard_grad, traceback_impl and here — and missing it
+        // was a segfault, not a wrong answer, because B leaves VM/VX/VY unallocated.)
+        if (pointers_) {
+            while (true) {
+                if (i == 0 && j == 0) break;
+                if constexpr (AM == AlignMode::Local)
+                    if (tbl == TBTable::M && dcode(buf.DM, i, j) == 3) break;
+                // Same border guard as the score-table walks — see the note there.
+                if      (i == 0) tbl = TBTable::Y;
+                else if (j == 0) tbl = TBTable::X;
+                unsigned char c;
+                if (tbl == TBTable::M) {
+                    a.push_back(sym_a(i)); b.push_back(sym_b(j));
+                    c = dcode(buf.DM, i, j); --i; --j;
+                } else if (tbl == TBTable::X) {
+                    a.push_back(sym_a(i)); b.push_back('-');
+                    c = dcode(buf.DX, i, j); --i;
+                } else {
+                    a.push_back('-'); b.push_back(sym_b(j));
+                    c = dcode(buf.DY, i, j); --j;
+                }
+                tbl = (c == 1) ? TBTable::X : (c == 2 ? TBTable::Y : TBTable::M);
+            }
+            std::reverse(a.begin(), a.end());
+            std::reverse(b.begin(), b.end());
+            return;
+        }
         const T go_a = static_cast<T>(params_->gap_open_a);
         const T ge_a = static_cast<T>(params_->gap_extend_a);
         const T go_b = static_cast<T>(params_->gap_open_b);

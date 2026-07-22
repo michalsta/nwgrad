@@ -72,12 +72,14 @@ struct SeqPairT {
             const AlignParams& params,
             GapModel gm, AlignMode am,
             GradMode grad_mode = GradMode::Hard,
-            int kernel = kBackendAuto)
+            int kernel = kBackendAuto,
+            TracebackMode tb = TracebackMode::Pointers)
         : a_idx_(params.matrix.alphabet().encode(a)),
           b_idx_(params.matrix.alphabet().encode(b)),
           params_(&params),
           grad_mode_(grad_mode),
           kernel_(kernel),
+          tb_(tb),
           grad_(params.matrix.alphabet())
     {
         if      (gm == GapModel::Linear && am == AlignMode::Global)
@@ -89,13 +91,19 @@ struct SeqPairT {
         else
             state_.template emplace<SeqPairState<GapModel::Affine, AlignMode::Local, T>>();
 
-        std::visit([kernel](auto& st) {
+        std::visit([kernel, tb](auto& st) {
             st.full_al.set_kernel(kernel);
             st.band_al.set_kernel(kernel);
+            // Only the Full aligner can use pointers; the banded one needs its score
+            // tables and its footprint is O(m*band) already.
+            st.full_al.set_traceback(tb);
+            st.band_al.set_traceback(TracebackMode::Scores);
         }, state_);
     }
 
     int kernel() const noexcept { return kernel_; }
+
+    TracebackMode traceback() const noexcept { return tb_; }
 
     // Swap alignment parameters.  Invalidates score and gradient; path stays.
     // realign_banded() remains callable after this — it will re-score the
@@ -340,6 +348,7 @@ private:
     const AlignParams*   params_;
     GradMode             grad_mode_;
     int                  kernel_;   // Viterbi backend, forwarded to each aligner
+    TracebackMode        tb_;
 
     bool             path_valid_   = false;
     bool             score_valid_  = false;

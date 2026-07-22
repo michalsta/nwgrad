@@ -78,6 +78,11 @@ struct AlignedAllocator {
 // The always-double DP storage (forward-backward / soft path) uses it.
 using DVec = std::vector<double, AlignedAllocator<double>>;
 
+// Direction-pointer storage for the variant-B Viterbi (see aligner.hpp).  One byte
+// per cell per state instead of a retained score table: 3 B/cell against 12 (float32)
+// or 24 (double), which is the whole point of B.
+using BVec = std::vector<unsigned char, AlignedAllocator<unsigned char>>;
+
 // ── DpBuffer ──────────────────────────────────────────────────────────────────
 //
 // Holds all DP table vectors for one Aligner computation.
@@ -114,6 +119,21 @@ struct DpBufferT {
     // query profile in striped order.  Both O(n), not O(m·n).
     TVec sopenv, sprof;
 
+    // ── TracebackMode::Pointers: predecessors instead of retained score tables ─
+    //
+    // DM/DX/DY hold, for every cell, which predecessor state the forward pass chose
+    // — 0=M, 1=X, 2=Y — recorded with exactly the traceback's own `>=` M>X>Y
+    // tie-break, which is what makes B bit-exact and not merely correct.  DM also
+    // carries the sentinel 3 = "VM <= 0 here", reproducing Local's traceback stop
+    // condition without keeping a single VM value around.
+    //
+    // With these, the score tables collapse to two rolling rows (rM/rX/rY below),
+    // so the retained footprint is 3 B/cell instead of 12.  That footprint is the
+    // thing measured to drive the page-fault cost that dominates the memory-bound
+    // regime — see the sorted-scheduler notes.
+    BVec DM, DX, DY;
+    TVec rM, rX, rY, qM, qX, qY;   // rolling current/previous rows (O(n), not O(mn))
+
     void clear() noexcept {
         auto clrT = [](TVec& v) noexcept { v.clear(); v.shrink_to_fit(); };
         auto clrD = [](DVec& v) noexcept { v.clear(); v.shrink_to_fit(); };
@@ -123,6 +143,9 @@ struct DpBufferT {
         clrD(FM); clrD(FX); clrD(FY); clrD(BM); clrD(BX); clrD(BY);
         clrT(prof); clrT(subbuf);
         clrT(sopenv); clrT(sprof);
+        auto clrB = [](BVec& v) noexcept { v.clear(); v.shrink_to_fit(); };
+        clrB(DM); clrB(DX); clrB(DY);
+        clrT(rM); clrT(rX); clrT(rY); clrT(qM); clrT(qX); clrT(qY);
     }
 };
 

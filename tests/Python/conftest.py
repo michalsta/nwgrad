@@ -117,3 +117,4 @@ def force_kernel(request):
 
     _current_backend = getattr(request, "param", _KERNEL)
     print(f"nwgrad: forcing backend {_current_backend!r}")
+

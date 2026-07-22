@@ -118,6 +118,7 @@ add_executable(nwgrad_tests
     tests/cpp/test_batch.cpp
     tests/cpp/test_banded.cpp
     tests/cpp/test_seq_pair.cpp
+    tests/cpp/test_traceback_modes.cpp
     tests/cpp/test_add_many.cpp
     tests/cpp/test_simd_bitexact.cpp
     tests/cpp/test_simd_bitexact_f32.cpp
@@ -158,6 +159,18 @@ add_test(NAME cpp_tests COMMAND nwgrad_tests)
 foreach(isa sse2 avx2 avx512 neon)
     add_test(NAME cpp_tests_isa_${isa} COMMAND nwgrad_tests "[simd]")
     set_tests_properties(cpp_tests_isa_${isa}
+        PROPERTIES ENVIRONMENT "NWGRAD_ISA=${isa}")
+endforeach()
+
+# ── the pointer traceback, once per instruction set ──────────────────────────
+#
+# TracebackMode::Pointers has its own kernel at every level, so "compiled" and
+# "tested" are as far apart for it as for the score-table kernel.  [traceback]
+# carries the pointers-vs-scores equivalence cases; forcing the ISA runs them
+# against each level's pointer kernel in turn.
+foreach(isa sse2 avx2 avx512 neon)
+    add_test(NAME cpp_tests_traceback_${isa} COMMAND nwgrad_tests "[traceback]")
+    set_tests_properties(cpp_tests_traceback_${isa}
         PROPERTIES ENVIRONMENT "NWGRAD_ISA=${isa}")
 endforeach()
 

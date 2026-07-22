@@ -98,6 +98,18 @@ static void keep_current_params(nb::object owner, nb::object params) {
     owner.attr("_params") = params;
 }
 
+// Traceback vocabulary, mirroring gap_model= / mode= / grad_mode= / kernel=.
+static TracebackMode parse_traceback(const std::string& name) {
+    if (name == "pointers") return TracebackMode::Pointers;
+    if (name == "scores")   return TracebackMode::Scores;
+    throw nb::value_error(
+        ("nwgrad: unknown traceback \"" + name +
+         "\" (expected \"pointers\" or \"scores\")").c_str());
+}
+static const char* traceback_name(TracebackMode t) {
+    return t == TracebackMode::Pointers ? "pointers" : "scores";
+}
+
 static std::vector<int> make_guide(const std::string& aligned_a,
                                     const std::string& aligned_b) {
     if (!aligned_a.empty() && !aligned_b.empty())
@@ -256,24 +268,27 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
             [](SP* self, const std::string& seq_a, const std::string& seq_b,
                const AlignParams& params, const std::string& gap_model,
                const std::string& mode, const std::string& grad_mode,
-               const std::string& kernel) {
+               const std::string& kernel, const std::string& traceback) {
                 GapModel  gm = (gap_model == "affine") ? GapModel::Affine  : GapModel::Linear;
                 AlignMode am = (mode      == "local")  ? AlignMode::Local  : AlignMode::Global;
                 GradMode  gd;
                 if      (grad_mode == "hard") gd = GradMode::Hard;
                 else if (grad_mode == "soft") gd = GradMode::Soft;
                 else                          gd = GradMode::None;
-                new (self) SP(seq_a, seq_b, params, gm, am, gd, parse_backend(kernel));
+                new (self) SP(seq_a, seq_b, params, gm, am, gd, parse_backend(kernel),
+                              parse_traceback(traceback));
             },
             nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("params"),
             nb::arg("gap_model") = "affine", nb::arg("mode") = "global",
             nb::arg("grad_mode") = "hard", nb::arg("kernel") = "auto",
+            nb::arg("traceback") = "pointers",
             nb::keep_alive<1, 4>(),
             "Persistent sequence pair.\n"
             "  gap_model : \"linear\" | \"affine\"\n"
             "  mode      : \"global\" | \"local\"\n"
             "  grad_mode : \"hard\" | \"soft\" | \"none\"\n"
-            "  kernel    : \"scalar\" | \"simd\" — bit-exact speed knob (Viterbi path).")
+            "  kernel    : \"scalar\" | \"simd\" — bit-exact speed knob (Viterbi path).\n"
+            "  traceback : \"pointers\" (default) | \"scores\" — see SeqPairBatch.")
         .def("alloc_dp", &SP::alloc_dp,
              "Pre-allocate own DP tables for the fixed sequences.")
         .def(
@@ -328,6 +343,9 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
                 return nb::cast(std::vector<int>(self.guide_j()));
             },
             "Current alignment as a guide_j vector (length m+1), or None.")
+        .def_prop_ro("traceback",
+                     [](const SP& s) { return traceback_name(s.traceback()); },
+                     "\"pointers\" (default) or \"scores\" — see SeqPairBatch.traceback.")
         .def_prop_ro("path_valid",  &SP::path_valid)
         .def_prop_ro("score_valid", &SP::score_valid)
         .def_prop_ro("grad_valid",  &SP::grad_valid)
@@ -343,12 +361,19 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
     nb::class_<SPB>(m, name, nb::dynamic_attr())
         .def(
             "__init__",
-            [](SPB* self, int n_threads) { new (self) SPB(n_threads); },
-            nb::arg("n_threads") = 0,
+            [](SPB* self, int n_threads, const std::string& traceback) {
+                new (self) SPB(n_threads, parse_traceback(traceback));
+            },
+            nb::arg("n_threads") = 0, nb::arg("traceback") = "pointers",
             "Threaded batch of SeqPair objects.\n"
             "  n_threads=0 (default) uses the PHYSICAL core count (falling back to\n"
             "  hardware_concurrency): this DP is stall-bound, so SMT siblings\n"
-            "  contend and the logical count measured up to 1.44x slower.")
+            "  contend and the logical count measured up to 1.44x slower.\n"
+            "  traceback : \"pointers\" (default) | \"scores\" — what the DP retains in\n"
+            "     order to recover predecessors.  \"pointers\" records 1 byte/cell/state\n"
+            "     during the fill (3 B/cell); \"scores\" keeps VM/VX/VY and re-derives\n"
+            "     the argmax (12 B/cell).  Bit-identical; pointers is smaller and\n"
+            "     measured 1.4-2.2x faster.  Applies to pairs built by add_many().")
         .def(
             "add",
             [](nb::object self_obj, nb::object sp_obj) {
@@ -459,6 +484,45 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             "300-arm sweep over 4 machines found no reserve was fastest on\n"
             "tailed length distributions and immaterial on flat ones.  Raise it\n"
             "only if your workload behaves unlike either.")
+        .def_rw("long_cost_ratio", &SPB::long_cost_ratio,
+                "schedule=\"sorted\" cost weight: how much more a cell costs once the DP\n"
+                "tables no longer fit cache.  DEFAULT 1.0 = OFF: correcting the\n"
+                "imbalance measured slower (it fixes balance but converts idle\n"
+                "threads into memory contention).  Raise it to move the straggler\n"
+                "toward the short-sequence chunks; expect to pay ~4-6%.")
+        .def_rw("weight_lo", &SPB::weight_lo,
+                "Effective length below which cells are unweighted (default 500).")
+        .def_rw("weight_hi", &SPB::weight_hi,
+                "Effective length at which the weight saturates (default 1700).")
+        .def_prop_ro("traceback",
+                     [](const SPB& s) { return traceback_name(s.traceback()); },
+                     "How the traceback recovers predecessors, fixed at construction:\n"
+                     "  \"pointers\" (default) — record 1 byte/cell/state during the fill\n"
+                     "     and follow it; scores need only two rolling rows.  3 B/cell.\n"
+                     "  \"scores\" — retain VM/VX/VY and re-derive the argmax.  12 B/cell.\n"
+                     "Bit-identical either way; \"scores\" exists for table introspection.")
+        .def_rw("profile", &SPB::profile,
+                "Record per-thread phase timings during schedule=\"sorted\" runs "
+                "(off by default).  Read them back with schedule_profile().")
+        .def("schedule_profile",
+             [](const SPB& self) {
+                 nb::list out;
+                 for (const auto& p : self.profile_out) {
+                     nb::dict d;
+                     d["chunk_s"]       = p.chunk_s;
+                     d["reserve_s"]     = p.reserve_s;
+                     d["chunk_cells"]   = p.chunk_cells;
+                     d["reserve_cells"] = p.reserve_cells;
+                     d["chunk_tasks"]   = p.chunk_tasks;
+                     d["reserve_tasks"] = p.reserve_tasks;
+                     d["finish_s"]      = p.finish_s;
+                     out.append(d);
+                 }
+                 return out;
+             },
+             "Per-thread phase timings from the last sorted-schedule run (needs "
+             "profile=True).  One dict per worker: busy seconds, cells and task "
+             "counts for the chunk and reserve phases, plus finish time.")
         .def_prop_ro("n_threads", [](const SPB& s) { return s.n_threads; });
 }
 

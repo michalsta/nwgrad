@@ -71,6 +71,7 @@ void check_bit_exact(const AlignParams& p, const std::string& a, const std::stri
     DpBuffer buf_scalar, buf_simd;
 
     al.set_problem(a, b, p, band);
+    al.set_traceback(TracebackMode::Scores);
     al.set_kernel(kBackendScalar);
     al.compute_viterbi(buf_scalar);
     const double score_scalar = al.score();
@@ -87,6 +88,7 @@ void check_bit_exact(const AlignParams& p, const std::string& a, const std::stri
     }
 
     al.set_problem(a, b, p, band);
+    al.set_traceback(TracebackMode::Scores);
     al.set_kernel(kBackendAuto);
     al.compute_viterbi(buf_simd);
     const double score_simd = al.score();

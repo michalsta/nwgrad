@@ -32,6 +32,7 @@ namespace stdx = std::experimental;
 #define NWGRAD_LEVEL_NS NWGRAD_LVL_NAME
 namespace NWGRAD_LVL_NAME {
 #include "kernels_impl.inl"       // striped affine Full kernel (defines KW)
+#include "kernels_pointers_impl.inl"  // same kernel, recording predecessor pointers
 #include "row_kernel_impl.inl"    // row-wise banded leaf kernels (uses KW)
 }
 #undef NWGRAD_LEVEL_NS
@@ -47,6 +48,8 @@ struct NwgradLevelRegistrar {
         register_level(NWGRAD_LVL_ENUM,
                        &NWGRAD_LVL_NAME::striped_full_entry<double>,  // affine Full double: G+L
                        &NWGRAD_LVL_NAME::striped_full_entry<float>,   // affine Full float32: G+L
+                       &NWGRAD_LVL_NAME::striped_full_ptr_entry<double>, // TracebackMode::Pointers, double
+                       &NWGRAD_LVL_NAME::striped_full_ptr_entry<float>,  // TracebackMode::Pointers, float32
                        &NWGRAD_LVL_NAME::banded_row_global,    // affine GuideBanded: whole-row ↓
                        &NWGRAD_LVL_NAME::banded_row_local,
                        NWGRAD_LVL_NAME::ROW_BLOCK);

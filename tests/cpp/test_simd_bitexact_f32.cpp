@@ -70,6 +70,7 @@ void check_bit_exact_f32(const AlignParams& p, const std::string& a, const std::
     DpBufferT<float> buf_scalar, buf_simd;
 
     al.set_problem(a, b, p);
+    al.set_traceback(TracebackMode::Scores);
     al.set_kernel(kBackendScalar);
     al.compute_viterbi(buf_scalar);
     const double score_scalar = al.score();
@@ -81,6 +82,7 @@ void check_bit_exact_f32(const AlignParams& p, const std::string& a, const std::
     std::vector<float> rmY = al.to_row_major(buf_scalar.VY);
 
     al.set_problem(a, b, p);
+    al.set_traceback(TracebackMode::Scores);
     al.set_kernel(kBackendAuto);
     al.compute_viterbi(buf_simd);
     const double score_simd = al.score();
@@ -128,6 +130,7 @@ TEST_CASE("f32 striped kernel is actually dispatched (not a scalar fallback)", "
     Aligner<GapModel::Affine, AlignMode::Global, AlignBand::Full, float> al;
     DpBufferT<float> buf;
     al.set_problem(a, b, p);
+    al.set_traceback(TracebackMode::Scores);
     al.set_kernel(kBackendAuto);
     al.compute_viterbi(buf);
     const size_t row_major = (a.size() + 1) * (b.size() + 1);

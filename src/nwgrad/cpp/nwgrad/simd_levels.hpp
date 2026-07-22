@@ -162,6 +162,8 @@ using banded_row_fn = double (*)(double* __restrict, double* __restrict, double*
 struct LevelKernels {
     viterbi_fn    viterbi = nullptr;            // striped affine Full, double (Global + Local)
     viterbi_fn_f  viterbi_f = nullptr;          // striped affine Full, float32
+    viterbi_fn    viterbi_ptr = nullptr;          // TracebackMode::Pointers, double
+    viterbi_fn_f  viterbi_ptr_f = nullptr;        // TracebackMode::Pointers, float32
     banded_row_fn banded_row_global = nullptr;  // row-wise banded whole-row kernels ↓ (double)
     banded_row_fn banded_row_local  = nullptr;
     int           row_block = 0;                // columns per interleaved block (per-µarch)
@@ -183,6 +185,7 @@ inline LevelKernels* level_table() {
 // program would SIGILL at load on a non-AVX512 box.  Passing bare pointers keeps the
 // registrar to scalar `lea`s; the struct is assembled and stored here, in baseline code.
 void register_level(SimdLevel l, viterbi_fn viterbi, viterbi_fn_f viterbi_f,
+                    viterbi_fn viterbi_ptr, viterbi_fn_f viterbi_ptr_f,
                     banded_row_fn banded_row_global, banded_row_fn banded_row_local,
                     int row_block);
 

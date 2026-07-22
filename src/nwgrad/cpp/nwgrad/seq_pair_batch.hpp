@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cmath>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -63,8 +65,87 @@ struct SeqPairBatchT {
     // with a workload unlike anything swept here may want it; the default is off.
     double reserve_frac = 0.0;
 
-    explicit SeqPairBatchT(int nt = 0)
-        : n_threads(nt > 0 ? nt : default_threads()) {}
+    // Traceback strategy for pairs this batch constructs (add_many).  Fixed at
+    // construction: it decides what the DP retains, so flipping it mid-flight would
+    // only be meaningful between calls and invited stale-state bugs.  Pairs added by
+    // add() keep whatever they were built with.
+    TracebackMode traceback() const noexcept { return tb_; }
+
+    // ── Cost-model weighting: cells are NOT fungible ─────────────────────────
+    //
+    // The plain square cost assumes every cell costs the same.  It does not.
+    // Measured per-chunk throughput (nighthaven avx2, 6 threads, equal-CELL
+    // chunks, so any spread here is pure model error):
+    //
+    //   chunk   16..771 aa  599.6 Mcell/s      chunk 1660..2308  206.7
+    //   chunk  771..1188    339.5              chunk 2309..4243  202.3
+    //   chunk 1189..1660    222.7              chunk 4359..8829  194.2
+    //
+    // A 3.09x spread, which left 22% of the machine idle and the LONG-sequence
+    // thread straggling by 6.7 s.  weight() corrects for that: a task's cost is
+    // its cells times a factor rising from 1 to `long_cost_ratio` as the effective
+    // length crosses [weight_lo, weight_hi] -- the cache cliff.
+    //
+    // DEFAULT 1.0 -- WEIGHTING OFF -- because correcting the imbalance measured
+    // SLOWER, which was not the expectation.  Sweep on nighthaven (avx2, 6 threads,
+    // 11.6 Gcells, equal-cell chunks as the 1.0 baseline):
+    //
+    //   ratio  wall    finish spread  idle   straggler
+    //   1.0    9.85s   6.63s          22%    t5 (4359..8829 aa)   1.000x
+    //   2.0   10.31s   4.53s          10%    t5                   1.046x
+    //   3.5   10.41s   1.59s           5%    t5                   1.057x
+    //   4.5   10.25s   0.75s           3%    t1 (1160..1613 aa)   1.041x
+    //   6.0   10.45s   0.58s           3%    t1                   1.061x
+    //
+    // It does what it says: at ratio >= 4.5 the straggler moves off the long chunk
+    // onto a short one and idle collapses from 22% to 3%.  And every setting is
+    // slower.  Busy time rises from 46.6 to ~59.7 thread-seconds for identical work
+    // -- balancing does not reclaim idle capacity, it converts idle into contention,
+    // because threads that finish early stop competing for memory and let the
+    // memory-bound thread have the bus to itself.  The "22% idle" was never waste.
+    //
+    // So this is a knob for someone whose workload behaves unlike anything measured
+    // here, not a default.  Set > 1.0 to shift the straggler toward the short chunks;
+    // expect to pay for it.
+    //
+    // weight() is MONOTONIC in length, so the sort order is untouched and each
+    // thread still owns a contiguous size band -- the property the whole memory
+    // bound rests on.  Only the partition boundaries move.
+    double long_cost_ratio = 1.0;    // 1.0 = no weighting (see above)
+    double weight_lo = 500.0;        // below this, cache-resident: weight 1
+    double weight_hi = 1700.0;       // above this, saturated: weight long_cost_ratio
+
+    double length_weight(double cells) const noexcept {
+        if (long_cost_ratio <= 1.0 || weight_hi <= weight_lo) return 1.0;
+        const double eff = std::sqrt(cells);          // geometric-mean length
+        const double t = std::clamp((eff - weight_lo) / (weight_hi - weight_lo),
+                                    0.0, 1.0);
+        return 1.0 + (long_cost_ratio - 1.0) * t;
+    }
+
+    // ── Per-thread schedule profiling (opt-in, off by default) ───────────────
+    //
+    // Exists to answer one specific question that timings alone could not: when
+    // reserve_frac rises, does the CHUNK phase itself get slower -- because pulling
+    // the cheap short sequences into the reserve leaves every thread grinding
+    // uniformly long, memory-bound work at the same moment -- or is the reserve
+    // merely relocating work?  Answering that needs cells AND seconds per phase,
+    // so a per-phase Mcell/s can be computed; wall time alone cannot distinguish
+    // "moved work" from "same work, run slower".
+    //
+    // Off by default and read only after the fact: two clock reads per worker per
+    // phase, nothing inside the task loop.
+    struct PhaseProfile {
+        double chunk_s = 0.0,  reserve_s = 0.0;      // busy seconds in each phase
+        double chunk_cells = 0.0, reserve_cells = 0.0;
+        long   chunk_tasks = 0, reserve_tasks = 0;
+        double finish_s = 0.0;                        // finish time from schedule start
+    };
+    bool profile = false;
+    std::vector<PhaseProfile> profile_out;
+
+    explicit SeqPairBatchT(int nt = 0, TracebackMode tb = TracebackMode::Pointers)
+        : n_threads(nt > 0 ? nt : default_threads()), tb_(tb) {}
 
     // Non-copyable.  It never was, meaningfully — a copy would duplicate the raw
     // pointers in `pairs` and alias every borrowed SeqPair.  But it has to be
@@ -139,7 +220,7 @@ struct SeqPairBatchT {
                 size_t i = idx.fetch_add(1, std::memory_order_relaxed);
                 if (i >= N) break;
                 staged[i] = std::make_unique<SeqPair>(seqs_a[i], seqs_b[i],
-                                                      params, gm, am, gd, kernel);
+                                                      params, gm, am, gd, kernel, tb_);
             }
         };
         run_workers(N, worker);
@@ -373,22 +454,44 @@ private:
         std::atomic<int>    next_worker{0};
         std::atomic<size_t> reserve_idx{0};
 
+        using clk = std::chrono::steady_clock;
+        const bool prof = profile;
+        if (prof) { profile_out.assign(static_cast<size_t>(nthr), PhaseProfile{}); }
+        const auto t_start = clk::now();
+        auto since = [&](clk::time_point a, clk::time_point b) {
+            return std::chrono::duration<double>(b - a).count();
+        };
+
         auto worker = [&]() {
             const int k = next_worker.fetch_add(1, std::memory_order_relaxed);
             DpBuffer buf;
+            PhaseProfile pp;
+
+            const auto t0 = clk::now();
             if (k < nthr) {
                 // Descending within the chunk: the buffer reaches its high-water
                 // mark on the first task and never reallocates afterwards.
                 for (size_t p = bound[static_cast<size_t>(k) + 1];
-                     p > bound[static_cast<size_t>(k)]; --p)
+                     p > bound[static_cast<size_t>(k)]; --p) {
                     task(order[p - 1], buf);
+                    if (prof) { pp.chunk_cells += cost[order[p - 1]]; ++pp.chunk_tasks; }
+                }
             }
+            const auto t1 = clk::now();
             // Finished early -> drain the reserve.  Largest reserve task first,
             // so the last thing any thread picks up is the cheapest work there is.
             while (true) {
                 size_t s = reserve_idx.fetch_add(1, std::memory_order_relaxed);
                 if (s >= r) break;
                 task(order[r - 1 - s], buf);
+                if (prof) { pp.reserve_cells += cost[order[r - 1 - s]]; ++pp.reserve_tasks; }
+            }
+            const auto t2 = clk::now();
+            if (prof && k >= 0 && static_cast<size_t>(k) < profile_out.size()) {
+                pp.chunk_s   = since(t0, t1);
+                pp.reserve_s = since(t1, t2);
+                pp.finish_s  = since(t_start, t2);
+                profile_out[static_cast<size_t>(k)] = pp;
             }
         };
 
@@ -400,9 +503,11 @@ private:
         const int    nthr = std::min<int>(n_threads, static_cast<int>(N));
 
         std::vector<double> cost(N);
-        for (size_t i = 0; i < N; ++i)
-            cost[i] = static_cast<double>(pairs[i]->len_a() + 1) *
-                      static_cast<double>(pairs[i]->len_b() + 1);
+        for (size_t i = 0; i < N; ++i) {
+            const double cells = static_cast<double>(pairs[i]->len_a() + 1) *
+                                 static_cast<double>(pairs[i]->len_b() + 1);
+            cost[i] = cells * length_weight(cells);
+        }
 
         run_sorted_phase_(cost, nthr, [&](size_t i, DpBuffer& buf) {
             pairs[i]->score_and_grad_with_dp(buf);
@@ -480,6 +585,8 @@ private:
 
     // Physical cores, not logical -- see parallel.hpp::physical_cores() for the
     // measurements.  hardware_concurrency() costs up to 1.44x on an SMT host.
+    TracebackMode tb_ = TracebackMode::Pointers;
+
     static int default_threads() noexcept { return default_thread_count(); }
 
     // Dispatch a lambda(size_t index) over [0, N) with per-index atomics.
