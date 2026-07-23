@@ -197,7 +197,19 @@ static void hb_sweep_striped(HbJob<T>& job) {
             bool changed = false;
             for (int s = 0; s < seg; ++s) {
                 vd v; v.copy_from(cY + (std::size_t)s * W, stdx::element_aligned);
+                // clang + libstdc++ std::simd cannot compile the AVX-512 mask reduction
+                // for T=double (its 64-bit lane asserts `long` but clang canonicalizes
+                // `long long`).  Same swap as kernels_impl.inl — see the long note there.
+#if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
+                if constexpr (std::is_same_v<T, double>) {
+                    alignas(64) double fa[8], va[8];
+                    F.copy_to(fa, stdx::element_aligned);
+                    v.copy_to(va, stdx::element_aligned);
+                    if (_mm512_cmp_pd_mask(_mm512_load_pd(fa), _mm512_load_pd(va), _CMP_GT_OQ) == 0) break;
+                } else { if (!stdx::any_of(F > v)) break; }
+#else
                 if (!stdx::any_of(F > v)) break;
+#endif
                 v = stdx::max(v, F);
                 v.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
                 F = v - vge_a;
