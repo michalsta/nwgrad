@@ -9,6 +9,7 @@ throw lands on a spawned thread rather than the caller's.
 import numpy as np
 import pytest
 import nwgrad
+from conftest import running_under_asan
 from test_subst_matrix import BLOSUM62
 
 
@@ -136,6 +137,14 @@ def test_set_params_keeps_the_current_params_alive():
                                atol=1e-12)
 
 
+@pytest.mark.skipif(running_under_asan(), reason=(
+    "RSS-based leak check is unreliable under ASan: its redzones and its "
+    "quarantine of freed blocks (retained, not released, so use-after-free "
+    "stays detectable) both inflate ru_maxrss regardless of whether "
+    "set_params() actually released the superseded params. Real release is "
+    "still verified by test_set_params_keeps_the_current_params_alive and the "
+    "refcount-based tests; this one only adds a size bound that ASan can't "
+    "give an honest answer to."))
 def test_set_params_releases_superseded_params():
     """A descent loop builds a fresh AlignParams each step.  nb::keep_alive
     pinned every one of them for the SeqPair's whole life -- 50k swaps retained

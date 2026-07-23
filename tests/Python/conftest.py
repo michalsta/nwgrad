@@ -23,6 +23,25 @@ import os
 
 import pytest
 
+
+def running_under_asan():
+    """Best-effort detection of AddressSanitizer in *this* process.
+
+    Checked by reading our own memory map rather than an env var (ASAN_OPTIONS /
+    LD_PRELOAD are set by the CI job's shell, not by the interpreter, so a test
+    importing this module has no other reliable signal). Used to skip tests that
+    infer heap behaviour from RSS: ASan's redzones and its quarantine of freed
+    blocks (held, not released, to catch use-after-free) both inflate RSS
+    regardless of whether the code under test leaked anything, so a threshold
+    tuned for a normal allocator fires on a perfectly healthy build.
+    """
+    try:
+        with open("/proc/self/maps") as f:
+            return "libasan" in f.read()
+    except OSError:
+        return False
+
+
 _KERNEL = os.environ.get("NWGRAD_FORCE_KERNEL", "").strip()
 _current_backend = None  # the backend string injected into kernel=, updated per sweep param
 
