@@ -190,7 +190,12 @@ static void hb_sweep_striped(HbJob<T>& job) {
             v.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
             prev = v;
         }
-        for (int r = 0; r < W; ++r) {
+        // seg == 0 means NC == 0 — a zero-width block, which hb_solve DOES produce when
+        // the optimal path crosses at a column extreme.  The carry-free and carry loops
+        // above are already `for s<seg` no-ops then, but the lazy-F sweep below runs W
+        // times regardless and reads `cY + (seg-1)*W` = cY - W (size_t wrap) — 32 bytes
+        // before the buffer.  Guard it; there is nothing to correct with no columns.
+        if (seg > 0) for (int r = 0; r < W; ++r) {
             vd last; last.copy_from(cY + (std::size_t)(seg - 1) * W, stdx::element_aligned);
             vd F([&](int q) { return q == 0 ? bY : last[q - 1]; });
             F = F - vge_a;
@@ -420,7 +425,7 @@ static void hb_base_striped(HbBaseJob<T>& job) {
             ky.copy_to(yc + (std::size_t)s * W, stdx::element_aligned);
             prev = v;
         }
-        for (int rr = 0; rr < W; ++rr) {
+        if (seg > 0) for (int rr = 0; rr < W; ++rr) {   // seg==0 (NC==0): nothing to correct
             vd last; last.copy_from(cY + off + (std::size_t)(seg - 1) * W, stdx::element_aligned);
             vd F([&](int q) { return q == 0 ? bY : last[q - 1]; });
             F = F - vge_a;
