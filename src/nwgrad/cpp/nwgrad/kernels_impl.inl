@@ -21,6 +21,47 @@
 #  error "kernels_impl.inl must be included inside a level namespace by a level TU"
 #endif
 
+// ── AVX-512/clang std::simd mask workaround (T=double only), shared ──────────
+// libstdc++'s <experimental/simd> mask path fails to COMPILE under clang at AVX-512
+// width for T=double — its 512-bit mask reduction (_MaskImplX86Mixin::_S_to_bits)
+// asserts the vector's 64-bit lane type is `long` (GCC's canonical 8-byte int), but
+// clang canonicalizes it `long long`, so `static_assert(is_same_v<long long, long>)`
+// fires (experimental/bits/simd_x86.h:4232) — a fixed mismatch in each compiler's
+// type model, unaffected by clang or libstdc++ version (checked clang 18-22,
+// libstdc++ 13-15 and current GCC trunk simd_x86.h — none guard this path). Below
+// this file's own early-exit workaround (a reduction to bool) are two more general
+// substitutes for `stdx::where(cond, dest) = value` compare-and-select, used by
+// kernels_pointers_impl.inl and hb_kernel_impl.inl (both #include'd after this file,
+// so these are visible there). T=float is untouched — its 32-bit lane type is `int`
+// on both compilers, so the std::simd form still compiles. -DNWGRAD_STD_SIMD_AVX512_MASK_OK
+// forces the std::simd form back if a future clang/libstdc++ pairing compiles it.
+#if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
+static inline __mmask8 avx512d_ge(stdx::native_simd<double> a, stdx::native_simd<double> b) {
+    alignas(64) double aa[8], bb[8];
+    a.copy_to(aa, stdx::element_aligned);
+    b.copy_to(bb, stdx::element_aligned);
+    return _mm512_cmp_pd_mask(_mm512_load_pd(aa), _mm512_load_pd(bb), _CMP_GE_OQ);
+}
+static inline __mmask8 avx512d_gt(stdx::native_simd<double> a, stdx::native_simd<double> b) {
+    alignas(64) double aa[8], bb[8];
+    a.copy_to(aa, stdx::element_aligned);
+    b.copy_to(bb, stdx::element_aligned);
+    return _mm512_cmp_pd_mask(_mm512_load_pd(aa), _mm512_load_pd(bb), _CMP_GT_OQ);
+}
+// Same semantics as `stdx::where(mask, dest) = value`: lanes where the mask bit is
+// set take `value`, the rest keep `dest`.
+static inline stdx::native_simd<double> avx512d_blend(__mmask8 k, stdx::native_simd<double> dest,
+                                                       stdx::native_simd<double> value) {
+    alignas(64) double da[8], va[8], out[8];
+    dest.copy_to(da, stdx::element_aligned);
+    value.copy_to(va, stdx::element_aligned);
+    _mm512_store_pd(out, _mm512_mask_blend_pd(k, _mm512_load_pd(da), _mm512_load_pd(va)));
+    stdx::native_simd<double> res;
+    res.copy_from(out, stdx::element_aligned);
+    return res;
+}
+#endif
+
 using vd = stdx::native_simd<double>;
 static constexpr int KW = (int)vd::size();     // native double-lane count (row_kernel uses it)
 static constexpr double K_NINF = -std::numeric_limits<double>::infinity();

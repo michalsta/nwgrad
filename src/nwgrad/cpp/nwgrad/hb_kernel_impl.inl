@@ -39,6 +39,11 @@
 #  error "hb_kernel_impl.inl must be included inside a level namespace by a level TU"
 #endif
 
+// The AVX-512/clang std::simd mask workaround (avx512d_ge / avx512d_gt / avx512d_blend)
+// used below is defined once in kernels_impl.inl, #include'd before this file — see
+// the note there. Every masked `stdx::where(cond, dest) = value` site in this file
+// goes through it for T=double; T=float is unaffected and keeps the std::simd form.
+
 // One half-sweep of a Hirschberg block.  Rows are walked by (a_start, a_step) and
 // columns by (b_start, b_step), so the forward and reverse halves are the same code
 // with the steps negated — there is one carry implementation, not two.
@@ -380,8 +385,18 @@ static void hb_base_striped(HbBaseJob<T>& job) {
             vd sb; sb.copy_from(sub + (std::size_t)s * W, stdx::element_aligned);
             vd vmv = stdx::max(stdx::max(dgM, dgX), dgY) + sb;
             vd km = vtwo;
+#if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
+            if constexpr (std::is_same_v<T, double>) {
+                km = avx512d_blend(avx512d_ge(dgX, dgY), km, vone);
+                km = avx512d_blend(avx512d_ge(dgM, dgX) & avx512d_ge(dgM, dgY), km, vzero);
+            } else {
+                stdx::where(dgX >= dgY, km) = vone;
+                stdx::where((dgM >= dgX) && (dgM >= dgY), km) = vzero;
+            }
+#else
             stdx::where(dgX >= dgY, km) = vone;
             stdx::where((dgM >= dgX) && (dgM >= dgY), km) = vzero;
+#endif
             vmv.copy_to(cM + off + (std::size_t)s * W, stdx::element_aligned);
             store_codes<T, W>(km, dM + (std::size_t)s * W);
 
@@ -392,14 +407,32 @@ static void hb_base_striped(HbBaseJob<T>& job) {
             const vd ax = (uM - vgo_b) - vge_b, bx = uX - vge_b, cx = (uY - vgo_b) - vge_b;
             vd vxv = stdx::max(stdx::max(ax, bx), cx);
             vd kx = vtwo;
+#if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
+            if constexpr (std::is_same_v<T, double>) {
+                kx = avx512d_blend(avx512d_ge(bx, cx), kx, vone);
+                kx = avx512d_blend(avx512d_ge(ax, bx) & avx512d_ge(ax, cx), kx, vzero);
+            } else {
+                stdx::where(bx >= cx, kx) = vone;
+                stdx::where((ax >= bx) && (ax >= cx), kx) = vzero;
+            }
+#else
             stdx::where(bx >= cx, kx) = vone;
             stdx::where((ax >= bx) && (ax >= cx), kx) = vzero;
+#endif
             vxv.copy_to(cX + off + (std::size_t)s * W, stdx::element_aligned);
             store_codes<T, W>(kx, dX + (std::size_t)s * W);
 
             ((stdx::max(vmv, vxv) - vgo_a) - vge_a).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
             vd okv = vone;
+#if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
+            if constexpr (std::is_same_v<T, double>) {
+                okv = avx512d_blend(avx512d_ge(vmv, vxv), okv, vzero);
+            } else {
+                stdx::where(vmv >= vxv, okv) = vzero;
+            }
+#else
             stdx::where(vmv >= vxv, okv) = vzero;
+#endif
             okv.copy_to(ok + (std::size_t)s * W, stdx::element_aligned);
         }
 
@@ -420,7 +453,15 @@ static void hb_base_striped(HbBaseJob<T>& job) {
             const vd ext = prev - vge_a;
             vd v = stdx::max(O, ext);
             vd ky = vtwo;
+#if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
+            if constexpr (std::is_same_v<T, double>) {
+                ky = avx512d_blend(avx512d_ge(O, ext), ky, OK);
+            } else {
+                stdx::where(O >= ext, ky) = OK;
+            }
+#else
             stdx::where(O >= ext, ky) = OK;
+#endif
             v.copy_to(cY + off + (std::size_t)s * W, stdx::element_aligned);
             ky.copy_to(yc + (std::size_t)s * W, stdx::element_aligned);
             prev = v;
@@ -443,7 +484,15 @@ static void hb_base_striped(HbBaseJob<T>& job) {
                 if (!stdx::any_of(F > v)) break;
 #endif
                 vd k; k.copy_from(yc + (std::size_t)s * W, stdx::element_aligned);
+#if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
+                if constexpr (std::is_same_v<T, double>) {
+                    k = avx512d_blend(avx512d_gt(F, v), k, vtwo);
+                } else {
+                    stdx::where(F > v, k) = vtwo;
+                }
+#else
                 stdx::where(F > v, k) = vtwo;
+#endif
                 k.copy_to(yc + (std::size_t)s * W, stdx::element_aligned);
                 v = stdx::max(v, F);
                 v.copy_to(cY + off + (std::size_t)s * W, stdx::element_aligned);
