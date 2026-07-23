@@ -73,13 +73,12 @@ struct SeqPairT {
             GapModel gm, AlignMode am,
             GradMode grad_mode = GradMode::Hard,
             int kernel = kBackendAuto,
-            TracebackMode tb = TracebackMode::Pointers)
+            TracebackMode tb = TracebackMode::Default)
         : a_idx_(params.matrix.alphabet().encode(a)),
           b_idx_(params.matrix.alphabet().encode(b)),
           params_(&params),
           grad_mode_(grad_mode),
           kernel_(kernel),
-          tb_(tb),
           grad_(params.matrix.alphabet())
     {
         if      (gm == GapModel::Linear && am == AlignMode::Global)
@@ -103,7 +102,22 @@ struct SeqPairT {
 
     int kernel() const noexcept { return kernel_; }
 
-    TracebackMode traceback() const noexcept { return tb_; }
+    // The RESOLVED mode the full aligner will actually run — set_traceback mapped the
+    // Default sentinel to this pair's compile-time default already, so a caller who
+    // passed "auto" sees "hirschberg" here on an affine+global+full pair, "pointers"
+    // otherwise.  More useful than echoing back "auto".
+    TracebackMode traceback() const noexcept {
+        return std::visit([](const auto& st) { return st.full_al.traceback(); }, state_);
+    }
+
+    // Hirschberg base-case size, in rows.  Only the full aligner ever runs Hirschberg,
+    // so only it is told.  Settable (unlike traceback) because it changes how the DP
+    // divides, not what it retains — no allocation decision depends on it.
+    void set_hb_cutoff(int rows) {
+        std::visit([rows](auto& st) { st.full_al.set_hb_cutoff(rows); }, state_);
+        hb_cutoff_ = rows;
+    }
+    int hb_cutoff() const noexcept { return hb_cutoff_; }
 
     // Swap alignment parameters.  Invalidates score and gradient; path stays.
     // realign_banded() remains callable after this — it will re-score the
@@ -348,7 +362,7 @@ private:
     const AlignParams*   params_;
     GradMode             grad_mode_;
     int                  kernel_;   // Viterbi backend, forwarded to each aligner
-    TracebackMode        tb_;
+    int                  hb_cutoff_ = 512;   // mirrors Aligner's default (fleet-swept)
 
     bool             path_valid_   = false;
     bool             score_valid_  = false;

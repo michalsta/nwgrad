@@ -100,17 +100,19 @@ static void keep_current_params(nb::object owner, nb::object params) {
 
 // Traceback vocabulary, mirroring gap_model= / mode= / grad_mode= / kernel=.
 static TracebackMode parse_traceback(const std::string& name) {
+    if (name == "auto")       return TracebackMode::Default;
     if (name == "pointers")   return TracebackMode::Pointers;
     if (name == "scores")     return TracebackMode::Scores;
     if (name == "hirschberg") return TracebackMode::Hirschberg;
     throw nb::value_error(
         ("nwgrad: unknown traceback \"" + name +
-         "\" (expected \"pointers\", \"scores\" or \"hirschberg\")").c_str());
+         "\" (expected \"auto\", \"pointers\", \"scores\" or \"hirschberg\")").c_str());
 }
 static const char* traceback_name(TracebackMode t) {
     switch (t) {
         case TracebackMode::Pointers:   return "pointers";
         case TracebackMode::Hirschberg: return "hirschberg";
+        case TracebackMode::Default:    return "auto";
         default:                        return "scores";
     }
 }
@@ -286,15 +288,15 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
             nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("params"),
             nb::arg("gap_model") = "affine", nb::arg("mode") = "global",
             nb::arg("grad_mode") = "hard", nb::arg("kernel") = "auto",
-            nb::arg("traceback") = "pointers",
+            nb::arg("traceback") = "auto",
             nb::keep_alive<1, 4>(),
             "Persistent sequence pair.\n"
             "  gap_model : \"linear\" | \"affine\"\n"
             "  mode      : \"global\" | \"local\"\n"
             "  grad_mode : \"hard\" | \"soft\" | \"none\"\n"
             "  kernel    : \"scalar\" | \"simd\" — bit-exact speed knob (Viterbi path).\n"
-            "  traceback : \"pointers\" (default) | \"scores\" | \"hirschberg\" — see\n"
-            "     SeqPairBatch.traceback.")
+            "  traceback : \"auto\" (default) | \"pointers\" | \"scores\" | \"hirschberg\"\n"
+            "     — see SeqPairBatch.traceback.  \"auto\" = Hirschberg where it applies.")
         .def("alloc_dp", &SP::alloc_dp,
              "Pre-allocate own DP tables for the fixed sequences.")
         .def(
@@ -356,6 +358,13 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
         .def_prop_ro("score_valid", &SP::score_valid)
         .def_prop_ro("grad_valid",  &SP::grad_valid)
         .def_prop_ro("dp_valid",    &SP::dp_valid)
+        .def_prop_rw(
+            "hb_cutoff",
+            [](const SP& s) { return s.hb_cutoff(); },
+            [](SP& s, int v) { s.set_hb_cutoff(v); },
+            "Hirschberg base-case size in rows — see SeqPairBatch.hb_cutoff.  Settable\n"
+            "(unlike traceback) because it changes how the DP divides, not what it\n"
+            "retains, so no allocation decision depends on it.")
         .def_prop_ro("seq_a", [](const SP& s) { return s.seq_a(); })
         .def_prop_ro("seq_b", [](const SP& s) { return s.seq_b(); });
 }
@@ -370,21 +379,24 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             [](SPB* self, int n_threads, const std::string& traceback) {
                 new (self) SPB(n_threads, parse_traceback(traceback));
             },
-            nb::arg("n_threads") = 0, nb::arg("traceback") = "pointers",
+            nb::arg("n_threads") = 0, nb::arg("traceback") = "auto",
             "Threaded batch of SeqPair objects.\n"
             "  n_threads=0 (default) uses the PHYSICAL core count (falling back to\n"
             "  hardware_concurrency): this DP is stall-bound, so SMT siblings\n"
             "  contend and the logical count measured up to 1.44x slower.\n"
-            "  traceback : \"pointers\" (default) | \"scores\" | \"hirschberg\" — what the\n"
-            "     DP retains in order to recover predecessors.  \"pointers\" records 1\n"
-            "     byte/cell/state during the fill (3 B/cell); \"scores\" keeps VM/VX/VY\n"
-            "     and re-derives the argmax (12 B/cell).  Those two are bit-identical;\n"
-            "     pointers is smaller and measured 1.4-2.2x faster.\n"
-            "     \"hirschberg\" is divide-and-conquer in O(n) memory — no table at all\n"
-            "     above the base case — at ~2x the cell work.  It is NOT bit-exact:\n"
-            "     where alignments tie it returns a different optimal path, hence a\n"
-            "     valid but different subgradient.  Affine + global only; anything\n"
-            "     else throws rather than silently running a different algorithm.\n"
+            "  traceback : \"auto\" (default) | \"pointers\" | \"scores\" | \"hirschberg\"\n"
+            "     — what the DP retains in order to recover predecessors.\n"
+            "     \"auto\" is Hirschberg for affine+global+full (the case it implements)\n"
+            "     and pointers for every other problem type, so the default is\n"
+            "     Hirschberg wherever Hirschberg exists.\n"
+            "     \"pointers\" records 1 byte/cell/state during the fill (3 B/cell);\n"
+            "     \"scores\" keeps VM/VX/VY and re-derives the argmax (12 B/cell).  Those\n"
+            "     two are bit-identical; pointers is smaller and 1.4-2.2x faster.\n"
+            "     \"hirschberg\" is divide-and-conquer in O(n) memory at ~2x the cell\n"
+            "     work; it never splits below hb_cutoff, so pairs that short run the\n"
+            "     exact pointers fill and are bit-exact, and only longer pairs take a\n"
+            "     valid-but-different subgradient.  Affine+global+full only; asking for\n"
+            "     it elsewhere throws (the \"auto\" default falls back instead).\n"
             "     Applies to pairs built by add_many().")
         .def(
             "add",
@@ -487,6 +499,32 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             "     reserve of the smallest tasks for threads that finish early.\n"
             "Bounds the DP memory high-water mark at sum-over-chunks rather than\n"
             "n_threads * the global maximum.  Results are identical either way.")
+        .def_prop_rw(
+            "hb_cutoff",
+            [](const SPB& s) { return s.hb_cutoff; },
+            [](SPB& s, int v) {
+                if (v < 1) throw nb::value_error("nwgrad: hb_cutoff must be >= 1");
+                s.hb_cutoff = v;
+            },
+            "Rows per block at which Hirschberg stops splitting and solves the block\n"
+            "outright with the (vectorized) pointers fill.  Applied by add_many(); ignored\n"
+            "unless the traceback resolves to Hirschberg.  Default 512.\n"
+            "\n"
+            "This is a THREE-way trade, not just a speed knob:\n"
+            "  memory     the base case materializes 3*(rows+1)*(cols+1) direction\n"
+            "             bytes, so the cutoff bounds the largest thing Hirschberg\n"
+            "             ever allocates.  1 is pure Hirschberg (minimum memory).\n"
+            "  overhead   smaller cutoff means more blocks and more recursion levels;\n"
+            "             larger cutoff means bigger base cases that eventually re-enter\n"
+            "             the memory wall on long pairs.\n"
+            "  exactness  splits are the ONLY place the tie-break can diverge from\n"
+            "             pointers, so a pair no longer than the cutoff never splits and\n"
+            "             is bit-exact with pointers; only longer pairs take a\n"
+            "             valid-but-different subgradient.  The cutoff sets that line.\n"
+            "\n"
+            "512 from a fleet sweep (sse2/avx2/avx512/neon, len 500-8000) with the base\n"
+            "case vectorized: pairs <= 512 run at full pointer speed and bit-exact,\n"
+            "longer pairs win 1.4-2.7x at high thread counts.")
         .def_prop_rw(
             "reserve_frac",
             [](const SPB& s) { return s.reserve_frac; },

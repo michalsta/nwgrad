@@ -147,6 +147,64 @@ struct ViterbiJob {
 using viterbi_fn   = void (*)(ViterbiJob<double>&);
 using viterbi_fn_f = void (*)(ViterbiJob<float>&);
 
+// ── Hirschberg linear-space sweep ─────────────────────────────────────────────
+//
+// One half-sweep of a divide-and-conquer block: fill H rows keeping only rolling rows,
+// and report the FINAL row.  No table is written — that is the whole point of the mode —
+// so unlike ViterbiJob there is no layout to report back; the output row is handed back
+// de-striped and contiguous, because the join that consumes it scans by column.
+//
+// Forward and reverse are the same sweep with different walks, so they are one entry
+// rather than two: the caller supplies start/step for both sequences.  Reverse is
+// a_step = b_step = -1 with the starts at the far end.  That keeps the striped carry
+// logic in exactly one place.
+template <class T>
+struct HbJob {
+    const unsigned char* a;                 // full encoded sequences; the block is
+    const unsigned char* b;                 // addressed by start/step below
+    const T* blk; int nalpha;
+    T go_a, ge_a, go_b, ge_b;
+    int a_start, a_step;                    // row t (0..H-1) consumes a[a_start + t*a_step]
+    int b_start, b_step;                    // column c (1..ncols) pairs b[b_start + (c-1)*b_step]
+    int H;                                  // rows to sweep
+    int ncols;                              // columns in this block
+    int in_x;                               // 1 = the path enters already inside a gap-in-b run
+    DpBufferT<T>* buf;                      // scratch (striped rows, profile, open vector)
+    T* outM; T* outX; T* outY;              // final row, CONTIGUOUS, index 0..ncols (0 = border)
+};
+
+using hb_fn   = void (*)(HbJob<double>&);
+using hb_fn_f = void (*)(HbJob<float>&);
+
+// ── Hirschberg base case: striped fill that RECORDS direction bytes ───────────
+//
+// The recursion bottoms out here.  Unlike HbJob (which keeps only rolling rows and
+// returns one row), this keeps the whole block's direction tables — 3 bytes/cell in
+// buf.hbD, striped — so the aligner can walk the path back.  It is the striped Pointers
+// kernel restricted to a sub-rectangle with an affine boundary seed (in_x), which is
+// why the base case is now vectorized instead of the scalar fill it began as.  The
+// walk-back stays on the aligner side (O(H+ncols), negligible) and reads hbD striped.
+template <class T>
+struct HbBaseJob {
+    const unsigned char* a;
+    const unsigned char* b;
+    const T* blk; int nalpha;
+    T go_a, ge_a, go_b, ge_b;
+    int a_start, a_step;
+    int b_start, b_step;
+    int H;                                   // rows (0..H), so H+1 rows of direction bytes
+    int ncols;                               // columns (0..ncols)
+    int in_x;                                // 1 = path enters already inside a gap-in-b run
+    DpBufferT<T>* buf;                       // writes buf.hbD; scratch in hprof/hf*/hov/hs*
+    // outputs: the final cell (H, ncols) scores, so the aligner picks the walk-back start
+    T fM; T fX; T fY;
+    int seg;                                 // striping segment count (walk-back needs it)
+    int width;                               // vector lane count W (walk-back needs it)
+};
+
+using hbbase_fn   = void (*)(HbBaseJob<double>&);
+using hbbase_fn_f = void (*)(HbBaseJob<float>&);
+
 // Whole-row banded kernel for the GuideBanded path.  viterbi_affine_simd (in
 // aligner_simd.hpp) owns the banded indexing and hands this one row's worth of
 // contiguous slices; it runs the whole interleaved block loop (carry-free VM/VX, serial
@@ -166,6 +224,10 @@ struct LevelKernels {
     viterbi_fn_f  viterbi_ptr_f = nullptr;        // TracebackMode::Pointers, float32
     banded_row_fn banded_row_global = nullptr;  // row-wise banded whole-row kernels ↓ (double)
     banded_row_fn banded_row_local  = nullptr;
+    hb_fn         hb_sweep = nullptr;           // Hirschberg linear-space sweep, double
+    hb_fn_f       hb_sweep_f = nullptr;         // ditto, float32
+    hbbase_fn     hb_base = nullptr;            // Hirschberg base case (records directions), double
+    hbbase_fn_f   hb_base_f = nullptr;         // ditto, float32
     int           row_block = 0;                // columns per interleaved block (per-µarch)
 };
 
@@ -187,6 +249,8 @@ inline LevelKernels* level_table() {
 void register_level(SimdLevel l, viterbi_fn viterbi, viterbi_fn_f viterbi_f,
                     viterbi_fn viterbi_ptr, viterbi_fn_f viterbi_ptr_f,
                     banded_row_fn banded_row_global, banded_row_fn banded_row_local,
+                    hb_fn hb_sweep, hb_fn_f hb_sweep_f,
+                    hbbase_fn hb_base, hbbase_fn_f hb_base_f,
                     int row_block);
 
 // ── The global default backend ────────────────────────────────────────────────

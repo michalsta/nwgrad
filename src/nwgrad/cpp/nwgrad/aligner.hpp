@@ -44,11 +44,19 @@ enum class AlignBand { Full,   GuideBanded };
 // M>X>Y tie-break the other two share, because the tie-break depends on the rows below
 // the split — which Hirschberg has already discarded.  Where the optimum is unique the
 // answers agree exactly; where alignments tie, it returns a DIFFERENT optimal path, hence
-// a valid but different subgradient (path score == Viterbi score, always).  It is
-// selectable for measurement; the equivalence tests deliberately do not include it.
-// Affine Full Global only for now — Local and the linear model throw rather than
-// silently falling back to a different algorithm than the caller asked for.
-enum class TracebackMode { Scores, Pointers, Hirschberg };
+// a valid but different subgradient (path score == Viterbi score, always).  BUT: below
+// its base-case cutoff Hirschberg never splits, so it runs the exact Pointers fill and IS
+// bit-exact — divergence is confined to pairs longer than hb_cutoff.  Affine Full Global
+// only; explicitly asking for it on Local / linear / banded THROWS rather than silently
+// running a different algorithm than requested.
+//
+//   Default    a per-problem SENTINEL, never stored on an Aligner: it resolves at compile
+//              time to Hirschberg for affine+global+full (the case Hirschberg implements)
+//              and to Pointers for everything else.  This is what "traceback defaults to
+//              Hirschberg" means without breaking Local/linear/banded, which have no
+//              Hirschberg variant.  SeqPair/SeqPairBatch leave the Aligner's own default
+//              (kDefaultTb, below) in place when handed this.
+enum class TracebackMode { Scores, Pointers, Hirschberg, Default };
 
 // Which Viterbi backend fills the DP tables is a runtime field (backend_, below), one of
 // the unified vocabulary in simd_levels.hpp: "scalar_fallback" (the original plain
@@ -246,8 +254,25 @@ struct Aligner {
     // How the traceback recovers predecessors — see TracebackMode.  Defaults to
     // Pointers (smaller and faster); set Scores when you need VM/VX/VY to survive
     // the fill, e.g. to compare tables across kernels.
-    void set_traceback(TracebackMode t) noexcept { tb_ = t; }
+    // Default resolves to this Aligner's compile-time kDefaultTb (Hirschberg for the
+    // affine+global+full case, Pointers elsewhere) — so a caller can pass the sentinel
+    // through without knowing the problem type.
+    void set_traceback(TracebackMode t) noexcept {
+        tb_ = (t == TracebackMode::Default) ? kDefaultTb : t;
+    }
     TracebackMode traceback() const noexcept { return tb_; }
+    // Rows per block at which the Hirschberg recursion stops splitting and solves
+    // outright — see hb_cutoff_.  Unlike set_traceback this is safe to change between
+    // runs: it alters how the DP divides, not what it retains.  It is a THREE-way knob
+    // (base-case memory, per-block overhead, tie-break fidelity), not just a speed one:
+    // at cutoff >= m no split happens at all and the result is the Pointers fill, hence
+    // bit-exact — the memory win is what pays for the divergence.
+    void set_hb_cutoff(int rows) {
+        if (rows < 1)
+            throw std::invalid_argument("nwgrad: hb_cutoff must be >= 1");
+        hb_cutoff_ = rows;
+    }
+    int hb_cutoff() const noexcept { return hb_cutoff_; }
     int  kernel() const noexcept { return backend_; }
 
     void compute_viterbi() {
@@ -449,9 +474,23 @@ private:
     // Rows per block at which the recursion stops splitting and runs the Pointers fill
     // instead.  1 would be pure Hirschberg (minimum memory, maximum re-sweeping); a
     // block of `cutoff` rows costs cutoff*n direction bytes and saves a level of
-    // recursion.  Tunable because the trade is a measured one, not a principled one.
-    int         hb_cutoff_ = 64;
-    TracebackMode tb_ = TracebackMode::Pointers;
+    // recursion.  512 from a fleet sweep AFTER hb_base was vectorized (sse2/avx2/avx512/
+    // neon × len 500..8000): with a vectorized base case the optimum jumped from 32 to
+    // ~512, because a bigger base case is now cheap and it means fewer 2x-work splits.
+    // 512 sits in the sweet spot on every host — pairs <= 512 don't split, so they run
+    // the exact Pointers fill at full speed (0.99-1.04x pointers, bit-exact); longer
+    // pairs split and win 1.4-2.7x at high thread counts by staying out of the memory
+    // wall.  A much larger cutoff (2048) re-enters that wall on long pairs.
+    int         hb_cutoff_ = 512;
+    // The Aligner's OWN default, resolved at compile time from the template case: the
+    // affine+global+full specialization is the one Hirschberg implements, so it defaults
+    // there; every other case keeps Pointers (which the linear/banded paths ignore
+    // anyway).  A default-constructed Aligner therefore never lands on a mode that would
+    // throw.  The TracebackMode::Default sentinel maps to exactly this.
+    static constexpr TracebackMode kDefaultTb =
+        (GM == GapModel::Affine && AM == AlignMode::Global && AB == AlignBand::Full)
+            ? TracebackMode::Hirschberg : TracebackMode::Pointers;
+    TracebackMode tb_ = kDefaultTb;
     int    striped_seg_    = 0;
     int    striped_w_      = 1;
 
@@ -1272,6 +1311,39 @@ private:
         if (v.size() < n) v.resize(n);
     }
 
+    // The leveled striped sweep for this aligner's backend, or null to go scalar.
+    // Resolved per sweep rather than cached: it is one predicated load against an
+    // O(H*ncols) sweep, and caching it would have to be invalidated on set_kernel().
+    const LevelKernels* hb_level() const noexcept {
+        const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
+        if (backend == kBackendScalar) return nullptr;
+        const LevelKernels& K = level_kernels(backend);
+        const bool have = std::is_same_v<T, double> ? (K.hb_sweep != nullptr)
+                                                    : (K.hb_sweep_f != nullptr);
+        return have ? &K : nullptr;
+    }
+
+    // Run one half-sweep through the leveled kernel.  Forward and reverse differ only in
+    // the walk direction, so they are the same call with the steps negated.
+    void hb_run_level(const LevelKernels& K, DpBuffer& buf, int a_start, int a_step,
+                      int b_start, int b_step, int H, int ncols, bool in_x,
+                      T* oM, T* oX, T* oY) const {
+        HbJob<T> job{};
+        job.a = a_idx_.data(); job.b = b_idx_.data();
+        job.blk = blkT_; job.nalpha = nalpha_;
+        job.go_a = static_cast<T>(params_->gap_open_a);
+        job.ge_a = static_cast<T>(params_->gap_extend_a);
+        job.go_b = static_cast<T>(params_->gap_open_b);
+        job.ge_b = static_cast<T>(params_->gap_extend_b);
+        job.a_start = a_start; job.a_step = a_step;
+        job.b_start = b_start; job.b_step = b_step;
+        job.H = H; job.ncols = ncols; job.in_x = in_x ? 1 : 0;
+        job.buf = &buf;
+        job.outM = oM; job.outX = oX; job.outY = oY;
+        if constexpr (std::is_same_v<T, double>) K.hb_sweep(job);
+        else                                     K.hb_sweep_f(job);
+    }
+
     // Forward sweep of rows (i0, i1], keeping two rolling rows.  On return the three
     // out-pointers hold row i1 of the block, indexed by column offset c = j - j0.
     // Costs (i1-i0)*(j1-j0) cells and O(j1-j0) memory: nothing is retained.
@@ -1351,6 +1423,65 @@ private:
     // restricted to the sub-rectangle and seeded by in_x/out_x, recording one direction
     // byte per cell per state and walking them back.  Appends the block's moves to hops_
     // in forward order.  Memory is 3*(rows+1)*(cols+1) bytes, bounded by hb_cutoff_.
+    // The leveled base-case kernel for this backend, or null to go scalar.  Registered
+    // together with hb_sweep, but checked separately so a partially-populated level table
+    // cannot dispatch one without the other.
+    const LevelKernels* hb_base_level() const noexcept {
+        const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
+        if (backend == kBackendScalar) return nullptr;
+        const LevelKernels& K = level_kernels(backend);
+        const bool have = std::is_same_v<T, double> ? (K.hb_base != nullptr)
+                                                    : (K.hb_base_f != nullptr);
+        return have ? &K : nullptr;
+    }
+
+    // Vectorized base case: the striped kernel fills buf.hbD (3 direction planes, striped)
+    // and returns seg/width + the final-cell scores; the walk-back below reads them
+    // striped.  Bit-identical to the scalar fill, so which one runs is a speed choice.
+    void hb_base_striped_run(const LevelKernels& K, DpBuffer& buf,
+                             int i0, int i1, int j0, int j1, bool in_x, bool out_x) {
+        const int H = i1 - i0, NC = j1 - j0;
+        HbBaseJob<T> job{};
+        job.a = a_idx_.data(); job.b = b_idx_.data();
+        job.blk = blkT_; job.nalpha = nalpha_;
+        job.go_a = static_cast<T>(params_->gap_open_a);
+        job.ge_a = static_cast<T>(params_->gap_extend_a);
+        job.go_b = static_cast<T>(params_->gap_open_b);
+        job.ge_b = static_cast<T>(params_->gap_extend_b);
+        job.a_start = i0; job.a_step = 1;      // row r=1..H consumes a[i0 + (r-1)]
+        job.b_start = j0; job.b_step = 1;      // col c=1..NC pairs   b[j0 + (c-1)]
+        job.H = H; job.ncols = NC; job.in_x = in_x ? 1 : 0; job.buf = &buf;
+        if constexpr (std::is_same_v<T, double>) K.hb_base(job);
+        else                                     K.hb_base_f(job);
+
+        // Striped walk-back over buf.hbD.  Column c lives at slot (c==0 ? 0 : W+scol(c)).
+        const int seg = job.seg, Wl = job.width;
+        const std::size_t rowsz = (std::size_t)(seg + 1) * Wl;
+        const std::size_t off   = (std::size_t)Wl;
+        const std::size_t plane = (std::size_t)(H + 1) * rowsz;
+        const unsigned char* dM = buf.hbD.data();
+        const unsigned char* dX = dM + plane;
+        const unsigned char* dY = dX + plane;
+        auto idx = [&](int r, int c) -> std::size_t {
+            return (std::size_t)r * rowsz + (c == 0 ? 0 : off + (std::size_t)((c - 1) % seg) * Wl + (c - 1) / seg);
+        };
+        int r = H, c = NC;
+        TBTable tbl;
+        if (out_x) tbl = TBTable::X;
+        else tbl = (job.fM >= job.fX && job.fM >= job.fY) ? TBTable::M
+                 : ((job.fX >= job.fY) ? TBTable::X : TBTable::Y);
+        const std::size_t first = hops_.size();
+        while (r > 0 || c > 0) {
+            const std::size_t k = idx(r, c);
+            unsigned char code;
+            if (tbl == TBTable::M)      { code = dM[k]; hops_.push_back(0); --r; --c; }
+            else if (tbl == TBTable::X) { code = dX[k]; hops_.push_back(1); --r; }
+            else                        { code = dY[k]; hops_.push_back(2); --c; }
+            tbl = (code == 1) ? TBTable::X : (code == 2 ? TBTable::Y : TBTable::M);
+        }
+        std::reverse(hops_.begin() + static_cast<std::ptrdiff_t>(first), hops_.end());
+    }
+
     void hb_base(DpBuffer& buf, int i0, int i1, int j0, int j1,
                  bool in_x, bool out_x) {
         const T go_a = static_cast<T>(params_->gap_open_a);
@@ -1359,6 +1490,10 @@ private:
         const T ge_b = static_cast<T>(params_->gap_extend_b);
         const int H = i1 - i0, W = j1 - j0;
         if (H == 0 && W == 0) return;
+        if (const LevelKernels* K = hb_base_level()) {
+            hb_base_striped_run(*K, buf, i0, i1, j0, j1, in_x, out_x);
+            return;
+        }
 
         const std::size_t stride = static_cast<std::size_t>(W) + 1;
         const std::size_t plane  = static_cast<std::size_t>(H + 1) * stride;
@@ -1436,6 +1571,32 @@ private:
 
     static void hb_fit_b(BVec& v, std::size_t n) { if (v.size() < n) v.resize(n); }
 
+    // One half-sweep, simd if this backend has a kernel and scalar otherwise, writing its
+    // final row contiguously into (oM,oX,oY).  The two are bit-identical by construction
+    // — same operations, same order, same left-association — so which one runs is a
+    // speed decision and never a correctness one, exactly as with the Viterbi backends.
+    void hb_half(DpBuffer& buf, bool reverse, int i0, int i1, int j0, int j1,
+                 bool flag, T* oM, T* oX, T* oY) {
+        const int H = i1 - i0, NC = j1 - j0;
+        if (const LevelKernels* K = hb_level()) {
+            if (reverse) hb_run_level(*K, buf, i1 - 1, -1, j1 - 1, -1, H, NC, flag, oM, oX, oY);
+            else         hb_run_level(*K, buf, i0,     +1, j0,     +1, H, NC, flag, oM, oX, oY);
+            return;
+        }
+        T *sM, *sX, *sY;
+        if (reverse)
+            hb_rev(i0, i1, j0, j1, flag,
+                   buf.hfa.data(), buf.hfb.data(), buf.hfc.data(),
+                   buf.hfd.data(), buf.hfe.data(), buf.hff.data(), sM, sX, sY);
+        else
+            hb_fwd(i0, i1, j0, j1, flag,
+                   buf.hfa.data(), buf.hfb.data(), buf.hfc.data(),
+                   buf.hfd.data(), buf.hfe.data(), buf.hff.data(), sM, sX, sY);
+        std::copy(sM, sM + NC + 1, oM);
+        std::copy(sX, sX + NC + 1, oX);
+        std::copy(sY, sY + NC + 1, oY);
+    }
+
     // The recursion.  Splits the block's rows in half, sweeps to the split row from both
     // ends, and joins the two halves to find the column the optimal path crosses at.
     void hb_solve(DpBuffer& buf, int i0, int i1, int j0, int j1, bool in_x, bool out_x) {
@@ -1450,20 +1611,16 @@ private:
         hb_fit(buf.hrd, stride); hb_fit(buf.hre, stride); hb_fit(buf.hrf, stride);
         hb_fit(buf.hsM, stride); hb_fit(buf.hsX, stride); hb_fit(buf.hsY, stride);
 
-        T *fM, *fX, *fY;
-        hb_fwd(i0, p, j0, j1, in_x,
-               buf.hfa.data(), buf.hfb.data(), buf.hfc.data(),
-               buf.hfd.data(), buf.hfe.data(), buf.hff.data(), fM, fX, fY);
-        // The reverse sweep reuses the same scratch pool, so copy the split row out first.
-        std::copy(fM, fM + stride, buf.hsM.data());
-        std::copy(fX, fX + stride, buf.hsX.data());
-        std::copy(fY, fY + stride, buf.hsY.data());
+        // Both halves land in their own contiguous output rows — hs* for the forward,
+        // hr{a,b,c} for the reverse — so the two never contend for scratch and the
+        // simd and scalar paths deliver their results in the same place.
+        hb_half(buf, false, i0, p, j0, j1, in_x,
+                buf.hsM.data(), buf.hsX.data(), buf.hsY.data());
         const T* FM = buf.hsM.data(); const T* FX = buf.hsX.data(); const T* FY = buf.hsY.data();
 
-        T *rM, *rX, *rY;
-        hb_rev(p, i1, j0, j1, out_x,
-               buf.hra.data(), buf.hrb.data(), buf.hrc.data(),
-               buf.hrd.data(), buf.hre.data(), buf.hrf.data(), rM, rX, rY);
+        hb_half(buf, true, p, i1, j0, j1, out_x,
+                buf.hra.data(), buf.hrb.data(), buf.hrc.data());
+        const T* rM = buf.hra.data(); const T* rX = buf.hrb.data(); const T* rY = buf.hrc.data();
 
         // Join.  For each crossing column c the prefix ends in some state and the suffix
         // begins in some state; every combination is a legal path, so the plain sum over
@@ -1558,10 +1715,13 @@ private:
     }
 
     std::vector<std::pair<int,int>> alignment_hb() const {
+        // Emit the 0-based sequence position of each matched pair BEFORE advancing —
+        // the same convention traceback_affine uses (it emits i-1,j-1 from 1-based DP
+        // coords), so alignment() agrees across tracebacks and with pairs_from_gapped().
         std::vector<std::pair<int,int>> path;
         int i = 0, j = 0;
         for (unsigned char op : hops_) {
-            if (op == 0)      { ++i; ++j; path.emplace_back(i, j); }
+            if (op == 0)      { path.emplace_back(i, j); ++i; ++j; }
             else if (op == 1) { ++i; }
             else              { ++j; }
         }

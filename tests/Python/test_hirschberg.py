@@ -133,9 +133,19 @@ def test_selectable_and_reported(params):
     assert sp.traceback == "hirschberg"
 
 
-def test_not_the_default():
-    """Hirschberg is opt-in.  It is not bit-exact, so it must never arrive by accident."""
-    assert nwgrad.SeqPairBatch(n_threads=1).traceback == "pointers"
+def test_is_the_default_where_it_applies(params):
+    """Hirschberg is now the default — but only via the "auto" sentinel, which resolves
+    per problem: Hirschberg for affine+global+full (where it exists), pointers otherwise.
+    A blanket Hirschberg default would break Local/linear/banded, which throw."""
+    assert nwgrad.SeqPairBatch(n_threads=1).traceback == "auto"
+    # affine + global + full resolves to hirschberg
+    assert nwgrad.SeqPair("ACDE", "ACDE", params, gap_model="affine",
+                          mode="global").traceback == "hirschberg"
+    # everything Hirschberg does not implement resolves to pointers, not a throw
+    assert nwgrad.SeqPair("ACDE", "ACDE", params, gap_model="affine",
+                          mode="local").traceback == "pointers"
+    assert nwgrad.SeqPair("ACDE", "ACDE", params, gap_model="linear",
+                          mode="global").traceback == "pointers"
 
 
 # ── optimality ────────────────────────────────────────────────────────────────
@@ -379,9 +389,11 @@ def _dot(g, p):
             + g["gap_open_b"] * p.gap_open_b + g["gap_extend_b"] * p.gap_extend_b)
 
 
-def _pair(a, b, p, tb):
+def _pair(a, b, p, tb, cutoff=None):
     sp = nwgrad.SeqPairDouble(a, b, p, gap_model="affine", mode="global",
                               grad_mode="hard", traceback=tb)
+    if cutoff is not None and tb == "hirschberg":
+        sp.hb_cutoff = cutoff
     sp.alloc_dp()
     sp.align_full()
     sp.compute_grad()
@@ -440,16 +452,20 @@ def test_gradient_identical_when_optimum_is_unique(asym_params):
 def test_gradients_really_do_diverge_under_ties(params):
     """A characterization test, deliberately asserting that the two DISAGREE.
 
-    If this ever fails, Hirschberg has become tie-exact with pointers — which would be
-    good news, but it would also make this module's whole framing (and the CLAUDE.md
-    paragraph, and its exclusion from test_traceback_modes.py) wrong.  Better to be told.
+    Forces a small hb_cutoff so the recursion actually SPLITS — divergence only happens
+    at splits (a non-splitting Hirschberg is bit-exact with pointers, verified elsewhere),
+    so this must pin the cutoff below the sequence lengths regardless of the default.
+
+    If this ever fails, Hirschberg has become tie-exact with pointers even when splitting —
+    which would be good news, but it would also make this module's whole framing (and the
+    CLAUDE.md paragraph, and its exclusion from test_traceback_modes.py) wrong.
     """
     A = _seqs(120, 20, 300, 3)
     B = _seqs(120, 20, 300, 4)
     differ = 0
     for a, b in zip(A, B):
         gp = _pair(a, b, params, "pointers").grad.to_dict()["matrix"]
-        gh = _pair(a, b, params, "hirschberg").grad.to_dict()["matrix"]
+        gh = _pair(a, b, params, "hirschberg", cutoff=8).grad.to_dict()["matrix"]
         if not np.array_equal(gp, gh):
             differ += 1
     assert differ > 0, ("hirschberg now agrees with pointers on every tied gradient — "
@@ -457,12 +473,38 @@ def test_gradients_really_do_diverge_under_ties(params):
                         "into test_traceback_modes.py")
 
 
-def test_soft_gradient_is_exactly_identical(params):
-    """Analog of test_soft_gradient_unaffected — and here NO relaxation is needed.
+def test_large_cutoff_is_bit_exact_with_pointers(params):
+    """With hb_cutoff above the sequence length the recursion never splits, so the whole
+    problem is one (vectorized) base case — which IS the Pointers fill.  It must then be
+    bit-identical to pointers: score, alignment AND gradient, ties included.
+
+    This is the property that makes Hirschberg safe as a default: for any pair short
+    enough to fit the cutoff it degrades exactly to the previous default, and only pairs
+    longer than the cutoff (the ones where Pointers' memory is the problem) take the
+    different-subgradient linear-space path.
+    """
+    A = _seqs(80, 1, 250, 51)
+    B = _seqs(80, 1, 250, 52)
+    for a, b in zip(A, B):
+        gp = _pair(a, b, params, "pointers")
+        gh = _pair(a, b, params, "hirschberg", cutoff=100000)
+        assert gh.score == gp.score, (a, b)
+        assert gh.aligned() == gp.aligned(), (a, b)
+        np.testing.assert_array_equal(gh.grad.to_dict()["matrix"],
+                                      gp.grad.to_dict()["matrix"])
+
+
+def test_soft_gradient_unaffected(params):
+    """Analog of test_soft_gradient_unaffected.
 
     The soft path is forward-backward in double and never runs a Viterbi traceback, so
-    the traceback mode is a pure no-op for it.  Measured bit-identical (max |delta| == 0),
-    and asserted as such: a tolerance here would hide a real regression.
+    the traceback mode is a pure no-op for it — pointers and hirschberg exercise
+    identical code.  The comparison is nonetheless tolerant, not exact, and the reason
+    is NOT hirschberg: score_and_grad reduces per-pair contributions across threads in a
+    non-deterministic order, so two batch runs differ in the last ULP whatever the
+    traceback.  (An earlier version asserted exact equality and was flaky under
+    pytest-randomly for exactly this reason — the sibling test in test_traceback_modes.py
+    uses the same tolerance.)
     """
     A = _seqs(40, 5, 200, 37)
     B = _seqs(40, 5, 200, 38)
@@ -472,9 +514,9 @@ def test_soft_gradient_is_exactly_identical(params):
         batch.add_many(A, B, params, gap_model="affine", mode="global",
                        grad_mode="soft", kernel="auto")
         out[tb] = (batch.score_and_grad(), batch.compute_grad().to_dict())
-    assert out["hirschberg"][0] == out["pointers"][0]
-    np.testing.assert_array_equal(out["hirschberg"][1]["matrix"],
-                                  out["pointers"][1]["matrix"])
+    assert out["hirschberg"][0] == pytest.approx(out["pointers"][0], rel=1e-12)
+    np.testing.assert_allclose(out["hirschberg"][1]["matrix"],
+                               out["pointers"][1]["matrix"], atol=1e-10)
 
 
 @pytest.mark.parametrize("band", [8, 32])

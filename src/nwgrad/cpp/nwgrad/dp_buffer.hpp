@@ -148,6 +148,12 @@ struct DpBufferT {
     TVec hsM, hsX, hsY;                  // forward half's split row, saved
     BVec hbD;                            // base-case direction table (3 x block)
     BVec hops;                           // the path: 0=M(diag) 1=X(gap in b) 2=Y(gap in a)
+    // Striped simd sweep only: the block's query profile in striped order, and one
+    // striped row of VM/VX open values feeding the VY carry.  Both O(block width).
+    // The profile is rebuilt per BLOCK (its striping geometry depends on the block's
+    // own width), but serves that block's forward AND reverse sweeps, so its cost
+    // amortizes over H rows rather than H/2.
+    TVec hprof, hov;
 
     void clear() noexcept {
         auto clrT = [](TVec& v) noexcept { v.clear(); v.shrink_to_fit(); };
@@ -164,6 +170,7 @@ struct DpBufferT {
         clrT(hfa); clrT(hfb); clrT(hfc); clrT(hfd); clrT(hfe); clrT(hff);
         clrT(hra); clrT(hrb); clrT(hrc); clrT(hrd); clrT(hre); clrT(hrf);
         clrT(hsM); clrT(hsX); clrT(hsY);
+        clrT(hprof); clrT(hov);
         clrB(hbD); clrB(hops);
     }
 };

@@ -49,8 +49,10 @@ def _batch(seqs_a, seqs_b, params, mode, traceback, grad_mode="hard", threads=4)
     return b
 
 
-def test_pointers_is_the_default():
-    assert nwgrad.SeqPairBatch(n_threads=1).traceback == "pointers"
+def test_auto_is_the_default():
+    # The batch default is "auto" — Hirschberg where it applies, pointers elsewhere.
+    # "pointers" and "scores" below are always requested explicitly.
+    assert nwgrad.SeqPairBatch(n_threads=1).traceback == "auto"
 
 
 def test_traceback_is_fixed_at_construction(params):

@@ -144,7 +144,7 @@ struct SeqPairBatchT {
     bool profile = false;
     std::vector<PhaseProfile> profile_out;
 
-    explicit SeqPairBatchT(int nt = 0, TracebackMode tb = TracebackMode::Pointers)
+    explicit SeqPairBatchT(int nt = 0, TracebackMode tb = TracebackMode::Default)
         : n_threads(nt > 0 ? nt : default_threads()), tb_(tb) {}
 
     // Non-copyable.  It never was, meaningfully — a copy would duplicate the raw
@@ -221,6 +221,10 @@ struct SeqPairBatchT {
                 if (i >= N) break;
                 staged[i] = std::make_unique<SeqPair>(seqs_a[i], seqs_b[i],
                                                       params, gm, am, gd, kernel, tb_);
+                // Harmless unless the pair's resolved traceback is Hirschberg (it only
+                // reads hb_cutoff then), so applied unconditionally — tb_ may be the
+                // Default sentinel, which resolves to Hirschberg per pair, not here.
+                staged[i]->set_hb_cutoff(hb_cutoff);
             }
         };
         run_workers(N, worker);
@@ -585,7 +589,16 @@ private:
 
     // Physical cores, not logical -- see parallel.hpp::physical_cores() for the
     // measurements.  hardware_concurrency() costs up to 1.44x on an SMT host.
-    TracebackMode tb_ = TracebackMode::Pointers;
+    TracebackMode tb_ = TracebackMode::Default;
+
+public:
+    // Hirschberg base-case size in rows, applied to pairs built by add_many().  Ignored
+    // unless traceback resolves to Hirschberg.  512 from a fleet sweep AFTER hb_base was
+    // vectorized; see the Aligner field for the mechanism (pairs <= cutoff run the exact
+    // pointers fill; longer ones split).
+    int hb_cutoff = 512;
+
+private:
 
     static int default_threads() noexcept { return default_thread_count(); }
 

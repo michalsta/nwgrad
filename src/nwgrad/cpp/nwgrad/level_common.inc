@@ -33,6 +33,7 @@ namespace stdx = std::experimental;
 namespace NWGRAD_LVL_NAME {
 #include "kernels_impl.inl"       // striped affine Full kernel (defines KW)
 #include "kernels_pointers_impl.inl"  // same kernel, recording predecessor pointers
+#include "hb_kernel_impl.inl"     // Hirschberg linear-space sweep (striped, no tables)
 #include "row_kernel_impl.inl"    // row-wise banded leaf kernels (uses KW)
 }
 #undef NWGRAD_LEVEL_NS
@@ -52,6 +53,10 @@ struct NwgradLevelRegistrar {
                        &NWGRAD_LVL_NAME::striped_full_ptr_entry<float>,  // TracebackMode::Pointers, float32
                        &NWGRAD_LVL_NAME::banded_row_global,    // affine GuideBanded: whole-row ↓
                        &NWGRAD_LVL_NAME::banded_row_local,
+                       &NWGRAD_LVL_NAME::hb_sweep_entry_d,     // Hirschberg sweep, double
+                       &NWGRAD_LVL_NAME::hb_sweep_entry_f,     // Hirschberg sweep, float32
+                       &NWGRAD_LVL_NAME::hb_base_entry_d,      // Hirschberg base case, double
+                       &NWGRAD_LVL_NAME::hb_base_entry_f,      // Hirschberg base case, float32
                        NWGRAD_LVL_NAME::ROW_BLOCK);
     }
 };
