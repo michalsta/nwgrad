@@ -59,7 +59,17 @@ endif()
 
 if (CMAKE_BUILD_TYPE STREQUAL "Debug")
     target_compile_definitions(nwgrad_ext PRIVATE DEBUG_MODE)
-    target_compile_options(nwgrad_ext PRIVATE -g -Og -D_GLIBCXX_ASSERTIONS -D_GLIBCXX_SANITIZE_VECTOR -DGLIBCXX_DEBUG -D_LIBCPP_ENABLE_ASSERTIONS=1)
+    target_compile_options(nwgrad_ext PRIVATE -g -Og)
+    # Range-checked containers for any Debug build.  These change no ABI and need
+    # no sanitizer, so they are safe on a plain Debug build.  The ASan-only vector
+    # annotations (_GLIBCXX_SANITIZE_VECTOR — which link-error without ASan) and the
+    # clang-vs-gcc handling live in the sanitizer block above, applied whenever a
+    # sanitizer is on.  (This line previously carried -DGLIBCXX_DEBUG, a typo for
+    # _GLIBCXX_DEBUG that expanded to nothing — dropped, not fixed: real _GLIBCXX_DEBUG
+    # changes the container ABI and is mutually exclusive with the vector annotations.)
+    target_compile_definitions(nwgrad_ext PRIVATE
+        _GLIBCXX_ASSERTIONS
+        $<$<CXX_COMPILER_ID:Clang,AppleClang>:_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_DEBUG>)
 endif()
 
 install(TARGETS nwgrad_ext LIBRARY DESTINATION nwgrad)
@@ -99,11 +109,35 @@ if (NWGRAD_SANITIZE OR NWGRAD_SANITIZE_EXT)
         -fno-sanitize-recover=all
         -fno-omit-frame-pointer
         -g)
+
+    # Hardened / range-checked standard library, and — under ASan — container
+    # annotations.  Applied to EVERY sanitizer build (both nwgrad_tests and
+    # nwgrad_ext, gcc and clang), not just the Debug ext build: the annotations
+    # are what catch a read past a vector's .size() through .data() — raw-pointer
+    # accesses the range-checked operator[] never sees — and that is precisely the
+    # class of bug (a striped-kernel .data() over-read) that a clang C++ job could
+    # not see before, because it had neither.
+    set(NWGRAD_SANITIZE_DEFS
+        _GLIBCXX_ASSERTIONS)                       # libstdc++: range-checked operator[] etc. (no ABI change)
+    if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|AppleClang")
+        # libc++ range checks (its ASan container annotations are automatic).
+        list(APPEND NWGRAD_SANITIZE_DEFS _LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_DEBUG)
+    endif()
+    if (NWGRAD_SANITIZERS MATCHES "address")
+        # libstdc++ std::vector ASan annotations.  GCC auto-enables these under
+        # -fsanitize=address; clang does NOT define __SANITIZE_ADDRESS__, so
+        # libstdc++ leaves them off unless told — which is exactly why the
+        # container overflow was invisible to the clang build.  Requires ASan (it
+        # calls the ASan annotation runtime), hence gated on the sanitizer list;
+        # every TU touching the vector must agree, and here all do.
+        list(APPEND NWGRAD_SANITIZE_DEFS _GLIBCXX_SANITIZE_VECTOR)
+    endif()
 endif()
 
 if (NWGRAD_SANITIZE_EXT)
     target_compile_options(nwgrad_ext PRIVATE ${NWGRAD_SANITIZE_FLAGS})
     target_link_options(nwgrad_ext PRIVATE ${NWGRAD_SANITIZE_FLAGS})
+    target_compile_definitions(nwgrad_ext PRIVATE ${NWGRAD_SANITIZE_DEFS})
 endif()
 
 # ── C++ unit tests (Catch2 v2, vendored single header) ───────────────────────
@@ -139,6 +173,7 @@ target_link_libraries(nwgrad_tests PRIVATE Threads::Threads)
 if (NWGRAD_SANITIZE)
     target_compile_options(nwgrad_tests PRIVATE ${NWGRAD_SANITIZE_FLAGS})
     target_link_options(nwgrad_tests PRIVATE ${NWGRAD_SANITIZE_FLAGS})
+    target_compile_definitions(nwgrad_tests PRIVATE ${NWGRAD_SANITIZE_DEFS})
 endif()
 
 enable_testing()
