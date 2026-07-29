@@ -153,6 +153,8 @@ add_executable(nwgrad_tests
     tests/cpp/test_banded.cpp
     tests/cpp/test_seq_pair.cpp
     tests/cpp/test_traceback_modes.cpp
+    tests/cpp/test_hirschberg_scan.cpp
+    tests/cpp/test_hirschberg_pmax.cpp
     tests/cpp/test_add_many.cpp
     tests/cpp/test_simd_bitexact.cpp
     tests/cpp/test_simd_bitexact_f32.cpp

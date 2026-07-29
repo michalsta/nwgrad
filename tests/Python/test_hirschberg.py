@@ -106,11 +106,29 @@ def _rescore(a_al, b_al, params):
 # nothing would fail and every measurement of this mode would be a measurement of
 # something else.
 
-def test_local_throws(params):
-    sp = nwgrad.SeqPair("ACDEFGHIK", "ACDWFGHIK", params, gap_model="affine",
+def test_local_no_longer_throws(params):
+    """Local Hirschberg used to throw "global alignment only".  It is now implemented
+    (the endpoint reduction: forward clamped scan for the end cell, reverse global-suffix
+    scan for the start, global alignment of the box between), so this must run and land
+    on the Smith-Waterman optimum.  The Local suite below holds it to that."""
+    sp = nwgrad.SeqPair("ACDEFGHIK", "WWACDEFGHIKWW", params, gap_model="affine",
                         mode="local", grad_mode="hard", traceback="hirschberg")
     sp.alloc_dp()
-    with pytest.raises(RuntimeError, match="global alignment only"):
+    sp.align_full()                       # no throw
+    ref = nwgrad.SeqPair("ACDEFGHIK", "WWACDEFGHIKWW", params, gap_model="affine",
+                         mode="local", grad_mode="hard", traceback="pointers")
+    ref.alloc_dp()
+    ref.align_full()
+    assert sp.score == pytest.approx(ref.score, rel=1e-5, abs=1e-3)
+
+
+def test_local_linear_still_throws(params):
+    """The gap model, not the alignment mode, is what Local Hirschberg cannot do: there
+    is no affine gap-open state to carry across a row cut in the linear model."""
+    sp = nwgrad.SeqPair("ACDEFGHIK", "ACDWFGHIK", params, gap_model="linear",
+                        mode="local", grad_mode="hard", traceback="hirschberg")
+    sp.alloc_dp()
+    with pytest.raises(RuntimeError, match="affine gap model only"):
         sp.align_full()
 
 
@@ -136,11 +154,17 @@ def test_selectable_and_reported(params):
 def test_is_the_default_where_it_applies(params):
     """Hirschberg is now the default — but only via the "auto" sentinel, which resolves
     per problem: Hirschberg for affine+global+full (where it exists), pointers otherwise.
-    A blanket Hirschberg default would break Local/linear/banded, which throw."""
+    A blanket Hirschberg default would break Local/linear/banded, which throw.
+
+    Which CARRY that Hirschberg uses then splits again on precision — pmax at float32,
+    the exact chain at double (see test_hirschberg_pmax.py).  Both are Hirschberg; this
+    test is about the algorithm, so it accepts either."""
     assert nwgrad.SeqPairBatch(n_threads=1).traceback == "auto"
-    # affine + global + full resolves to hirschberg
+    # affine + global + full resolves to a hirschberg mode
     assert nwgrad.SeqPair("ACDE", "ACDE", params, gap_model="affine",
-                          mode="global").traceback == "hirschberg"
+                          mode="global").traceback == "hirschberg_pmax"
+    assert nwgrad.SeqPairDouble("ACDE", "ACDE", params, gap_model="affine",
+                                mode="global").traceback == "hirschberg"
     # everything Hirschberg does not implement resolves to pointers, not a throw
     assert nwgrad.SeqPair("ACDE", "ACDE", params, gap_model="affine",
                           mode="local").traceback == "pointers"
@@ -345,6 +369,134 @@ def test_batch_total_matches_pointers(params):
         batch.add_many(A, B, params, gap_model="affine", mode="global",
                        grad_mode="hard", kernel="auto")
         out[tb] = batch.score_and_grad()
+    assert out["hirschberg"] == pytest.approx(out["pointers"], rel=1e-5, abs=1e-2)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Local (Smith-Waterman) linear space
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Local Hirschberg is the endpoint reduction: a forward CLAMPED scan finds the end cell
+# (ie, je) and score S, a reverse UNCLAMPED global-suffix scan finds the start (is, js),
+# and the box A[is..ie) x B[js..je) is aligned GLOBALLY by the same recursion global uses.
+# It is held to the same bar — optimality, not identity — with the SW-specific twists:
+#   * the oracle is LOCAL pointers (Smith-Waterman), not global;
+#   * `aligned()` returns only the aligned sub-region, so a reconstruction check asserts a
+#     contiguous SUBSTRING of each input rather than the whole input;
+#   * self-pairs are a unique optimum (the whole diagonal), so there Hirschberg is
+#     BIT-exact — score and alignment — which also proves the reverse-scan start is right.
+# The reverse scan is global-suffix, not clamped, precisely so its argmax box always
+# scores S: a clamped reverse could pick, at a tie, a start whose box misses (ie, je).
+
+
+def _local(a, b, p, tb, cutoff=None, dtype="double"):
+    cls = nwgrad.SeqPairDouble if dtype == "double" else nwgrad.SeqPair
+    sp = cls(a, b, p, gap_model="affine", mode="local", grad_mode="hard", traceback=tb)
+    if cutoff is not None and tb == "hirschberg":
+        sp.hb_cutoff = cutoff
+    sp.alloc_dp()
+    sp.align_full()
+    return sp
+
+
+@pytest.mark.parametrize("fixture", ["params", "asym_params"])
+def test_local_score_matches_pointers(request, fixture):
+    """The headline claim: Smith-Waterman optimum, reached in linear space.  cutoff=64
+    forces splits on the longer pairs so this is not secretly testing the pointers fill."""
+    p = request.getfixturevalue(fixture)
+    A = _seqs(80, 1, 400, 41)
+    B = _seqs(80, 1, 400, 42)
+    for a, b in zip(A, B):
+        ref = _local(a, b, p, "pointers")
+        hb = _local(a, b, p, "hirschberg", cutoff=64)
+        assert hb.score == pytest.approx(ref.score, abs=1e-9), (a, b)
+
+
+def test_local_self_pair_is_bit_exact(params):
+    """A self-pair has a unique optimum (the full diagonal) — no tie to break — so local
+    Hirschberg must reproduce local pointers to the bit, alignment included.  This also
+    forces a genuine split (length 900 >> cutoff 32) and pins the reverse-scan start: a
+    wrong start would shift the whole alignment."""
+    a = _seqs(1, 900, 901, 51)[0]
+    ref = _local(a, a, params, "pointers")
+    hb = _local(a, a, params, "hirschberg", cutoff=32)
+    assert hb.score == ref.score
+    assert hb.aligned() == ref.aligned()
+
+
+@pytest.mark.parametrize("fixture", ["params", "asym_params"])
+def test_local_alignment_is_a_real_substring_alignment(request, fixture):
+    p = request.getfixturevalue(fixture)
+    A = _seqs(50, 1, 300, 43)
+    B = _seqs(50, 1, 300, 44)
+    for a, b in zip(A, B):
+        sp = _local(a, b, p, "hirschberg", cutoff=64)
+        x, y = sp.aligned()
+        assert len(x) == len(y)
+        assert x.replace("-", "") in a          # the aligned A-region is a contiguous substring
+        assert y.replace("-", "") in b
+        assert not any(u == "-" and v == "-" for u, v in zip(x, y))
+        assert _rescore(x, y, p) == pytest.approx(sp.score, abs=1e-9), (a, b)
+
+
+def test_local_gradient_is_the_gradient_of_that_path(asym_params):
+    """Same as global: the hard gradient must count exactly the returned local path."""
+    A = _seqs(30, 20, 250, 45)
+    B = _seqs(30, 20, 250, 46)
+    idx = {c: i for i, c in enumerate(AA)}
+    for a, b in zip(A, B):
+        sp = _local(a, b, asym_params, "hirschberg", cutoff=64)
+        sp.compute_grad()
+        g = sp.grad.to_dict()
+        x, y = sp.aligned()
+        want = np.zeros((20, 20))
+        opens_a = opens_b = ext_a = ext_b = 0
+        prev = "M"
+        for u, v in zip(x, y):
+            if u != "-" and v != "-":
+                want[idx[u], idx[v]] += 1.0
+                prev = "M"
+            elif v == "-":
+                if prev != "X":
+                    opens_b += 1
+                ext_b += 1
+                prev = "X"
+            else:
+                if prev != "Y":
+                    opens_a += 1
+                ext_a += 1
+                prev = "Y"
+        np.testing.assert_array_equal(g["matrix"], want)
+        assert g["gap_open_a"] == -opens_a
+        assert g["gap_open_b"] == -opens_b
+        assert g["gap_extend_a"] == -ext_a
+        assert g["gap_extend_b"] == -ext_b
+
+
+def test_local_degenerate_shapes(params):
+    """Empty and tiny inputs: the S<=0 / empty-alignment early-out, and boxes so small the
+    recursion never splits (bit-exact there by construction)."""
+    odd = ["", "A", "AC", "ACDEFGHIK"]
+    for a in odd:
+        for b in odd:
+            ref = _local(a, b, params, "pointers")
+            hb = _local(a, b, params, "hirschberg")
+            assert hb.score == pytest.approx(ref.score, abs=1e-9), (a, b)
+            x, y = hb.aligned()
+            assert x.replace("-", "") in a
+            assert y.replace("-", "") in b
+
+
+def test_local_batch_matches_pointers(params):
+    """Batch level, same optimum as local pointers, reproducible across thread counts."""
+    A = _seqs(150, 1, 250, 47)
+    B = _seqs(150, 1, 250, 48)
+    out = {}
+    for tb in ("pointers", "hirschberg"):
+        batch = nwgrad.SeqPairBatch(n_threads=4, traceback=tb)
+        batch.add_many(A, B, params, gap_model="affine", mode="local",
+                       grad_mode="hard", kernel="auto")
+        out[tb] = batch.score_and_grad()          # scalar: total score over the batch
     assert out["hirschberg"] == pytest.approx(out["pointers"], rel=1e-5, abs=1e-2)
 
 

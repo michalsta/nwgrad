@@ -51,12 +51,39 @@ enum class AlignBand { Full,   GuideBanded };
 // running a different algorithm than requested.
 //
 //   Default    a per-problem SENTINEL, never stored on an Aligner: it resolves at compile
-//              time to Hirschberg for affine+global+full (the case Hirschberg implements)
-//              and to Pointers for everything else.  This is what "traceback defaults to
-//              Hirschberg" means without breaking Local/linear/banded, which have no
-//              Hirschberg variant.  SeqPair/SeqPairBatch leave the Aligner's own default
-//              (kDefaultTb, below) in place when handed this.
-enum class TracebackMode { Scores, Pointers, Hirschberg, Default };
+//              time to a Hirschberg mode for affine+global+full (the case Hirschberg
+//              implements) and to Pointers for everything else.  This is what "traceback
+//              defaults to Hirschberg" means without breaking Local/linear/banded, which
+//              have no Hirschberg variant.  It resolves further on the SCALAR TYPE —
+//              HirschbergPmax at T=float, Hirschberg at T=double — so the two precisions
+//              do not merely differ in width, they run different carries; see kDefaultTb
+//              for why.  SeqPair/SeqPairBatch leave the Aligner's own default in place
+//              when handed this.
+//
+//   HirschbergPmax
+//              Hirschberg with the VY carry computed by the CLOSED-FORM PREFIX MAX
+//              (VY[c] = prefixmax_k(open[k] + k*ge_a) - (c-1)*ge_a) instead of the serial
+//              `- ge_a` chain + lazy-F.  It is the one mode in this library that can
+//              return a SUBOPTIMAL path, because the ramp k*ge_a is added and then
+//              subtracted again and the round-trip costs a rounding proportional to the
+//              column index.  Read that sentence before selecting it: no other mode here
+//              trades optimality, and this one buys speed with it.  It is nonetheless the
+//              DEFAULT AT T=float (see kDefaultTb) — at that precision the ramp is
+//              two orders of magnitude below float32's own rounding, so the trade is
+//              already paid for; at T=double it is strictly opt-in.  Everything else
+//              about it is Hirschberg — same recursion, same
+//              exact base case below hb_cutoff, same exact row 0 — so pairs that never
+//              split are unaffected.  It remains bit-identical scalar-vs-simd across
+//              every ISA level (the closed form depends only on the absolute column
+//              index, not on the vector width).  See hb_kernel_impl.inl.
+enum class TracebackMode { Scores, Pointers, Hirschberg, HirschbergPmax, Default };
+
+// Both Hirschberg modes share the whole divide-and-conquer driver — the recursion, the
+// join, the base case, the memory story — and differ only in which carry the SWEEP uses.
+// Everything structural therefore asks this rather than naming one of them.
+inline constexpr bool is_hirschberg(TracebackMode t) noexcept {
+    return t == TracebackMode::Hirschberg || t == TracebackMode::HirschbergPmax;
+}
 
 // Which Viterbi backend fills the DP tables is a runtime field (backend_, below), one of
 // the unified vocabulary in simd_levels.hpp: "scalar_fallback" (the original plain
@@ -471,6 +498,11 @@ private:
     // is O(m+n) where a table would be O(m·n).
     bool        hirschberg_ = false;
     std::vector<unsigned char> hops_;   // 0=M diagonal, 1=X gap-in-b, 2=Y gap-in-a
+    // Local Hirschberg only: the 0-based cell where the recovered local path STARTS.
+    // hops_ is a path within the sub-rectangle A[hb_start_i_..ie) x B[hb_start_j_..je),
+    // so every consumer replays it from this origin rather than (0, 0).  For Global (and
+    // any non-local mode) both are 0, so the consumers are byte-for-byte unchanged there.
+    int         hb_start_i_ = 0, hb_start_j_ = 0;
     // Rows per block at which the recursion stops splitting and runs the Pointers fill
     // instead.  1 would be pure Hirschberg (minimum memory, maximum re-sweeping); a
     // block of `cutoff` rows costs cutoff*n direction bytes and saves a level of
@@ -487,9 +519,23 @@ private:
     // there; every other case keeps Pointers (which the linear/banded paths ignore
     // anyway).  A default-constructed Aligner therefore never lands on a mode that would
     // throw.  The TracebackMode::Default sentinel maps to exactly this.
+    //
+    // The Hirschberg case defaults FURTHER, on the scalar type: at T=float the carry is
+    // the closed-form prefix max, at T=double the exact serial chain.  That split is a
+    // deliberate judgment about what each precision is FOR.  float32 is the throughput
+    // mode — it has already accepted ~8.4e-3 of its own rounding against a double oracle,
+    // and the ramp's worst measured contribution on top of that is 4.9e-4, two orders of
+    // magnitude below the error the caller has already agreed to pay, in exchange for
+    // 1.5-3.9x on homologous data.  T=double is chosen BY people who want exactness, so
+    // it keeps the carry that has it: there the ramp would be the largest error term in
+    // the computation (~9.1e-13 against the exact mode's ~1.6e-12) rather than a rounding
+    // lost in the noise.  Either default is overridable per problem; neither is reachable
+    // for Local, linear or banded, which resolve to Pointers above.
     static constexpr TracebackMode kDefaultTb =
         (GM == GapModel::Affine && AM == AlignMode::Global && AB == AlignBand::Full)
-            ? TracebackMode::Hirschberg : TracebackMode::Pointers;
+            ? (std::is_same_v<T, float> ? TracebackMode::HirschbergPmax
+                                        : TracebackMode::Hirschberg)
+            : TracebackMode::Pointers;
     TracebackMode tb_ = kDefaultTb;
     int    striped_seg_    = 0;
     int    striped_w_      = 1;
@@ -579,7 +625,7 @@ private:
             // Hirschberg allocates even less: its scratch is O(n) rows sized on demand
             // inside the recursion, and the whole point is that no O(m*n) table exists.
             if constexpr (AB == AlignBand::Full)
-                if (tb_ == TracebackMode::Pointers || tb_ == TracebackMode::Hirschberg) return;
+                if (tb_ == TracebackMode::Pointers || is_hirschberg(tb_)) return;
             if (buf.VM.size() < sz_) { buf.VM.resize(sz_); buf.VX.resize(sz_); buf.VY.resize(sz_); }
         }
     }
@@ -949,7 +995,7 @@ private:
         // same one, so an unsupported combination throws instead of falling back — a
         // silent substitution would make a benchmark of it meaningless and a gradient
         // from it unattributable.
-        if (tb_ == TracebackMode::Hirschberg) {
+        if (is_hirschberg(tb_)) {
             if constexpr (GM != GapModel::Affine)
                 throw std::logic_error(
                     "nwgrad: traceback=\"hirschberg\" is implemented for the affine gap "
@@ -959,11 +1005,7 @@ private:
                 throw std::logic_error(
                     "nwgrad: traceback=\"hirschberg\" is implemented for full DP only; a "
                     "guide band already bounds memory, which is the only thing Hirschberg buys");
-            else if constexpr (AM != AlignMode::Global)
-                throw std::logic_error(
-                    "nwgrad: traceback=\"hirschberg\" is implemented for global alignment "
-                    "only (local needs a linear-space scan for the best cell and its start "
-                    "before the divide-and-conquer can begin)");
+            else if constexpr (AM == AlignMode::Local) { viterbi_affine_hirschberg_local(buf); return; }
             else { viterbi_affine_hirschberg(buf); return; }
         }
         // Variant B: direction pointers + rolling rows, 3 B/cell instead of 12/24.
@@ -1314,12 +1356,18 @@ private:
     // The leveled striped sweep for this aligner's backend, or null to go scalar.
     // Resolved per sweep rather than cached: it is one predicated load against an
     // O(H*ncols) sweep, and caching it would have to be invalidated on set_kernel().
+    // True when this aligner's sweep uses the closed-form prefix-max carry rather than
+    // the exact serial one.  Only the SWEEP differs: the recursion, the join, the base
+    // case and row 0 are shared, which is why this is a predicate and not a second driver.
+    bool hb_pmax() const noexcept { return tb_ == TracebackMode::HirschbergPmax; }
+
     const LevelKernels* hb_level() const noexcept {
         const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
         if (backend == kBackendScalar) return nullptr;
         const LevelKernels& K = level_kernels(backend);
-        const bool have = std::is_same_v<T, double> ? (K.hb_sweep != nullptr)
-                                                    : (K.hb_sweep_f != nullptr);
+        const bool dbl = std::is_same_v<T, double>;
+        const bool have = hb_pmax() ? (dbl ? K.hb_sweep_pmax != nullptr : K.hb_sweep_pmax_f != nullptr)
+                                    : (dbl ? K.hb_sweep      != nullptr : K.hb_sweep_f      != nullptr);
         return have ? &K : nullptr;
     }
 
@@ -1340,16 +1388,27 @@ private:
         job.H = H; job.ncols = ncols; job.in_x = in_x ? 1 : 0;
         job.buf = &buf;
         job.outM = oM; job.outX = oX; job.outY = oY;
-        if constexpr (std::is_same_v<T, double>) K.hb_sweep(job);
-        else                                     K.hb_sweep_f(job);
+        if constexpr (std::is_same_v<T, double>) {
+            if (hb_pmax()) K.hb_sweep_pmax(job); else K.hb_sweep(job);
+        } else {
+            if (hb_pmax()) K.hb_sweep_pmax_f(job); else K.hb_sweep_f(job);
+        }
     }
 
     // Forward sweep of rows (i0, i1], keeping two rolling rows.  On return the three
     // out-pointers hold row i1 of the block, indexed by column offset c = j - j0.
     // Costs (i1-i0)*(j1-j0) cells and O(j1-j0) memory: nothing is retained.
+    //
+    // Pmax = true swaps the VY carry for the closed-form prefix max — see the long note
+    // in hb_kernel_impl.inl.  `rmp` then holds the gap ramp k*ge_a for k = 0..(j1-j0),
+    // precomputed by the caller.  It is a LOAD and not a multiply on purpose: an
+    // adjacent multiply would let the compiler contract `g + k*ge_a` into an FMA, which
+    // rounds once instead of twice and would make this reference disagree with the simd
+    // kernel on any -mfma level.  Row 0 stays exact in both variants.
+    template <bool Pmax = false>
     void hb_fwd(int i0, int i1, int j0, int j1, bool in_x,
                 T* pM, T* pX, T* pY, T* cM, T* cX, T* cY,
-                T*& oM, T*& oX, T*& oY) const {
+                T*& oM, T*& oX, T*& oY, const T* rmp = nullptr) const {
         const T go_a = static_cast<T>(params_->gap_open_a);
         const T ge_a = static_cast<T>(params_->gap_extend_a);
         const T go_b = static_cast<T>(params_->gap_open_b);
@@ -1370,11 +1429,23 @@ private:
             cM[0] = static_cast<T>(NEG_INF);
             cX[0] = std::max({pM[0] - go_b - ge_b, pX[0] - ge_b, pY[0] - go_b - ge_b});
             cY[0] = static_cast<T>(NEG_INF);
+            // The running prefix max over Q[k] = g[k] + k*ge_a, seeded with the column-0
+            // border folded in as k = -1.  Unused (and cold) when Pmax is false.
+            T P = cY[0] - ge_a;
             for (int c = 1; c <= W; ++c) {
                 // subT is 1-based over the full sequences; row r consumes a[r-1].
                 cM[c] = std::max({pM[c-1], pX[c-1], pY[c-1]}) + subT(r, j0 + c);
                 cX[c] = std::max({pM[c] - go_b - ge_b, pX[c] - ge_b, pY[c] - go_b - ge_b});
-                cY[c] = std::max({cM[c-1] - go_a - ge_a, cX[c-1] - go_a - ge_a, cY[c-1] - ge_a});
+                if constexpr (Pmax) {
+                    // g[k] for k = c-1.  Max-then-subtract mirrors the kernel's `ov`
+                    // exactly (subtracting a common value is order-preserving, so this is
+                    // bit-identical to the three-way form the exact branch uses).
+                    const T g = (std::max(cM[c-1], cX[c-1]) - go_a) - ge_a;
+                    P = std::max(g + rmp[c-1], P);
+                    cY[c] = P - rmp[c-1];
+                } else {
+                    cY[c] = std::max({cM[c-1] - go_a - ge_a, cX[c-1] - go_a - ge_a, cY[c-1] - ge_a});
+                }
             }
             std::swap(pM, cM); std::swap(pX, cX); std::swap(pY, cY);
         }
@@ -1385,9 +1456,10 @@ private:
     // a[r..i1) with b[.. j1), so on return oS[c] is the best score of aligning
     // a[i0..i1) with b[(j0+c)..j1) given the block's FIRST forward move has type S.
     // out_x seeds the far end exactly as in_x seeds the near one.
+    template <bool Pmax = false>
     void hb_rev(int i0, int i1, int j0, int j1, bool out_x,
                 T* pM, T* pX, T* pY, T* cM, T* cX, T* cY,
-                T*& oM, T*& oX, T*& oY) const {
+                T*& oM, T*& oX, T*& oY, const T* rmp = nullptr) const {
         const T go_a = static_cast<T>(params_->gap_open_a);
         const T ge_a = static_cast<T>(params_->gap_extend_a);
         const T go_b = static_cast<T>(params_->gap_open_b);
@@ -1408,11 +1480,18 @@ private:
             cM[0] = static_cast<T>(NEG_INF);
             cX[0] = std::max({pM[0] - go_b - ge_b, pX[0] - ge_b, pY[0] - go_b - ge_b});
             cY[0] = static_cast<T>(NEG_INF);
+            T P = cY[0] - ge_a;
             for (int d = 1; d <= W; ++d) {
                 // Mirrored diagonal: this step pairs a[r] with b[j1-d], i.e. subT(r+1, j1-d+1).
                 cM[d] = std::max({pM[d-1], pX[d-1], pY[d-1]}) + subT(r + 1, j1 - d + 1);
                 cX[d] = std::max({pM[d] - go_b - ge_b, pX[d] - ge_b, pY[d] - go_b - ge_b});
-                cY[d] = std::max({cM[d-1] - go_a - ge_a, cX[d-1] - go_a - ge_a, cY[d-1] - ge_a});
+                if constexpr (Pmax) {
+                    const T g = (std::max(cM[d-1], cX[d-1]) - go_a) - ge_a;
+                    P = std::max(g + rmp[d-1], P);
+                    cY[d] = P - rmp[d-1];
+                } else {
+                    cY[d] = std::max({cM[d-1] - go_a - ge_a, cX[d-1] - go_a - ge_a, cY[d-1] - ge_a});
+                }
             }
             std::swap(pM, cM); std::swap(pX, cX); std::swap(pY, cY);
         }
@@ -1584,7 +1663,24 @@ private:
             return;
         }
         T *sM, *sX, *sY;
-        if (reverse)
+        if (hb_pmax()) {
+            // The ramp, contiguous: rmp[k] = k*ge_a.  Same scalar multiply of the same
+            // exactly-representable integer the striped kernel uses for the same absolute
+            // column k, so the two agree to the bit — and built here, outside the row
+            // loop, so the carry loop below contains no multiply to contract into an FMA.
+            const T ge_a = static_cast<T>(params_->gap_extend_a);
+            hb_fit(buf.hramp, static_cast<std::size_t>(NC) + 1);
+            T* rmp = buf.hramp.data();
+            for (int k = 0; k <= NC; ++k) rmp[k] = static_cast<T>(k) * ge_a;
+            if (reverse)
+                hb_rev<true>(i0, i1, j0, j1, flag,
+                             buf.hfa.data(), buf.hfb.data(), buf.hfc.data(),
+                             buf.hfd.data(), buf.hfe.data(), buf.hff.data(), sM, sX, sY, rmp);
+            else
+                hb_fwd<true>(i0, i1, j0, j1, flag,
+                             buf.hfa.data(), buf.hfb.data(), buf.hfc.data(),
+                             buf.hfd.data(), buf.hfe.data(), buf.hff.data(), sM, sX, sY, rmp);
+        } else if (reverse)
             hb_rev(i0, i1, j0, j1, flag,
                    buf.hfa.data(), buf.hfb.data(), buf.hfc.data(),
                    buf.hfd.data(), buf.hfe.data(), buf.hff.data(), sM, sX, sY);
@@ -1693,13 +1789,161 @@ private:
         hirschberg_ = true;
     }
 
+    // ── Local (Smith-Waterman) linear space: endpoint scans + a global box ─────
+    //
+    // The leveled endpoint-scan kernel for this backend, or null to go scalar — the
+    // twin of hb_level()/hb_base_level().
+    const LevelKernels* hb_scan_level() const noexcept {
+        const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
+        if (backend == kBackendScalar) return nullptr;
+        const LevelKernels& K = level_kernels(backend);
+        const bool have = std::is_same_v<T, double> ? (K.hb_scan != nullptr)
+                                                    : (K.hb_scan_f != nullptr);
+        return have ? &K : nullptr;
+    }
+
+    // Run one endpoint scan over the sub-rectangle rows [i0, i1), cols [j0, j1): simd if
+    // this backend has the kernel, scalar otherwise.  `local` picks clamped-SW (forward
+    // end cell) vs unclamped global-suffix (reverse start cell); `reverse` negates the
+    // walk.  Reports the best cell in BLOCK-1-based coords (row 1..H, col 1..NC) and its
+    // score.  The two paths are bit-identical by construction — same recurrence, same
+    // topmost/leftmost tie-break — so which runs is a speed choice, exactly as elsewhere.
+    void hb_scan(DpBuffer& buf, bool local, bool reverse, int i0, int i1, int j0, int j1,
+                 T& best, int& bi, int& bj) {
+        const int H = i1 - i0, NC = j1 - j0;
+        if (const LevelKernels* K = hb_scan_level()) {
+            HbScanJob<T> job{};
+            job.a = a_idx_.data(); job.b = b_idx_.data();
+            job.blk = blkT_; job.nalpha = nalpha_;
+            job.go_a = static_cast<T>(params_->gap_open_a);
+            job.ge_a = static_cast<T>(params_->gap_extend_a);
+            job.go_b = static_cast<T>(params_->gap_open_b);
+            job.ge_b = static_cast<T>(params_->gap_extend_b);
+            if (reverse) { job.a_start = i1 - 1; job.a_step = -1; job.b_start = j1 - 1; job.b_step = -1; }
+            else         { job.a_start = i0;     job.a_step = +1; job.b_start = j0;     job.b_step = +1; }
+            job.H = H; job.ncols = NC; job.local = local ? 1 : 0;
+            job.buf = &buf;
+            if constexpr (std::is_same_v<T, double>) K->hb_scan(job);
+            else                                     K->hb_scan_f(job);
+            best = job.best; bi = job.best_i; bj = job.best_j;
+            return;
+        }
+        hb_scan_scalar(buf, local, reverse, i0, i1, j0, j1, best, bi, bj);
+    }
+
+    // Scalar reference endpoint scan.  Rolling rows only; the borders and the M-clamp
+    // switch on `local`, the walk direction on `reverse`.  The argmax is topmost-row /
+    // leftmost-column, strict > — the SAME tie-break the simd kernel uses, so the two
+    // agree to the bit (the property NWGRAD_ISA relies on).
+    void hb_scan_scalar(DpBuffer& buf, bool local, bool reverse, int i0, int i1, int j0, int j1,
+                        T& best, int& bi, int& bj) {
+        const int H = i1 - i0, NC = j1 - j0;
+        best = static_cast<T>(0); bi = 0; bj = 0;
+        if (H == 0 || NC == 0) return;
+        const T go_a = static_cast<T>(params_->gap_open_a);
+        const T ge_a = static_cast<T>(params_->gap_extend_a);
+        const T go_b = static_cast<T>(params_->gap_open_b);
+        const T ge_b = static_cast<T>(params_->gap_extend_b);
+        const int a_start = reverse ? i1 - 1 : i0, a_step = reverse ? -1 : +1;
+        const int b_start = reverse ? j1 - 1 : j0, b_step = reverse ? -1 : +1;
+
+        const std::size_t stride = static_cast<std::size_t>(NC) + 1;
+        hb_fit(buf.hfa, stride); hb_fit(buf.hfb, stride); hb_fit(buf.hfc, stride);
+        hb_fit(buf.hfd, stride); hb_fit(buf.hfe, stride); hb_fit(buf.hff, stride);
+        T* pM = buf.hfa.data(); T* pX = buf.hfb.data(); T* pY = buf.hfc.data();
+        T* cM = buf.hfd.data(); T* cX = buf.hfe.data(); T* cY = buf.hff.data();
+
+        // Row 0.  Local: M = 0 for every column (fresh start anywhere).  Global: the
+        // Y-gap-open series, so the reverse pass computes the suffixes' global alignment.
+        pM[0] = static_cast<T>(0); pX[0] = static_cast<T>(NEG_INF); pY[0] = static_cast<T>(NEG_INF);
+        for (int c = 1; c <= NC; ++c) {
+            if (local) { pM[c] = static_cast<T>(0); pX[c] = static_cast<T>(NEG_INF); pY[c] = static_cast<T>(NEG_INF); }
+            else {
+                pM[c] = static_cast<T>(NEG_INF); pX[c] = static_cast<T>(NEG_INF);
+                pY[c] = std::max((std::max(pM[c-1], pX[c-1]) - go_a) - ge_a, pY[c-1] - ge_a);
+            }
+        }
+
+        T gbest = static_cast<T>(0); int gi = 0, gj = 0;
+        for (int t = 0; t < H; ++t) {
+            const int arow = a_start + t * a_step;                 // 0-based sequence row
+            cM[0] = local ? static_cast<T>(0) : static_cast<T>(NEG_INF);
+            cX[0] = std::max(std::max((pM[0] - go_b) - ge_b, pX[0] - ge_b), (pY[0] - go_b) - ge_b);
+            cY[0] = static_cast<T>(NEG_INF);
+            for (int c = 1; c <= NC; ++c) {
+                const int bcol = b_start + (c - 1) * b_step;       // 0-based sequence col
+                T m = std::max({pM[c-1], pX[c-1], pY[c-1]}) + subT(arow + 1, bcol + 1);
+                if (local) m = std::max(m, static_cast<T>(0));
+                const T x = std::max(std::max((pM[c] - go_b) - ge_b, pX[c] - ge_b), (pY[c] - go_b) - ge_b);
+                const T y = std::max(std::max((cM[c-1] - go_a) - ge_a, (cX[c-1] - go_a) - ge_a), cY[c-1] - ge_a);
+                cM[c] = m; cX[c] = x; cY[c] = y;
+                const T here = std::max({m, x, y});
+                if (here > gbest) { gbest = here; gi = t + 1; gj = c; }
+            }
+            std::swap(pM, cM); std::swap(pX, cX); std::swap(pY, cY);
+        }
+        best = gbest; bi = gi; bj = gj;
+    }
+
+    // Entry: linear-space Smith-Waterman.  Forward clamped scan -> end cell (ie, je) and
+    // score S; reverse global-suffix scan over the prefix rectangle -> start (is, js);
+    // then hb_solve GLOBALLY aligns the box A[is..ie) x B[js..je), which scores exactly S.
+    // Everything is O(n) memory.  Below hb_cutoff the box never splits and the fill is the
+    // exact Pointers one, so short local pairs are bit-exact; longer ones return a valid
+    // (equal-score) but possibly different optimal path at ties, like Global Hirschberg.
+    void viterbi_affine_hirschberg_local(DpBuffer& buf) {
+        hops_.clear();
+        hb_start_i_ = 0; hb_start_j_ = 0;
+
+        T s_fwd; int ie, je;
+        hb_scan(buf, /*local=*/true, /*reverse=*/false, 0, m_, 0, n_, s_fwd, ie, je);
+
+        // No positive-scoring local alignment: the empty alignment (score 0) is optimal.
+        if (s_fwd <= static_cast<T>(0) || ie <= 0 || je <= 0) {
+            viterbi_score_ = 0.0;
+            best_i_ = 0; best_j_ = 0; best_tbl_ = TBTable::M;
+            hirschberg_ = true;
+            return;
+        }
+
+        T s_rev; int p, q;
+        hb_scan(buf, /*local=*/false, /*reverse=*/true, 0, ie, 0, je, s_rev, p, q);
+        const int is = ie - p, js = je - q;
+
+        hb_solve(buf, is, ie, js, je, false, false);
+        hb_start_i_ = is; hb_start_j_ = js;
+
+        // Replay for the score, seeded at the local start (subT is 1-based).  Same order
+        // and precision as the DP, so the path's score is exact — the value the tests pin
+        // against SW Pointers.
+        const T go_a = static_cast<T>(params_->gap_open_a);
+        const T ge_a = static_cast<T>(params_->gap_extend_a);
+        const T go_b = static_cast<T>(params_->gap_open_b);
+        const T ge_b = static_cast<T>(params_->gap_extend_b);
+        T s = static_cast<T>(0);
+        int i = is, j = js;
+        unsigned char prev = 3;
+        for (unsigned char op : hops_) {
+            if (op == 0) { ++i; ++j; s += subT(i, j); }
+            else if (op == 1) { if (prev != 1) s -= go_b; s -= ge_b; ++i; }
+            else              { if (prev != 2) s -= go_a; s -= ge_a; ++j; }
+            prev = op;
+        }
+        viterbi_score_ = static_cast<double>(s);
+        best_i_ = ie; best_j_ = je;
+        best_tbl_ = hops_.empty() ? TBTable::M
+                  : (hops_.back() == 1 ? TBTable::X
+                     : (hops_.back() == 2 ? TBTable::Y : TBTable::M));
+        hirschberg_ = true;
+    }
+
     // ── Consumers of a Hirschberg path ────────────────────────────────────────
     // Each mirrors its table-walking twin, but replays hops_ forward instead of
     // walking predecessors backward.  Same emissions, same gradient convention.
 
     void hard_grad_affine_hb(AlignParams& grad) const {
         double* gblk = grad_block(grad);
-        int i = 0, j = 0;
+        int i = hb_start_i_, j = hb_start_j_;   // local: the path starts at (is, js), not the origin
         unsigned char prev = 3;
         for (unsigned char op : hops_) {
             if (op == 0) { ++i; ++j; gblk[sub_off(i, j)] += 1.0; }
@@ -1719,7 +1963,7 @@ private:
         // the same convention traceback_affine uses (it emits i-1,j-1 from 1-based DP
         // coords), so alignment() agrees across tracebacks and with pairs_from_gapped().
         std::vector<std::pair<int,int>> path;
-        int i = 0, j = 0;
+        int i = hb_start_i_, j = hb_start_j_;
         for (unsigned char op : hops_) {
             if (op == 0)      { path.emplace_back(i, j); ++i; ++j; }
             else if (op == 1) { ++i; }
@@ -1730,7 +1974,7 @@ private:
 
     void aligned_hb(std::string& a, std::string& b) const {
         a.clear(); b.clear();
-        int i = 0, j = 0;
+        int i = hb_start_i_, j = hb_start_j_;
         for (unsigned char op : hops_) {
             if (op == 0)      { ++i; ++j; a.push_back(sym_a(i)); b.push_back(sym_b(j)); }
             else if (op == 1) { ++i; a.push_back(sym_a(i)); b.push_back('-'); }
@@ -1741,7 +1985,11 @@ private:
     std::vector<int> guide_j_affine_hb() const {
         std::vector<int> gj(static_cast<std::size_t>(m_ + 1), -1);
         gj[0] = 0;
-        int i = 0, j = 0;
+        // Local: the path covers only rows [is, ie); seed the start anchor and let the
+        // rows outside it interpolate (fill_guide_gaps), exactly as guide_j_affine does
+        // from its local traceback.  For Global (is=js=0) this is the original walk.
+        int i = hb_start_i_, j = hb_start_j_;
+        gj[static_cast<std::size_t>(i)] = j;
         for (unsigned char op : hops_) {
             if (op == 0)      { ++i; ++j; gj[static_cast<std::size_t>(i)] = j; }
             else if (op == 1) { ++i;      gj[static_cast<std::size_t>(i)] = j; }

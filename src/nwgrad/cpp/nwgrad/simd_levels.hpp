@@ -176,6 +176,41 @@ struct HbJob {
 using hb_fn   = void (*)(HbJob<double>&);
 using hb_fn_f = void (*)(HbJob<float>&);
 
+// ── Hirschberg LOCAL endpoint scan: a striped affine sweep that reports its argmax ─
+//
+// Local (Smith-Waterman) linear-space alignment cannot begin the divide-and-conquer
+// until it knows the optimal cell's END and START; the recursion then aligns the
+// substring between them GLOBALLY.  This job is that scan: the same striped rolling-row
+// recurrence as HbJob, but it RETAINS NOTHING — it tracks the single best cell over the
+// whole (sub-)block and reports it.  Two modes, chosen by `local`:
+//   local = 1  clamped local borders (M=0) and the M-clamp max(.,0) — the FORWARD pass
+//              that finds the end cell (ie, je) and score S.
+//   local = 0  hb_sweep's GLOBAL borders and no clamp — the REVERSE pass, walked
+//              backward, that computes Rev[i][j] = best global alignment of the
+//              suffixes and finds the start (its argmax box globally aligns to S, so
+//              the tie-break can never cost score).
+// Forward vs reverse is the usual negated start/step; the reported (best_i, best_j) are
+// block-1-based, and the caller maps them to absolute end/start cells.
+template <class T>
+struct HbScanJob {
+    const unsigned char* a;
+    const unsigned char* b;
+    const T* blk; int nalpha;
+    T go_a, ge_a, go_b, ge_b;
+    int a_start, a_step;                    // row t (0..H-1) consumes a[a_start + t*a_step]
+    int b_start, b_step;                    // column c (1..ncols) pairs b[b_start + (c-1)*b_step]
+    int H;                                  // rows to sweep
+    int ncols;                              // columns in this block
+    int local;                              // 1 = clamped local (forward end), 0 = global (reverse start)
+    DpBufferT<T>* buf;                      // scratch (striped rows, profile, open vector)
+    // outputs: the best cell and its block-1-based coordinates.  Default 0 at (0,0), so
+    // an all-nonpositive local block reports the empty alignment.
+    T best; int best_i; int best_j;
+};
+
+using hbscan_fn   = void (*)(HbScanJob<double>&);
+using hbscan_fn_f = void (*)(HbScanJob<float>&);
+
 // ── Hirschberg base case: striped fill that RECORDS direction bytes ───────────
 //
 // The recursion bottoms out here.  Unlike HbJob (which keeps only rolling rows and
@@ -226,8 +261,16 @@ struct LevelKernels {
     banded_row_fn banded_row_local  = nullptr;
     hb_fn         hb_sweep = nullptr;           // Hirschberg linear-space sweep, double
     hb_fn_f       hb_sweep_f = nullptr;         // ditto, float32
+    // The opt-in prefix-max sibling of the sweep (TracebackMode::HirschbergPmax): same
+    // job, same output, a closed-form VY carry instead of the serial chain + lazy-F.
+    // NOT interchangeable with the pair above — it is bit-identical only within its own
+    // family — so it gets its own slots rather than overwriting theirs.
+    hb_fn         hb_sweep_pmax = nullptr;      // prefix-max carry sweep, double
+    hb_fn_f       hb_sweep_pmax_f = nullptr;    // ditto, float32
     hbbase_fn     hb_base = nullptr;            // Hirschberg base case (records directions), double
     hbbase_fn_f   hb_base_f = nullptr;         // ditto, float32
+    hbscan_fn     hb_scan = nullptr;            // Hirschberg local endpoint scan, double
+    hbscan_fn_f   hb_scan_f = nullptr;          // ditto, float32
     int           row_block = 0;                // columns per interleaved block (per-µarch)
 };
 
@@ -250,7 +293,9 @@ void register_level(SimdLevel l, viterbi_fn viterbi, viterbi_fn_f viterbi_f,
                     viterbi_fn viterbi_ptr, viterbi_fn_f viterbi_ptr_f,
                     banded_row_fn banded_row_global, banded_row_fn banded_row_local,
                     hb_fn hb_sweep, hb_fn_f hb_sweep_f,
+                    hb_fn hb_sweep_pmax, hb_fn_f hb_sweep_pmax_f,
                     hbbase_fn hb_base, hbbase_fn_f hb_base_f,
+                    hbscan_fn hb_scan, hbscan_fn_f hb_scan_f,
                     int row_block);
 
 // ── The global default backend ────────────────────────────────────────────────

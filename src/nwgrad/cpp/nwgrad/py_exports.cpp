@@ -104,14 +104,17 @@ static TracebackMode parse_traceback(const std::string& name) {
     if (name == "pointers")   return TracebackMode::Pointers;
     if (name == "scores")     return TracebackMode::Scores;
     if (name == "hirschberg") return TracebackMode::Hirschberg;
+    if (name == "hirschberg_pmax") return TracebackMode::HirschbergPmax;
     throw nb::value_error(
         ("nwgrad: unknown traceback \"" + name +
-         "\" (expected \"auto\", \"pointers\", \"scores\" or \"hirschberg\")").c_str());
+         "\" (expected \"auto\", \"pointers\", \"scores\", \"hirschberg\" or "
+         "\"hirschberg_pmax\")").c_str());
 }
 static const char* traceback_name(TracebackMode t) {
     switch (t) {
         case TracebackMode::Pointers:   return "pointers";
         case TracebackMode::Hirschberg: return "hirschberg";
+        case TracebackMode::HirschbergPmax: return "hirschberg_pmax";
         case TracebackMode::Default:    return "auto";
         default:                        return "scores";
     }
@@ -296,7 +299,9 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
             "  grad_mode : \"hard\" | \"soft\" | \"none\"\n"
             "  kernel    : \"scalar\" | \"simd\" — bit-exact speed knob (Viterbi path).\n"
             "  traceback : \"auto\" (default) | \"pointers\" | \"scores\" | \"hirschberg\"\n"
-            "     — see SeqPairBatch.traceback.  \"auto\" = Hirschberg where it applies.")
+            "              | \"hirschberg_pmax\"\n"
+            "     — see SeqPairBatch.traceback.  \"auto\" = Hirschberg where it applies\n"
+            "     (the prefix-max carry at float32, the exact one at double).")
         .def("alloc_dp", &SP::alloc_dp,
              "Pre-allocate own DP tables for the fixed sequences.")
         .def(
@@ -385,18 +390,33 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             "  hardware_concurrency): this DP is stall-bound, so SMT siblings\n"
             "  contend and the logical count measured up to 1.44x slower.\n"
             "  traceback : \"auto\" (default) | \"pointers\" | \"scores\" | \"hirschberg\"\n"
+            "              | \"hirschberg_pmax\"\n"
             "     — what the DP retains in order to recover predecessors.\n"
-            "     \"auto\" is Hirschberg for affine+global+full (the case it implements)\n"
-            "     and pointers for every other problem type, so the default is\n"
-            "     Hirschberg wherever Hirschberg exists.\n"
+            "     \"auto\" is Hirschberg for affine+global+full and pointers for every\n"
+            "     other problem type.  At float32 (the default dtype) it resolves to\n"
+            "     \"hirschberg_pmax\" rather than \"hirschberg\": the prefix-max carry is\n"
+            "     1.5-3.9x faster on homologous data and its worst measured cost is\n"
+            "     ~5e-4, against the ~8e-3 float32 itself already costs.  Use the double\n"
+            "     classes, or ask for \"hirschberg\" by name, to get the exact carry.\n"
+            "     Other problem types — including affine+full+LOCAL, which supports\n"
+            "     Hirschberg but keeps pointers as its auto default (local HB is a memory\n"
+            "     play, not a speed one: select traceback=\"hirschberg\" for long/huge pairs).\n"
             "     \"pointers\" records 1 byte/cell/state during the fill (3 B/cell);\n"
             "     \"scores\" keeps VM/VX/VY and re-derives the argmax (12 B/cell).  Those\n"
             "     two are bit-identical; pointers is smaller and 1.4-2.2x faster.\n"
             "     \"hirschberg\" is divide-and-conquer in O(n) memory at ~2x the cell\n"
             "     work; it never splits below hb_cutoff, so pairs that short run the\n"
             "     exact pointers fill and are bit-exact, and only longer pairs take a\n"
-            "     valid-but-different subgradient.  Affine+global+full only; asking for\n"
-            "     it elsewhere throws (the \"auto\" default falls back instead).\n"
+            "     valid-but-different subgradient.  Affine+full only (global or local);\n"
+            "     asking for it on the linear or banded paths throws (the \"auto\"\n"
+            "     default falls back instead).\n"
+            "     \"hirschberg_pmax\" is the same algorithm with the VY gap carry\n"
+            "     computed by a closed-form prefix max instead of the serial chain.\n"
+            "     It is the ONE mode here that can return a SUBOPTIMAL path: the ramp\n"
+            "     k*gap_extend_a is added and subtracted again, costing a rounding that\n"
+            "     grows with the column index.  It is the float32 \"auto\" default and\n"
+            "     opt-in at double; it stays bit-identical across ISA levels but not\n"
+            "     with any other mode.\n"
             "     Applies to pairs built by add_many().")
         .def(
             "add",

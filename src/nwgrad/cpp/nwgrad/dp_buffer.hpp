@@ -154,6 +154,14 @@ struct DpBufferT {
     // own width), but serves that block's forward AND reverse sweeps, so its cost
     // amortizes over H rows rather than H/2.
     TVec hprof, hov;
+    // Prefix-max sweep only (TracebackMode::HirschbergPmax): the gap ramp k*ge_a for
+    // every column of the block, in striped order.  Built ONCE per sweep by a scalar
+    // loop and then only loaded, which is load-bearing twice over: it keeps the ramp
+    // out of the row loop (it depends on the column, not the row), and it means the
+    // hot loop contains no multiply for the compiler to contract into an FMA — an FMA
+    // in one level TU and a mul+add in another would round differently and break the
+    // scalar==simd bit-identity the pmax family is required to hold.
+    TVec hramp;
 
     void clear() noexcept {
         auto clrT = [](TVec& v) noexcept { v.clear(); v.shrink_to_fit(); };
@@ -170,7 +178,7 @@ struct DpBufferT {
         clrT(hfa); clrT(hfb); clrT(hfc); clrT(hfd); clrT(hfe); clrT(hff);
         clrT(hra); clrT(hrb); clrT(hrc); clrT(hrd); clrT(hre); clrT(hrf);
         clrT(hsM); clrT(hsX); clrT(hsY);
-        clrT(hprof); clrT(hov);
+        clrT(hprof); clrT(hov); clrT(hramp);
         clrB(hbD); clrB(hops);
     }
 };

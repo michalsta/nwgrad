@@ -55,8 +55,12 @@ struct NwgradLevelRegistrar {
                        &NWGRAD_LVL_NAME::banded_row_local,
                        &NWGRAD_LVL_NAME::hb_sweep_entry_d,     // Hirschberg sweep, double
                        &NWGRAD_LVL_NAME::hb_sweep_entry_f,     // Hirschberg sweep, float32
+                       &NWGRAD_LVL_NAME::hb_sweep_pmax_entry_d, // prefix-max carry sweep, double
+                       &NWGRAD_LVL_NAME::hb_sweep_pmax_entry_f, // ditto, float32
                        &NWGRAD_LVL_NAME::hb_base_entry_d,      // Hirschberg base case, double
                        &NWGRAD_LVL_NAME::hb_base_entry_f,      // Hirschberg base case, float32
+                       &NWGRAD_LVL_NAME::hb_scan_entry_d,      // Hirschberg local endpoint scan, double
+                       &NWGRAD_LVL_NAME::hb_scan_entry_f,      // Hirschberg local endpoint scan, float32
                        NWGRAD_LVL_NAME::ROW_BLOCK);
     }
 };

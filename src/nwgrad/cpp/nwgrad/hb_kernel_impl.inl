@@ -31,9 +31,10 @@
 // step rather than any closed form.
 //
 // NOT USED HERE: the closed-form prefix-max trick (VY[c] = prefixmax(open[k] + k*ge_a)
-// - c*ge_a) would turn the carry into a log-depth scan, but it re-associates the gap
-// arithmetic and is therefore NOT bit-exact with the scalar chain.  Noted as the lever
-// to reach for if the carry ever proves to be the ceiling and exactness is renegotiated.
+// - c*ge_a) would turn the carry into a max-only chain with no lazy-F, but it
+// re-associates the gap arithmetic and is therefore NOT bit-exact with the scalar chain.
+// It is implemented as an OPT-IN SIBLING further down this file
+// (hb_sweep_striped_pmax, TracebackMode::HirschbergPmax) — never as a replacement.
 
 #ifndef NWGRAD_LEVEL_NS
 #  error "hb_kernel_impl.inl must be included inside a level namespace by a level TU"
@@ -248,6 +249,463 @@ static void hb_sweep_striped(HbJob<T>& job) {
 
 static void hb_sweep_entry_d(HbJob<double>& j) { hb_sweep_striped<double>(j); }
 static void hb_sweep_entry_f(HbJob<float>&  j) { hb_sweep_striped<float>(j); }
+
+// ── OPT-IN SIBLING: the same sweep with a CLOSED-FORM prefix-max carry ────────────
+//
+// Selected by TracebackMode::HirschbergPmax only.  It is NOT bit-exact with
+// hb_sweep_striped above and never replaces it; it exists to answer whether the VY
+// latency chain is the ceiling of the sweep, at a measured cost in exactness.
+//
+// THE ALGEBRA.  Write g[k] for the value a Y-gap opens with after column k, i.e.
+// g[k] = (max(VM[k], VX[k]) - go_a) - ge_a (g[0] coming from the column-0 border).  The
+// serial recurrence VY[c] = max(g[c-1], VY[c-1] - ge_a) unrolls to
+//
+//     VY[c] = max over k <= c-1 of ( g[k] - (c-1-k)*ge_a ),  and also  bY - c*ge_a
+//           = ( max over k <= c-1 of ( g[k] + k*ge_a ) ) - (c-1)*ge_a
+//
+// with the border folded in as the seed g[-1] + (-1)*ge_a := bY - ge_a.  So the carry
+// becomes a PREFIX MAX over Q[k] = g[k] + k*ge_a followed by one subtraction.  Two
+// things follow, and they are the whole point:
+//   * the chain is max-only (no `- ge_a` in it), roughly halving its latency; and
+//   * lazy-F disappears entirely — a prefix max composes across lane boundaries by a
+//     plain max of lane totals, so the cross-lane fixup is W scalar maxes per row
+//     instead of up to W correction sweeps over the whole row.
+//
+// WHY IT IS INEXACT.  Q[k] adds k*ge_a and the last step subtracts it again.  The
+// intermediate is O(k*ge_a) where the answer is O(g[k]), so the value carries a rounding
+// proportional to the COLUMN INDEX, not to the gap-run length.  (The often-quoted
+// L*eps model — L the winning run length — is what you would get from a per-run rebase,
+// which is not what a single global prefix max does.  Measured, not assumed: see
+// tests/Python/test_hirschberg_pmax.py.)  The path can therefore come back SUBOPTIMAL,
+// a different kind of error from plain Hirschberg's tie-break (which is exactly optimal,
+// just a different optimum).
+//
+// WHAT DOES SURVIVE: the family is self-consistent to the bit.  Every quantity above
+// depends on the ABSOLUTE column index k and on nothing else — not on W, not on seg —
+// and max is exact and associative, so the per-lane-then-across-lane prefix max equals a
+// serial one exactly.  pmax-scalar == pmax-sse2 == pmax-avx2 == pmax-avx512 == pmax-neon,
+// bit for bit, which is what keeps NWGRAD_ISA a speed knob here as everywhere else.
+//
+// The ramp k*ge_a is precomputed into buf.hramp by a scalar loop, once per sweep, for
+// two reasons: it depends on the column and not the row, and a multiply adjacent to the
+// add in the hot loop is exactly what a compiler contracts into an FMA — which would
+// round differently in the -mfma level TUs than in the baseline one and shatter the
+// bit-identity above.  Loading a precomputed ramp leaves nothing to contract.
+template <class T>
+static void hb_sweep_striped_pmax(HbJob<T>& job) {
+    using vd = stdx::native_simd<T>;
+    const int W = (int)vd::size();
+    const T NINF = -std::numeric_limits<T>::infinity();
+
+    const int H = job.H, NC = job.ncols;
+    const T go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;
+    const unsigned char* a = job.a;
+    const unsigned char* b = job.b;
+    const T* blk = job.blk;
+    const int nalpha = job.nalpha;
+    DpBufferT<T>& buf = *job.buf;
+
+    T* oM = job.outM; T* oX = job.outX; T* oY = job.outY;
+
+    // ── row 0 of the block: kept EXACT (serial), deliberately ────────────────
+    // It is O(ncols) once per sweep against O(H*ncols) for the body, so approximating it
+    // would buy nothing measurable and would add error for free.  Identical code to
+    // hb_sweep_striped's row 0, and the scalar pmax reference does the same — which is
+    // what keeps the family bit-identical.
+    T* r0M = oM; T* r0X = oX; T* r0Y = oY;
+    r0M[0] = job.in_x ? NINF : T(0);
+    r0X[0] = job.in_x ? T(0) : NINF;
+    r0Y[0] = NINF;
+    for (int c = 1; c <= NC; ++c) {
+        r0M[c] = NINF;
+        r0X[c] = NINF;
+        const T open = (std::max(r0M[c - 1], r0X[c - 1]) - go_a) - ge_a;
+        r0Y[c] = std::max(open, r0Y[c - 1] - ge_a);
+    }
+    if (H == 0) return;                 // nothing to sweep: row 0 IS the answer, in place
+
+    const int seg = (NC + W - 1) / W;
+    const std::size_t sw = (std::size_t)seg * W;
+    auto fit = [](typename DpBufferT<T>::TVec& v, std::size_t k) {
+        if (v.size() < k) v.resize(k);
+    };
+    fit(buf.hfa, sw); fit(buf.hfb, sw); fit(buf.hfc, sw);
+    fit(buf.hfd, sw); fit(buf.hfe, sw); fit(buf.hff, sw);
+    fit(buf.hov, sw); fit(buf.hramp, sw);
+    fit(buf.hprof, (std::size_t)nalpha * sw);
+
+    T* pM = buf.hfa.data(); T* pX = buf.hfb.data(); T* pY = buf.hfc.data();
+    T* cM = buf.hfd.data(); T* cX = buf.hfe.data(); T* cY = buf.hff.data();
+    T* ov = buf.hov.data();
+    T* rmp = buf.hramp.data();
+
+    // The gap ramp, striped: slot (s,l) carries k*ge_a for the ABSOLUTE column index
+    // k = l*seg + s.  Scalar, so it is bit-identical to the scalar reference's
+    // `static_cast<T>(k) * ge_a` by construction, and outside the row loop so it costs
+    // O(ncols) per sweep rather than per row.  k is an exact integer well below 2^24
+    // (float32's exact-integer bound) for any sequence this library can hold, so the
+    // multiply is the only rounding here.
+    for (int l = 0; l < W; ++l)
+        for (int s = 0; s < seg; ++s)
+            rmp[(std::size_t)s * W + l] = static_cast<T>(l * seg + s) * ge_a;
+
+    // Striped query profile over the block's column slice — identical to the exact sweep.
+    for (int sym = 0; sym < nalpha; ++sym) {
+        const T* row = blk + (std::size_t)sym * nalpha;
+        T* dst = buf.hprof.data() + (std::size_t)sym * sw;
+        for (int l = 0; l < W; ++l)
+            for (int s = 0; s < seg; ++s) {
+                const int c = l * seg + s + 1;
+                dst[(std::size_t)s * W + l] =
+                    (c <= NC) ? row[b[job.b_start + (c - 1) * job.b_step]] : NINF;
+            }
+    }
+
+    for (int l = 0; l < W; ++l)
+        for (int s = 0; s < seg; ++s) {
+            const int c = l * seg + s + 1;
+            const std::size_t k = (std::size_t)s * W + l;
+            pM[k] = (c <= NC) ? r0M[c] : NINF;
+            pX[k] = (c <= NC) ? r0X[c] : NINF;
+            pY[k] = (c <= NC) ? r0Y[c] : NINF;
+        }
+    T bM = r0M[0], bX = r0X[0], bY = r0Y[0];
+
+    const vd vgo_a(go_a), vge_a(ge_a), vgo_b(go_b), vge_b(ge_b);
+
+    for (int t = 0; t < H; ++t) {
+        const T* sub = buf.hprof.data() +
+                       (std::size_t)a[job.a_start + t * job.a_step] * sw;
+
+        const T nbM = NINF;
+        const T nbX = std::max(std::max((bM - go_b) - ge_b, bX - ge_b), (bY - go_b) - ge_b);
+        const T nbY = NINF;
+        const T nbOpen = (std::max(nbM, nbX) - go_a) - ge_a;
+
+        // ── carry-free half: VM (diagonal) and VX (same column) ──────────────
+        // Byte-for-byte the exact sweep's; pmax changes only what comes after.
+        for (int s = 0; s < seg; ++s) {
+            vd dM, dX, dY;
+            if (s == 0) {
+                vd lM, lX, lY;
+                lM.copy_from(pM + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                lX.copy_from(pX + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                lY.copy_from(pY + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                dM = vd([&](int q) { return q == 0 ? bM : lM[q - 1]; });
+                dX = vd([&](int q) { return q == 0 ? bX : lX[q - 1]; });
+                dY = vd([&](int q) { return q == 0 ? bY : lY[q - 1]; });
+            } else {
+                dM.copy_from(pM + (std::size_t)(s - 1) * W, stdx::element_aligned);
+                dX.copy_from(pX + (std::size_t)(s - 1) * W, stdx::element_aligned);
+                dY.copy_from(pY + (std::size_t)(s - 1) * W, stdx::element_aligned);
+            }
+            vd sb; sb.copy_from(sub + (std::size_t)s * W, stdx::element_aligned);
+            const vd vmv = stdx::max(stdx::max(dM, dX), dY) + sb;
+            vmv.copy_to(cM + (std::size_t)s * W, stdx::element_aligned);
+
+            vd uM, uX, uY;
+            uM.copy_from(pM + (std::size_t)s * W, stdx::element_aligned);
+            uX.copy_from(pX + (std::size_t)s * W, stdx::element_aligned);
+            uY.copy_from(pY + (std::size_t)s * W, stdx::element_aligned);
+            const vd vxv = stdx::max(stdx::max((uM - vgo_b) - vge_b, uX - vge_b),
+                                     (uY - vgo_b) - vge_b);
+            vxv.copy_to(cX + (std::size_t)s * W, stdx::element_aligned);
+            ((stdx::max(vmv, vxv) - vgo_a) - vge_a)
+                .copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
+        }
+
+        // ── pass 1: Q[k] = g[k] + k*ge_a, then a LANE-LOCAL prefix max ───────
+        // The `O` vector is built exactly as in the exact sweep (segment s of lane l
+        // wants g[l*seg + s], which lives one segment back, or in the previous lane's
+        // last segment when s == 0).  The chain here is a single max: no subtraction
+        // sits in it, which is the latency the whole variant is trying to buy back.
+        vd P(NINF);
+        for (int s = 0; s < seg; ++s) {
+            vd O;
+            if (s == 0) {
+                vd lo; lo.copy_from(ov + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                O = vd([&](int q) { return q == 0 ? nbOpen : lo[q - 1]; });
+            } else {
+                O.copy_from(ov + (std::size_t)(s - 1) * W, stdx::element_aligned);
+            }
+            vd rq; rq.copy_from(rmp + (std::size_t)s * W, stdx::element_aligned);
+            P = stdx::max(O + rq, P);
+            P.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
+        }
+
+        // ── the cross-lane join: W scalar maxes, and EXACT ──────────────────
+        // Lane order IS column order, so folding the running maximum through the lane
+        // totals reproduces a serial prefix max over the whole row exactly — max neither
+        // rounds nor cares about association.  This is what lazy-F cost W sweeps to do.
+        T tot[64], cin[64];                     // 64 >= any native_simd width we build
+        P.copy_to(tot, stdx::element_aligned);
+        T run = bY - ge_a;                      // the border, folded in as the seed
+        for (int l = 0; l < W; ++l) { cin[l] = run; run = std::max(run, tot[l]); }
+        vd vcin; vcin.copy_from(cin, stdx::element_aligned);
+
+        // ── pass 2: VY[c] = max(prefix, seed) - (c-1)*ge_a ───────────────────
+        // Fully parallel: no lane depends on another, and no s depends on s-1.
+        for (int s = 0; s < seg; ++s) {
+            vd p; p.copy_from(cY + (std::size_t)s * W, stdx::element_aligned);
+            vd rq; rq.copy_from(rmp + (std::size_t)s * W, stdx::element_aligned);
+            (stdx::max(p, vcin) - rq).copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
+        }
+
+        std::swap(pM, cM); std::swap(pX, cX); std::swap(pY, cY);
+        bM = nbM; bX = nbX; bY = nbY;
+    }
+
+    oM[0] = bM; oX[0] = bX; oY[0] = bY;
+    for (int l = 0; l < W; ++l)
+        for (int s = 0; s < seg; ++s) {
+            const int c = l * seg + s + 1;
+            if (c <= NC) {
+                const std::size_t k = (std::size_t)s * W + l;
+                oM[c] = pM[k]; oX[c] = pX[k]; oY[c] = pY[k];
+            }
+        }
+}
+
+static void hb_sweep_pmax_entry_d(HbJob<double>& j) { hb_sweep_striped_pmax<double>(j); }
+static void hb_sweep_pmax_entry_f(HbJob<float>&  j) { hb_sweep_striped_pmax<float>(j); }
+
+// ── Hirschberg LOCAL endpoint scan: striped affine sweep that reports its argmax ──
+//
+// This is hb_sweep_striped's striped recurrence with the tables still deleted, but
+// instead of a final row it keeps only the single best cell over the WHOLE block.  It
+// is what Smith-Waterman needs before divide-and-conquer can start: the FORWARD pass
+// (Local = clamped, local borders) finds the end cell (ie, je); the REVERSE pass
+// (Local = false, hb_sweep's global borders, no clamp) computes Rev = the best global
+// alignment of the suffixes and finds the start.  One recurrence, the template picks
+// the borders and the clamp so nothing branches per cell.
+//
+// The argmax is done PER ROW, vectorized: each lane keeps its own leftmost best column
+// (columns grow with the segment index within a lane, so the strict-`>` update keeps the
+// smaller column on a tie); a short horizontal pass across lanes then takes the leftmost
+// lane (lane order IS column order in the striped layout).  Rolled into a running global
+// best with a strict-`>` topmost-row update, this reproduces exactly the scalar scan's
+// topmost-row / leftmost-column tie-break — the property that keeps the scalar and simd
+// scans bit-identical (forcing NWGRAD_ISA must never move the endpoint).
+//
+// Padding lanes need no mask.  In Local mode they clamp to 0, which can never beat a
+// real positive value nor lift the strict-`>` global best above its initial 0; in global
+// mode they stay -inf.  Either way they lose every comparison.  The one masked op is the
+// leftmost-column blend, which takes the clang/AVX-512/double workaround like every other
+// masked select in these kernels.
+template <class T, bool Local>
+static void hb_scan_impl(HbScanJob<T>& job) {
+    using vd = stdx::native_simd<T>;
+    constexpr int W = (int)vd::size();
+    const T NINF = -std::numeric_limits<T>::infinity();
+
+    const int H = job.H, NC = job.ncols;
+    const T go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;
+    const unsigned char* a = job.a;
+    const unsigned char* b = job.b;
+    const T* blk = job.blk;
+    const int nalpha = job.nalpha;
+    DpBufferT<T>& buf = *job.buf;
+
+    // The empty local alignment (score 0 at the origin) is the default answer.
+    job.best = T(0); job.best_i = 0; job.best_j = 0;
+    if (H == 0 || NC == 0) return;      // no interior cell to score
+
+    const int seg = (NC + W - 1) / W;
+    const std::size_t sw = (std::size_t)seg * W;
+    auto fit = [](typename DpBufferT<T>::TVec& v, std::size_t k) {
+        if (v.size() < k) v.resize(k);
+    };
+    fit(buf.hfa, sw); fit(buf.hfb, sw); fit(buf.hfc, sw);
+    fit(buf.hfd, sw); fit(buf.hfe, sw); fit(buf.hff, sw);
+    fit(buf.hov, sw);
+    fit(buf.hprof, (std::size_t)nalpha * sw);
+
+    T* pM = buf.hfa.data(); T* pX = buf.hfb.data(); T* pY = buf.hfc.data();
+    T* cM = buf.hfd.data(); T* cX = buf.hfe.data(); T* cY = buf.hff.data();
+    T* ov = buf.hov.data();
+
+    // Striped query profile over the block's column slice (padding -> -inf).  Serves this
+    // block's sweep exactly as in hb_sweep_striped.
+    for (int sym = 0; sym < nalpha; ++sym) {
+        const T* row = blk + (std::size_t)sym * nalpha;
+        T* dst = buf.hprof.data() + (std::size_t)sym * sw;
+        for (int l = 0; l < W; ++l)
+            for (int s = 0; s < seg; ++s) {
+                const int c = l * seg + s + 1;
+                dst[(std::size_t)s * W + l] =
+                    (c <= NC) ? row[b[job.b_start + (c - 1) * job.b_step]] : NINF;
+            }
+    }
+
+    // ── row 0, striped ────────────────────────────────────────────────────────
+    // Local: M = 0 for every real column (a fresh alignment may start anywhere), X = Y =
+    // -inf.  Global: the same Y-gap-open series hb_sweep_striped builds, so the reverse
+    // pass computes the suffixes' global alignment.  Column 0 is held in the border scalars.
+    if constexpr (Local) {
+        for (int l = 0; l < W; ++l)
+            for (int s = 0; s < seg; ++s) {
+                const int c = l * seg + s + 1;
+                const std::size_t k = (std::size_t)s * W + l;
+                pM[k] = (c <= NC) ? T(0) : NINF;
+                pX[k] = NINF;
+                pY[k] = NINF;
+            }
+    } else {
+        // scalar Y-series in column order, then stripe it (identical to hb_sweep row 0).
+        // Reuse cY as a contiguous scratch for the series (overwritten before use below).
+        T prevY = NINF;                       // r0Y[0] = -inf (column 0 border)
+        for (int c = 1; c <= NC; ++c) {
+            // r0M[c-1]/r0X[c-1] are -inf for c-1>=1; for c==1 the predecessors are the
+            // column-0 border (M=0, X=-inf), giving open = (max(0,-inf) - go_a) - ge_a.
+            const T pm = (c == 1) ? T(0) : NINF;
+            const T px = NINF;
+            const T open = (std::max(pm, px) - go_a) - ge_a;
+            prevY = std::max(open, prevY - ge_a);
+            const int cc = c;
+            const std::size_t k = (std::size_t)((cc - 1) % seg) * W + (cc - 1) / seg;
+            pM[k] = NINF; pX[k] = NINF; pY[k] = prevY;
+        }
+        // pad slots (c > NC) to -inf
+        for (int l = 0; l < W; ++l)
+            for (int s = 0; s < seg; ++s) {
+                const int c = l * seg + s + 1;
+                if (c > NC) { const std::size_t k = (std::size_t)s * W + l; pM[k] = NINF; pX[k] = NINF; pY[k] = NINF; }
+            }
+    }
+    // column-0 border of the previous row: M = 0 fresh start in both modes, X = Y = -inf.
+    T bM = 0, bX = NINF, bY = NINF;
+
+    const vd vgo_a(go_a), vge_a(ge_a), vgo_b(go_b), vge_b(ge_b);
+    const vd vzero(T(0));
+    const vd vlane([](int q) { return T(q); });   // [0,1,...,W-1] for per-lane column ids
+
+    T gbest = T(0); int gi = 0, gj = 0;
+
+    for (int t = 0; t < H; ++t) {
+        const T* sub = buf.hprof.data() +
+                       (std::size_t)a[job.a_start + t * job.a_step] * sw;
+
+        // Column 0 of this row.  Local: M = 0 (fresh start).  Global: M = -inf.  X extends
+        // downward from the previous row's column 0 in both modes; Y cannot occur (no
+        // column to consume).
+        const T nbM = Local ? T(0) : NINF;
+        const T nbX = std::max(std::max((bM - go_b) - ge_b, bX - ge_b), (bY - go_b) - ge_b);
+        const T nbY = NINF;
+        const T nbOpen = (std::max(nbM, nbX) - go_a) - ge_a;
+
+        // ── carry-free: VM (diagonal, clamped to 0 for Local), VX (same column) ──
+        for (int s = 0; s < seg; ++s) {
+            vd dM, dX, dY;
+            if (s == 0) {
+                vd lM, lX, lY;
+                lM.copy_from(pM + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                lX.copy_from(pX + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                lY.copy_from(pY + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                dM = vd([&](int q) { return q == 0 ? bM : lM[q - 1]; });
+                dX = vd([&](int q) { return q == 0 ? bX : lX[q - 1]; });
+                dY = vd([&](int q) { return q == 0 ? bY : lY[q - 1]; });
+            } else {
+                dM.copy_from(pM + (std::size_t)(s - 1) * W, stdx::element_aligned);
+                dX.copy_from(pX + (std::size_t)(s - 1) * W, stdx::element_aligned);
+                dY.copy_from(pY + (std::size_t)(s - 1) * W, stdx::element_aligned);
+            }
+            vd sb; sb.copy_from(sub + (std::size_t)s * W, stdx::element_aligned);
+            vd vmv = stdx::max(stdx::max(dM, dX), dY) + sb;
+            if constexpr (Local) vmv = stdx::max(vmv, vzero);
+            vmv.copy_to(cM + (std::size_t)s * W, stdx::element_aligned);
+
+            vd uM, uX, uY;
+            uM.copy_from(pM + (std::size_t)s * W, stdx::element_aligned);
+            uX.copy_from(pX + (std::size_t)s * W, stdx::element_aligned);
+            uY.copy_from(pY + (std::size_t)s * W, stdx::element_aligned);
+            const vd vxv = stdx::max(stdx::max((uM - vgo_b) - vge_b, uX - vge_b),
+                                     (uY - vgo_b) - vge_b);
+            vxv.copy_to(cX + (std::size_t)s * W, stdx::element_aligned);
+            ((stdx::max(vmv, vxv) - vgo_a) - vge_a)
+                .copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
+        }
+
+        // ── the carry: VY, same-lane striped chain, then lazy-F (exact) ──────────
+        vd prev([&](int q) { return q == 0 ? bY : NINF; });
+        for (int s = 0; s < seg; ++s) {
+            vd O;
+            if (s == 0) {
+                vd lo; lo.copy_from(ov + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                O = vd([&](int q) { return q == 0 ? nbOpen : lo[q - 1]; });
+            } else {
+                O.copy_from(ov + (std::size_t)(s - 1) * W, stdx::element_aligned);
+            }
+            const vd v = stdx::max(O, prev - vge_a);
+            v.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
+            prev = v;
+        }
+        for (int r = 0; r < W; ++r) {
+            vd last; last.copy_from(cY + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+            vd F([&](int q) { return q == 0 ? bY : last[q - 1]; });
+            F = F - vge_a;
+            bool changed = false;
+            for (int s = 0; s < seg; ++s) {
+                vd v; v.copy_from(cY + (std::size_t)s * W, stdx::element_aligned);
+#if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
+                if constexpr (std::is_same_v<T, double>) {
+                    alignas(64) double fa[8], va[8];
+                    F.copy_to(fa, stdx::element_aligned);
+                    v.copy_to(va, stdx::element_aligned);
+                    if (_mm512_cmp_pd_mask(_mm512_load_pd(fa), _mm512_load_pd(va), _CMP_GT_OQ) == 0) break;
+                } else { if (!stdx::any_of(F > v)) break; }
+#else
+                if (!stdx::any_of(F > v)) break;
+#endif
+                v = stdx::max(v, F);
+                v.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
+                F = v - vge_a;
+                changed = true;
+            }
+            if (!changed) break;
+        }
+
+        // ── per-row argmax over the row's cells, leftmost-column per lane ────────
+        vd vbest(NINF), vbcol(T(0));
+        for (int s = 0; s < seg; ++s) {
+            vd mm; mm.copy_from(cM + (std::size_t)s * W, stdx::element_aligned);
+            vd xx; xx.copy_from(cX + (std::size_t)s * W, stdx::element_aligned);
+            vd yy; yy.copy_from(cY + (std::size_t)s * W, stdx::element_aligned);
+            const vd here = stdx::max(stdx::max(mm, xx), yy);
+            const vd colv = vlane * T(seg) + T(s + 1);     // column l*seg + s + 1, per lane
+#if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
+            if constexpr (std::is_same_v<T, double>) {
+                vbcol = avx512d_blend(avx512d_gt(here, vbest), vbcol, colv);
+            } else {
+                stdx::where(here > vbest, vbcol) = colv;
+            }
+#else
+            stdx::where(here > vbest, vbcol) = colv;
+#endif
+            vbest = stdx::max(vbest, here);
+        }
+        // horizontal reduce: leftmost lane wins ties (lane order = column order)
+        alignas(sizeof(T) * W) T rb[W], cb[W];
+        vbest.copy_to(rb, stdx::element_aligned);
+        vbcol.copy_to(cb, stdx::element_aligned);
+        T rowbest = NINF; T rowcol = 0;
+        for (int l = 0; l < W; ++l)
+            if (rb[l] > rowbest) { rowbest = rb[l]; rowcol = cb[l]; }
+        // global update, strict > so the topmost row and (via rowcol) leftmost column win
+        if (rowbest > gbest) { gbest = rowbest; gi = t + 1; gj = (int)rowcol; }
+
+        std::swap(pM, cM); std::swap(pX, cX); std::swap(pY, cY);
+        bM = nbM; bX = nbX; bY = nbY;
+    }
+
+    job.best = gbest; job.best_i = gi; job.best_j = gj;
+}
+
+static void hb_scan_entry_d(HbScanJob<double>& j) {
+    if (j.local) hb_scan_impl<double, true>(j); else hb_scan_impl<double, false>(j);
+}
+static void hb_scan_entry_f(HbScanJob<float>& j) {
+    if (j.local) hb_scan_impl<float, true>(j); else hb_scan_impl<float, false>(j);
+}
 
 // ── Hirschberg base case: striped fill that RECORDS direction bytes ───────────
 //
