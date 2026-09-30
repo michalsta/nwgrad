@@ -56,10 +56,11 @@ static void hb_sweep_striped(HbJob<T>& job) {
 
     const int H = job.H, NC = job.ncols;
     const T go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;
-    const unsigned char* a = job.a;
+    const std::uint32_t*  a = job.a;   // sequence A as row symbols
     const unsigned char* b = job.b;
     const T* blk = job.blk;
-    const int nalpha = job.nalpha;
+    const int nrow = job.nrow;    // ROW SYMBOLS, not alphabet size: the block is the
+    const int ncol = job.ncol;    // problem's (slot, residue) row alphabet x the alphabet
     DpBufferT<T>& buf = *job.buf;
 
     T* oM = job.outM; T* oX = job.outX; T* oY = job.outY;
@@ -94,7 +95,7 @@ static void hb_sweep_striped(HbJob<T>& job) {
     fit(buf.hfa, sw); fit(buf.hfb, sw); fit(buf.hfc, sw);
     fit(buf.hfd, sw); fit(buf.hfe, sw); fit(buf.hff, sw);
     fit(buf.hov, sw);
-    fit(buf.hprof, (std::size_t)nalpha * sw);
+    fit(buf.hprof, (std::size_t)nrow * sw);
 
     T* pM = buf.hfa.data(); T* pX = buf.hfb.data(); T* pY = buf.hfc.data();
     T* cM = buf.hfd.data(); T* cX = buf.hfe.data(); T* cY = buf.hff.data();
@@ -105,8 +106,8 @@ static void hb_sweep_striped(HbJob<T>& job) {
     // the striping geometry depends on the block's own width — but it serves this
     // block's forward AND reverse sweeps, so it amortizes over H rows.  Padding columns
     // get -inf so they can never win a max.
-    for (int sym = 0; sym < nalpha; ++sym) {
-        const T* row = blk + (std::size_t)sym * nalpha;
+    for (int sym = 0; sym < nrow; ++sym) {
+        const T* row = blk + (std::size_t)sym * ncol;
         T* dst = buf.hprof.data() + (std::size_t)sym * sw;
         for (int l = 0; l < W; ++l)
             for (int s = 0; s < seg; ++s) {
@@ -299,10 +300,11 @@ static void hb_sweep_striped_pmax(HbJob<T>& job) {
 
     const int H = job.H, NC = job.ncols;
     const T go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;
-    const unsigned char* a = job.a;
+    const std::uint32_t*  a = job.a;   // sequence A as row symbols
     const unsigned char* b = job.b;
     const T* blk = job.blk;
-    const int nalpha = job.nalpha;
+    const int nrow = job.nrow;    // ROW SYMBOLS, not alphabet size: the block is the
+    const int ncol = job.ncol;    // problem's (slot, residue) row alphabet x the alphabet
     DpBufferT<T>& buf = *job.buf;
 
     T* oM = job.outM; T* oX = job.outX; T* oY = job.outY;
@@ -332,7 +334,7 @@ static void hb_sweep_striped_pmax(HbJob<T>& job) {
     fit(buf.hfa, sw); fit(buf.hfb, sw); fit(buf.hfc, sw);
     fit(buf.hfd, sw); fit(buf.hfe, sw); fit(buf.hff, sw);
     fit(buf.hov, sw); fit(buf.hramp, sw);
-    fit(buf.hprof, (std::size_t)nalpha * sw);
+    fit(buf.hprof, (std::size_t)nrow * sw);
 
     T* pM = buf.hfa.data(); T* pX = buf.hfb.data(); T* pY = buf.hfc.data();
     T* cM = buf.hfd.data(); T* cX = buf.hfe.data(); T* cY = buf.hff.data();
@@ -350,8 +352,8 @@ static void hb_sweep_striped_pmax(HbJob<T>& job) {
             rmp[(std::size_t)s * W + l] = static_cast<T>(l * seg + s) * ge_a;
 
     // Striped query profile over the block's column slice — identical to the exact sweep.
-    for (int sym = 0; sym < nalpha; ++sym) {
-        const T* row = blk + (std::size_t)sym * nalpha;
+    for (int sym = 0; sym < nrow; ++sym) {
+        const T* row = blk + (std::size_t)sym * ncol;
         T* dst = buf.hprof.data() + (std::size_t)sym * sw;
         for (int l = 0; l < W; ++l)
             for (int s = 0; s < seg; ++s) {
@@ -500,10 +502,11 @@ static void hb_scan_impl(HbScanJob<T>& job) {
 
     const int H = job.H, NC = job.ncols;
     const T go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;
-    const unsigned char* a = job.a;
+    const std::uint32_t*  a = job.a;   // sequence A as row symbols
     const unsigned char* b = job.b;
     const T* blk = job.blk;
-    const int nalpha = job.nalpha;
+    const int nrow = job.nrow;    // ROW SYMBOLS, not alphabet size: the block is the
+    const int ncol = job.ncol;    // problem's (slot, residue) row alphabet x the alphabet
     DpBufferT<T>& buf = *job.buf;
 
     // The empty local alignment (score 0 at the origin) is the default answer.
@@ -518,7 +521,7 @@ static void hb_scan_impl(HbScanJob<T>& job) {
     fit(buf.hfa, sw); fit(buf.hfb, sw); fit(buf.hfc, sw);
     fit(buf.hfd, sw); fit(buf.hfe, sw); fit(buf.hff, sw);
     fit(buf.hov, sw);
-    fit(buf.hprof, (std::size_t)nalpha * sw);
+    fit(buf.hprof, (std::size_t)nrow * sw);
 
     T* pM = buf.hfa.data(); T* pX = buf.hfb.data(); T* pY = buf.hfc.data();
     T* cM = buf.hfd.data(); T* cX = buf.hfe.data(); T* cY = buf.hff.data();
@@ -526,8 +529,8 @@ static void hb_scan_impl(HbScanJob<T>& job) {
 
     // Striped query profile over the block's column slice (padding -> -inf).  Serves this
     // block's sweep exactly as in hb_sweep_striped.
-    for (int sym = 0; sym < nalpha; ++sym) {
-        const T* row = blk + (std::size_t)sym * nalpha;
+    for (int sym = 0; sym < nrow; ++sym) {
+        const T* row = blk + (std::size_t)sym * ncol;
         T* dst = buf.hprof.data() + (std::size_t)sym * sw;
         for (int l = 0; l < W; ++l)
             for (int s = 0; s < seg; ++s) {
@@ -728,10 +731,11 @@ static void hb_base_striped(HbBaseJob<T>& job) {
 
     const int H = job.H, NC = job.ncols;
     const T go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;
-    const unsigned char* a = job.a;
+    const std::uint32_t*  a = job.a;   // sequence A as row symbols
     const unsigned char* b = job.b;
     const T* blk = job.blk;
-    const int nalpha = job.nalpha;
+    const int nrow = job.nrow;    // ROW SYMBOLS, not alphabet size: the block is the
+    const int ncol = job.ncol;    // problem's (slot, residue) row alphabet x the alphabet
     DpBufferT<T>& buf = *job.buf;
 
     const int seg = (NC + W - 1) / W;
@@ -744,7 +748,7 @@ static void hb_base_striped(HbBaseJob<T>& job) {
 
     auto fit = [](typename DpBufferT<T>::TVec& v, std::size_t k) { if (v.size() < k) v.resize(k); };
     if (buf.hbD.size() < 3 * plane) buf.hbD.resize(3 * plane);
-    fit(buf.hprof, (std::size_t)nalpha * sw);
+    fit(buf.hprof, (std::size_t)nrow * sw);
     fit(buf.hfa, rowsz); fit(buf.hfb, rowsz); fit(buf.hfc, rowsz);
     fit(buf.hfd, rowsz); fit(buf.hfe, rowsz); fit(buf.hff, rowsz);
     fit(buf.hov, 2 * sw);
@@ -755,8 +759,8 @@ static void hb_base_striped(HbBaseJob<T>& job) {
     };
 
     // Striped query profile over the block's column slice.
-    for (int sym = 0; sym < nalpha; ++sym) {
-        const T* row = blk + (std::size_t)sym * nalpha;
+    for (int sym = 0; sym < nrow; ++sym) {
+        const T* row = blk + (std::size_t)sym * ncol;
         T* dst = buf.hprof.data() + (std::size_t)sym * sw;
         for (int l = 0; l < W; ++l)
             for (int s = 0; s < seg; ++s) {

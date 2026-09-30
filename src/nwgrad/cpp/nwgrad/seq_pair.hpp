@@ -68,19 +68,41 @@ struct SeqPairT {
     // index — see simd_levels.hpp).  Every simd level is bit-exact with the scalar one, so
     // it is purely a speed knob — and it is a runtime argument, not a template parameter,
     // so StateVar above stays at four arms instead of eight.  See the note in aligner.hpp.
+    //
+    // `track` (optional) names one AlignParams matrix slot per residue of seq_a, so
+    // different stretches of A are scored by different substitution matrices.  It is
+    // fixed at construction alongside the sequences, because it is a property of THIS
+    // A: set_params() may swap the matrices under it, but a track built for one
+    // sequence is meaningless against another.  Empty = slot 0 throughout, which is
+    // the single-matrix behaviour, unchanged.
     SeqPairT(std::string_view a, std::string_view b,
             const AlignParams& params,
             GapModel gm, AlignMode am,
             GradMode grad_mode = GradMode::Hard,
             int kernel = kBackendAuto,
-            TracebackMode tb = TracebackMode::Default)
+            TracebackMode tb = TracebackMode::Default,
+            std::vector<int32_t> track = {})
         : a_idx_(params.matrix.alphabet().encode(a)),
           b_idx_(params.matrix.alphabet().encode(b)),
+          track_(std::move(track)),
           params_(&params),
           grad_mode_(grad_mode),
           kernel_(kernel),
-          grad_(params.matrix.alphabet())
+          grad_(AlignParams::zeros_like(params))
     {
+        // Eagerly, on the caller's thread and at the point of the mistake — the DP
+        // would otherwise raise it from inside a batch worker on the first align.
+        if (!track_.empty() && track_.size() != a_idx_.size())
+            throw std::invalid_argument(
+                "nwgrad: track has " + std::to_string(track_.size()) +
+                " entries but seq_a has " + std::to_string(a_idx_.size()) +
+                " residues; a track names one matrix slot per position of A");
+        for (size_t k = 0; k < track_.size(); ++k)
+            if (track_[k] < 0 || track_[k] >= params.matrix_count())
+                throw std::invalid_argument(
+                    "nwgrad: track[" + std::to_string(k) + "] = " +
+                    std::to_string(track_[k]) + " is not a matrix slot; these params "
+                    "hold " + std::to_string(params.matrix_count()) + " slot(s)");
         if      (gm == GapModel::Linear && am == AlignMode::Global)
             state_.template emplace<SeqPairState<GapModel::Linear, AlignMode::Global, T>>();
         else if (gm == GapModel::Linear && am == AlignMode::Local)
@@ -134,6 +156,15 @@ struct SeqPairT {
                 params_->matrix.alphabet().symbols() + "\" -> \"" +
                 params.matrix.alphabet().symbols() +
                 "\"); construct a new SeqPair instead");
+        // Nor the slot count, for the same reason one step along: this pair's track
+        // names slots of the params it was built with, and the cached gradient is
+        // shaped by that count too.
+        if (params.matrix_count() != params_->matrix_count())
+            throw std::invalid_argument(
+                "nwgrad: set_params() cannot change the matrix slot count (" +
+                std::to_string(params_->matrix_count()) + " -> " +
+                std::to_string(params.matrix_count()) +
+                "); construct a new SeqPair instead");
         params_ = &params;
         score_valid_ = false;
         grad_valid_  = false;
@@ -154,7 +185,7 @@ struct SeqPairT {
     // then forward-backward; score returns log Z.
     void align_full() {
         std::visit([&](auto& st) {
-            st.full_al.set_problem(a_idx_, b_idx_, *params_);
+            st.full_al.set_problem(a_idx_, b_idx_, *params_, 0, {}, track_);
             run_dp(st.full_al);
         }, state_);
         last_banded_  = false;
@@ -174,7 +205,7 @@ struct SeqPairT {
             throw std::logic_error(
                 "nwgrad: call align_full() before realign_banded()");
         std::visit([&](auto& st) {
-            st.band_al.set_problem(a_idx_, b_idx_, *params_, bandwidth, guide_j_);
+            st.band_al.set_problem(a_idx_, b_idx_, *params_, bandwidth, guide_j_, track_);
             run_dp(st.band_al);
         }, state_);
         last_banded_  = true;
@@ -204,7 +235,7 @@ struct SeqPairT {
     // path because it is a separate workload with its own cost shape.
     void score_and_grad_with_dp(DpBuffer& buf) {
         std::visit([&](auto& st) {
-            st.full_al.set_problem(a_idx_, b_idx_, *params_);
+            st.full_al.set_problem(a_idx_, b_idx_, *params_, 0, {}, track_);
             run_dp_with_buf(st.full_al, buf);
             last_banded_ = false;
             if (grad_mode_ != GradMode::None) {
@@ -236,7 +267,7 @@ struct SeqPairT {
                 "nwgrad: banded_grad_with_dp() needs a guide path; run the full "
                 "score_and_grad_with_dp() (or align_full()) at least once first");
         std::visit([&](auto& st) {
-            st.band_al.set_problem(a_idx_, b_idx_, *params_, bandwidth, guide_j_);
+            st.band_al.set_problem(a_idx_, b_idx_, *params_, bandwidth, guide_j_, track_);
             run_dp_with_buf(st.band_al, buf);
             last_banded_ = true;
             if (grad_mode_ != GradMode::None) {
@@ -357,8 +388,20 @@ struct SeqPairT {
 
     const Alphabet& alphabet() const noexcept { return params_->matrix.alphabet(); }
 
+    // The params this pair currently scores against.  Exposed so a batch can build a
+    // gradient accumulator of the right SHAPE (zeros_like), which the alphabet alone
+    // no longer determines now that params carry a matrix stack.
+    const AlignParams& params() const noexcept { return *params_; }
+
+    // Per-position matrix slots for sequence A; empty when the pair uses slot 0
+    // throughout.  Read-only: it is fixed at construction, like the sequences.
+    const std::vector<int32_t>& track() const noexcept { return track_; }
+
 private:
     std::vector<uint8_t> a_idx_, b_idx_;   // alphabet indices, not characters
+    // Per-position matrix slot for sequence A; empty = slot 0 throughout.  Fixed at
+    // construction: it belongs to THIS sequence A, not to the params.
+    std::vector<int32_t> track_;
     const AlignParams*   params_;
     GradMode             grad_mode_;
     int                  kernel_;   // Viterbi backend, forwarded to each aligner

@@ -169,6 +169,17 @@ struct SeqPairBatchT {
                 "nwgrad: SeqPair over alphabet \"" + sp->alphabet().symbols() +
                 "\" cannot join a batch over alphabet \"" +
                 pairs.front()->alphabet().symbols() + "\"");
+        // The same argument one step along: gradients are summed, and a gradient over
+        // 3 matrix slots is not a direction in a 1-slot space.  Pairs may carry
+        // different TRACKS — that is the point of a track — but they must agree on how
+        // many slots exist to be tracked.
+        if (!pairs.empty() &&
+            sp->params().matrix_count() != pairs.front()->params().matrix_count())
+            throw std::invalid_argument(
+                "nwgrad: SeqPair with " +
+                std::to_string(sp->params().matrix_count()) +
+                " matrix slot(s) cannot join a batch of pairs with " +
+                std::to_string(pairs.front()->params().matrix_count()));
         pairs.push_back(sp);
     }
 
@@ -184,11 +195,28 @@ struct SeqPairBatchT {
     // so the last three costs do not arise and the first is threaded.
     //
     // `params` must outlive the batch, exactly as for a SeqPair built by hand.
+    //
+    // `tracks`, if given, is one per pair — the matrix slot of each residue of that
+    // pair's seq_a.  Empty means no pair is tracked; an empty entry means that one
+    // pair is not.  Each pair's track is validated inside its own constructor, on a
+    // worker, and rethrown here by run_workers.
     void add_many(const std::vector<std::string_view>& seqs_a,
                   const std::vector<std::string_view>& seqs_b,
                   const AlignParams& params,
                   GapModel gm, AlignMode am, GradMode gd,
-                  int kernel = kBackendAuto) {
+                  int kernel = kBackendAuto,
+                  const std::vector<std::vector<int32_t>>& tracks = {}) {
+        if (!tracks.empty() && tracks.size() != seqs_a.size())
+            throw std::invalid_argument(
+                "nwgrad: add_many() got " + std::to_string(tracks.size()) +
+                " tracks for " + std::to_string(seqs_a.size()) +
+                " pairs; pass one track per pair or none at all");
+        if (!pairs.empty() &&
+            params.matrix_count() != pairs.front()->params().matrix_count())
+            throw std::invalid_argument(
+                "nwgrad: params with " + std::to_string(params.matrix_count()) +
+                " matrix slot(s) cannot join a batch of pairs with " +
+                std::to_string(pairs.front()->params().matrix_count()));
         if (seqs_a.size() != seqs_b.size())
             throw std::invalid_argument(
                 "nwgrad: add_many() needs seqs_a and seqs_b of equal length (got " +
@@ -219,8 +247,9 @@ struct SeqPairBatchT {
             while (true) {
                 size_t i = idx.fetch_add(1, std::memory_order_relaxed);
                 if (i >= N) break;
-                staged[i] = std::make_unique<SeqPair>(seqs_a[i], seqs_b[i],
-                                                      params, gm, am, gd, kernel, tb_);
+                staged[i] = std::make_unique<SeqPair>(
+                    seqs_a[i], seqs_b[i], params, gm, am, gd, kernel, tb_,
+                    tracks.empty() ? std::vector<int32_t>{} : tracks[i]);
                 // Harmless unless the pair's resolved traceback is Hirschberg (it only
                 // reads hb_cutoff then), so applied unconditionally — tb_ may be the
                 // Default sentinel, which resolves to Hirschberg per pair, not here.
@@ -303,14 +332,17 @@ struct SeqPairBatchT {
     // Throws on an empty batch: the sum has no alphabet, and a zero gradient
     // labelled with a guessed one would be a silent wrong answer.
     AlignParams compute_grad() {
-        const Alphabet& alpha = alphabet();   // throws if empty
+        (void)alphabet();                     // throws if empty
+        // Shaped by the pairs' params, not just their alphabet — add() has already
+        // established that every pair agrees on the slot count.
+        const AlignParams& proto = pairs.front()->params();
         const size_t N = pairs.size();
         std::atomic<size_t> idx{0};
         std::mutex grad_mutex;
-        AlignParams grad_out(alpha);
+        AlignParams grad_out = AlignParams::zeros_like(proto);
 
         auto worker = [&]() {
-            AlignParams local(alpha);
+            AlignParams local = AlignParams::zeros_like(proto);
             while (true) {
                 size_t i = idx.fetch_add(1, std::memory_order_relaxed);
                 if (i >= N) break;

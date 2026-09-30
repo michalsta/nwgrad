@@ -76,10 +76,11 @@ static void striped_affine_full(ViterbiJob<T>& job) {
     const T K_NINF = -std::numeric_limits<T>::infinity();
 
     const int m = job.m, n = job.n;
-    const int nalpha = job.nalpha;
+    const int nrow = job.nrow;    // ROW SYMBOLS, not alphabet size: the block is the
+    const int ncol = job.ncol;    // problem's (slot, residue) row alphabet x the alphabet
     const T go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;
     const T* blk = job.blk;
-    const unsigned char* a = job.a;
+    const std::uint32_t*  a = job.a;   // sequence A as row symbols
     const unsigned char* b = job.b;
     DpBufferT<T>& buf = *job.buf;
 
@@ -95,7 +96,7 @@ static void striped_affine_full(ViterbiJob<T>& job) {
     const std::size_t rowsz = (std::size_t)(seg + 1) * W;
     const std::size_t off   = (std::size_t)W;   // striped columns start here (col 0 at 0)
     if (buf.sopenv.size() < sw)     buf.sopenv.resize(sw);
-    if (buf.sprof.size()  < (std::size_t)nalpha * sw) buf.sprof.resize((std::size_t)nalpha * sw);
+    if (buf.sprof.size()  < (std::size_t)nrow * sw) buf.sprof.resize((std::size_t)nrow * sw);
     const std::size_t vsz = (std::size_t)(m + 1) * rowsz;
     if (buf.VM.size() < vsz) { buf.VM.resize(vsz); buf.VX.resize(vsz); buf.VY.resize(vsz); }
     // striped slot within a row (offset past slot 0) for DP column j in 1..n
@@ -104,8 +105,8 @@ static void striped_affine_full(ViterbiJob<T>& job) {
     };
 
     // striped query profile: prof[c][s*W+l] = score(c, b[col(l,s)-1]), padding -> NINF
-    for (int c = 0; c < nalpha; ++c) {
-        const T* row = blk + (std::size_t)c * nalpha;
+    for (int c = 0; c < nrow; ++c) {
+        const T* row = blk + (std::size_t)c * ncol;
         T* dst = buf.sprof.data() + (std::size_t)c * sw;
         for (int l = 0; l < W; ++l)
             for (int s = 0; s < seg; ++s) {

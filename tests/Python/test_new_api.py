@@ -53,12 +53,16 @@ def test_alignparams_subst_matrix_carries_alphabet_into_scores():
 def test_to_dict_shape_and_keys():
     p = _affine_params(BLOSUM62)
     d = p.to_dict()
-    assert set(d) == {"matrix", "alphabet", "gap_open_a", "gap_extend_a",
+    assert set(d) == {"matrix", "matrices", "alphabet", "gap_open_a", "gap_extend_a",
                       "gap_open_b", "gap_extend_b"}
     assert d["alphabet"] == BLOSUM62.alphabet
     assert d["matrix"].shape == (BLOSUM62.size, BLOSUM62.size)
     assert d["gap_open_a"] == 11.0 and d["gap_extend_b"] == 1.0
     np.testing.assert_array_equal(d["matrix"], BLOSUM62.to_matrix())
+    # 'matrices' is present unconditionally — one entry per matrix slot, so reading a
+    # gradient never has to branch on whether a track was used.  Here K == 1.
+    assert len(d["matrices"]) == 1
+    np.testing.assert_array_equal(d["matrices"][0], d["matrix"])
 
 
 # ── aligned() / formatted() ──────────────────────────────────────────────────

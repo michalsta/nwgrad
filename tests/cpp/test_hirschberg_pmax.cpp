@@ -132,9 +132,13 @@ Row<T> run_sweep(const LevelKernels& K, bool pmax,
     Row<T> out;
     out.M.assign(NC + 1, T(0)); out.X.assign(NC + 1, T(0)); out.Y.assign(NC + 1, T(0));
     DpBufferT<T> buf;
+    // The kernels take sequence A as ROW SYMBOLS into an nrow x ncol block.  With no
+    // matrix track that block is the plain substitution matrix and a row symbol is
+    // just the residue index, so this is a widening copy and nothing more.
+    const std::vector<std::uint32_t> arow(a.begin(), a.end());
     HbJob<T> job{};
-    job.a = a.data(); job.b = b.data();
-    job.blk = blk.data(); job.nalpha = nalpha;
+    job.a = arow.data(); job.b = b.data();
+    job.blk = blk.data(); job.nrow = nalpha; job.ncol = nalpha;
     job.go_a = go_a; job.ge_a = ge_a; job.go_b = go_b; job.ge_b = ge_b;
     job.a_start = 0; job.a_step = 1;
     job.b_start = 0; job.b_step = 1;

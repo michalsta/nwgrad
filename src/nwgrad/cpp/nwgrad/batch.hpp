@@ -17,12 +17,18 @@ struct ProblemInstance {
     std::string_view seq_a;
     std::string_view seq_b;
     std::vector<int> guide_j;  // empty → trivial diagonal guide (band around main diagonal)
+    // Per-position matrix slot for seq_a; empty → slot 0 throughout.  Length must equal
+    // seq_a's, and each entry must name a slot of the batch's params.
+    std::vector<int32_t> track;
 };
 
 struct BatchResult {
     std::vector<double> scores;
     AlignParams grad;
 
+    // Built from the params, not merely their alphabet: the gradient's shape is the
+    // number of matrix slots, and an alphabet does not carry that.
+    explicit BatchResult(const AlignParams& p) : grad(AlignParams::zeros_like(p)) {}
     explicit BatchResult(const Alphabet& alpha) : grad(alpha) {}
 };
 
@@ -53,7 +59,7 @@ struct BatchAlignerT {
 
     BatchResult align(const std::vector<ProblemInstance>& problems) const {
         const size_t N = problems.size();
-        BatchResult result(params.matrix.alphabet());
+        BatchResult result(params);
         result.scores.resize(N, 0.0);
 
         if (N == 0) return result;
@@ -149,7 +155,7 @@ private:
             const auto& p = problems[idx];
             encode_into(alpha, p.seq_a, a_enc, idx, 'a');
             encode_into(alpha, p.seq_b, b_enc, idx, 'b');
-            al.set_problem(a_enc, b_enc, params, band, p.guide_j);
+            al.set_problem(a_enc, b_enc, params, band, p.guide_j, p.track);
 
             if (grad_mode == GradMode::Hard) {
                 al.compute_viterbi(buf);

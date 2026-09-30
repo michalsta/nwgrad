@@ -159,35 +159,40 @@ static std::string format_alignment(const std::string& a, const std::string& b,
 // numerically identical to the plain ones — bound for naming symmetry only.
 template<class T>
 static void bind_convenience(nb::module_& m, const std::string& sfx) {
+// `track` names one params matrix slot per residue of seq_a — see AlignParams.  Empty
+// (the default) is the single-matrix behaviour.  Trailing, so every existing call is
+// unaffected; keyword-only in spirit, since nothing sensible follows it positionally.
 #define NWG_CONV_ARGS \
         nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("params"), nb::arg("band") = 0, \
-        nb::arg("aligned_a") = "", nb::arg("aligned_b") = "", nb::arg("kernel") = "auto"
+        nb::arg("aligned_a") = "", nb::arg("aligned_b") = "", nb::arg("kernel") = "auto", \
+        nb::arg("track") = std::vector<int32_t>{}
+#define NWG_CONV_PARAMS \
+        const std::string& a, const std::string& b, const AlignParams& params, int band, \
+        const std::string& aligned_a, const std::string& aligned_b, \
+        const std::string& kernel, const std::vector<int32_t>& track
 #define NWG_SCORE(FN, GM, AM, DOC) \
     m.def((std::string(FN) + sfx).c_str(), \
-        [](const std::string& a, const std::string& b, const AlignParams& params, int band, \
-           const std::string& aligned_a, const std::string& aligned_b, const std::string& kernel) { \
+        [](NWG_CONV_PARAMS) { \
             auto gj = make_guide(aligned_a, aligned_b); EncodedPair enc(a, b, params); \
             WITH_ALIGNER_T(T, GM, AM, band, gj, { \
-                al.set_problem(enc.a, enc.b, params, band, gj); \
+                al.set_problem(enc.a, enc.b, params, band, gj, track); \
                 al.compute_viterbi(_buf); return al.score(); }); \
         }, NWG_CONV_ARGS, DOC)
 #define NWG_HARD(FN, GM, AM, DOC) \
     m.def((std::string(FN) + sfx).c_str(), \
-        [](const std::string& a, const std::string& b, const AlignParams& params, int band, \
-           const std::string& aligned_a, const std::string& aligned_b, const std::string& kernel) { \
+        [](NWG_CONV_PARAMS) { \
             auto gj = make_guide(aligned_a, aligned_b); EncodedPair enc(a, b, params); \
             WITH_ALIGNER_T(T, GM, AM, band, gj, { \
-                al.set_problem(enc.a, enc.b, params, band, gj); al.compute_viterbi(_buf); \
+                al.set_problem(enc.a, enc.b, params, band, gj, track); al.compute_viterbi(_buf); \
                 AlignParams grad = AlignParams::zeros_like(params); al.hard_grad(_buf, grad); \
                 return nb::make_tuple(al.score(), grad); }); \
         }, NWG_CONV_ARGS, DOC)
 #define NWG_SOFT(FN, GM, AM, DOC) \
     m.def((std::string(FN) + sfx).c_str(), \
-        [](const std::string& a, const std::string& b, const AlignParams& params, int band, \
-           const std::string& aligned_a, const std::string& aligned_b, const std::string& kernel) { \
+        [](NWG_CONV_PARAMS) { \
             auto gj = make_guide(aligned_a, aligned_b); EncodedPair enc(a, b, params); \
             WITH_ALIGNER_T(T, GM, AM, band, gj, { \
-                al.set_problem(enc.a, enc.b, params, band, gj); al.compute_forward_back(_buf); \
+                al.set_problem(enc.a, enc.b, params, band, gj, track); al.compute_forward_back(_buf); \
                 AlignParams grad = AlignParams::zeros_like(params); al.soft_grad(_buf, grad); \
                 return nb::make_tuple(al.log_z(), grad); }); \
         }, NWG_CONV_ARGS, DOC)
@@ -208,6 +213,7 @@ static void bind_convenience(nb::module_& m, const std::string& sfx) {
 #undef NWG_HARD
 #undef NWG_SOFT
 #undef NWG_CONV_ARGS
+#undef NWG_CONV_PARAMS
 }
 
 template<class T>
@@ -242,7 +248,8 @@ static void bind_batch_aligner(nb::module_& m, const char* name) {
                const std::vector<std::string>& seqs_a,
                const std::vector<std::string>& seqs_b,
                const std::vector<std::string>& aligned_a,
-               const std::vector<std::string>& aligned_b) -> BatchResult {
+               const std::vector<std::string>& aligned_b,
+               const std::vector<std::vector<int32_t>>& tracks) -> BatchResult {
                 if (seqs_a.size() != seqs_b.size())
                     throw std::invalid_argument(
                         "sequences_a and sequences_b must have the same length");
@@ -252,13 +259,18 @@ static void bind_batch_aligner(nb::module_& m, const char* name) {
                         throw std::invalid_argument(
                             "aligned_a and aligned_b must have the same length as sequences");
                 }
+                if (!tracks.empty() && tracks.size() != seqs_a.size())
+                    throw std::invalid_argument(
+                        "tracks must have the same length as sequences (one track per "
+                        "pair), or be empty");
                 const size_t N = seqs_a.size();
                 std::vector<ProblemInstance> problems;
                 problems.reserve(N);
                 for (size_t k = 0; k < N; ++k) {
-                    ProblemInstance pi{seqs_a[k], seqs_b[k], {}};
+                    ProblemInstance pi{seqs_a[k], seqs_b[k], {}, {}};
                     if (has_guide)
                         pi.guide_j = guide_j_from_aligned(aligned_a[k], aligned_b[k]);
+                    if (!tracks.empty()) pi.track = tracks[k];
                     problems.push_back(std::move(pi));
                 }
                 return self.align(problems);
@@ -266,7 +278,10 @@ static void bind_batch_aligner(nb::module_& m, const char* name) {
             nb::arg("sequences_a"), nb::arg("sequences_b"),
             nb::arg("aligned_a") = std::vector<std::string>{},
             nb::arg("aligned_b") = std::vector<std::string>{},
-            "Align N sequence pairs.  Returns a BatchResult with .scores and .grad.");
+            nb::arg("tracks") = std::vector<std::vector<int32_t>>{},
+            "Align N sequence pairs.  Returns a BatchResult with .scores and .grad.\n"
+            "tracks: optional list of N matrix-slot tracks, one per pair, each as long as\n"
+            "        that pair's sequence_a.  [] = every pair uses slot 0 throughout.");
 }
 
 template<class T>
@@ -278,7 +293,8 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
             [](SP* self, const std::string& seq_a, const std::string& seq_b,
                const AlignParams& params, const std::string& gap_model,
                const std::string& mode, const std::string& grad_mode,
-               const std::string& kernel, const std::string& traceback) {
+               const std::string& kernel, const std::string& traceback,
+               const std::vector<int32_t>& track) {
                 GapModel  gm = (gap_model == "affine") ? GapModel::Affine  : GapModel::Linear;
                 AlignMode am = (mode      == "local")  ? AlignMode::Local  : AlignMode::Global;
                 GradMode  gd;
@@ -286,12 +302,13 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
                 else if (grad_mode == "soft") gd = GradMode::Soft;
                 else                          gd = GradMode::None;
                 new (self) SP(seq_a, seq_b, params, gm, am, gd, parse_backend(kernel),
-                              parse_traceback(traceback));
+                              parse_traceback(traceback), track);
             },
             nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("params"),
             nb::arg("gap_model") = "affine", nb::arg("mode") = "global",
             nb::arg("grad_mode") = "hard", nb::arg("kernel") = "auto",
             nb::arg("traceback") = "auto",
+            nb::arg("track") = std::vector<int32_t>{},
             nb::keep_alive<1, 4>(),
             "Persistent sequence pair.\n"
             "  gap_model : \"linear\" | \"affine\"\n"
@@ -301,7 +318,13 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
             "  traceback : \"auto\" (default) | \"pointers\" | \"scores\" | \"hirschberg\"\n"
             "              | \"hirschberg_pmax\"\n"
             "     — see SeqPairBatch.traceback.  \"auto\" = Hirschberg where it applies\n"
-            "     (the prefix-max carry at float32, the exact one at double).")
+            "     (the prefix-max carry at float32, the exact one at double).\n"
+            "  track     : optional list of len(seq_a) matrix-slot indices, so different\n"
+            "              stretches of seq_a are scored by different substitution\n"
+            "              matrices — see AlignParams.matrices.  [] = slot 0 throughout.\n"
+            "              Fixed at construction: it belongs to this seq_a.")
+        .def_prop_ro("track", [](const SP& self) { return self.track(); },
+                     "The per-position matrix slots for seq_a, or [] if untracked.")
         .def("alloc_dp", &SP::alloc_dp,
              "Pre-allocate own DP tables for the fixed sequences.")
         .def(
@@ -439,7 +462,8 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
                const std::vector<std::string_view>& seqs_b,
                nb::object params_obj,
                const std::string& gap_model, const std::string& mode,
-               const std::string& grad_mode, const std::string& kernel) {
+               const std::string& grad_mode, const std::string& kernel,
+               const std::vector<std::vector<int32_t>>& tracks) {
                 SPB& self = nb::cast<SPB&>(self_obj);
                 const AlignParams& params = nb::cast<const AlignParams&>(params_obj);
                 GapModel  gm = (gap_model == "affine") ? GapModel::Affine : GapModel::Linear;
@@ -449,7 +473,7 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
                 else if (grad_mode == "soft") gd = GradMode::Soft;
                 else                          gd = GradMode::None;
                 int  kn = parse_backend(kernel);
-                self.add_many(seqs_a, seqs_b, params, gm, am, gd, kn);
+                self.add_many(seqs_a, seqs_b, params, gm, am, gd, kn, tracks);
                 nb::list refs;
                 if (nb::hasattr(self_obj, "_owned_params"))
                     refs = nb::borrow<nb::list>(self_obj.attr("_owned_params"));
@@ -460,8 +484,11 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             nb::arg("seqs_a"), nb::arg("seqs_b"), nb::arg("params"),
             nb::arg("gap_model") = "affine", nb::arg("mode") = "global",
             nb::arg("grad_mode") = "hard", nb::arg("kernel") = "auto",
+            nb::arg("tracks") = std::vector<std::vector<int32_t>>{},
             "Bulk-construct N SeqPairs in C++ and append them to the batch.\n"
-            "Per-pair results remain available via batch[i].score / .grad / .aligned().")
+            "Per-pair results remain available via batch[i].score / .grad / .aligned().\n"
+            "tracks: optional list of N matrix-slot tracks, one per pair, each as long as\n"
+            "        that pair's seq_a.  [] = every pair uses slot 0 throughout.")
         .def("__len__", &SPB::size)
         .def(
             "__getitem__",
@@ -737,6 +764,64 @@ NB_MODULE(nwgrad_ext, m) {
             "Construct from a SubstMatrix (which carries its own alphabet) plus gap costs.\n"
             "Preferred over the (array, alphabet) form — no risk of an alphabet mismatch.")
         .def(
+            "__init__",
+            [](AlignParams* self, const std::vector<SubstMatrix>& matrices,
+               double gap_open_a, double gap_extend_a,
+               double gap_open_b, double gap_extend_b) {
+                new (self) AlignParams(matrices, gap_open_a, gap_extend_a,
+                                       gap_open_b, gap_extend_b);
+            },
+            nb::arg("matrices"),
+            nb::arg("gap_open_a")   = 0.0,
+            nb::arg("gap_extend_a") = 0.0,
+            nb::arg("gap_open_b")   = 0.0,
+            nb::arg("gap_extend_b") = 0.0,
+            "Construct with a STACK of substitution matrices (all over one alphabet).\n"
+            "Matrix k is 'slot k'.  A per-problem `track` — one slot index per residue of\n"
+            "sequence A — then picks which slot scores each position, so one alignment can\n"
+            "use a different substitution matrix in different regions of A.\n"
+            "\n"
+            "The gradient comes back with the same stack: slot k accumulates the counts of\n"
+            "every position that selected it, so all positions sharing a slot are tied to\n"
+            "one set of learnable parameters.  A genuinely per-position matrix is the case\n"
+            "len(matrices) == len(seq_a) with track = range(len(seq_a)) — supported, and\n"
+            "simply the case where nothing is tied.")
+        .def(
+            "add_matrix",
+            [](AlignParams& self, const SubstMatrix& m) { return self.add_matrix(m); },
+            nb::arg("matrix"),
+            "Append a matrix slot (must be over the same alphabet).  Returns its index.")
+        .def_prop_ro("matrix_count", &AlignParams::matrix_count,
+                     "Number of matrix slots, K >= 1.  A `track` indexes these.")
+        .def(
+            "matrix_at",
+            [](const AlignParams& self, int k) { return self.matrix_at(k); },
+            nb::arg("k"),
+            "Matrix slot k, as a copy.  Slot 0 has the same value as .matrix.")
+        .def(
+            "set_matrix_at",
+            [](AlignParams& self, int k, const SubstMatrix& m) {
+                if (&m.alphabet() != &self.matrix.alphabet())
+                    throw std::invalid_argument(
+                        "nwgrad: cannot assign a matrix over alphabet \"" +
+                        m.alphabet().symbols() + "\" to params over \"" +
+                        self.matrix.alphabet().symbols() + "\"");
+                self.matrix_at(k) = m;
+            },
+            nb::arg("k"), nb::arg("matrix"),
+            "Replace matrix slot k in place.  The counterpart of the .matrix setter for\n"
+            "slots past 0 — this is how a training loop updates a tracked stack.")
+        .def_prop_ro(
+            "matrices",
+            [](const AlignParams& self) {
+                std::vector<SubstMatrix> out;
+                out.reserve(static_cast<size_t>(self.matrix_count()));
+                for (int k = 0; k < self.matrix_count(); ++k) out.push_back(self.matrix_at(k));
+                return out;
+            },
+            "All matrix slots as a list of copies, slot 0 first.  Writing to the list does\n"
+            "not touch the params — use set_matrix_at() (or the .matrix setter for slot 0).")
+        .def(
             "to_dict",
             [](const AlignParams& self) {
                 int n = self.matrix.size();
@@ -751,10 +836,24 @@ NB_MODULE(nwgrad_ext, m) {
                 d["gap_extend_a"] = self.gap_extend_a;
                 d["gap_open_b"]   = self.gap_open_b;
                 d["gap_extend_b"] = self.gap_extend_b;
+                // Every slot, always — including the K == 1 case, where it is a one-element
+                // list holding the same values as 'matrix'.  Unconditional so that reading
+                // a gradient does not need to branch on whether a track was used.
+                nb::list mats;
+                for (int k = 0; k < self.matrix_count(); ++k) {
+                    double* kb = new double[static_cast<size_t>(n) * n];
+                    self.matrix_at(k).to_array(kb);
+                    nb::capsule kowner(kb, [](void* p) noexcept {
+                        delete[] static_cast<double*>(p); });
+                    mats.append(nb::ndarray<nb::numpy, double>(kb, 2, shape, kowner));
+                }
+                d["matrices"] = mats;
                 return d;
             },
-            "Return the parameters as a dict: 'matrix' (N×N array), 'alphabet', and the\n"
-            "four gap fields. Convenient for inspecting a gradient.")
+            "Return the parameters as a dict: 'matrix' (N×N array for slot 0), 'matrices'\n"
+            "(a list of one N×N array per matrix slot), 'alphabet', and the four gap\n"
+            "fields.  Convenient for inspecting a gradient — with a track, the per-slot\n"
+            "gradients are in 'matrices'.")
         .def_prop_rw(
             "matrix",
             [](const AlignParams& self) { return self.matrix; },

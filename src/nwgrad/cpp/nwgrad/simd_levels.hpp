@@ -20,6 +20,7 @@
 // feature of the built extension, where CMake compiles the level TUs with flags.
 
 #include <atomic>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -123,10 +124,12 @@ inline int best_simd_backend() { return (int)detect_available_levels().back(); }
 // are all T; the reported score stays double (a T score promotes to double exactly).
 template <class T>
 struct ViterbiJob {
-    // problem (sequences already encoded to alphabet indices)
-    const unsigned char* a; int m;
-    const unsigned char* b; int n;
-    const T* blk; int nalpha;               // substitution block, row-major nalpha×nalpha
+    // problem: `a` is sequence A as ROW SYMBOLS (dense ids into the nrow×ncol block —
+    // see Aligner::build_row_alphabet; with no matrix track they are just the encoded
+    // residues renumbered), `b` is sequence B encoded to alphabet indices.
+    const std::uint32_t*  a; int m;
+    const unsigned char*  b; int n;
+    const T* blk; int nrow, ncol;           // substitution block, row-major nrow×ncol
     T go_a, ge_a, go_b, ge_b;               // gap penalties (in the Viterbi precision)
     int   align_mode;                       // 0 = Global, 1 = Local
     int   align_band;                       // 0 = Full,   1 = GuideBanded
@@ -160,9 +163,9 @@ using viterbi_fn_f = void (*)(ViterbiJob<float>&);
 // logic in exactly one place.
 template <class T>
 struct HbJob {
-    const unsigned char* a;                 // full encoded sequences; the block is
-    const unsigned char* b;                 // addressed by start/step below
-    const T* blk; int nalpha;
+    const std::uint32_t* a;                 // A as row symbols; B encoded.  The block
+    const unsigned char* b;                 // is addressed by start/step below
+    const T* blk; int nrow, ncol;
     T go_a, ge_a, go_b, ge_b;
     int a_start, a_step;                    // row t (0..H-1) consumes a[a_start + t*a_step]
     int b_start, b_step;                    // column c (1..ncols) pairs b[b_start + (c-1)*b_step]
@@ -193,9 +196,9 @@ using hb_fn_f = void (*)(HbJob<float>&);
 // block-1-based, and the caller maps them to absolute end/start cells.
 template <class T>
 struct HbScanJob {
-    const unsigned char* a;
+    const std::uint32_t* a;                 // A as row symbols (see HbJob)
     const unsigned char* b;
-    const T* blk; int nalpha;
+    const T* blk; int nrow, ncol;
     T go_a, ge_a, go_b, ge_b;
     int a_start, a_step;                    // row t (0..H-1) consumes a[a_start + t*a_step]
     int b_start, b_step;                    // column c (1..ncols) pairs b[b_start + (c-1)*b_step]
@@ -221,9 +224,9 @@ using hbscan_fn_f = void (*)(HbScanJob<float>&);
 // walk-back stays on the aligner side (O(H+ncols), negligible) and reads hbD striped.
 template <class T>
 struct HbBaseJob {
-    const unsigned char* a;
+    const std::uint32_t* a;                 // A as row symbols (see HbJob)
     const unsigned char* b;
-    const T* blk; int nalpha;
+    const T* blk; int nrow, ncol;
     T go_a, ge_a, go_b, ge_b;
     int a_start, a_step;
     int b_start, b_step;

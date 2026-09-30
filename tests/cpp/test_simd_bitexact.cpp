@@ -62,15 +62,21 @@ long first_bit_diff(const std::vector<double>& a, const std::vector<double>& b, 
 
 // Run one problem under both kernels and demand the tables, the score and the hard
 // gradient all agree exactly.
+//
+// `track` (optional) makes it a MATRIX-TRACK problem: each position of A is scored by
+// the params' matrix slot named there.  That widens the DP's row alphabet, hence the
+// query profile every kernel builds — so it is exactly the sort of change that could
+// shift a lane boundary or a profile row and break bit-exactness silently.  Running it
+// through this same harness is the cheapest way to be sure it did not.
 template<GapModel GM, AlignMode AM, AlignBand AB>
 void check_bit_exact(const AlignParams& p, const std::string& a, const std::string& b,
-                     int band = 0) {
+                     int band = 0, const std::vector<int32_t>& track = {}) {
     Aligner<GM, AM, AB> al;
     const size_t sz = (a.size() + 1) * (b.size() + 1);
 
     DpBuffer buf_scalar, buf_simd;
 
-    al.set_problem(a, b, p, band);
+    al.set_problem(a, b, p, band, {}, track);
     al.set_traceback(TracebackMode::Scores);
     al.set_kernel(kBackendScalar);
     al.compute_viterbi(buf_scalar);
@@ -87,7 +93,7 @@ void check_bit_exact(const AlignParams& p, const std::string& a, const std::stri
         rmY = al.to_row_major(buf_scalar.VY);
     }
 
-    al.set_problem(a, b, p, band);
+    al.set_problem(a, b, p, band, {}, track);
     al.set_traceback(TracebackMode::Scores);
     al.set_kernel(kBackendAuto);
     al.compute_viterbi(buf_simd);
@@ -110,10 +116,11 @@ void check_bit_exact(const AlignParams& p, const std::string& a, const std::stri
     // The gradient depends on *which* optimal path the traceback picked, so an equal
     // gradient is the real proof that tie-breaking survived vectorization.
     const int N = p.matrix.size();
-    for (int i = 0; i < N; ++i)
-        for (int j = 0; j < N; ++j)
-            REQUIRE(std::bit_cast<uint64_t>(grad_scalar.matrix.at(i, j)) ==
-                    std::bit_cast<uint64_t>(grad_simd.matrix.at(i, j)));
+    for (int k = 0; k < p.matrix_count(); ++k)
+        for (int i = 0; i < N; ++i)
+            for (int j = 0; j < N; ++j)
+                REQUIRE(std::bit_cast<uint64_t>(grad_scalar.matrix_at(k).at(i, j)) ==
+                        std::bit_cast<uint64_t>(grad_simd.matrix_at(k).at(i, j)));
     REQUIRE(grad_scalar.gap_open_a   == grad_simd.gap_open_a);
     REQUIRE(grad_scalar.gap_extend_a == grad_simd.gap_extend_a);
     REQUIRE(grad_scalar.gap_open_b   == grad_simd.gap_open_b);
@@ -121,18 +128,43 @@ void check_bit_exact(const AlignParams& p, const std::string& a, const std::stri
 }
 
 // Every combination of gap model, align mode and band, for one params/sequence pair.
-void check_all_modes(const AlignParams& p, const std::string& a, const std::string& b) {
-    check_bit_exact<GapModel::Linear, AlignMode::Global, AlignBand::Full>(p, a, b);
-    check_bit_exact<GapModel::Linear, AlignMode::Local,  AlignBand::Full>(p, a, b);
-    check_bit_exact<GapModel::Affine, AlignMode::Global, AlignBand::Full>(p, a, b);
-    check_bit_exact<GapModel::Affine, AlignMode::Local,  AlignBand::Full>(p, a, b);
+void check_all_modes(const AlignParams& p, const std::string& a, const std::string& b,
+                     const std::vector<int32_t>& track = {}) {
+    check_bit_exact<GapModel::Linear, AlignMode::Global, AlignBand::Full>(p, a, b, 0, track);
+    check_bit_exact<GapModel::Linear, AlignMode::Local,  AlignBand::Full>(p, a, b, 0, track);
+    check_bit_exact<GapModel::Affine, AlignMode::Global, AlignBand::Full>(p, a, b, 0, track);
+    check_bit_exact<GapModel::Affine, AlignMode::Local,  AlignBand::Full>(p, a, b, 0, track);
 
     for (int band : {4, 16}) {
-        check_bit_exact<GapModel::Linear, AlignMode::Global, AlignBand::GuideBanded>(p, a, b, band);
-        check_bit_exact<GapModel::Linear, AlignMode::Local,  AlignBand::GuideBanded>(p, a, b, band);
-        check_bit_exact<GapModel::Affine, AlignMode::Global, AlignBand::GuideBanded>(p, a, b, band);
-        check_bit_exact<GapModel::Affine, AlignMode::Local,  AlignBand::GuideBanded>(p, a, b, band);
+        check_bit_exact<GapModel::Linear, AlignMode::Global, AlignBand::GuideBanded>(p, a, b, band, track);
+        check_bit_exact<GapModel::Linear, AlignMode::Local,  AlignBand::GuideBanded>(p, a, b, band, track);
+        check_bit_exact<GapModel::Affine, AlignMode::Global, AlignBand::GuideBanded>(p, a, b, band, track);
+        check_bit_exact<GapModel::Affine, AlignMode::Local,  AlignBand::GuideBanded>(p, a, b, band, track);
     }
+}
+
+// K integer-valued slots that disagree with each other everywhere, so a kernel reading
+// the wrong slot cannot produce the right table by luck.  Integer-valued for the same
+// reason the single-slot fixture is: exact ties everywhere, which is the condition under
+// which a careless argmax diverges.
+AlignParams tracked_params(int nslots) {
+    AlignParams p = int_params(11.0, 1.0, 11.0, 1.0);
+    for (int k = 1; k < nslots; ++k) {
+        std::array<double, 400> src{};
+        for (int i = 0; i < 20; ++i)
+            for (int j = 0; j < 20; ++j)
+                src[static_cast<size_t>(i * 20 + j)] =
+                    (i == j) ? 4.0 + k : ((i + j + k) % 3 == 0 ? -1.0 - k : -3.0 + k);
+        p.add_matrix(SubstMatrix(src.data()));
+    }
+    return p;
+}
+
+std::vector<int32_t> random_track(std::mt19937_64& rng, size_t len, int nslots) {
+    std::uniform_int_distribution<int> d(0, nslots - 1);
+    std::vector<int32_t> t(len);
+    for (auto& v : t) v = d(rng);
+    return t;
 }
 
 }  // namespace
@@ -181,4 +213,76 @@ TEST_CASE("simd viterbi is bit-exact with scalar — degenerate shapes", "[simd]
     check_all_modes(p, "A", "WYWYWY");
     check_all_modes(p, "WYWYWY", "A");
     check_all_modes(p, "AAAAAAAAAA", "AAAAAAAAAA");  // maximal ties
+}
+
+// ── Matrix track ─────────────────────────────────────────────────────────────
+//
+// A track widens the DP's ROW ALPHABET from "residue" to "(matrix slot, residue)", and
+// every kernel here builds its query profile over that alphabet.  So a track changes the
+// number of profile rows, the row a given DP row selects, and — because the row alphabet
+// is compacted to only the pairs actually present — the ORDER those rows sit in.  None of
+// that may move a single bit of any table.  Same harness, same demands.
+
+TEST_CASE("simd viterbi is bit-exact with scalar — matrix track", "[simd][track]") {
+    std::mt19937_64 rng(20260806);
+    AlignParams p = tracked_params(3);
+
+    for (int trial = 0; trial < 10; ++trial) {
+        std::uniform_int_distribution<int> len(1, 90);
+        const std::string a = random_seq(rng, len(rng));
+        const std::string b = random_seq(rng, len(rng));
+        check_all_modes(p, a, b, random_track(rng, a.size(), 3));
+    }
+}
+
+TEST_CASE("simd viterbi is bit-exact with scalar — track, degenerate shapes",
+          "[simd][track]") {
+    AlignParams p = tracked_params(3);
+
+    check_all_modes(p, "", "", {});
+    check_all_modes(p, "A", "", {2});
+    check_all_modes(p, "A", "A", {1});
+    check_all_modes(p, "A", "WYWYWY", {2});
+    check_all_modes(p, "WYWYWY", "A", {0, 1, 2, 2, 1, 0});
+    // Maximal ties AND a track: identical residues throughout, so the only thing
+    // distinguishing one row from another is which slot it selected.
+    check_all_modes(p, "AAAAAAAAAA", "AAAAAAAAAA", {0, 1, 2, 0, 1, 2, 0, 1, 2, 0});
+}
+
+TEST_CASE("simd viterbi is bit-exact with scalar — one slot per position",
+          "[simd][track]") {
+    // The literal per-position reading: as many slots as residues of A, nothing tied.
+    // This is the case with the most profile rows and the least reuse, so it is where a
+    // row-compaction bug would show.
+    std::mt19937_64 rng(4242);
+    const std::string a = random_seq(rng, 40);
+    const std::string b = random_seq(rng, 37);
+    AlignParams p = tracked_params(static_cast<int>(a.size()));
+    std::vector<int32_t> track(a.size());
+    for (size_t i = 0; i < a.size(); ++i) track[i] = static_cast<int32_t>(i);
+    check_all_modes(p, a, b, track);
+}
+
+TEST_CASE("an all-zeros track is bit-identical to no track at all", "[track]") {
+    // The reduction must be pure re-indexing.  Not "equivalent" — identical.
+    std::mt19937_64 rng(31337);
+    AlignParams p = tracked_params(3);
+    const std::string a = random_seq(rng, 60);
+    const std::string b = random_seq(rng, 55);
+
+    Aligner<GapModel::Affine, AlignMode::Global, AlignBand::Full> al;
+    DpBuffer plain, tracked;
+
+    al.set_problem(a, b, p);
+    al.set_traceback(TracebackMode::Scores);
+    al.compute_viterbi(plain);
+    const double s_plain = al.score();
+    const std::vector<double> rm = al.to_row_major(plain.VM);
+
+    al.set_problem(a, b, p, 0, {}, std::vector<int32_t>(a.size(), 0));
+    al.set_traceback(TracebackMode::Scores);
+    al.compute_viterbi(tracked);
+    REQUIRE(std::bit_cast<uint64_t>(s_plain) == std::bit_cast<uint64_t>(al.score()));
+    REQUIRE(first_bit_diff(rm, al.to_row_major(tracked.VM),
+                           (a.size() + 1) * (b.size() + 1)) == -1);
 }

@@ -38,10 +38,11 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
     const T K_NINF = -std::numeric_limits<T>::infinity();
 
     const int m = job.m, n = job.n;
-    const int nalpha = job.nalpha;
+    const int nrow = job.nrow;    // ROW SYMBOLS, not alphabet size: the block is the
+    const int ncol = job.ncol;    // problem's (slot, residue) row alphabet x the alphabet
     const T go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;
     const T* blk = job.blk;
-    const unsigned char* a = job.a;
+    const std::uint32_t*  a = job.a;   // sequence A as row symbols
     const unsigned char* b = job.b;
     DpBufferT<T>& buf = *job.buf;
 
@@ -51,7 +52,7 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
     const std::size_t off   = (std::size_t)W;
 
     if (buf.sopenv.size() < 2 * sw) buf.sopenv.resize(2 * sw);   // ov | openk
-    if (buf.sprof.size()  < (std::size_t)nalpha * sw) buf.sprof.resize((std::size_t)nalpha * sw);
+    if (buf.sprof.size()  < (std::size_t)nrow * sw) buf.sprof.resize((std::size_t)nrow * sw);
     const std::size_t dsz = (std::size_t)(m + 1) * rowsz;
     if (buf.DM.size() < dsz) { buf.DM.resize(dsz); buf.DX.resize(dsz); buf.DY.resize(dsz); }
     // rolling score rows: 2 x rowsz instead of (m+1) x rowsz -- the whole point
@@ -65,8 +66,8 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
         return (std::size_t)((j - 1) % seg) * W + (j - 1) / seg;
     };
 
-    for (int c = 0; c < nalpha; ++c) {
-        const T* row = blk + (std::size_t)c * nalpha;
+    for (int c = 0; c < nrow; ++c) {
+        const T* row = blk + (std::size_t)c * ncol;
         T* dst = buf.sprof.data() + (std::size_t)c * sw;
         for (int l = 0; l < W; ++l)
             for (int s = 0; s < seg; ++s) {

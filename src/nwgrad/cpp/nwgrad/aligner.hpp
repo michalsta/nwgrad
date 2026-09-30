@@ -207,41 +207,39 @@ struct Aligner {
     void set_problem(std::string_view a, std::string_view b,
                      const AlignParams& params,
                      int band = 0,
-                     std::vector<int> guide_j = {}) {
+                     std::vector<int> guide_j = {},
+                     std::span<const int32_t> track = {}) {
         const Alphabet& alpha = params.matrix.alphabet();
         a_own_ = alpha.encode(a);
         b_own_ = alpha.encode(b);
         set_problem(std::span<const uint8_t>(a_own_),
                     std::span<const uint8_t>(b_own_),
-                    params, band, std::move(guide_j));
+                    params, band, std::move(guide_j), track);
     }
 
     // Sequences arrive already encoded to alphabet indices — the DP never sees a
     // char.  Encoding (and validation) happens once, at the boundary, in SeqPair
     // / BatchAligner.  The spans must outlive the DP calls that follow.
+    // `track` (optional) names one AlignParams matrix slot per position of sequence A,
+    // so different stretches of A can be scored by different substitution matrices in
+    // a single alignment.  Empty (the default) means slot 0 throughout, which is the
+    // single-matrix behaviour this library had before tracks existed — identical, not
+    // merely equivalent.  See build_row_alphabet() for how it reaches the DP.
     void set_problem(std::span<const uint8_t> a, std::span<const uint8_t> b,
                      const AlignParams& params,
                      int band = 0,
-                     std::vector<int> guide_j = {}) {
+                     std::vector<int> guide_j = {},
+                     std::span<const int32_t> track = {}) {
         a_idx_  = a;
         b_idx_  = b;
         params_ = &params;
-        blk_    = params.matrix.data();
         nalpha_ = params.matrix.size();
-        // The Viterbi-precision copy of the substitution block.  T=double aliases the
-        // master (no copy); float32 converts once per problem into blkT_storage_.
-        if constexpr (std::is_same_v<T, double>) {
-            blkT_ = blk_;
-        } else {
-            const std::size_t nn = static_cast<std::size_t>(nalpha_) * nalpha_;
-            blkT_storage_.resize(nn);
-            for (std::size_t k = 0; k < nn; ++k)
-                blkT_storage_[k] = static_cast<T>(blk_[k]);
-            blkT_ = blkT_storage_.data();
-        }
         band_   = band;
         m_      = static_cast<int>(a.size());
         n_      = static_cast<int>(b.size());
+        // Sets nrow_/arow_/rowsrc_ and the compacted blk_ / blkT_ this problem scores
+        // against.  Needs m_ and nalpha_, hence its position here.
+        build_row_alphabet(params, track);
         stride_ = static_cast<size_t>(n_ + 1);
         sz_     = static_cast<size_t>(m_ + 1) * stride_;
         if constexpr (AB == AlignBand::GuideBanded) {
@@ -471,13 +469,30 @@ private:
     // the caller supplied encoded spans directly.
     std::vector<uint8_t> a_own_, b_own_;
     const AlignParams*  params_     = nullptr;
-    const double*       blk_        = nullptr; // params_->matrix.data(), cached (double master)
+    // The COMPACTED substitution block for this problem: nrow_ rows of nalpha_ columns,
+    // row d being row (rowsrc_[d] % nalpha_) of matrix slot (rowsrc_[d] / nalpha_).
+    // Points into blkc_.  With no track and one slot this is just the rows of
+    // params_->matrix that sequence A actually uses, so its contents are a subset of
+    // what blk_ used to alias — identical doubles, fewer of them.
+    const double*       blk_        = nullptr;
+    std::vector<double> blkc_;
     // The substitution block in the Viterbi precision T.  For T=double it aliases blk_
     // (zero copy); for float32 it points into blkT_storage_.  subT() reads it; sub()
     // keeps reading the double master, so the soft path is untouched by T.
     const T*            blkT_       = nullptr;
     std::vector<T>      blkT_storage_;
-    int                 nalpha_     = 0;       // params_->matrix.size(), cached
+    int                 nalpha_     = 0;       // params_->matrix.size(): the COLUMN axis
+
+    // ── The row alphabet (position-dependent substitution) ────────────────────
+    // arow_[i] is the dense row symbol for position i of sequence A: the compacted id
+    // of the (matrix slot, residue) pair that scores that row.  It is what the kernels
+    // receive in place of the raw encoded A, and what indexes blk_ and every query
+    // profile built from it.  rowsrc_ inverts it back to slot*nalpha_ + residue, which
+    // is how a gradient finds the slot to accumulate into.
+    int                   nrow_ = 0;
+    std::vector<uint32_t> arow_;     // length m_
+    std::vector<uint32_t> rowsrc_;   // length nrow_
+    std::vector<int32_t>  rowmap_;   // slot*nalpha_ + residue -> dense id, -1 = unseen
     int                 band_       = 0;
     int                 m_ = 0, n_ = 0;
     size_t              stride_ = 0, sz_ = 0;
@@ -672,11 +687,109 @@ private:
         return t[cell_index(i, j)];
     }
 
+    // ── The row alphabet ──────────────────────────────────────────────────────
+    //
+    // Build the problem's row alphabet: the distinct (matrix slot, residue) pairs that
+    // actually occur along sequence A, compacted to dense ids in arow_, together with
+    // the nrow_ × nalpha_ block those ids index.
+    //
+    // This is the entirety of the position-dependent machinery, and it is deliberately
+    // confined here.  Every kernel in this library already builds a query profile
+    // indexed by a row symbol and takes one slice of it per row (see the query-profile
+    // note in aligner_simd.hpp); all this does is widen that symbol from "residue" to
+    // "(slot, residue)".  Nothing downstream changes shape and NOTHING changes per
+    // cell — the cost is this O(m + nrow_·nalpha_) setup and no more.
+    //
+    // COMPACTED rather than simply stacking the K slots, because the general case is
+    // genuinely per-position (K == m with track = 0,1,2,...).  A stacked K·N-row block
+    // would make every profile build O(K·N·n) = O(m·N·n) there — N times the DP it is
+    // meant to accelerate.  Compaction bounds the row count by min(m, K·N), which is
+    // the most rows any profile could need, so the per-position case costs O(m·n) of
+    // profile (inherent: that IS the position-specific scoring matrix) and the ordinary
+    // single-slot case costs at most one row per residue occurring in A — no more than
+    // it ever did, and usually less.
+    void build_row_alphabet(const AlignParams& params, std::span<const int32_t> track) {
+        const int K = params.matrix_count();
+        if (!track.empty() && static_cast<int>(track.size()) != m_)
+            throw std::invalid_argument(
+                "nwgrad: track has " + std::to_string(track.size()) +
+                " entries but sequence A has " + std::to_string(m_) +
+                " residues; a track names one matrix slot per position of A");
+
+        arow_.resize(static_cast<size_t>(m_));
+
+        // No track: the row alphabet IS the residue alphabet, so there is nothing to
+        // compact and nothing to copy — blk_ aliases the params' own block exactly as it
+        // did before tracks existed.  Kept as a separate path deliberately: the
+        // compaction below is cheap but not free (an O(nrow·ncol) copy of the matrix per
+        // problem), and on a batch of short sequences that is a measurable share of a
+        // small DP.  The untracked case must cost what it always cost.
+        if (track.empty()) {
+            nrow_ = nalpha_;
+            for (int i = 0; i < m_; ++i)
+                arow_[static_cast<size_t>(i)] = a_idx_[static_cast<size_t>(i)];
+            rowsrc_.resize(static_cast<size_t>(nalpha_));
+            for (int d = 0; d < nalpha_; ++d)     // slot 0, residue d
+                rowsrc_[static_cast<size_t>(d)] = static_cast<uint32_t>(d);
+            blk_ = params.matrix.data();
+            set_viterbi_block(static_cast<size_t>(nalpha_) * static_cast<size_t>(nalpha_));
+            return;
+        }
+
+        rowmap_.assign(static_cast<size_t>(K) * static_cast<size_t>(nalpha_), -1);
+        rowsrc_.clear();
+        for (int i = 0; i < m_; ++i) {
+            const int k = track.empty() ? 0
+                                        : static_cast<int>(track[static_cast<size_t>(i)]);
+            if (k < 0 || k >= K)
+                throw std::invalid_argument(
+                    "nwgrad: track[" + std::to_string(i) + "] = " + std::to_string(k) +
+                    " is not a matrix slot; these params hold " + std::to_string(K) +
+                    " slot(s)");
+            const size_t key = static_cast<size_t>(k) * static_cast<size_t>(nalpha_) +
+                               static_cast<size_t>(a_idx_[static_cast<size_t>(i)]);
+            int32_t& dense = rowmap_[key];
+            if (dense < 0) {
+                dense = static_cast<int32_t>(rowsrc_.size());
+                rowsrc_.push_back(static_cast<uint32_t>(key));
+            }
+            arow_[static_cast<size_t>(i)] = static_cast<uint32_t>(dense);
+        }
+        nrow_ = static_cast<int>(rowsrc_.size());
+
+        // One spare row when A is empty, so blk_ is a real pointer rather than the
+        // null a zero-length vector would hand back.  Never read: nothing indexes it.
+        const size_t nc = static_cast<size_t>(nalpha_);
+        blkc_.resize(std::max<size_t>(1, static_cast<size_t>(nrow_)) * nc);
+        for (int d = 0; d < nrow_; ++d) {
+            const size_t key = rowsrc_[static_cast<size_t>(d)];
+            const double* src =
+                params.matrix_at(static_cast<int>(key / nc)).data() + (key % nc) * nc;
+            std::copy_n(src, nc, blkc_.begin() + static_cast<size_t>(d) * nc);
+        }
+        blk_ = blkc_.data();
+        set_viterbi_block(blkc_.size());
+    }
+
+    // Point blkT_ at blk_ in the Viterbi precision.  T=double aliases (no copy, as it
+    // always did); float32 converts the block's `n` entries once per problem.
+    void set_viterbi_block(size_t n) {
+        if constexpr (std::is_same_v<T, double>) {
+            blkT_ = blk_;
+        } else {
+            blkT_storage_.resize(n);
+            for (size_t k = 0; k < n; ++k)
+                blkT_storage_[k] = static_cast<T>(blk_[k]);
+            blkT_ = blkT_storage_.data();
+        }
+    }
+
     // ── Substitution lookup (the DP hot path) ─────────────────────────────────
-    // Offset of the (a[i-1], b[j-1]) cell in an n_alpha × n_alpha block.  DP
-    // coordinates are 1-based, so i-1 / j-1 index the sequences.
+    // Offset of the (row symbol of i, b[j-1]) cell in the nrow_ × nalpha_ block.  DP
+    // coordinates are 1-based, so i-1 / j-1 index the sequences.  With no track the
+    // row symbol is just a[i-1] renumbered, so this is the same lookup it always was.
     size_t sub_off(int i, int j) const noexcept {
-        return static_cast<size_t>(a_idx_[static_cast<size_t>(i) - 1]) *
+        return static_cast<size_t>(arow_[static_cast<size_t>(i) - 1]) *
                    static_cast<size_t>(nalpha_) +
                static_cast<size_t>(b_idx_[static_cast<size_t>(j) - 1]);
     }
@@ -700,15 +813,41 @@ private:
             static_cast<int>(b_idx_[static_cast<size_t>(j) - 1]));
     }
 
-    // The gradient's matrix block, checked to be over the same alphabet as the
-    // params.  Checked once per grad call, not once per cell.
-    double* grad_block(AlignParams& grad) const {
+    // Where each row symbol accumulates.  rows[d] is the row of `grad` that row symbol
+    // d contributes to — row (rowsrc_[d] % nalpha_) of grad's slot (rowsrc_[d] /
+    // nalpha_) — so an accumulation site stays a single indexed store into
+    // rows[arow_[i-1]], exactly what it was when there was only one matrix.
+    //
+    // Resolving the slot HERE rather than per cell is what keeps the position
+    // dependence off the hot path: the inverse map is O(nrow_) and runs once per
+    // gradient call, alongside the alphabet and slot-count checks.
+    std::vector<double*> grad_rows(AlignParams& grad) const {
         if (&grad.matrix.alphabet() != &params_->matrix.alphabet())
             throw std::invalid_argument(
                 "nwgrad: gradient alphabet \"" + grad.matrix.alphabet().symbols() +
                 "\" does not match params alphabet \"" +
                 params_->matrix.alphabet().symbols() + "\"");
-        return grad.matrix.data();
+        if (grad.matrix_count() != params_->matrix_count())
+            throw std::invalid_argument(
+                "nwgrad: gradient holds " + std::to_string(grad.matrix_count()) +
+                " matrix slot(s) but the params being differentiated hold " +
+                std::to_string(params_->matrix_count()) +
+                "; build the accumulator with AlignParams::zeros_like()");
+        const size_t nc = static_cast<size_t>(nalpha_);
+        std::vector<double*> rows(static_cast<size_t>(nrow_));
+        for (int d = 0; d < nrow_; ++d) {
+            const size_t key = rowsrc_[static_cast<size_t>(d)];
+            rows[static_cast<size_t>(d)] =
+                grad.matrix_at(static_cast<int>(key / nc)).data() + (key % nc) * nc;
+        }
+        return rows;
+    }
+
+    // The gradient cell for the pair (a[i-1], b[j-1]) under the matrix slot governing
+    // row i.  `rows` comes from grad_rows().
+    double& gcell(const std::vector<double*>& rows, int i, int j) const noexcept {
+        return rows[arow_[static_cast<size_t>(i) - 1]]
+                   [static_cast<size_t>(b_idx_[static_cast<size_t>(j) - 1])];
     }
 
     // ── Band helpers ──────────────────────────────────────────────────────────
@@ -883,7 +1022,7 @@ private:
     }
 
     void hard_grad_affine_ptr(const DpBuffer& buf, AlignParams& grad) const {
-        double* gblk = grad_block(grad);
+        const std::vector<double*> grows = grad_rows(grad);
         int i = best_i_, j = best_j_;
         TBTable tbl = best_tbl_;
         while (true) {
@@ -895,7 +1034,7 @@ private:
             else if (j == 0) tbl = TBTable::X;
             unsigned char c;
             if (tbl == TBTable::M) {
-                gblk[sub_off(i, j)] += 1.0;
+                gcell(grows, i, j) += 1.0;
                 c = dcode(buf.DM, i, j); --i; --j;
                 tbl = (c == 1) ? TBTable::X : (c == 2 ? TBTable::Y : TBTable::M);
             } else if (tbl == TBTable::X) {
@@ -1053,11 +1192,11 @@ private:
     // (table_layout == 1) and reports seg/width; rat/at then read them striped.
     void run_dispatched_affine(DpBuffer& buf, const LevelKernels& K, bool use_ptr = false) {
         ViterbiJob<T> job{};
-        job.a = a_idx_.data(); job.m = m_;
+        job.a = arow_.data(); job.m = m_;
         job.b = b_idx_.data(); job.n = n_;
         // blkT_ is the substitution block already in the Viterbi precision T (= blk_ when
         // T is double); the penalties convert to T on assignment.
-        job.blk = blkT_;       job.nalpha = nalpha_;
+        job.blk = blkT_;       job.nrow = nrow_; job.ncol = nalpha_;
         job.go_a = static_cast<T>(params_->gap_open_a);   job.ge_a = static_cast<T>(params_->gap_extend_a);
         job.go_b = static_cast<T>(params_->gap_open_b);   job.ge_b = static_cast<T>(params_->gap_extend_b);
         job.align_mode = (AM == AlignMode::Local) ? 1 : 0;
@@ -1182,7 +1321,7 @@ private:
     }
 
     void hard_grad_linear(const DpBuffer& buf, AlignParams& grad) const {
-        double* gblk = grad_block(grad);
+        const std::vector<double*> grows = grad_rows(grad);
         int i = (AM == AlignMode::Global) ? m_ : best_i_;
         int j = (AM == AlignMode::Global) ? n_ : best_j_;
 
@@ -1193,7 +1332,7 @@ private:
             if (i > 0 && j > 0 &&
                 rat(buf.H, i, j) == rat(buf.H, i-1, j-1) + sub(i, j))
             {
-                gblk[sub_off(i, j)] += 1.0;
+                gcell(grows, i, j) += 1.0;
                 --i; --j;
             } else if (i > 0 && rat(buf.H, i, j) == rat(buf.H, i-1, j) - params_->gap_extend_b) {
                 grad.gap_extend_b -= 1.0;   // the score subtracts this penalty
@@ -1377,8 +1516,8 @@ private:
                       int b_start, int b_step, int H, int ncols, bool in_x,
                       T* oM, T* oX, T* oY) const {
         HbJob<T> job{};
-        job.a = a_idx_.data(); job.b = b_idx_.data();
-        job.blk = blkT_; job.nalpha = nalpha_;
+        job.a = arow_.data(); job.b = b_idx_.data();
+        job.blk = blkT_; job.nrow = nrow_; job.ncol = nalpha_;
         job.go_a = static_cast<T>(params_->gap_open_a);
         job.ge_a = static_cast<T>(params_->gap_extend_a);
         job.go_b = static_cast<T>(params_->gap_open_b);
@@ -1521,8 +1660,8 @@ private:
                              int i0, int i1, int j0, int j1, bool in_x, bool out_x) {
         const int H = i1 - i0, NC = j1 - j0;
         HbBaseJob<T> job{};
-        job.a = a_idx_.data(); job.b = b_idx_.data();
-        job.blk = blkT_; job.nalpha = nalpha_;
+        job.a = arow_.data(); job.b = b_idx_.data();
+        job.blk = blkT_; job.nrow = nrow_; job.ncol = nalpha_;
         job.go_a = static_cast<T>(params_->gap_open_a);
         job.ge_a = static_cast<T>(params_->gap_extend_a);
         job.go_b = static_cast<T>(params_->gap_open_b);
@@ -1813,8 +1952,8 @@ private:
         const int H = i1 - i0, NC = j1 - j0;
         if (const LevelKernels* K = hb_scan_level()) {
             HbScanJob<T> job{};
-            job.a = a_idx_.data(); job.b = b_idx_.data();
-            job.blk = blkT_; job.nalpha = nalpha_;
+            job.a = arow_.data(); job.b = b_idx_.data();
+            job.blk = blkT_; job.nrow = nrow_; job.ncol = nalpha_;
             job.go_a = static_cast<T>(params_->gap_open_a);
             job.ge_a = static_cast<T>(params_->gap_extend_a);
             job.go_b = static_cast<T>(params_->gap_open_b);
@@ -1942,11 +2081,11 @@ private:
     // walking predecessors backward.  Same emissions, same gradient convention.
 
     void hard_grad_affine_hb(AlignParams& grad) const {
-        double* gblk = grad_block(grad);
+        const std::vector<double*> grows = grad_rows(grad);
         int i = hb_start_i_, j = hb_start_j_;   // local: the path starts at (is, js), not the origin
         unsigned char prev = 3;
         for (unsigned char op : hops_) {
-            if (op == 0) { ++i; ++j; gblk[sub_off(i, j)] += 1.0; }
+            if (op == 0) { ++i; ++j; gcell(grows, i, j) += 1.0; }
             else if (op == 1) {
                 if (prev != 1) grad.gap_open_b -= 1.0;
                 grad.gap_extend_b -= 1.0; ++i;
@@ -2240,7 +2379,7 @@ private:
     }
 
     void hard_grad_affine(const DpBuffer& buf, AlignParams& grad) const {
-        double* gblk = grad_block(grad);
+        const std::vector<double*> grows = grad_rows(grad);
         int i = best_i_, j = best_j_;
         TBTable tbl = best_tbl_;
         // T-precision penalties for the predecessor argmax; the gradient counts
@@ -2266,7 +2405,7 @@ private:
             else if (j == 0) tbl = TBTable::X;   // col 0: only upward moves remain
 
             if (tbl == TBTable::M) {
-                gblk[sub_off(i, j)] += 1.0;
+                gcell(grows, i, j) += 1.0;
                 T vm = rat(buf.VM,i-1,j-1), vx = rat(buf.VX,i-1,j-1), vy = rat(buf.VY,i-1,j-1);
                 --i; --j;
                 if      (vm >= vx && vm >= vy) tbl = TBTable::M;
@@ -2367,7 +2506,7 @@ private:
     }
 
     void soft_grad_linear(const DpBuffer& buf, AlignParams& grad) const {
-        double* gblk = grad_block(grad);
+        const std::vector<double*> grows = grad_rows(grad);
         // Matrix gradient: match steps (i-1,j-1) → (i,j)
         for (int i = 1; i <= m_; ++i) {
             for (int j = jlo(i); j <= jhi(i); ++j) {
@@ -2376,7 +2515,7 @@ private:
                 double log_p = rat(buf.F, i-1, j-1)
                                + sub(i, j)
                                + bval - log_z_;
-                gblk[sub_off(i, j)] += std::exp(log_p);
+                gcell(grows, i, j) += std::exp(log_p);
             }
         }
 
@@ -2494,7 +2633,7 @@ private:
     }
 
     void soft_grad_affine(const DpBuffer& buf, AlignParams& grad) const {
-        double* gblk = grad_block(grad);
+        const std::vector<double*> grows = grad_rows(grad);
         // Matrix gradient: match steps
         for (int i = 1; i <= m_; ++i) {
             for (int j = jlo(i); j <= jhi(i); ++j) {
@@ -2502,7 +2641,7 @@ private:
                 if (bm == NEG_INF) continue;
                 double pred  = lse3(rat(buf.FM,i-1,j-1), rat(buf.FX,i-1,j-1), rat(buf.FY,i-1,j-1));
                 double log_p = pred + sub(i, j) + bm - log_z_;
-                gblk[sub_off(i, j)] += std::exp(log_p);
+                gcell(grows, i, j) += std::exp(log_p);
             }
         }
 

@@ -91,7 +91,13 @@ inline constexpr double NEG_INF = -std::numeric_limits<double>::infinity();
 
 // ── Query profile ─────────────────────────────────────────────────────────────
 //
-// prof[c*(n+1) + j] = score of symbol c against b[j-1], for j in [1, n].
+// prof[c*(n+1) + j] = score of ROW SYMBOL c against b[j-1], for j in [1, n].
+//
+// "Row symbol" rather than "alphabet symbol": with a matrix track the row axis is the
+// problem's compacted (slot, residue) alphabet of nrow_ entries, built in
+// build_row_alphabet().  Without one it is the plain residue alphabet renumbered, so
+// this loop is what it always was.  Nothing else about the profile changes — which is
+// the entire reason position-dependent scoring costs nothing per cell here.
 //
 // Indexed by the DP's own 1-based j so the row kernels can read subrow[j] directly
 // alongside vm_cur[j].  Slot j=0 is padding and never read — it exists so that
@@ -99,17 +105,17 @@ inline constexpr double NEG_INF = -std::numeric_limits<double>::infinity();
 // would form a pointer before the start of the allocation and is undefined behaviour
 // even if it happens to work.
 //
-// Rebuilt on every simd call rather than cached: the cost is O(nalpha * n) at ~2 ops
+// Rebuilt on every simd call rather than cached: the cost is O(nrow_ * n) at ~2 ops
 // per entry against a DP of O(m * n) at ~15 ops per cell — about 2.7/m, so ~5% at
 // m=50 and ~1% at m=200 — and it buys immunity to a whole class of staleness bugs
 // when the matrix changes under a SeqPair between re-alignments.
 template<GapModel GM, AlignMode AM, AlignBand AB, class T>
 void Aligner<GM, AM, AB, T>::build_profile(DpBuffer& buf) const {
     const size_t w = static_cast<size_t>(n_) + 1;
-    const size_t need = static_cast<size_t>(nalpha_) * w;
+    const size_t need = static_cast<size_t>(nrow_) * w;
     if (buf.prof.size() < need) buf.prof.resize(need);
 
-    for (int c = 0; c < nalpha_; ++c) {
+    for (int c = 0; c < nrow_; ++c) {
         const double* blk_row = blk_ + static_cast<size_t>(c) * static_cast<size_t>(nalpha_);
         double* dst = buf.prof.data() + static_cast<size_t>(c) * w;
         dst[0] = 0.0;  // padding; never read
@@ -121,7 +127,7 @@ void Aligner<GM, AM, AB, T>::build_profile(DpBuffer& buf) const {
 // Substitution scores for row i, contiguous in j.
 //
 // Full mode hands back a slice of the profile.  Banded mode gathers the row's short
-// span instead: a full-width profile costs O(nalpha * n) against a banded DP of only
+// span instead: a full-width profile costs O(nrow_ * n) against a banded DP of only
 // O(m * band), so for a narrow band it would outcost the thing it is accelerating.
 template<GapModel GM, AlignMode AM, AlignBand AB, class T>
 const double* Aligner<GM, AM, AB, T>::subrow(DpBuffer& buf, int i, int lo, int hi) const {
@@ -129,12 +135,12 @@ const double* Aligner<GM, AM, AB, T>::subrow(DpBuffer& buf, int i, int lo, int h
         (void)lo; (void)hi;
         const size_t w = static_cast<size_t>(n_) + 1;
         return buf.prof.data() +
-               static_cast<size_t>(a_idx_[static_cast<size_t>(i) - 1]) * w;
+               static_cast<size_t>(arow_[static_cast<size_t>(i) - 1]) * w;
     } else {
         const size_t w = static_cast<size_t>(n_) + 1;
         if (buf.subbuf.size() < w) buf.subbuf.resize(w);
         const double* blk_row =
-            blk_ + static_cast<size_t>(a_idx_[static_cast<size_t>(i) - 1]) *
+            blk_ + static_cast<size_t>(arow_[static_cast<size_t>(i) - 1]) *
                        static_cast<size_t>(nalpha_);
         double* dst = buf.subbuf.data();
         for (int j = lo; j <= hi; ++j)
