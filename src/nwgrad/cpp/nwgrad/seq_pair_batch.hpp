@@ -326,6 +326,39 @@ struct SeqPairBatchT {
         return grad_out;
     }
 
+    // The pairs' cached scores, in pair order.  Runs no alignment: call
+    // score_and_grad(), align_full(), realign_banded() or banded_grad() first.
+    // Throws if any pair has no valid score.
+    std::vector<double> scores() const {
+        std::vector<double> out(pairs.size());
+        for (size_t i = 0; i < pairs.size(); ++i) out[i] = pairs[i]->score();
+        return out;
+    }
+
+    // sum_i weights[i] * grad_i over the pairs' CACHED gradients.  Runs no
+    // alignment, so a caller whose weights depend on the scores (a logistic
+    // likelihood, say) runs score_and_grad(), derives the weights from
+    // scores(), then calls this.
+    //
+    // Summed serially in pair-index order: the result is bit-reproducible and
+    // independent of n_threads and the schedule.  (compute_grad() sums per-thread
+    // partials in completion order, so it is not.)  One pass of O(N * |alphabet|^2)
+    // multiply-adds is negligible next to the DP that produced the gradients.
+    //
+    // Throws on an empty batch (the sum has no alphabet), on a weight count other
+    // than size(), and on a pair without a valid gradient.
+    AlignParams weighted_grad(const double* weights, size_t n) const {
+        const Alphabet& alpha = alphabet();   // throws if empty
+        if (n != pairs.size())
+            throw std::invalid_argument(
+                "nwgrad: weighted_grad() needs one weight per pair (got " +
+                std::to_string(n) + " weights for " +
+                std::to_string(pairs.size()) + " pairs)");
+        AlignParams out(alpha);
+        for (size_t i = 0; i < n; ++i) out.add_scaled(pairs[i]->grad(), weights[i]);
+        return out;
+    }
+
     // Full-pipeline batch operation using per-thread DpBuffers.
     // For each pair: runs the full DP, computes grad,
     // stores score + guide_j + grad into the SeqPair.  The pairs' own DP tables

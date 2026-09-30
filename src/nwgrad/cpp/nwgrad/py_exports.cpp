@@ -494,6 +494,31 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
              "Compute gradient on all pairs in parallel.  Returns summed AlignParams.")
         .def("score_and_grad", [](SPB& self) { return self.score_and_grad(); },
              "Full-DP batch op using per-thread DP buffers.  Returns sum of scores.")
+        .def(
+            "scores",
+            [](const SPB& self) {
+                std::vector<double> v = self.scores();
+                double* buf = new double[v.size()];
+                std::copy(v.begin(), v.end(), buf);
+                nb::capsule owner(buf, [](void* p) noexcept { delete[] static_cast<double*>(p); });
+                size_t shape[1] = {v.size()};
+                return nb::ndarray<nb::numpy, double>(buf, 1, shape, owner);
+            },
+            "The pairs' cached scores as a float64 array, in pair order.  Runs no\n"
+            "alignment; raises if any pair has no valid score.")
+        .def(
+            "weighted_grad",
+            [](const SPB& self,
+               nb::ndarray<const double, nb::ndim<1>, nb::c_contig, nb::device::cpu> weights) {
+                return self.weighted_grad(weights.data(), weights.shape(0));
+            },
+            nb::arg("weights"), nb::rv_policy::move,
+            "sum_i weights[i] * grad_i over the pairs' CACHED gradients, as one\n"
+            "AlignParams.  Runs no alignment: call score_and_grad() (or compute_grad())\n"
+            "first, derive the weights from scores() if they depend on them, then call\n"
+            "this.  Summed in pair order, so the result does not depend on n_threads.\n"
+            "Raises on an empty batch, on len(weights) != len(batch), and on a pair\n"
+            "without a valid gradient.")
         .def("banded_grad",
              [](SPB& self, int bandwidth) { return self.banded_grad(bandwidth); },
              nb::arg("bandwidth"),

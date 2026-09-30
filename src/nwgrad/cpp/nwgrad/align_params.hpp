@@ -84,6 +84,17 @@ struct AlignParams {
 
     AlignParams& operator-=(const AlignParams& o) { return *this += (-1.0 * o); }
 
+    // *this += s * o over every field, without building s * o.  The accumulation
+    // step of a weighted gradient sum.
+    AlignParams& add_scaled(const AlignParams& o, double s) {
+        matrix.add_scaled(o.matrix, s);
+        gap_open_a   += s * o.gap_open_a;
+        gap_extend_a += s * o.gap_extend_a;
+        gap_open_b   += s * o.gap_open_b;
+        gap_extend_b += s * o.gap_extend_b;
+        return *this;
+    }
+
     AlignParams operator+(const AlignParams& o) const {
         AlignParams r(*this);
         r += o;

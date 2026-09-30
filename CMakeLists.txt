@@ -156,6 +156,7 @@ add_executable(nwgrad_tests
     tests/cpp/test_hirschberg_scan.cpp
     tests/cpp/test_hirschberg_pmax.cpp
     tests/cpp/test_add_many.cpp
+    tests/cpp/test_weighted_grad.cpp
     tests/cpp/test_simd_bitexact.cpp
     tests/cpp/test_simd_bitexact_f32.cpp
     ${NWGRAD_LEVEL_SOURCES}   # per-ISA kernel TUs, so kernel="simd" exercises the dispatched striped path

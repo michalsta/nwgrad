@@ -118,6 +118,11 @@ total_log_z = batch.score_and_grad()
 # Sum gradients across all pairs → AlignParams
 grad = batch.compute_grad()
 
+# Or weight each pair's gradient, e.g. by a per-pair loss derivative computed
+# from the scores.  Reads the cached gradients; no alignment is run.
+scores = batch.scores()                     # float64 array, pair order
+grad = batch.weighted_grad(weights)         # sum_i weights[i] * grad_i
+
 # Update matrix and re-run with banded DP around the existing paths
 new_params = nwgrad.AlignParams(new_subst_matrix,
                                 gap_open_a=11.0, gap_extend_a=1.0,
@@ -307,6 +312,8 @@ nwgrad.SeqPairBatch(n_threads=0)
 | `set_params(params)` | — | Call `set_params()` on all pairs |
 | `score_and_grad(bandwidth=0)` | `float` (sum of scores) | Full-pipeline parallel alignment. Uses per-thread DP buffers (pair-owned tables are never allocated). If `bandwidth > 0`, runs a full DP for the guide path then a banded DP. Results are cached on each `SeqPair`. |
 | `compute_grad()` | `AlignParams` | Sum cached per-pair gradients. No DP work if all `grad_valid` are already true. |
+| `scores()` | `numpy.ndarray` (float64) | The cached per-pair scores, in pair order. Runs no DP; raises if any pair has no valid score. |
+| `weighted_grad(weights)` | `AlignParams` | `sum_i weights[i] * grad_i` over the cached per-pair gradients. `weights` is a 1-D numeric array with one entry per pair. Runs no DP; raises if any pair has no valid gradient. Summed in pair order, so the result does not depend on `n_threads`. |
 | `align_full()` | `float` (sum of scores) | Full DP on all pairs in parallel using pair-owned buffers. Call `alloc_dp()` first. |
 | `realign_banded(bandwidth)` | `float` (sum of scores) | Banded DP on all pairs in parallel using pair-owned buffers. |
 | `alloc_dp()` | — | Pre-allocate pair-owned DP tables in parallel. |
