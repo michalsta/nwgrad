@@ -1,8 +1,6 @@
-import importlib.metadata
 from pathlib import Path
 
-
-__version__ = importlib.metadata.version("nwgrad")
+from . import __version__
 
 
 def module_main():

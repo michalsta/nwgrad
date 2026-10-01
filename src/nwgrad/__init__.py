@@ -32,3 +32,7 @@ from .nwgrad_ext import (
     BatchAlignerDouble, SeqPairDouble, SeqPairBatchDouble,
 )
 from . import matrices
+
+from importlib.metadata import version as _version
+__version__ = _version("nwgrad")
+del _version

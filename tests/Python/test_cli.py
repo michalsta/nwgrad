@@ -75,3 +75,8 @@ def test_headers_are_importable_from_the_advertised_path():
         [cxx, "-std=c++20", "-I", include_dir, "-fsyntax-only", "-x", "c++", "-"],
         input=source, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
+
+
+def test_package_version_comes_from_the_installed_metadata():
+    import nwgrad
+    assert nwgrad.__version__ == version("nwgrad")
