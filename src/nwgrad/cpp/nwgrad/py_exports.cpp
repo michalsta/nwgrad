@@ -98,6 +98,33 @@ static void keep_current_params(nb::object owner, nb::object params) {
     owner.attr("_params") = params;
 }
 
+static GapModel parse_gap_model(const std::string& name) {
+    if (name == "linear") return GapModel::Linear;
+    if (name == "affine") return GapModel::Affine;
+    throw nb::value_error(
+        ("nwgrad: unknown gap_model \"" + name +
+         "\" (expected \"linear\" or \"affine\")").c_str());
+}
+
+static AlignMode parse_align_mode(const std::string& name) {
+    if (name == "global") return AlignMode::Global;
+    if (name == "local")  return AlignMode::Local;
+    throw nb::value_error(
+        ("nwgrad: unknown mode \"" + name +
+         "\" (expected \"global\" or \"local\")").c_str());
+}
+
+// BatchAligner and SeqPair use separate gradient-mode enum types.
+template<class Mode>
+static Mode parse_grad_mode(const std::string& name) {
+    if (name == "hard") return Mode::Hard;
+    if (name == "soft") return Mode::Soft;
+    if (name == "none") return Mode::None;
+    throw nb::value_error(
+        ("nwgrad: unknown grad_mode \"" + name +
+         "\" (expected \"hard\", \"soft\" or \"none\")").c_str());
+}
+
 // Traceback vocabulary, mirroring gap_model= / mode= / grad_mode= / kernel=.
 static TracebackMode parse_traceback(const std::string& name) {
     if (name == "auto")       return TracebackMode::Default;
@@ -219,12 +246,9 @@ static void bind_batch_aligner(nb::module_& m, const char* name) {
             [](BA* self, const AlignParams& params, int band,
                const std::string& gap_model, const std::string& mode,
                const std::string& grad_mode, int n_threads, const std::string& kernel) {
-                GapModel  gm = (gap_model == "affine") ? GapModel::Affine  : GapModel::Linear;
-                AlignMode am = (mode      == "local")  ? AlignMode::Local  : AlignMode::Global;
-                typename BA::GradMode gd;
-                if      (grad_mode == "hard") gd = BA::GradMode::Hard;
-                else if (grad_mode == "soft") gd = BA::GradMode::Soft;
-                else                          gd = BA::GradMode::None;
+                const GapModel gm = parse_gap_model(gap_model);
+                const AlignMode am = parse_align_mode(mode);
+                const auto gd = parse_grad_mode<typename BA::GradMode>(grad_mode);
                 new (self) BA(params, band, gm, am, gd, n_threads, parse_backend(kernel));
             },
             nb::arg("params"), nb::arg("band") = 0, nb::arg("gap_model") = "affine",
@@ -280,12 +304,9 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
                const AlignParams& params, const std::string& gap_model,
                const std::string& mode, const std::string& grad_mode,
                const std::string& kernel, const std::string& traceback) {
-                GapModel  gm = (gap_model == "affine") ? GapModel::Affine  : GapModel::Linear;
-                AlignMode am = (mode      == "local")  ? AlignMode::Local  : AlignMode::Global;
-                GradMode  gd;
-                if      (grad_mode == "hard") gd = GradMode::Hard;
-                else if (grad_mode == "soft") gd = GradMode::Soft;
-                else                          gd = GradMode::None;
+                const GapModel gm = parse_gap_model(gap_model);
+                const AlignMode am = parse_align_mode(mode);
+                const auto gd = parse_grad_mode<GradMode>(grad_mode);
                 new (self) SP(seq_a, seq_b, params, gm, am, gd, parse_backend(kernel),
                               parse_traceback(traceback));
             },
@@ -445,12 +466,9 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
                const std::string& grad_mode, const std::string& kernel) {
                 SPB& self = nb::cast<SPB&>(self_obj);
                 const AlignParams& params = nb::cast<const AlignParams&>(params_obj);
-                GapModel  gm = (gap_model == "affine") ? GapModel::Affine : GapModel::Linear;
-                AlignMode am = (mode      == "local")  ? AlignMode::Local : AlignMode::Global;
-                GradMode  gd;
-                if      (grad_mode == "hard") gd = GradMode::Hard;
-                else if (grad_mode == "soft") gd = GradMode::Soft;
-                else                          gd = GradMode::None;
+                const GapModel gm = parse_gap_model(gap_model);
+                const AlignMode am = parse_align_mode(mode);
+                const auto gd = parse_grad_mode<GradMode>(grad_mode);
                 int  kn = parse_backend(kernel);
                 self.add_many(seqs_a, seqs_b, params, gm, am, gd, kn);
                 nb::list refs;
