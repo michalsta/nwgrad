@@ -743,7 +743,7 @@ def test_self_pair_closed_form(params):
 
 # --- "bit-exact with pointers below hb_cutoff" -------------------------------------------
 #
-# README's traceback table promises that a pair no longer than hb_cutoff never splits and
+# docs/tuning.md's traceback table promises that a pair no longer than hb_cutoff never splits and
 # is bit-exact with "pointers".  It used not to be: such a pair ran the Hirschberg base
 # case, whose borders are seeded and carried differently from the Pointers fill, so with
 # a non-representable gap_extend (0.1) it settled float ties on paths one ULP worse
