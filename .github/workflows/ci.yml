@@ -215,6 +215,58 @@ jobs:
       - name: Test
         run: ctest --test-dir build-san --output-on-failure
 
+  tsan:
+    name: C++ tests (${{ matrix.compiler }}, TSan)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - compiler: gcc
+            cc: gcc
+            cxx: g++
+          - compiler: clang
+            cc: clang
+            cxx: clang++
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+      # Fail on the first race rather than collecting reports and exiting 66 at the
+      # end: the first one is the one worth reading, and later ones are often echoes.
+      TSAN_OPTIONS: halt_on_error=1 second_deadlock_stack=1
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install nanobind
+        run: pip install nanobind
+
+      # TSan reserves fixed shadow ranges, and the runner kernel's 32 bits of mmap
+      # randomization can place a mapping inside them; older runtimes then die at
+      # startup with "FATAL: ThreadSanitizer: unexpected memory mapping" before a
+      # single test runs.  28 bits is the long-standing safe value.
+      - name: Narrow mmap ASLR for TSan
+        run: sudo sysctl vm.mmap_rnd_bits=28
+
+      # Its own build: TSan cannot share one with ASan.  The batch workers share
+      # SeqPairs, DP buffers and gradient accumulators across threads; this is the
+      # job that sees two workers touching one of them.
+      - name: Configure
+        run: >
+          cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug
+          -DNWGRAD_SANITIZE=ON -DNWGRAD_SANITIZERS=thread
+          -DNWGRAD_BUILD_BENCHMARKS=OFF
+          -Dnanobind_DIR="$(python -m nanobind --cmake_dir)"
+
+      - name: Build
+        run: cmake --build build-tsan --target nwgrad_tests -j"$(nproc)"
+
+      - name: Test
+        run: ctest --test-dir build-tsan --output-on-failure -j"$(nproc)"
+
   python:
     name: Python tests (${{ matrix.python-version }})
     runs-on: ubuntu-latest

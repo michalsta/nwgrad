@@ -97,12 +97,22 @@ option(NWGRAD_SANITIZE_EXT
 # Which sanitizers, for either option.  Split so ASan and UBSan can run as
 # separate CI jobs: ASan needs an LD_PRELOAD dance and must give up leak
 # detection inside CPython, UBSan needs neither.
+#
+# "thread" (TSan) is the third configuration, and it must be its own build: TSan
+# cannot be combined with ASan.  The batch workers hand SeqPairs, DP buffers and
+# summed gradients across threads; TSan is what sees two workers touching one of
+# them, which ASan and UBSan cannot.  Verified live: it reports the duplicate-pair
+# race (two workers in one Aligner::set_problem) at its first collision.
 set(NWGRAD_SANITIZERS "address,undefined" CACHE STRING
-    "Comma-separated -fsanitize list for NWGRAD_SANITIZE / NWGRAD_SANITIZE_EXT")
+    "Comma-separated -fsanitize list for NWGRAD_SANITIZE / NWGRAD_SANITIZE_EXT (or \"thread\")")
 
 if (NWGRAD_SANITIZE OR NWGRAD_SANITIZE_EXT)
     if (NOT CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
         message(FATAL_ERROR "NWGRAD_SANITIZE requires GCC or Clang")
+    endif()
+    if (NWGRAD_SANITIZERS MATCHES "thread" AND NWGRAD_SANITIZERS MATCHES "address")
+        message(FATAL_ERROR "NWGRAD_SANITIZERS: thread and address cannot be combined; "
+                            "configure a separate build for each")
     endif()
     set(NWGRAD_SANITIZE_FLAGS
         -fsanitize=${NWGRAD_SANITIZERS}
@@ -180,6 +190,16 @@ if (NWGRAD_BUILD_TESTS)
         target_compile_options(nwgrad_tests PRIVATE -Wall -Wextra)
     endif()
     target_link_libraries(nwgrad_tests PRIVATE Threads::Threads)
+
+    # Hardened standard library for the test binary in EVERY build, not only the
+    # sanitizer ones: the plain gcc/clang and NEON CI jobs, and any local
+    # `cmake -B build`, otherwise ran the tests with unchecked operator[].  Neither
+    # macro changes the ABI.  Deliberately not -fhardened: its
+    # -ftrivial-auto-var-init=zero would zero exactly the uninitialized reads a test
+    # build exists to expose, and _FORTIFY_SOURCE needs optimization.
+    target_compile_definitions(nwgrad_tests PRIVATE
+        _GLIBCXX_ASSERTIONS
+        $<$<CXX_COMPILER_ID:Clang,AppleClang>:_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_DEBUG>)
 
     # Sanitizers must be passed to both the compile and the link step.
     if (NWGRAD_SANITIZE)
