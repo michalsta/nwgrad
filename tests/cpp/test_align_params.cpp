@@ -34,12 +34,18 @@ static void require_matrix_equals(const SubstMatrix& got, const SubstMatrix& wan
             REQUIRE(got.at(i, j) == Approx(want.at(i, j)));
 }
 
+// Approx is purely relative by default, so an expected value of exactly 0 tolerates
+// nothing.  A step like x - 0.1*(10x) cancels to 0 in the library (two roundings) but
+// to ~1e-17 in an expectation that AArch64 gcc contracts into one fused multiply-
+// subtract, so every comparison here carries a small absolute margin as well.
+constexpr double kAbsMargin = 1e-12;
+
 static void require_gaps(const AlignParams& p, double oa, double ea,
                          double ob, double eb) {
-    REQUIRE(p.gap_open_a   == Approx(oa));
-    REQUIRE(p.gap_extend_a == Approx(ea));
-    REQUIRE(p.gap_open_b   == Approx(ob));
-    REQUIRE(p.gap_extend_b == Approx(eb));
+    REQUIRE(p.gap_open_a   == Approx(oa).margin(kAbsMargin));
+    REQUIRE(p.gap_extend_a == Approx(ea).margin(kAbsMargin));
+    REQUIRE(p.gap_open_b   == Approx(ob).margin(kAbsMargin));
+    REQUIRE(p.gap_extend_b == Approx(eb).margin(kAbsMargin));
 }
 
 TEST_CASE("AlignParams: default construction is a zero accumulator", "[params]") {
@@ -183,7 +189,8 @@ TEST_CASE("AlignParams: the advertised gradient-descent step", "[params]") {
     for (int i = 0; i < 20; ++i)
         for (int j = 0; j < 20; ++j)
             REQUIRE(params.matrix.at(i, j) ==
-                    Approx(before.matrix.at(i, j) - learning_rate * grad.matrix.at(i, j)));
+                    Approx(before.matrix.at(i, j) - learning_rate * grad.matrix.at(i, j))
+                        .margin(kAbsMargin));
     require_gaps(params,
                  before.gap_open_a   - learning_rate * grad.gap_open_a,
                  before.gap_extend_a - learning_rate * grad.gap_extend_a,
