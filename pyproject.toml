@@ -7,12 +7,12 @@ build-backend = "scikit_build_core.build"
 name = "nwgrad"
 dependencies = ["numpy"]
 description = "High-performance sequence alignment with gradients of the score w.r.t. the substitution matrix."
-version = "0.4.0"
+version = "0.5.0"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{name = "Michał Startek"}]
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 classifiers = [
     "Programming Language :: Python :: 3",
     "Topic :: Software Development :: Libraries :: Python Modules",
@@ -40,7 +40,7 @@ testpaths = ["tests/Python"]
 # and rejected outright.  CPython wheels dodge this entirely: every test dependency
 # has a prebuilt wheel, so nothing is compiled at test time.  PyPy was never a target.
 [tool.cibuildwheel]
-skip = ["cp36-*", "cp37-*", "pp*"]
+skip = ["cp36-*", "cp37-*", "cp38-*", "pp*"]
 test-command = "python -m pytest {project}/tests/Python"
 test-extras = ["dev"]
 
