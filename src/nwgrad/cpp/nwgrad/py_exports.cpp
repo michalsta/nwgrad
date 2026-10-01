@@ -98,6 +98,52 @@ static void keep_current_params(nb::object owner, nb::object params) {
     owner.attr("_params") = params;
 }
 
+// `nurse` keeps `patient` alive, through nanobind's own keep-alive table: a C++ hash
+// map, not a Python container, so it adds nothing for the cyclic GC to walk.  That
+// is the point.  Pinning via an attribute instead created a __dict__ and a list per
+// pair, and on 3.14's GC that cost ~3 us per first add() (707 -> 3575 ns, 200k
+// pairs; ~2.5 us of it was the GC re-walking those containers).  The table is
+// invisible to the GC, so only use it where the patient can never reach back to the
+// nurse.  NB_CALL(keep_alive_py) is the entry nanobind's own keep_alive<> call policy
+// uses; it needs nanobind >= 3.0, which pyproject.toml and CMakeLists.txt enforce.
+static void pin(nb::handle nurse, nb::handle patient) {
+    NB_CALL(keep_alive_py)(NB_CTX, nurse.ptr(), patient.ptr());
+}
+
+// The list stored in obj.<name>, created empty on first use.  Looked up in the
+// instance __dict__ rather than with nb::hasattr, which raises and discards an
+// AttributeError on every miss.  (Not a measurable win here — the first-add cost
+// it was suspected of turned out to be the GC — just the direct way to ask.)
+// `name` must be a string literal: its interned str is created once per call site
+// and deliberately never released (a handful of immortal attribute names).
+static nb::list attr_list(nb::handle obj, PyObject* key) {
+    nb::dict d = nb::borrow<nb::dict>(obj.attr("__dict__"));
+    if (PyObject* v = PyDict_GetItemWithError(d.ptr(), key))
+        return nb::borrow<nb::list>(v);
+    if (PyErr_Occurred()) throw nb::python_error();
+    nb::list l;
+    if (PyDict_SetItem(d.ptr(), key, l.ptr()) != 0) throw nb::python_error();
+    return l;
+}
+#define NWGRAD_ATTR_LIST(obj, name) \
+    attr_list((obj), [] { static PyObject* k = PyUnicode_InternFromString(name); return k; }())
+
+// A batch's params pin is a one-slot CELL (a list) rather than an attribute, so it can
+// be SHARED with every pair added to the batch.  batch.set_params() re-points all its
+// pairs in C++, including borrowed ones that may outlive the batch; each of those must
+// keep the new params alive, and re-pinning them one by one cost ~570 ns per pair per
+// swap (a Python setattr on a scattered wrapper — measured, 3.5% of a 50x50 DP step).
+// With the cell, set_params() writes one slot and every pair that holds the cell is
+// covered.  Safe because a pair's C++ params were set either by pair.set_params()
+// (pinned in its own _params) or by some batch's set_params() (pinned in that batch's
+// cell, which the pair holds from add() on).  The cost is mild over-retention: a pair
+// keeps alive the LAST params of each batch it was ever added to.
+static nb::list batch_params_cell(nb::handle batch) {
+    nb::list cell = NWGRAD_ATTR_LIST(batch, "_params_cell");
+    if (cell.size() == 0) cell.append(nb::none());
+    return cell;
+}
+
 static GapModel parse_gap_model(const std::string& name) {
     if (name == "linear") return GapModel::Linear;
     if (name == "affine") return GapModel::Affine;
@@ -447,12 +493,13 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             [](nb::object self_obj, nb::object sp_obj) {
                 SPB& self = nb::cast<SPB&>(self_obj);
                 self.add(nb::cast<SP*>(sp_obj));
-                nb::list refs;
-                if (nb::hasattr(self_obj, "_keepalive"))
-                    refs = nb::borrow<nb::list>(self_obj.attr("_keepalive"));
-                else
-                    self_obj.attr("_keepalive") = refs;
-                refs.append(sp_obj);
+                NWGRAD_ATTR_LIST(self_obj, "_keepalive").append(sp_obj);
+                // Share the batch's params cell with the pair: once this batch's
+                // set_params() re-points the pair, the cell is what keeps those params
+                // alive for it — even after the batch is gone.  See batch_params_cell().
+                // pin(), not an attribute: no per-pair container for the GC, and no
+                // cycle is possible — the cell holds only params, never a pair or batch.
+                pin(sp_obj, batch_params_cell(self_obj));
             },
             nb::arg("seq_pair"),
             "Append a SeqPair to the batch.")
@@ -471,12 +518,7 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
                 const auto gd = parse_grad_mode<GradMode>(grad_mode);
                 int  kn = parse_backend(kernel);
                 self.add_many(seqs_a, seqs_b, params, gm, am, gd, kn);
-                nb::list refs;
-                if (nb::hasattr(self_obj, "_owned_params"))
-                    refs = nb::borrow<nb::list>(self_obj.attr("_owned_params"));
-                else
-                    self_obj.attr("_owned_params") = refs;
-                refs.append(params_obj);
+                NWGRAD_ATTR_LIST(self_obj, "_owned_params").append(params_obj);
             },
             nb::arg("seqs_a"), nb::arg("seqs_b"), nb::arg("params"),
             nb::arg("gap_model") = "affine", nb::arg("mode") = "global",
@@ -486,13 +528,31 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
         .def("__len__", &SPB::size)
         .def(
             "__getitem__",
-            [](SPB& self, int i) -> SP& {
+            [](nb::object self_obj, int i) -> nb::object {
+                SPB& self = nb::cast<SPB&>(self_obj);
                 if (i < 0) i += static_cast<int>(self.size());
                 if (i < 0 || static_cast<size_t>(i) >= self.size())
                     throw nb::index_error("SeqPairBatch index out of range");
-                return self[static_cast<size_t>(i)];
+                SP& sp = self[static_cast<size_t>(i)];
+                // A pair with a live wrapper is returned as is: either Python built it
+                // (add() holds it in _keepalive, so its wrapper cannot have died) or it
+                // was indexed before and that wrapper already pins its owner.
+                nb::handle existing = nb::find(sp);
+                if (existing.is_valid())
+                    return nb::borrow(existing);
+                // No wrapper, so add_many() built it and THIS batch owns it: the
+                // wrapper must keep the batch alive, or it dangles once the batch dies.
+                // Pinned through a __dict__ attribute rather than keep_alive or
+                // rv_policy::reference_internal: the cyclic GC can see an attribute,
+                // so a cycle (b1.add(b2[0]) with b2.add(b1[0])) is collectable instead
+                // of leaking both batches through nanobind's keep-alive table.  And
+                // only owned pairs get it: pinning a borrowed pair's wrapper to the
+                // batch would close a cycle on every add() + index.
+                nb::object w = nb::cast(&sp, nb::rv_policy::reference);
+                w.attr("_owner") = self_obj;
+                return w;
             },
-            nb::rv_policy::reference, nb::arg("i"))
+            nb::arg("i"))
         .def("alloc_dp", [](SPB& self) { self.alloc_dp(); },
              "Pre-allocate own DP tables on all pairs in parallel.")
         .def(
@@ -500,7 +560,11 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             [](nb::object self_obj, nb::object params_obj) {
                 SPB& self = nb::cast<SPB&>(self_obj);
                 self.set_params(nb::cast<const AlignParams&>(params_obj));
-                keep_current_params(self_obj, params_obj);
+                // One slot, shared by the batch and every pair it borrowed: O(1)
+                // however many pairs, superseded params released at once.  It used
+                // to pin only the batch, so a borrowed pair outliving the batch
+                // pointed at freed params.  See batch_params_cell().
+                batch_params_cell(self_obj)[0] = params_obj;
             },
             nb::arg("params"),
             "Set alignment parameters on all pairs (clears score and grad caches).")

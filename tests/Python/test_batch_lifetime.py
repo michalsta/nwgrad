@@ -13,9 +13,10 @@ a use-after-free, which in-process would crash pytest or corrupt its heap and fa
 unrelated later test.  Observed on the unfixed tree: a segfault (exit 139) for an
 indexed pair, and a silently wrong score (396 where 8 is correct) for stale params.
 
-Tests marked xfail(strict=True) document a bug not yet fixed.  When the fix lands they
-XPASS, strict turns that into a failure, and the marker must be removed — so the test
-cannot quietly keep "expecting" a bug that no longer exists.
+The fix: an indexed batch-owned pair pins its batch through an `_owner` attribute, and
+batch.set_params() re-pins every borrowed pair's `_params`.  Attributes rather than
+nanobind keep_alive, so any cycle they close stays visible to the cyclic GC — the last
+two tests check that nothing leaks.
 """
 
 import pytest
@@ -64,14 +65,11 @@ def run(sp, spb, body):
 
 # --- Issue 2: a pair indexed out of a batch must keep the batch alive -------------------
 #
-# add_many() pairs are owned by the batch (unique_ptrs in owned_); __getitem__ hands them
-# out with rv_policy::reference, so nothing stops the batch dying under the wrapper.
-
-ISSUE2 = pytest.mark.xfail(strict=True, reason="issue 2: indexed C++-owned pair does not "
-                                               "retain its batch (rv_policy::reference)")
+# add_many() pairs are owned by the batch (unique_ptrs in owned_).  __getitem__ used to
+# hand them out with rv_policy::reference, so nothing stopped the batch dying under the
+# wrapper; the wrapper now pins it through an `_owner` attribute.
 
 
-@ISSUE2
 @pytest.mark.parametrize("sp,spb", PRECISIONS, ids=PRECISION_IDS)
 def test_indexed_pair_outlives_batch(sp, spb):
     run(sp, spb, """
@@ -85,7 +83,6 @@ expect(s, 2)
 """)
 
 
-@ISSUE2
 @pytest.mark.parametrize("sp,spb", PRECISIONS, ids=PRECISION_IDS)
 def test_every_indexed_pair_outlives_batch(sp, spb):
     """Index every pair, several times over (exercises nanobind handing back an existing
@@ -103,7 +100,6 @@ expect(held[-1], 2, *seqs[-1])
 """)
 
 
-@ISSUE2
 @pytest.mark.parametrize("sp,spb", PRECISIONS, ids=PRECISION_IDS)
 def test_owned_pair_borrowed_by_second_batch(sp, spb):
     """A pair owned by batch 1, added to batch 2: batch 2's keep-alive holds the wrapper,
@@ -140,14 +136,11 @@ expect(s, 2)
 
 # --- Issue 3: batch.set_params() must pin the new params for every surviving pair -------
 #
-# The batch re-points every pair at the new params but pins them only in the BATCH's
-# _params attribute.  A borrowed pair outliving the batch then points at freed params.
-
-ISSUE3 = pytest.mark.xfail(strict=True, reason="issue 3: batch.set_params() does not pin "
-                                               "new params for borrowed pairs")
+# The batch re-points every pair at the new params.  It used to pin them only in the
+# BATCH's _params, so a borrowed pair outliving the batch pointed at freed params; it
+# now re-pins each borrowed pair's own _params as well.
 
 
-@ISSUE3
 @pytest.mark.parametrize("sp,spb", PRECISIONS, ids=PRECISION_IDS)
 def test_borrowed_pair_keeps_batch_params(sp, spb):
     run(sp, spb, """
@@ -162,7 +155,6 @@ expect(s, 2)
 """)
 
 
-@ISSUE3
 @pytest.mark.parametrize("sp,spb", PRECISIONS, ids=PRECISION_IDS)
 def test_borrowed_pair_after_repeated_set_params(sp, spb):
     """A training loop: many replacements, each new params' only name dropped at once.
@@ -181,7 +173,6 @@ expect(s, 11)
 """)
 
 
-@ISSUE3
 @pytest.mark.parametrize("sp,spb", PRECISIONS, ids=PRECISION_IDS)
 def test_pair_shared_by_two_batches(sp, spb):
     """Last set_params() wins, whichever batch made it, and the pair outlives both."""
@@ -228,4 +219,51 @@ trash = churn()
 total = b.score_and_grad()
 ref = SP(A, B, params(3)).score_and_grad()[0]
 assert total == 2 * ref, f"batch total {total} != {2 * ref}"
+""")
+
+
+# --- No leaks: the pins above must not keep batches alive forever ------------------------
+
+def _live_batches():
+    return """
+def live_batches():
+    gc.collect()
+    return sum(type(o).__name__ in ("SeqPairBatch", "SeqPairBatchDouble")
+               for o in gc.get_objects())
+"""
+
+
+@pytest.mark.parametrize("sp,spb", PRECISIONS, ids=PRECISION_IDS)
+def test_indexing_borrowed_pair_does_not_pin_batch(sp, spb):
+    """Index a pair that was add()-ed: the batch already holds that wrapper, so pinning
+    the batch from it would be a cycle.  The batch must die by refcount alone."""
+    run(sp, spb, _live_batches() + """
+gc.disable()
+s = SP(A, B, params(2))
+b = SPB(n_threads=1)
+b.add(s)
+assert b[0] is s
+b.set_params(params(3))
+del b
+gc.enable()
+assert live_batches() == 0, "batch kept alive by its own borrowed pair"
+expect(s, 3)
+""")
+
+
+@pytest.mark.parametrize("sp,spb", PRECISIONS, ids=PRECISION_IDS)
+def test_cross_batch_owned_pairs_are_collectable(sp, spb):
+    """b1 borrows a pair b2 owns and vice versa: a genuine cycle, b1 -> b2[0] -> b2 ->
+    b1[0] -> b1.  It must be collectable, and both must stay usable until then."""
+    run(sp, spb, _live_batches() + """
+b1, b2 = SPB(n_threads=1), SPB(n_threads=1)
+b1.add_many([A], [B], params(2))
+b2.add_many([A], [B], params(2))
+b1.add(b2[0]); b2.add(b1[0])
+w = b1[0]
+del b1, b2
+trash = churn()
+expect(w, 2)
+del w
+assert live_batches() == 0, "cross-batch cycle leaked"
 """)
