@@ -8,6 +8,7 @@
 #include <mutex>
 #include <numeric>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <thread>
 #include <vector>
@@ -170,6 +171,7 @@ struct SeqPairBatchT {
                 "\" cannot join a batch over alphabet \"" +
                 pairs.front()->alphabet().symbols() + "\"");
         pairs.push_back(sp);
+        unique_checked_ = false;  // verified lazily, at the next dispatch
     }
 
     // Bulk-construct N pairs in C++, in parallel, and append them.  The batch
@@ -654,6 +656,10 @@ private:
     // measurements.  hardware_concurrency() costs up to 1.44x on an SMT host.
     TracebackMode tb_ = TracebackMode::Default;
 
+    // False after an add() until check_unique_() has verified that no SeqPair
+    // repeats.  True for an empty batch and after add_many(), which cannot repeat.
+    bool unique_checked_ = true;
+
 public:
     // Hirschberg base-case size in rows, applied to pairs built by add_many().  Ignored
     // unless traceback resolves to Hirschberg.  512 from a fleet sweep AFTER hb_base was
@@ -679,8 +685,40 @@ private:
         run_workers(N, worker);
     }
 
+    // Every SeqPair in the batch must be distinct.  Workers align pairs[i] and
+    // pairs[j] concurrently; if both are one object, two threads write its DP tables
+    // and cached state at once — measured: wrong totals (some above the optimum),
+    // segfaults and hangs, with no error raised.  Even on one thread a duplicate
+    // double-counts the pair in every sum.  So it is rejected, but LAZILY: add()
+    // only marks the batch unchecked, and the next dispatch sorts a copy of the
+    // pointers once and caches the verdict until the next add().  O(N log N) once
+    // per batch change (~150 ms at 2.5M pairs) and nothing per training step, where
+    // an eager hash set would hold ~40 B per pair for the batch's whole life.
+    // add_many() pairs are freshly allocated and cannot repeat each other or an
+    // existing pair, so add_many() leaves the verdict alone; re-adding one of them
+    // with add() is caught like any other duplicate.  (`pairs` is public: code that
+    // pushes into it directly bypasses this check, as it bypasses add()'s.)
+    void check_unique_() {
+        if (unique_checked_) return;
+        std::vector<const SeqPair*> sorted(pairs.begin(), pairs.end());
+        std::sort(sorted.begin(), sorted.end());
+        auto dup = std::adjacent_find(sorted.begin(), sorted.end());
+        if (dup != sorted.end()) {
+            std::vector<size_t> where;
+            for (size_t i = 0; i < pairs.size() && where.size() < 2; ++i)
+                if (pairs[i] == *dup) where.push_back(i);
+            throw std::invalid_argument(
+                "nwgrad: the same SeqPair is in this batch more than once (at "
+                "indices " + std::to_string(where[0]) + " and " +
+                std::to_string(where[1]) + "); workers would align it "
+                "concurrently.  Add each pair once.");
+        }
+        unique_checked_ = true;
+    }
+
     template<typename Worker>
     void run_workers(size_t N, Worker& worker) {
+        check_unique_();
         if (N == 0) return;
         int actual = std::min<int>(n_threads, static_cast<int>(N));
         run_workers_guarded(actual, worker);

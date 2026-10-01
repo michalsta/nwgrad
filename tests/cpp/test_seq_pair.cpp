@@ -18,6 +18,7 @@
 
 #include <array>
 #include <string>
+#include <string_view>
 #include <vector>
 
 // Match = +2, mismatch = -1, over the canonical AA alphabet.
@@ -426,18 +427,15 @@ TEST_CASE("SeqPairBatch: single-threaded and multi-threaded agree",
 // ── Issue 4: the same SeqPair twice in one batch ─────────────────────────────
 //
 // Two workers would align one object concurrently — writing its DP tables and
-// cached state at once.  Observed from Python on the unfixed tree: wrong totals,
-// some above the optimum, and a segfault at double precision.  The guard must live
+// cached state at once.  Observed before the fix: wrong totals, some above the
+// optimum, a segfault at double precision, and a hang under TSan.  The guard must live
 // HERE, in the header, not only in the bindings: header-only users call add()
 // directly.  Rejection may happen at add() or at the next dispatch; both are
 // accepted.  Single-threaded on purpose — with one thread nothing races, so this
 // stays safe to run under ASan while the bug is still present.
 //
-// [!shouldfail] is Catch2's strict xfail: it passes while the assertion fails, and
-// fails once it passes.  When the fix lands, remove the tag.
-
 TEST_CASE("SeqPairBatch: a pair added twice is rejected",
-          "[seq_pair_batch][!shouldfail]") {
+          "[seq_pair_batch]") {
     auto p = asym_params(4.0, 0.5, 1.5, 2.0);
     SeqPair sp("WWKKLLMMFF", "WWKLLMMFFA", p,
                GapModel::Affine, AlignMode::Global, GradMode::Hard);
@@ -447,6 +445,38 @@ TEST_CASE("SeqPairBatch: a pair added twice is rejected",
         batch.add(&sp);
         batch.score_and_grad();
     }(), std::invalid_argument);
+}
+
+TEST_CASE("SeqPairBatch: a duplicate is rejected before any worker runs",
+          "[seq_pair_batch][threads]") {
+    // The multi-threaded case — the one that actually raced.  The check runs before
+    // the workers launch, so under the TSan job this must throw and report nothing;
+    // a check that ran after (or inside) the workers would show up as a race here.
+    // Every dispatch path, and a duplicate of an add_many()-owned pair via add().
+    auto p = asym_params(4.0, 0.5, 1.5, 2.0);
+    Corpus c;
+    std::vector<SeqPair> pairs;
+    pairs.reserve(c.as.size());
+    for (size_t i = 0; i < c.as.size(); ++i)
+        pairs.emplace_back(c.as[i], c.bs[i], p,
+                           GapModel::Affine, AlignMode::Global, GradMode::Hard);
+
+    SeqPairBatch batch(4);
+    for (auto& sp : pairs) batch.add(&sp);
+    batch.add(&pairs[2]);
+    REQUIRE_THROWS_AS(batch.score_and_grad(), std::invalid_argument);
+    REQUIRE_THROWS_AS(batch.alloc_dp(),       std::invalid_argument);
+    REQUIRE_THROWS_AS(batch.align_full(),     std::invalid_argument);
+    batch.sorted_schedule = true;
+    REQUIRE_THROWS_AS(batch.score_and_grad(), std::invalid_argument);
+
+    SeqPairBatch owned(4);
+    owned.add_many(std::vector<std::string_view>(c.as.begin(), c.as.end()),
+                   std::vector<std::string_view>(c.bs.begin(), c.bs.end()),
+                   p, GapModel::Affine, AlignMode::Global, GradMode::Hard);
+    REQUIRE_NOTHROW(owned.score_and_grad());   // add_many alone cannot duplicate
+    owned.add(&owned[1]);
+    REQUIRE_THROWS_AS(owned.score_and_grad(), std::invalid_argument);
 }
 
 TEST_CASE("SeqPairBatch: one pair in two batches is not a duplicate",

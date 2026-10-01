@@ -1,11 +1,10 @@
 """Batch threading hazards that no worker-exception guard can catch.
 
-Issue 4: one SeqPair added to a batch twice.  The workers then align the same object
-concurrently — two threads writing one pair's DP tables and cached score/path/grad.
-Observed on the unfixed tree: align_full() returned a wrong total in 40/40 runs, some
-of them ABOVE the optimal score, with no error raised.  Either contract is acceptable
-for a fix — reject the duplicate (at add() or at the next dispatch), or serialize it —
-and the tests below accept both; what they reject is a wrong answer.
+Issue 4: one SeqPair added to a batch twice.  The workers then aligned the same object
+concurrently — two threads writing one pair's DP tables and cached score/path/grad:
+wrong totals (some ABOVE the optimum), segfaults and hangs, with no error raised.  The
+fix rejects the duplicate (ValueError) at the next dispatch; the tests would equally
+accept rejection at add() or serialization — what they reject is a wrong answer.
 
 Issue 5: run_workers_guarded() launches threads outside its guard.  If a launch fails
 after earlier ones started, the joinable std::threads are destroyed during unwinding and
@@ -14,9 +13,8 @@ The fix finishes on the threads that did start; the test also accepts a Python
 exception, but never the abort, and never a short sum (the sorted scheduler assigns
 chunks to workers statically, so a worker that never started must not lose its chunk).
 
-Scenarios that can race or abort run in a child interpreter (conftest.run_isolated).
-xfail(strict=True) marks an unfixed bug; when the fix lands the XPASS fails the suite
-and the marker must come off.
+Scenarios that can race or abort run in a child interpreter (conftest.run_isolated):
+a regression would otherwise take pytest down with it.
 """
 
 import os
@@ -41,11 +39,6 @@ def dna_params():
 
 # --- Issue 4: duplicate pair pointers ---------------------------------------------------
 
-ISSUE4 = pytest.mark.xfail(strict=True, reason="issue 4: SeqPairBatch accepts the same "
-                                               "SeqPair twice and races on it")
-
-
-@ISSUE4
 @pytest.mark.parametrize("sp,spb", PRECISIONS, ids=PRECISION_IDS)
 def test_duplicate_pair_rejected_or_correct(sp, spb):
     """One pair added twice among distinct ones, on several threads, both dispatch paths.
@@ -82,7 +75,6 @@ def test_duplicate_pair_rejected_or_correct(sp, spb):
     assert proc.returncode == 0 and "OK" in proc.stdout, describe(proc)
 
 
-@ISSUE4
 def test_duplicate_owned_pair_via_indexing():
     """The other way to duplicate: re-add a pair the batch already owns (from add_many).
     Single-threaded, so in-process is safe; the contract is rejection, since with one
@@ -95,7 +87,6 @@ def test_duplicate_owned_pair_via_indexing():
         b.align_full()
 
 
-@ISSUE4
 def test_duplicate_pair_single_thread_rejected():
     """With one thread a duplicate cannot race, but it is still a caller error (it double
     counts the pair in every sum).  Rejected at add() or at the first dispatch."""
