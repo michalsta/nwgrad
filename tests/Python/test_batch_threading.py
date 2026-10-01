@@ -10,8 +10,9 @@ and the tests below accept both; what they reject is a wrong answer.
 Issue 5: run_workers_guarded() launches threads outside its guard.  If a launch fails
 after earlier ones started, the joinable std::threads are destroyed during unwinding and
 the process calls std::terminate.  Forced here with RLIMIT_NPROC (which counts threads).
-Either contract is acceptable — a Python exception, or finishing on fewer threads; what
-is rejected is the abort.
+The fix finishes on the threads that did start; the test also accepts a Python
+exception, but never the abort, and never a short sum (the sorted scheduler assigns
+chunks to workers statically, so a worker that never started must not lose its chunk).
 
 Scenarios that can race or abort run in a child interpreter (conftest.run_isolated).
 xfail(strict=True) marks an unfixed bug; when the fix lands the XPASS fails the suite
@@ -126,8 +127,6 @@ def test_same_pair_in_two_batches_is_legal(sp, spb):
 
 # --- Issue 5: thread-launch failure ------------------------------------------------------
 
-@pytest.mark.xfail(strict=True, reason="issue 5: a failed thread launch in "
-                                       "run_workers_guarded() calls std::terminate")
 @pytest.mark.skipif(not sys.platform.startswith("linux"),
                     reason="RLIMIT_NPROC counting threads is Linux behaviour")
 @pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0,
@@ -135,7 +134,7 @@ def test_same_pair_in_two_batches_is_legal(sp, spb):
 @pytest.mark.skipif(running_under_asan(),
                     reason="ASan's own threads and allocator make the thread budget "
                            "unpredictable; the plain build is what matters here")
-@pytest.mark.parametrize("entry", ["score_and_grad", "align_full", "add_many"])
+@pytest.mark.parametrize("entry", ["score_and_grad", "sorted", "align_full", "add_many"])
 def test_thread_launch_failure_does_not_abort(entry):
     """Cap the user's thread count a few above what is running, then ask for 32
     workers: the first launches succeed, a later one fails.  The process must survive —
@@ -147,6 +146,10 @@ def test_thread_launch_failure_does_not_abort(entry):
         A, B = ["ACGTACGTAC"] * 64, ["ACGTTCGTAC"] * 64
         want = 64 * n.SeqPair(A[0], B[0], p).score_and_grad()[0]
         b = n.SeqPairBatch(n_threads=32)
+        if "{entry}" == "sorted":
+            # Static chunk-per-worker scheduler: a worker that never started must
+            # not take its chunk with it.
+            b.schedule = "sorted"
         if "{entry}" != "add_many":
             b.add_many(A, B, p)
             if "{entry}" == "align_full":

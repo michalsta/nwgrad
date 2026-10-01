@@ -539,6 +539,20 @@ private:
                 task(order[r - 1 - s], buf);
                 if (prof) { pp.reserve_cells += cost[order[r - 1 - s]]; ++pp.reserve_tasks; }
             }
+            // Sweep up chunks no worker claimed.  Normally there are none: nthr
+            // workers start and each claims its own chunk first.  But a thread
+            // launch can fail (run_workers_guarded then carries on with fewer
+            // workers), and chunk k would otherwise go unprocessed — a silently
+            // short sum.  A late-starting worker whose chunk was taken here gets
+            // k >= nthr, skips its chunk and finds the reserve drained: correct
+            // either way.
+            for (int k2; (k2 = next_worker.fetch_add(1, std::memory_order_relaxed)) < nthr; ) {
+                for (size_t p = bound[static_cast<size_t>(k2) + 1];
+                     p > bound[static_cast<size_t>(k2)]; --p) {
+                    task(order[p - 1], buf);
+                    if (prof) { pp.chunk_cells += cost[order[p - 1]]; ++pp.chunk_tasks; }
+                }
+            }
             const auto t2 = clk::now();
             if (prof && k >= 0 && static_cast<size_t>(k) < profile_out.size()) {
                 pp.chunk_s   = since(t0, t1);

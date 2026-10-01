@@ -107,10 +107,24 @@ inline void run_workers_guarded(int n_threads, Worker&& worker) {
         }
     };
 
+    // A launch can fail (std::system_error when the process or user is out of
+    // threads, bad_alloc).  Unguarded, that exception unwound through `threads`
+    // while earlier workers were still joinable, and a joinable std::thread's
+    // destructor calls std::terminate — the interpreter died with no traceback.
+    // Instead, stop launching and carry on with the workers that did start: every
+    // worker drains a shared queue (the sorted scheduler sweeps up chunks whose
+    // owner never started), so fewer threads still means all the work, done
+    // correctly.  The reserve() is inside the try for the same reason — it
+    // allocates, and before it no thread exists to orphan.
     std::vector<std::thread> threads;
-    threads.reserve(static_cast<size_t>(n_threads - 1));
-    for (int t = 0; t < n_threads - 1; ++t)
-        threads.emplace_back(guarded);
+    try {
+        threads.reserve(static_cast<size_t>(n_threads - 1));
+        for (int t = 0; t < n_threads - 1; ++t)
+            threads.emplace_back(guarded);
+    } catch (...) {
+        // Fall through with however many started — possibly none, in which case
+        // the calling thread below does all of it.
+    }
     guarded();
     for (auto& t : threads) t.join();
 
