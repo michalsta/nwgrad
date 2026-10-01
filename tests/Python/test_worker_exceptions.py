@@ -101,15 +101,22 @@ def test_batch_add_is_linear_not_quadratic():
             batch.add(sp)
         return time.perf_counter() - t
 
+    # Best of 3 at each size, and sizes large enough that each run lasts tens of ms.
+    # A single run of 10k vs 40k lasted 2 ms on the macOS arm64 runner, where one
+    # one-off lump inside the 40k window -- nanobind's keep-alive hash map growing, or
+    # a GC pass over the live wrappers -- read as 13.1x and failed the v0.5.0 wheel
+    # tests, while add() measured flat per pair (640-800 ns over a 64x range of N).
+    # Repeats reuse the grown table, so the minimum drops the one-off growth; the
+    # threshold below is unchanged, so a quadratic add() (~16x) still fails.
     time_adds(2_000)                   # warm up
-    small = time_adds(10_000)
-    large = time_adds(40_000)
+    small = min(time_adds(40_000) for _ in range(3))
+    large = min(time_adds(160_000) for _ in range(3))
 
     # 4x the pairs. Linear predicts ~4x the time; quadratic predicts ~16x.
     # Allow a lot of slack for a loaded machine and still catch quadratic.
     assert large < small * 8, (
-        f"batch.add() looks super-linear: 10k took {small:.3f}s, "
-        f"40k took {large:.3f}s ({large / max(small, 1e-9):.1f}x for 4x the pairs)")
+        f"batch.add() looks super-linear: 40k took {small:.3f}s, "
+        f"160k took {large:.3f}s ({large / max(small, 1e-9):.1f}x for 4x the pairs)")
 
 
 def _fresh_params(scale):
