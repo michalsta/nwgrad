@@ -44,6 +44,11 @@ skip = ["cp36-*", "cp37-*", "cp38-*", "pp*"]
 test-command = "python -m pytest {project}/tests/Python"
 test-extras = ["dev"]
 
+# Package builds need only the extension; tests and benchmarks are not in the sdist.
+[tool.scikit-build.cmake.define]
+NWGRAD_BUILD_TESTS = "OFF"
+NWGRAD_BUILD_BENCHMARKS = "OFF"
+
 [tool.scikit-build.sdist]
 exclude = [
     "tests/",

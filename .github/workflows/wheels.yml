@@ -183,8 +183,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Build sdist
-        run: pipx run build --sdist
+      # build's default flow builds the sdist, then a wheel FROM that archive.
+      # A source archive that cannot compile must never reach the publish job.
+      - name: Build sdist and wheel from sdist
+        run: pipx run build
+      - name: Install and test the wheel built from sdist
+        run: |
+          for wheel in dist/*.whl; do
+            python -m pip install "${wheel}[dev]"
+          done
+          python -m pytest tests/Python -q
       - uses: actions/upload-artifact@v4
         with:
           name: sdist

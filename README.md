@@ -544,6 +544,10 @@ pip install -e ".[dev]"
 pytest tests/Python/
 ```
 
+Python package builds compile only the extension. Direct CMake builds enable the
+C++ tests and benchmarks by default; use `-DNWGRAD_BUILD_TESTS=OFF` and
+`-DNWGRAD_BUILD_BENCHMARKS=OFF` to disable them.
+
 C++ unit tests (requires CMake). The extension target does `find_package(nanobind)`,
 so even a tests-only configure needs nanobind discoverable:
 

@@ -140,94 +140,107 @@ if (NWGRAD_SANITIZE_EXT)
     target_compile_definitions(nwgrad_ext PRIVATE ${NWGRAD_SANITIZE_DEFS})
 endif()
 
-# ── C++ unit tests (Catch2 v2, vendored single header) ───────────────────────
-add_executable(nwgrad_tests
-    tests/cpp/main.cpp
-    tests/cpp/test_subst_matrix.cpp
-    tests/cpp/test_align_params.cpp
-    tests/cpp/test_aligner.cpp
-    tests/cpp/test_alignment_path.cpp
-    tests/cpp/test_preconditions.cpp
-    tests/cpp/test_gradient.cpp
-    tests/cpp/test_batch.cpp
-    tests/cpp/test_banded.cpp
-    tests/cpp/test_seq_pair.cpp
-    tests/cpp/test_traceback_modes.cpp
-    tests/cpp/test_hirschberg_scan.cpp
-    tests/cpp/test_hirschberg_pmax.cpp
-    tests/cpp/test_add_many.cpp
-    tests/cpp/test_weighted_grad.cpp
-    tests/cpp/test_simd_bitexact.cpp
-    tests/cpp/test_simd_bitexact_f32.cpp
-    ${NWGRAD_LEVEL_SOURCES}   # per-ISA kernel TUs, so kernel="simd" exercises the dispatched striped path
-)
-target_include_directories(nwgrad_tests PRIVATE
-    src/nwgrad/cpp/nwgrad
-    tests/cpp
-)
-target_compile_features(nwgrad_tests PRIVATE cxx_std_20)
-if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
-    target_compile_options(nwgrad_tests PRIVATE -Wall -Wextra)
-endif()
-find_package(Threads REQUIRED)
-target_link_libraries(nwgrad_tests PRIVATE Threads::Threads)
+# Direct CMake builds retain the developer targets by default. Python package
+# builds disable both options in pyproject.toml: the sdist excludes tests/.
+option(NWGRAD_BUILD_TESTS "Build the C++ unit tests" ON)
+option(NWGRAD_BUILD_BENCHMARKS "Build the C++ benchmarks" ON)
 
-# Sanitizers must be passed to both the compile and the link step.
-if (NWGRAD_SANITIZE)
-    target_compile_options(nwgrad_tests PRIVATE ${NWGRAD_SANITIZE_FLAGS})
-    target_link_options(nwgrad_tests PRIVATE ${NWGRAD_SANITIZE_FLAGS})
-    target_compile_definitions(nwgrad_tests PRIVATE ${NWGRAD_SANITIZE_DEFS})
+if (NWGRAD_BUILD_TESTS OR NWGRAD_BUILD_BENCHMARKS)
+    find_package(Threads REQUIRED)
 endif()
 
-enable_testing()
-add_test(NAME cpp_tests COMMAND nwgrad_tests)
+if (NWGRAD_BUILD_TESTS)
+    # ── C++ unit tests (Catch2 v2, vendored single header) ───────────────────────
+    add_executable(nwgrad_tests
+        tests/cpp/main.cpp
+        tests/cpp/test_subst_matrix.cpp
+        tests/cpp/test_align_params.cpp
+        tests/cpp/test_aligner.cpp
+        tests/cpp/test_alignment_path.cpp
+        tests/cpp/test_preconditions.cpp
+        tests/cpp/test_gradient.cpp
+        tests/cpp/test_batch.cpp
+        tests/cpp/test_banded.cpp
+        tests/cpp/test_seq_pair.cpp
+        tests/cpp/test_traceback_modes.cpp
+        tests/cpp/test_hirschberg_scan.cpp
+        tests/cpp/test_hirschberg_pmax.cpp
+        tests/cpp/test_add_many.cpp
+        tests/cpp/test_weighted_grad.cpp
+        tests/cpp/test_simd_bitexact.cpp
+        tests/cpp/test_simd_bitexact_f32.cpp
+        ${NWGRAD_LEVEL_SOURCES}   # per-ISA kernel TUs, so kernel="simd" exercises the dispatched striped path
+    )
+    target_include_directories(nwgrad_tests PRIVATE
+        src/nwgrad/cpp/nwgrad
+        tests/cpp
+    )
+    target_compile_features(nwgrad_tests PRIVATE cxx_std_20)
+    if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(nwgrad_tests PRIVATE -Wall -Wextra)
+    endif()
+    target_link_libraries(nwgrad_tests PRIVATE Threads::Threads)
 
-# ── The simd kernel, once per instruction set ────────────────────────────────
-#
-# The ISA is chosen once per process from a function-pointer table, so a single run
-# only ever exercises one of them.  These re-run the bit-exactness sweep with the
-# choice forced, which is what makes the AVX2 / AVX-512 clones *tested* rather than
-# merely compiled: a CI runner with AVX2 executes the AVX2 kernel here.
-#
-# An ISA the CPU cannot run resolves to auto (best available) rather than trapping, so
-# every one of these is safe to run everywhere — it simply re-tests the best level on a
-# machine that lacks the named hardware.  That is why they are unconditional.  Names are
-# the unified backend vocabulary (sse2 replaces the old "baseline"; neon is the AArch64
-# level, a no-op on x86).
-foreach(isa sse2 avx2 avx512 neon)
-    add_test(NAME cpp_tests_isa_${isa} COMMAND nwgrad_tests "[simd]")
-    set_tests_properties(cpp_tests_isa_${isa}
-        PROPERTIES ENVIRONMENT "NWGRAD_ISA=${isa}")
-endforeach()
+    # Sanitizers must be passed to both the compile and the link step.
+    if (NWGRAD_SANITIZE)
+        target_compile_options(nwgrad_tests PRIVATE ${NWGRAD_SANITIZE_FLAGS})
+        target_link_options(nwgrad_tests PRIVATE ${NWGRAD_SANITIZE_FLAGS})
+        target_compile_definitions(nwgrad_tests PRIVATE ${NWGRAD_SANITIZE_DEFS})
+    endif()
 
-# ── the pointer traceback, once per instruction set ──────────────────────────
-#
-# TracebackMode::Pointers has its own kernel at every level, so "compiled" and
-# "tested" are as far apart for it as for the score-table kernel.  [traceback]
-# carries the pointers-vs-scores equivalence cases; forcing the ISA runs them
-# against each level's pointer kernel in turn.
-foreach(isa sse2 avx2 avx512 neon)
-    add_test(NAME cpp_tests_traceback_${isa} COMMAND nwgrad_tests "[traceback]")
-    set_tests_properties(cpp_tests_traceback_${isa}
-        PROPERTIES ENVIRONMENT "NWGRAD_ISA=${isa}")
-endforeach()
+    enable_testing()
+    add_test(NAME cpp_tests COMMAND nwgrad_tests)
 
-# ── C++ stress benchmark ──────────────────────────────────────────────────────
-add_executable(stress_batch tests/cpp/stress_batch.cpp)
-target_include_directories(stress_batch PRIVATE src/nwgrad/cpp/nwgrad)
-target_compile_features(stress_batch PRIVATE cxx_std_20)
-if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
-    target_compile_options(stress_batch PRIVATE -O3 -Wall -Wextra)
+    # ── The simd kernel, once per instruction set ────────────────────────────────
+    #
+    # The ISA is chosen once per process from a function-pointer table, so a single run
+    # only ever exercises one of them.  These re-run the bit-exactness sweep with the
+    # choice forced, which is what makes the AVX2 / AVX-512 clones *tested* rather than
+    # merely compiled: a CI runner with AVX2 executes the AVX2 kernel here.
+    #
+    # An ISA the CPU cannot run resolves to auto (best available) rather than trapping, so
+    # every one of these is safe to run everywhere — it simply re-tests the best level on a
+    # machine that lacks the named hardware.  That is why they are unconditional.  Names are
+    # the unified backend vocabulary (sse2 replaces the old "baseline"; neon is the AArch64
+    # level, a no-op on x86).
+    foreach(isa sse2 avx2 avx512 neon)
+        add_test(NAME cpp_tests_isa_${isa} COMMAND nwgrad_tests "[simd]")
+        set_tests_properties(cpp_tests_isa_${isa}
+            PROPERTIES ENVIRONMENT "NWGRAD_ISA=${isa}")
+    endforeach()
+
+    # ── the pointer traceback, once per instruction set ──────────────────────────
+    #
+    # TracebackMode::Pointers has its own kernel at every level, so "compiled" and
+    # "tested" are as far apart for it as for the score-table kernel.  [traceback]
+    # carries the pointers-vs-scores equivalence cases; forcing the ISA runs them
+    # against each level's pointer kernel in turn.
+    foreach(isa sse2 avx2 avx512 neon)
+        add_test(NAME cpp_tests_traceback_${isa} COMMAND nwgrad_tests "[traceback]")
+        set_tests_properties(cpp_tests_traceback_${isa}
+            PROPERTIES ENVIRONMENT "NWGRAD_ISA=${isa}")
+    endforeach()
+
 endif()
-target_link_libraries(stress_batch PRIVATE Threads::Threads)
 
-# ── float32 vs double kernel benchmark ────────────────────────────────────────
-# Links the per-ISA level TUs, so kernel=Simd dispatches the real striped kernel at
-# both precisions (viterbi / viterbi_f) rather than the scalar header-only fallback.
-add_executable(bench_f32 tests/cpp/bench_f32.cpp ${NWGRAD_LEVEL_SOURCES})
-target_include_directories(bench_f32 PRIVATE src/nwgrad/cpp/nwgrad)
-target_compile_features(bench_f32 PRIVATE cxx_std_20)
-if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
-    target_compile_options(bench_f32 PRIVATE -O3 -Wall -Wextra)
+if (NWGRAD_BUILD_BENCHMARKS)
+    # ── C++ stress benchmark ──────────────────────────────────────────────────────
+    add_executable(stress_batch tests/cpp/stress_batch.cpp)
+    target_include_directories(stress_batch PRIVATE src/nwgrad/cpp/nwgrad)
+    target_compile_features(stress_batch PRIVATE cxx_std_20)
+    if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(stress_batch PRIVATE -O3 -Wall -Wextra)
+    endif()
+    target_link_libraries(stress_batch PRIVATE Threads::Threads)
+
+    # ── float32 vs double kernel benchmark ────────────────────────────────────────
+    # Links the per-ISA level TUs, so kernel=Simd dispatches the real striped kernel at
+    # both precisions (viterbi / viterbi_f) rather than the scalar header-only fallback.
+    add_executable(bench_f32 tests/cpp/bench_f32.cpp ${NWGRAD_LEVEL_SOURCES})
+    target_include_directories(bench_f32 PRIVATE src/nwgrad/cpp/nwgrad)
+    target_compile_features(bench_f32 PRIVATE cxx_std_20)
+    if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(bench_f32 PRIVATE -O3 -Wall -Wextra)
+    endif()
+    target_link_libraries(bench_f32 PRIVATE Threads::Threads)
 endif()
-target_link_libraries(bench_f32 PRIVATE Threads::Threads)

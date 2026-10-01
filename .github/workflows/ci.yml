@@ -11,6 +11,24 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  sdist:
+    name: Build and test from sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # build's default flow builds a wheel from the freshly generated sdist.
+      - name: Build sdist and wheel from sdist
+        run: pipx run build
+      - name: Install and test the wheel built from sdist
+        run: |
+          for wheel in dist/*.whl; do
+            python -m pip install "${wheel}[dev]"
+          done
+          python -m pytest tests/Python -q
+
   cpp:
     name: C++ tests (${{ matrix.compiler }})
     runs-on: ubuntu-latest
