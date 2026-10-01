@@ -813,6 +813,16 @@ private:
         }
     }
 
+    // The four linear walkers (guide_j_linear, traceback_linear, aligned_linear,
+    // hard_grad_linear) re-derive each step by exact float equality, like the affine
+    // ones — but unlike them they had no border guard.  Column 0 is seeded closed-form,
+    // H[i][0] = -i*ge_b, which is NOT bit-equal to the stepwise H[i-1][0] - ge_b when
+    // ge_b is not representable (0.1: some i differ by an ULP).  The gap-in-B test then
+    // failed on the border, the walk fell through to --j, and read H[i][-1] — off the
+    // row: out of bounds in a release build, an assertion under _GLIBCXX_ASSERTIONS.
+    // On column 0 only an upward move remains, so `j == 0` now takes it outright, as the
+    // affine walkers' "col 0: only upward moves remain" does.  (Row 0 was already safe:
+    // both earlier branches need i > 0, so the else takes --j.)
     std::vector<int> guide_j_linear(const DpBuffer& buf) const {
         std::vector<int> gj(static_cast<size_t>(m_ + 1), -1);
         gj[0] = 0;
@@ -826,11 +836,11 @@ private:
             if constexpr (AM == AlignMode::Global) { if (i == 0 && j == 0) break; }
             else                                    { if (rat(buf.H, i, j) <= 0.0) break; }
             if (i > 0 && j > 0 &&
-                rat(buf.H, i, j) == rat(buf.H, i-1, j-1) + sub(i, j))
+                rat(buf.H, i, j) == rat(buf.H, i-1, j-1) + subT(i, j))
             {
                 --i; --j;
                 gj[static_cast<size_t>(i)] = j;
-            } else if (i > 0 && rat(buf.H, i, j) == rat(buf.H, i-1, j) - params_->gap_extend_b) {
+            } else if (i > 0 && (j == 0 || rat(buf.H, i, j) == rat(buf.H, i-1, j) - static_cast<T>(params_->gap_extend_b))) {
                 --i;
                 gj[static_cast<size_t>(i)] = j;
             } else {
@@ -1112,14 +1122,21 @@ private:
     // Viterbi — Linear gap model
     // ═════════════════════════════════════════════════════════════════════════
 
+    // In precision T throughout, like the affine fill: the walkers below re-derive
+    // each step by exact equality against this table, so they must round where it
+    // rounded.  It used to add in double (sub(), the raw double gap costs) and store
+    // into a float table at T=float; the walkers' double recomputation then rarely
+    // matched the stored float for a non-representable cost, every test fell through
+    // to "gap in A", and the returned path was not the one scored (-18.7 vs -7.9).
+    // At T=double every cast here is the identity: results are unchanged bit for bit.
     void viterbi_linear(DpBuffer& buf) {
         banded_fill(buf.H);
 
         if constexpr (AM == AlignMode::Global) {
             at(buf.H, 0, 0) = 0.0;
             const int bi = border_rows(), bj = border_cols();
-            for (int i = 1; i <= bi; ++i) at(buf.H, i, 0) = -i * params_->gap_extend_b;
-            for (int j = 1; j <= bj; ++j) at(buf.H, 0, j) = -j * params_->gap_extend_a;
+            for (int i = 1; i <= bi; ++i) at(buf.H, i, 0) = -static_cast<T>(i) * static_cast<T>(params_->gap_extend_b);
+            for (int j = 1; j <= bj; ++j) at(buf.H, 0, j) = -static_cast<T>(j) * static_cast<T>(params_->gap_extend_a);
         } else {
             for (int i = 0; i <= m_; ++i) at(buf.H, i, 0) = 0.0;
             for (int j = 0; j <= n_; ++j) at(buf.H, 0, j) = 0.0;
@@ -1129,13 +1146,13 @@ private:
         double best_local = 0.0;
         for (int i = 1; i <= m_; ++i) {
             for (int j = jlo(i); j <= jhi(i); ++j) {
-                double v = std::max({
-                    rat(buf.H, i-1, j-1) + sub(i, j),
-                    rat(buf.H, i-1, j)   - params_->gap_extend_b,  // gap in B (advance i)
-                    rat(buf.H, i,   j-1) - params_->gap_extend_a,  // gap in A (advance j)
+                T v = std::max({
+                    rat(buf.H, i-1, j-1) + subT(i, j),
+                    rat(buf.H, i-1, j)   - static_cast<T>(params_->gap_extend_b),  // gap in B (advance i)
+                    rat(buf.H, i,   j-1) - static_cast<T>(params_->gap_extend_a),  // gap in A (advance j)
                 });
                 if constexpr (AM == AlignMode::Local) {
-                    v = std::max(v, 0.0);
+                    v = std::max(v, static_cast<T>(0));
                     if (v > best_local) { best_local = v; best_i_ = i; best_j_ = j; }
                 }
                 at(buf.H, i, j) = v;
@@ -1155,11 +1172,11 @@ private:
             if constexpr (AM == AlignMode::Local)
                 if (rat(buf.H, i, j) <= 0.0) break;
             if (i > 0 && j > 0 &&
-                rat(buf.H, i, j) == rat(buf.H, i-1, j-1) + sub(i, j))
+                rat(buf.H, i, j) == rat(buf.H, i-1, j-1) + subT(i, j))
             {
                 path.emplace_back(i-1, j-1);
                 --i; --j;
-            } else if (i > 0 && rat(buf.H, i, j) == rat(buf.H, i-1, j) - params_->gap_extend_b) {
+            } else if (i > 0 && (j == 0 || rat(buf.H, i, j) == rat(buf.H, i-1, j) - static_cast<T>(params_->gap_extend_b))) {
                 --i;  // gap in B
             } else {
                 --j;  // gap in A
@@ -1178,11 +1195,11 @@ private:
             if constexpr (AM == AlignMode::Local)
                 if (rat(buf.H, i, j) <= 0.0) break;
             if (i > 0 && j > 0 &&
-                rat(buf.H, i, j) == rat(buf.H, i-1, j-1) + sub(i, j))
+                rat(buf.H, i, j) == rat(buf.H, i-1, j-1) + subT(i, j))
             {
                 a.push_back(sym_a(i)); b.push_back(sym_b(j));
                 --i; --j;
-            } else if (i > 0 && rat(buf.H, i, j) == rat(buf.H, i-1, j) - params_->gap_extend_b) {
+            } else if (i > 0 && (j == 0 || rat(buf.H, i, j) == rat(buf.H, i-1, j) - static_cast<T>(params_->gap_extend_b))) {
                 a.push_back(sym_a(i)); b.push_back('-');  // gap in B
                 --i;
             } else {
@@ -1204,11 +1221,11 @@ private:
             if constexpr (AM == AlignMode::Local)
                 if (rat(buf.H, i, j) <= 0.0) break;
             if (i > 0 && j > 0 &&
-                rat(buf.H, i, j) == rat(buf.H, i-1, j-1) + sub(i, j))
+                rat(buf.H, i, j) == rat(buf.H, i-1, j-1) + subT(i, j))
             {
                 gblk[sub_off(i, j)] += 1.0;
                 --i; --j;
-            } else if (i > 0 && rat(buf.H, i, j) == rat(buf.H, i-1, j) - params_->gap_extend_b) {
+            } else if (i > 0 && (j == 0 || rat(buf.H, i, j) == rat(buf.H, i-1, j) - static_cast<T>(params_->gap_extend_b))) {
                 grad.gap_extend_b -= 1.0;   // the score subtracts this penalty
                 --i;
             } else {
