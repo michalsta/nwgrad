@@ -35,6 +35,12 @@ import nwgrad
 
 AA = "ARNDCQEGHILKMFPSTWYV"
 
+# Every test of Hirschberg's OWN correctness pins this cutoff.  A pair no longer than
+# hb_cutoff never splits and is run AS Pointers (bit-exact by construction), so at the
+# default 512 the short random pairs below would test Pointers wearing Hirschberg's name.
+# 16 makes the recursion — splits, joins, the spanning-X refund — run on nearly every pair.
+HB_CUTOFF = 16
+
 
 @pytest.fixture(scope="module")
 def params():
@@ -113,6 +119,7 @@ def test_local_no_longer_throws(params):
     on the Smith-Waterman optimum.  The Local suite below holds it to that."""
     sp = nwgrad.SeqPair("ACDEFGHIK", "WWACDEFGHIKWW", params, gap_model="affine",
                         mode="local", grad_mode="hard", traceback="hirschberg")
+    sp.hb_cutoff = 1                      # 9 rows: any larger cutoff runs it as Pointers
     sp.alloc_dp()
     sp.align_full()                       # no throw
     ref = nwgrad.SeqPair("ACDEFGHIK", "WWACDEFGHIKWW", params, gap_model="affine",
@@ -191,6 +198,7 @@ def test_score_matches_pointers_exactly_at_double(request, fixture):
                                    grad_mode="hard", traceback="pointers")
         hb = nwgrad.SeqPairDouble(a, b, p, gap_model="affine", mode="global",
                                   grad_mode="hard", traceback="hirschberg")
+        hb.hb_cutoff = HB_CUTOFF
         for sp in (ref, hb):
             sp.alloc_dp()
             sp.align_full()
@@ -211,6 +219,7 @@ def test_score_matches_pointers_at_float32(params):
                              grad_mode="hard", traceback="pointers")
         hb = nwgrad.SeqPair(a, b, params, gap_model="affine", mode="global",
                             grad_mode="hard", traceback="hirschberg")
+        hb.hb_cutoff = HB_CUTOFF
         for sp in (ref, hb):
             sp.alloc_dp()
             sp.align_full()
@@ -229,6 +238,7 @@ def test_recursion_actually_runs(params):
                                grad_mode="hard", traceback="pointers")
     hb = nwgrad.SeqPairDouble(a, b, params, gap_model="affine", mode="global",
                               grad_mode="hard", traceback="hirschberg")
+    hb.hb_cutoff = HB_CUTOFF
     for sp in (ref, hb):
         sp.alloc_dp()
         sp.align_full()
@@ -245,6 +255,7 @@ def test_alignment_reconstructs_inputs(request, fixture):
     for a, b in zip(A, B):
         sp = nwgrad.SeqPairDouble(a, b, p, gap_model="affine", mode="global",
                                   grad_mode="hard", traceback="hirschberg")
+        sp.hb_cutoff = HB_CUTOFF
         sp.alloc_dp()
         sp.align_full()
         x, y = sp.aligned()
@@ -276,6 +287,7 @@ def test_path_scores_what_it_claims(request, fixture):
     for a, b in zip(A, B):
         sp = nwgrad.SeqPairDouble(a, b, p, gap_model="affine", mode="global",
                                   grad_mode="hard", traceback="hirschberg")
+        sp.hb_cutoff = HB_CUTOFF
         sp.alloc_dp()
         sp.align_full()
         x, y = sp.aligned()
@@ -292,6 +304,7 @@ def test_gradient_is_the_gradient_of_that_path(asym_params):
     for a, b in zip(A, B):
         sp = nwgrad.SeqPairDouble(a, b, asym_params, gap_model="affine", mode="global",
                                   grad_mode="hard", traceback="hirschberg")
+        sp.hb_cutoff = HB_CUTOFF
         sp.alloc_dp()
         sp.align_full()
         sp.compute_grad()
@@ -336,6 +349,7 @@ def test_degenerate_shapes(params):
                                        grad_mode="hard", traceback="pointers")
             hb = nwgrad.SeqPairDouble(a, b, params, gap_model="affine", mode="global",
                                       grad_mode="hard", traceback="hirschberg")
+            hb.hb_cutoff = 1    # split to single rows: these inputs are <= 9 long
             for sp in (ref, hb):
                 sp.alloc_dp()
                 sp.align_full()
@@ -350,10 +364,12 @@ def test_batch_matches_single_pair(params):
     A = _seqs(120, 1, 200, 13)
     B = _seqs(120, 1, 200, 14)
     b1 = nwgrad.SeqPairBatch(n_threads=4, traceback="hirschberg")
+    b1.hb_cutoff = HB_CUTOFF
     b1.add_many(A, B, params, gap_model="affine", mode="global",
                 grad_mode="hard", kernel="auto")
     t1 = b1.score_and_grad()
     b2 = nwgrad.SeqPairBatch(n_threads=1, traceback="hirschberg")
+    b2.hb_cutoff = HB_CUTOFF
     b2.add_many(A, B, params, gap_model="affine", mode="global",
                 grad_mode="hard", kernel="auto")
     assert b2.score_and_grad() == t1          # thread count must not change the answer
@@ -366,6 +382,7 @@ def test_batch_total_matches_pointers(params):
     out = {}
     for tb in ("pointers", "hirschberg"):
         batch = nwgrad.SeqPairBatch(n_threads=4, traceback=tb)
+        batch.hb_cutoff = HB_CUTOFF
         batch.add_many(A, B, params, gap_model="affine", mode="global",
                        grad_mode="hard", kernel="auto")
         out[tb] = batch.score_and_grad()
@@ -389,7 +406,7 @@ def test_batch_total_matches_pointers(params):
 # scores S: a clamped reverse could pick, at a tie, a start whose box misses (ie, je).
 
 
-def _local(a, b, p, tb, cutoff=None, dtype="double"):
+def _local(a, b, p, tb, cutoff=HB_CUTOFF, dtype="double"):
     cls = nwgrad.SeqPairDouble if dtype == "double" else nwgrad.SeqPair
     sp = cls(a, b, p, gap_model="affine", mode="local", grad_mode="hard", traceback=tb)
     if cutoff is not None and tb == "hirschberg":
@@ -474,13 +491,13 @@ def test_local_gradient_is_the_gradient_of_that_path(asym_params):
 
 
 def test_local_degenerate_shapes(params):
-    """Empty and tiny inputs: the S<=0 / empty-alignment early-out, and boxes so small the
-    recursion never splits (bit-exact there by construction)."""
+    """Empty and tiny inputs: the S<=0 / empty-alignment early-out, and boxes split all the
+    way down to single rows (cutoff 1) so the block origins are exercised."""
     odd = ["", "A", "AC", "ACDEFGHIK"]
     for a in odd:
         for b in odd:
             ref = _local(a, b, params, "pointers")
-            hb = _local(a, b, params, "hirschberg")
+            hb = _local(a, b, params, "hirschberg", cutoff=1)
             assert hb.score == pytest.approx(ref.score, abs=1e-9), (a, b)
             x, y = hb.aligned()
             assert x.replace("-", "") in a
@@ -494,6 +511,7 @@ def test_local_batch_matches_pointers(params):
     out = {}
     for tb in ("pointers", "hirschberg"):
         batch = nwgrad.SeqPairBatch(n_threads=4, traceback=tb)
+        batch.hb_cutoff = HB_CUTOFF
         batch.add_many(A, B, params, gap_model="affine", mode="local",
                        grad_mode="hard", kernel="auto")
         out[tb] = batch.score_and_grad()          # scalar: total score over the batch
@@ -507,7 +525,9 @@ def test_local_batch_matches_pointers(params):
 # These mirror test_traceback_modes.py case for case, with "exactly equal" weakened to
 # "close".  Measuring first was worth it, because the weakening is NOT uniform — some of
 # those cases survive as exact, and some fail so badly that no tolerance would save them.
-# Measured, 120 random pairs of 20-300 aa, hirschberg vs pointers at T=double:
+# Measured, 120 random pairs of 20-300 aa, hirschberg vs pointers at T=double.  (At the
+# default cutoff, i.e. on the old never-split base case, before short pairs were routed
+# through Pointers; the tests below now pin HB_CUTOFF so the recursion itself is compared.)
 #
 #   quantity                       unique optimum      ties (integral matrix)
 #   ---------------------------------------------------------------------------
@@ -541,7 +561,7 @@ def _dot(g, p):
             + g["gap_open_b"] * p.gap_open_b + g["gap_extend_b"] * p.gap_extend_b)
 
 
-def _pair(a, b, p, tb, cutoff=None):
+def _pair(a, b, p, tb, cutoff=HB_CUTOFF):
     sp = nwgrad.SeqPairDouble(a, b, p, gap_model="affine", mode="global",
                               grad_mode="hard", traceback=tb)
     if cutoff is not None and tb == "hirschberg":
@@ -689,6 +709,7 @@ def test_banded_composes_but_does_not_agree(params, band):
     B = _seqs(60, 20, 300, 40)
     for tb in ("pointers", "hirschberg"):
         batch = nwgrad.SeqPairBatch(n_threads=2, traceback=tb)
+        batch.hb_cutoff = HB_CUTOFF
         batch.add_many(A, B, params, gap_model="affine", mode="global",
                        grad_mode="hard", kernel="auto")
         full = batch.score_and_grad()
@@ -702,6 +723,7 @@ def test_self_pair_closed_form(params):
     score and gradient both.  This is the one case where it is provably bit-exact."""
     seqs = _seqs(40, 5, 300, 17)
     batch = nwgrad.SeqPairBatch(n_threads=4, traceback="hirschberg")
+    batch.hb_cutoff = HB_CUTOFF
     batch.add_many(seqs, seqs, params, gap_model="affine", mode="global",
                    grad_mode="hard", kernel="auto")
     total = batch.score_and_grad()
@@ -719,17 +741,16 @@ def test_self_pair_closed_form(params):
         assert g[f] == 0.0, f
 
 
-# --- Issue 8: "bit-exact with pointers below hb_cutoff" ---------------------------------
+# --- "bit-exact with pointers below hb_cutoff" -------------------------------------------
 #
 # README's traceback table promises that a pair no longer than hb_cutoff never splits and
-# is bit-exact with "pointers".  With a non-representable gap_extend (0.1) that is false:
-# the score differs in the last ULP (-4.299999999999999 vs -4.3, because Hirschberg
-# replays the score from the recovered path while Pointers reads it off the table) and
-# the alignment string can differ.  At gap_extend = 1.0 it holds.
-#
-# The fix is undecided: make the short-pair path truly exact, or correct the README.  The
-# xfail below encodes the README's CURRENT promise.  If the decision is to relax the
-# promise, replace it with a test of the relaxed wording instead of deleting the marker.
+# is bit-exact with "pointers".  It used not to be: such a pair ran the Hirschberg base
+# case, whose borders are seeded and carried differently from the Pointers fill, so with
+# a non-representable gap_extend (0.1) it settled float ties on paths one ULP worse
+# (-4.3 vs -4.299999999999999) and replayed the score from the path — 27 of the 41 pairs
+# below differed.  Such a pair is now run AS Pointers, so the promise holds by
+# construction.  Both gap_extend values are checked: 1.0 always held, 0.1 is the one
+# that broke.
 
 def _short_pairs(rng, count):
     rand = lambda k: "".join(rng.choice(list("ACGT"), k))
@@ -756,15 +777,11 @@ def _identity_mismatches(gap_extend):
     return bad
 
 
-@pytest.mark.xfail(strict=True, reason="issue 8: below hb_cutoff, hirschberg is not "
-                                       "bit-exact with pointers at gap_extend = 0.1")
 def test_short_pairs_bit_exact_with_pointers_non_representable_gap():
     bad = _identity_mismatches(0.1)
     assert not bad, f"{len(bad)} short pair(s) differ, first: {bad[0]}"
 
 
 def test_short_pairs_bit_exact_with_pointers_representable_gap():
-    """The half of the promise that holds today; pinned so a fix for the other half
-    cannot break it."""
     bad = _identity_mismatches(1.0)
     assert not bad, f"{len(bad)} short pair(s) differ, first: {bad[0]}"

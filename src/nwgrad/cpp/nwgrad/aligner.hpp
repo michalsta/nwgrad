@@ -44,9 +44,9 @@ enum class AlignBand { Full,   GuideBanded };
 // M>X>Y tie-break the other two share, because the tie-break depends on the rows below
 // the split — which Hirschberg has already discarded.  Where the optimum is unique the
 // answers agree exactly; where alignments tie, it returns a DIFFERENT optimal path, hence
-// a valid but different subgradient (path score == Viterbi score, always).  BUT: below
-// its base-case cutoff Hirschberg never splits, so it runs the exact Pointers fill and IS
-// bit-exact — divergence is confined to pairs longer than hb_cutoff.  Affine Full Global
+// a valid but different subgradient (path score == Viterbi score, always).  BUT: a pair
+// no longer than hb_cutoff never splits, and is run AS Pointers (see run_viterbi), so it
+// IS bit-exact — divergence is confined to pairs longer than hb_cutoff.  Affine Full Global
 // only; explicitly asking for it on Local / linear / banded THROWS rather than silently
 // running a different algorithm than requested.
 //
@@ -1005,8 +1005,19 @@ private:
                 throw std::logic_error(
                     "nwgrad: traceback=\"hirschberg\" is implemented for full DP only; a "
                     "guide band already bounds memory, which is the only thing Hirschberg buys");
-            else if constexpr (AM == AlignMode::Local) { viterbi_affine_hirschberg_local(buf); return; }
-            else { viterbi_affine_hirschberg(buf); return; }
+            else if (m_ > hb_cutoff_) {
+                if constexpr (AM == AlignMode::Local) { viterbi_affine_hirschberg_local(buf); return; }
+                else { viterbi_affine_hirschberg(buf); return; }
+            }
+            // A pair no longer than hb_cutoff never splits, so it is run AS Pointers —
+            // the same fill, table and traceback, hence bit-exact with traceback=
+            // "pointers" by construction.  It used to run the Hirschberg base case
+            // instead, which is the Pointers fill in spirit but not in arithmetic: its
+            // borders are seeded and carried differently, so with a non-representable
+            // gap_extend (0.1) it could settle a float tie on a path one ULP worse, and
+            // it replayed the score from the path rather than reading the table — 27/41
+            // short pairs differed from Pointers.  Same memory (the base case kept
+            // a Pointers-sized table too) and the same speed (measured 0.99-1.04x).
         }
         // Variant B: direction pointers + rolling rows, 3 B/cell instead of 12/24.
         // Full affine only; the banded and linear paths keep their score tables.
@@ -1019,7 +1030,9 @@ private:
         // Resolve this aligner's backend: auto -> the global default, then scalar or a level.
         const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
         // Pointers is Full-affine only; banded/linear always keep score tables.
-        const bool use_ptr = (tb_ == TracebackMode::Pointers) && (AB == AlignBand::Full);
+        // (a Hirschberg mode reaches here only for a short pair — see above)
+        const bool use_ptr = (tb_ == TracebackMode::Pointers || is_hirschberg(tb_)) &&
+                             (AB == AlignBand::Full);
         if (backend == kBackendScalar) {
             if (use_ptr) viterbi_affine_ptr(buf); else viterbi_affine(buf);
             return;
