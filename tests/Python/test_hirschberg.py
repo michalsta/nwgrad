@@ -717,3 +717,54 @@ def test_self_pair_closed_form(params):
     np.testing.assert_array_equal(g["matrix"], want_m)
     for f in ("gap_open_a", "gap_extend_a", "gap_open_b", "gap_extend_b"):
         assert g[f] == 0.0, f
+
+
+# --- Issue 8: "bit-exact with pointers below hb_cutoff" ---------------------------------
+#
+# README's traceback table promises that a pair no longer than hb_cutoff never splits and
+# is bit-exact with "pointers".  With a non-representable gap_extend (0.1) that is false:
+# the score differs in the last ULP (-4.299999999999999 vs -4.3, because Hirschberg
+# replays the score from the recovered path while Pointers reads it off the table) and
+# the alignment string can differ.  At gap_extend = 1.0 it holds.
+#
+# The fix is undecided: make the short-pair path truly exact, or correct the README.  The
+# xfail below encodes the README's CURRENT promise.  If the decision is to relax the
+# promise, replace it with a test of the relaxed wording instead of deleting the marker.
+
+def _short_pairs(rng, count):
+    rand = lambda k: "".join(rng.choice(list("ACGT"), k))
+    return ([("TTGGCGCTCAAAGG", "A")] +  # the handoff's reproduction
+            [(rand(rng.integers(1, 60)), rand(rng.integers(1, 60))) for _ in range(count)])
+
+
+def _identity_mismatches(gap_extend):
+    p = nwgrad.AlignParams(2 * np.eye(4) - np.ones((4, 4)), alphabet="ACGT",
+                           gap_open_a=2, gap_open_b=2,
+                           gap_extend_a=gap_extend, gap_extend_b=gap_extend)
+    bad = []
+    for a, b in _short_pairs(np.random.default_rng(8), 40):
+        x = nwgrad.SeqPairDouble(a, b, p, traceback="pointers")
+        y = nwgrad.SeqPairDouble(a, b, p, traceback="hirschberg")
+        assert len(a) <= y.hb_cutoff  # below the cutoff, or the test means nothing
+        (sx, gx), (sy, gy) = x.score_and_grad(), y.score_and_grad()
+        same = (sx == sy and x.aligned() == y.aligned()
+                and np.array_equal(gx.matrix.to_matrix(), gy.matrix.to_matrix())
+                and all(getattr(gx, f) == getattr(gy, f) for f in
+                        ("gap_open_a", "gap_extend_a", "gap_open_b", "gap_extend_b")))
+        if not same:
+            bad.append((a, b, sx, sy, x.aligned(), y.aligned()))
+    return bad
+
+
+@pytest.mark.xfail(strict=True, reason="issue 8: below hb_cutoff, hirschberg is not "
+                                       "bit-exact with pointers at gap_extend = 0.1")
+def test_short_pairs_bit_exact_with_pointers_non_representable_gap():
+    bad = _identity_mismatches(0.1)
+    assert not bad, f"{len(bad)} short pair(s) differ, first: {bad[0]}"
+
+
+def test_short_pairs_bit_exact_with_pointers_representable_gap():
+    """The half of the promise that holds today; pinned so a fix for the other half
+    cannot break it."""
+    bad = _identity_mismatches(1.0)
+    assert not bad, f"{len(bad)} short pair(s) differ, first: {bad[0]}"

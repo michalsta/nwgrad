@@ -42,6 +42,30 @@ def running_under_asan():
         return False
 
 
+def run_isolated(code, timeout=120):
+    """Run `code` in a fresh interpreter and return the CompletedProcess.
+
+    For tests whose failure mode is a use-after-free or an abort: in-process, the
+    bug would take pytest down with it (or corrupt its heap and fail something
+    unrelated later).  The child inherits the environment, so under the CI's
+    ASan job it is instrumented too and a finding surfaces as a non-zero exit.
+    NWGRAD_FORCE_KERNEL is NOT applied in the child — it is wired through this
+    conftest, which the child never loads — so these tests stay on the default
+    backend; they test lifetimes and threading, not kernels.
+    """
+    import subprocess
+    import sys
+    import textwrap
+    return subprocess.run([sys.executable, "-c", textwrap.dedent(code)],
+                          capture_output=True, text=True, timeout=timeout)
+
+
+def describe(proc):
+    """Failure message for a run_isolated() result: exit code plus both streams."""
+    return (f"child exited {proc.returncode}\n--- stdout ---\n{proc.stdout}"
+            f"\n--- stderr ---\n{proc.stderr}")
+
+
 _KERNEL = os.environ.get("NWGRAD_FORCE_KERNEL", "").strip()
 _current_backend = None  # the backend string injected into kernel=, updated per sweep param
 

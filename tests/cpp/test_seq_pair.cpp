@@ -422,3 +422,44 @@ TEST_CASE("SeqPairBatch: single-threaded and multi-threaded agree",
         for (int j = 0; j < 20; ++j)
             REQUIRE(grad8.matrix.at(i, j) == Approx(grad1.matrix.at(i, j)));
 }
+
+// ── Issue 4: the same SeqPair twice in one batch ─────────────────────────────
+//
+// Two workers would align one object concurrently — writing its DP tables and
+// cached state at once.  Observed from Python on the unfixed tree: wrong totals,
+// some above the optimum, and a segfault at double precision.  The guard must live
+// HERE, in the header, not only in the bindings: header-only users call add()
+// directly.  Rejection may happen at add() or at the next dispatch; both are
+// accepted.  Single-threaded on purpose — with one thread nothing races, so this
+// stays safe to run under ASan while the bug is still present.
+//
+// [!shouldfail] is Catch2's strict xfail: it passes while the assertion fails, and
+// fails once it passes.  When the fix lands, remove the tag.
+
+TEST_CASE("SeqPairBatch: a pair added twice is rejected",
+          "[seq_pair_batch][!shouldfail]") {
+    auto p = asym_params(4.0, 0.5, 1.5, 2.0);
+    SeqPair sp("WWKKLLMMFF", "WWKLLMMFFA", p,
+               GapModel::Affine, AlignMode::Global, GradMode::Hard);
+    SeqPairBatch batch(1);
+    REQUIRE_THROWS_AS([&] {
+        batch.add(&sp);
+        batch.add(&sp);
+        batch.score_and_grad();
+    }(), std::invalid_argument);
+}
+
+TEST_CASE("SeqPairBatch: one pair in two batches is not a duplicate",
+          "[seq_pair_batch]") {
+    // The legal neighbour of the case above: a fix for issue 4 must not reject it.
+    auto p = asym_params(4.0, 0.5, 1.5, 2.0);
+    SeqPair sp("WWKKLLMMFF", "WWKLLMMFFA", p,
+               GapModel::Affine, AlignMode::Global, GradMode::Hard);
+    const double want = aligner_score<GapModel::Affine, AlignMode::Global>(
+        p, "WWKKLLMMFF", "WWKLLMMFFA");
+    SeqPairBatch b1(2), b2(2);
+    b1.add(&sp);
+    b2.add(&sp);
+    REQUIRE(b1.score_and_grad() == Approx(want));
+    REQUIRE(b2.score_and_grad() == Approx(want));
+}
