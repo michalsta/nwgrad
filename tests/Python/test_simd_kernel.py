@@ -45,6 +45,13 @@ def test_bad_kernel_name_raises():
             nwgrad.nw_score_affine("ACDE", "ACDE", p, kernel=bad)
 
 
+def test_unknown_kernel_name_is_not_blamed_on_the_cpu():
+    # "simd" was never a CPU feature; saying it is "not available on this CPU" sent
+    # users hunting for hardware support instead of the renamed keyword.
+    with pytest.raises(ValueError, match="unknown backend"):
+        nwgrad.nw_score_affine("ACDE", "ACDE", params(), kernel="simd")
+
+
 @pytest.mark.parametrize("fn", ["nw_score_affine", "sw_score_affine"])
 def test_scores_are_exactly_equal(fn):
     rng = random.Random(1234)

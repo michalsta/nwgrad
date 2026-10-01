@@ -97,9 +97,15 @@ inline int parse_backend(const std::string& name) {
     if (name == "auto")            return kBackendAuto;
     for (SimdLevel l : detect_available_levels())
         if (name == level_name(l)) return (int)l;
+    // Every level name on every platform, so a real level this CPU lacks is told
+    // apart from a name that is not a backend at all (e.g. the pre-0.3 "simd").
+    if (name == "sse2" || name == "avx2" || name == "avx512" || name == "neon")
+        throw std::invalid_argument(
+            "nwgrad: backend \"" + name + "\" is not available on this CPU — expected "
+            "\"scalar_fallback\", \"auto\", or a simd level this CPU runs (see available_isa_levels())");
     throw std::invalid_argument(
-        "nwgrad: backend \"" + name + "\" is not available on this CPU — expected "
-        "\"scalar_fallback\", \"auto\", or a simd level this CPU runs (see available_isa_levels())");
+        "nwgrad: unknown backend \"" + name + "\" — expected \"auto\", \"scalar_fallback\", "
+        "\"sse2\", \"avx2\", \"avx512\" or \"neon\"");
 }
 
 inline std::string backend_name(int backend) {
