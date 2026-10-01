@@ -84,8 +84,6 @@ def sdist(tmp_path_factory):
     return names, set(tracked)
 
 
-@pytest.mark.xfail(strict=True, reason="issue 7: the sdist collects untracked "
-                                       "scratch files and build artifacts")
 def test_sdist_contains_only_tracked_files(sdist):
     names, tracked = sdist
     generated = {"PKG-INFO"}

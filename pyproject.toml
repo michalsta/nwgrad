@@ -50,13 +50,19 @@ NWGRAD_BUILD_TESTS = "OFF"
 NWGRAD_BUILD_BENCHMARKS = "OFF"
 
 [tool.scikit-build.sdist]
+# An ALLOWLIST, written as gitignore negation: exclude everything at the top level,
+# then re-admit what building the package and distributing the C++ headers needs.
+# Not `include`: in scikit-build-core an include rule beats .gitignore too, so
+# include = ["src/**"] would ship __pycache__ and any stray in-tree .so.  A negated
+# exclude merely falls through, and .gitignore still applies underneath it.
+# Without this, a local `python -m build --sdist` collected every untracked file in
+# the working tree (a 106 MB FASTA, whole build directories, editor settings).
+# tests/Python/test_sdist_contents.py checks both directions.
 exclude = [
-    "tests/",
-    "dist/",
-    ".github/",
-    ".vscode/",
-    ".pytest_cache/",
-    "src/nwgrad/__pycache__/",
-    "reinstall.sh",
-    ".coverage",
+    "/*",
+    "!/src",   # no trailing slash: the walker tests directories as "src", which "!/src/" misses
+    "!/CMakeLists.txt",
+    "!/pyproject.toml",
+    "!/README.md",
+    "!/LICENSE",
 ]
