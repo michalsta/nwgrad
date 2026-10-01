@@ -185,8 +185,13 @@ jobs:
           python-version: "3.11"
       # build's default flow builds the sdist, then a wheel FROM that archive.
       # A source archive that cannot compile must never reach the publish job.
+      # With the setup-python interpreter, not `pipx run build`: pipx runs build under
+      # its OWN Python (3.12 on the runner), whose cp312 wheel the 3.11 pip below
+      # rejects as "not a supported wheel on this platform" — which blocked v0.5.0.
       - name: Build sdist and wheel from sdist
-        run: pipx run build
+        run: |
+          python -m pip install build
+          python -m build
       - name: Install and test the wheel built from sdist
         run: |
           for wheel in dist/*.whl; do
