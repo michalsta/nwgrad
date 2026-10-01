@@ -14,6 +14,17 @@ endif()
 
 set(CMAKE_CXX_STANDARD 20)
 
+# No FMA contraction anywhere.  Every simd level promises tables bit-identical to the
+# scalar path, and a multiply next to an add is exactly what a compiler fuses into one
+# rounding where the scalar build — compiled for a target without FMA — keeps two.  It
+# happened: clang (18 and 22, not gcc) fused the striped kernels' closed-form borders
+# -(go + j*ge) in the avx2/avx512 TUs, 8 FMAs per TU, so with a non-representable
+# gap_extend a border cell differed by an ULP and kernel="avx2" returned a different
+# path than kernel="scalar_fallback".  The third instance after the pmax ramp and
+# weighted_grad, each fixed by hand; this closes the class.  Free here: the kernels are
+# max/add chains, with nothing for an FMA to speed up.
+add_compile_options($<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-ffp-contract=off>)
+
 # ── Per-ISA-level kernel TUs ──────────────────────────────────────────────────
 #
 # The affine Viterbi kernels are compiled once per instruction-set level, each in its

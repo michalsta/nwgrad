@@ -157,6 +157,23 @@ TEST_CASE("simd viterbi is bit-exact with scalar — asymmetric gaps", "[simd]")
         check_all_modes(p, random_seq(rng, 40), random_seq(rng, 55));
 }
 
+TEST_CASE("simd viterbi is bit-exact with scalar — non-representable gap costs", "[simd]") {
+    // Every other fixture here uses dyadic gap costs (1, 3, 0.5, 0), for which the
+    // closed-form border -(go + j*ge) is EXACT whether or not the compiler fuses it into
+    // an FMA — so a contracted border could never show up in a cell-for-cell compare.
+    // It did happen: clang fused it in the avx2/avx512 TUs and kernel=avx2 picked a
+    // different path than scalar_fallback.  0.1 / 0.3 / 10.7 round, and a long B walks
+    // the border far enough (j up to ~200) for one rounding to differ.  CMakeLists.txt
+    // now builds with -ffp-contract=off; this is the test that sees it if that goes.
+    std::mt19937_64 rng(20261001);
+    AlignParams p = int_params(11.0, 0.1, 10.7, 0.3);
+    for (int trial = 0; trial < 8; ++trial) {
+        std::uniform_int_distribution<int> len(1, 12);
+        check_all_modes(p, random_seq(rng, len(rng)), random_seq(rng, 200));
+        check_all_modes(p, random_seq(rng, 200), random_seq(rng, len(rng)));
+    }
+}
+
 TEST_CASE("simd viterbi is bit-exact with scalar — zero gap-extend", "[simd]") {
     // The degenerate case, and the one most likely to expose the lazy-F reasoning:
     // with ge_a == 0 a gap costs nothing to extend, so the carry propagates the whole
