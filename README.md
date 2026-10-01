@@ -12,7 +12,9 @@ nwgrad implements Needleman-Wunsch (global) and Smith-Waterman (local) alignment
 - **Soft (differentiable) gradient** — forward-backward in log-space; log-partition function and expected substitution counts
 - **Multithreaded batch processing** — lock-free work dispatch, per-thread gradient accumulation
 - **Guide-banded DP** — cheap re-alignment under a new matrix around a cached alignment path
-- **Double precision throughout** — no float truncation in the hot path
+- **float32 by default, float64 on request** — the plain names (`SeqPair`, `nw_score`, …) run the Viterbi DP in float32; `SeqPairDouble`, `nw_score_double`, … run it in float64 (see [Precision](#precision))
+- **Linear-space alignment** — Hirschberg (Myers-Miller) traceback is the default for affine global alignment, so long pairs no longer need O(m×n) tables
+- **Runtime ISA dispatch** — one binary carries SSE2 / AVX2 / AVX-512 (x86) or NEON (ARM) kernels and picks the best one at load; every level is bit-exact with the scalar kernel
 - **Zero-copy Python interface** — nanobind buffer protocol; no unnecessary array copies
 
 ## Installation
@@ -29,7 +31,11 @@ cd nwgrad
 pip install .
 ```
 
-Requires Python ≥ 3.8 and a C++20 compiler (GCC 11+ or Clang 13+).
+Prebuilt wheels cover CPython 3.9–3.14 on Linux x86_64 / aarch64 and macOS arm64.
+Anywhere else pip builds from source, which needs a C++20 compiler with libstdc++'s
+`<experimental/simd>`: GCC 11+, or Clang 13+ built against libstdc++. Apple's
+system clang (libc++) and MSVC lack that header — on macOS use Homebrew `gcc`;
+Windows is not supported.
 
 ## Quick Start
 
@@ -251,6 +257,8 @@ nwgrad.SeqPair(
     gap_model="affine",     # "linear" | "affine"
     mode="global",          # "global" | "local"
     grad_mode="hard",       # "hard" | "soft" | "none"
+    kernel="auto",          # Viterbi backend, see "Kernel selection"
+    traceback="auto",       # see "Traceback modes"
 )
 ```
 
@@ -285,6 +293,8 @@ a separate reference to it.
 | `score_valid` | `bool` | `score` matches current matrix and path |
 | `grad_valid` | `bool` | `grad` is populated |
 | `dp_valid` | `bool` | DP tables are in memory (`compute_grad()` is callable) |
+| `traceback` | `str` | The traceback mode this pair *resolved* to (never `"auto"`) |
+| `hb_cutoff` | `int` | Hirschberg base-case size in rows (settable; default 512) |
 
 **Gradient modes:**
 
@@ -299,16 +309,19 @@ a separate reference to it.
 ### `SeqPairBatch`
 
 ```python
-nwgrad.SeqPairBatch(n_threads=0)
+nwgrad.SeqPairBatch(n_threads=0, traceback="auto")
 ```
 
-`n_threads=0` (default) uses `hardware_concurrency`. `add()` keeps each `SeqPair` (and, transitively, its `AlignParams`) alive for the lifetime of the batch.
+`n_threads=0` (default) uses the number of *physical* cores (falling back to
+`hardware_concurrency` where that cannot be determined): the DP is stall-bound, so
+SMT siblings contend and the logical count measured up to 1.44× slower. `add()` keeps each `SeqPair` (and, transitively, its `AlignParams`) alive for the lifetime of the batch.
 
 **Methods:**
 
 | Method | Returns | Description |
 |---|---|---|
 | `add(seq_pair)` | — | Append a `SeqPair` |
+| `add_many(seqs_a, seqs_b, params, gap_model="affine", mode="global", grad_mode="hard", kernel="auto")` | — | Build N `SeqPair`s in C++ and append them — much faster than N `add()` calls. The pairs take the batch's `traceback` and `hb_cutoff`. |
 | `set_params(params)` | — | Call `set_params()` on all pairs |
 | `score_and_grad(bandwidth=0)` | `float` (sum of scores) | Full-pipeline parallel alignment. Uses per-thread DP buffers (pair-owned tables are never allocated). If `bandwidth > 0`, runs a full DP for the guide path then a banded DP. Results are cached on each `SeqPair`. |
 | `compute_grad()` | `AlignParams` | Sum cached per-pair gradients. No DP work if all `grad_valid` are already true. |
@@ -316,6 +329,7 @@ nwgrad.SeqPairBatch(n_threads=0)
 | `weighted_grad(weights)` | `AlignParams` | `sum_i weights[i] * grad_i` over the cached per-pair gradients. `weights` is a 1-D numeric array with one entry per pair. Runs no DP; raises if any pair has no valid gradient. Summed in pair order, so the result does not depend on `n_threads`. |
 | `align_full()` | `float` (sum of scores) | Full DP on all pairs in parallel using pair-owned buffers. Call `alloc_dp()` first. |
 | `realign_banded(bandwidth)` | `float` (sum of scores) | Banded DP on all pairs in parallel using pair-owned buffers. |
+| `banded_grad(bandwidth)` | `float` (sum of scores) | Banded re-align + gradient around each pair's cached path, using per-thread buffers. Run `score_and_grad()` once to establish the paths, then `set_params()` + `banded_grad(bw)` after each update. |
 | `alloc_dp()` | — | Pre-allocate pair-owned DP tables in parallel. |
 | `drop_dp()` | — | Free pair-owned DP tables in parallel. |
 
@@ -328,6 +342,9 @@ read back without keeping a separate list.
 | Property | Type | Description |
 |---|---|---|
 | `n_threads` | `int` | Thread count |
+| `traceback` | `str` | The batch's traceback mode as given (`"auto"` resolves per pair) |
+| `hb_cutoff` | `int` | Hirschberg base-case size applied by `add_many()` (default 512) |
+| `schedule` | `str` | `"dynamic"` (default; atomic counter) or `"sorted"` (length-sorted equal-work chunks — bounds peak DP memory). Results are identical either way. |
 
 **Typical optimization loop:**
 
@@ -371,6 +388,7 @@ nwgrad.BatchAligner(
     mode="global",        # "global" | "local"
     grad_mode="hard",     # "hard" | "soft" | "none"
     n_threads=1,
+    kernel="auto",        # Viterbi backend, see "Kernel selection"
 )
 ```
 
@@ -397,8 +415,11 @@ not in the argument list, so the linear and affine variants differ only in which
 its gap fields they read:
 
 ```python
-f(seq_a, seq_b, params, band=0, aligned_a="", aligned_b="")
+f(seq_a, seq_b, params, band=0, aligned_a="", aligned_b="", kernel="auto")
 ```
+
+Each also exists with a `_double` suffix (`nw_score_double`, `nw_affine_grad_double`,
+…) that runs the DP in float64 — see [Precision](#precision).
 
 `band > 0` (or a non-empty `aligned_a` / `aligned_b` guide pair) runs a banded DP
 instead of the full one. The sequences are plain `str` and are validated and
@@ -440,6 +461,55 @@ score, grad = nwgrad.nw_affine_grad("PLEASANTLY", "MEANLY", params)
 
 ---
 
+## Precision
+
+The plain names — `SeqPair`, `SeqPairBatch`, `BatchAligner` and the twelve
+convenience functions — run the Viterbi DP in **float32**. The `*Double` classes
+(`SeqPairDouble`, `SeqPairBatchDouble`, `BatchAlignerDouble`) and `_double`
+functions run it in **float64**. Inputs and outputs are float64 either way
+(`AlignParams`, scores, gradients); only the DP arithmetic differs. Over 400
+protein pairs measured against a float64 reference, float32 scores deviated by up
+to 8.4e-3 (mean 1.6e-3). The soft-gradient (forward-backward) path is float64 in both,
+so the `_double` soft functions are identical to the plain ones.
+
+The two precisions also have different traceback defaults (next section), so a
+float32 result and a float64 result are not bit-comparable even where the
+arithmetic would agree.
+
+## Traceback modes
+
+`SeqPair` and `SeqPairBatch` take `traceback=`, fixed at construction. It decides
+what the DP retains in order to recover the alignment path:
+
+| `traceback` | Memory | Notes |
+|---|---|---|
+| `"pointers"` | 3 B/cell | Records a predecessor byte per cell per state. |
+| `"scores"` | 12 B/cell | Keeps the score tables and re-derives the path. Bit-identical to `"pointers"`, slower; for table introspection. |
+| `"hirschberg"` | O(m+n) | Linear-space divide-and-conquer. Pairs no longer than `hb_cutoff` (default 512) never split and are bit-exact with `"pointers"`; longer pairs get an optimal path, but where alignments tie it may be a *different* optimal path (a different valid subgradient). Affine + full DP only (global or local). |
+| `"hirschberg_pmax"` | O(m+n) | As `"hirschberg"`, with the gap carry computed as a closed-form prefix max: 1.5–3.9× faster on related sequences. The **only mode that can return a slightly suboptimal path** — measured worst case 4.9e-4 at float32, below float32's own error. Bit-identical across ISA levels. |
+| `"auto"` (default) | — | Affine + global + full DP: `"hirschberg_pmax"` at float32, `"hirschberg"` at float64. Everything else: `"pointers"`. |
+
+Asking explicitly for a Hirschberg mode on a linear-gap or banded problem raises;
+`"auto"` falls back to `"pointers"` there instead. Local alignment supports
+Hirschberg but `"auto"` keeps `"pointers"` for it, because local Hirschberg wins on
+memory, not speed: select `traceback="hirschberg"` explicitly for very long local
+pairs (e.g. >10k residues), where the pointer tables would not fit.
+
+## Kernel selection
+
+`kernel=` picks the Viterbi backend: `"auto"` (default — the strongest SIMD level
+the CPU runs), `"scalar_fallback"`, or a named level: `"sse2"`, `"avx2"`, `"avx512"`
+(x86) or `"neon"` (ARM). Every level is **bit-exact** with `"scalar_fallback"`
+(same tables, paths and gradients), so this is purely a speed knob. An unknown
+name, or a level this CPU cannot run, raises. It affects the Viterbi (hard / none)
+path only; the linear gap model has no SIMD kernel, so any choice is a no-op there.
+
+Module-level controls: `nwgrad.simd_isa()` reports the active level,
+`nwgrad.available_isa_levels()` lists what this CPU runs, and
+`nwgrad.set_isa_level(name)` (for testing; not thread-safe while work is in flight)
+or the `NWGRAD_ISA` environment variable force the level that `"auto"` dispatches to. `nwgrad.compiled_with()` names the compiler the extension was built
+with.
+
 ## Gap penalty conventions
 
 For **linear** gap model, a gap of length `k` costs `gap_extend * k`.
@@ -450,7 +520,7 @@ This matches BioPython's convention where `open` is charged once per gap regardl
 
 ## Performance notes
 
-- Full O(m×n) DP tables are retained for gradient computation — no Hirschberg-style memory optimisation.
+- With `traceback="pointers"`, a hard-gradient alignment keeps 3 bytes per DP cell; `"scores"` keeps 12. The default for affine global alignment is Hirschberg, which keeps O(m+n) — so the per-thread buffer described below applies to the pointer modes and to the Hirschberg base case (≤ `hb_cutoff` rows).
 - `SeqPairBatch.score_and_grad()` allocates one `DpBuffer` per thread (sized to the largest sequence pair in the batch) and reuses it across all assigned pairs. Pair-owned DP tables are never allocated, keeping peak memory at `n_threads × max(m×n)` rather than `N × max(m×n)`.
 - Work is distributed via a shared `std::atomic` counter — no per-task mutex, no work-stealing queue.
 - Gradient accumulation is per-thread; a single mutex is taken once at join to merge partial gradients.

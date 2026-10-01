@@ -235,7 +235,8 @@ static void bind_batch_aligner(nb::module_& m, const char* name) {
             "  mode      : \"global\" | \"local\"\n"
             "  grad_mode : \"hard\" | \"soft\" | \"none\"\n"
             "  band      : 0 = full DP; >0 = banded half-width\n"
-            "  kernel    : \"scalar\" | \"simd\" — bit-exact Viterbi backends; a speed knob.")
+            "  kernel    : \"auto\" (default) | \"scalar_fallback\" | \"sse2\" | \"avx2\" |\n"
+            "              \"avx512\" | \"neon\" — bit-exact Viterbi backends; a speed knob.")
         .def(
             "align",
             [](const BA& self,
@@ -297,7 +298,8 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
             "  gap_model : \"linear\" | \"affine\"\n"
             "  mode      : \"global\" | \"local\"\n"
             "  grad_mode : \"hard\" | \"soft\" | \"none\"\n"
-            "  kernel    : \"scalar\" | \"simd\" — bit-exact speed knob (Viterbi path).\n"
+            "  kernel    : \"auto\" (default) | \"scalar_fallback\" | \"sse2\" | \"avx2\" |\n"
+            "              \"avx512\" | \"neon\" — bit-exact speed knob (Viterbi path).\n"
             "  traceback : \"auto\" (default) | \"pointers\" | \"scores\" | \"hirschberg\"\n"
             "              | \"hirschberg_pmax\"\n"
             "     — see SeqPairBatch.traceback.  \"auto\" = Hirschberg where it applies\n"
@@ -358,7 +360,8 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
             "Current alignment as a guide_j vector (length m+1), or None.")
         .def_prop_ro("traceback",
                      [](const SP& s) { return traceback_name(s.traceback()); },
-                     "\"pointers\" (default) or \"scores\" — see SeqPairBatch.traceback.")
+                     "The resolved traceback mode (never \"auto\"): \"pointers\" | \"scores\" |\n"
+                     "\"hirschberg\" | \"hirschberg_pmax\" — see SeqPairBatch.traceback.")
         .def_prop_ro("path_valid",  &SP::path_valid)
         .def_prop_ro("score_valid", &SP::score_valid)
         .def_prop_ro("grad_valid",  &SP::grad_valid)
@@ -591,11 +594,10 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
                 "Effective length at which the weight saturates (default 1700).")
         .def_prop_ro("traceback",
                      [](const SPB& s) { return traceback_name(s.traceback()); },
-                     "How the traceback recovers predecessors, fixed at construction:\n"
-                     "  \"pointers\" (default) — record 1 byte/cell/state during the fill\n"
-                     "     and follow it; scores need only two rolling rows.  3 B/cell.\n"
-                     "  \"scores\" — retain VM/VX/VY and re-derive the argmax.  12 B/cell.\n"
-                     "Bit-identical either way; \"scores\" exists for table introspection.")
+                     "The traceback mode the batch was constructed with — \"auto\" (the\n"
+                     "default) is reported as-is, since it resolves per pair (read\n"
+                     "batch[i].traceback for a pair's resolved mode).  See the constructor\n"
+                     "docstring for what each mode retains.")
         .def_rw("profile", &SPB::profile,
                 "Record per-thread phase timings during schedule=\"sorted\" runs "
                 "(off by default).  Read them back with schedule_profile().")
@@ -823,28 +825,28 @@ NB_MODULE(nwgrad_ext, m) {
         "simd_isa",
         []() { return get_isa_level(); },
         "Which instruction set the simd Viterbi kernels are dispatched to on this\n"
-        "CPU: \"baseline\" | \"avx2\" | \"avx512\" (x86) or \"neon\" (AArch64).  An alias\n"
+        "CPU: \"sse2\" | \"avx2\" | \"avx512\" (x86) or \"neon\" (AArch64).  An alias\n"
         "for get_isa_level().\n"
         "\n"
         "Worth checking before you conclude the simd kernel did not help.  Prebuilt\n"
-        "wheels are compiled for the x86-64 baseline, so \"baseline\" means SSE2 —\n"
-        "two doubles per vector.  A modern CPU should report \"avx2\" or better.\n"
+        "wheels carry every x86 level and pick at load; \"sse2\" (two doubles per\n"
+        "vector) is the fallback for CPUs without AVX2.  A modern CPU should report \"avx2\" or better.\n"
         "\n"
         "Plain \"avx\" is never selected: it is a measured regression on Bulldozer/\n"
         "Piledriver, whose FP unit splits every 256-bit operation into two 128-bit\n"
-        "halves, so AVX-only CPUs run the baseline level.  Set NWGRAD_ISA, or call\n"
+        "halves, so AVX-only CPUs run the sse2 level.  Set NWGRAD_ISA, or call\n"
         "set_isa_level(), to force a level (one the CPU cannot run falls back).");
 
     // ── Per-ISA-level dispatch for the striped affine kernel ──────────────────
     m.def("available_isa_levels", []() { return available_isa_levels(); },
           "The ISA levels this CPU can actually run, weakest first "
-          "(e.g. [\"baseline\", \"avx2\"]).");
+          "(e.g. [\"scalar_fallback\", \"sse2\", \"avx2\"]).");
     m.def("get_isa_level", []() { return get_isa_level(); },
           "The ISA level the striped affine kernel is currently dispatched to.");
     m.def("set_isa_level", [](const std::string& name) { set_isa_level(name); },
           nb::arg("level"),
           "Force the striped kernel's ISA level (for testing).  You may force any\n"
-          "level the CPU supports — forcing *down* (e.g. \"baseline\" on an AVX2 box)\n"
+          "level the CPU supports — forcing *down* (e.g. \"sse2\" on an AVX2 box)\n"
           "is how a level's bit-exactness is checked on capable hardware.  Forcing a\n"
           "level the CPU cannot run raises ValueError (it would SIGILL).  NOT\n"
           "thread-safe to change while work is in flight — set it before dispatching.\n"

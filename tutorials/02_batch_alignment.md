@@ -43,7 +43,7 @@ pairs = [
     for a, b in zip(seqs_a, seqs_b)
 ]
 
-batch = nwgrad.SeqPairBatch(n_threads=4)   # 0 = hardware_concurrency
+batch = nwgrad.SeqPairBatch(n_threads=4)   # 0 = physical core count
 for sp in pairs:
     batch.add(sp)
 ```
@@ -159,8 +159,14 @@ for n in [1, 2, 4, 8]:
     assert abs(total - ref_total) < 1e-10
 ```
 
-`n_threads=0` (the default) uses `hardware_concurrency`. Thread count is
-automatically clamped to the number of pairs.
+`n_threads=0` (the default) uses the number of physical cores (SMT siblings
+contend in this DP, so the logical count is slower). Thread count is automatically
+clamped to the number of pairs.
+
+If you need a gradient that is bit-for-bit independent of the thread count, read
+the per-pair results back with `batch.scores()` and sum them with
+`batch.weighted_grad(weights)` — it sums in pair order (use `np.ones(len(batch))`
+for a plain sum).
 
 ## All-vs-all pairs
 
