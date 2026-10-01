@@ -33,6 +33,17 @@ cmake -S . -B build-san -DCMAKE_BUILD_TYPE=Debug -DNWGRAD_SANITIZE=ON \
 cmake --build build-san --target nwgrad_tests
 ctest --test-dir build-san
 
+# Same, with TSan (CI's `tsan` job, gcc and clang).  Its own build: TSan cannot be
+# combined with ASan, and CMake refuses the mix.  Verified live — it reports the
+# duplicate-pair race (fixed in 92f45e0) at the first collision.  A clean run is ~2 min (gcc)
+# / ~4 min (clang) on skynet.  The test binary gets _GLIBCXX_ASSERTIONS (and libc++
+# hardening under clang) in EVERY build, sanitized or not.
+cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug -DNWGRAD_SANITIZE=ON \
+      -DNWGRAD_SANITIZERS=thread -DNWGRAD_BUILD_BENCHMARKS=OFF \
+      -Dnanobind_DIR="$(python -m nanobind --cmake_dir)"
+cmake --build build-tsan --target nwgrad_tests
+TSAN_OPTIONS="halt_on_error=1" ctest --test-dir build-tsan
+
 # Benchmark the scalar vs simd Viterbi kernels, across every ISA the CPU offers.
 # Needs only the installed package — it compiles nothing, deliberately: comparing
 # separately-compiled binaries produced code-layout artifacts LARGER than the effect
@@ -62,7 +73,26 @@ tools/bench_toolchain.sh [threads] [reps]
 python -m nwgrad --include
 ```
 
-Build dependencies: `scikit-build-core`, `nanobind`, C++20 compiler (GCC 11+ or Clang 13+).
+Build dependencies: `scikit-build-core`, `nanobind>=3.0` (the bindings call its backend keep-alive entry; enforced by pyproject and CMake), C++20 compiler (GCC 11+ or Clang 13+).
+
+## Open TODOs
+
+- **Measure what `-ffp-contract=off` costs on AArch64.** `CMakeLists.txt` now builds every
+  target with it (commit `42df954`): clang fused the striped kernels' closed-form borders
+  `-(go + j*ge)` into FMAs in the avx2/avx512 TUs, so with a non-representable gap cost
+  `kernel="avx2"` could return a different alignment than `scalar_fallback`. On x86 it is
+  free — gcc emitted 0 FMAs there already, and the Viterbi kernels are max/add chains. It
+  is **unmeasured on AArch64**, where gcc contracts by default and FMA is baseline, so the
+  shared scalar code (forward-backward / `soft_grad`, gradient accumulation) may have lost
+  fusions it had. Time the soft path and `tools/bench_simd.py` on spot (M1) with and
+  without the flag. If it costs, prefer narrowing the flag to the level TUs and the
+  Viterbi/traceback code over dropping it — bit-exactness across levels is the contract.
+- **Release the GIL during batch computation** (from the 2026-10-01 release review). The
+  bindings hold it throughout, so a long `score_and_grad()` blocks every other Python
+  thread. Only safe now that pair/params lifetimes are pinned (commits `0413212`,
+  `92f45e0`); still needs a stated contract against concurrent mutation of a batch from
+  two Python threads. Nothing implemented or measured.
+- Default thread count for short pairs: see `TODO.md`.
 
 ## Architecture
 
@@ -316,7 +346,7 @@ nanobind module `nwgrad_ext`, re-exported from `src/nwgrad/__init__.py`. Exposes
 - Alphabet constants: `nwgrad.DNA`, `DNA_N`, `RNA`, `RNA_N`, `PROTEIN`, `PROTEIN_X`, `PROTEIN_UO`, `PROTEIN_UOX`, plus `NCBI_PROTEIN` and `IUPAC_DNA` for the packaged matrices
 - Zero-copy numpy integration via nanobind buffer protocol
 - `kernel="auto"` (default) on the 12 functions, `BatchAligner` and `SeqPair` — the **one unified backend vocabulary** `scalar_fallback | auto | sse2 | avx2 | avx512 | neon`, the same words `set_isa_level()`/`NWGRAD_ISA` take (`auto` = the strongest simd level the CPU runs; `sse2` was formerly called `baseline`). Every simd level is **bit-exact** with `scalar_fallback` — identical tables, alignments and gradients — so it is a speed knob and never a correctness one. It is per-aligner (the level is no longer a global), and affects the **Viterbi/hard-gradient path only**: forward-backward and `soft_grad` are the same shared code either way, and the linear gap model has no simd kernel, so any simd backend is a legal no-op there. An unrecognised name — or a simd level this CPU cannot run — **throws** (a typo that silently gave you the wrong path would be undetectable).
-- `traceback="auto"` (default) on `SeqPair` and `SeqPairBatch` — **fixed at construction**, deliberately not settable afterwards, because it decides what the DP *retains* rather than how it computes. `auto` resolves per problem to a Hirschberg mode (affine+global+full) or `pointers` (else), and then on precision: **`hirschberg_pmax` at float32, `hirschberg` at double**. `pointers` records a 1-byte predecessor per cell per state during the fill (3 B/cell); `scores` keeps VM/VX/VY and re-derives the argmax (12 B/cell, and the only mode that leaves tables for `to_row_major()` to inspect); `hirschberg` keeps no table at all above its `hb_cutoff` base case. `hirschberg_pmax` is Hirschberg with the closed-form prefix-max gap carry — 1.5–3.9× faster on related sequences, the float32 default, and the one mode that can return a *suboptimal* path (see its section above; at float32 its error is measurably dominated by float32's own, which is what justifies the default). Pointers and Scores are **bit-identical**; Hirschberg is bit-exact with them only for pairs ≤ `hb_cutoff` (it degrades to the Pointers fill there), and a valid-but-different subgradient above. **Caveat measured 2026-07-28:** that "bit-exact below the cutoff" holds for the *score* but not always for the *alignment string* — with a non-representable `gap_extend` (0.1) exact Hirschberg's path differed from Pointers on 3/20 short pairs, and on degenerate pure-gap inputs its replayed score lands one ULP off (−11.399999999999999 vs −11.4), because both Hirschberg modes replay the score from the recovered path while Pointers reads it off the table. At `gap_extend` = 1.0 the divergence is 0/20. This predates and is independent of `hirschberg_pmax`, which matched exact Hirschberg 20/20 in the same check; the cause has not been chased. An unknown name **throws**; explicit `hirschberg`/`hirschberg_pmax` on linear/banded **throws** (the `auto` default falls back instead); on **Local** both are supported (affine+full), though `auto` deliberately resolves Local to `pointers` (fleet-swept 2026-07-27: Local HB is a memory play, not a speed one — select it explicitly when memory-bound or aligning very long sequences). Note this is a different axis from `kernel=`: that one is bit-exact by contract, this one is not.
+- `traceback="auto"` (default) on `SeqPair` and `SeqPairBatch` — **fixed at construction**, deliberately not settable afterwards, because it decides what the DP *retains* rather than how it computes. `auto` resolves per problem to a Hirschberg mode (affine+global+full) or `pointers` (else), and then on precision: **`hirschberg_pmax` at float32, `hirschberg` at double**. `pointers` records a 1-byte predecessor per cell per state during the fill (3 B/cell); `scores` keeps VM/VX/VY and re-derives the argmax (12 B/cell, and the only mode that leaves tables for `to_row_major()` to inspect); `hirschberg` keeps no table at all above its `hb_cutoff` base case. `hirschberg_pmax` is Hirschberg with the closed-form prefix-max gap carry — 1.5–3.9× faster on related sequences, the float32 default, and the one mode that can return a *suboptimal* path (see its section above; at float32 its error is measurably dominated by float32's own, which is what justifies the default). Pointers and Scores are **bit-identical**; Hirschberg is bit-exact with them only for pairs ≤ `hb_cutoff` (it degrades to the Pointers fill there), and a valid-but-different subgradient above. **Fixed 2026-10-01 (was a caveat measured 2026-07-28):** "bit-exact below the cutoff" used to hold for neither the score nor the path. A pair that never split ran the Hirschberg *base case*, whose borders are seeded and carried differently from the Pointers fill, so with a non-representable `gap_extend` (0.1) it settled float ties on a path one ULP worse (−4.3 vs −4.299999999999999) and replayed the score from that path: 27/41 short pairs differed. Such pairs are now run *as* Pointers in `run_viterbi` (same fill, table, traceback), so the promise holds by construction, at unchanged memory and speed. Consequence for tests: a Hirschberg test on short pairs at the default cutoff tests Pointers — `test_hirschberg.py` pins `HB_CUTOFF = 16` (1 for tiny inputs) so the recursion stays under test. An unknown name **throws**; explicit `hirschberg`/`hirschberg_pmax` on linear/banded **throws** (the `auto` default falls back instead); on **Local** both are supported (affine+full), though `auto` deliberately resolves Local to `pointers` (fleet-swept 2026-07-27: Local HB is a memory play, not a speed one — select it explicitly when memory-bound or aligning very long sequences). Note this is a different axis from `kernel=`: that one is bit-exact by contract, this one is not.
 - `simd_isa()` reports which instruction set the kernel selected.
 
 `SubstMatrix` and `AlignParams` take the alphabet as a `str`, not an `Alphabet` object — there is no implicit conversion, so pass `.symbols` if you are holding one.
