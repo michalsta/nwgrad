@@ -207,6 +207,7 @@ SMT siblings contend and the logical count measured up to 1.44× slower. `add()`
 | `compute_grad()` | `AlignParams` | Sum cached per-pair gradients. No DP work if all `grad_valid` are already true. |
 | `scores()` | `numpy.ndarray` (float64) | The cached per-pair scores, in pair order. Runs no DP; raises if any pair has no valid score. |
 | `weighted_grad(weights)` | `AlignParams` | `sum_i weights[i] * grad_i` over the cached per-pair gradients. `weights` is a 1-D numeric array with one entry per pair. Runs no DP; raises if any pair has no valid gradient. Summed in pair order, so the result does not depend on `n_threads`. |
+| `grads()` | `(numpy.ndarray, numpy.ndarray)` (float64) | The cached per-pair gradients as two arrays, in pair order: `matrices` of shape `(N, n, n)`, rows and columns in the order of `alphabet`, and `gaps` of shape `(N, 4)` with columns `gap_open_a`, `gap_extend_a`, `gap_open_b`, `gap_extend_b`. The same numbers as `batch[i].grad`, without one `AlignParams` object per pair. Runs no DP; raises on an empty batch and if any pair has no valid gradient. |
 | `align_full()` | `float` (sum of scores) | Full DP on all pairs in parallel using pair-owned buffers. Call `alloc_dp()` first. |
 | `realign_banded(bandwidth)` | `float` (sum of scores) | Banded DP on all pairs in parallel using pair-owned buffers. |
 | `banded_grad(bandwidth)` | `float` (sum of scores) | Banded re-align + gradient around each pair's cached path, using per-thread buffers. Run `score_and_grad()` once to establish the paths, then `set_params()` + `banded_grad(bw)` after each update. |
@@ -227,6 +228,7 @@ concurrently). The same pair may belong to several batches.
 | Property | Type | Description |
 |---|---|---|
 | `n_threads` | `int` | Thread count |
+| `alphabet` | `str` | The symbols of the alphabet every pair shares (the row and column order of `grads()`). Raises on an empty batch. |
 | `traceback` | `str` | The batch's traceback mode as given (`"auto"` resolves per pair) |
 | `hb_cutoff` | `int` | Hirschberg base-case size applied by `add_many()` (default 512) |
 | `schedule` | `str` | `"dynamic"` (default; atomic counter) or `"sorted"` (length-sorted equal-work chunks — bounds peak DP memory). Results are identical either way. |

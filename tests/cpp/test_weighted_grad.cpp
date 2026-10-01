@@ -1,4 +1,5 @@
-// Tests for SeqPairBatch::scores() and SeqPairBatch::weighted_grad().
+// Tests for SeqPairBatch::scores(), SeqPairBatch::weighted_grad() and
+// SeqPairBatch::grads_into().
 
 #include "catch.hpp"
 #include "align_params.hpp"
@@ -112,4 +113,32 @@ TEST_CASE("weighted_grad: products are rounded before they are summed", "[weight
         }
     }
     REQUIRE(flat(batch.weighted_grad(w.data(), w.size())) == expected);
+}
+
+TEST_CASE("grads_into: copies every pair's cached gradient", "[weighted_grad]") {
+    auto p = dna_params();
+    SeqPairBatchT<double> batch(3);
+    batch.add_many(views(SEQS_A), views(SEQS_B), p, GapModel::Affine,
+                   AlignMode::Local, GradMode::Hard);
+    batch.score_and_grad();
+    const size_t N = batch.size();
+    std::vector<double> mats(N * 16, -1.0), gaps(N * 4, -1.0);
+    batch.grads_into(mats.data(), gaps.data());
+    for (size_t i = 0; i < N; ++i) {
+        std::vector<double> e = flat(batch[i].grad());
+        for (size_t k = 0; k < 16; ++k) REQUIRE(mats[i * 16 + k] == e[k]);
+        for (size_t k = 0; k < 4; ++k) REQUIRE(gaps[i * 4 + k] == e[16 + k]);
+    }
+}
+
+TEST_CASE("grads_into: preconditions throw", "[weighted_grad]") {
+    auto p = dna_params();
+    SeqPairBatchT<double> empty(1);
+    REQUIRE_THROWS_AS(empty.grads_into(nullptr, nullptr), std::logic_error);
+
+    SeqPairBatchT<double> batch(2);
+    batch.add_many(views(SEQS_A), views(SEQS_B), p, GapModel::Affine,
+                   AlignMode::Global, GradMode::Hard);
+    std::vector<double> mats(batch.size() * 16), gaps(batch.size() * 4);
+    REQUIRE_THROWS_AS(batch.grads_into(mats.data(), gaps.data()), std::logic_error);
 }

@@ -604,6 +604,33 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             "this.  Summed in pair order, so the result does not depend on n_threads.\n"
             "Raises on an empty batch, on len(weights) != len(batch), and on a pair\n"
             "without a valid gradient.")
+        .def(
+            "grads",
+            [](const SPB& self) {
+                const size_t N = self.size();
+                const size_t n = static_cast<size_t>(self.alphabet().size());   // throws if empty
+                double* mats = new double[N * n * n];
+                nb::capsule mats_owner(mats, [](void* p) noexcept { delete[] static_cast<double*>(p); });
+                double* gaps = new double[N * 4];
+                nb::capsule gaps_owner(gaps, [](void* p) noexcept { delete[] static_cast<double*>(p); });
+                self.grads_into(mats, gaps);
+                size_t mats_shape[3] = {N, n, n};
+                size_t gaps_shape[2] = {N, 4};
+                return nb::make_tuple(nb::ndarray<nb::numpy, double>(mats, 3, mats_shape, mats_owner),
+                                      nb::ndarray<nb::numpy, double>(gaps, 2, gaps_shape, gaps_owner));
+            },
+            "The pairs' CACHED gradients as two float64 arrays, in pair order:\n"
+            "(matrices, gaps).  matrices has shape (N, n, n), rows and columns in the\n"
+            "order of the batch's alphabet; gaps has shape (N, 4), with columns\n"
+            "gap_open_a, gap_extend_a, gap_open_b, gap_extend_b.  The same numbers as\n"
+            "batch[i].grad, without one AlignParams object per pair.  Runs no\n"
+            "alignment: call score_and_grad() (or compute_grad()) first.  Raises on an\n"
+            "empty batch and on a pair without a valid gradient.")
+        .def_prop_ro(
+            "alphabet",
+            [](const SPB& self) { return self.alphabet().symbols(); },
+            "The symbols of the alphabet every pair in the batch shares.  Raises on an\n"
+            "empty batch.")
         .def("banded_grad",
              [](SPB& self, int bandwidth) { return self.banded_grad(bandwidth); },
              nb::arg("bandwidth"),

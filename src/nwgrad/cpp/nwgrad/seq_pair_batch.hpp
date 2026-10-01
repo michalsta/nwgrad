@@ -371,6 +371,29 @@ struct SeqPairBatchT {
         return out;
     }
 
+    // The pairs' CACHED gradients, copied out in pair order: pair i's matrix to
+    // matrices[i*n*n ..] (row-major, n = alphabet().size(), rows and columns in
+    // alphabet order) and its gap fields to gaps[i*4 ..] as gap_open_a,
+    // gap_extend_a, gap_open_b, gap_extend_b.  The caller sizes both buffers for
+    // size() pairs.  Runs no alignment, so per-pair gradients reach the caller as
+    // two arrays rather than one AlignParams object per pair.
+    //
+    // Throws on an empty batch (no alphabet, so no matrix size) and on a pair
+    // without a valid gradient.
+    void grads_into(double* matrices, double* gaps) const {
+        const size_t nn = static_cast<size_t>(alphabet().size()) *
+                          static_cast<size_t>(alphabet().size());   // throws if empty
+        for (size_t i = 0; i < pairs.size(); ++i) {
+            const AlignParams& g = pairs[i]->grad();
+            g.matrix.to_array(matrices + i * nn);
+            double* gp = gaps + i * 4;
+            gp[0] = g.gap_open_a;
+            gp[1] = g.gap_extend_a;
+            gp[2] = g.gap_open_b;
+            gp[3] = g.gap_extend_b;
+        }
+    }
+
     // dst = s * src.  Out of line on purpose; see weighted_grad().
     [[gnu::noinline]] static void scale_into(AlignParams& dst, const AlignParams& src, double s) {
         dst = src;

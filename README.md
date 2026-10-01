@@ -94,7 +94,7 @@ for step in range(100):
 
 `add_many()` builds the pairs in parallel C++ with no per-pair Python objects, so
 batches of millions of pairs are cheap to set up. Per-pair scores and gradients are
-available too (`batch.scores()`, `batch.weighted_grad(weights)`, `batch[i]`), for
+available too (`batch.scores()`, `batch.grads()`, `batch.weighted_grad(weights)`, `batch[i]`), for
 objectives that weight each pair differently.
 
 ## Good to know
