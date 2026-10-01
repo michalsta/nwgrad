@@ -55,7 +55,7 @@ jobs:
       # CMakeLists does find_package(nanobind) for the extension target, so even a
       # tests-only configure needs it on the prefix path.
       - name: Install nanobind
-        run: pip install nanobind
+        run: pip install "nanobind>=3.0"
 
       # The C++ test binary is not reachable through the Python package, so it
       # only ever runs here: SeqPair/SeqPairBatch from C++, Aligner::alignment(),
@@ -94,7 +94,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install nanobind
-        run: pip install nanobind
+        run: pip install "nanobind>=3.0"
 
       - name: Configure
         run: >
@@ -156,7 +156,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install nanobind
-        run: pip install nanobind
+        run: pip install "nanobind>=3.0"
 
       - name: Configure
         run: >
@@ -198,7 +198,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install nanobind
-        run: pip install nanobind
+        run: pip install "nanobind>=3.0"
 
       # The DP indexes a raw double* with encoded sequence indices and the batch
       # code hands spans across threads, so out-of-bounds reads here would be
@@ -242,7 +242,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install nanobind
-        run: pip install nanobind
+        run: pip install "nanobind>=3.0"
 
       # TSan reserves fixed shadow ranges, and the runner kernel's 32 bits of mmap
       # randomization can place a mapping inside them; older runtimes then die at
@@ -273,7 +273,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.11", "3.13"]
+        python-version: ["3.10", "3.11", "3.13"]
     steps:
       - uses: actions/checkout@v4
 

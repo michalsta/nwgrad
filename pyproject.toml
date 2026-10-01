@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools", "scikit-build-core", "nanobind"]
+requires = ["setuptools", "scikit-build-core", "nanobind>=3.0"]
 build-backend = "scikit_build_core.build"
 
 
@@ -12,7 +12,7 @@ license = "MIT"
 license-files = ["LICENSE"]
 authors = [{name = "Michał Startek"}]
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 classifiers = [
     "Programming Language :: Python :: 3",
     "Topic :: Software Development :: Libraries :: Python Modules",
@@ -40,7 +40,7 @@ testpaths = ["tests/Python"]
 # and rejected outright.  CPython wheels dodge this entirely: every test dependency
 # has a prebuilt wheel, so nothing is compiled at test time.  PyPy was never a target.
 [tool.cibuildwheel]
-skip = ["cp36-*", "cp37-*", "cp38-*", "pp*"]
+skip = ["cp36-*", "cp37-*", "cp38-*", "cp39-*", "pp*"]
 test-command = "python -m pytest {project}/tests/Python"
 test-extras = ["dev"]
 

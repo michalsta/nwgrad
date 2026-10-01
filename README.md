@@ -31,7 +31,7 @@ cd nwgrad
 pip install .
 ```
 
-Prebuilt wheels cover CPython 3.9–3.14 on Linux x86_64 / aarch64 and macOS arm64.
+Prebuilt wheels cover CPython 3.10–3.14 on Linux x86_64 / aarch64 and macOS arm64.
 Anywhere else pip builds from source, which needs a C++20 compiler with libstdc++'s
 `<experimental/simd>`: GCC 11+, or Clang 13+ built against libstdc++. Apple's
 system clang (libc++) and MSVC lack that header — on macOS use Homebrew `gcc`;

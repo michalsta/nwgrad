@@ -1,10 +1,16 @@
 cmake_minimum_required(VERSION 3.15)
 
 project(nwgrad LANGUAGES CXX)
-find_package(Python 3.8
+find_package(Python 3.10
   REQUIRED COMPONENTS Interpreter Development.Module
   OPTIONAL_COMPONENTS Development.SABIModule)
 find_package(nanobind REQUIRED CONFIG)
+# nanobind >= 3.0: the bindings call its backend keep-alive entry (NB_CALL) directly.
+# Checked here rather than as find_package(nanobind 3.0): nanobind's version file uses
+# same-major compatibility, which would also reject 4.x, and the requirement is a floor.
+if (nanobind_VERSION VERSION_LESS 3.0)
+    message(FATAL_ERROR "nwgrad needs nanobind >= 3.0 (found ${nanobind_VERSION})")
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 
