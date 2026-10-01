@@ -345,6 +345,13 @@ struct SeqPairBatchT {
     // partials in completion order, so it is not.)  One pass of O(N * |alphabet|^2)
     // multiply-adds is negligible next to the DP that produced the gradients.
     //
+    // No product is ever formed next to the add that consumes it: scale_into()
+    // stores w_i * grad_i out of line, and the sum loads it.  A multiply adjacent to
+    // an add is what compilers contract into an FMA, which rounds once instead of
+    // twice -- on FMA targets (AArch64, by default) the sum would then differ in the
+    // last bits from targets without FMA.  Same rule as the precomputed gap ramp in
+    // hb_kernel_impl.inl.
+    //
     // Throws on an empty batch (the sum has no alphabet), on a weight count other
     // than size(), and on a pair without a valid gradient.
     AlignParams weighted_grad(const double* weights, size_t n) const {
@@ -354,9 +361,18 @@ struct SeqPairBatchT {
                 "nwgrad: weighted_grad() needs one weight per pair (got " +
                 std::to_string(n) + " weights for " +
                 std::to_string(pairs.size()) + " pairs)");
-        AlignParams out(alpha);
-        for (size_t i = 0; i < n; ++i) out.add_scaled(pairs[i]->grad(), weights[i]);
+        AlignParams out(alpha), scaled(alpha);
+        for (size_t i = 0; i < n; ++i) {
+            scale_into(scaled, pairs[i]->grad(), weights[i]);
+            out += scaled;
+        }
         return out;
+    }
+
+    // dst = s * src.  Out of line on purpose; see weighted_grad().
+    [[gnu::noinline]] static void scale_into(AlignParams& dst, const AlignParams& src, double s) {
+        dst = src;
+        dst *= s;
     }
 
     // Full-pipeline batch operation using per-thread DpBuffers.

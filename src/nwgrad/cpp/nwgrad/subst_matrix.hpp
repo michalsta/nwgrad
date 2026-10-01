@@ -101,13 +101,6 @@ struct SubstMatrix {
         return *this;
     }
 
-    // *this += s * o, without the temporary that `*this += s * o` would build.
-    SubstMatrix& add_scaled(const SubstMatrix& o, double s) {
-        check_same_alphabet(o);
-        for (size_t k = 0; k < blk_.size(); ++k) blk_[k] += s * o.blk_[k];
-        return *this;
-    }
-
 private:
     void check_same_alphabet(const SubstMatrix& o) const {
         if (alpha_ != o.alpha_)

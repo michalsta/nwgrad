@@ -1,5 +1,4 @@
-// Tests for AlignParams::add_scaled(), SeqPairBatch::scores() and
-// SeqPairBatch::weighted_grad().
+// Tests for SeqPairBatch::scores() and SeqPairBatch::weighted_grad().
 
 #include "catch.hpp"
 #include "align_params.hpp"
@@ -41,20 +40,6 @@ static std::vector<double> flat(const AlignParams& g) {
     out.push_back(g.gap_open_b);
     out.push_back(g.gap_extend_b);
     return out;
-}
-
-TEST_CASE("add_scaled: equals += s * o over every field", "[weighted_grad]") {
-    AlignParams a = dna_params(), b = dna_params();
-    b.gap_open_a = 7.0;
-    AlignParams expected = a + (-0.5) * b;
-    a.add_scaled(b, -0.5);
-    REQUIRE(flat(a) == flat(expected));
-}
-
-TEST_CASE("add_scaled: different alphabets throw", "[weighted_grad]") {
-    AlignParams a = dna_params();
-    AlignParams rna(Alphabet::get("ACGU"));
-    REQUIRE_THROWS_AS(a.add_scaled(rna, 1.0), std::invalid_argument);
 }
 
 TEST_CASE("scores / weighted_grad: match the per-pair values", "[weighted_grad]") {
@@ -104,4 +89,27 @@ TEST_CASE("weighted_grad: preconditions throw", "[weighted_grad]") {
     batch.score_and_grad();
     REQUIRE_THROWS_AS(batch.weighted_grad(WEIGHTS.data(), WEIGHTS.size() - 1),
                       std::invalid_argument);
+}
+
+// Every product is rounded on its own before it is added: no FMA.  The reference
+// forces that with a volatile store.  On an FMA target (the ARM64 CI job) a
+// contracted sum in weighted_grad() would miss this bit-exact equality.
+TEST_CASE("weighted_grad: products are rounded before they are summed", "[weighted_grad]") {
+    auto p = dna_params();
+    SeqPairBatchT<double> batch(2);
+    batch.add_many(views(SEQS_A), views(SEQS_B), p, GapModel::Affine,
+                   AlignMode::Local, GradMode::Hard);
+    batch.score_and_grad();
+    // Weights with long mantissas, so a fused multiply-add would round differently.
+    const std::vector<double> w = {0.1, -1.0 / 3.0, 2.0 / 7.0, 1e-3 / 9.0, -0.7};
+
+    std::vector<double> expected(20, 0.0);
+    for (size_t i = 0; i < batch.size(); ++i) {
+        std::vector<double> g = flat(batch[i].grad());
+        for (size_t k = 0; k < g.size(); ++k) {
+            volatile double product = w[i] * g[k];
+            expected[k] += product;
+        }
+    }
+    REQUIRE(flat(batch.weighted_grad(w.data(), w.size())) == expected);
 }
