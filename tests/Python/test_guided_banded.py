@@ -193,7 +193,7 @@ class TestGradientGuided:
         a, b = "PLEASANTLY", "MEANLY"
         s_full, _ = nwgrad.nw_grad(a, b, blosum)
         aligned_a = "PLEASANTLY"
-        aligned_b = "-MEA--NELY"
+        aligned_b = "-MEA--N-LY"
         s_guided, _ = nwgrad.nw_grad(a, b, blosum, band=3,
                                       aligned_a=aligned_a, aligned_b=aligned_b)
         assert s_guided == pytest.approx(s_full)

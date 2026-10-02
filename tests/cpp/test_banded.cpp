@@ -234,3 +234,66 @@ TEST_CASE("Guide-banded: endpoint always reachable for complete guide", "[banded
 
     REQUIRE(guided.score() == Approx(full.score()));
 }
+
+// ── Supplied guides are validated against the problem ─────────────────────────
+//
+// The band helpers index guide_j[0..m] unchecked, so set_problem() must reject a
+// guide that does not describe this a and b before any DP touches it.  A guide
+// built from well-formed aligned strings that spell a different (shorter) pair
+// used to read past the end of the vector (heap-buffer-overflow under ASan).
+
+TEST_CASE("Guide-banded: malformed supplied guides are rejected", "[banded][guide]") {
+    auto p = unit_params(1.0, 2.0);
+    Aligner<GapModel::Affine, AlignMode::Global, AlignBand::GuideBanded> al;
+    al.alloc_buf();
+
+    // Short: aligned strings "A"/"A" describe one residue of a four-residue A.
+    REQUIRE_THROWS_AS(al.set_problem("ACDE", "ACDE", p, 1, guide_j_from_aligned("A", "A")),
+                      std::invalid_argument);
+    // Long.
+    REQUIRE_THROWS_AS(al.set_problem("AC", "AC", p, 1, std::vector<int>{0, 1, 2, 2}),
+                      std::invalid_argument);
+    // Column outside [0, n].
+    REQUIRE_THROWS_AS(al.set_problem("AC", "AC", p, 1, std::vector<int>{0, 1, 3}),
+                      std::invalid_argument);
+    REQUIRE_THROWS_AS(al.set_problem("AC", "AC", p, 1, std::vector<int>{-1, 1, 2}),
+                      std::invalid_argument);
+    // Moving left.
+    REQUIRE_THROWS_AS(al.set_problem("ACD", "ACD", p, 1, std::vector<int>{0, 2, 1, 3}),
+                      std::invalid_argument);
+    // Negative band, with and without a guide.
+    REQUIRE_THROWS_AS(al.set_problem("AC", "AC", p, -1, std::vector<int>{0, 1, 2}),
+                      std::invalid_argument);
+    REQUIRE_THROWS_AS(al.set_problem("AC", "AC", p, -1), std::invalid_argument);
+
+    // A rejected problem leaves the aligner unset, not holding the previous result.
+    al.set_problem("AC", "AC", p, 1);
+    al.compute_viterbi();
+    REQUIRE_THROWS_AS(al.set_problem("ACDE", "ACDE", p, 1, std::vector<int>{0, 1}),
+                      std::invalid_argument);
+    REQUIRE_THROWS(al.compute_viterbi());
+}
+
+TEST_CASE("Guide-banded: valid edge-case guides are accepted", "[banded][guide]") {
+    auto p = unit_params(1.0, 2.0);
+    Aligner<GapModel::Affine, AlignMode::Global, AlignBand::GuideBanded> al;
+    Aligner<GapModel::Affine, AlignMode::Global, AlignBand::Full> full;
+    al.alloc_buf();
+    full.alloc_buf();
+    // Leading and trailing gaps in A: the last guide entry need not be n, because
+    // trailing B residues are consumed after the last A residue is recorded.
+    for (auto [aa, bb] : {std::pair{"--ACDE--", "MMACDEMM"},
+                          std::pair{"ACDE", "----"},
+                          std::pair{"----", "MMMM"}}) {
+        std::string a, b;
+        for (char c : std::string(aa)) if (c != '-') a += c;
+        for (char c : std::string(bb)) if (c != '-') b += c;
+        auto gj = guide_j_from_aligned(aa, bb);
+        REQUIRE(gj.size() == a.size() + 1);
+        al.set_problem(a, b, p, 100, gj);
+        al.compute_viterbi();
+        full.set_problem(a, b, p);
+        full.compute_viterbi();
+        REQUIRE(al.score() == Approx(full.score()));
+    }
+}

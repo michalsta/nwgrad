@@ -5,7 +5,6 @@ import pytest
 from conftest import describe, run_isolated
 
 
-@pytest.mark.xfail(strict=True, reason="guide length is not checked against sequence A")
 @pytest.mark.parametrize("precision", ["", "Double"], ids=["float32", "double"])
 @pytest.mark.parametrize("entry", ["convenience", "batch"])
 @pytest.mark.parametrize("grad_mode", ["hard", "soft"])

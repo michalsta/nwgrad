@@ -223,6 +223,14 @@ struct Aligner {
                      const AlignParams& params,
                      int band = 0,
                      std::vector<int> guide_j = {}) {
+        // Invalidate first: a guide rejected below must not leave the previous
+        // problem's results readable against this problem's sequences.
+        problem_set_      = false;
+        viterbi_done_     = false;
+        fwdbwd_done_      = false;
+        any_viterbi_done_ = false;
+        any_fwdbwd_done_  = false;
+        fwdbwd_is_newest_ = false;
         a_idx_  = a;
         b_idx_  = b;
         params_ = &params;
@@ -245,6 +253,9 @@ struct Aligner {
         stride_ = static_cast<size_t>(n_ + 1);
         sz_     = static_cast<size_t>(m_ + 1) * stride_;
         if constexpr (AB == AlignBand::GuideBanded) {
+            if (band_ < 0)
+                throw std::invalid_argument(
+                    "nwgrad: band must be >= 0, got " + std::to_string(band_));
             if (guide_j.empty()) {
                 guide_j_.resize(static_cast<size_t>(m_ + 1));
                 if (m_ > 0)
@@ -254,15 +265,15 @@ struct Aligner {
                 else
                     guide_j_[0] = 0;
             } else {
+                // The band helpers index guide_j_[0..m] unchecked, so a supplied guide
+                // must describe THIS problem: one entry per row, each a column of B,
+                // never moving left.  guide_j_from_aligned() checks only the aligned
+                // strings' own syntax, not that they spell this a and b.
+                validate_guide(guide_j);
                 guide_j_ = std::move(guide_j);
             }
         }
         problem_set_      = true;
-        viterbi_done_     = false;
-        fwdbwd_done_      = false;
-        any_viterbi_done_ = false;
-        any_fwdbwd_done_  = false;
-        fwdbwd_is_newest_ = false;
     }
 
     // Allocate an empty buffer shell. Must be called once before compute_viterbi()
@@ -712,6 +723,28 @@ private:
     }
 
     // ── Band helpers ──────────────────────────────────────────────────────────
+    void validate_guide(const std::vector<int>& gj) const {
+        if (gj.size() != static_cast<size_t>(m_) + 1)
+            throw std::invalid_argument(
+                "nwgrad: guide_j has " + std::to_string(gj.size()) +
+                " entries, but sequence A of length " + std::to_string(m_) +
+                " needs " + std::to_string(m_ + 1) +
+                " (do the aligned strings spell the input sequences?)");
+        for (size_t i = 0; i < gj.size(); ++i) {
+            if (gj[i] < 0 || gj[i] > n_)
+                throw std::invalid_argument(
+                    "nwgrad: guide_j[" + std::to_string(i) + "] = " +
+                    std::to_string(gj[i]) + " is outside [0, " +
+                    std::to_string(n_) + "] for sequence B of length " +
+                    std::to_string(n_));
+            if (i > 0 && gj[i] < gj[i - 1])
+                throw std::invalid_argument(
+                    "nwgrad: guide_j decreases at row " + std::to_string(i) +
+                    " (" + std::to_string(gj[i - 1]) + " -> " +
+                    std::to_string(gj[i]) + ")");
+        }
+    }
+
     int jlo(int i) const noexcept {
         if constexpr (AB == AlignBand::Full) return 1;
         else                                  return std::max(1, guide_j_[i] - band_);
