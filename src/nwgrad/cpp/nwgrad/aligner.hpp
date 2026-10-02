@@ -477,6 +477,17 @@ struct Aligner {
         return {std::move(a), std::move(b)};
     }
 
+    // guide_j_from_viterbi(buf) and hard_grad(buf, grad) in one traceback walk where
+    // the path is read from score tables (affine, not Pointers or Hirschberg); two walks
+    // otherwise.  Same guide, same gradient either way.
+    void hard_grad_and_guide(const DpBuffer& buf, AlignParams& grad, std::vector<int>& gj) const {
+        if constexpr (GM == GapModel::Affine) {
+            if (!hirschberg_ && !pointers_) { hard_grad_affine(buf, grad, &gj); return; }
+        }
+        gj = guide_j_from_viterbi(buf);
+        hard_grad(buf, grad);
+    }
+
     void hard_grad(const DpBuffer& buf, AlignParams& grad) const {
         if constexpr (GM == GapModel::Affine) {
             if (hirschberg_) { hard_grad_affine_hb(grad); return; }
@@ -701,7 +712,7 @@ private:
     // so switching VM/VX/VY between row-major and striped is a change to cell_index alone.
     // Striped layout MUST match the kernel in kernels_impl.inl: row size striped_seg_*
     // striped_w_ + 1, slot 0 = column 0, column j (1..n) at 1 + ((j-1)%seg)*W + (j-1)/seg.
-    size_t cell_index(int i, int j) const noexcept {
+    __attribute__((always_inline)) size_t cell_index(int i, int j) const noexcept {
         if (inter_w_) {
             // Inter-pair fill (adopt_interleaved): W pairs' tables interleaved per cell.
             return (static_cast<size_t>(i) * stride_ + static_cast<size_t>(j)) *
@@ -2370,10 +2381,19 @@ private:
         std::reverse(b.begin(), b.end());
     }
 
-    void hard_grad_affine(const DpBuffer& buf, AlignParams& grad) const {
+    // gj != nullptr: also record the guide path, exactly as guide_j_affine() would —
+    // the two walks take the same steps — so one walk serves both.
+    void hard_grad_affine(const DpBuffer& buf, AlignParams& grad,
+                          std::vector<int>* gj = nullptr) const {
         double* gblk = grad_block(grad);
         int i = best_i_, j = best_j_;
         TBTable tbl = best_tbl_;
+        if (gj) {
+            gj->assign(static_cast<size_t>(m_ + 1), -1);
+            (*gj)[0] = 0;
+            (*gj)[static_cast<size_t>(m_)] = n_;
+            (*gj)[static_cast<size_t>(i)] = j;
+        }
         // T-precision penalties for the predecessor argmax; the gradient counts
         // themselves accumulate into the double grad block, exact for integer counts.
         const T go_a = static_cast<T>(params_->gap_open_a);
@@ -2400,6 +2420,7 @@ private:
                 gblk[sub_off(i, j)] += 1.0;
                 T vm = rat(buf.VM,i-1,j-1), vx = rat(buf.VX,i-1,j-1), vy = rat(buf.VY,i-1,j-1);
                 --i; --j;
+                if (gj) (*gj)[static_cast<size_t>(i)] = j;
                 if      (vm >= vx && vm >= vy) tbl = TBTable::M;
                 else if (vx >= vy)             tbl = TBTable::X;
                 else                            tbl = TBTable::Y;
@@ -2410,6 +2431,7 @@ private:
                 T fx = rat(buf.VX,i-1,j)        - ge_b;
                 T fy = rat(buf.VY,i-1,j) - go_b - ge_b;
                 --i;
+                if (gj) (*gj)[static_cast<size_t>(i)] = j;
                 TBTable prev;
                 if      (fm >= fx && fm >= fy) prev = TBTable::M;
                 else if (fx >= fy)             prev = TBTable::X;
@@ -2431,6 +2453,7 @@ private:
                 tbl = prev;
             }
         }
+        if (gj) fill_guide_gaps(*gj);
     }
 
     // ═════════════════════════════════════════════════════════════════════════
