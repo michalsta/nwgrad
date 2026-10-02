@@ -177,7 +177,7 @@ The shape is exactly what the profile-build cost predicts: a track costs O(nrow�
 
 **Verification.** `tests/cpp/test_simd_bitexact.cpp` runs tracks through the *same* scalar-vs-simd harness at every ISA level (`[track]`, 423,830 assertions): a track changes the number of profile rows, which row a DP row selects, and the order those rows sit in, and none of it may move a single bit of any table. It also pins that **an all-zeros track is bit-identical to no track at all** — the reduction must be pure re-indexing, so the fast path and the compacted path are asserted to agree bit-for-bit. `tests/Python/test_matrix_track.py` (36 tests) checks the score and both gradients against an exhaustive enumeration of every alignment path, against an independent Python affine DP, and against finite differences per slot; plus all four traceback modes, the banded path, and the batch paths. Under `NWGRAD_FORCE_KERNEL=simd` every one of those becomes a per-level bit-identity check.
 
-**Not done:** the README still documents the single-matrix API only. No fleet sweep — every number above is skynet/sse2.
+**Not done:** the docs (`docs/api.md`) still describe the single-matrix API only. No fleet sweep — every number above is skynet/sse2.
 
 ### Vectorization: the faster hard-gradient kernels (prototyped, measured on 3 machines)
 
