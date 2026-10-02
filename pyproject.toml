@@ -28,7 +28,7 @@ Repository = "https://github.com/michalsta/nwgrad"
 
 
 [project.optional-dependencies]
-dev = ["pytest", "pytest-rerunfailures", "biopython"]
+dev = ["pytest", "pytest-rerunfailures", "biopython", "scipy"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests/Python"]
