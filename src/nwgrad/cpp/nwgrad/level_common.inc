@@ -35,6 +35,7 @@ namespace NWGRAD_LVL_NAME {
 #include "kernels_pointers_impl.inl"  // same kernel, recording predecessor pointers
 #include "hb_kernel_impl.inl"     // Hirschberg linear-space sweep (striped, no tables)
 #include "row_kernel_impl.inl"    // row-wise banded leaf kernels (uses KW)
+#include "inter_kernel_impl.inl"  // inter-pair affine Full fill (uses KW)
 }
 #undef NWGRAD_LEVEL_NS
 
@@ -61,7 +62,9 @@ struct NwgradLevelRegistrar {
                        &NWGRAD_LVL_NAME::hb_base_entry_f,      // Hirschberg base case, float32
                        &NWGRAD_LVL_NAME::hb_scan_entry_d,      // Hirschberg local endpoint scan, double
                        &NWGRAD_LVL_NAME::hb_scan_entry_f,      // Hirschberg local endpoint scan, float32
-                       NWGRAD_LVL_NAME::ROW_BLOCK);
+                       NWGRAD_LVL_NAME::ROW_BLOCK,
+                       &NWGRAD_LVL_NAME::inter_fill_entry,      // inter-pair affine Full, double
+                       NWGRAD_LVL_NAME::IW);
     }
 };
 const NwgradLevelRegistrar nwgrad_level_registrar_instance;

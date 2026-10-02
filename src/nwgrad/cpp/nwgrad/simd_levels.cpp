@@ -17,7 +17,7 @@ void register_level(SimdLevel l, viterbi_fn viterbi, viterbi_fn_f viterbi_f,
                     hb_fn hb_sweep_pmax, hb_fn_f hb_sweep_pmax_f,
                     hbbase_fn hb_base, hbbase_fn_f hb_base_f,
                     hbscan_fn hb_scan, hbscan_fn_f hb_scan_f,
-                    int row_block) {
+                    int row_block, inter_fn inter_fill, int inter_w) {
     LevelKernels k;
     k.viterbi          = viterbi;
     k.viterbi_f        = viterbi_f;
@@ -34,5 +34,7 @@ void register_level(SimdLevel l, viterbi_fn viterbi, viterbi_fn_f viterbi_f,
     k.hb_scan           = hb_scan;
     k.hb_scan_f         = hb_scan_f;
     k.row_block         = row_block;
+    k.inter_fill        = inter_fill;
+    k.inter_w           = inter_w;
     level_table()[(int)l] = k;
 }

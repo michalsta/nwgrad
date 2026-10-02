@@ -413,6 +413,41 @@ struct Aligner {
         fwdbwd_is_newest_ = false;
     }
 
+    // In place of compute_viterbi(buf): adopt lane `lane` of an inter-pair fill
+    // (InterJob, inter_kernel_impl.inl) that left W pairs' tables interleaved in
+    // buf.VM/VX/VY, this aligner's pair being that lane.  The tables are bit-identical
+    // to this pair's own affine Full fill, so score(), the traceback and hard_grad()
+    // behave exactly as after compute_viterbi(buf).  Local passes the lane's best cell
+    // as the kernel found it; Global reads the score at (m, n).  set_problem() first.
+    void adopt_interleaved(const DpBuffer& buf, int W, int lane,
+                           double local_best, int best_i, int best_j) {
+        check_problem();
+        tables_striped_ = false;
+        pointers_       = false;
+        hirschberg_     = false;
+        inter_w_ = W; inter_lane_ = lane;
+        if constexpr (AM == AlignMode::Local) {
+            viterbi_score_ = static_cast<T>(local_best);
+            best_i_ = best_i; best_j_ = best_j; best_tbl_ = TBTable::M;
+            if (best_i > 0) {
+                const T mv = rat(buf.VM, best_i, best_j), xv = rat(buf.VX, best_i, best_j),
+                        yv = rat(buf.VY, best_i, best_j);
+                if      (mv >= xv && mv >= yv) best_tbl_ = TBTable::M;
+                else if (xv >= yv)             best_tbl_ = TBTable::X;
+                else                            best_tbl_ = TBTable::Y;
+            }
+        } else {
+            const T vm = rat(buf.VM, m_, n_), vx = rat(buf.VX, m_, n_), vy = rat(buf.VY, m_, n_);
+            viterbi_score_ = std::max({vm, vx, vy});
+            best_i_ = m_; best_j_ = n_;
+            if      (vm >= vx && vm >= vy) best_tbl_ = TBTable::M;
+            else if (vx >= vy)             best_tbl_ = TBTable::X;
+            else                            best_tbl_ = TBTable::Y;
+        }
+        any_viterbi_done_ = true;
+        fwdbwd_is_newest_ = false;
+    }
+
     void compute_forward_back(DpBuffer& buf) {
         check_problem();
         ensure_fwdbwd_buf(buf);  // Grow if needed (allows implicit growth from size 0)
@@ -506,6 +541,10 @@ private:
     // is striped_seg_*striped_w_ + 1 doubles, slot 0 being column 0.
     bool   tables_striped_ = false;
     bool   rowwise_full_   = false;   // see set_rowwise_full()
+    // Set by adopt_interleaved(): VM/VX/VY hold inter_w_ pairs' tables interleaved per
+    // cell and this aligner's pair is lane inter_lane_.  0 = not interleaved; every fill
+    // of this aligner's own clears it (run_viterbi).
+    int    inter_w_ = 0, inter_lane_ = 0;
     // Pointers mode: DM/DX/DY hold predecessor codes, VM/VX/VY are NOT retained.
     bool        pointers_ = false;
     // Hirschberg mode: no tables at all survive the fill.  The recursion recovers the
@@ -663,6 +702,11 @@ private:
     // Striped layout MUST match the kernel in kernels_impl.inl: row size striped_seg_*
     // striped_w_ + 1, slot 0 = column 0, column j (1..n) at 1 + ((j-1)%seg)*W + (j-1)/seg.
     size_t cell_index(int i, int j) const noexcept {
+        if (inter_w_) {
+            // Inter-pair fill (adopt_interleaved): W pairs' tables interleaved per cell.
+            return (static_cast<size_t>(i) * stride_ + static_cast<size_t>(j)) *
+                   static_cast<size_t>(inter_w_) + static_cast<size_t>(inter_lane_);
+        }
         if (tables_striped_) {
             // rowsz = (seg+1)*W: slot 0 is column 0, slots [W, W+seg*W) are the striped
             // columns 1..n (started at W so every W-wide access lands on an aligned
@@ -1051,6 +1095,7 @@ private:
         tables_striped_ = false;
         pointers_     = false;
         hirschberg_   = false;
+        inter_w_      = 0;
         // Hirschberg: divide and conquer, no tables above the base case.  It is a
         // DIFFERENT algorithm with a different tie-break, not a faster spelling of the
         // same one, so an unsupported combination throws instead of falling back — a

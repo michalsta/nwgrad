@@ -80,6 +80,7 @@ struct SeqPairT {
           params_(&params),
           grad_mode_(grad_mode),
           kernel_(kernel),
+          gm_(gm), am_(am),
           grad_(params.matrix.alphabet())
     {
         if      (gm == GapModel::Linear && am == AlignMode::Global)
@@ -357,6 +358,35 @@ struct SeqPairT {
 
     bool path_valid()  const noexcept { return path_valid_;  }
     bool score_valid() const noexcept { return score_valid_; }
+    // score_and_grad_with_dp() for a pair whose affine Full DP was filled as lane `lane`
+    // of an inter-pair fill (InterJob) into buf's interleaved tables: same results,
+    // bit for bit — only the fill was shared.  Hard or no gradient only.
+    void score_and_grad_interleaved(DpBuffer& buf, int W, int lane,
+                                    double local_best, int best_i, int best_j) {
+        std::visit([&](auto& st) {
+            st.full_al.set_problem(a_idx_, b_idx_, *params_);
+            st.full_al.adopt_interleaved(buf, W, lane, local_best, best_i, best_j);
+            guide_j_ = st.full_al.guide_j_from_viterbi(buf);
+            score_ = st.full_al.score();
+            last_banded_ = false;
+            if (grad_mode_ != GradMode::None) {
+                grad_.zero();
+                grad_with_buf(st.full_al, buf);
+            }
+        }, state_);
+        path_valid_  = true;
+        score_valid_ = true;
+        grad_valid_  = (grad_mode_ != GradMode::None);
+        dp_valid_    = false;
+    }
+
+    // For the inter-pair scheduler: the problem as the fill needs it.
+    const std::vector<uint8_t>& a_codes() const noexcept { return a_idx_; }
+    const std::vector<uint8_t>& b_codes() const noexcept { return b_idx_; }
+    const AlignParams* params_ptr() const noexcept { return params_; }
+    GapModel gap_model() const noexcept { return gm_; }
+    AlignMode align_mode() const noexcept { return am_; }
+
     bool grad_valid()  const noexcept { return grad_valid_;  }
     bool dp_valid()    const noexcept { return dp_valid_;    }
 
@@ -378,6 +408,8 @@ private:
     const AlignParams*   params_;
     GradMode             grad_mode_;
     int                  kernel_;   // Viterbi backend, forwarded to each aligner
+    GapModel             gm_;
+    AlignMode            am_;
     int                  hb_cutoff_ = 512;   // mirrors Aligner's default (fleet-swept)
     bool                 rowwise_full_ = false;
 

@@ -465,8 +465,9 @@ struct SeqPairBatchT {
         if (N == 0) return 0.0;
         std::vector<double> scores(N, 0.0);
 
-        if (sorted_schedule) score_and_grad_sorted_(scores);
-        else                 score_and_grad_dynamic_(scores);
+        if (inter_fill)           score_and_grad_inter_(scores);
+        else if (sorted_schedule) score_and_grad_sorted_(scores);
+        else                      score_and_grad_dynamic_(scores);
 
         // Summed in pair-index order, never in completion order, so the total is
         // reproducible bit-for-bit no matter which schedule ran or how the threads
@@ -495,6 +496,120 @@ struct SeqPairBatchT {
     }
 
 private:
+    // The vector backend an inter-pair fill of this pair would run on, or -1 when the
+    // pair must take its own fill: float32, linear gaps, soft gradients, an alphabet
+    // over 8 letters, the scalar backend, or a traceback that would not read the fill's
+    // tables (Hirschberg past its cutoff).
+    int inter_backend_(const SeqPair& p) const {
+        if constexpr (!std::is_same_v<T, double>) return -1;
+        else {
+            if (p.gap_model() != GapModel::Affine || p.grad_mode() == GradMode::Soft) return -1;
+            if (p.len_a() == 0 || p.len_b() == 0) return -1;
+            if (p.params_ptr()->matrix.size() > 8) return -1;
+            const TracebackMode tb = p.traceback();
+            if (tb != TracebackMode::Pointers && tb != TracebackMode::Scores &&
+                static_cast<int>(p.len_a()) > p.hb_cutoff()) return -1;
+            const int backend = (p.kernel() == kBackendAuto) ? global_default_backend() : p.kernel();
+            if (backend < 0) return -1;
+            const LevelKernels& K = level_kernels(backend);
+            return (K.inter_fill && K.inter_w > 0) ? backend : -1;
+        }
+    }
+
+    // fill = "interpair": the qualifying pairs grouped W at a time by (params, backend,
+    // alignment mode, length of B), sorted by length of A so a group's rows are nearly all used; each
+    // group is one InterJob, then each lane's pair adopts its tables for score, path and
+    // gradient.  The other pairs run their own fill.  One atomic counter over all tasks.
+    void score_and_grad_inter_(std::vector<double>& scores) {
+        if constexpr (!std::is_same_v<T, double>) {
+            score_and_grad_dynamic_(scores);   // float32 never qualifies
+        } else {
+        const size_t N = pairs.size();
+        std::vector<size_t> elig, other;
+        std::vector<int> backend(N, -1);
+        for (size_t i = 0; i < N; ++i) {
+            backend[i] = inter_backend_(*pairs[i]);
+            (backend[i] >= 0 ? elig : other).push_back(i);
+        }
+        std::stable_sort(elig.begin(), elig.end(), [&](size_t x, size_t y) {
+            const SeqPair& a = *pairs[x]; const SeqPair& b = *pairs[y];
+            if (a.params_ptr() != b.params_ptr()) return a.params_ptr() < b.params_ptr();
+            if (backend[x] != backend[y]) return backend[x] < backend[y];
+            if (a.align_mode() != b.align_mode()) return a.align_mode() < b.align_mode();
+            if (a.len_b() != b.len_b()) return a.len_b() < b.len_b();
+            return a.len_a() < b.len_a();
+        });
+        // Groups: [start, end) runs of elig sharing (params, backend, mode, len_b), cut every W.
+        std::vector<std::pair<size_t, size_t>> groups;
+        for (size_t s = 0; s < elig.size();) {
+            const SeqPair& p0 = *pairs[elig[s]];
+            const int W = level_kernels(backend[elig[s]]).inter_w;
+            size_t e = s + 1;
+            while (e < elig.size() && e - s < static_cast<size_t>(W)) {
+                const SeqPair& q = *pairs[elig[e]];
+                if (q.params_ptr() != p0.params_ptr() || backend[elig[e]] != backend[elig[s]] ||
+                    q.align_mode() != p0.align_mode() || q.len_b() != p0.len_b()) break;
+                ++e;
+            }
+            groups.emplace_back(s, e);
+            s = e;
+        }
+        const size_t G = groups.size(), tasks = G + other.size();
+        std::atomic<size_t> idx{0};
+        auto worker = [&]() {
+            DpBuffer buf;
+            std::vector<const unsigned char*> a, b;
+            std::vector<int> m, bi, bj;
+            std::vector<double> best;
+            while (true) {
+                const size_t t = idx.fetch_add(1, std::memory_order_relaxed);
+                if (t >= tasks) break;
+                if (t >= G) {
+                    const size_t i = other[t - G];
+                    pairs[i]->score_and_grad_with_dp(buf);
+                    scores[i] = pairs[i]->score();
+                    continue;
+                }
+                const auto [s, e] = groups[t];
+                const size_t real = e - s;
+                const SeqPair& p0 = *pairs[elig[s]];
+                const LevelKernels& K = level_kernels(backend[elig[s]]);
+                const int W = K.inter_w;
+                a.assign(W, nullptr); b.assign(W, nullptr); m.assign(W, 0);
+                bi.assign(W, 0); bj.assign(W, 0); best.assign(W, 0.0);
+                int M = 0;
+                for (int l = 0; l < W; ++l) {
+                    // Short group: the spare lanes repeat the last pair; their results are dropped.
+                    const SeqPair& p = *pairs[elig[s + std::min<size_t>(l, real - 1)]];
+                    a[l] = p.a_codes().data(); b[l] = p.b_codes().data();
+                    m[l] = static_cast<int>(p.len_a());
+                    M = std::max(M, m[l]);
+                }
+                const int n = static_cast<int>(p0.len_b());
+                const size_t sz = static_cast<size_t>(M + 1) * (n + 1) * W;
+                if (buf.VM.size() < sz) { buf.VM.resize(sz); buf.VX.resize(sz); buf.VY.resize(sz); }
+                const AlignParams& P = *p0.params_ptr();
+                InterJob job{};
+                job.a = a.data(); job.m = m.data(); job.b = b.data(); job.n = n; job.M = M;
+                job.blk = P.matrix.data(); job.nalpha = P.matrix.size();
+                job.go_a = P.gap_open_a; job.ge_a = P.gap_extend_a;
+                job.go_b = P.gap_open_b; job.ge_b = P.gap_extend_b;
+                job.align_mode = (p0.align_mode() == AlignMode::Local) ? 1 : 0;
+                job.VM = buf.VM.data(); job.VX = buf.VX.data(); job.VY = buf.VY.data();
+                job.best = best.data(); job.best_i = bi.data(); job.best_j = bj.data();
+                K.inter_fill(job);
+                for (size_t l = 0; l < real; ++l) {
+                    const size_t i = elig[s + l];
+                    pairs[i]->score_and_grad_interleaved(buf, W, static_cast<int>(l),
+                                                         best[l], bi[l], bj[l]);
+                    scores[i] = pairs[i]->score();
+                }
+            }
+        };
+        run_workers(tasks, worker);
+        }
+    }
+
     // The original: one atomic counter, tasks in insertion order.
     void score_and_grad_dynamic_(std::vector<double>& scores) {
         const size_t N = pairs.size();
@@ -749,6 +864,11 @@ public:
     // See Aligner::set_rowwise_full.  Setting it through the Python `fill` property
     // also applies it to the pairs already in the batch.
     bool rowwise_full = false;
+
+    // score_and_grad() fills W pairs at once, one per vector lane (InterJob), wherever
+    // a pair qualifies (inter_eligible_); the rest run their own fill.  Bit-identical
+    // results either way.  Python: fill = "interpair".
+    bool inter_fill = false;
 
 private:
 

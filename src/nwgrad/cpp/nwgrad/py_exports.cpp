@@ -191,6 +191,14 @@ static bool parse_fill(const std::string& name) {
     throw nb::value_error(
         ("nwgrad: unknown fill \"" + name + "\" (expected \"striped\" or \"rowwise\")").c_str());
 }
+// The batch also has "interpair".  Returns {rowwise_full, inter_fill}.
+static std::pair<bool, bool> parse_batch_fill(const std::string& name) {
+    if (name == "interpair") return {false, true};
+    if (name == "striped" || name == "rowwise") return {parse_fill(name), false};
+    throw nb::value_error(
+        ("nwgrad: unknown fill \"" + name +
+         "\" (expected \"striped\", \"rowwise\" or \"interpair\")").c_str());
+}
 static const char* traceback_name(TracebackMode t) {
     switch (t) {
         case TracebackMode::Pointers:   return "pointers";
@@ -674,19 +682,30 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             "n_threads * the global maximum.  Results are identical either way.")
         .def_prop_rw(
             "fill",
-            [](const SPB& s) { return s.rowwise_full ? "rowwise" : "striped"; },
+            [](const SPB& s) {
+                return s.inter_fill ? "interpair" : s.rowwise_full ? "rowwise" : "striped";
+            },
             [](SPB& s, const std::string& v) {
-                s.rowwise_full = parse_fill(v);
+                const auto [rowwise, inter] = parse_batch_fill(v);
+                s.rowwise_full = rowwise;
+                s.inter_fill = inter;
                 for (auto* sp : s.pairs) sp->set_rowwise_full(s.rowwise_full);
             },
             "Which vectorized fill full (unbanded) affine DP uses at double precision.\n"
             "  \"striped\" (default): the striped kernel, fastest on long pairs.\n"
             "  \"rowwise\": the row-wise kernel the banded path uses; no lazy-F\n"
             "     fixpoint, so faster on short pairs (miRNA x site, ~22 x 50: 1.5-1.8x).\n"
-            "Scores, paths and gradients are bit-identical either way.  \"rowwise\"\n"
-            "keeps three score tables per thread (24 B/cell) even with traceback\n"
-            "\"pointers\".  Ignored at float32, for linear gaps, and on the scalar\n"
-            "kernel.  Applies to the pairs in the batch and to later add_many() ones.")
+            "  \"interpair\": score_and_grad() fills several pairs at once, one per\n"
+            "     vector lane, grouped by length of B (fastest on many short pairs;\n"
+            "     ~4x the scalar fill at 22 x 50 on AVX2).  Pairs it cannot take —\n"
+            "     float32, linear gaps, soft gradients, alphabets over 8 letters, the\n"
+            "     scalar kernel — run the striped fill.  Other batch operations\n"
+            "     (align_full, banded) use the striped fill.\n"
+            "Scores, paths and gradients are bit-identical whichever fill runs.\n"
+            "\"rowwise\" and \"interpair\" keep three score tables (24 B/cell; interpair\n"
+            "per group of pairs) per thread even with traceback \"pointers\".  Ignored at\n"
+            "float32, for linear gaps, and on the scalar kernel.  Applies to the pairs in\n"
+            "the batch and to later add_many() ones.")
         .def_prop_rw(
             "hb_cutoff",
             [](const SPB& s) { return s.hb_cutoff; },

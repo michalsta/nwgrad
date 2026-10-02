@@ -246,6 +246,31 @@ struct HbBaseJob {
 using hbbase_fn   = void (*)(HbBaseJob<double>&);
 using hbbase_fn_f = void (*)(HbBaseJob<float>&);
 
+// Inter-pair affine Full fill, double: W pairs at once, one per vector lane (W = the
+// level's native double count, reported in LevelKernels::inter_w).  All W pairs share
+// sequence B's length n; A's lengths may differ (a lane's rows past its own m are
+// computed and ignored).  Writes VM/VX/VY INTERLEAVED — cell (i,j) of lane l at
+// ((i*(n+1)+j)*W + l), rows 0..max m — with exactly the operations, in exactly the
+// order, of the row-wise kernel (row_kernel_impl.inl), so each lane's table is bit-
+// identical to that pair's own fill and the aligner's traceback/gradient read it
+// unchanged through cell_index().  The substitution score is selected per lane by
+// blending on the bits of the B residue: nalpha <= 8 only (the caller falls back
+// otherwise).  Local: also returns each lane's best cell, chosen as the per-pair fill
+// chooses it (first row, then first column, reaching the maximum; 0 if none > 0).
+struct InterJob {
+    const unsigned char* const* a;   // W pointers to A's codes
+    const int* m;                    // W lengths of A
+    const unsigned char* const* b;   // W pointers to B's codes (all of length n)
+    int n;
+    int M;                           // max m over the lanes (rows filled)
+    const double* blk; int nalpha;   // substitution block, row-major nalpha x nalpha
+    double go_a, ge_a, go_b, ge_b;
+    int align_mode;                  // 0 = Global, 1 = Local
+    double* VM; double* VX; double* VY;   // (M+1)*(n+1)*W each
+    double* best; int* best_i; int* best_j;   // W each, Local only
+};
+using inter_fn = void (*)(InterJob&);
+
 // Whole-row banded kernel for the GuideBanded path.  viterbi_affine_simd (in
 // aligner_simd.hpp) owns the banded indexing and hands this one row's worth of
 // contiguous slices; it runs the whole interleaved block loop (carry-free VM/VX, serial
@@ -278,6 +303,8 @@ struct LevelKernels {
     hbscan_fn     hb_scan = nullptr;            // Hirschberg local endpoint scan, double
     hbscan_fn_f   hb_scan_f = nullptr;          // ditto, float32
     int           row_block = 0;                // columns per interleaved block (per-µarch)
+    inter_fn      inter_fill = nullptr;         // inter-pair affine Full fill, double
+    int           inter_w = 0;                  // its lane count (pairs per call)
 };
 
 // One slot per possible level; index by (int)SimdLevel.  Populated by the level TUs'
@@ -302,7 +329,7 @@ void register_level(SimdLevel l, viterbi_fn viterbi, viterbi_fn_f viterbi_f,
                     hb_fn hb_sweep_pmax, hb_fn_f hb_sweep_pmax_f,
                     hbbase_fn hb_base, hbbase_fn_f hb_base_f,
                     hbscan_fn hb_scan, hbscan_fn_f hb_scan_f,
-                    int row_block);
+                    int row_block, inter_fn inter_fill, int inter_w);
 
 // ── The global default backend ────────────────────────────────────────────────
 //
