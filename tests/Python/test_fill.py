@@ -166,3 +166,26 @@ def test_float32_and_linear_ignore_it():
             out.append((batch.scores(), *batch.grads()))
         for x, y in zip(*out):
             assert np.array_equal(x, y)
+
+
+def test_interpair_plan_follows_set_params_and_add_many():
+    """The grouping is cached across calls: it must survive set_params() and be
+    rebuilt when pairs are added."""
+    a, b = _seqs(150, 10, 30, 13), _fixed_len_b(range(150), 40, 14)
+    a2, b2 = _seqs(37, 5, 25, 15), _fixed_len_b(range(37), 40, 16)
+    p1, p2 = _params("random"), _params("cheap_gaps")
+    res = {}
+    for fill in ("striped", "interpair"):
+        batch = nwgrad.SeqPairBatchDouble(n_threads=3, traceback="pointers")
+        batch.fill = fill
+        batch.add_many(a, b, p1, gap_model="affine", mode="local")
+        out = []
+        batch.score_and_grad(); out.append((batch.scores(), *batch.grads()))
+        batch.set_params(p2)
+        batch.score_and_grad(); out.append((batch.scores(), *batch.grads()))
+        batch.add_many(a2, b2, p2, gap_model="affine", mode="local")
+        batch.score_and_grad(); out.append((batch.scores(), *batch.grads()))
+        res[fill] = out
+    for x, y in zip(res["striped"], res["interpair"]):
+        for u, v in zip(x, y):
+            assert np.array_equal(u, v)

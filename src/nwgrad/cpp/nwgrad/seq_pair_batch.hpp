@@ -172,6 +172,7 @@ struct SeqPairBatchT {
                 pairs.front()->alphabet().symbols() + "\"");
         pairs.push_back(sp);
         unique_checked_ = false;  // verified lazily, at the next dispatch
+        ++generation_;
     }
 
     // Bulk-construct N pairs in C++, in parallel, and append them.  The batch
@@ -240,6 +241,7 @@ struct SeqPairBatchT {
             pairs.push_back(up.get());
             owned_.push_back(std::move(up));
         }
+        ++generation_;
     }
 
     size_t size() const noexcept { return pairs.size(); }
@@ -524,36 +526,19 @@ private:
         if constexpr (!std::is_same_v<T, double>) {
             score_and_grad_dynamic_(scores);   // float32 never qualifies
         } else {
-        const size_t N = pairs.size();
-        std::vector<size_t> elig, other;
-        std::vector<int> backend(N, -1);
-        for (size_t i = 0; i < N; ++i) {
-            backend[i] = inter_backend_(*pairs[i]);
-            (backend[i] >= 0 ? elig : other).push_back(i);
-        }
-        std::stable_sort(elig.begin(), elig.end(), [&](size_t x, size_t y) {
-            const SeqPair& a = *pairs[x]; const SeqPair& b = *pairs[y];
-            if (a.params_ptr() != b.params_ptr()) return a.params_ptr() < b.params_ptr();
-            if (backend[x] != backend[y]) return backend[x] < backend[y];
-            if (a.align_mode() != b.align_mode()) return a.align_mode() < b.align_mode();
-            if (a.len_b() != b.len_b()) return a.len_b() < b.len_b();
-            return a.len_a() < b.len_a();
-        });
-        // Groups: [start, end) runs of elig sharing (params, backend, mode, len_b), cut every W.
-        std::vector<std::pair<size_t, size_t>> groups;
-        for (size_t s = 0; s < elig.size();) {
-            const SeqPair& p0 = *pairs[elig[s]];
-            const int W = level_kernels(backend[elig[s]]).inter_w;
-            size_t e = s + 1;
-            while (e < elig.size() && e - s < static_cast<size_t>(W)) {
-                const SeqPair& q = *pairs[elig[e]];
-                if (q.params_ptr() != p0.params_ptr() || backend[elig[e]] != backend[elig[s]] ||
-                    q.align_mode() != p0.align_mode() || q.len_b() != p0.len_b()) break;
-                ++e;
-            }
-            groups.emplace_back(s, e);
-            s = e;
-        }
+        // The grouping depends only on what a pair is, not on the parameter values, so
+        // it is computed once and reused until pairs are added or the default ISA level
+        // changes (a fit calls this every iteration on the same pairs: re-sorting 2.5M
+        // pairs each time was ~0.9 s of serial work per call).  Parameters are checked
+        // per group at run time instead.
+        const int def_backend = global_default_backend();
+        if (plan_.generation != generation_ || plan_.default_backend != def_backend ||
+            plan_.n_pairs != pairs.size())
+            build_inter_plan_(def_backend);
+        const auto& elig = plan_.elig;
+        const auto& other = plan_.other;
+        const auto& backend = plan_.backend;
+        const auto& groups = plan_.groups;
         const size_t G = groups.size(), tasks = G + other.size();
         std::atomic<size_t> idx{0};
         auto worker = [&]() {
@@ -573,6 +558,17 @@ private:
                 const auto [s, e] = groups[t];
                 const size_t real = e - s;
                 const SeqPair& p0 = *pairs[elig[s]];
+                bool same_params = true;
+                for (size_t l = 1; l < real; ++l)
+                    same_params &= pairs[elig[s + l]]->params_ptr() == p0.params_ptr();
+                if (!same_params) {   // pairs given their own params: no shared fill
+                    for (size_t l = 0; l < real; ++l) {
+                        const size_t i = elig[s + l];
+                        pairs[i]->score_and_grad_with_dp(buf);
+                        scores[i] = pairs[i]->score();
+                    }
+                    continue;
+                }
                 const LevelKernels& K = level_kernels(backend[elig[s]]);
                 const int W = K.inter_w;
                 a.assign(W, nullptr); b.assign(W, nullptr); m.assign(W, 0);
@@ -608,6 +604,55 @@ private:
         };
         run_workers(tasks, worker);
         }
+    }
+
+    struct InterPlan {
+        size_t generation = static_cast<size_t>(-1);
+        int default_backend = -1000;
+        size_t n_pairs = 0;
+        std::vector<size_t> elig, other;
+        std::vector<int> backend;
+        std::vector<std::pair<size_t, size_t>> groups;   // [start, end) into elig
+    };
+    InterPlan plan_;
+    size_t generation_ = 0;   // bumped by add() / add_many(); keys plan_
+
+    void build_inter_plan_(int def_backend) {
+        const size_t N = pairs.size();
+        InterPlan P;
+        P.generation = generation_; P.default_backend = def_backend; P.n_pairs = N;
+        P.backend.assign(N, -1);
+        // Sort keys gathered once, so the sort does not chase pair pointers.
+        struct Key { int backend, mode; size_t len_b, len_a, i; };
+        std::vector<Key> keys;
+        keys.reserve(N);
+        for (size_t i = 0; i < N; ++i) {
+            const SeqPair& p = *pairs[i];
+            P.backend[i] = inter_backend_(p);
+            if (P.backend[i] < 0) { P.other.push_back(i); continue; }
+            keys.push_back({P.backend[i], static_cast<int>(p.align_mode()), p.len_b(), p.len_a(), i});
+        }
+        std::sort(keys.begin(), keys.end(), [](const Key& x, const Key& y) {
+            if (x.backend != y.backend) return x.backend < y.backend;
+            if (x.mode != y.mode) return x.mode < y.mode;
+            if (x.len_b != y.len_b) return x.len_b < y.len_b;
+            if (x.len_a != y.len_a) return x.len_a < y.len_a;
+            return x.i < y.i;
+        });
+        P.elig.reserve(keys.size());
+        for (const Key& k : keys) P.elig.push_back(k.i);
+        // Groups: runs of equal (backend, mode, len_b), cut every W.
+        for (size_t s = 0; s < keys.size();) {
+            const int W = level_kernels(keys[s].backend).inter_w;
+            size_t e = s + 1;
+            while (e < keys.size() && e - s < static_cast<size_t>(W) &&
+                   keys[e].backend == keys[s].backend && keys[e].mode == keys[s].mode &&
+                   keys[e].len_b == keys[s].len_b)
+                ++e;
+            P.groups.emplace_back(s, e);
+            s = e;
+        }
+        plan_ = std::move(P);
     }
 
     // The original: one atomic counter, tasks in insertion order.
