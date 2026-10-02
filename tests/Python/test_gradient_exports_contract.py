@@ -12,11 +12,8 @@ from test_grads import per_pair
 @pytest.mark.parametrize("gap_model,mode", PROBLEMS)
 @pytest.mark.parametrize("component", ["matrix", "gaps"])
 def test_weighted_soft_grad_matches_composed_objective_finite_difference(
-        class_name, gap_model, mode, component, request):
+        class_name, gap_model, mode, component):
     """Check the chain rule against scores, independently of cached gradients."""
-    if mode == "local" and component == "gaps":
-        request.node.add_marker(pytest.mark.xfail(
-            strict=True, reason="local soft gap gradients count nonexistent border transitions"))
     batch, params = make_batch(getattr(nwgrad, class_name), gap_model, mode,
                               grad_mode="soft", n_threads=1)
     batch.score_and_grad()

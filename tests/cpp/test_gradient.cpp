@@ -153,3 +153,42 @@ TEST_CASE("Gradient affine local: finds and counts local match", "[gradient][aff
     al.hard_grad(grad);
     REQUIRE(sum_grad(grad) == Approx(3.0));
 }
+
+// ── Local soft gap gradients: border cells are free starts, not gap moves ─────
+//
+// For local "A" vs "A" the forward recurrence gives
+//   Z = 4 + exp(s) + exp(-cost_a) + exp(-cost_b)
+// (four constant border/restart terms, the match, one interior gap step each way),
+// so d(log Z)/d(gap param) = -exp(-cost)/Z for each parameter in that cost.  The
+// gradient once also counted gap transitions INTO the constant border cells, which
+// the forward pass never takes.
+template <GapModel GM, AlignBand AB>
+static void local_one_cell_gap_oracle() {
+    const Alphabet& al = Alphabet::get("A");
+    SubstMatrix M(al);
+    M.at(0, 0) = 2.0;
+    const AlignParams p(M, 2.0, 1.0, 1.5, 0.5);   // open_a, ext_a, open_b, ext_b
+    Aligner<GM, AlignMode::Local, AB> aligner;
+    aligner.alloc_buf();
+    aligner.set_problem("A", "A", p, AB == AlignBand::GuideBanded ? 1 : 0);
+    aligner.compute_forward_back();
+    AlignParams g(al);
+    aligner.soft_grad(g);
+
+    const bool affine = (GM == GapModel::Affine);
+    const double cost_a = p.gap_extend_a + (affine ? p.gap_open_a : 0.0);
+    const double cost_b = p.gap_extend_b + (affine ? p.gap_open_b : 0.0);
+    const double z = 4.0 + std::exp(2.0) + std::exp(-cost_a) + std::exp(-cost_b);
+    REQUIRE(aligner.log_z() == Approx(std::log(z)).margin(1e-14));
+    REQUIRE(g.gap_extend_a == Approx(-std::exp(-cost_a) / z).margin(1e-14));
+    REQUIRE(g.gap_extend_b == Approx(-std::exp(-cost_b) / z).margin(1e-14));
+    REQUIRE(g.gap_open_a == Approx(affine ? -std::exp(-cost_a) / z : 0.0).margin(1e-14));
+    REQUIRE(g.gap_open_b == Approx(affine ? -std::exp(-cost_b) / z : 0.0).margin(1e-14));
+}
+
+TEST_CASE("Local soft gap gradients match the one-cell oracle", "[gradient][soft][local]") {
+    local_one_cell_gap_oracle<GapModel::Linear, AlignBand::Full>();
+    local_one_cell_gap_oracle<GapModel::Affine, AlignBand::Full>();
+    local_one_cell_gap_oracle<GapModel::Linear, AlignBand::GuideBanded>();
+    local_one_cell_gap_oracle<GapModel::Affine, AlignBand::GuideBanded>();
+}

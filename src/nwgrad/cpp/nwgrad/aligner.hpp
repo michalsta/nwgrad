@@ -2438,6 +2438,13 @@ private:
         }
     }
 
+    // Local borders are constants (a free start), not gap moves: the forward pass sets
+    // F(i,0) = F(0,j) = 0 rather than deriving them from a neighbour minus a gap cost,
+    // so a gap transition INTO a border cell does not exist and must not be counted,
+    // even though the backward pass leaves finite values there.  Global borders really
+    // are charged gap runs, so there the border targets stay in.
+    static constexpr int kGapTargetMin = (AM == AlignMode::Local) ? 1 : 0;
+
     void soft_grad_linear(const DpBuffer& buf, AlignParams& grad) const {
         double* gblk = grad_block(grad);
         // Matrix gradient: match steps (i-1,j-1) → (i,j)
@@ -2454,7 +2461,7 @@ private:
 
         // gap_extend_b: B-gap steps (i-1,j) → (i,j), cost = -gap_extend_b
         for (int i = 1; i <= m_; ++i) {
-            for (int j = jlo0(i); j <= jhi0(i); ++j) {
+            for (int j = std::max(kGapTargetMin, jlo0(i)); j <= jhi0(i); ++j) {
                 double bval = srat(buf.B, i, j);
                 if (bval == NEG_INF) continue;
                 double fval = srat(buf.F, i-1, j);
@@ -2464,7 +2471,7 @@ private:
         }
 
         // gap_extend_a: A-gap steps (i,j-1) → (i,j), cost = -gap_extend_a
-        for (int i = 0; i <= m_; ++i) {
+        for (int i = kGapTargetMin; i <= m_; ++i) {
             for (int j = std::max(1, jlo0(i)); j <= jhi0(i); ++j) {
                 double bval = srat(buf.B, i, j);
                 if (bval == NEG_INF) continue;
@@ -2596,9 +2603,10 @@ private:
             }
         }
 
-        // gap_open_b: expected # of B-gap openings (M→X or Y→X transitions)
+        // gap_open_b: expected # of B-gap openings (M→X or Y→X transitions).  Local
+        // border X cells are unreachable (FX = -inf there), so no opening lands on one.
         for (int i = 1; i <= m_; ++i) {
-            for (int j = jlo0(i); j <= jhi0(i); ++j) {
+            for (int j = std::max(kGapTargetMin, jlo0(i)); j <= jhi0(i); ++j) {
                 double bx = srat(buf.BX, i, j);
                 if (bx == NEG_INF) continue;
                 double fm = srat(buf.FM, i-1, j), fy_prev = srat(buf.FY, i-1, j);
@@ -2610,7 +2618,7 @@ private:
         }
 
         // gap_open_a: expected # of A-gap openings (M→Y or X→Y transitions)
-        for (int i = 0; i <= m_; ++i) {
+        for (int i = kGapTargetMin; i <= m_; ++i) {
             for (int j = std::max(1, jlo0(i)); j <= jhi0(i); ++j) {
                 double by = srat(buf.BY, i, j);
                 if (by == NEG_INF) continue;
