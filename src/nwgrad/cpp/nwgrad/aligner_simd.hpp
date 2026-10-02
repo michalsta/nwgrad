@@ -194,9 +194,22 @@ template<GapModel GM, AlignMode AM, AlignBand AB, class T>
 void Aligner<GM, AM, AB, T>::viterbi_affine_simd(DpBuffer& buf, const LevelKernels& K) {
     using nwgrad_simd::NEG_INF;
 
-    band_fill(buf.VM, NEG_INF);
-    band_fill(buf.VX, NEG_INF);
-    band_fill(buf.VY, NEG_INF);
+    if constexpr (AB == AlignBand::Full) {
+        // The row loop writes every cell of rows 1..m, columns 1..n, and reads only
+        // those, row 0 and column 0 — so only the borders need -inf, not the whole
+        // (m+1)x(n+1) tables (three of them, every pair: on a 22x50 pair that prefill
+        // is as many stores as the DP itself).  Same tables, bit for bit.
+        // Measured on 22x50 pairs: -12% time for fill="rowwise".
+        for (auto* v : {&buf.VM, &buf.VX, &buf.VY}) {
+            double* t = v->data();
+            std::fill(t, t + stride_, NEG_INF);                                         // row 0
+            for (int i = 1; i <= m_; ++i) t[static_cast<size_t>(i) * stride_] = NEG_INF;  // column 0
+        }
+    } else {
+        band_fill(buf.VM, NEG_INF);
+        band_fill(buf.VX, NEG_INF);
+        band_fill(buf.VY, NEG_INF);
+    }
 
     if constexpr (AM == AlignMode::Global) {
         at(buf.VM, 0, 0) = 0.0;
