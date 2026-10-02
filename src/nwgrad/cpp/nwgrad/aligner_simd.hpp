@@ -268,14 +268,18 @@ void Aligner<GM, AM, AB, T>::viterbi_affine_simd(DpBuffer& buf, const LevelKerne
                 vm_cur, vx_cur, vy_cur, vm_prev, vx_prev, vy_prev, sr, lo, hi, blk,
                 go_a, ge_a, go_b, ge_b);
             if (rowmax > best_local) {
+                // The new best is the FIRST cell of the row whose max3 equals rowmax: a
+                // strict-> running scan stops updating once it reaches the maximum.  So
+                // stop there too, instead of comparing against a moving best over the
+                // whole row (that scan was ~17% of a 22x50 local pair's instructions).
                 for (int j = lo; j <= hi; ++j) {
                     const double mv = vm_cur[j], xv = vx_cur[j], yv = vy_cur[j];
-                    const double best_here = std::max(mv, std::max(xv, yv));
-                    if (best_here > best_local) {
-                        best_local = best_here; best_i_ = i; best_j_ = j;
+                    if (std::max(mv, std::max(xv, yv)) == rowmax) {
+                        best_local = rowmax; best_i_ = i; best_j_ = j;
                         if      (mv >= xv && mv >= yv) best_tbl_ = TBTable::M;
                         else if (xv >= yv)             best_tbl_ = TBTable::X;
                         else                            best_tbl_ = TBTable::Y;
+                        break;
                     }
                 }
             }
