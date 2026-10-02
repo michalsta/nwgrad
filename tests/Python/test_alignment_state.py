@@ -59,13 +59,7 @@ assert sp.aligned() == ("ACGT", "ACGT"), sp.aligned()
 @pytest.mark.parametrize("traceback", ["scores", "pointers"])
 @pytest.mark.parametrize("realign", [False, True], ids=["cached-path", "realigned"])
 def test_traceback_after_replacing_and_releasing_params(precision, traceback,
-                                                       realign, request):
-    if not realign:
-        # Allocator reuse makes this fail on normal builds; ASan detects the
-        # dangling read regardless of reuse. Do not make an allocator-dependent
-        # XPASS break a normal build on another platform.
-        request.node.add_marker(pytest.mark.xfail(
-            strict=False, reason="set_params leaves traceback pointing at freed params"))
+                                                       realign):
     proc = run_isolated(PRELUDE + f"""
 sp = n.SeqPair{precision}("ACGT", "ACGT", params(),
                           traceback={traceback!r}, kernel="scalar_fallback")
@@ -86,13 +80,47 @@ if {realign!r}:
     assert sp.score == 16
     assert sp.aligned() == expected
 else:
-    # Safely rejecting a stale traceback is also acceptable; reading freed
-    # params or decoding the sequence using a different alphabet is not.
+    # set_params() invalidates the retained tables: they and the traceback
+    # belong to the replaced params, which may already be freed.
+    assert not sp.dp_valid
+    for call in (sp.aligned, lambda: sp.formatted(0)):
+        try:
+            call()
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("stale traceback was readable after set_params()")
+""")
+    assert proc.returncode == 0, describe(proc)
+
+
+@pytest.mark.parametrize("precision", ["", "Double"], ids=["float32", "double"])
+@pytest.mark.parametrize("traceback", ["scores", "pointers"])
+@pytest.mark.parametrize("realign", [False, True], ids=["cached-path", "realigned"])
+def test_batch_set_params_invalidates_owned_pair_traceback(precision, traceback,
+                                                           realign):
+    # Batch-owned pairs (add_many) borrow the batch's params cell, so a batch
+    # set_params() releases the params their tables were computed under.
+    proc = run_isolated(PRELUDE + f"""
+b = n.SeqPairBatch{precision}(n_threads=1, traceback={traceback!r})
+b.add_many(["ACGT", "ACGTT"], ["ACGT", "ACGT"], params(), kernel="scalar_fallback")
+b.set_params(params(4))
+b.alloc_dp()
+b.align_full()
+expected = [b[i].aligned() for i in range(len(b))]
+b.set_params(params(5))
+gc.collect()
+trash = [params(99, "TGCA") for _ in range(500)]
+for i in range(len(b)):
+    assert not b[i].dp_valid
     try:
-        got = sp.aligned()
+        b[i].aligned()
     except RuntimeError:
         pass
     else:
-        assert got == expected, (got, expected)
+        raise AssertionError("stale traceback was readable after batch.set_params()")
+if {realign!r}:
+    b.realign_banded(4)
+    assert [b[i].aligned() for i in range(len(b))] == expected
 """)
     assert proc.returncode == 0, describe(proc)

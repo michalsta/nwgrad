@@ -42,7 +42,8 @@ enum class GradMode { None, Hard, Soft };
 // Invariants:
 //   - score_valid => path_valid
 //   - grad_valid  => score_valid
-//   - set_matrix() clears score_valid and grad_valid; path_valid stays (guide still usable)
+//   - set_params() clears score_valid, grad_valid and dp_valid (the retained tables
+//     and traceback belong to the old params); path_valid stays (guide still usable)
 //   - align_full() / realign_banded() set path_valid + score_valid, clear grad_valid
 //   - compute_grad() requires score_valid and grad_mode != None
 //   - SubstMatrix pointed to by matrix_ must outlive this object
@@ -119,7 +120,8 @@ struct SeqPairT {
     }
     int hb_cutoff() const noexcept { return hb_cutoff_; }
 
-    // Swap alignment parameters.  Invalidates score and gradient; path stays.
+    // Swap alignment parameters.  Invalidates score, gradient and the retained DP
+    // tables (aligned() throws until the next align); the guide path stays.
     // realign_banded() remains callable after this — it will re-score the
     // existing guide path under the new params.
     // The new params must outlive this SeqPair.
@@ -137,6 +139,12 @@ struct SeqPairT {
         params_ = &params;
         score_valid_ = false;
         grad_valid_  = false;
+        // The aligners' retained tables, and the params pointer they took at
+        // set_problem(), belong to the OLD params, which the caller may now free
+        // (the Python binding drops its reference).  A traceback re-derives each
+        // step from those params, so aligned() is invalid until the next DP.
+        // guide_j_ is plain data and survives, which is what realign_banded() needs.
+        dp_valid_    = false;
     }
 
     // Allocate own DP buffer shells. Must be called before align_full() / realign_banded() / compute_grad().

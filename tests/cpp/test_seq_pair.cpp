@@ -493,3 +493,35 @@ TEST_CASE("SeqPairBatch: one pair in two batches is not a duplicate",
     REQUIRE(b1.score_and_grad() == Approx(want));
     REQUIRE(b2.score_and_grad() == Approx(want));
 }
+
+// set_params() may be the last moment the old params are alive: the Python binding
+// drops its reference right after.  The retained tables (and the params pointer the
+// aligners took at set_problem) belong to the old params, so the traceback must be
+// refused until the next DP rather than read through a dangling pointer (a
+// heap-use-after-free under ASan before the fix).  The guide survives.
+TEST_CASE("SeqPair: set_params invalidates the retained traceback", "[seq_pair]") {
+    for (auto tb : {TracebackMode::Scores, TracebackMode::Pointers}) {
+        auto* p1 = new AlignParams(asym_params(4.0, 0.5, 1.5, 2.0));
+        SeqPair sp(A, B, *p1, GapModel::Affine, AlignMode::Global, GradMode::Hard,
+                   kBackendAuto, tb);
+        sp.alloc_dp();
+        sp.align_full();
+        const auto expected = sp.aligned();
+        const auto guide    = sp.guide_j();
+
+        auto p2 = asym_params(4.0, 0.5, 1.5, 2.0);
+        sp.set_params(p2);
+        delete p1;
+
+        REQUIRE_FALSE(sp.dp_valid());
+        REQUIRE(sp.path_valid());
+        REQUIRE(sp.guide_j() == guide);
+        REQUIRE_THROWS_AS(sp.aligned(), std::logic_error);
+        REQUIRE_THROWS_AS(sp.compute_grad(), std::logic_error);
+
+        sp.realign_banded(4);
+        REQUIRE(sp.aligned() == expected);
+        sp.compute_grad();
+        REQUIRE(sp.grad_valid());
+    }
+}

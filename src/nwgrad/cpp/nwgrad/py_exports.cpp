@@ -381,7 +381,9 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
                 keep_current_params(self_obj, params_obj);
             },
             nb::arg("params"),
-            "Swap alignment parameters.  Invalidates cached score and gradient.")
+            "Swap alignment parameters.  Invalidates cached score, gradient and DP\n"
+            "tables (aligned() raises until the next align); guide_j is kept for\n"
+            "realign_banded().")
         .def("align_full",     &SP::align_full,
              "Full DP alignment.  Updates score and alignment path; clears gradient cache.")
         .def("realign_banded", &SP::realign_banded, nb::arg("bandwidth"),
