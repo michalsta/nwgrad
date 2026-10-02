@@ -264,8 +264,28 @@ struct SeqPairBatchT {
 
     // Set params on all pairs (O(1) per pair — no threading needed).
     // Clears score_valid and grad_valid on every pair; path_valid is preserved.
+    // Point every pair at `params`, in parallel: each pair only stores the pointer
+    // and invalidates its cached results, and the pairs are independent.  The
+    // alphabet is checked once, before any pair changes, so a mismatch leaves the
+    // whole batch as it was.  `params` must outlive the batch's use of it (the
+    // Python binding keeps it alive).
     void set_params(const AlignParams& params) {
-        for (auto& sp : pairs) sp->set_params(params);
+        if (pairs.empty()) return;
+        if (&params.matrix.alphabet() != &alphabet())
+            throw std::invalid_argument(
+                "nwgrad: set_params() cannot change the alphabet (\"" +
+                alphabet().symbols() + "\" -> \"" + params.matrix.alphabet().symbols() +
+                "\"); construct new pairs instead");
+        const size_t n = pairs.size();
+        const size_t nblocks = (n + SCORES_BLOCK - 1) / SCORES_BLOCK;
+        std::atomic<size_t> next{0};
+        auto worker = [&]() {
+            for (size_t b; (b = next.fetch_add(1, std::memory_order_relaxed)) < nblocks; ) {
+                const size_t end = std::min(n, (b + 1) * SCORES_BLOCK);
+                for (size_t i = b * SCORES_BLOCK; i < end; ++i) pairs[i]->set_params(params);
+            }
+        };
+        run_workers(nblocks, worker);
     }
 
     // Drop DP tables on all pairs in parallel to free O(mn) memory per pair.
@@ -332,10 +352,24 @@ struct SeqPairBatchT {
     // score_and_grad(), align_full(), realign_banded() or banded_grad() first.
     // Throws if any pair has no valid score.
     std::vector<double> scores() const {
-        std::vector<double> out(pairs.size());
-        for (size_t i = 0; i < pairs.size(); ++i) out[i] = pairs[i]->score();
+        const size_t n = pairs.size();
+        std::vector<double> out(n);
+        const size_t nblocks = (n + SCORES_BLOCK - 1) / SCORES_BLOCK;
+        std::atomic<size_t> next{0};
+        auto worker = [&]() {
+            for (size_t b; (b = next.fetch_add(1, std::memory_order_relaxed)) < nblocks; ) {
+                const size_t end = std::min(n, (b + 1) * SCORES_BLOCK);
+                for (size_t i = b * SCORES_BLOCK; i < end; ++i) out[i] = pairs[i]->score();
+            }
+        };
+        if (nblocks > 0)
+            run_workers_guarded(std::min<int>(n_threads, static_cast<int>(nblocks)), worker);
         return out;
     }
+
+    // Pairs per worker task in scores() and set_params().  Only a scheduling
+    // granularity: every pair is handled alone, so results do not depend on it.
+    static constexpr size_t SCORES_BLOCK = 4096;
 
     // sum_i weights[i] * grad_i over the pairs' CACHED gradients.  Runs no
     // alignment, so a caller whose weights depend on the scores (a logistic
