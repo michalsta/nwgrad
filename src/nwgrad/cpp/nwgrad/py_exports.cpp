@@ -601,7 +601,8 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             "sum_i weights[i] * grad_i over the pairs' CACHED gradients, as one\n"
             "AlignParams.  Runs no alignment: call score_and_grad() (or compute_grad())\n"
             "first, derive the weights from scores() if they depend on them, then call\n"
-            "this.  Summed in pair order, so the result does not depend on n_threads.\n"
+            "this.  Summed in fixed blocks of pairs (in parallel), then over the\n"
+            "blocks in order, so the result does not depend on n_threads.\n"
             "Raises on an empty batch, on len(weights) != len(batch), and on a pair\n"
             "without a valid gradient.")
         .def(

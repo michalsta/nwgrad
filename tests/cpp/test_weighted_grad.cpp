@@ -6,7 +6,9 @@
 #include "seq_pair.hpp"
 #include "seq_pair_batch.hpp"
 
+#include <algorithm>
 #include <array>
+#include <cstdint>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -141,4 +143,48 @@ TEST_CASE("grads_into: preconditions throw", "[weighted_grad]") {
                    AlignMode::Global, GradMode::Hard);
     std::vector<double> mats(batch.size() * 16), gaps(batch.size() * 4);
     REQUIRE_THROWS_AS(batch.grads_into(mats.data(), gaps.data()), std::logic_error);
+}
+
+// More pairs than one block: the sum is per block in pair order, then over the
+// blocks in order, whatever the thread count.  The reference rounds every
+// product on its own (volatile), as in the test above, and adds in that order.
+TEST_CASE("weighted_grad: block order, bit-identical across thread counts", "[weighted_grad]") {
+    const size_t B = SeqPairBatchT<double>::WEIGHTED_GRAD_BLOCK;
+    const size_t N = 3 * B + 17;
+    static const char ACGT[] = "ACGT";
+    std::vector<std::string> a(N), b(N);
+    uint64_t state = 12345;
+    auto next = [&]() { state = state * 6364136223846793005ULL + 1442695040888963407ULL; return state >> 33; };
+    for (size_t i = 0; i < N; ++i) {
+        for (size_t k = 0, len = 4 + next() % 9; k < len; ++k) a[i] += ACGT[next() % 4];
+        for (size_t k = 0, len = 4 + next() % 13; k < len; ++k) b[i] += ACGT[next() % 4];
+    }
+    std::vector<double> w(N);
+    for (size_t i = 0; i < N; ++i) w[i] = (static_cast<double>(next() % 2000001) - 1e6) / 7e5;
+
+    auto p = dna_params();
+    std::vector<std::vector<double>> results;
+    std::vector<double> expected(20, 0.0);
+    for (int threads : {1, 2, 7}) {
+        SeqPairBatchT<double> batch(threads);
+        batch.add_many(views(a), views(b), p, GapModel::Affine, AlignMode::Local, GradMode::Hard);
+        batch.score_and_grad();
+        results.push_back(flat(batch.weighted_grad(w.data(), N)));
+        if (threads == 1) {
+            for (size_t lo = 0; lo < N; lo += B) {
+                std::vector<double> block(20, 0.0);
+                for (size_t i = lo; i < std::min(N, lo + B); ++i) {
+                    std::vector<double> g = flat(batch[i].grad());
+                    for (size_t k = 0; k < g.size(); ++k) {
+                        volatile double product = w[i] * g[k];
+                        block[k] += product;
+                    }
+                }
+                for (size_t k = 0; k < 20; ++k) expected[k] += block[k];
+            }
+        }
+    }
+    REQUIRE(results[0] == expected);
+    for (const auto& r : results)
+        REQUIRE(std::memcmp(r.data(), results[0].data(), r.size() * sizeof(double)) == 0);
 }

@@ -61,3 +61,33 @@ no-SMT hosts) it cannot do harm.
 
 Until then, callers with short pairs should pass an explicit `n_threads`.
 DiscrimAlign does: it passes the logical core count.
+
+## Per-pair gradients stored contiguously (weighted_grad, grads)
+
+`weighted_grad()` and `grads()` read every pair's cached gradient from its own
+heap objects: `pairs[i]` points to a `SeqPair` (about 2.8 KB per pair with its
+DP machinery), whose `grad_` holds a `SubstMatrix` with its values in yet
+another heap block. The cost is the walk, not the arithmetic. Measured
+2026-10-02 on skynet, 2.5M random 22×50 nt pairs, DNA, double:
+
+| operation | time |
+|---|---|
+| serial `weighted_grad()` (0.5.0) | 779 ms (312 ns/pair) |
+| `grads()`, the same walk copying instead of multiplying | 591 ms |
+| numpy `w @ X` on the same numbers in one contiguous (N, 20) array, 1 thread | 160 ms |
+| `weighted_grad()` in fixed parallel blocks (current), 1 / 4 / 16 / 60 threads | 708 / 304 / 118 / 63 ms |
+
+The block-parallel sum (fixed blocks of `WEIGHTED_GRAD_BLOCK` pairs, block
+sums added in order) hides the latency across cores and stays bit-identical
+for any thread count; it flattens above ~16 threads.
+
+### Proposal (not implemented)
+
+Let `score_and_grad()` write each pair's gradient into one batch-owned
+(N, n²+4) array instead of, or besides, `SeqPair::grad_`. Then
+`weighted_grad()` is a streaming pass (memory bandwidth, not latency) and
+`grads()` is a copy or a view. Worth it for few-core machines and as part of
+slimming the per-pair objects (2.8 KB/pair is what made DiscrimAlign's
+2.5M-pair Manakov fit peak at 10 GB); not worth it on its own while the
+block-parallel sum is already ~2% of a DiscrimAlign iteration. Keep the
+block order (and the no-FMA rule) so results do not change.

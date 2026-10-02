@@ -342,10 +342,13 @@ struct SeqPairBatchT {
     // likelihood, say) runs score_and_grad(), derives the weights from
     // scores(), then calls this.
     //
-    // Summed serially in pair-index order: the result is bit-reproducible and
-    // independent of n_threads and the schedule.  (compute_grad() sums per-thread
-    // partials in completion order, so it is not.)  One pass of O(N * |alphabet|^2)
-    // multiply-adds is negligible next to the DP that produced the gradients.
+    // Summed in fixed blocks of WEIGHTED_GRAD_BLOCK pairs: each block in pair
+    // order, the blocks in parallel, then the block sums in block order.  The
+    // blocks depend only on the pair count, so the result is bit-reproducible
+    // and independent of n_threads (and identical to a plain pair-order sum for
+    // batches of at most one block).  The time is not the multiply-adds but
+    // fetching each pair's gradient from its own heap objects; parallel workers
+    // keep many of those memory accesses in flight.
     //
     // No product is ever formed next to the add that consumes it: scale_into()
     // stores w_i * grad_i out of line, and the sum loads it.  A multiply adjacent to
@@ -355,7 +358,8 @@ struct SeqPairBatchT {
     // hb_kernel_impl.inl.
     //
     // Throws on an empty batch (the sum has no alphabet), on a weight count other
-    // than size(), and on a pair without a valid gradient.
+    // than size(), and on a pair without a valid gradient.  Only reads the pairs,
+    // so unlike the alignment operations it does not need each pair to appear once.
     AlignParams weighted_grad(const double* weights, size_t n) const {
         const Alphabet& alpha = alphabet();   // throws if empty
         if (n != pairs.size())
@@ -363,12 +367,34 @@ struct SeqPairBatchT {
                 "nwgrad: weighted_grad() needs one weight per pair (got " +
                 std::to_string(n) + " weights for " +
                 std::to_string(pairs.size()) + " pairs)");
-        AlignParams out(alpha), scaled(alpha);
-        for (size_t i = 0; i < n; ++i) {
-            scale_into(scaled, pairs[i]->grad(), weights[i]);
-            out += scaled;
-        }
+        const size_t nblocks = (n + WEIGHTED_GRAD_BLOCK - 1) / WEIGHTED_GRAD_BLOCK;
+        std::vector<AlignParams> partial(nblocks, AlignParams(alpha));
+        std::atomic<size_t> next{0};
+        auto worker = [&]() {
+            AlignParams scaled(alpha);
+            for (size_t b; (b = next.fetch_add(1, std::memory_order_relaxed)) < nblocks; ) {
+                const size_t end = std::min(n, (b + 1) * WEIGHTED_GRAD_BLOCK);
+                for (size_t i = b * WEIGHTED_GRAD_BLOCK; i < end; ++i) {
+                    scale_into(scaled, pairs[i]->grad(), weights[i]);
+                    partial[b] += scaled;
+                }
+            }
+        };
+        if (nblocks > 0)
+            run_workers_guarded(std::min<int>(n_threads, static_cast<int>(nblocks)), worker);
+        AlignParams out(alpha);
+        for (const AlignParams& p : partial) out += p;
         return out;
+    }
+
+    // Pairs per block in weighted_grad().  Part of the result's definition: a
+    // different block size sums in a different order and can change the last bits.
+    static constexpr size_t WEIGHTED_GRAD_BLOCK = 4096;
+
+    // dst = s * src.  Out of line on purpose; see weighted_grad().
+    [[gnu::noinline]] static void scale_into(AlignParams& dst, const AlignParams& src, double s) {
+        dst = src;
+        dst *= s;
     }
 
     // The pairs' CACHED gradients, copied out in pair order: pair i's matrix to
@@ -392,12 +418,6 @@ struct SeqPairBatchT {
             gp[2] = g.gap_open_b;
             gp[3] = g.gap_extend_b;
         }
-    }
-
-    // dst = s * src.  Out of line on purpose; see weighted_grad().
-    [[gnu::noinline]] static void scale_into(AlignParams& dst, const AlignParams& src, double s) {
-        dst = src;
-        dst *= s;
     }
 
     // Full-pipeline batch operation using per-thread DpBuffers.

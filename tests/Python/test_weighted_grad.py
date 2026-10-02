@@ -193,3 +193,26 @@ def test_weighted_grad_after_set_params_raises():
     batch.set_params(params)
     with pytest.raises(RuntimeError, match="gradient not computed"):
         batch.weighted_grad(np.ones(len(batch)))
+
+
+def test_weighted_grad_over_many_blocks_is_thread_independent_and_matches_numpy():
+    """More pairs than one summation block (4096): same bits for any thread count."""
+    rng = np.random.default_rng(7)
+    n = 3 * 4096 + 17
+    letters = np.array(list("ACGT"))
+    seqs_a = ["".join(rng.choice(letters, size=rng.integers(4, 13))) for _ in range(n)]
+    seqs_b = ["".join(rng.choice(letters, size=rng.integers(4, 17))) for _ in range(n)]
+    w = rng.normal(size=n)
+    results = []
+    for threads in (1, 3, 8):
+        batch = nwgrad.SeqPairBatchDouble(n_threads=threads)
+        batch.add_many(seqs_a, seqs_b, dna_params(), gap_model="affine", mode="local")
+        batch.score_and_grad()
+        results.append(batch.weighted_grad(w).to_dict())
+    for r in results[1:]:
+        assert np.array_equal(r["matrix"], results[0]["matrix"])
+        assert all(r[f] == results[0][f] for f in FIELDS)
+    matrices, gaps = batch.grads()
+    np.testing.assert_allclose(results[0]["matrix"], np.tensordot(w, matrices, axes=1),
+                               rtol=1e-12, atol=1e-9)
+    np.testing.assert_allclose([results[0][f] for f in FIELDS], w @ gaps, rtol=1e-12, atol=1e-9)
