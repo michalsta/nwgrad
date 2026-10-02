@@ -17,6 +17,8 @@
 #include "seq_pair_batch.hpp"
 
 namespace nb = nanobind;
+
+void bind_logistic(nb::module_& parent);   // logistic/py_logistic.cpp
 using nb_arr_f64    = nb::ndarray<double, nb::ndim<2>, nb::c_contig, nb::device::cpu>;
 using nb_arr_f64_1d = nb::ndarray<nb::numpy, double, nb::ndim<1>>;
 
@@ -1009,4 +1011,6 @@ NB_MODULE(nwgrad_ext, m) {
     bind_seq_pair_batch<float >(m, "SeqPairBatch");
     bind_seq_pair_batch<double>(m, "SeqPairBatchDouble");
 
+    // ── logistic: a binary logistic link over batch scores (submodule) ────────
+    bind_logistic(m);
 }

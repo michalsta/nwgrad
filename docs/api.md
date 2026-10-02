@@ -9,7 +9,7 @@ building from source, see [cpp.md](cpp.md).
 
 - [`Alphabet`](#alphabet) · [`SubstMatrix`](#substmatrix) · [`AlignParams`](#alignparams)
   (with [gap penalty conventions](#gap-penalty-conventions))
-- [`SeqPair`](#seqpair) · [`SeqPairBatch`](#seqpairbatch)
+- [`SeqPair`](#seqpair) · [`SeqPairBatch`](#seqpairbatch) · [`nwgrad.logistic`](#nwgradlogistic)
 - [`BatchAligner`](#batchaligner) · [`BatchResult`](#batchresult)
 - [Single-pair convenience functions](#single-pair-convenience-functions)
 
@@ -202,10 +202,10 @@ SMT siblings contend and the logical count measured up to 1.44× slower. `add()`
 |---|---|---|
 | `add(seq_pair)` | — | Append a `SeqPair` |
 | `add_many(seqs_a, seqs_b, params, gap_model="affine", mode="global", grad_mode="hard", kernel="auto")` | — | Build N `SeqPair`s in C++ and append them — much faster than N `add()` calls. The pairs take the batch's `traceback` and `hb_cutoff`. |
-| `set_params(params)` | — | Call `set_params()` on all pairs |
+| `set_params(params)` | — | Call `set_params()` on all pairs, in parallel. The alphabet is checked once first, so a mismatch raises without changing any pair. |
 | `score_and_grad(bandwidth=0)` | `float` (sum of scores) | Full-pipeline parallel alignment. Uses per-thread DP buffers (pair-owned tables are never allocated). If `bandwidth > 0`, runs a full DP for the guide path then a banded DP. Results are cached on each `SeqPair`. |
 | `compute_grad()` | `AlignParams` | Sum cached per-pair gradients. No DP work if all `grad_valid` are already true. |
-| `scores()` | `numpy.ndarray` (float64) | The cached per-pair scores, in pair order. Runs no DP; raises if any pair has no valid score. |
+| `scores()` | `numpy.ndarray` (float64) | The cached per-pair scores, in pair order, gathered in parallel. Runs no DP; raises if any pair has no valid score. |
 | `weighted_grad(weights)` | `AlignParams` | `sum_i weights[i] * grad_i` over the cached per-pair gradients. `weights` is a 1-D numeric array with one entry per pair. Runs no DP; raises if any pair has no valid gradient. Summed in fixed blocks of 4096 pairs (each in pair order, the blocks in parallel), then over the blocks in order, so the result is bit-reproducible and does not depend on `n_threads`. |
 | `grads()` | `(numpy.ndarray, numpy.ndarray)` (float64) | The cached per-pair gradients as two arrays, in pair order: `matrices` of shape `(N, n, n)`, rows and columns in the order of `alphabet`, and `gaps` of shape `(N, 4)` with columns `gap_open_a`, `gap_extend_a`, `gap_open_b`, `gap_extend_b`. The same numbers as `batch[i].grad`, without one `AlignParams` object per pair. Runs no DP; raises on an empty batch and if any pair has no valid gradient. |
 | `align_full()` | `float` (sum of scores) | Full DP on all pairs in parallel using pair-owned buffers. Call `alloc_dp()` first. |
@@ -262,6 +262,23 @@ for step in range(n_steps):
 ```
 
 ---
+
+## `nwgrad.logistic`
+
+A binary logistic link over per-pair alignment scores, P(y = 1) = expit(α + score): the
+likelihood [DiscrimAlign](https://github.com/BioGeMT/DiscrimAlign) maximises. It lives in
+its own module (`src/nwgrad/cpp/nwgrad/logistic/`) and uses only `SeqPairBatch`'s public
+interface. Every sum is taken over fixed blocks of 4096 elements and the block sums are
+added in order, so results do not depend on `n_threads` (0 = the default thread count).
+`labels` are float64 arrays of 0s and 1s with both classes present; anything else raises
+`ValueError`.
+
+| Function | Returns | Description |
+|---|---|---|
+| `step(batch, labels, alpha0)` | `Step` | One optimisation iteration's logistic work after `batch.score_and_grad()`: `loglik_at_alpha0`, the fitted `alpha` (as `fit_alpha`), and `grad = Σᵢ (labels[i] − expit(alpha + scoreᵢ)) gradᵢ` as an `AlignParams` (as `weighted_grad` returns it). Uses the batch's `n_threads`. `SeqPairBatch` and `SeqPairBatchDouble`. |
+| `fit_alpha(scores, labels, alpha0, n_threads=0, tol=1e-12, max_newton=8, maxiter=200)` | `float` | The intercept maximising the likelihood: the root of dL/dα = Σ(y − p), which is strictly decreasing in α. Plain Newton steps while \|step\| ≤ 1, otherwise a bracketed safeguarded Newton (Numerical Recipes' rtsafe). Exact to rounding from any start. |
+| `log_likelihood(scores, labels, alpha, n_threads=0)` | `float` | Σ y log c + (1 − y) log1p(−c), with c = expit(α + score) clipped to [ε, 1 − ε]. |
+| `probabilities(scores, alpha, n_threads=0)` | `numpy.ndarray` | expit(α + scores), bit-identical to `scipy.special.expit`. |
 
 ## `BatchAligner`
 
