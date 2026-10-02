@@ -156,9 +156,9 @@ a separate reference to it.
 | `realign_banded(bandwidth)` | Banded DP around the current path. Requires prior `align_full()`. Sets `score`; clears `grad`. |
 | `compute_grad()` | Compute and cache the gradient from the current alignment. Requires `align_full()` or `realign_banded()` to have been called first. |
 | `score_and_grad()` | Convenience: `alloc_dp()` + `align_full()` + `compute_grad()` in one call. Returns `(score, grad)`. |
-| `aligned()` | Return the alignment as a pair of gapped strings `(seq_a, seq_b)`. Requires the DP tables (call before `drop_dp()`). |
-| `formatted(width=60)` | Pretty-printed alignment block (seq A / match line / seq B), wrapped at `width` columns (`0` = no wrap). |
-| `set_params(params)` | Swap alignment parameters. Clears `score` and `grad`; preserves `guide_j`. |
+| `aligned()` | Return the alignment as a pair of gapped strings `(seq_a, seq_b)`. Requires the DP tables of the current params: raises `RuntimeError` after `drop_dp()` or `set_params()` until the next `align_full()` / `realign_banded()`. With `grad_mode="soft"` it is the Viterbi alignment. |
+| `formatted(width=60)` | Pretty-printed alignment block (seq A / match line / seq B), wrapped at `width` columns (`0` = no wrap). Same availability as `aligned()`. |
+| `set_params(params)` | Swap alignment parameters. Clears `score` and `grad` and invalidates the retained DP tables (`dp_valid` becomes `False`, so `aligned()` raises until you re-align: the tables belong to the replaced params, which may already be freed). Preserves `guide_j`, so `realign_banded()` works straight after. |
 | `drop_dp()` | Free O(m×n) DP table memory. Cached `score`, `grad`, and `guide_j` survive (but `aligned()` / `compute_grad()` then need a re-align). |
 
 **Properties:**
@@ -282,7 +282,8 @@ nwgrad.BatchAligner(
 **`.align(sequences_a, sequences_b, aligned_a=[], aligned_b=[]) -> BatchResult`**
 
 Aligns each pair `(sequences_a[i], sequences_b[i])`. `aligned_a` / `aligned_b`, if
-given, are gapped alignment strings (one per pair) used as banding guides.
+given, are gapped alignment strings (one per pair) used as banding guides. Each guide
+must describe its own pair — see [guide validation](#guide-validation).
 
 ## `BatchResult`
 
@@ -311,6 +312,14 @@ Each also exists with a `_double` suffix (`nw_score_double`, `nw_affine_grad_dou
 `band > 0` (or a non-empty `aligned_a` / `aligned_b` guide pair) runs a banded DP
 instead of the full one. The sequences are plain `str` and are validated and
 encoded against `params`'s alphabet on the way in.
+
+<a id="guide-validation"></a>**Guide validation.** A guide built from `aligned_a` /
+`aligned_b` must describe the input pair, not merely be well formed: it needs one
+entry per residue of `seq_a` plus one (i.e. the gapped `aligned_a` spells `seq_a`),
+every column in `[0, len(seq_b)]`, never decreasing. Anything else raises
+`ValueError` before the DP runs, as does a negative `band`. The last guide entry need
+not equal `len(seq_b)`: B residues after the last A residue (trailing gaps in A) do not
+add an entry.
 
 **Score only** — return `float`:
 
