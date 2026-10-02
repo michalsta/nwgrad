@@ -227,6 +227,7 @@ struct SeqPairBatchT {
                 // reads hb_cutoff then), so applied unconditionally — tb_ may be the
                 // Default sentinel, which resolves to Hirschberg per pair, not here.
                 staged[i]->set_hb_cutoff(hb_cutoff);
+                staged[i]->set_rowwise_full(rowwise_full);
             }
         };
         run_workers(N, worker);
@@ -743,6 +744,11 @@ public:
     // vectorized; see the Aligner field for the mechanism (pairs <= cutoff run the exact
     // pointers fill; longer ones split).
     int hb_cutoff = 512;
+
+    // Full-band fill for pairs built by add_many(): striped (false) or row-wise (true).
+    // See Aligner::set_rowwise_full.  Setting it through the Python `fill` property
+    // also applies it to the pairs already in the batch.
+    bool rowwise_full = false;
 
 private:
 

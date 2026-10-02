@@ -312,6 +312,14 @@ struct Aligner {
     }
     int hb_cutoff() const noexcept { return hb_cutoff_; }
     int  kernel() const noexcept { return backend_; }
+    // Which simd fill the Full band uses at double precision: the striped kernel (false,
+    // the default) or the row-wise one the guide-banded path uses (true).  Both write
+    // tables bit-identical to the scalar fill, so this is a speed knob only.  Row-wise
+    // pays no lazy-F fixpoint, which wins on short pairs (miRNA x site, ~22 x 50:
+    // 1.5-1.8x, more with cheap gaps); striped wins on long ones.  Row-wise keeps
+    // VM/VX/VY (24 B/cell) even under traceback Pointers, which it cannot record.
+    void set_rowwise_full(bool on) noexcept { rowwise_full_ = on; }
+    bool rowwise_full() const noexcept { return rowwise_full_; }
 
     void compute_viterbi() {
         check_problem();
@@ -497,6 +505,7 @@ private:
     // striped_w_ come straight from the kernel (ViterbiJob.seg / .width); a striped row
     // is striped_seg_*striped_w_ + 1 doubles, slot 0 being column 0.
     bool   tables_striped_ = false;
+    bool   rowwise_full_   = false;   // see set_rowwise_full()
     // Pointers mode: DM/DX/DY hold predecessor codes, VM/VX/VY are NOT retained.
     bool        pointers_ = false;
     // Hirschberg mode: no tables at all survive the fill.  The recursion recovers the
@@ -632,7 +641,7 @@ private:
             // Hirschberg allocates even less: its scratch is O(n) rows sized on demand
             // inside the recursion, and the whole point is that no O(m*n) table exists.
             if constexpr (AB == AlignBand::Full)
-                if (tb_ == TracebackMode::Pointers || is_hirschberg(tb_)) return;
+                if ((tb_ == TracebackMode::Pointers || is_hirschberg(tb_)) && !rowwise_full_) return;
             if (buf.VM.size() < sz_) { buf.VM.resize(sz_); buf.VX.resize(sz_); buf.VY.resize(sz_); }
         }
     }
@@ -1094,6 +1103,11 @@ private:
         // single-level build), every pointer is null and we fall through to scalar.
         const LevelKernels& K = level_kernels(backend);
         if constexpr (AB == AlignBand::Full) {
+            // Opt-in row-wise fill (set_rowwise_full): score tables, row-major, read back
+            // by the Scores traceback whatever tb_ says — the paths are identical.
+            if constexpr (std::is_same_v<T, double>) {
+                if (rowwise_full_ && K.banded_row_local) { viterbi_affine_simd(buf, K); return; }
+            }
             // The striped Full kernel exists at both precisions (viterbi / viterbi_f).
             if constexpr (std::is_same_v<T, double>) {
                 if (use_ptr && K.viterbi_ptr) { run_dispatched_affine(buf, K, true);  return; }

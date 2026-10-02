@@ -185,6 +185,12 @@ static TracebackMode parse_traceback(const std::string& name) {
          "\" (expected \"auto\", \"pointers\", \"scores\", \"hirschberg\" or "
          "\"hirschberg_pmax\")").c_str());
 }
+static bool parse_fill(const std::string& name) {
+    if (name == "striped") return false;
+    if (name == "rowwise") return true;
+    throw nb::value_error(
+        ("nwgrad: unknown fill \"" + name + "\" (expected \"striped\" or \"rowwise\")").c_str());
+}
 static const char* traceback_name(TracebackMode t) {
     switch (t) {
         case TracebackMode::Pointers:   return "pointers";
@@ -444,6 +450,11 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
             "Hirschberg base-case size in rows — see SeqPairBatch.hb_cutoff.  Settable\n"
             "(unlike traceback) because it changes how the DP divides, not what it\n"
             "retains, so no allocation decision depends on it.")
+        .def_prop_rw(
+            "fill",
+            [](const SP& s) { return s.rowwise_full() ? "rowwise" : "striped"; },
+            [](SP& s, const std::string& v) { s.set_rowwise_full(parse_fill(v)); },
+            "Full-DP simd fill at double precision — see SeqPairBatch.fill.")
         .def_prop_ro("seq_a", [](const SP& s) { return s.seq_a(); })
         .def_prop_ro("seq_b", [](const SP& s) { return s.seq_b(); });
 }
@@ -661,6 +672,21 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             "     reserve of the smallest tasks for threads that finish early.\n"
             "Bounds the DP memory high-water mark at sum-over-chunks rather than\n"
             "n_threads * the global maximum.  Results are identical either way.")
+        .def_prop_rw(
+            "fill",
+            [](const SPB& s) { return s.rowwise_full ? "rowwise" : "striped"; },
+            [](SPB& s, const std::string& v) {
+                s.rowwise_full = parse_fill(v);
+                for (auto* sp : s.pairs) sp->set_rowwise_full(s.rowwise_full);
+            },
+            "Which vectorized fill full (unbanded) affine DP uses at double precision.\n"
+            "  \"striped\" (default): the striped kernel, fastest on long pairs.\n"
+            "  \"rowwise\": the row-wise kernel the banded path uses; no lazy-F\n"
+            "     fixpoint, so faster on short pairs (miRNA x site, ~22 x 50: 1.5-1.8x).\n"
+            "Scores, paths and gradients are bit-identical either way.  \"rowwise\"\n"
+            "keeps three score tables per thread (24 B/cell) even with traceback\n"
+            "\"pointers\".  Ignored at float32, for linear gaps, and on the scalar\n"
+            "kernel.  Applies to the pairs in the batch and to later add_many() ones.")
         .def_prop_rw(
             "hb_cutoff",
             [](const SPB& s) { return s.hb_cutoff; },

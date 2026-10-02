@@ -120,6 +120,14 @@ struct SeqPairT {
     }
     int hb_cutoff() const noexcept { return hb_cutoff_; }
 
+    // Full-band simd fill at double precision: striped (default) or row-wise — see
+    // Aligner::set_rowwise_full.  Bit-identical results, so settable at any time.
+    void set_rowwise_full(bool on) {
+        std::visit([on](auto& st) { st.full_al.set_rowwise_full(on); }, state_);
+        rowwise_full_ = on;
+    }
+    bool rowwise_full() const noexcept { return rowwise_full_; }
+
     // Swap alignment parameters.  Invalidates score, gradient and the retained DP
     // tables (aligned() throws until the next align); the guide path stays.
     // realign_banded() remains callable after this — it will re-score the
@@ -371,6 +379,7 @@ private:
     GradMode             grad_mode_;
     int                  kernel_;   // Viterbi backend, forwarded to each aligner
     int                  hb_cutoff_ = 512;   // mirrors Aligner's default (fleet-swept)
+    bool                 rowwise_full_ = false;
 
     bool             path_valid_   = false;
     bool             score_valid_  = false;
