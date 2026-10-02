@@ -29,15 +29,9 @@ def params(k=3, alphabet="ACGT"):
     ("hirschberg", 512), ("hirschberg", 1),
 ])
 def test_soft_pair_retains_viterbi_alignment(precision, mode, kernel, traceback,
-                                           cutoff, request):
+                                           cutoff):
     # F/B are row-major, but changing their layout must not change how the
     # separately retained Viterbi scores/directions are read.
-    import nwgrad
-    simd = kernel == "auto" and nwgrad.get_isa_level() != "scalar_fallback"
-    if ((traceback == "scores" and simd) or traceback == "pointers"
-            or (traceback == "hirschberg" and cutoff >= 4)):
-        request.node.add_marker(pytest.mark.xfail(
-            strict=True, reason="forward-backward overwrites Viterbi layout metadata"))
     proc = run_isolated(PRELUDE + f"""
 sp = n.SeqPair{precision}("ACGT", "ACGT", params(), mode={mode!r},
                           grad_mode="soft", kernel={kernel!r}, traceback={traceback!r})

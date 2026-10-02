@@ -326,8 +326,6 @@ struct Aligner {
         check_problem();
         check_own_buf_allocated();
         ensure_fwdbwd_buf(own_buf_);  // Grow if needed
-        tables_striped_ = false; // F/B are always row-major, even after a striped Viterbi
-        pointers_ = false;     // and the soft path needs real score tables, not codes
         if constexpr (GM == GapModel::Linear) fwdbwd_linear(own_buf_);
         else                                   fwdbwd_affine(own_buf_);
         fwdbwd_done_ = any_fwdbwd_done_ = true;
@@ -410,8 +408,6 @@ struct Aligner {
     void compute_forward_back(DpBuffer& buf) {
         check_problem();
         ensure_fwdbwd_buf(buf);  // Grow if needed (allows implicit growth from size 0)
-        tables_striped_ = false; // F/B are always row-major, even after a striped Viterbi
-        pointers_ = false;     // and the soft path needs real score tables, not codes
         if constexpr (GM == GapModel::Linear) fwdbwd_linear(buf);
         else                                   fwdbwd_affine(buf);
         any_fwdbwd_done_ = true;
@@ -681,6 +677,19 @@ private:
     }
     template <class V> typename V::value_type rat(const V& t, int i, int j) const {
         return t[cell_index(i, j)];
+    }
+    // The forward-backward tables (F/B, FM..BY) are ALWAYS row-major, whatever layout
+    // the Viterbi fill left VM/VX/VY or DM/DX/DY in.  They get their own accessors so
+    // the soft path never has to touch tables_striped_ / pointers_: those describe the
+    // retained Viterbi state, which a traceback after compute_forward_back() still
+    // reads (SeqPair's soft mode runs Viterbi, then forward-backward, then aligned()).
+    // Clearing them here once made Pointers walk unallocated score tables and a
+    // striped Scores walk read its tables row-major.
+    double& sat(DVec& t, int i, int j) const noexcept {
+        return t[static_cast<size_t>(i) * stride_ + static_cast<size_t>(j)];
+    }
+    double srat(const DVec& t, int i, int j) const noexcept {
+        return t[static_cast<size_t>(i) * stride_ + static_cast<size_t>(j)];
     }
 
     // ── Substitution lookup (the DP hot path) ─────────────────────────────────
@@ -2374,57 +2383,57 @@ private:
         banded_fill(buf.F);
 
         if constexpr (AM == AlignMode::Global) {
-            at(buf.F, 0, 0) = 0.0;
+            sat(buf.F, 0, 0) = 0.0;
             const int bi = border_rows(), bj = border_cols();
             for (int i = 1; i <= bi; ++i)
-                at(buf.F, i, 0) = -static_cast<double>(i) * params_->gap_extend_b;
+                sat(buf.F, i, 0) = -static_cast<double>(i) * params_->gap_extend_b;
             for (int j = 1; j <= bj; ++j)
-                at(buf.F, 0, j) = -static_cast<double>(j) * params_->gap_extend_a;
+                sat(buf.F, 0, j) = -static_cast<double>(j) * params_->gap_extend_a;
         } else {
-            for (int i = 0; i <= m_; ++i) at(buf.F, i, 0) = 0.0;
-            for (int j = 0; j <= n_; ++j) at(buf.F, 0, j) = 0.0;
+            for (int i = 0; i <= m_; ++i) sat(buf.F, i, 0) = 0.0;
+            for (int j = 0; j <= n_; ++j) sat(buf.F, 0, j) = 0.0;
         }
 
         for (int i = 1; i <= m_; ++i) {
             for (int j = jlo(i); j <= jhi(i); ++j) {
                 double v = lse3(
-                    rat(buf.F, i-1, j-1) + sub(i, j),
-                    rat(buf.F, i-1, j)   - params_->gap_extend_b,
-                    rat(buf.F, i,   j-1) - params_->gap_extend_a
+                    srat(buf.F, i-1, j-1) + sub(i, j),
+                    srat(buf.F, i-1, j)   - params_->gap_extend_b,
+                    srat(buf.F, i,   j-1) - params_->gap_extend_a
                 );
                 if constexpr (AM == AlignMode::Local) v = lse2(v, 0.0);
-                at(buf.F, i, j) = v;
+                sat(buf.F, i, j) = v;
             }
         }
 
         if constexpr (AM == AlignMode::Global) {
-            log_z_ = rat(buf.F, m_, n_);
+            log_z_ = srat(buf.F, m_, n_);
         } else {
             log_z_ = NEG_INF;
             for (int i = 0; i <= m_; ++i)
                 for (int j = jlo0(i); j <= jhi0(i); ++j)
-                    log_z_ = lse2(log_z_, rat(buf.F, i, j));
+                    log_z_ = lse2(log_z_, srat(buf.F, i, j));
         }
 
         // ── Backward ──
         if constexpr (AM == AlignMode::Global) {
             band_fill(buf.B, NEG_INF);
-            at(buf.B, m_, n_) = 0.0;
+            sat(buf.B, m_, n_) = 0.0;
         } else {
             band_fill(buf.B, 0.0);
         }
 
         for (int i = m_; i >= 0; --i) {
             for (int j = jhi0(i); j >= jlo0(i); --j) {
-                double bval = rat(buf.B, i, j);
+                double bval = srat(buf.B, i, j);
                 if (bval == NEG_INF) continue;
                 if (i > 0 && j > 0)
-                    at(buf.B,i-1,j-1) = lse2(rat(buf.B,i-1,j-1),
+                    sat(buf.B,i-1,j-1) = lse2(srat(buf.B,i-1,j-1),
                                               bval + sub(i, j));
                 if (i > 0)
-                    at(buf.B,i-1,j)   = lse2(rat(buf.B,i-1,j),   bval - params_->gap_extend_b);
+                    sat(buf.B,i-1,j)   = lse2(srat(buf.B,i-1,j),   bval - params_->gap_extend_b);
                 if (j > 0)
-                    at(buf.B,i,j-1)   = lse2(rat(buf.B,i,j-1),   bval - params_->gap_extend_a);
+                    sat(buf.B,i,j-1)   = lse2(srat(buf.B,i,j-1),   bval - params_->gap_extend_a);
             }
         }
     }
@@ -2434,9 +2443,9 @@ private:
         // Matrix gradient: match steps (i-1,j-1) → (i,j)
         for (int i = 1; i <= m_; ++i) {
             for (int j = jlo(i); j <= jhi(i); ++j) {
-                double bval = rat(buf.B, i, j);
+                double bval = srat(buf.B, i, j);
                 if (bval == NEG_INF) continue;
-                double log_p = rat(buf.F, i-1, j-1)
+                double log_p = srat(buf.F, i-1, j-1)
                                + sub(i, j)
                                + bval - log_z_;
                 gblk[sub_off(i, j)] += std::exp(log_p);
@@ -2446,9 +2455,9 @@ private:
         // gap_extend_b: B-gap steps (i-1,j) → (i,j), cost = -gap_extend_b
         for (int i = 1; i <= m_; ++i) {
             for (int j = jlo0(i); j <= jhi0(i); ++j) {
-                double bval = rat(buf.B, i, j);
+                double bval = srat(buf.B, i, j);
                 if (bval == NEG_INF) continue;
-                double fval = rat(buf.F, i-1, j);
+                double fval = srat(buf.F, i-1, j);
                 if (fval == NEG_INF) continue;
                 grad.gap_extend_b -= std::exp(fval - params_->gap_extend_b + bval - log_z_);
             }
@@ -2457,9 +2466,9 @@ private:
         // gap_extend_a: A-gap steps (i,j-1) → (i,j), cost = -gap_extend_a
         for (int i = 0; i <= m_; ++i) {
             for (int j = std::max(1, jlo0(i)); j <= jhi0(i); ++j) {
-                double bval = rat(buf.B, i, j);
+                double bval = srat(buf.B, i, j);
                 if (bval == NEG_INF) continue;
-                double fval = rat(buf.F, i, j-1);
+                double fval = srat(buf.F, i, j-1);
                 if (fval == NEG_INF) continue;
                 grad.gap_extend_a -= std::exp(fval - params_->gap_extend_a + bval - log_z_);
             }
@@ -2477,41 +2486,41 @@ private:
         band_fill(buf.FY, NEG_INF);
 
         if constexpr (AM == AlignMode::Global) {
-            at(buf.FM, 0, 0) = 0.0;
+            sat(buf.FM, 0, 0) = 0.0;
             const int bi = border_rows(), bj = border_cols();
             for (int i = 1; i <= bi; ++i)
-                at(buf.FX, i, 0) = -(params_->gap_open_b + static_cast<double>(i) * params_->gap_extend_b);
+                sat(buf.FX, i, 0) = -(params_->gap_open_b + static_cast<double>(i) * params_->gap_extend_b);
             for (int j = 1; j <= bj; ++j)
-                at(buf.FY, 0, j) = -(params_->gap_open_a + static_cast<double>(j) * params_->gap_extend_a);
+                sat(buf.FY, 0, j) = -(params_->gap_open_a + static_cast<double>(j) * params_->gap_extend_a);
         } else {
-            for (int i = 0; i <= m_; ++i) at(buf.FM, i, 0) = 0.0;
-            for (int j = 0; j <= n_; ++j) at(buf.FM, 0, j) = 0.0;
+            for (int i = 0; i <= m_; ++i) sat(buf.FM, i, 0) = 0.0;
+            for (int j = 0; j <= n_; ++j) sat(buf.FM, 0, j) = 0.0;
         }
 
         for (int i = 1; i <= m_; ++i) {
             for (int j = jlo(i); j <= jhi(i); ++j) {
-                double diag  = lse3(rat(buf.FM,i-1,j-1), rat(buf.FX,i-1,j-1), rat(buf.FY,i-1,j-1));
+                double diag  = lse3(srat(buf.FM,i-1,j-1), srat(buf.FX,i-1,j-1), srat(buf.FY,i-1,j-1));
                 double m_val = diag + sub(i, j);
                 double x_val = lse3(
-                    rat(buf.FM,i-1,j) - params_->gap_open_b - params_->gap_extend_b,
-                    rat(buf.FX,i-1,j)                       - params_->gap_extend_b,
-                    rat(buf.FY,i-1,j) - params_->gap_open_b - params_->gap_extend_b);
+                    srat(buf.FM,i-1,j) - params_->gap_open_b - params_->gap_extend_b,
+                    srat(buf.FX,i-1,j)                       - params_->gap_extend_b,
+                    srat(buf.FY,i-1,j) - params_->gap_open_b - params_->gap_extend_b);
                 double y_val = lse3(
-                    rat(buf.FM,i,j-1) - params_->gap_open_a - params_->gap_extend_a,
-                    rat(buf.FX,i,j-1) - params_->gap_open_a - params_->gap_extend_a,
-                    rat(buf.FY,i,j-1)                       - params_->gap_extend_a);
+                    srat(buf.FM,i,j-1) - params_->gap_open_a - params_->gap_extend_a,
+                    srat(buf.FX,i,j-1) - params_->gap_open_a - params_->gap_extend_a,
+                    srat(buf.FY,i,j-1)                       - params_->gap_extend_a);
                 if constexpr (AM == AlignMode::Local) m_val = lse2(m_val, 0.0);
-                at(buf.FM, i, j) = m_val; at(buf.FX, i, j) = x_val; at(buf.FY, i, j) = y_val;
+                sat(buf.FM, i, j) = m_val; sat(buf.FX, i, j) = x_val; sat(buf.FY, i, j) = y_val;
             }
         }
 
         if constexpr (AM == AlignMode::Global) {
-            log_z_ = lse3(rat(buf.FM,m_,n_), rat(buf.FX,m_,n_), rat(buf.FY,m_,n_));
+            log_z_ = lse3(srat(buf.FM,m_,n_), srat(buf.FX,m_,n_), srat(buf.FY,m_,n_));
         } else {
             log_z_ = NEG_INF;
             for (int i = 0; i <= m_; ++i)
                 for (int j = jlo0(i); j <= jhi0(i); ++j)
-                    log_z_ = lse2(log_z_, lse3(rat(buf.FM,i,j), rat(buf.FX,i,j), rat(buf.FY,i,j)));
+                    log_z_ = lse2(log_z_, lse3(srat(buf.FM,i,j), srat(buf.FX,i,j), srat(buf.FY,i,j)));
         }
 
         // ── Backward ──
@@ -2519,7 +2528,7 @@ private:
             band_fill(buf.BM, NEG_INF);
             band_fill(buf.BX, NEG_INF);
             band_fill(buf.BY, NEG_INF);
-            at(buf.BM,m_,n_) = 0.0; at(buf.BX,m_,n_) = 0.0; at(buf.BY,m_,n_) = 0.0;
+            sat(buf.BM,m_,n_) = 0.0; sat(buf.BX,m_,n_) = 0.0; sat(buf.BY,m_,n_) = 0.0;
         } else {
             band_fill(buf.BM, 0.0);
             band_fill(buf.BX, 0.0);
@@ -2528,29 +2537,29 @@ private:
 
         for (int i = m_; i >= 0; --i) {
             for (int j = jhi0(i); j >= jlo0(i); --j) {
-                double bm = rat(buf.BM,i,j), bx = rat(buf.BX,i,j), by = rat(buf.BY,i,j);
+                double bm = srat(buf.BM,i,j), bx = srat(buf.BX,i,j), by = srat(buf.BY,i,j);
 
                 if (bm != NEG_INF && i > 0 && j > 0) {
                     double contrib = bm + sub(i, j);
-                    at(buf.BM,i-1,j-1) = lse2(rat(buf.BM,i-1,j-1), contrib);
-                    at(buf.BX,i-1,j-1) = lse2(rat(buf.BX,i-1,j-1), contrib);
-                    at(buf.BY,i-1,j-1) = lse2(rat(buf.BY,i-1,j-1), contrib);
+                    sat(buf.BM,i-1,j-1) = lse2(srat(buf.BM,i-1,j-1), contrib);
+                    sat(buf.BX,i-1,j-1) = lse2(srat(buf.BX,i-1,j-1), contrib);
+                    sat(buf.BY,i-1,j-1) = lse2(srat(buf.BY,i-1,j-1), contrib);
                 }
                 // X state (gap in B) contribution to predecessors at (i-1,j)
                 if (bx != NEG_INF && i > 0) {
-                    at(buf.BM,i-1,j) = lse2(rat(buf.BM,i-1,j),
+                    sat(buf.BM,i-1,j) = lse2(srat(buf.BM,i-1,j),
                                              bx - params_->gap_open_b - params_->gap_extend_b);
-                    at(buf.BX,i-1,j) = lse2(rat(buf.BX,i-1,j), bx - params_->gap_extend_b);
-                    at(buf.BY,i-1,j) = lse2(rat(buf.BY,i-1,j),
+                    sat(buf.BX,i-1,j) = lse2(srat(buf.BX,i-1,j), bx - params_->gap_extend_b);
+                    sat(buf.BY,i-1,j) = lse2(srat(buf.BY,i-1,j),
                                              bx - params_->gap_open_b - params_->gap_extend_b);
                 }
                 // Y state (gap in A) contribution to predecessors at (i,j-1)
                 if (by != NEG_INF && j > 0) {
-                    at(buf.BM,i,j-1) = lse2(rat(buf.BM,i,j-1),
+                    sat(buf.BM,i,j-1) = lse2(srat(buf.BM,i,j-1),
                                              by - params_->gap_open_a - params_->gap_extend_a);
-                    at(buf.BX,i,j-1) = lse2(rat(buf.BX,i,j-1),
+                    sat(buf.BX,i,j-1) = lse2(srat(buf.BX,i,j-1),
                                              by - params_->gap_open_a - params_->gap_extend_a);
-                    at(buf.BY,i,j-1) = lse2(rat(buf.BY,i,j-1), by - params_->gap_extend_a);
+                    sat(buf.BY,i,j-1) = lse2(srat(buf.BY,i,j-1), by - params_->gap_extend_a);
                 }
             }
         }
@@ -2561,9 +2570,9 @@ private:
         // Matrix gradient: match steps
         for (int i = 1; i <= m_; ++i) {
             for (int j = jlo(i); j <= jhi(i); ++j) {
-                double bm = rat(buf.BM, i, j);
+                double bm = srat(buf.BM, i, j);
                 if (bm == NEG_INF) continue;
-                double pred  = lse3(rat(buf.FM,i-1,j-1), rat(buf.FX,i-1,j-1), rat(buf.FY,i-1,j-1));
+                double pred  = lse3(srat(buf.FM,i-1,j-1), srat(buf.FX,i-1,j-1), srat(buf.FY,i-1,j-1));
                 double log_p = pred + sub(i, j) + bm - log_z_;
                 gblk[sub_off(i, j)] += std::exp(log_p);
             }
@@ -2572,7 +2581,7 @@ private:
         // gap_extend_b: expected # of X-state steps (gap in B)
         for (int i = 1; i <= m_; ++i) {
             for (int j = jlo0(i); j <= jhi0(i); ++j) {
-                double fx = rat(buf.FX, i, j), bx = rat(buf.BX, i, j);
+                double fx = srat(buf.FX, i, j), bx = srat(buf.BX, i, j);
                 if (fx == NEG_INF || bx == NEG_INF) continue;
                 grad.gap_extend_b -= std::exp(fx + bx - log_z_);
             }
@@ -2581,7 +2590,7 @@ private:
         // gap_extend_a: expected # of Y-state steps (gap in A)
         for (int i = 0; i <= m_; ++i) {
             for (int j = std::max(1, jlo0(i)); j <= jhi0(i); ++j) {
-                double fy = rat(buf.FY, i, j), by = rat(buf.BY, i, j);
+                double fy = srat(buf.FY, i, j), by = srat(buf.BY, i, j);
                 if (fy == NEG_INF || by == NEG_INF) continue;
                 grad.gap_extend_a -= std::exp(fy + by - log_z_);
             }
@@ -2590,9 +2599,9 @@ private:
         // gap_open_b: expected # of B-gap openings (M→X or Y→X transitions)
         for (int i = 1; i <= m_; ++i) {
             for (int j = jlo0(i); j <= jhi0(i); ++j) {
-                double bx = rat(buf.BX, i, j);
+                double bx = srat(buf.BX, i, j);
                 if (bx == NEG_INF) continue;
-                double fm = rat(buf.FM, i-1, j), fy_prev = rat(buf.FY, i-1, j);
+                double fm = srat(buf.FM, i-1, j), fy_prev = srat(buf.FY, i-1, j);
                 double log_open = lse2(fm, fy_prev)
                                   - params_->gap_open_b - params_->gap_extend_b
                                   + bx - log_z_;
@@ -2603,9 +2612,9 @@ private:
         // gap_open_a: expected # of A-gap openings (M→Y or X→Y transitions)
         for (int i = 0; i <= m_; ++i) {
             for (int j = std::max(1, jlo0(i)); j <= jhi0(i); ++j) {
-                double by = rat(buf.BY, i, j);
+                double by = srat(buf.BY, i, j);
                 if (by == NEG_INF) continue;
-                double fm = rat(buf.FM, i, j-1), fx_prev = rat(buf.FX, i, j-1);
+                double fm = srat(buf.FM, i, j-1), fx_prev = srat(buf.FX, i, j-1);
                 double log_open = lse2(fm, fx_prev)
                                   - params_->gap_open_a - params_->gap_extend_a
                                   + by - log_z_;
