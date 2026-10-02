@@ -1,5 +1,16 @@
 # TODO
 
+## Batch-wide walks over SeqPair objects are memory-bound and do not scale
+
+Measured 2026-10-02 on nighthaven, 2.5M Manakov pairs: `set_params()` 56 ms at 12
+threads vs 61 ms at 1; `scores()` 25 vs 33 ms; `weighted_grad()` ~50 ms. perf puts
+the time in the worker loop itself: each pair is a separate ~1 KB heap object, so
+touching a few fields per pair is close to one DRAM miss per pair, and more threads
+do not help. With `fill="interpair"` these walks are ~14% of a DiscrimAlign
+iteration (0.13 of 0.94 s). The fix is structural: keep the hot per-pair state
+(score, validity flags, params pointer, the gradient's counts) in contiguous
+batch-owned arrays, so these become streaming passes.
+
 ## `banded_grad()` in global mode is not deterministic across threads
 
 Found 2026-10-02, present on `main` (`eb08bb6`). After `score_and_grad()` and
