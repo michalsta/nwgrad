@@ -102,6 +102,10 @@ objectives that weight each pair differently.
 - **Precision.** The plain names (`SeqPair`, `SeqPairBatch`, `nw_score`, …) run the
   DP in float32; `SeqPairDouble`, `SeqPairBatchDouble`, `nw_score_double`, … run it in
   float64. Inputs and outputs are float64 either way.
+- **Many short pairs.** For millions of short pairs (e.g. miRNA × target site),
+  `batch.fill = "interpair"` aligns several pairs per vector instruction — about 6×
+  the default `"striped"` fill per pair on AVX2 — with bit-identical results; see
+  [`SeqPairBatch.fill`](docs/api.md#seqpairbatch).
 - **Stateless one-offs.** Twelve functions (`nw_score`, `sw_affine_grad`,
   `nw_affine_soft_grad`, …) align a single pair without keeping any state.
 - **C++.** `python -m nwgrad --include` prints the path to the header-only library.

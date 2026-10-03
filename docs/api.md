@@ -175,6 +175,7 @@ a separate reference to it.
 | `dp_valid` | `bool` | DP tables are in memory (`compute_grad()` is callable) |
 | `traceback` | `str` | The traceback mode this pair *resolved* to (never `"auto"`) |
 | `hb_cutoff` | `int` | Hirschberg base-case size in rows (settable; default 512) |
+| `fill` | `str` | Full-DP simd fill at double precision: `"striped"` (default) or `"rowwise"` (settable; see `SeqPairBatch.fill`) |
 
 **Gradient modes:**
 
@@ -232,6 +233,27 @@ concurrently). The same pair may belong to several batches.
 | `traceback` | `str` | The batch's traceback mode as given (`"auto"` resolves per pair) |
 | `hb_cutoff` | `int` | Hirschberg base-case size applied by `add_many()` (default 512) |
 | `schedule` | `str` | `"dynamic"` (default; atomic counter) or `"sorted"` (length-sorted equal-work chunks — bounds peak DP memory). Results are identical either way. |
+| `fill` | `str` | How full affine DP is vectorized at double precision: `"striped"` (default), `"rowwise"` or `"interpair"`. Settable; applies to the pairs already in the batch and to later `add_many()` ones. Results are bit-identical whichever fill runs. See below. |
+
+**Choosing a fill.** All three fills compute bit-identical tables, so scores, paths and
+gradients do not depend on the choice; only speed and memory do. They apply to
+affine gaps at double precision (`SeqPairBatchDouble`, `SeqPairDouble`) on a simd
+kernel; float32, linear gaps and `kernel="scalar_fallback"` ignore the setting.
+
+| `fill` | How | Use for |
+|---|---|---|
+| `"striped"` | Striped vectors within one pair (Farrar's layout, lazy-F gap correction) | Long pairs (hundreds of residues and more) |
+| `"rowwise"` | One row of one pair at a time; no lazy-F fixpoint, whose cost grows when gaps are cheap | Short pairs; SSE2-only hosts |
+| `"interpair"` | `score_and_grad()` aligns W pairs at once, one per vector lane (W = 2 on SSE2/NEON, 4 on AVX2, 8 on AVX-512), grouping pairs by the length of B | Many short pairs of similar length, e.g. miRNA × target site |
+
+Measured on 2.5 million miRNA × target-site pairs (A ~22, B = 50, local affine, an
+i5-12500 with AVX2): `score_and_grad()` per pair, single thread, 9.70 µs `"striped"`,
+3.50 µs `"rowwise"`, 1.61 µs `"interpair"`. `"rowwise"` and `"interpair"` keep three
+score tables (24 B/cell; `"interpair"` per group of pairs) per thread even with
+`traceback="pointers"`. `"interpair"` takes only pairs with hard or no gradients and
+an alphabet of at most 8 letters; the batch's other pairs, and every operation other
+than `score_and_grad()`, use the pair's own fill. The pair grouping is built once and
+reused until pairs are added.
 
 **Typical optimization loop:**
 

@@ -338,7 +338,7 @@ So: **Pointers when it fits and threads ≤ its peak; Hirschberg above the cross
 - **Segment-boundary "shift-as-load" — TRIED, REJECTED (net loss on all 5 machine×compiler combos).** The once-per-row s==0 lane shift compiles to `vbroadcastsd`/`vinsertf128` (both compilers) plus `vpermpd`/`vshufpd` (clang). The idea was to load the previous segment's last vector *one element early* (giving lanes 1..W-1 for free) and overwrite lane 0 with the border via a blend, turning the shuffle into a load. Bit-exact but **slower everywhere** (worst i5: −16% gcc, −22% clang): the compilers already lower the generator-constructor shift `vd([&](int i){...})` efficiently, and the replacement adds an *unaligned* load one element back plus a compare+blend. The boundary shift is O(m), already cheap — trust the compiler's shuffle lowering.
 - **64-byte-aligning the DP buffers — a real +15–18% win on AVX2, free, and now SHIPPED.** Chasing the "keep alignment" thread from the above found the actual lever: it is not the boundary shift, it is the *main-loop* W-wide loads/stores. `std::vector<double>` guarantees only **16-byte** alignment, so on AVX2 every 256-bit (32-byte) access is misaligned and some split cache lines. `dp_buffer.hpp`'s `AlignedAllocator` (C++17 aligned `operator new`, 64-byte, with `rebind`; `DVec` aliases `vector<double>` over it) backs every `DpBuffer` table, and the striped kernel pads each row to `rowsz = (seg+1)*W` with the striped columns starting at offset `W`, so every W-wide access is aligned. Measured on the shipped Full kernel (i5, forward-only, len=200): **594→698 Mcell/s (+17 %) on avx2**, `1.73×→2.06×`. **Nothing on SSE2/Piledriver or NEON/M1** (flat) — there W=2 is 16-byte and 16-byte alignment already suffices. So: worth doing on any 256-bit-or-wider target, pointless below.
 
-### Short pairs: `fill="rowwise"` and `fill="interpair"` (branch `perf-dp`, 2026-10-02)
+### Short pairs: `fill="rowwise"` and `fill="interpair"` (2026-10-02; in 0.5.2)
 
 **Why.** On miRNA × target-site pairs (Manakov: 2.5M pairs, A ~22, B = 50) the striped Full kernel is the wrong tool. Its lazy-F fixpoint is data-dependent and worst when gaps are cheap: DiscrimAlign's fitted parameters (gaps at the −1e-4 cap) cost **+25%** over its starting ones on the same pairs (2.39 → 2.99 s, nighthaven, 12 threads, score-only nearly identical, so it is the fill, not the traceback). Both new fills are opt-in on `SeqPairBatch.fill` (`SeqPair.fill` takes the first two), default stays `"striped"`, and both give **bit-identical** scores, paths and gradients (`tests/Python/test_fill.py`; DiscrimAlign full fits identical to the last bit).
 
@@ -349,10 +349,10 @@ So: **Pointers when it fits and threads ≤ its peak; Hirschberg above the cross
 
 | threads | striped | rowwise | interpair |
 |---|---|---|---|
-| 1 | 9.70 µs/pair | 3.88 µs/pair | 2.18 µs/pair (200k-pair sample) |
-| 12 | ~3.0 s | 1.37 s | 0.87 s |
+| 1 | 9.70 µs/pair | 3.50 µs/pair | 1.61 µs/pair (200k-pair sample) |
+| 12 | ~3.0 s | 1.25 s | 0.76 s |
 
-skynet (Piledriver, W=2, 1 thread, 200k pairs): rowwise 12.4 µs/pair, interpair 12.1 — a tie; 128-bit lanes barely pay for the interleaved tables there. Not yet measured: AVX-512 (W=8), NEON.
+skynet (Piledriver, W=2, 1 thread, 200k pairs): rowwise 12.4 µs/pair, interpair 12.1 — a tie; 128-bit lanes barely pay for the interleaved tables there. Not yet measured for speed: AVX-512 (W=8), NEON; their correctness is covered by the wheel workflow's test runs (linux-aarch64, macos-arm64) and by `test_every_isa_level` on whatever levels the runner offers.
 
 ### Python bindings (`py_exports.cpp`)
 
