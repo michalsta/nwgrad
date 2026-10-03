@@ -1,14 +1,16 @@
-#include <algorithm>
-#include <cstdint>
-#include <string>
-#include <vector>
-
+// nanobind (and so Python.h) first: pyconfig.h defines _POSIX_C_SOURCE/_XOPEN_SOURCE,
+// which must be in place before any standard header is included.
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/pair.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/string_view.h>
 #include <nanobind/stl/vector.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <string>
+#include <vector>
 
 #include "align_params.hpp"
 #include "aligner.hpp"
