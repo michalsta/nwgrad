@@ -500,17 +500,14 @@ struct SeqPairBatchT {
 private:
     // The vector backend an inter-pair fill of this pair would run on, or -1 when the
     // pair must take its own fill: float32, linear gaps, soft gradients, an alphabet
-    // over 8 letters, the scalar backend, or a traceback that would not read the fill's
-    // tables (Hirschberg past its cutoff).
+    // over 8 letters or the scalar backend. The mutable Hirschberg cutoff is
+    // handled separately when building and validating the cached plan.
     int inter_backend_(const SeqPair& p) const {
         if constexpr (!std::is_same_v<T, double>) return -1;
         else {
             if (p.gap_model() != GapModel::Affine || p.grad_mode() == GradMode::Soft) return -1;
             if (p.len_a() == 0 || p.len_b() == 0) return -1;
             if (p.params_ptr()->matrix.size() > 8) return -1;
-            const TracebackMode tb = p.traceback();
-            if (tb != TracebackMode::Pointers && tb != TracebackMode::Scores &&
-                static_cast<int>(p.len_a()) > p.hb_cutoff()) return -1;
             const int backend = (p.kernel() == kBackendAuto) ? global_default_backend() : p.kernel();
             if (backend < 0) return -1;
             const LevelKernels& K = level_kernels(backend);
@@ -526,14 +523,14 @@ private:
         if constexpr (!std::is_same_v<T, double>) {
             score_and_grad_dynamic_(scores);   // float32 never qualifies
         } else {
-        // The grouping depends only on what a pair is, not on the parameter values, so
-        // it is computed once and reused until pairs are added or the default ISA level
-        // changes (a fit calls this every iteration on the same pairs: re-sorting 2.5M
-        // pairs each time was ~0.9 s of serial work per call).  Parameters are checked
-        // per group at run time instead.
+        // Reuse the grouping until pairs are added, the default ISA changes, or a
+        // Hirschberg cutoff crosses the pair's length. Only potentially eligible
+        // Hirschberg pairs need cutoff checks; a Pointers batch has none. Re-sorting
+        // 2.5M pairs every training iteration was ~0.9 s of serial work per call.
+        // Parameter identity is checked per group at run time instead.
         const int def_backend = global_default_backend();
         if (plan_.generation != generation_ || plan_.default_backend != def_backend ||
-            plan_.n_pairs != pairs.size())
+            plan_.n_pairs != pairs.size() || !inter_plan_cutoffs_match_())
             build_inter_plan_(def_backend);
         const auto& elig = plan_.elig;
         const auto& other = plan_.other;
@@ -613,9 +610,20 @@ private:
         std::vector<size_t> elig, other;
         std::vector<int> backend;
         std::vector<std::pair<size_t, size_t>> groups;   // [start, end) into elig
+        // Pair index and whether its cutoff admitted the shared fill. Track both
+        // eligible and splitting pairs, so lowering OR raising the cutoff works.
+        std::vector<std::pair<size_t, bool>> hirschberg_cutoffs;
     };
     InterPlan plan_;
     size_t generation_ = 0;   // bumped by add() / add_many(); keys plan_
+
+    bool inter_plan_cutoffs_match_() const {
+        for (const auto& [i, eligible] : plan_.hirschberg_cutoffs) {
+            const SeqPair& p = *pairs[i];
+            if ((p.len_a() <= static_cast<size_t>(p.hb_cutoff())) != eligible) return false;
+        }
+        return true;
+    }
 
     void build_inter_plan_(int def_backend) {
         const size_t N = pairs.size();
@@ -629,6 +637,11 @@ private:
         for (size_t i = 0; i < N; ++i) {
             const SeqPair& p = *pairs[i];
             P.backend[i] = inter_backend_(p);
+            if (P.backend[i] >= 0 && is_hirschberg(p.traceback())) {
+                const bool eligible = p.len_a() <= static_cast<size_t>(p.hb_cutoff());
+                P.hirschberg_cutoffs.emplace_back(i, eligible);
+                if (!eligible) P.backend[i] = -1;
+            }
             if (P.backend[i] < 0) { P.other.push_back(i); continue; }
             keys.push_back({P.backend[i], static_cast<int>(p.align_mode()), p.len_b(), p.len_a(), i});
         }

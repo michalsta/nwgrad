@@ -191,6 +191,47 @@ def test_interpair_plan_follows_set_params_and_add_many():
             assert np.array_equal(u, v)
 
 
+@pytest.mark.parametrize("traceback", ["hirschberg", "hirschberg_pmax"])
+@pytest.mark.parametrize("threads", [1, 3])
+@pytest.mark.parametrize("initial_cutoff", [1, 512])
+def test_interpair_plan_follows_pair_cutoff_changes(traceback, threads, initial_cutoff):
+    """A cached plan must honor cutoff changes on any lane, in both directions."""
+    p = nwgrad.AlignParams(np.eye(4) * 3 - 1, alphabet=DNA,
+                          gap_open_a=2, gap_extend_a=.5,
+                          gap_open_b=2, gap_extend_b=.5)
+    a = ["AGGGTTGGACTTACCGACCATGATGAGCCC"] * 17
+    b = ["TATATTATACGGAACTCGATTCTCCCATAC"] * 17
+
+    def make(fill, cutoffs):
+        batch = nwgrad.SeqPairBatchDouble(n_threads=threads, traceback=traceback)
+        batch.fill = fill
+        batch.add_many(a, b, p)
+        for i, cutoff in enumerate(cutoffs):
+            batch[i].hb_cutoff = cutoff
+        batch.score_and_grad()
+        return batch
+
+    cutoffs = [initial_cutoff] * len(a)
+    batch = make("interpair", cutoffs)
+    original = batch.grads()
+    # Index 1 catches checks limited to a group's first pair; the last index
+    # also exercises a partially populated vector group.
+    for cutoff in (513 - initial_cutoff, initial_cutoff):
+        for i in (1, len(a) - 1):
+            cutoffs[i] = cutoff
+            batch[i].hb_cutoff = cutoff
+        batch.score_and_grad()
+        for fill in ("striped", "interpair"):
+            ref = make(fill, cutoffs)
+            np.testing.assert_array_equal(batch.scores(), ref.scores())
+            for got, expected in zip(batch.grads(), ref.grads()):
+                np.testing.assert_array_equal(got, expected)
+        if cutoff != initial_cutoff:
+            # This fixture must expose the changed tie-break; otherwise a stale
+            # plan could pass the comparisons without ever taking Hirschberg.
+            assert not np.array_equal(batch.grads()[1][1], original[1][1])
+
+
 @pytest.mark.parametrize("fill", ["rowwise", "interpair"])
 @pytest.mark.parametrize("mode", ["local", "global"])
 def test_guides_match_striped(fill, mode):
