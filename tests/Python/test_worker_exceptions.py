@@ -101,22 +101,23 @@ def test_batch_add_is_linear_not_quadratic():
             batch.add(sp)
         return time.perf_counter() - t
 
-    # Best of 3 at each size, and sizes large enough that each run lasts tens of ms.
-    # A single run of 10k vs 40k lasted 2 ms on the macOS arm64 runner, where one
-    # one-off lump inside the 40k window -- nanobind's keep-alive hash map growing, or
-    # a GC pass over the live wrappers -- read as 13.1x and failed the v0.5.0 wheel
-    # tests, while add() measured flat per pair (640-800 ns over a 64x range of N).
-    # Repeats reuse the grown table, so the minimum drops the one-off growth; the
-    # threshold below is unchanged, so a quadratic add() (~16x) still fails.
+    # Two sizes 16x apart: linear add() predicts ~16x the time, quadratic ~256x, and
+    # the bound sits between them, 4x from each.  A 4x step with an 8x bound used to
+    # be too tight: linear add() still gets slower per pair as the 160k wrappers and
+    # nanobind's keep-alive table outgrow the cache (macOS arm64 runner, v0.5.2:
+    # 235 ns/pair at 40k, 480 ns/pair at 160k, read as 8.2x for 4x the pairs).
+    # Before that, a single 2 ms run read a one-off lump -- the keep-alive hash map
+    # growing, or a GC pass -- as 13.1x and failed the v0.5.0 wheel; best-of-N keeps
+    # dropping those, since repeats reuse the grown table.
     time_adds(2_000)                   # warm up
-    small = min(time_adds(40_000) for _ in range(3))
+    small = min(time_adds(10_000) for _ in range(5))
     large = min(time_adds(160_000) for _ in range(3))
 
-    # 4x the pairs. Linear predicts ~4x the time; quadratic predicts ~16x.
-    # Allow a lot of slack for a loaded machine and still catch quadratic.
-    assert large < small * 8, (
-        f"batch.add() looks super-linear: 40k took {small:.3f}s, "
-        f"160k took {large:.3f}s ({large / max(small, 1e-9):.1f}x for 4x the pairs)")
+    ratio = large / max(small, 1e-9)
+    assert ratio < 64, (
+        f"batch.add() looks super-linear: 10k took {small:.4f}s, "
+        f"160k took {large:.4f}s ({ratio:.1f}x for 16x the pairs; linear ~16x, "
+        f"quadratic ~256x)")
 
 
 def _fresh_params(scale):
