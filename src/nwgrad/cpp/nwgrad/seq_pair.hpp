@@ -356,6 +356,33 @@ struct SeqPairT {
         return out;
     }
 
+    // The alignment as Biopython-style coordinates: two rows (positions in A and in B)
+    // with a column at the start, at every change between aligned, gap-in-B and
+    // gap-in-A columns, and at the end — what Bio.Align.Alignment(sequences,
+    // coordinates) takes.  Local alignments start where the path starts, not at 0.
+    // Same availability as aligned().
+    std::pair<std::vector<int64_t>, std::vector<int64_t>> coordinates() const {
+        const auto [sa, sb] = aligned();
+        std::pair<int, int> end;
+        std::visit([&](auto& st) {
+            end = last_banded_ ? st.band_al.alignment_end() : st.full_al.alignment_end();
+        }, state_);
+        int64_t i = end.first, j = end.second;
+        for (char c : sa) if (c != '-') --i;
+        for (char c : sb) if (c != '-') --j;
+        std::vector<int64_t> ci{i}, cj{j};
+        int prev = -1;
+        for (size_t k = 0; k < sa.size(); ++k) {
+            const int t = (sa[k] == '-') ? 2 : (sb[k] == '-') ? 1 : 0;
+            if (prev != -1 && t != prev) { ci.push_back(i); cj.push_back(j); }
+            if (sa[k] != '-') ++i;
+            if (sb[k] != '-') ++j;
+            prev = t;
+        }
+        ci.push_back(i); cj.push_back(j);
+        return {std::move(ci), std::move(cj)};
+    }
+
     // The current alignment as a guide_j vector (length m+1).
     // Valid when path_valid().
     const std::vector<int>& guide_j() const {

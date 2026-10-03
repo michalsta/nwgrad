@@ -468,6 +468,14 @@ struct Aligner {
         else                                   return guide_j_affine(buf);
     }
 
+    // The cell the alignment ends at, (i, j) in the DP: (m, n) for Global, the best cell
+    // for Local.  Every traceback walks back from it, so with the aligned strings it
+    // fixes where the alignment starts too (SeqPair::coordinates).
+    std::pair<int, int> alignment_end() const {
+        if constexpr (AM == AlignMode::Global) return {m_, n_};   // not every fill records it
+        else                                   return {best_i_, best_j_};
+    }
+
     std::pair<std::string, std::string> aligned(const DpBuffer& buf) const {
         std::string a, b;
         if constexpr (GM == GapModel::Affine)

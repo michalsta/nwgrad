@@ -414,6 +414,23 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
         .def("aligned", &SP::aligned,
              "Return the alignment as a pair of gapped strings (seq_a, seq_b).")
         .def(
+            "coordinates",
+            [](const SP& s) {
+                auto [ci, cj] = s.coordinates();
+                const size_t k = ci.size();
+                int64_t* buf = new int64_t[2 * k];
+                std::copy(ci.begin(), ci.end(), buf);
+                std::copy(cj.begin(), cj.end(), buf + k);
+                nb::capsule owner(buf, [](void* p) noexcept { delete[] static_cast<int64_t*>(p); });
+                size_t shape[2] = {2, k};
+                return nb::ndarray<nb::numpy, int64_t>(buf, 2, shape, owner);
+            },
+            "The alignment as Biopython-style coordinates: an int64 array of shape (2, k),\n"
+            "row 0 positions in seq_a and row 1 in seq_b, with a column at the start, at\n"
+            "each change between aligned and gap columns, and at the end.  Pass it to\n"
+            "Bio.Align.Alignment([seq_a, seq_b], coordinates).  A local alignment starts\n"
+            "where its path starts.  Same availability as aligned().")
+        .def(
             "formatted",
             [](const SP& self, int width) {
                 auto [a, b] = self.aligned();
