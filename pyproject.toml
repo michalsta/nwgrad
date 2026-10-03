@@ -33,14 +33,16 @@ dev = ["pytest", "pytest-rerunfailures", "biopython", "scipy"]
 [tool.pytest.ini_options]
 testpaths = ["tests/Python"]
 
-# PyPy is deliberately NOT built.  This is a nanobind C-extension whose test extras
+# PyPy is deliberately NOT built (cibuildwheel builds it only when `enable` asks for
+# it, so it needs no skip selector).  This is a nanobind C-extension whose test extras
 # pull biopython, for which no PyPy wheels are published — pip would compile it from
 # source under the build environment, where the macOS arm's LDFLAGS='-static-libgcc'
 # (a gcc-only flag we set for our own extension) is handed to biopython's clang build
 # and rejected outright.  CPython wheels dodge this entirely: every test dependency
 # has a prebuilt wheel, so nothing is compiled at test time.  PyPy was never a target.
 [tool.cibuildwheel]
-skip = ["cp36-*", "cp37-*", "cp38-*", "cp39-*", "pp*"]
+# cibuildwheel 4 no longer builds CPython < 3.9; this keeps 3.9 out (requires-python).
+skip = ["cp39-*"]
 test-command = "python -m pytest {project}/tests/Python"
 test-extras = ["dev"]
 
