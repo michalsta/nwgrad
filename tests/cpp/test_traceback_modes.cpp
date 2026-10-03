@@ -76,6 +76,62 @@ void compare_one(const std::string& A, const std::string& B, const AlignParams& 
 
 }  // namespace
 
+namespace {
+
+template <AlignMode AM, class T>
+void check_rowwise_storage(const AlignParams& p, int backend, TracebackMode tb, int cutoff) {
+    Aligner<GapModel::Affine, AM, AlignBand::Full, T> ref, row;
+    const auto a = p.matrix.alphabet().encode("ACGTACGTACGTACGT");
+    const auto b = p.matrix.alphabet().encode("ACGTACGTACGTACGTACGTACGT");
+    for (auto* al : {&ref, &row}) {
+        al->set_kernel(backend);
+        al->set_traceback(tb);
+        al->set_hb_cutoff(cutoff);
+        al->set_problem(a, b, p);
+    }
+    row.set_rowwise_full(true);
+    DpBufferT<T> ref_buf, row_buf;
+    ref.compute_viterbi(ref_buf);
+    row.compute_viterbi(row_buf);
+    CHECK(row.score() == ref.score());
+    CHECK(row.aligned(row_buf) == ref.aligned(ref_buf));
+
+    // Splitting Hirschberg, float32 and scalar Pointers never use full score
+    // tables. Check the buffers themselves rather than a noisy process RSS.
+    const bool splits = tb != TracebackMode::Pointers && a.size() > static_cast<size_t>(cutoff);
+    if (splits || std::is_same_v<T, float> || backend == kBackendScalar) {
+        CHECK(row_buf.VM.empty());
+        CHECK(row_buf.VX.empty());
+        CHECK(row_buf.VY.empty());
+    } else if (level_kernels(backend).banded_row_local) {
+        // Below the cutoff, double SIMD rowwise really does need these tables.
+        CHECK_FALSE(row_buf.VM.empty());
+        CHECK_FALSE(row_buf.VX.empty());
+        CHECK_FALSE(row_buf.VY.empty());
+    }
+}
+
+}  // namespace
+
+TEST_CASE("rowwise allocates score tables only when its fill runs", "[traceback][rowwise]") {
+    const Alphabet& alpha = Alphabet::get("ACGT");
+    SubstMatrix matrix(alpha);
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 4; ++j) matrix.at(i, j) = i == j ? 2.0 : -1.0;
+    const AlignParams p(matrix, 2.0, 0.5, 2.0, 0.5);
+    for (int backend : backends_under_test())
+        for (auto tb : {TracebackMode::Pointers, TracebackMode::Hirschberg,
+                        TracebackMode::HirschbergPmax})
+            for (int cutoff : {1, 512}) {
+                INFO("backend=" << backend_name(backend) << " traceback=" << static_cast<int>(tb)
+                     << " cutoff=" << cutoff);
+                check_rowwise_storage<AlignMode::Global, double>(p, backend, tb, cutoff);
+                check_rowwise_storage<AlignMode::Local, double>(p, backend, tb, cutoff);
+                check_rowwise_storage<AlignMode::Global, float>(p, backend, tb, cutoff);
+                check_rowwise_storage<AlignMode::Local, float>(p, backend, tb, cutoff);
+            }
+}
+
 TEST_CASE("traceback=pointers is bit-identical to traceback=scores", "[simd][traceback]") {
     const Alphabet& al = Alphabet::get("ACDEFGHIKLMNPQRSTVWY");
     SubstMatrix M(al);

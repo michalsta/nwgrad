@@ -679,6 +679,20 @@ private:
         }
     }
 
+    // Whether this run actually selects rowwise score tables. The preference
+    // alone is insufficient: splitting Hirschberg, float32 and scalar kernels
+    // ignore it. Share the predicate with dispatch so those paths keep their
+    // smaller memory bounds even when rowwise was requested.
+    bool uses_rowwise_full() const {
+        if constexpr (GM == GapModel::Affine && AB == AlignBand::Full &&
+                      std::is_same_v<T, double>) {
+            if (!rowwise_full_ || (is_hirschberg(tb_) && m_ > hb_cutoff_)) return false;
+            const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
+            return backend >= 0 && level_kernels(backend).banded_row_local;
+        }
+        return false;
+    }
+
     // Grow external buffer to fit current problem (thread-owned path).
     void ensure_viterbi_ptruf(DpBuffer& buf) const {
         if constexpr (GM == GapModel::Linear) {
@@ -691,7 +705,7 @@ private:
             // Hirschberg allocates even less: its scratch is O(n) rows sized on demand
             // inside the recursion, and the whole point is that no O(m*n) table exists.
             if constexpr (AB == AlignBand::Full)
-                if ((tb_ == TracebackMode::Pointers || is_hirschberg(tb_)) && !rowwise_full_) return;
+                if ((tb_ == TracebackMode::Pointers || is_hirschberg(tb_)) && !uses_rowwise_full()) return;
             if (buf.VM.size() < sz_) { buf.VM.resize(sz_); buf.VX.resize(sz_); buf.VY.resize(sz_); }
         }
     }
@@ -1162,7 +1176,7 @@ private:
             // Opt-in row-wise fill (set_rowwise_full): score tables, row-major, read back
             // by the Scores traceback whatever tb_ says — the paths are identical.
             if constexpr (std::is_same_v<T, double>) {
-                if (rowwise_full_ && K.banded_row_local) { viterbi_affine_simd(buf, K); return; }
+                if (uses_rowwise_full()) { viterbi_affine_simd(buf, K); return; }
             }
             // The striped Full kernel exists at both precisions (viterbi / viterbi_f).
             if constexpr (std::is_same_v<T, double>) {
