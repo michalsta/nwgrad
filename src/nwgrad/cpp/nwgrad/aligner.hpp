@@ -2405,6 +2405,27 @@ private:
             if (i == 0 && j == 0) break;
             if constexpr (AM == AlignMode::Local)
                 if (tbl == TBTable::M && rat(buf.VM, i, j) <= 0.0) break;
+            if constexpr (AM == AlignMode::Global) {
+                // On row 0 or column 0 one move remains all the way to the origin: the
+                // path ends in a single leading gap run, which is one open and i or j
+                // extends — exactly what stepping through the Full DP's border values
+                // counts.  Counted directly because a guide band need not cover the
+                // border: guide_j[0] is where the old path LEFT row 0, so after a long
+                // leading gap the band misses the origin, and stepping read cells never
+                // initialised for this pair (stale data from the thread's previous one:
+                // banded_grad gap-open counts that changed with the thread count).
+                if (i == 0) {
+                    grad.gap_extend_a -= static_cast<double>(j);
+                    grad.gap_open_a   -= 1.0;   // (moves along row 0 add no guide entry)
+                    break;
+                }
+                if (j == 0) {
+                    grad.gap_extend_b -= static_cast<double>(i);
+                    grad.gap_open_b   -= 1.0;
+                    if (gj) for (int r = i - 1; r >= 0; --r) (*gj)[static_cast<size_t>(r)] = 0;  // as the X steps would
+                    break;
+                }
+            }
             // GuideBanded with a band narrower than the path needs: the band can fail
             // to admit any route back to the origin, leaving every predecessor at
             // -inf.  The M>=X>=Y tie-break then picks M, and M steps DIAGONALLY — so

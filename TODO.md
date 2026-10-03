@@ -11,18 +11,6 @@ iteration (0.13 of 0.94 s). The fix is structural: keep the hot per-pair state
 (score, validity flags, params pointer, the gradient's counts) in contiguous
 batch-owned arrays, so these become streaming passes.
 
-## `banded_grad()` in global mode is not deterministic across threads
-
-Found 2026-10-02, present on `main` (`eb08bb6`). After `score_and_grad()` and
-`set_params()`, `banded_grad(2)` on 120 global affine DNA pairs (A 10-30, B 45)
-gives different scores/gradients from run to run at `n_threads=3`: 20 of 30 runs
-differ from the first on `main`, 30 of 30 on `perf-dp`; at `n_threads=1`, 0 of
-30. The likely cause is a read of DP cells outside the band that were never
-initialised for this pair, so the value depends on what the thread's buffer held
-before (the GuideBanded global border/band init in `viterbi_affine_simd`). Local
-mode did not show it in the same test. Reproducer: `banded_nondet.py` pattern in
-`tests/Python/test_fill.py::test_guides_match_striped` with more than one thread.
-
 ## Default thread count (`n_threads=0`): physical cores are wrong for short pairs
 
 `default_thread_count()` (`parallel.hpp`) resolves `n_threads=0` to the number

@@ -297,3 +297,37 @@ def test_narrow_band_does_not_crash():
             got = batch.realign_banded(band)
             assert np.isfinite(got), f"{mode} band={band} -> {got}"
             assert got <= full + 1e-9, f"{mode} band={band}: {got} beats unbanded {full}"
+
+
+def test_banded_grad_global_is_independent_of_buffer_history():
+    """A global path that starts with a long leading gap leaves guide_j[0] far from
+    column 0, so the band misses the origin; the traceback's walk along row 0 used to
+    read cells the band never initialised (stale values from the thread's previous
+    pair), and the gap-open counts changed with the thread count.  Each pair's banded
+    result must equal that pair aligned alone, in a fresh batch, at any thread count."""
+    rng = np.random.default_rng(17)
+    a = ["".join(rng.choice(list("ACGT"), int(l))) for l in rng.integers(10, 30, 120)]
+    b = ["".join(rng.choice(list("ACGT"), 45)) for _ in range(120)]
+
+    def P(seed, scale, go, ge):
+        m = np.random.default_rng(seed).normal(scale=scale, size=(4, 4))
+        return nwgrad.AlignParams(nwgrad.SubstMatrix(m, alphabet="ACGT"), gap_open_a=go,
+                                  gap_extend_a=ge, gap_open_b=go * 1.3, gap_extend_b=ge * 0.8)
+
+    p1, p2 = P(7, 0.1, 0.0, 1e-4), P(8, 1.0, 2.5, 0.7)
+
+    def run(seqs_a, seqs_b, threads):
+        batch = nwgrad.SeqPairBatchDouble(n_threads=threads, traceback="pointers")
+        batch.add_many(seqs_a, seqs_b, p1, gap_model="affine", mode="global")
+        batch.score_and_grad()
+        batch.set_params(p2)
+        batch.banded_grad(2)
+        m, g = batch.grads()
+        return batch.scores(), m, g
+
+    alone = [run([x], [y], 1) for x, y in zip(a, b)]
+    ref = tuple(np.concatenate([r[k] for r in alone]) for k in range(3))
+    for threads in (1, 3, 3, 3):
+        got = run(a, b, threads)
+        for x, y in zip(ref, got):
+            assert np.array_equal(x, y)
