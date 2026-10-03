@@ -196,14 +196,12 @@ def test_interpair_plan_follows_set_params_and_add_many():
 def test_guides_match_striped(fill, mode):
     """score_and_grad() caches each pair's path as the guide for banded_grad(); the
     row-wise and inter-pair paths take it from the gradient's own traceback walk.  A
-    narrow band around a different guide would score differently.  One thread:
-    banded_grad() in global mode is not yet deterministic across threads (stale DP
-    cells outside the band; see TODO.md), which is unrelated to the fill."""
+    narrow band around a different guide would score differently."""
     a, b = _seqs(120, 10, 30, 17), _fixed_len_b(range(120), 45, 18)
     p1, p2 = _params("cheap_gaps"), _params("random")
     out = []
     for f in ("striped", fill):
-        batch = nwgrad.SeqPairBatchDouble(n_threads=1, traceback="pointers")
+        batch = nwgrad.SeqPairBatchDouble(n_threads=3, traceback="pointers")
         batch.fill = f
         batch.add_many(a, b, p1, gap_model="affine", mode=mode)
         batch.score_and_grad()
