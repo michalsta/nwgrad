@@ -103,9 +103,9 @@ jobs:
           # vectorized kernels and would be slower than tools already available there.
           # A source install under MSVC fails honestly at the missing header.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -170,7 +170,7 @@ jobs:
             python -c "import nwgrad; print('isa', nwgrad.simd_isa(), nwgrad.compiled_with())" &&
             python -m pytest {project}/tests/Python -q
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wheels-${{ matrix.name }}
           path: ./wheelhouse/*.whl
@@ -179,8 +179,8 @@ jobs:
     name: sdist
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       # build's default flow builds the sdist, then a wheel FROM that archive.
@@ -198,7 +198,7 @@ jobs:
             python -m pip install "${wheel}[dev]"
           done
           python -m pytest tests/Python -q
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: sdist
           path: ./dist/*.tar.gz
@@ -228,9 +228,9 @@ jobs:
           - name: macos-arm64 (gcc)
             runner: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: wheels-${{ matrix.name }}
           path: wheelhouse
@@ -294,13 +294,13 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: wheels-*
           path: dist
           merge-multiple: true
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: sdist
           path: dist
