@@ -132,8 +132,8 @@ private:
         if (backend < 0) return -1;
         const LevelKernels& K = level_kernels(backend);
         if (grad_mode == GradMode::Soft)
-            return (K.inter_soft && K.inter_w > 0 && soft_impl != SoftImpl::Log && band == 0 &&
-                    params.matrix.size() <= 8) ? backend : -1;
+            return (K.inter_soft && K.inter_w > 0 && soft_impl != SoftImpl::Log && band == 0)
+                       ? backend : -1;
         if (inter_w_(K) <= 0) return -1;
         if (gap_model == GapModel::Linear && (band > 0 ||
             (align_mode == AlignMode::Global && inter_w_(K) < 4))) return -1;
@@ -159,7 +159,9 @@ private:
         size_t maxa = 0, maxb = 0;
         for (size_t i = 0; i < N; ++i) {
             const size_t la = problems[i].seq_a.size(), lb = problems[i].seq_b.size();
-            if (la == 0 || lb == 0 || (hb_case && la > static_cast<size_t>(hb_cut))) {
+            if (la == 0 || lb == 0 || (hb_case && la > static_cast<size_t>(hb_cut)) ||
+                !inter_pair_fits(la, lb, gap_model == GapModel::Affine, soft,
+                                 inter_w_(K), sizeof(T), K.inter_w)) {
                 other.push_back(i); continue;
             }
             elig.push_back(i);

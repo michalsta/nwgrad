@@ -338,6 +338,23 @@ struct SoftPairJob {
     int ok;
 };
 using soft_pair_fn = void (*)(SoftPairJob&);
+// Whether a pair of lengths (la, lb) may join an inter-pair group: the group's
+// interleaved tables must stay in L2.  Measured (nighthaven, i5-12500, Golden Cove: 1.25
+// MiB L2 per core; protein pairs, 12 threads): affine Viterbi wins up to 100-130
+// residues (tables ~1.3 MB per group) and loses 2x at 130-160 (~1.6 MB); linear, one
+// table, still wins at 160-200 and loses at 150-300 — the same byte crossover.  Past
+// it W pairs' tables stream from L3/DRAM while the per-pair fills keep 3 B/cell
+// (pointers) and win by up to 11x.  Viterbi: `tables` T-tables of W lanes (3 affine, 1
+// linear); soft: the soft pass's 4 (affine) / 2 (linear) double tables of Ws lanes.
+inline constexpr size_t kInterGroupBytes = size_t(5) << 18;   // 1.25 MiB
+inline bool inter_pair_fits(size_t la, size_t lb, bool affine, bool soft, int W,
+                            size_t tsize, int Ws) {
+    const size_t cells = (la + 1) * (lb + 1);
+    if (cells * static_cast<size_t>(W) * (affine ? 3 : 1) * tsize > kInterGroupBytes) return false;
+    return !soft || cells * static_cast<size_t>(Ws) * (affine ? 4 : 2) * sizeof(double) <=
+                        kInterGroupBytes;
+}
+
 inline size_t inter_soft_scratch(int n, int M, int W) {
     return (3 * static_cast<size_t>(M + 1) * (n + 1) + static_cast<size_t>(M + 1) * (n + 2) +
             7 * static_cast<size_t>(n + 2) + 2 * static_cast<size_t>(M + 1)) * W;

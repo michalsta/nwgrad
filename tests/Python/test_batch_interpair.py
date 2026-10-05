@@ -192,3 +192,26 @@ def test_ragged_b(prec, gm, mode, grad):
         r1 = _align(prec, p, gm, mode, grad, A, B, "interpair", band=3)
         for x, y in zip(r0, r1):
             assert np.array_equal(x, y)
+
+
+@pytest.mark.parametrize("prec", ["double", "float32"])
+@pytest.mark.parametrize("gm", ["affine", "linear"])
+@pytest.mark.parametrize("mode", ["local", "global"])
+@pytest.mark.parametrize("grad", ["hard", "soft"])
+def test_protein(prec, gm, mode, grad):
+    """20 letters: the gathered per-row profile (hard) and gathered weights with per-lane
+    count scatter (soft); B lengths ragged within the cap."""
+    AA = nwgrad.PROTEIN.symbols
+    rng = np.random.default_rng(55)
+    m = rng.normal(size=(20, 20))
+    go = 0.0 if gm == "linear" else 3.0
+    p = nwgrad.AlignParams(nwgrad.SubstMatrix(m, alphabet=AA), go, 1.0, go * 1.3, 0.8)
+    A = ["".join(rng.choice(list(AA), int(k))) for k in rng.integers(0, 40, 139)]
+    B = ["".join(rng.choice(list(AA), int(k))) for k in rng.integers(30, 38, 139)]
+    r0 = _align(prec, p, gm, mode, grad, A, B, "striped")
+    r1 = _align(prec, p, gm, mode, grad, A, B, "interpair")
+    for x, y in zip(r0, r1):
+        if grad == "hard":
+            assert np.array_equal(x, y)
+        else:
+            np.testing.assert_allclose(x, y, rtol=REL, atol=REL)

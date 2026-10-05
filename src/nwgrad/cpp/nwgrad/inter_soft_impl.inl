@@ -61,10 +61,19 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_affine(InterSoftJob& J) noexcept {
     int* S = J.iscratch;                     // (M+1)*IW forward exponents
 
     // Lane masks: column j's B residue == c.
+    // Alphabets over 8 letters (big): no letter masks — each row's weights are gathered
+    // per lane (fill_E) and the match contributions kept per cell (trow), added into the
+    // counts per lane after the row.  nm = the letters accumulated through masks.
+    const bool big = na > 8;
+    const int nm = big ? 0 : na;
+    static thread_local std::vector<ivd> trowv;
+    if (big && trowv.size() < static_cast<size_t>(w2)) trowv.resize(w2);
+    ivd* trow = trowv.data();
+    (void)trow;
     static thread_local std::vector<ivl> eqm;
-    if (eqm.size() < static_cast<size_t>(w2) * na) eqm.resize(static_cast<size_t>(w2) * na);
+    if (eqm.size() < static_cast<size_t>(w2) * nm) eqm.resize(static_cast<size_t>(w2) * nm);
     for (int j = 1; j <= n; ++j)
-        for (int c = 0; c < na; ++c) {
+        for (int c = 0; c < nm; ++c) {
             ivl v;
             for (int l = 0; l < IW; ++l)
                 v[l] = ((!Rag || j <= J.nb[l]) && J.b[l][j - 1] == c) ? -1 : 0;
@@ -87,13 +96,23 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_affine(InterSoftJob& J) noexcept {
     // once per row in the forward pass, read again by the backward pass.
     auto fill_E = [&](int i) {
         ivd* E = ER + static_cast<size_t>(i) * w2;
+        E[0] = z; E[n + 1] = z;
+        if (big) {
+            for (int l = 0; l < IW; ++l) {
+                const double* pr = J.es + static_cast<size_t>((i <= J.m[l]) ? J.a[l][i - 1] : 0) * na;
+                const unsigned char* bl = J.b[l];
+                const int nl = Rag ? J.nb[l] : n;
+                for (int j = 1; j <= nl; ++j) E[j][l] = pr[bl[j - 1]];
+                for (int j = nl + 1; j <= n; ++j) E[j][l] = 0.0;
+            }
+            return;
+        }
         ivd P[8];
         for (int c = 0; c < na; ++c)
             for (int l = 0; l < IW; ++l) {
                 const int a = (i <= J.m[l]) ? J.a[l][i - 1] : 0;
                 P[c][l] = J.es[a * na + c];
             }
-        E[0] = z; E[n + 1] = z;
         for (int j = 1; j <= n; ++j) {
             ivd s = z;
             const ivl* mk = &eqm[static_cast<size_t>(j) * na];
@@ -229,7 +248,7 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_affine(InterSoftJob& J) noexcept {
         // applied to them afterwards.
         ivd c = z, mx = z;
         ivd sx = z, sy = z, so = z, sob = z, acc[8];
-        for (int cc = 0; cc < na; ++cc) acc[cc] = z;
+        for (int cc = 0; cc < nm; ++cc) acc[cc] = z;
         auto cell = [&](int j) {
             const ivd d = (En ? En[j + 1] * nM[j + 1] : z) + init;
             const ivd v = nX[j];
@@ -255,8 +274,9 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_affine(InterSoftJob& J) noexcept {
                 so += (fM[j - 1] + fX[j - 1]) * y;
                 sob += (qM[j] + qY[j]) * xv;
                 const ivd t = (qM[j - 1] + qX[j - 1] + qY[j - 1]) * Ec[j] * mv;
-                const ivl* mk = &eqm[static_cast<size_t>(j) * na];
-                for (int cc = 0; cc < na; ++cc) acc[cc] += ivsel(mk[cc], t, z);
+                if (big) trow[j] = t;
+                const ivl* mk = &eqm[static_cast<size_t>(j) * nm];
+                for (int cc = 0; cc < nm; ++cc) acc[cc] += ivsel(mk[cc], t, z);
             }
             const auto [mv0, xv0] = cell(0);
             (void)mv0;
@@ -276,7 +296,7 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_affine(InterSoftJob& J) noexcept {
             if (kv[l]) {
                 const double f = std::ldexp(1.0, -kv[l]);
                 sx[l] *= f; sy[l] *= f; so[l] *= f; sob[l] *= f;
-                for (int cc = 0; cc < na; ++cc) acc[cc][l] *= f;
+                for (int cc = 0; cc < nm; ++cc) acc[cc][l] *= f;
             }
 
         ivd gh, gv = z;
@@ -303,7 +323,14 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_affine(InterSoftJob& J) noexcept {
             if (i >= 1) {
                 g_ob[l] += sob[l] * J.ob * gv[l];
                 double* gr = J.counts + l * nn + static_cast<size_t>(J.a[l][i - 1]) * na;
-                for (int cc = 0; cc < na; ++cc) gr[cc] += acc[cc][l] * gv[l];
+                if (big) {
+                    // trow holds pre-rescale values: apply this row's rescale factor here.
+                    const double f = std::ldexp(gv[l], -kv[l]);
+                    const unsigned char* bl = J.b[l];
+                    const int nl = Rag ? J.nb[l] : n;
+                    for (int j = 1; j <= nl; ++j) gr[bl[j - 1]] += trow[j][l] * f;
+                }
+                for (int cc = 0; cc < nm; ++cc) gr[cc] += acc[cc][l] * gv[l];
             }
         }
         for (int l = 0; l < IW; ++l) Tn[l] = (i > J.m[l]) ? 0 : Ti[l];
@@ -340,10 +367,19 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_linear(InterSoftJob& J) noexcept {
     ivd* mf = rs + (M + 1);
     int* S = J.iscratch;
 
+    // Alphabets over 8 letters (big): no letter masks — each row's weights are gathered
+    // per lane (fill_E) and the match contributions kept per cell (trow), added into the
+    // counts per lane after the row.  nm = the letters accumulated through masks.
+    const bool big = na > 8;
+    const int nm = big ? 0 : na;
+    static thread_local std::vector<ivd> trowv;
+    if (big && trowv.size() < static_cast<size_t>(w2)) trowv.resize(w2);
+    ivd* trow = trowv.data();
+    (void)trow;
     static thread_local std::vector<ivl> eqm;
-    if (eqm.size() < static_cast<size_t>(w2) * na) eqm.resize(static_cast<size_t>(w2) * na);
+    if (eqm.size() < static_cast<size_t>(w2) * nm) eqm.resize(static_cast<size_t>(w2) * nm);
     for (int j = 1; j <= n; ++j)
-        for (int c = 0; c < na; ++c) {
+        for (int c = 0; c < nm; ++c) {
             ivl v;
             for (int l = 0; l < IW; ++l)
                 v[l] = ((!Rag || j <= J.nb[l]) && J.b[l][j - 1] == c) ? -1 : 0;
@@ -364,13 +400,23 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_linear(InterSoftJob& J) noexcept {
     (void)cok; (void)endc;
     auto fill_E = [&](int i) {
         ivd* E = ER + static_cast<size_t>(i) * w2;
+        E[0] = z; E[n + 1] = z;
+        if (big) {
+            for (int l = 0; l < IW; ++l) {
+                const double* pr = J.es + static_cast<size_t>((i <= J.m[l]) ? J.a[l][i - 1] : 0) * na;
+                const unsigned char* bl = J.b[l];
+                const int nl = Rag ? J.nb[l] : n;
+                for (int j = 1; j <= nl; ++j) E[j][l] = pr[bl[j - 1]];
+                for (int j = nl + 1; j <= n; ++j) E[j][l] = 0.0;
+            }
+            return;
+        }
         ivd P[8];
         for (int c = 0; c < na; ++c)
             for (int l = 0; l < IW; ++l) {
                 const int a = (i <= J.m[l]) ? J.a[l][i - 1] : 0;
                 P[c][l] = J.es[a * na + c];
             }
-        E[0] = z; E[n + 1] = z;
         for (int j = 1; j <= n; ++j) {
             ivd sv = z;
             const ivl* mk = &eqm[static_cast<size_t>(j) * na];
@@ -474,7 +520,7 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_linear(InterSoftJob& J) noexcept {
         const ivd* q = f - st;
         const ivd* Ec = ER + static_cast<size_t>(i) * w2;
         ivd c = z, mx = z, sa = z, sb = z, acc[8];
-        for (int cc = 0; cc < na; ++cc) acc[cc] = z;
+        for (int cc = 0; cc < nm; ++cc) acc[cc] = z;
         for (int j = n; j >= 0; --j) {
             ivd b = (En ? En[j + 1] * nxt[j + 1] : z) + nxt[j] * eb + init + ea * c;
             if constexpr (Rag) {
@@ -488,8 +534,9 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_linear(InterSoftJob& J) noexcept {
                 if (j >= kmin) sb += q[j] * b;
                 if (j >= 1) {
                     const ivd t = q[j - 1] * Ec[j] * b;
-                    const ivl* mk = &eqm[static_cast<size_t>(j) * na];
-                    for (int cc = 0; cc < na; ++cc) acc[cc] += ivsel(mk[cc], t, z);
+                    if (big) trow[j] = t;
+                    const ivl* mk = &eqm[static_cast<size_t>(j) * nm];
+                    for (int cc = 0; cc < nm; ++cc) acc[cc] += ivsel(mk[cc], t, z);
                 }
             }
         }
@@ -498,7 +545,7 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_linear(InterSoftJob& J) noexcept {
             if (kv[l]) {
                 const double fct = std::ldexp(1.0, -kv[l]);
                 sa[l] *= fct; sb[l] *= fct;
-                for (int cc = 0; cc < na; ++cc) acc[cc][l] *= fct;
+                for (int cc = 0; cc < nm; ++cc) acc[cc][l] *= fct;
             }
         for (int l = 0; l < IW; ++l) {
             const int Ti = Tn[l] + kv[l];
@@ -514,7 +561,13 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_linear(InterSoftJob& J) noexcept {
             if (i >= 1) {
                 g_eb[l] += sb[l] * J.eb * gv;
                 double* gr = J.counts + l * nn + static_cast<size_t>(J.a[l][i - 1]) * na;
-                for (int cc = 0; cc < na; ++cc) gr[cc] += acc[cc][l] * gv;
+                if (big) {
+                    const double f = std::ldexp(gv, -kv[l]);
+                    const unsigned char* bl = J.b[l];
+                    const int nl = Rag ? J.nb[l] : n;
+                    for (int j = 1; j <= nl; ++j) gr[bl[j - 1]] += trow[j][l] * f;
+                }
+                for (int cc = 0; cc < nm; ++cc) gr[cc] += acc[cc][l] * gv;
             }
             Tn[l] = Ti;
         }

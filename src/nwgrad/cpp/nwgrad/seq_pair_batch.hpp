@@ -526,6 +526,10 @@ private:
             if (backend < 0) return -1;
             const LevelKernels& K = level_kernels(backend);
             if (inter_w_(K) <= 0) return -1;
+            if (!inter_pair_fits(p.len_a(), p.len_b(), p.gap_model() == GapModel::Affine,
+                                 p.grad_mode() == GradMode::Soft, inter_w_(K), sizeof(T),
+                                 K.inter_w))
+                return -1;
             // The linear inter-pair VITERBI fill, Global, at 2 lanes is a measured LOSS
             // (skynet sse2: 0.76x the scalar fill, which is already cheap there); Local
             // wins at every width (1.41x sse2, 3.23x avx2) and Global from 4 lanes (1.41x
@@ -641,7 +645,7 @@ private:
                 // Soft lanes share the forward-backward too when every real lane is soft
                 // with one soft_impl (not "log") and one temperature, and the weights fit.
                 bool soft_group = K.inter_soft != nullptr && p0.grad_mode() == GradMode::Soft &&
-                                  p0.soft_impl() != SoftImpl::Log && P.matrix.size() <= 8;
+                                  p0.soft_impl() != SoftImpl::Log;
                 for (size_t l = 1; l < real && soft_group; ++l) {
                     const SeqPair& p = *pairs[elig[s + l]];
                     soft_group = p.grad_mode() == GradMode::Soft && p.soft_impl() == p0.soft_impl() &&
