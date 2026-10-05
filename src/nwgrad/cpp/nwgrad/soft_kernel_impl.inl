@@ -38,19 +38,40 @@
 
 static constexpr double kSpLossTol = 0x1p-45;
 
-// y[j] = u[j] + e·y[j-1], j = lo..hi (y[lo-1] given; u may alias y), two cells per
-// carry step.
+// y[j] = u[j] + e·y[j-1], j = lo..hi (y[lo-1] given; u may alias y).  FOUR cells per
+// carry step: only y[j+3] = (u3 + e·u2 + e²·u1 + e³·u0) + e⁴·c sits on the serial
+// chain (one FMA latency per four cells); y[j..j+2] hang off it.  Reassociated — the
+// soft path is tolerance-tested.
 static inline void sp_carry_fwd(double* y, const double* u, int lo, int hi, double e) noexcept {
     double c = y[lo - 1];
-    const double e2 = e * e;
+    const double e2 = e * e, e3 = e2 * e, e4 = e2 * e2;
     int j = lo;
-    for (; j < hi; j += 2) {
-        const double u1 = u[j], u2 = u[j + 1];
-        y[j] = u1 + e * c;
-        c = (u2 + e * u1) + e2 * c;
-        y[j + 1] = c;
+    for (; j + 3 <= hi; j += 4) {
+        const double u0 = u[j], u1 = u[j + 1], u2 = u[j + 2], u3 = u[j + 3];
+        const double p1 = u1 + e * u0, p2 = u2 + e * p1, p3 = u3 + e * p2;
+        y[j] = u0 + e * c;
+        y[j + 1] = p1 + e2 * c;
+        y[j + 2] = p2 + e3 * c;
+        c = p3 + e4 * c;
+        y[j + 3] = c;
     }
-    if (j == hi) y[j] = u[j] + e * c;
+    for (; j <= hi; ++j) { c = u[j] + e * c; y[j] = c; }
+}
+// y[j] += e·y[j+1], j = hi..lo, four cells per carry step.
+static inline void sp_carry_bwd(double* y, int lo, int hi, double e) noexcept {
+    double c = y[hi + 1];
+    const double e2 = e * e, e3 = e2 * e, e4 = e2 * e2;
+    int j = hi;
+    for (; j - 3 >= lo; j -= 4) {
+        const double u0 = y[j], u1 = y[j - 1], u2 = y[j - 2], u3 = y[j - 3];
+        const double p1 = u1 + e * u0, p2 = u2 + e * p1, p3 = u3 + e * p2;
+        y[j] = u0 + e * c;
+        y[j - 1] = p1 + e2 * c;
+        y[j - 2] = p2 + e3 * c;
+        c = p3 + e4 * c;
+        y[j - 3] = c;
+    }
+    for (; j >= lo; --j) { c = y[j] + e * c; y[j] = c; }
 }
 
 // LAZY rescale: only when the row max mx leaves [2^-256, 2^256] (or overflows: bad).
@@ -74,20 +95,6 @@ static inline double sp_loss(int n, int kf, int kb, double mxf, double mxb, doub
     const double lb = kb < 0 ? std::ldexp(1.0, -kb) : 1.0;
     return 32.0 * (n + 1) * std::numeric_limits<double>::min() * (lf * mxb + lb * mxf) * g;
 }
-// y[j] += e·y[j+1], j = hi..lo.
-static inline void sp_carry_bwd(double* y, int lo, int hi, double e) noexcept {
-    double c = y[hi + 1];
-    const double e2 = e * e;
-    int j = hi;
-    for (; j > lo; j -= 2) {
-        const double u1 = y[j], u2 = y[j - 1];
-        y[j] = u1 + e * c;
-        c = (u2 + e * u1) + e2 * c;
-        y[j - 1] = c;
-    }
-    if (j == lo) y[j] = y[j] + e * c;
-}
-
 static inline double sp_post(int e, double izr, bool& bad) noexcept {
     const double f = std::ldexp(izr, e);
     if (!(f <= std::numeric_limits<double>::max())) bad = true;
