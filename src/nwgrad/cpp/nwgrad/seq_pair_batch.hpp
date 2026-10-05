@@ -508,8 +508,6 @@ private:
     // float32 runs the float kernel (inter_fill_f), twice the lanes in the same register.  Soft pairs qualify: the shared fill is their guide Viterbi
     // (bit-identical to their own), and forward-backward then runs per pair. The mutable Hirschberg cutoff is
     // handled separately when building and validating the cached plan.
-    static constexpr double DBL_MAX_ = std::numeric_limits<double>::max();
-
     // The inter-pair fill and its lane count at this batch's precision.
     static int inter_w_(const LevelKernels& K) {
         if constexpr (std::is_same_v<T, double>) return K.inter_fill ? K.inter_w : 0;
@@ -647,25 +645,15 @@ private:
                 const int na = P.matrix.size();
                 const size_t nn = static_cast<size_t>(na) * na;
                 if (soft_group) {
-                    const double it = 1.0 / p0.soft_temperature();
-                    ses.resize(nn);
-                    for (size_t k = 0; k < nn; ++k) ses[k] = std::exp(P.matrix.data()[k] * it);
                     InterSoftJob sj{};
-                    sj.oa = std::exp(-(P.gap_open_a + P.gap_extend_a) * it);
-                    sj.ea = std::exp(-P.gap_extend_a * it);
-                    sj.ob = std::exp(-(P.gap_open_b + P.gap_extend_b) * it);
-                    sj.eb = std::exp(-P.gap_extend_b * it);
-                    sj.linear = lin ? 1 : 0;
-                    bool fin = sj.ea <= DBL_MAX_ && sj.eb <= DBL_MAX_ &&
-                               (lin || (sj.oa <= DBL_MAX_ && sj.ob <= DBL_MAX_));
-                    for (size_t k = 0; k < nn; ++k) fin &= ses[k] <= DBL_MAX_;
+                    const bool fin = inter_soft_weights(P, p0.soft_temperature(), lin, ses, sj);
                     soft_group = fin;
                     if (fin) {
                         // The soft pass is double (the forward-backward is double at any
                         // T), K.inter_w lanes: a float32 group runs it in W / SW chunks.
                         const int SW = K.inter_w;
                         slogz.resize(W); scnt.resize(W * nn); sgap.resize(W * 4); sok.assign(W, 0);
-                        sj.es = ses.data(); sj.nalpha = na; sj.n = n;
+                        sj.n = n;
                         sj.align_mode = job.align_mode;
                         for (int c = 0; c < W && static_cast<size_t>(c) < real; c += SW) {
                             int Mc = 0;
@@ -699,9 +687,12 @@ private:
 
     // banded_grad() under fill = "interpair": the same groups as score_and_grad(), each
     // a GuideBanded InterJob — every lane around its own guide, its tables bit-identical
-    // to its own banded fill (see InterJobT::blo).  Hard pairs only: a group with a soft
-    // lane (banded forward-backward), mixed params, or linear Global below 4 lanes runs
-    // each pair's own banded path, as do the pairs outside the plan.
+    // to its own banded fill (see InterJobT::blo).  Hard affine pairs only: a group with
+    // a soft lane (banded forward-backward), mixed params or linear gaps runs each pair's
+    // own banded path, as do the pairs outside the plan.  Measured (nighthaven AVX2,
+    // Manakov 100k, bw 2-8, 1 thread): affine 0.45-0.89x the own path's time, linear
+    // 0.60-1.27x — hence affine only.  At 12 threads affine is ~1.0x (per-pair setup and
+    // the traceback walk, not the fill, are most of a banded step on 22 x 50 pairs).
     void banded_grad_inter_(std::vector<double>& scores, int bandwidth) {
         const int def_backend = global_default_backend();
         if (plan_.generation != generation_ || plan_.default_backend != def_backend ||
@@ -733,7 +724,9 @@ private:
                 const size_t real = e - s;
                 const SeqPair& p0 = *pairs[elig[s]];
                 const LevelKernels& K = level_kernels(backend[elig[s]]);
-                bool shared = linear_fill_ok_(p0, K);
+                // Affine only: linear's own banded fill is already cheap and the shared
+                // one measured 0.83-1.27x of it on AVX2 (a loss at narrow bands).
+                bool shared = p0.gap_model() == GapModel::Affine;
                 for (size_t l = 0; l < real && shared; ++l) {
                     const SeqPair& p = *pairs[elig[s + l]];
                     shared = p.params_ptr() == p0.params_ptr() && p.grad_mode() != GradMode::Soft;

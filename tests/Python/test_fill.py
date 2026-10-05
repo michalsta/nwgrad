@@ -432,3 +432,29 @@ def test_banded_interpair_needs_a_guide():
     b.add_many(A, B, _params("random"), gap_model="affine", mode="local", grad_mode="hard")
     with pytest.raises(Exception, match="guide"):
         b.banded_grad(3)
+
+
+@pytest.mark.parametrize("prec", ["double", "float32"])
+@pytest.mark.parametrize("gm", ["affine", "linear"])
+@pytest.mark.parametrize("mode", ["local", "global"])
+@pytest.mark.parametrize("fill", ["striped", "interpair"])
+def test_banded_grad_guides_match_realign_banded(prec, gm, mode, fill):
+    """banded_grad() takes its new guide from the gradient's traceback walk (one walk
+    for both); it must equal the separately extracted guide of a pair's own
+    realign_banded() around the same old guide, with the same score."""
+    A, B = _seqs(90, 5, 30, 41), _fixed_len_b(range(90), 35, 42)
+    p = _params("ties")
+    bcls, pcls = _CLS[prec]
+    b = bcls(n_threads=2, traceback="pointers")
+    b.fill = fill
+    b.add_many(A, B, p, gap_model=gm, mode=mode, grad_mode="hard")
+    b.score_and_grad()
+    b.banded_grad(2)
+    for i in range(90):
+        sp = pcls(A[i], B[i], p, gap_model=gm, mode=mode, grad_mode="hard",
+                  traceback="pointers")
+        sp.alloc_dp()
+        sp.align_full()
+        sp.realign_banded(2)
+        assert list(sp.guide_j) == list(b[i].guide_j)
+        assert sp.score == b[i].score

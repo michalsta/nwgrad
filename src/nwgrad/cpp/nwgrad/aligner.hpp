@@ -3017,6 +3017,27 @@ private:
     }
 };
 
+// The inter-pair soft pass's weights (InterSoftJob es/oa/ea/ob/eb, linear) for `P` at
+// temperature T: exp(score / T), exp(-(go+ge)/T), exp(-ge/T).  False when one overflows
+// — the pairs then run their own path (which raises or falls back per soft_impl).
+// Shared by SeqPairBatch and BatchAligner so both batch the same weights.
+inline bool inter_soft_weights(const AlignParams& P, double T, bool lin,
+                               std::vector<double>& es, InterSoftJob& sj) {
+    constexpr double big = std::numeric_limits<double>::max();
+    const double it = 1.0 / T;
+    const size_t nn = static_cast<size_t>(P.matrix.size()) * P.matrix.size();
+    es.resize(nn);
+    bool fin = true;
+    for (size_t k = 0; k < nn; ++k) { es[k] = std::exp(P.matrix.data()[k] * it); fin &= es[k] <= big; }
+    sj.oa = std::exp(-(P.gap_open_a + P.gap_extend_a) * it);
+    sj.ea = std::exp(-P.gap_extend_a * it);
+    sj.ob = std::exp(-(P.gap_open_b + P.gap_extend_b) * it);
+    sj.eb = std::exp(-P.gap_extend_b * it);
+    sj.linear = lin ? 1 : 0;
+    sj.es = es.data(); sj.nalpha = P.matrix.size();
+    return fin && sj.ea <= big && sj.eb <= big && (lin || (sj.oa <= big && sj.ob <= big));
+}
+
 // The Simd kernel's out-of-line definitions.  Included last, once Aligner is a
 // complete type, so every instantiation sees both kernels.
 #define NWGRAD_ALIGNER_HPP_INCLUDED 1

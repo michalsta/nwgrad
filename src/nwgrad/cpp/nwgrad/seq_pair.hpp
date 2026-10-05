@@ -313,8 +313,15 @@ struct SeqPairT {
         resolve_guide(buf);
         std::visit([&](auto& st) {
             st.band_al.set_problem(a_idx_, b_idx_, *params_, bandwidth, guide_j_);
-            run_dp_with_buf(st.band_al, buf);
             last_banded_ = true;
+            if (grad_mode_ == GradMode::Hard) {   // one traceback walk for guide and gradient
+                st.band_al.compute_viterbi(buf);
+                score_ = st.band_al.score();
+                grad_.zero();
+                st.band_al.hard_grad_and_guide(buf, grad_, guide_j_);
+                return;
+            }
+            run_dp_with_buf(st.band_al, buf);
             if (grad_mode_ != GradMode::None) {
                 grad_.zero();
                 grad_with_buf(st.band_al, buf);
@@ -345,12 +352,13 @@ struct SeqPairT {
                                  double local_best, int best_i, int best_j) {
         std::visit([&](auto& st) {
             st.band_al.adopt_interleaved(buf, W, lane, local_best, best_i, best_j);
-            guide_j_ = st.band_al.guide_j_from_viterbi(buf);
             score_ = st.band_al.score();
             last_banded_ = true;
-            if (grad_mode_ != GradMode::None) {
+            if (grad_mode_ == GradMode::Hard) {   // one walk for both (hard pairs only here)
                 grad_.zero();
-                grad_with_buf(st.band_al, buf);
+                st.band_al.hard_grad_and_guide(buf, grad_, guide_j_);
+            } else {
+                guide_j_ = st.band_al.guide_j_from_viterbi(buf);
             }
         }, state_);
         path_valid_  = true;
