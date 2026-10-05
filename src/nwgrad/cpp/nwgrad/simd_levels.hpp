@@ -292,6 +292,31 @@ struct InterSoftJob {
     double* logz; double* counts; double* gaps; int* ok;   // W, W*nalpha^2, W*4, W
 };
 using inter_soft_fn = void (*)(InterSoftJob&);
+
+// Per-pair scaled forward-backward (Aligner's SoftImpl::Scaled), double: one pair, Full
+// or GuideBanded, any alphabet.  Bodies in soft_kernel_impl.inl — compiled once per
+// level (LevelKernels::soft_pair_*) and once at baseline inside aligner.hpp.  The Aligner
+// fills it: sequences, exp'd profile P (nalpha x (n+2), temperature applied), gap
+// weights, per-row band ranges (jlo/jhi: the computed cells j >= 1; jlo0/jhi0: the
+// band; slo/shi: the initialized span), tables and scratch.  Outputs: log_z (of
+// params/T), expected counts accumulated into scnt (zeroed by the caller), the gap
+// gradient fields (negative), ok = 0 when out of range.
+struct SoftPairJob {
+    int m, n, nalpha;
+    const unsigned char* a; const unsigned char* b;
+    const double* P;
+    double oa, ea, ob, eb;          // linear: ea, eb only
+    int local, full, bi, bj;        // bi/bj: Global border rows/cols
+    const int *jlo, *jhi, *jlo0, *jhi0, *slo, *shi;   // m+1 each
+    size_t stride;                  // n+1
+    double *FM, *FX, *FY;           // forward tables (linear: FM only)
+    double *r0, *r1, *r2, *r3, *r4, *r5;   // n+2 each
+    int* S; double* rowsum;         // m+1 each
+    double* scnt; double* srow;     // nalpha^2, nalpha
+    double log_z, g_oa, g_ea, g_ob, g_eb;
+    int ok;
+};
+using soft_pair_fn = void (*)(SoftPairJob&);
 inline size_t inter_soft_scratch(int n, int M, int W) {
     return (3 * static_cast<size_t>(M + 1) * (n + 1) + static_cast<size_t>(M + 1) * (n + 2) +
             7 * static_cast<size_t>(n + 2) + 2 * static_cast<size_t>(M + 1)) * W;
@@ -332,6 +357,8 @@ struct LevelKernels {
     inter_fn      inter_fill = nullptr;         // inter-pair affine Full fill, double
     int           inter_w = 0;                  // its lane count (pairs per call)
     inter_soft_fn inter_soft = nullptr;         // inter-pair soft pass, double (same W)
+    soft_pair_fn  soft_pair_linear = nullptr;   // per-pair scaled forward-backward ↓
+    soft_pair_fn  soft_pair_affine = nullptr;
 };
 
 // One slot per possible level; index by (int)SimdLevel.  Populated by the level TUs'
@@ -357,7 +384,8 @@ void register_level(SimdLevel l, viterbi_fn viterbi, viterbi_fn_f viterbi_f,
                     hbbase_fn hb_base, hbbase_fn_f hb_base_f,
                     hbscan_fn hb_scan, hbscan_fn_f hb_scan_f,
                     int row_block, inter_fn inter_fill, int inter_w,
-                    inter_soft_fn inter_soft);
+                    inter_soft_fn inter_soft,
+                    soft_pair_fn soft_pair_linear, soft_pair_fn soft_pair_affine);
 
 // ── The global default backend ────────────────────────────────────────────────
 //

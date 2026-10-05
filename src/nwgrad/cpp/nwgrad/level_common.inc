@@ -37,6 +37,7 @@ namespace NWGRAD_LVL_NAME {
 #include "row_kernel_impl.inl"    // row-wise banded leaf kernels (uses KW)
 #include "inter_kernel_impl.inl"  // inter-pair affine Full fill (uses KW)
 #include "inter_soft_impl.inl"    // inter-pair soft pass (uses the above's IW/ivd)
+#include "soft_kernel_impl.inl"   // per-pair scaled forward-backward
 }
 #undef NWGRAD_LEVEL_NS
 
@@ -66,7 +67,9 @@ struct NwgradLevelRegistrar {
                        NWGRAD_LVL_NAME::ROW_BLOCK,
                        &NWGRAD_LVL_NAME::inter_fill_entry,      // inter-pair affine Full, double
                        NWGRAD_LVL_NAME::IW,
-                       &NWGRAD_LVL_NAME::inter_soft_entry);    // inter-pair soft pass, double
+                       &NWGRAD_LVL_NAME::inter_soft_entry,     // inter-pair soft pass, double
+                       &NWGRAD_LVL_NAME::soft_pair_linear,     // per-pair soft, linear
+                       &NWGRAD_LVL_NAME::soft_pair_affine);    // per-pair soft, affine
     }
 };
 const NwgradLevelRegistrar nwgrad_level_registrar_instance;
