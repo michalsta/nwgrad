@@ -179,9 +179,18 @@ static void inter_soft_entry(InterSoftJob& J) noexcept {
             if (local && i <= J.m[l]) init[l] = std::ldexp(1.0, -Tn[l]);
         }
         const ivd* En = (i < M) ? ER + static_cast<size_t>(i + 1) * w2 : nullptr;
-        // One fused descending loop: carry-free part, Y carry, and the M/X gap terms.
+        const size_t ro = static_cast<size_t>(i) * st;
+        const ivd* fM = FM + ro; const ivd* fX = FX + ro; const ivd* fY = FY + ro;
+        const ivd* qM = fM - st; const ivd* qX = fX - st; const ivd* qY = fY - st;
+        const ivd* Ec = ER + static_cast<size_t>(i) * w2;
+        // ONE fused descending pass per row: carry-free part, the Y carry, the M/X gap
+        // terms, AND every gradient sum.  The sums are linear in this row's backward
+        // values, so they are taken before any rescale and the (rare) rescale is
+        // applied to them afterwards.
         ivd c = z, mx = z;
-        for (int j = n; j >= 0; --j) {
+        ivd sx = z, sy = z, so = z, sob = z, acc[8];
+        for (int cc = 0; cc < na; ++cc) acc[cc] = z;
+        auto cell = [&](int j) {
             const ivd d = (En ? En[j + 1] * nM[j + 1] : z) + init;
             const ivd v = nX[j];
             ivd b1 = d + v * ob, b2 = d + v * eb;
@@ -192,8 +201,40 @@ static void inter_soft_entry(InterSoftJob& J) noexcept {
             cM[j] = mv; cX[j] = xv; cY[j] = y;
             c = y;
             mx = ivmax(mx, mv + xv + y);
+            return std::make_pair(mv, xv);
+        };
+        if (i >= 1) {
+            for (int j = n; j >= 1; --j) {
+                const auto [mv, xv] = cell(j);
+                const ivd y = c;
+                sx += fX[j] * xv;
+                sy += fY[j] * y;
+                so += (fM[j - 1] + fX[j - 1]) * y;
+                sob += (qM[j] + qY[j]) * xv;
+                const ivd t = (qM[j - 1] + qX[j - 1] + qY[j - 1]) * Ec[j] * mv;
+                const ivl* mk = &eqm[static_cast<size_t>(j) * na];
+                for (int cc = 0; cc < na; ++cc) acc[cc] += ivsel(mk[cc], t, z);
+            }
+            const auto [mv0, xv0] = cell(0);
+            (void)mv0;
+            sx += fX[0] * xv0;
+            if (kmin == 0) sob += (qM[0] + qY[0]) * xv0;
+        } else {
+            for (int j = n; j >= 1; --j) {
+                cell(j);
+                const ivd y = c;
+                sy += fY[j] * y;
+                so += (fM[j - 1] + fX[j - 1]) * y;
+            }
+            cell(0);
         }
         rescale(cM, cX, cY, nullptr, mx);
+        for (int l = 0; l < IW; ++l)
+            if (kv[l]) {
+                const double f = std::ldexp(1.0, -kv[l]);
+                sx[l] *= f; sy[l] *= f; so[l] *= f; sob[l] *= f;
+                for (int cc = 0; cc < na; ++cc) acc[cc][l] *= f;
+            }
 
         ivd gh, gv = z;
         int Ti[IW];
@@ -210,27 +251,6 @@ static void inter_soft_entry(InterSoftJob& J) noexcept {
             const double lf = kf < 0 ? std::ldexp(1.0, -kf) : 1.0;
             const double lb = kb < 0 ? std::ldexp(1.0, -kb) : 1.0;
             loss[l] += 32.0 * (n + 1) * DMIN * (lf * mx[l] + lb * mf[i][l]) * gh[l];
-        }
-
-        const size_t ro = static_cast<size_t>(i) * st;
-        const ivd* fM = FM + ro; const ivd* fX = FX + ro; const ivd* fY = FY + ro;
-        ivd sx = z, sy = z, so = z;
-        if (i >= 1) for (int j = 0; j <= n; ++j) sx += fX[j] * cX[j];
-        for (int j = 1; j <= n; ++j) {
-            sy += fY[j] * cY[j];
-            so += (fM[j - 1] + fX[j - 1]) * cY[j];
-        }
-        ivd sob = z, acc[8];
-        if (i >= 1) {
-            const ivd* Ec = ER + static_cast<size_t>(i) * w2;
-            const ivd* qM = fM - st; const ivd* qX = fX - st; const ivd* qY = fY - st;
-            for (int j = kmin; j <= n; ++j) sob += (qM[j] + qY[j]) * cX[j];
-            for (int cc = 0; cc < na; ++cc) acc[cc] = z;
-            for (int j = 1; j <= n; ++j) {
-                const ivd t = (qM[j - 1] + qX[j - 1] + qY[j - 1]) * Ec[j] * cM[j];
-                const ivl* mk = &eqm[static_cast<size_t>(j) * na];
-                for (int cc = 0; cc < na; ++cc) acc[cc] += ivsel(mk[cc], t, z);
-            }
         }
         for (int l = 0; l < IW; ++l) {
             if (i > J.m[l]) continue;
