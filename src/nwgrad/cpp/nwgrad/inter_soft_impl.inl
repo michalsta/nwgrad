@@ -17,7 +17,25 @@
 #  error "inter_soft_impl.inl is included from a level TU (level_common.inc); not standalone"
 #endif
 
-static void inter_soft_affine(InterSoftJob& J) noexcept {
+// FMA contraction, for THESE functions only.  The build compiles everything with
+// -ffp-contract=off because the Viterbi/hard kernels' bit-exactness across levels
+// depends on it; the soft path is tolerance-tested and may fuse (so on avx2/avx512/neon
+// each a*b + c here is one rounding, on sse2 two).  gcc: the optimize attribute on the
+// function; clang: the scoped pragma at the top of the body (clang ignores the
+// attribute).  Lambdas inside are separate functions and keep the global setting.
+#if defined(__clang__)
+#  define NWGRAD_SOFT_FMA_FN
+#  define NWGRAD_SOFT_FMA_BODY _Pragma("clang fp contract(fast)")
+#elif defined(__GNUC__)
+#  define NWGRAD_SOFT_FMA_FN __attribute__((optimize("fp-contract=fast")))
+#  define NWGRAD_SOFT_FMA_BODY
+#else
+#  define NWGRAD_SOFT_FMA_FN
+#  define NWGRAD_SOFT_FMA_BODY
+#endif
+
+NWGRAD_SOFT_FMA_FN static void inter_soft_affine(InterSoftJob& J) noexcept {
+    NWGRAD_SOFT_FMA_BODY
     const int n = J.n, M = J.M, st = n + 1, na = J.nalpha, w2 = n + 2;
     const bool local = J.align_mode == 1;
     const int kmin = local ? 1 : 0;   // Aligner::kGapTargetMin
@@ -278,7 +296,8 @@ static void inter_soft_affine(InterSoftJob& J) noexcept {
 // Linear gaps: one table, F(i,j) = F(i-1,j-1)·E + F(i-1,j)·eb + F(i,j-1)·ea (+ Local's
 // free start).  Per lane exactly Aligner::fwdbwd_linear_scaled; the same fused column
 // loops, lazy rescale and lost-mass bound as inter_soft_affine.  Gap opens are 0.
-static void inter_soft_linear(InterSoftJob& J) noexcept {
+NWGRAD_SOFT_FMA_FN static void inter_soft_linear(InterSoftJob& J) noexcept {
+    NWGRAD_SOFT_FMA_BODY
     const int n = J.n, M = J.M, st = n + 1, na = J.nalpha, w2 = n + 2;
     const bool local = J.align_mode == 1;
     const int kmin = local ? 1 : 0;
