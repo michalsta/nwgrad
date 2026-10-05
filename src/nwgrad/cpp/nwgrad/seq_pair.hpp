@@ -129,6 +129,14 @@ struct SeqPairT {
     }
     bool rowwise_full() const noexcept { return rowwise_full_; }
 
+    // How the soft path evaluates forward-backward — see SoftImpl.  Not bit-exact
+    // across choices (tolerance-tested), so it invalidates nothing already cached.
+    void set_soft_impl(SoftImpl s) {
+        std::visit([s](auto& st) { st.full_al.set_soft_impl(s); st.band_al.set_soft_impl(s); }, state_);
+        soft_impl_ = s;
+    }
+    SoftImpl soft_impl() const noexcept { return soft_impl_; }
+
     // Swap alignment parameters.  Invalidates score, gradient and the retained DP
     // tables (aligned() throws until the next align); the guide path stays.
     // realign_banded() remains callable after this — it will re-score the
@@ -449,6 +457,7 @@ private:
     AlignMode            am_;
     int                  hb_cutoff_ = 512;   // mirrors Aligner's default (fleet-swept)
     bool                 rowwise_full_ = false;
+    SoftImpl             soft_impl_ = SoftImpl::Scaled;
 
     bool             path_valid_   = false;
     bool             score_valid_  = false;

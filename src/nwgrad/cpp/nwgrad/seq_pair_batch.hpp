@@ -229,6 +229,7 @@ struct SeqPairBatchT {
                 // Default sentinel, which resolves to Hirschberg per pair, not here.
                 staged[i]->set_hb_cutoff(hb_cutoff);
                 staged[i]->set_rowwise_full(rowwise_full);
+                staged[i]->set_soft_impl(soft_impl);
             }
         };
         run_workers(N, worker);
@@ -922,6 +923,10 @@ public:
     // See Aligner::set_rowwise_full.  Setting it through the Python `fill` property
     // also applies it to the pairs already in the batch.
     bool rowwise_full = false;
+
+    // Soft-path evaluation for pairs built by add_many() — see SoftImpl.  The Python
+    // `soft_impl` property also applies it to the pairs already in the batch.
+    SoftImpl soft_impl = SoftImpl::Scaled;
 
     // score_and_grad() fills W pairs at once, one per vector lane (InterJob), wherever
     // a pair qualifies (inter_eligible_); the rest run their own fill.  Bit-identical

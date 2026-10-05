@@ -163,6 +163,12 @@ struct DpBufferT {
     // scalar==simd bit-identity the pmax family is required to hold.
     TVec hramp;
 
+    // Scaled soft path (SoftImpl::Scaled): rolling backward rows (current/next, per
+    // state) and the per-row power-of-two exponents of the forward tables.  The forward
+    // tables reuse F / FM,FX,FY; the B tables are not used at all.
+    DVec sb0, sb1, sb2, sb3, sb4, sb5;
+    std::vector<int> sexp;
+
     void clear() noexcept {
         auto clrT = [](TVec& v) noexcept { v.clear(); v.shrink_to_fit(); };
         auto clrD = [](DVec& v) noexcept { v.clear(); v.shrink_to_fit(); };
@@ -180,6 +186,8 @@ struct DpBufferT {
         clrT(hsM); clrT(hsX); clrT(hsY);
         clrT(hprof); clrT(hov); clrT(hramp);
         clrB(hbD); clrB(hops);
+        clrD(sb0); clrD(sb1); clrD(sb2); clrD(sb3); clrD(sb4); clrD(sb5);
+        sexp.clear(); sexp.shrink_to_fit();
     }
 };
 

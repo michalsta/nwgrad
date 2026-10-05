@@ -78,6 +78,17 @@ enum class AlignBand { Full,   GuideBanded };
 //              index, not on the vector width).  See hb_kernel_impl.inl.
 enum class TracebackMode { Scores, Pointers, Hirschberg, HirschbergPmax, Default };
 
+// How compute_forward_back() evaluates log Z and the expected counts.
+//   Scaled (default): probability space with exact power-of-two row rescaling and the
+//     gradient fused into the backward pass — no transcendental call per cell.  Throws
+//     std::domain_error when a pair's dynamic range does not fit a double (see
+//     fwdbwd_*_scaled); it never returns a silently degraded result.
+//   ScaledOrLog: Scaled, falling back per problem to Log where Scaled would throw.
+//   Log: the original log-space recurrences (lse per cell).  Unlimited range, slow.
+// The soft path is NOT bit-exact across modes, ISAs or compilers; it is tested with
+// tolerances.  The Viterbi/hard path is unaffected by any of this.
+enum class SoftImpl { Scaled, ScaledOrLog, Log };
+
 // Both Hirschberg modes share the whole divide-and-conquer driver — the recursion, the
 // join, the base case, the memory story — and differ only in which carry the SWEEP uses.
 // Everything structural therefore asks this rather than naming one of them.
@@ -333,9 +344,7 @@ struct Aligner {
     void compute_forward_back() {
         check_problem();
         check_own_buf_allocated();
-        ensure_fwdbwd_buf(own_buf_);  // Grow if needed
-        if constexpr (GM == GapModel::Linear) fwdbwd_linear(own_buf_);
-        else                                   fwdbwd_affine(own_buf_);
+        run_fwdbwd(own_buf_);
         fwdbwd_done_ = any_fwdbwd_done_ = true;
         fwdbwd_is_newest_ = true;
     }
@@ -450,9 +459,7 @@ struct Aligner {
 
     void compute_forward_back(DpBuffer& buf) {
         check_problem();
-        ensure_fwdbwd_buf(buf);  // Grow if needed (allows implicit growth from size 0)
-        if constexpr (GM == GapModel::Linear) fwdbwd_linear(buf);
-        else                                   fwdbwd_affine(buf);
+        run_fwdbwd(buf);
         any_fwdbwd_done_ = true;
         fwdbwd_is_newest_ = true;
     }
@@ -527,9 +534,16 @@ struct Aligner {
     }
 
     void soft_grad(const DpBuffer& buf, AlignParams& grad) const {
+        if (soft_scaled_used_) { add_scaled_counts(grad); return; }
         if constexpr (GM == GapModel::Linear) soft_grad_linear(buf, grad);
         else                                   soft_grad_affine(buf, grad);
     }
+
+    // See SoftImpl.  Takes effect at the next compute_forward_back().
+    void set_soft_impl(SoftImpl s) noexcept { soft_impl_ = s; }
+    SoftImpl soft_impl() const noexcept { return soft_impl_; }
+    // Whether the most recent compute_forward_back() ran the scaled path (false: log).
+    bool soft_scaled_used() const noexcept { return soft_scaled_used_; }
 
 private:
     static constexpr double NEG_INF = -std::numeric_limits<double>::infinity();
@@ -628,6 +642,14 @@ private:
     double viterbi_score_ = 0.0;
     double log_z_         = 0.0;
     int    best_i_ = 0, best_j_ = 0;
+
+    // ── Scaled soft path state ────────────────────────────────────────────────
+    SoftImpl soft_impl_ = SoftImpl::Scaled;
+    bool     soft_scaled_used_ = false;
+    // exp(substitution block), and the expected counts the scaled backward pass
+    // accumulated (matrix: +count; gaps: -count, i.e. already the gradient's sign).
+    std::vector<double> es_, scnt_, srow_;
+    double sg_go_a_ = 0, sg_ge_a_ = 0, sg_go_b_ = 0, sg_ge_b_ = 0;
     enum class TBTable { M, X, Y };
     mutable TBTable best_tbl_ = TBTable::M;
 
@@ -720,9 +742,11 @@ private:
 
     void ensure_fwdbwd_buf(DpBuffer& buf) const {
         if constexpr (GM == GapModel::Linear) {
-            if (buf.F.size() < sz_) { buf.F.resize(sz_); buf.B.resize(sz_); }
+            // F and B checked separately: the scaled path grows F alone.
+            if (buf.F.size() < sz_) buf.F.resize(sz_);
+            if (buf.B.size() < sz_) buf.B.resize(sz_);
         } else {
-            if (buf.FM.size() < sz_) {
+            if (buf.FM.size() < sz_ || buf.BM.size() < sz_) {
                 buf.FM.resize(sz_); buf.FX.resize(sz_); buf.FY.resize(sz_);
                 buf.BM.resize(sz_); buf.BX.resize(sz_); buf.BY.resize(sz_);
             }
@@ -2754,6 +2778,409 @@ private:
                 if (log_open > -700) grad.gap_open_a -= std::exp(log_open);
             }
         }
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // Forward-backward — scaled probability space (SoftImpl::Scaled)
+    // ═════════════════════════════════════════════════════════════════════════
+    //
+    // The same recurrences as fwdbwd_linear/fwdbwd_affine with exp() applied: every
+    // log-space lse becomes a +, every +score a ×exp(score), so a cell costs only
+    // multiply-adds.  exp() runs |Σ|² + 4 times per problem, log() once.
+    //
+    // Range.  Each forward row i is stored times 2^-S[i] (S[i] cumulative; the factor
+    // is a power of two, so rescaling is exact; the row max lands in [1, 2)), each
+    // backward row times 2^-T[i], and Z = 2^ze · zr.  Posteriors are then
+    // F̂·B̂ · 2^(S+T-ze)/zr, an ldexp — no exp.
+    //
+    // All terms are non-negative, so normal values carry full relative precision, and
+    // the only error is MASS LOST to the bottom of the double range: a term that went
+    // subnormal or to 0 (a deep cell, a weight like exp(-100), a local free start
+    // 2^-S).  Any lost term is below DBL_MIN in its row's scaled units (times 2^-k if
+    // the rescale scaled the row UP), and mass lost at a cell moves any posterior —
+    // and Z — by at most its own posterior, F_lost·B/Z = lost · B̂ · 2^(S+T-ze)/zr.
+    // With B̂ (or F̂) at most 2 after rescaling, each row's possible damage is bounded
+    // by quantities already in hand, so the run sums that bound and fails (returns
+    // false) when it exceeds kScaledLossTol, or when a weight or a row overflows.  The
+    // bound is rigorous, not a heuristic: a pair passes exactly when nothing that was
+    // lost could matter at the tolerance.  What fails in practice: a row whose forward
+    // and backward mass sit ~1000 binary orders apart (extreme score ranges, very low
+    // temperature), or a step score beyond ~+709 (exp overflows).  SoftImpl decides
+    // whether that throws or falls back to the log path.
+
+    void run_fwdbwd(DpBuffer& buf) {
+        if (soft_impl_ != SoftImpl::Log) {
+            bool ok;
+            if constexpr (GM == GapModel::Linear) ok = fwdbwd_linear_scaled(buf);
+            else                                   ok = fwdbwd_affine_scaled(buf);
+            if (ok) { soft_scaled_used_ = true; return; }
+            if (soft_impl_ == SoftImpl::Scaled)
+                throw std::domain_error(
+                    "nwgrad: soft path: this pair's dynamic range does not fit the scaled "
+                    "probability-space forward-backward (lengths " + std::to_string(m_) +
+                    " x " + std::to_string(n_) + "; mass lost to underflow could move the "
+                    "result by more than 2^-45, or a step score exceeds ~709 so exp() "
+                    "overflows — typically a very low temperature or extreme scores). "
+                    "Use soft_impl=\"scaled_or_log\" (falls back per pair) or \"log\".");
+        }
+        soft_scaled_used_ = false;
+        ensure_fwdbwd_buf(buf);
+        if constexpr (GM == GapModel::Linear) fwdbwd_linear(buf);
+        else                                   fwdbwd_affine(buf);
+    }
+
+    void add_scaled_counts(AlignParams& grad) const {
+        double* gblk = grad_block(grad);
+        const size_t nn = static_cast<size_t>(nalpha_) * nalpha_;
+        for (size_t k = 0; k < nn; ++k) gblk[k] += scnt_[k];
+        grad.gap_open_a   += sg_go_a_;
+        grad.gap_extend_a += sg_ge_a_;
+        grad.gap_open_b   += sg_go_b_;
+        grad.gap_extend_b += sg_ge_b_;
+    }
+
+    // Weights only need to be finite: a weight that underflows is lost mass, which
+    // the per-row bound accounts for.
+    static bool weight_bad(double w) noexcept {
+        return !(w <= std::numeric_limits<double>::max());
+    }
+    static constexpr double kScaledLossTol = 0x1p-45;
+
+    // Possible damage (posterior units) from mass lost in one row pair: forward row
+    // rescaled by 2^-kf, backward row by 2^-kb, posterior factor g.  16 terms per cell
+    // bounds every state/predecessor combination; F̂, B̂ <= 2 after rescaling.
+    double row_loss(int kf, int kb, double g) const noexcept {
+        const double lf = kf < 0 ? std::ldexp(1.0, -kf) : 1.0;
+        const double lb = kb < 0 ? std::ldexp(1.0, -kb) : 1.0;
+        return 32.0 * (n_ + 1) * std::numeric_limits<double>::min() * (lf + lb) * g;
+    }
+
+    // exp of the substitution block; false if any weight is out of range.
+    bool prepare_scaled() {
+        const size_t nn = static_cast<size_t>(nalpha_) * nalpha_;
+        es_.resize(nn);
+        scnt_.assign(nn, 0.0);
+        srow_.resize(static_cast<size_t>(nalpha_));
+        sg_go_a_ = sg_ge_a_ = sg_go_b_ = sg_ge_b_ = 0.0;
+        bool bad = false;
+        for (size_t k = 0; k < nn; ++k) { es_[k] = std::exp(blk_[k]); bad |= weight_bad(es_[k]); }
+        return !bad;
+    }
+
+    // Rescale columns [lo, hi] of up to three rows by the power of two that brings
+    // their max into [1, 2).  Returns the exponent removed; sets `bad` on overflow.
+    static int rescale_rows(double* r0, double* r1, double* r2, int lo, int hi, bool& bad) noexcept {
+        double mx = 0.0;
+        for (int j = lo; j <= hi; ++j) {
+            double v = r0[j];
+            if (r1) v = std::max(v, std::max(r1[j], r2[j]));
+            mx = std::max(mx, v);
+        }
+        if (!(mx <= std::numeric_limits<double>::max())) { bad = true; return 0; }
+        if (mx == 0.0) return 0;
+        const int k = std::ilogb(mx);
+        if (k == 0) return 0;
+        const double sc = std::ldexp(1.0, -k);
+        for (int j = lo; j <= hi; ++j) r0[j] *= sc;
+        if (r1) for (int j = lo; j <= hi; ++j) { r1[j] *= sc; r2[j] *= sc; }
+        return k;
+    }
+
+    // Row i's span [lo, hi] (Full: the whole row) — what the forward tables hold.
+    void sc_span(int i, int& lo, int& hi) const noexcept {
+        if constexpr (AB == AlignBand::Full) { lo = 0; hi = n_; }
+        else band_row_span(i, lo, hi);
+    }
+
+    // Z = 2^ze · zr from the forward tables.  Local: every in-band cell is an end.
+    template <class RowSum>
+    void finish_log_z(const std::vector<int>& S, RowSum rowsum, int& ze, double& zr) {
+        if constexpr (AM == AlignMode::Global) {
+            ze = S[m_];
+            zr = (n_ >= jlo0(m_) && n_ <= jhi0(m_)) ? rowsum(m_, n_, n_) : 0.0;
+        } else {
+            ze = *std::max_element(S.begin(), S.begin() + m_ + 1);
+            zr = 0.0;
+            for (int i = 0; i <= m_; ++i)
+                zr += std::ldexp(rowsum(i, jlo0(i), jhi0(i)), S[i] - ze);
+        }
+        log_z_ = (zr > 0.0) ? std::log(zr) + ze * 0.69314718055994530942 : NEG_INF;
+    }
+
+    // Z == 0 is genuine only for Global with (m, n) outside the band (a guide that
+    // never reaches column n): log Z = -inf, counts zero.  Anywhere else every pair
+    // has a positive Z, so 0 means everything was lost.
+    bool zero_z_ok() const noexcept {
+        if constexpr (AM == AlignMode::Global) return !(n_ >= jlo0(m_) && n_ <= jhi0(m_));
+        else return false;
+    }
+
+    // Posterior factor 2^e / zr for a row pair; false (bad) if it does not fit.
+    static double post_factor(int e, double zr, bool& bad) noexcept {
+        const double f = std::ldexp(1.0 / zr, e);
+        if (!(f <= std::numeric_limits<double>::max())) bad = true;
+        return f;
+    }
+
+    bool fwdbwd_linear_scaled(DpBuffer& buf) {
+        if (!prepare_scaled()) return false;
+        const double ea = std::exp(-params_->gap_extend_a), eb = std::exp(-params_->gap_extend_b);
+        if (weight_bad(ea) || weight_bad(eb)) return false;
+        if (buf.F.size() < sz_) buf.F.resize(sz_);
+        auto& S = buf.sexp; S.assign(static_cast<size_t>(m_) + 1, 0);
+        double* F = buf.F.data();
+        const size_t st = stride_;
+        const double* E = es_.data();
+        const int na = nalpha_;
+        const uint8_t* A = a_idx_.data();
+        const uint8_t* Bs = b_idx_.data();
+        constexpr bool L = (AM == AlignMode::Local);
+        bool bad = false;
+
+        if constexpr (AB == AlignBand::GuideBanded) band_fill(buf.F, 0.0);
+        // Row 0.
+        if constexpr (L) { for (int j = 0; j <= n_; ++j) F[j] = 1.0; }
+        else {
+            if constexpr (AB == AlignBand::Full) std::fill(F, F + n_ + 1, 0.0);
+            F[0] = 1.0;
+            const int bj = border_cols();
+            for (int j = 1; j <= bj; ++j) F[j] = F[j - 1] * ea;
+        }
+        const int bi = border_rows();
+        for (int i = 1; i <= m_; ++i) {
+            double* r = F + static_cast<size_t>(i) * st;
+            const double* p = r - st;
+            double fr = 0.0;
+            if constexpr (L) {
+                fr = std::ldexp(1.0, -S[i - 1]);
+                r[0] = fr;
+            } else {
+                r[0] = (i <= bi) ? p[0] * eb : 0.0;
+            }
+            const double* Er = E + static_cast<size_t>(A[i - 1]) * na;
+            const int lo = jlo(i), hi = jhi(i);
+            for (int j = lo; j <= hi; ++j)
+                r[j] = p[j - 1] * Er[Bs[j - 1]] + p[j] * eb + fr;
+            for (int j = lo; j <= hi; ++j)
+                r[j] += r[j - 1] * ea;
+            int slo, shi; sc_span(i, slo, shi);
+            S[i] = S[i - 1] + rescale_rows(r, nullptr, nullptr, slo, shi, bad);
+            if (bad) return false;
+        }
+
+        int ze; double zr;
+        finish_log_z(S, [&](int i, int lo, int hi) {
+            double s = 0.0; const double* r = F + static_cast<size_t>(i) * st;
+            for (int j = lo; j <= hi; ++j) s += r[j];
+            return s;
+        }, ze, zr);
+        if (!(zr > 0.0)) return zero_z_ok();
+
+        // Backward, rolling rows, gradient fused.
+        auto& c0 = buf.sb0; auto& c1 = buf.sb1;
+        c0.assign(static_cast<size_t>(n_) + 2, 0.0);
+        c1.assign(static_cast<size_t>(n_) + 2, 0.0);
+        double* cur = c0.data();
+        double* nxt = c1.data();
+        int clo = 0, chi = n_, nlo = 0, nhi = n_;   // ranges last written into cur / nxt
+        int Tn = 0;                                 // T[i+1]
+        double* srow = srow_.data();
+        double* gblk = scnt_.data();
+        double g_ea = 0.0, g_eb = 0.0, loss = 0.0;
+        for (int i = m_; i >= 0; --i) {
+            const int lo0 = jlo0(i), hi0 = jhi0(i);
+            std::fill(cur + clo, cur + chi + 1, 0.0);
+            double init = 0.0;
+            if constexpr (L) {
+                init = std::ldexp(1.0, -Tn);
+            }
+            const double* En = (i < m_) ? E + static_cast<size_t>(A[i]) * na : nullptr;
+            for (int j = lo0; j <= hi0; ++j) {
+                double v = nxt[j] * eb + init;
+                if (En && j < n_) v += En[Bs[j]] * nxt[j + 1];
+                cur[j] = v;
+            }
+            if constexpr (!L) if (i == m_ && n_ >= lo0 && n_ <= hi0) cur[n_] = 1.0;
+            for (int j = hi0 - 1; j >= lo0; --j) cur[j] += cur[j + 1] * ea;
+            clo = lo0; chi = hi0;
+            const int Ti = Tn + rescale_rows(cur, nullptr, nullptr, lo0, hi0, bad);
+            if (bad) return false;
+
+            const double* Fi = F + static_cast<size_t>(i) * st;
+            const double gh = post_factor(S[i] + Ti - ze, zr, bad);
+            loss += row_loss(i > 0 ? S[i] - S[i - 1] : 0, Ti - Tn, gh);
+            // gap_extend_a: A-gap steps (i, j-1) -> (i, j).
+            if (i >= kGapTargetMin) {
+                double s = 0.0;
+                for (int j = std::max(1, lo0); j <= hi0; ++j) s += Fi[j - 1] * cur[j];
+                g_ea += s * ea * gh;
+            }
+            if (i >= 1) {
+                const double gv = post_factor(S[i - 1] + Ti - ze, zr, bad);
+                const double* Fp = Fi - st;
+                double s = 0.0;
+                for (int j = std::max(kGapTargetMin, lo0); j <= hi0; ++j) s += Fp[j] * cur[j];
+                g_eb += s * eb * gv;
+                const double* Er = E + static_cast<size_t>(A[i - 1]) * na;
+                std::fill(srow, srow + na, 0.0);
+                for (int j = jlo(i); j <= jhi(i); ++j)
+                    srow[Bs[j - 1]] += Fp[j - 1] * Er[Bs[j - 1]] * cur[j];
+                double* gr = gblk + static_cast<size_t>(A[i - 1]) * na;
+                for (int b = 0; b < na; ++b) gr[b] += srow[b] * gv;
+            }
+            if (bad) return false;
+            Tn = Ti;
+            std::swap(cur, nxt); std::swap(clo, nlo); std::swap(chi, nhi);
+        }
+        if (!(loss <= kScaledLossTol)) return false;
+        sg_ge_a_ = -g_ea; sg_ge_b_ = -g_eb;
+        return true;
+    }
+
+    bool fwdbwd_affine_scaled(DpBuffer& buf) {
+        if (!prepare_scaled()) return false;
+        const double oa = std::exp(-(params_->gap_open_a + params_->gap_extend_a));
+        const double ea = std::exp(-params_->gap_extend_a);
+        const double ob = std::exp(-(params_->gap_open_b + params_->gap_extend_b));
+        const double eb = std::exp(-params_->gap_extend_b);
+        if (weight_bad(oa) || weight_bad(ea) || weight_bad(ob) || weight_bad(eb)) return false;
+        if (buf.FM.size() < sz_) { buf.FM.resize(sz_); buf.FX.resize(sz_); buf.FY.resize(sz_); }
+        auto& S = buf.sexp; S.assign(static_cast<size_t>(m_) + 1, 0);
+        double* FM = buf.FM.data(); double* FX = buf.FX.data(); double* FY = buf.FY.data();
+        const size_t st = stride_;
+        const double* E = es_.data();
+        const int na = nalpha_;
+        const uint8_t* A = a_idx_.data();
+        const uint8_t* Bs = b_idx_.data();
+        constexpr bool L = (AM == AlignMode::Local);
+        bool bad = false;
+
+        if constexpr (AB == AlignBand::GuideBanded) {
+            band_fill(buf.FM, 0.0); band_fill(buf.FX, 0.0); band_fill(buf.FY, 0.0);
+        } else {
+            std::fill(FM, FM + n_ + 1, 0.0); std::fill(FX, FX + n_ + 1, 0.0);
+            std::fill(FY, FY + n_ + 1, 0.0);
+        }
+        // Row 0.
+        if constexpr (L) { for (int j = 0; j <= n_; ++j) FM[j] = 1.0; }
+        else {
+            FM[0] = 1.0;
+            const int bj = border_cols();
+            if (bj >= 1) FY[1] = oa;
+            for (int j = 2; j <= bj; ++j) FY[j] = FY[j - 1] * ea;
+        }
+        const int bi = border_rows();
+        for (int i = 1; i <= m_; ++i) {
+            const size_t ro = static_cast<size_t>(i) * st;
+            double* rM = FM + ro; double* rX = FX + ro; double* rY = FY + ro;
+            const double* pM = rM - st; const double* pX = rX - st; const double* pY = rY - st;
+            double fr = 0.0;
+            if constexpr (L) {
+                fr = std::ldexp(1.0, -S[i - 1]);
+                rM[0] = fr; rX[0] = 0.0; rY[0] = 0.0;
+            } else {
+                rM[0] = 0.0; rY[0] = 0.0;
+                rX[0] = (i <= bi) ? (pM[0] + pY[0]) * ob + pX[0] * eb : 0.0;
+            }
+            const double* Er = E + static_cast<size_t>(A[i - 1]) * na;
+            const int lo = jlo(i), hi = jhi(i);
+            for (int j = lo; j <= hi; ++j) {
+                rM[j] = (pM[j - 1] + pX[j - 1] + pY[j - 1]) * Er[Bs[j - 1]] + fr;
+                rX[j] = (pM[j] + pY[j]) * ob + pX[j] * eb;
+            }
+            for (int j = lo; j <= hi; ++j)
+                rY[j] = (rM[j - 1] + rX[j - 1]) * oa + rY[j - 1] * ea;
+            int slo, shi; sc_span(i, slo, shi);
+            S[i] = S[i - 1] + rescale_rows(rM, rX, rY, slo, shi, bad);
+            if (bad) return false;
+        }
+
+        int ze; double zr;
+        finish_log_z(S, [&](int i, int lo, int hi) {
+            const size_t ro = static_cast<size_t>(i) * st;
+            double s = 0.0;
+            for (int j = lo; j <= hi; ++j) s += FM[ro + j] + FX[ro + j] + FY[ro + j];
+            return s;
+        }, ze, zr);
+        if (!(zr > 0.0)) return zero_z_ok();
+
+        const size_t w = static_cast<size_t>(n_) + 2;
+        buf.sb0.assign(w, 0.0); buf.sb1.assign(w, 0.0); buf.sb2.assign(w, 0.0);
+        buf.sb3.assign(w, 0.0); buf.sb4.assign(w, 0.0); buf.sb5.assign(w, 0.0);
+        double *cM = buf.sb0.data(), *cX = buf.sb1.data(), *cY = buf.sb2.data();
+        double *nM = buf.sb3.data(), *nX = buf.sb4.data(), *nY = buf.sb5.data();
+        int clo = 0, chi = n_, nlo = 0, nhi = n_;
+        int Tn = 0;
+        double* srow = srow_.data();
+        double* gblk = scnt_.data();
+        double g_ea = 0.0, g_eb = 0.0, g_oa = 0.0, g_ob = 0.0, loss = 0.0;
+        for (int i = m_; i >= 0; --i) {
+            const int lo0 = jlo0(i), hi0 = jhi0(i);
+            std::fill(cM + clo, cM + chi + 1, 0.0);
+            std::fill(cX + clo, cX + chi + 1, 0.0);
+            std::fill(cY + clo, cY + chi + 1, 0.0);
+            double init = 0.0;
+            if constexpr (L) {
+                init = std::ldexp(1.0, -Tn);
+            }
+            const double* En = (i < m_) ? E + static_cast<size_t>(A[i]) * na : nullptr;
+            for (int j = lo0; j <= hi0; ++j) {
+                const double d = (En && j < n_) ? En[Bs[j]] * nM[j + 1] + init : init;
+                const double v = nX[j];
+                cM[j] = d + v * ob;
+                cX[j] = d + v * eb;
+                cY[j] = d + v * ob;
+            }
+            if constexpr (!L)
+                if (i == m_ && n_ >= lo0 && n_ <= hi0) { cM[n_] = 1.0; cX[n_] = 1.0; cY[n_] = 1.0; }
+            for (int j = hi0 - 1; j >= lo0; --j) {
+                const double h = cY[j + 1];
+                cM[j] += h * oa;
+                cX[j] += h * oa;
+                cY[j] += h * ea;
+            }
+            clo = lo0; chi = hi0;
+            const int Ti = Tn + rescale_rows(cM, cX, cY, lo0, hi0, bad);
+            if (bad) return false;
+
+            const size_t ro = static_cast<size_t>(i) * st;
+            const double* fM = FM + ro; const double* fX = FX + ro; const double* fY = FY + ro;
+            const double gh = post_factor(S[i] + Ti - ze, zr, bad);
+            loss += row_loss(i > 0 ? S[i] - S[i - 1] : 0, Ti - Tn, gh);
+            {
+                double sx = 0.0;   // gap_extend_b: X-state occupancy
+                if (i >= 1) for (int j = lo0; j <= hi0; ++j) sx += fX[j] * cX[j];
+                double sy = 0.0, so = 0.0;   // gap_extend_a: Y occupancy; gap_open_a: M/X -> Y
+                for (int j = std::max(1, lo0); j <= hi0; ++j) {
+                    sy += fY[j] * cY[j];
+                    so += (fM[j - 1] + fX[j - 1]) * cY[j];
+                }
+                g_eb += sx * gh;
+                g_ea += sy * gh;
+                if (i >= kGapTargetMin) g_oa += so * oa * gh;
+            }
+            if (i >= 1) {
+                const double gv = post_factor(S[i - 1] + Ti - ze, zr, bad);
+                const double* qM = fM - st; const double* qX = fX - st; const double* qY = fY - st;
+                double s = 0.0;   // gap_open_b: M/Y at (i-1, j) -> X at (i, j)
+                for (int j = std::max(kGapTargetMin, lo0); j <= hi0; ++j)
+                    s += (qM[j] + qY[j]) * cX[j];
+                g_ob += s * ob * gv;
+                const double* Er = E + static_cast<size_t>(A[i - 1]) * na;
+                std::fill(srow, srow + na, 0.0);
+                for (int j = jlo(i); j <= jhi(i); ++j)
+                    srow[Bs[j - 1]] += (qM[j - 1] + qX[j - 1] + qY[j - 1]) * Er[Bs[j - 1]] * cM[j];
+                double* gr = gblk + static_cast<size_t>(A[i - 1]) * na;
+                for (int b = 0; b < na; ++b) gr[b] += srow[b] * gv;
+            }
+            if (bad) return false;
+            Tn = Ti;
+            std::swap(cM, nM); std::swap(cX, nX); std::swap(cY, nY);
+            std::swap(clo, nlo); std::swap(chi, nhi);
+        }
+        if (!(loss <= kScaledLossTol)) return false;
+        sg_ge_a_ = -g_ea; sg_ge_b_ = -g_eb; sg_go_a_ = -g_oa; sg_go_b_ = -g_ob;
+        return true;
     }
 };
 

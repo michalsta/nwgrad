@@ -201,6 +201,31 @@ static std::pair<bool, bool> parse_batch_fill(const std::string& name) {
         ("nwgrad: unknown fill \"" + name +
          "\" (expected \"striped\", \"rowwise\" or \"interpair\")").c_str());
 }
+static SoftImpl parse_soft_impl(const std::string& name) {
+    if (name == "scaled")        return SoftImpl::Scaled;
+    if (name == "scaled_or_log") return SoftImpl::ScaledOrLog;
+    if (name == "log")           return SoftImpl::Log;
+    throw nb::value_error(
+        ("nwgrad: unknown soft_impl \"" + name +
+         "\" (expected \"scaled\", \"scaled_or_log\" or \"log\")").c_str());
+}
+static const char* soft_impl_name(SoftImpl s) {
+    switch (s) {
+        case SoftImpl::Scaled:      return "scaled";
+        case SoftImpl::ScaledOrLog: return "scaled_or_log";
+        default:                    return "log";
+    }
+}
+#define NWGRAD_SOFT_IMPL_DOC \
+    "How the soft path (grad_mode=\"soft\") evaluates forward-backward.\n" \
+    "  \"scaled\" (default): probability space with exact power-of-two row\n" \
+    "     rescaling, gradient fused into the backward pass; no exp/log per cell.\n" \
+    "     Raises ValueError for a pair whose dynamic range does not fit a double\n" \
+    "     (typically local log Z beyond ~700 nats, i.e. long high-scoring protein\n" \
+    "     pairs, or a step score beyond +-34.6).\n" \
+    "  \"scaled_or_log\": \"scaled\", silently falling back per pair to \"log\".\n" \
+    "  \"log\": the log-space recurrences; unlimited range, far slower.\n" \
+    "Results agree to ~1e-12 relative, not bit-for-bit; the hard path is unaffected."
 static const char* traceback_name(TracebackMode t) {
     switch (t) {
         case TracebackMode::Pointers:   return "pointers";
@@ -275,13 +300,18 @@ static void bind_convenience(nb::module_& m, const std::string& sfx) {
 #define NWG_SOFT(FN, GM, AM, DOC) \
     m.def((std::string(FN) + sfx).c_str(), \
         [](const std::string& a, const std::string& b, const AlignParams& params, int band, \
-           const std::string& aligned_a, const std::string& aligned_b, const std::string& kernel) { \
+           const std::string& aligned_a, const std::string& aligned_b, const std::string& kernel, \
+           const std::string& soft_impl) { \
             auto gj = make_guide(aligned_a, aligned_b); EncodedPair enc(a, b, params); \
+            const SoftImpl si = parse_soft_impl(soft_impl); \
             WITH_ALIGNER_T(T, GM, AM, band, gj, { \
+                al.set_soft_impl(si); \
                 al.set_problem(enc.a, enc.b, params, band, gj); al.compute_forward_back(_buf); \
                 AlignParams grad = AlignParams::zeros_like(params); al.soft_grad(_buf, grad); \
                 return nb::make_tuple(al.log_z(), grad); }); \
-        }, NWG_CONV_ARGS, DOC)
+        }, NWG_CONV_ARGS, nb::arg("soft_impl") = "scaled", \
+        DOC "\n\nsoft_impl: \"scaled\" (default) | \"scaled_or_log\" | \"log\" -- " \
+        "see SeqPairBatch.soft_impl.")
 
     NWG_SCORE("nw_score", Linear, Global, "Needleman-Wunsch global alignment score (linear gap penalty).");
     NWG_SCORE("sw_score", Linear, Local,  "Smith-Waterman local alignment score (linear gap penalty).");
@@ -325,6 +355,11 @@ static void bind_batch_aligner(nb::module_& m, const char* name) {
             "  band      : 0 = full DP; >0 = banded half-width\n"
             "  kernel    : \"auto\" (default) | \"scalar_fallback\" | \"sse2\" | \"avx2\" |\n"
             "              \"avx512\" | \"neon\" — bit-exact Viterbi backends; a speed knob.")
+        .def_prop_rw(
+            "soft_impl",
+            [](const BA& s) { return soft_impl_name(s.soft_impl); },
+            [](BA& s, const std::string& v) { s.soft_impl = parse_soft_impl(v); },
+            NWGRAD_SOFT_IMPL_DOC)
         .def(
             "align",
             [](const BA& self,
@@ -482,6 +517,11 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
             [](const SP& s) { return s.rowwise_full() ? "rowwise" : "striped"; },
             [](SP& s, const std::string& v) { s.set_rowwise_full(parse_fill(v)); },
             "Full-DP simd fill at double precision — see SeqPairBatch.fill.")
+        .def_prop_rw(
+            "soft_impl",
+            [](const SP& s) { return soft_impl_name(s.soft_impl()); },
+            [](SP& s, const std::string& v) { s.set_soft_impl(parse_soft_impl(v)); },
+            NWGRAD_SOFT_IMPL_DOC)
         .def_prop_ro("seq_a", [](const SP& s) { return s.seq_a(); })
         .def_prop_ro("seq_b", [](const SP& s) { return s.seq_b(); });
 }
@@ -725,6 +765,14 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             "per group of pairs) per thread even with traceback \"pointers\".  Ignored at\n"
             "float32, for linear gaps, and on the scalar kernel.  Applies to the pairs in\n"
             "the batch and to later add_many() ones.")
+        .def_prop_rw(
+            "soft_impl",
+            [](const SPB& s) { return soft_impl_name(s.soft_impl); },
+            [](SPB& s, const std::string& v) {
+                s.soft_impl = parse_soft_impl(v);
+                for (auto* sp : s.pairs) sp->set_soft_impl(s.soft_impl);
+            },
+            NWGRAD_SOFT_IMPL_DOC "\nApplies to the pairs in the batch and to later add_many() ones.")
         .def_prop_rw(
             "hb_cutoff",
             [](const SPB& s) { return s.hb_cutoff; },

@@ -125,7 +125,9 @@ def test_low_temperature_limit(a, b, name, soft_fn, _score_fn, gap_extend, gap_o
     T = 1000.0
     p_scaled = make_params(BLOSUM62 * T, gap_extend * T, gap_open * T)
 
-    log_z, g_soft = soft_fn(a, b, p_scaled)
+    # Steps of ~1e4 nats are far outside the scaled path's range (it raises there);
+    # this is the regime soft_impl="scaled_or_log" exists for.
+    log_z, g_soft = soft_fn(a, b, p_scaled, soft_impl="scaled_or_log")
     g_soft = g_soft.matrix.to_matrix()
 
     hard_fn_map = {
