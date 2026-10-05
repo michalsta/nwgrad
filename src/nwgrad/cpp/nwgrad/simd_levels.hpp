@@ -311,7 +311,7 @@ struct SoftPairJob {
     size_t stride;                  // n+1
     double *FM, *FX, *FY;           // forward tables (linear: FM only)
     double *r0, *r1, *r2, *r3, *r4, *r5;   // n+2 each
-    int* S; double* rowsum;         // m+1 each
+    int* S; double* rowsum; double* fmax;   // m+1 each (fmax: forward row maxima)
     double* scnt; double* srow;     // nalpha^2, nalpha
     double log_z, g_oa, g_ea, g_ob, g_eb;
     int ok;

@@ -2956,7 +2956,7 @@ private:
             bl[4 * mm + i] = lo; bl[5 * mm + i] = hi;
         }
         buf.sexp.resize(mm);
-        srs_.resize(mm);
+        srs_.resize(2 * mm);
         J.m = m_; J.n = n_; J.nalpha = nalpha_;
         J.a = a_idx_.data(); J.b = b_idx_.data();
         J.P = build_profile(buf, w);
@@ -2970,7 +2970,7 @@ private:
         else { J.FM = buf.FM.data(); J.FX = buf.FX.data(); J.FY = buf.FY.data(); }
         J.r0 = buf.sb0.data(); J.r1 = buf.sb1.data(); J.r2 = buf.sb2.data();
         J.r3 = buf.sb3.data(); J.r4 = buf.sb4.data(); J.r5 = buf.sb5.data();
-        J.S = buf.sexp.data(); J.rowsum = srs_.data();
+        J.S = buf.sexp.data(); J.rowsum = srs_.data(); J.fmax = srs_.data() + mm;
         J.scnt = scnt_.data(); J.srow = srow_.data();
         soft_pair_fn fn = lin ? &nwgrad_soft_base::soft_pair_linear : &nwgrad_soft_base::soft_pair_affine;
         const int be = (backend_ == kBackendAuto) ? global_default_backend() : backend_;

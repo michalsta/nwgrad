@@ -351,3 +351,35 @@ def test_soft_guide_rejects_unknown():
     b = nwgrad.SeqPairBatchDouble()
     with pytest.raises(ValueError):
         b.soft_guide = "never"
+
+
+@pytest.mark.parametrize("gm", ["affine", "linear"])
+@pytest.mark.parametrize("mode", ["global", "local"])
+@pytest.mark.parametrize("bw", [0, 6])
+def test_lazy_rescale_both_directions(gm, mode, bw):
+    """Rows are rescaled only when they leave [2^-256, 2^256].  Long pairs with strongly
+    negative (global) or strongly positive (local) scores force rescales in both
+    directions, over full and banded tables; results must still match the log path."""
+    rng = np.random.default_rng(91)
+    M = rng.normal(-3.0, 1.0, (4, 4)) + (9.0 if mode == "local" else 0.0) * np.eye(4)
+    gaps = (2.0, 1.5, 2.5, 1.0) if gm == "affine" else (0.0, 2.5, 0.0, 2.0)
+    params = nwgrad.AlignParams(nwgrad.SubstMatrix(M, "ACGT"), *gaps)
+    for _ in range(3):
+        a = rand_seq(rng, "ACGT", int(rng.integers(250, 400)))
+        b = a[:150] + rand_seq(rng, "ACGT", int(rng.integers(100, 250)))
+        out = []
+        for impl in ("scaled", "log"):
+            sp = nwgrad.SeqPairDouble(a, b, params, gap_model=gm, mode=mode, grad_mode="soft")
+            sp.soft_impl = impl
+            sp.alloc_dp()
+            sp.align_full()
+            if bw:
+                sp.realign_banded(bw)
+            sp.compute_grad()
+            g = sp.grad
+            out.append((sp.score, g.matrix.to_matrix(),
+                        [g.gap_open_a, g.gap_extend_a, g.gap_open_b, g.gap_extend_b]))
+        assert abs(out[0][0]) > 200          # far outside a single rescale window
+        close(out[0][0], out[1][0])
+        close(out[0][1], out[1][1])
+        close(out[0][2], out[1][2])

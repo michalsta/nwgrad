@@ -38,18 +38,41 @@
 
 static constexpr double kSpLossTol = 0x1p-45;
 
-// y[j] += e·y[j-1], j = lo..hi, two cells per carry step.
-static inline void sp_carry_fwd(double* y, int lo, int hi, double e) noexcept {
+// y[j] = u[j] + e·y[j-1], j = lo..hi (y[lo-1] given; u may alias y), two cells per
+// carry step.
+static inline void sp_carry_fwd(double* y, const double* u, int lo, int hi, double e) noexcept {
     double c = y[lo - 1];
     const double e2 = e * e;
     int j = lo;
     for (; j < hi; j += 2) {
-        const double u1 = y[j], u2 = y[j + 1];
+        const double u1 = u[j], u2 = u[j + 1];
         y[j] = u1 + e * c;
         c = (u2 + e * u1) + e2 * c;
         y[j + 1] = c;
     }
-    if (j == hi) y[j] = y[j] + e * c;
+    if (j == hi) y[j] = u[j] + e * c;
+}
+
+// LAZY rescale: only when the row max mx leaves [2^-256, 2^256] (or overflows: bad).
+// Scales [lo, hi] of the given rows (nullptr skips) and mx; returns the exponent removed.
+static inline int sp_lazy(double& mx, int lo, int hi, bool& bad, double* r0, double* r1 = nullptr,
+                          double* r2 = nullptr, double* r3 = nullptr) noexcept {
+    if (!(mx <= std::numeric_limits<double>::max())) { bad = true; return 0; }
+    if (mx == 0.0 || (mx <= 0x1p256 && mx >= 0x1p-256)) return 0;
+    const int k = std::ilogb(mx);
+    const double sc = std::ldexp(1.0, -k);
+    for (double* r : {r0, r1, r2, r3})
+        if (r) for (int j = lo; j <= hi; ++j) r[j] *= sc;
+    mx *= sc;
+    return k;
+}
+// Bound on the posterior damage of mass lost in one row pair (see AGENTS.md): lost terms
+// are below DMIN in stored units (x2^-k where a rescale scaled UP), and act through the
+// other direction's actual row max times the row's posterior factor g.
+static inline double sp_loss(int n, int kf, int kb, double mxf, double mxb, double g) noexcept {
+    const double lf = kf < 0 ? std::ldexp(1.0, -kf) : 1.0;
+    const double lb = kb < 0 ? std::ldexp(1.0, -kb) : 1.0;
+    return 32.0 * (n + 1) * std::numeric_limits<double>::min() * (lf * mxb + lb * mxf) * g;
 }
 // y[j] += e·y[j+1], j = hi..lo.
 static inline void sp_carry_bwd(double* y, int lo, int hi, double e) noexcept {
@@ -65,48 +88,10 @@ static inline void sp_carry_bwd(double* y, int lo, int hi, double e) noexcept {
     if (j == lo) y[j] = y[j] + e * c;
 }
 
-// Rescale [lo, hi] of one or three rows so the total's max lands in [1, 2); totals to
-// tot if given.  Returns the exponent removed; sets bad on overflow.
-static inline int sp_rescale(double* __restrict r0, double* __restrict r1, double* __restrict r2,
-                             double* __restrict tot, int lo, int hi, bool& bad) noexcept {
-    double mx = 0.0;
-    if (r1 && tot) {
-        NWGRAD_SP_MAX(mx)
-        for (int j = lo; j <= hi; ++j) {
-            const double t = r0[j] + r1[j] + r2[j];
-            tot[j] = t;
-            mx = t > mx ? t : mx;
-        }
-    } else if (r1) {
-        NWGRAD_SP_MAX(mx)
-        for (int j = lo; j <= hi; ++j) {
-            const double t = r0[j] + r1[j] + r2[j];
-            mx = t > mx ? t : mx;
-        }
-    } else {
-        NWGRAD_SP_MAX(mx)
-        for (int j = lo; j <= hi; ++j) mx = r0[j] > mx ? r0[j] : mx;
-    }
-    if (!(mx <= std::numeric_limits<double>::max())) { bad = true; return 0; }
-    if (mx == 0.0) return 0;
-    const int k = std::ilogb(mx);
-    if (k == 0) return 0;
-    const double sc = std::ldexp(1.0, -k);
-    for (int j = lo; j <= hi; ++j) r0[j] *= sc;
-    if (r1) for (int j = lo; j <= hi; ++j) { r1[j] *= sc; r2[j] *= sc; }
-    if (tot) for (int j = lo; j <= hi; ++j) tot[j] *= sc;
-    return k;
-}
-
 static inline double sp_post(int e, double izr, bool& bad) noexcept {
     const double f = std::ldexp(izr, e);
     if (!(f <= std::numeric_limits<double>::max())) bad = true;
     return f;
-}
-static inline double sp_row_loss(int n, int kf, int kb, double g) noexcept {
-    const double lf = kf < 0 ? std::ldexp(1.0, -kf) : 1.0;
-    const double lb = kb < 0 ? std::ldexp(1.0, -kb) : 1.0;
-    return 32.0 * (n + 1) * std::numeric_limits<double>::min() * (lf + lb) * g;
 }
 // Match posteriors tmp[j] of row i into the count row of a[i-1], times g.
 static inline void sp_scatter(const SoftPairJob& J, const double* tmp, int i, int lo, int hi,
@@ -140,7 +125,7 @@ static inline bool sp_log_z(SoftPairJob& J, const int* S, const double* rowsum_o
 
 NWGRAD_SP_FMA_FN static void soft_pair_linear(SoftPairJob& J) noexcept {
     NWGRAD_SP_FMA_BODY
-    const int m = J.m, n = J.n, na = J.nalpha;
+    const int m = J.m, n = J.n;
     const bool L = J.local != 0;
     const int kmin = L ? 1 : 0;
     const double ea = J.ea, eb = J.eb;
@@ -148,6 +133,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear(SoftPairJob& J) noexcept {
     double* F = J.FM;
     int* S = J.S;
     double* rs = J.rowsum;
+    double* mf = J.fmax;
     const double* P = J.P;
     bool bad = false;
     J.ok = 0;
@@ -164,7 +150,12 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear(SoftPairJob& J) noexcept {
         for (int j = 1; j <= J.bj; ++j) F[j] = F[j - 1] * ea;
     }
     S[0] = 0;
-    if (L) { double s = 0.0; for (int j = J.jlo0[0]; j <= J.jhi0[0]; ++j) s += F[j]; rs[0] = s; }
+    {
+        double mx = 0.0;
+        for (int j = J.slo[0]; j <= J.shi[0]; ++j) mx = F[j] > mx ? F[j] : mx;
+        mf[0] = mx;
+        if (L) { double s = 0.0; for (int j = J.jlo0[0]; j <= J.jhi0[0]; ++j) s += F[j]; rs[0] = s; }
+    }
     for (int i = 1; i <= m; ++i) {
         double* __restrict r = F + static_cast<size_t>(i) * st;
         const double* __restrict p = r - st;
@@ -174,9 +165,13 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear(SoftPairJob& J) noexcept {
         const double* __restrict pr = P + static_cast<size_t>(J.a[i - 1]) * w;
         const int lo = J.jlo[i], hi = J.jhi[i];
         for (int j = lo; j <= hi; ++j) r[j] = p[j - 1] * pr[j] + p[j] * eb + fr;
-        if (lo <= hi) sp_carry_fwd(r, lo, hi, ea);
-        S[i] = S[i - 1] + sp_rescale(r, nullptr, nullptr, nullptr, J.slo[i], J.shi[i], bad);
+        if (lo <= hi) sp_carry_fwd(r, r, lo, hi, ea);
+        double mx = 0.0;
+        NWGRAD_SP_MAX(mx)
+        for (int j = J.slo[i]; j <= J.shi[i]; ++j) mx = r[j] > mx ? r[j] : mx;
+        S[i] = S[i - 1] + sp_lazy(mx, J.slo[i], J.shi[i], bad, r);
         if (bad) return;
+        mf[i] = mx;
         if (L) {
             double s = 0.0;
             NWGRAD_SP_SUM(s)
@@ -188,8 +183,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear(SoftPairJob& J) noexcept {
     const double corner = mn_in ? F[static_cast<size_t>(m) * st + n] : 0.0;
     int ze; double izr;
     if (!sp_log_z(J, S, rs, corner, ze, izr)) {
-        // Global with (m, n) outside the band: log Z = -inf and zero counts, genuinely.
-        if (!L && !mn_in) {
+        if (!L && !mn_in) {   // Global, (m, n) outside the band: log Z = -inf, genuinely
             J.log_z = -std::numeric_limits<double>::infinity();
             J.g_oa = J.g_ea = J.g_ob = J.g_eb = 0.0;
             J.ok = 1;
@@ -217,31 +211,45 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear(SoftPairJob& J) noexcept {
         }
         if (lo0 <= hi0) sp_carry_bwd(cur, lo0, hi0, ea);
         clo = lo0; chi = hi0;
-        const int Ti = Tn + sp_rescale(cur, nullptr, nullptr, nullptr, lo0, hi0, bad);
-        if (bad) return;
 
+        // One vector pass: row max and every gradient sum, on the pre-rescale values.
         const double* __restrict Fi = F + static_cast<size_t>(i) * st;
         const double* __restrict cb = cur;
-        const double gh = sp_post(S[i] + Ti - ze, izr, bad);
-        loss += sp_row_loss(n, i > 0 ? S[i] - S[i - 1] : 0, Ti - Tn, gh);
-        if (i >= kmin) {
-            double s = 0.0;
-            NWGRAD_SP_SUM(s)
-            for (int j = std::max(1, lo0); j <= hi0; ++j) s += Fi[j - 1] * cb[j];
-            g_ea += s * ea * gh;
-        }
+        const int j1 = std::max(1, lo0);
+        double mx = 0.0, sa = 0.0, sb = 0.0;
+        if (lo0 == 0) { mx = cb[0]; if (i >= 1 && kmin == 0) sb += (Fi - st)[0] * cb[0]; }
         if (i >= 1) {
-            const double gv = sp_post(S[i - 1] + Ti - ze, izr, bad);
             const double* __restrict Fp = Fi - st;
-            double s = 0.0;
-            NWGRAD_SP_SUM(s)
-            for (int j = std::max(kmin, lo0); j <= hi0; ++j) s += Fp[j] * cb[j];
-            g_eb += s * eb * gv;
             const double* __restrict pr = P + static_cast<size_t>(J.a[i - 1]) * w;
             double* __restrict t = tmp;
-            const int lo = J.jlo[i], hi = J.jhi[i];
-            for (int j = lo; j <= hi; ++j) t[j] = Fp[j - 1] * pr[j] * cb[j];
-            sp_scatter(J, tmp, i, lo, hi, gv);
+            NWGRAD_SP_PRAGMA_(omp simd reduction(+:sa, sb) reduction(max:mx))
+            for (int j = j1; j <= hi0; ++j) {
+                const double b = cb[j];
+                mx = b > mx ? b : mx;
+                sa += Fi[j - 1] * b;
+                sb += Fp[j] * b;
+                t[j] = Fp[j - 1] * pr[j] * b;
+            }
+        } else {
+            NWGRAD_SP_PRAGMA_(omp simd reduction(+:sa) reduction(max:mx))
+            for (int j = j1; j <= hi0; ++j) {
+                const double b = cb[j];
+                mx = b > mx ? b : mx;
+                sa += Fi[j - 1] * b;
+            }
+        }
+        const int kb = sp_lazy(mx, lo0, hi0, bad, cur);
+        if (bad) return;
+        const int Ti = Tn + kb;
+        // Sums were taken before any rescale: their factor uses Tn, the bound uses Ti.
+        const double gh0 = sp_post(S[i] + Tn - ze, izr, bad);
+        const double gh = sp_post(S[i] + Ti - ze, izr, bad);
+        loss += sp_loss(n, i > 0 ? S[i] - S[i - 1] : 0, kb, mf[i], mx, gh);
+        if (i >= kmin) g_ea += sa * ea * gh0;
+        if (i >= 1) {
+            const double gv0 = sp_post(S[i - 1] + Tn - ze, izr, bad);
+            g_eb += sb * eb * gv0;
+            sp_scatter(J, tmp, i, j1, hi0, gv0);
         }
         if (bad) return;
         Tn = Ti;
@@ -250,7 +258,6 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear(SoftPairJob& J) noexcept {
     if (!(loss <= kSpLossTol)) return;
     J.g_oa = 0.0; J.g_ea = -g_ea; J.g_ob = 0.0; J.g_eb = -g_eb;
     J.ok = 1;
-    (void)na;
 }
 
 NWGRAD_SP_FMA_FN static void soft_pair_affine(SoftPairJob& J) noexcept {
@@ -263,10 +270,12 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine(SoftPairJob& J) noexcept {
     double* FM = J.FM; double* FX = J.FX; double* FY = J.FY;
     int* S = J.S;
     double* rs = J.rowsum;
+    double* mf = J.fmax;
     const double* P = J.P;
     bool bad = false;
     J.ok = 0;
     double* tp = J.r5;   // M+X+Y of the previous forward row; later the match scratch
+    double* uy = J.r4;   // forward: the Y carry's carry-free input
 
     if (!J.full) {
         for (int i = 0; i <= m; ++i) {
@@ -282,7 +291,14 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine(SoftPairJob& J) noexcept {
         if (J.bj >= 1) FY[1] = oa;
         for (int j = 2; j <= J.bj; ++j) FY[j] = FY[j - 1] * ea;
     }
-    for (int j = J.slo[0]; j <= J.shi[0]; ++j) tp[j] = FM[j] + FX[j] + FY[j];
+    {
+        double mx = 0.0;
+        for (int j = J.slo[0]; j <= J.shi[0]; ++j) {
+            tp[j] = FM[j] + FX[j] + FY[j];
+            mx = tp[j] > mx ? tp[j] : mx;
+        }
+        mf[0] = mx;
+    }
     S[0] = 0;
     if (L) { double s = 0.0; for (int j = J.jlo0[0]; j <= J.jhi0[0]; ++j) s += tp[j]; rs[0] = s; }
     for (int i = 1; i <= m; ++i) {
@@ -299,15 +315,30 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine(SoftPairJob& J) noexcept {
         }
         const double* __restrict pr = P + static_cast<size_t>(J.a[i - 1]) * w;
         const double* __restrict tq = tp;
+        double* __restrict u = uy;
         const int lo = J.jlo[i], hi = J.jhi[i];
-        for (int j = lo; j <= hi; ++j) {
-            rM[j] = tq[j - 1] * pr[j] + fr;
-            rX[j] = (pM[j] + pY[j]) * ob + pX[j] * eb;
+        if (lo <= hi) {
+            u[lo] = (rM[lo - 1] + rX[lo - 1]) * oa;
+            // M, X, and the Y carry's input for the NEXT column, in one vector pass.
+            for (int j = lo; j <= hi; ++j) {
+                const double mv = tq[j - 1] * pr[j] + fr;
+                const double xv = (pM[j] + pY[j]) * ob + pX[j] * eb;
+                rM[j] = mv; rX[j] = xv;
+                u[j + 1] = (mv + xv) * oa;
+            }
+            sp_carry_fwd(rY, u, lo, hi, ea);
         }
-        for (int j = lo; j <= hi; ++j) rY[j] = (rM[j - 1] + rX[j - 1]) * oa;
-        if (lo <= hi) sp_carry_fwd(rY, lo, hi, ea);
-        S[i] = S[i - 1] + sp_rescale(rM, rX, rY, tp, J.slo[i], J.shi[i], bad);
+        double mx = 0.0;
+        double* __restrict t = tp;
+        NWGRAD_SP_MAX(mx)
+        for (int j = J.slo[i]; j <= J.shi[i]; ++j) {
+            const double v = rM[j] + rX[j] + rY[j];
+            t[j] = v;
+            mx = v > mx ? v : mx;
+        }
+        S[i] = S[i - 1] + sp_lazy(mx, J.slo[i], J.shi[i], bad, rM, rX, rY, tp);
         if (bad) return;
+        mf[i] = mx;
         if (L) {
             double s = 0.0;
             NWGRAD_SP_SUM(s)
@@ -349,7 +380,8 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine(SoftPairJob& J) noexcept {
                 const double* __restrict pn = P + static_cast<size_t>(J.a[i]) * w;
                 for (int j = lo0; j <= hi0; ++j) {
                     const double d = pn[j + 1] * nm[j + 1] + init, v = nx[j];
-                    b1[j] = d + v * ob; b2[j] = d + v * eb; y[j] = b1[j];
+                    const double v1 = d + v * ob;
+                    b1[j] = v1; b2[j] = d + v * eb; y[j] = v1;
                 }
             } else {
                 for (int j = lo0; j <= hi0; ++j) { b1[j] = init; b2[j] = init; y[j] = init; }
@@ -357,54 +389,72 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine(SoftPairJob& J) noexcept {
             }
         }
         if (lo0 <= hi0) sp_carry_bwd(cY, lo0, hi0, ea);
-        {
-            double* __restrict b1 = cM; double* __restrict b2 = cX;
-            const double* __restrict y = cY;
-            for (int j = lo0; j <= hi0; ++j) {
-                const double h = y[j + 1] * oa;
-                b1[j] += h; b2[j] += h;
-            }
-        }
         clo = lo0; chi = hi0;
-        const int Ti = Tn + sp_rescale(cM, cX, cY, nullptr, lo0, hi0, bad);
-        if (bad) return;
 
+        // One vector pass: final M/X, the row max, every gradient sum and the match
+        // posteriors, all on the pre-rescale values.
         const size_t ro = static_cast<size_t>(i) * st;
         const double* __restrict fM = FM + ro; const double* __restrict fX = FX + ro;
         const double* __restrict fY = FY + ro;
-        const double* __restrict bM = cM; const double* __restrict bX = cX;
+        double* __restrict bM = cM; double* __restrict bX = cX;
         const double* __restrict bY = cY;
-        const double gh = sp_post(S[i] + Ti - ze, izr, bad);
-        loss += sp_row_loss(n, i > 0 ? S[i] - S[i - 1] : 0, Ti - Tn, gh);
-        {
-            double sx = 0.0;
+        const int j1 = std::max(1, lo0);
+        double mx = 0.0, sx = 0.0, sy = 0.0, so = 0.0, sob = 0.0;
+        if (lo0 == 0) {
+            const double h = bY[1] * oa;
+            const double mv = bM[0] + h, xv = bX[0] + h;
+            bM[0] = mv; bX[0] = xv;
+            mx = mv + xv + bY[0];
             if (i >= 1) {
-                NWGRAD_SP_SUM(sx)
-                for (int j = lo0; j <= hi0; ++j) sx += fX[j] * bX[j];
+                sx += fX[0] * xv;
+                if (kmin == 0) sob += ((fM - st)[0] + (fY - st)[0]) * xv;
             }
-            double sy = 0.0, so = 0.0;
-            NWGRAD_SP_SUM(sy, so)
-            for (int j = std::max(1, lo0); j <= hi0; ++j) {
-                sy += fY[j] * bY[j];
-                so += (fM[j - 1] + fX[j - 1]) * bY[j];
-            }
-            g_eb += sx * gh;
-            g_ea += sy * gh;
-            if (i >= kmin) g_oa += so * oa * gh;
         }
         if (i >= 1) {
-            const double gv = sp_post(S[i - 1] + Ti - ze, izr, bad);
             const double* __restrict qM = fM - st; const double* __restrict qX = fX - st;
             const double* __restrict qY = fY - st;
-            double s = 0.0;
-            NWGRAD_SP_SUM(s)
-            for (int j = std::max(kmin, lo0); j <= hi0; ++j) s += (qM[j] + qY[j]) * bX[j];
-            g_ob += s * ob * gv;
             const double* __restrict pr = P + static_cast<size_t>(J.a[i - 1]) * w;
             double* __restrict t = tmp;
-            const int lo = J.jlo[i], hi = J.jhi[i];
-            for (int j = lo; j <= hi; ++j) t[j] = (qM[j - 1] + qX[j - 1] + qY[j - 1]) * pr[j] * bM[j];
-            sp_scatter(J, tmp, i, lo, hi, gv);
+            NWGRAD_SP_PRAGMA_(omp simd reduction(+:sx, sy, so, sob) reduction(max:mx))
+            for (int j = j1; j <= hi0; ++j) {
+                const double y = bY[j];
+                const double h = bY[j + 1] * oa;
+                const double mv = bM[j] + h, xv = bX[j] + h;
+                bM[j] = mv; bX[j] = xv;
+                const double tot = mv + xv + y;
+                mx = tot > mx ? tot : mx;
+                sx += fX[j] * xv;
+                sy += fY[j] * y;
+                so += (fM[j - 1] + fX[j - 1]) * y;
+                sob += (qM[j] + qY[j]) * xv;
+                t[j] = (qM[j - 1] + qX[j - 1] + qY[j - 1]) * pr[j] * mv;
+            }
+        } else {
+            NWGRAD_SP_PRAGMA_(omp simd reduction(+:sy, so) reduction(max:mx))
+            for (int j = j1; j <= hi0; ++j) {
+                const double y = bY[j];
+                const double h = bY[j + 1] * oa;
+                const double mv = bM[j] + h, xv = bX[j] + h;
+                bM[j] = mv; bX[j] = xv;
+                const double tot = mv + xv + y;
+                mx = tot > mx ? tot : mx;
+                sy += fY[j] * y;
+                so += (fM[j - 1] + fX[j - 1]) * y;
+            }
+        }
+        const int kb = sp_lazy(mx, lo0, hi0, bad, cM, cX, cY);
+        if (bad) return;
+        const int Ti = Tn + kb;
+        const double gh0 = sp_post(S[i] + Tn - ze, izr, bad);
+        const double gh = sp_post(S[i] + Ti - ze, izr, bad);
+        loss += sp_loss(n, i > 0 ? S[i] - S[i - 1] : 0, kb, mf[i], mx, gh);
+        g_eb += sx * gh0;
+        g_ea += sy * gh0;
+        if (i >= kmin) g_oa += so * oa * gh0;
+        if (i >= 1) {
+            const double gv0 = sp_post(S[i - 1] + Tn - ze, izr, bad);
+            g_ob += sob * ob * gv0;
+            sp_scatter(J, tmp, i, j1, hi0, gv0);
         }
         if (bad) return;
         Tn = Ti;
