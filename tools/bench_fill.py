@@ -88,8 +88,8 @@ for prec in args.prec:
         for cfg in args.configs:
             mode, gap = cfg.split("-")
             for tb in args.tb:
-                if tb == "auto" and prec == "double":
-                    continue   # double auto = exact hirschberg; pointers row covers it
+                if tb == "auto" and prec == "double" and gap == "affine":
+                    continue   # double affine auto = exact hirschberg; pointers row covers it
                 for bw in [0] + args.band:
                     s = run(prec, t, mode, gap, tb, "striped", bw)
                     i = run(prec, t, mode, gap, tb, "interpair", bw)

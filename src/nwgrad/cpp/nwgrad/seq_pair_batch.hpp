@@ -730,7 +730,7 @@ private:
             band_.full_calls != full_calls_ || band_.default_backend != def_backend)
             build_band_groups_();
         const auto& elig = band_.elig;
-        const auto& other = plan_.other;
+        const auto& other = band_.other;
         const auto& backend = plan_.backend;
         const auto& groups = band_.groups;
         const size_t G = groups.size(), tasks = G + other.size();
@@ -823,17 +823,29 @@ private:
     struct BandGroups {
         size_t plan_gen = static_cast<size_t>(-1), plan_n = 0, full_calls = static_cast<size_t>(-1);
         int default_backend = -1000;
-        std::vector<size_t> elig;
+        std::vector<size_t> elig, other;
         std::vector<std::pair<size_t, size_t>> groups;
     };
     BandGroups band_;
     size_t full_calls_ = 0;
 
     void build_band_groups_() {
-        const auto& E = plan_.elig;
         BandGroups Bg;
         Bg.plan_gen = plan_.generation; Bg.plan_n = plan_.n_pairs;
         Bg.full_calls = full_calls_; Bg.default_backend = plan_.default_backend;
+        // Only hard affine pairs can share a banded fill; the rest (linear, soft) run
+        // their own, in PAIR order with the plan's ineligible ones — leaving them in the
+        // guide-sorted groups walked the pair objects in a permuted order, 5-10 % slower
+        // than the plain per-pair path (measured, linear, AVX2).
+        std::vector<size_t> E;
+        E.reserve(plan_.elig.size());
+        Bg.other = plan_.other;
+        for (size_t i : plan_.elig) {
+            const SeqPair& p = *pairs[i];
+            if (p.gap_model() == GapModel::Affine && p.grad_mode() != GradMode::Soft) E.push_back(i);
+            else Bg.other.push_back(i);
+        }
+        std::sort(Bg.other.begin(), Bg.other.end());
         Bg.elig = E;
         struct Key { int mid, len_a; size_t i; };
         std::vector<Key> keys;
