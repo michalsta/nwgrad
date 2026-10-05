@@ -24,6 +24,8 @@ ap.add_argument("--threads", type=int, nargs="+", default=[1])
 ap.add_argument("--reps", type=int, default=3)
 ap.add_argument("--impl", nargs="+", default=None,
                 help="soft_impl values to time (default: the build's default only)")
+ap.add_argument("--soft-guide", default="eager", choices=["eager", "lazy"],
+                help="SeqPairBatch.soft_guide for the soft arm")
 ap.add_argument("--configs", nargs="+",
                 default=["local-affine", "global-affine", "local-linear", "global-linear"])
 args = ap.parse_args()
@@ -44,6 +46,8 @@ def run(threads, mode, gap, grad_mode, tb="auto", fill=None, impl=None):
         b.fill = fill
     if impl is not None:
         b.soft_impl = impl
+    if grad_mode == "soft":
+        b.soft_guide = args.soft_guide
     b.add_many(A, B, params if gap == "affine" else lin, gap_model=gap, mode=mode,
                grad_mode=grad_mode)
     b.score_and_grad()  # warm: allocation, plan
@@ -55,7 +59,7 @@ def run(threads, mode, gap, grad_mode, tb="auto", fill=None, impl=None):
     return best / len(A) * 1e6
 
 
-print(f"isa={nwgrad.simd_isa()} n={args.n}")
+print(f"isa={nwgrad.simd_isa()} n={args.n} soft_guide={args.soft_guide}")
 for threads in args.threads:
     for cfg in args.configs:
         mode, gap = cfg.split("-")

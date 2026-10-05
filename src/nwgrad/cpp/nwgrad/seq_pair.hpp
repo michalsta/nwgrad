@@ -146,6 +146,28 @@ struct SeqPairT {
     }
     double soft_temperature() const noexcept { return soft_temp_; }
 
+    // Soft guide policy.  Eager (default): a soft score_and_grad_with_dp() also runs the
+    // guide Viterbi, exactly as before.  Lazy: it skips it and marks the guide pending;
+    // the guide is then computed on first use (guide_j(), realign_banded(),
+    // banded_grad_with_dp()) under the params CURRENT AT THAT TIME — so after
+    // set_params() or an in-place params update it follows the new params, not the ones
+    // scored.  For loops that rescore in full every step and never band, lazy saves the
+    // whole Viterbi; anything that bands around the scored path wants eager.
+    void set_soft_guide_lazy(bool lazy) noexcept { soft_guide_lazy_ = lazy; }
+    bool soft_guide_lazy() const noexcept { return soft_guide_lazy_; }
+
+    // Compute a pending lazy guide now (no-op otherwise).
+    void resolve_guide(DpBuffer& buf) {
+        if (!guide_pending_) return;
+        std::visit([&](auto& st) {
+            st.full_al.set_problem(a_idx_, b_idx_, *params_);
+            st.full_al.compute_viterbi(buf);
+            guide_j_ = st.full_al.guide_j_from_viterbi(buf);
+        }, state_);
+        guide_pending_ = false;
+        dp_valid_ = false;   // the full aligner's tables now hold this Viterbi, not a scored DP
+    }
+
     // Swap alignment parameters.  Invalidates score, gradient and the retained DP
     // tables (aligned() throws until the next align); the guide path stays.
     // realign_banded() remains callable after this — it will re-score the
@@ -192,6 +214,7 @@ struct SeqPairT {
             run_dp(st.full_al);
         }, state_);
         last_banded_  = false;
+        guide_pending_ = false;
         path_valid_   = true;
         score_valid_  = true;
         grad_valid_   = false;
@@ -207,6 +230,7 @@ struct SeqPairT {
         if (!path_valid_)
             throw std::logic_error(
                 "nwgrad: call align_full() before realign_banded()");
+        if (guide_pending_) { DpBuffer tmp; resolve_guide(tmp); }
         std::visit([&](auto& st) {
             st.band_al.set_problem(a_idx_, b_idx_, *params_, bandwidth, guide_j_);
             run_dp(st.band_al);
@@ -249,12 +273,20 @@ struct SeqPairT {
                 st.full_al.hard_grad_and_guide(buf, grad_, guide_j_);
                 return;
             }
+            if (grad_mode_ == GradMode::Soft && soft_guide_lazy_) {
+                st.full_al.compute_forward_back(buf);
+                score_ = st.full_al.log_z();
+                grad_.zero();
+                grad_with_buf(st.full_al, buf);
+                return;
+            }
             run_dp_with_buf(st.full_al, buf);
             if (grad_mode_ != GradMode::None) {
                 grad_.zero();
                 grad_with_buf(st.full_al, buf);
             }
         }, state_);
+        guide_pending_ = (grad_mode_ == GradMode::Soft && soft_guide_lazy_);
         path_valid_  = true;
         score_valid_ = true;
         grad_valid_  = (grad_mode_ != GradMode::None);
@@ -278,6 +310,7 @@ struct SeqPairT {
             throw std::logic_error(
                 "nwgrad: banded_grad_with_dp() needs a guide path; run the full "
                 "score_and_grad_with_dp() (or align_full()) at least once first");
+        resolve_guide(buf);
         std::visit([&](auto& st) {
             st.band_al.set_problem(a_idx_, b_idx_, *params_, bandwidth, guide_j_);
             run_dp_with_buf(st.band_al, buf);
@@ -402,12 +435,14 @@ struct SeqPairT {
 
     // The current alignment as a guide_j vector (length m+1).
     // Valid when path_valid().
-    const std::vector<int>& guide_j() const {
+    const std::vector<int>& guide_j() {
         if (!path_valid_)
             throw std::logic_error(
                 "nwgrad: alignment not computed; call align_full() first");
+        if (guide_pending_) { DpBuffer tmp; resolve_guide(tmp); }
         return guide_j_;
     }
+    bool guide_pending() const noexcept { return guide_pending_; }
 
     bool path_valid()  const noexcept { return path_valid_;  }
     bool score_valid() const noexcept { return score_valid_; }
@@ -423,6 +458,7 @@ struct SeqPairT {
     void score_and_grad_interleaved(DpBuffer& buf, int W, int lane,
                                     double local_best, int best_i, int best_j,
                                     const SoftLane* soft = nullptr) {
+        guide_pending_ = false;
         std::visit([&](auto& st) {
             st.full_al.set_problem(a_idx_, b_idx_, *params_);
             st.full_al.adopt_interleaved(buf, W, lane, local_best, best_i, best_j);
@@ -454,11 +490,15 @@ struct SeqPairT {
     // linear gaps, so its guide Viterbi is its own).  soft == nullptr: own path.
     void score_and_grad_with_soft_lane(DpBuffer& buf, const SoftLane* soft) {
         if (!soft || grad_mode_ != GradMode::Soft) { score_and_grad_with_dp(buf); return; }
-        std::visit([&](auto& st) {
-            st.full_al.set_problem(a_idx_, b_idx_, *params_);
-            st.full_al.compute_viterbi(buf);
-            guide_j_ = st.full_al.guide_j_from_viterbi(buf);
-        }, state_);
+        if (soft_guide_lazy_) guide_pending_ = true;
+        else {
+            std::visit([&](auto& st) {
+                st.full_al.set_problem(a_idx_, b_idx_, *params_);
+                st.full_al.compute_viterbi(buf);
+                guide_j_ = st.full_al.guide_j_from_viterbi(buf);
+            }, state_);
+            guide_pending_ = false;
+        }
         last_banded_ = false;
         apply_soft_lane(*soft);
         path_valid_  = true;
@@ -500,6 +540,8 @@ private:
     int                  hb_cutoff_ = 512;   // mirrors Aligner's default (fleet-swept)
     bool                 rowwise_full_ = false;
     SoftImpl             soft_impl_ = SoftImpl::Scaled;
+    bool                 soft_guide_lazy_ = false;
+    bool                 guide_pending_ = false;   // lazy soft: guide not computed yet
     double               soft_temp_ = 1.0;
 
     bool             path_valid_   = false;

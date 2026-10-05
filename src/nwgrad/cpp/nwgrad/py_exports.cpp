@@ -508,7 +508,7 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
             "Gradient as an AlignParams object, or None if not computed.")
         .def_prop_ro(
             "guide_j",
-            [](const SP& self) -> nb::object {
+            [](SP& self) -> nb::object {
                 if (!self.path_valid()) return nb::none();
                 return nb::cast(std::vector<int>(self.guide_j()));
             },
@@ -804,6 +804,27 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
                 for (auto* sp : s.pairs) sp->set_soft_temperature(v);
             },
             NWGRAD_SOFT_TEMP_DOC "\nApplies to the pairs in the batch and to later add_many() ones.")
+        .def_prop_rw(
+            "soft_guide",
+            [](const SPB& s) { return s.soft_guide_lazy ? "lazy" : "eager"; },
+            [](SPB& s, const std::string& v) {
+                bool lazy;
+                if      (v == "eager") lazy = false;
+                else if (v == "lazy")  lazy = true;
+                else throw nb::value_error(("nwgrad: unknown soft_guide \"" + v +
+                                            "\" (expected \"eager\" or \"lazy\")").c_str());
+                s.soft_guide_lazy = lazy;
+                for (auto* sp : s.pairs) sp->set_soft_guide_lazy(lazy);
+            },
+            "When soft pairs compute their guide path (the Viterbi alignment that\n"
+            "realign_banded()/banded_grad() band around).\n"
+            "  \"eager\" (default): score_and_grad() runs the guide Viterbi, as always.\n"
+            "  \"lazy\": it does not; the guide is computed on first use (guide_j,\n"
+            "     realign_banded, banded_grad) under the params CURRENT THEN — after\n"
+            "     set_params() or an in-place params update it follows the new params.\n"
+            "     Saves the whole Viterbi for loops that rescore in full each step and\n"
+            "     never band (soft-score continuation); use eager to band around the\n"
+            "     scored path.  Applies to the pairs in the batch and later add_many() ones.")
         .def_prop_rw(
             "hb_cutoff",
             [](const SPB& s) { return s.hb_cutoff; },

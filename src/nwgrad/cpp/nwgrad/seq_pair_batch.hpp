@@ -231,6 +231,7 @@ struct SeqPairBatchT {
                 staged[i]->set_rowwise_full(rowwise_full);
                 staged[i]->set_soft_impl(soft_impl);
                 staged[i]->set_soft_temperature(soft_temperature);
+                staged[i]->set_soft_guide_lazy(soft_guide_lazy);
             }
         };
         run_workers(N, worker);
@@ -591,10 +592,17 @@ private:
                 const int n = static_cast<int>(p0.len_b());
                 const AlignParams& P = *p0.params_ptr();
                 const bool lin = p0.gap_model() == GapModel::Linear;   // then all soft
+                // A lazy-guide soft group needs no Viterbi at all: skip the shared fill.
+                bool lazy = p0.grad_mode() == GradMode::Soft && p0.soft_guide_lazy();
+                for (size_t l = 1; l < real && lazy; ++l) {
+                    const SeqPair& p = *pairs[elig[s + l]];
+                    lazy = p.grad_mode() == GradMode::Soft && p.soft_guide_lazy();
+                }
+                const bool skip_fill = lin || lazy;
                 InterJob job{};
                 job.a = a.data(); job.m = m.data(); job.b = b.data(); job.n = n; job.M = M;
                 job.align_mode = (p0.align_mode() == AlignMode::Local) ? 1 : 0;
-                if (!lin) {
+                if (!skip_fill) {
                     const size_t sz = static_cast<size_t>(M + 1) * (n + 1) * W;
                     if (buf.VM.size() < sz) { buf.VM.resize(sz); buf.VX.resize(sz); buf.VY.resize(sz); }
                     job.blk = P.matrix.data(); job.nalpha = P.matrix.size();
@@ -648,7 +656,7 @@ private:
                     typename SeqPair::SoftLane lane{};
                     const bool use = soft_group && sok[l];
                     if (use) lane = {slogz[l], scnt.data() + l * nn, sgap.data() + l * 4};
-                    if (lin) pairs[i]->score_and_grad_with_soft_lane(buf, use ? &lane : nullptr);
+                    if (skip_fill) pairs[i]->score_and_grad_with_soft_lane(buf, use ? &lane : nullptr);
                     else     pairs[i]->score_and_grad_interleaved(buf, W, static_cast<int>(l),
                                                                   best[l], bi[l], bj[l],
                                                                   use ? &lane : nullptr);
@@ -988,6 +996,8 @@ public:
     SoftImpl soft_impl = SoftImpl::Scaled;
     // Soft temperature for pairs built by add_many() — see Aligner::set_soft_temperature.
     double soft_temperature = 1.0;
+    // Soft guide policy for pairs built by add_many() — see SeqPair::set_soft_guide_lazy.
+    bool soft_guide_lazy = false;
 
     // score_and_grad() fills W pairs at once, one per vector lane (InterJob), wherever
     // a pair qualifies (inter_eligible_); the rest run their own fill.  Bit-identical

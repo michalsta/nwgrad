@@ -305,3 +305,49 @@ def test_soft_interpair_linear(mode, T):
     close(out[0][1], out[1][1])
     close(out[0][2], out[1][2])
     assert out[0][3] == out[1][3]
+
+
+# ── soft_guide = "lazy" ───────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("gm", ["affine", "linear"])
+@pytest.mark.parametrize("fill", ["striped", "interpair"])
+def test_soft_guide_lazy(gm, fill):
+    """Lazy skips the guide Viterbi at score time: scores and gradients are those of
+    eager (to REL — interpair may route them differently); the guide, computed on first
+    use, equals eager's while params are unchanged and follows set_params() after."""
+    rng = np.random.default_rng(81)
+    params = dna_params(rng, gaps=(1.0, 0.5, 1.5, 0.3) if gm == "affine" else (0, 0.9, 0, 1.2))
+    p2 = dna_params(rng)
+    A = [rand_seq(rng, "ACGT", int(rng.integers(5, 25))) for _ in range(30)]
+    B = [rand_seq(rng, "ACGT", 40) for _ in range(30)]
+
+    def batch(policy):
+        b = nwgrad.SeqPairBatchDouble(n_threads=2, traceback="pointers")
+        b.fill = fill
+        b.soft_guide = policy
+        b.add_many(A, B, params, gap_model=gm, mode="local", grad_mode="soft")
+        b.score_and_grad()
+        return b
+
+    e, l = batch("eager"), batch("lazy")
+    assert l.soft_guide == "lazy"
+    close(e.scores(), l.scores())
+    close(e.grads()[0], l.grads()[0])
+    close(e.grads()[1], l.grads()[1])
+    assert [list(e[i].guide_j) for i in range(30)] == [list(l[i].guide_j) for i in range(30)]
+    # banded_grad on a still-pending guide resolves it first.
+    l2 = batch("lazy")
+    assert l2.banded_grad(3) == pytest.approx(e.banded_grad(3), rel=1e-12)
+    # After set_params, a pending lazy guide follows the NEW params.
+    l3 = batch("lazy")
+    l3.set_params(p2)
+    e2 = nwgrad.SeqPairBatchDouble(n_threads=2, traceback="pointers")
+    e2.add_many(A, B, p2, gap_model=gm, mode="local", grad_mode="soft")
+    e2.score_and_grad()
+    assert [list(l3[i].guide_j) for i in range(30)] == [list(e2[i].guide_j) for i in range(30)]
+
+
+def test_soft_guide_rejects_unknown():
+    b = nwgrad.SeqPairBatchDouble()
+    with pytest.raises(ValueError):
+        b.soft_guide = "never"
