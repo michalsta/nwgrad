@@ -1457,6 +1457,7 @@ private:
             D[j] = local ? 3 : 2;
         }
         int bi = 0, bj = 0;   // locals: best_i_/best_j_ are members (see below)
+        const int n = n_;     // ditto: a member bound is reloaded after every byte store
         double best_local = 0.0;
         const unsigned char* __restrict bcode = b_idx_.data();
         for (int i = 1; i <= m_; ++i) {
@@ -1468,24 +1469,31 @@ private:
             T* __restrict cv = cur;
             cv[0] = local ? static_cast<T>(0) : -static_cast<T>(i) * ge_b;
             d[0] = local ? 3 : 1;
-            for (int j = 1; j <= n_; ++j) {
-                // Branch-free: the same comparisons in the same order as std::max over
-                // the initializer list, but as selects — data-dependent branches here
-                // mispredicted on every other cell (2x slower than the H fill, Global).
-                // The value exactly as viterbi_linear computes it (std::max, first largest),
-                // so only max(v1, l) and the - ge_a sit on the carry chain; the code is
-                // derived from the same two comparisons, off the chain.
+            // Two passes, as gcc -O3 splits viterbi_linear's own loop: the carry-free
+            // max(diag+s, up-ge_b) and its code vectorize across the row; only
+            // max(t, left-ge_a) stays on the serial chain.  One fused loop (the code on
+            // the carry) ran 2.6x slower than the H fill; this, ~1.6x (a third pass
+            // reading the codes off the values was slower still: 2x).  The values are the
+            // same std::max calls in the same order, so bit-exact.
+            for (int j = 1; j <= n; ++j) {
                 const T d0 = pv[j - 1] + prow[bcode[j - 1]];
-                const T u = pv[j] - ge_b, l = cv[j - 1] - ge_a;
-                const T v1 = std::max(d0, u);
-                T v = std::max(v1, l);
-                unsigned char c = static_cast<unsigned char>((v1 < l) ? 2 : ((d0 < u) ? 1 : 0));
+                const T u = pv[j] - ge_b;
+                cv[j] = std::max(d0, u);
+                d[j] = static_cast<unsigned char>(d0 < u);
+            }
+            T left = cv[0];
+            for (int j = 1; j <= n; ++j) {
+                const T t = cv[j], l = left - ge_a;
+                T v = std::max(t, l);
+                const int tl = t < l;
+                unsigned char c = static_cast<unsigned char>(d[j] + tl * (2 - d[j]));
                 if constexpr (local) {
                     v = std::max(v, static_cast<T>(0));
                     c = (v <= static_cast<T>(0)) ? static_cast<unsigned char>(3) : c;
                     if (v > best_local) { best_local = v; bi = i; bj = j; }
                 }
                 cv[j] = v; d[j] = c;
+                left = v;
             }
             std::swap(prev, cur);
         }
