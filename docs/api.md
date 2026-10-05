@@ -234,12 +234,11 @@ concurrently). The same pair may belong to several batches.
 | `traceback` | `str` | The batch's traceback mode as given (`"auto"` resolves per pair) |
 | `hb_cutoff` | `int` | Hirschberg base-case size applied by `add_many()` (default 512) |
 | `schedule` | `str` | `"dynamic"` (default; atomic counter) or `"sorted"` (length-sorted equal-work chunks — bounds peak DP memory). Results are identical either way. |
-| `fill` | `str` | How full affine DP is vectorized at double precision: `"striped"` (default), `"rowwise"` or `"interpair"`. Settable; applies to the pairs already in the batch and to later `add_many()` ones. Results are bit-identical whichever fill runs. See below. |
+| `fill` | `str` | How full DP is vectorized at double precision: `"striped"` (default), `"rowwise"` or `"interpair"`. Settable; applies to the pairs already in the batch and to later `add_many()` ones. Results are bit-identical whichever fill runs. See below. |
 
 **Choosing a fill.** All three fills compute bit-identical tables, so scores, paths and
-gradients do not depend on the choice; only speed and memory do. They apply to
-affine gaps at double precision (`SeqPairBatchDouble`, `SeqPairDouble`) on a simd
-kernel; float32, linear gaps and `kernel="scalar_fallback"` ignore the setting.
+gradients do not depend on the choice; only speed and memory do. A pair that a fill
+cannot take silently runs its own fill instead, with the same results.
 
 | `fill` | How | Use for |
 |---|---|---|
@@ -247,14 +246,26 @@ kernel; float32, linear gaps and `kernel="scalar_fallback"` ignore the setting.
 | `"rowwise"` | One row of one pair at a time; no lazy-F fixpoint, whose cost grows when gaps are cheap | Short pairs; SSE2-only hosts |
 | `"interpair"` | `score_and_grad()` aligns W pairs at once, one per vector lane (W = 2 on SSE2/NEON, 4 on AVX2, 8 on AVX-512), grouping pairs by the length of B | Many short pairs of similar length, e.g. miRNA × target site |
 
+Which pairs each fill applies to:
+
+- **`"rowwise"`**: affine gaps at double precision (`SeqPairBatchDouble`,
+  `SeqPairDouble`) on a simd kernel. Float32, linear gaps, `kernel="scalar_fallback"`
+  and Hirschberg pairs longer than `hb_cutoff` ignore it.
+- **`"interpair"`**: only `SeqPairBatchDouble.score_and_grad()`; every other
+  operation (`align_full()`, …) uses the pair's own fill. It takes affine and linear
+  gaps and hard and soft pairs (for soft pairs, the shared fill is their guide
+  Viterbi) on a simd kernel, with an alphabet of at most 8 letters; linear gaps and
+  soft pairs are new since 0.5.2. Pairs in one group must share their parameters. Hard linear Global pairs
+  take it only at 4 or more lanes (AVX2, AVX-512): at 2 lanes it is slower than their
+  own fill. Float32, `kernel="scalar_fallback"`, empty sequences and Hirschberg pairs
+  longer than `hb_cutoff` run their own fill.
+
 Measured on 2.5 million miRNA × target-site pairs (A ~22, B = 50, local affine, an
 i5-12500 with AVX2): `score_and_grad()` per pair, single thread, 9.70 µs `"striped"`,
-3.50 µs `"rowwise"`, 1.61 µs `"interpair"`. `"rowwise"` and `"interpair"` keep three
-score tables (24 B/cell; `"interpair"` per group of pairs) per thread even with
-`traceback="pointers"`. `"interpair"` takes only pairs with hard or no gradients and
-an alphabet of at most 8 letters; the batch's other pairs, and every operation other
-than `score_and_grad()`, use the pair's own fill. The pair grouping is built once and
-reused until pairs are added.
+3.50 µs `"rowwise"`, 1.61 µs `"interpair"`. For affine gaps, `"rowwise"` and
+`"interpair"` keep three score tables (24 B/cell; `"interpair"` per group of pairs) per
+thread even with `traceback="pointers"`. The `"interpair"` pair grouping is built once
+and reused until pairs are added.
 
 **Typical optimization loop:**
 
