@@ -501,11 +501,11 @@ struct SeqPairT {
 
     void score_and_grad_interleaved(DpBuffer& buf, int W, int lane,
                                     double local_best, int best_i, int best_j,
-                                    const SoftLane* soft = nullptr) {
+                                    const SoftLane* soft = nullptr, size_t stride = 0) {
         guide_pending_ = false;
         std::visit([&](auto& st) {
             st.full_al.set_problem(a_idx_, b_idx_, *params_);
-            st.full_al.adopt_interleaved(buf, W, lane, local_best, best_i, best_j);
+            st.full_al.adopt_interleaved(buf, W, lane, local_best, best_i, best_j, stride);
             score_ = st.full_al.score();
             last_banded_ = false;
             if (grad_mode_ == GradMode::Hard) {

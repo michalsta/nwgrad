@@ -460,9 +460,12 @@ struct Aligner {
     // to this pair's own affine Full fill, so score(), the traceback and hard_grad()
     // behave exactly as after compute_viterbi(buf).  Local passes the lane's best cell
     // as the kernel found it; Global reads the score at (m, n).  set_problem() first.
+    // `stride`: the group's row length (n+1 of its longest B) when B lengths are ragged
+    // (InterJobT::nb); 0 = this problem's own n+1.
     void adopt_interleaved(const DpBuffer& buf, int W, int lane,
-                           double local_best, int best_i, int best_j) {
+                           double local_best, int best_i, int best_j, size_t stride = 0) {
         check_problem();
+        inter_stride_ = stride ? stride : stride_;
         tables_striped_ = false;
         pointers_       = false;
         hirschberg_     = false;
@@ -630,6 +633,7 @@ private:
     // cell and this aligner's pair is lane inter_lane_.  0 = not interleaved; every fill
     // of this aligner's own clears it (run_viterbi).
     int    inter_w_ = 0, inter_lane_ = 0;
+    size_t inter_stride_ = 0;   // the interleaved tables' row length (>= stride_ if ragged)
     // Pointers mode: DM/DX/DY hold predecessor codes, VM/VX/VY are NOT retained.
     bool        pointers_ = false;
     // Hirschberg mode: no tables at all survive the fill.  The recursion recovers the
@@ -816,7 +820,7 @@ private:
     __attribute__((always_inline)) size_t cell_index(int i, int j) const noexcept {
         if (inter_w_) {
             // Inter-pair fill (adopt_interleaved): W pairs' tables interleaved per cell.
-            return (static_cast<size_t>(i) * stride_ + static_cast<size_t>(j)) *
+            return (static_cast<size_t>(i) * inter_stride_ + static_cast<size_t>(j)) *
                    static_cast<size_t>(inter_w_) + static_cast<size_t>(inter_lane_);
         }
         if (tables_striped_) {

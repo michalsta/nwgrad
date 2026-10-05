@@ -560,7 +560,7 @@ private:
         auto worker = [&]() {
             DpBuffer buf;
             std::vector<const unsigned char*> a, b;
-            std::vector<int> m, bi, bj;
+            std::vector<int> m, bi, bj, nb;
             std::vector<T> best, blkT;
             // Soft groups: the inter-pair soft pass's scratch and per-lane results.
             DVec sscr;
@@ -593,15 +593,20 @@ private:
                 const int W = inter_w_(K);
                 a.assign(W, nullptr); b.assign(W, nullptr); m.assign(W, 0);
                 bi.assign(W, 0); bj.assign(W, 0); best.assign(W, T(0));
-                int M = 0;
+                int M = 0, n = 0;
+                bool ragged = false;
+                nb.assign(W, 0);
                 for (int l = 0; l < W; ++l) {
                     // Short group: the spare lanes repeat the last pair; their results are dropped.
                     const SeqPair& p = *pairs[elig[s + std::min<size_t>(l, real - 1)]];
                     a[l] = p.a_codes().data(); b[l] = p.b_codes().data();
                     m[l] = static_cast<int>(p.len_a());
+                    nb[l] = static_cast<int>(p.len_b());
                     M = std::max(M, m[l]);
+                    n = std::max(n, nb[l]);
+                    ragged |= nb[l] != nb[0];
                 }
-                const int n = static_cast<int>(p0.len_b());
+                const size_t gstride = ragged ? static_cast<size_t>(n) + 1 : 0;
                 const AlignParams& P = *p0.params_ptr();
                 const bool lin = p0.gap_model() == GapModel::Linear;
                 // A lazy-guide soft group needs no Viterbi at all: skip the shared fill.
@@ -614,6 +619,7 @@ private:
                 InterJobT<T> job{};
                 job.a = a.data(); job.m = m.data(); job.b = b.data(); job.n = n; job.M = M;
                 job.align_mode = (p0.align_mode() == AlignMode::Local) ? 1 : 0;
+                if (ragged) job.nb = nb.data();
                 if (!skip_fill) {
                     const size_t sz = static_cast<size_t>(M + 1) * (n + 1) * W;
                     // Linear's one table rides in the H slot (adopt_interleaved reads buf.H).
@@ -662,6 +668,7 @@ private:
                             if (sscr.size() < need) sscr.resize(need);
                             siscr.resize(static_cast<size_t>(Mc + 1) * SW);
                             sj.a = a.data() + c; sj.m = m.data() + c; sj.b = b.data() + c; sj.M = Mc;
+                            sj.nb = ragged ? nb.data() + c : nullptr;
                             sj.scratch = sscr.data(); sj.iscratch = siscr.data();
                             sj.logz = slogz.data() + c; sj.counts = scnt.data() + c * nn;
                             sj.gaps = sgap.data() + c * 4; sj.ok = sok.data() + c;
@@ -677,7 +684,7 @@ private:
                     if (skip_fill) pairs[i]->score_and_grad_with_soft_lane(buf, use ? &lane : nullptr);
                     else     pairs[i]->score_and_grad_interleaved(buf, W, static_cast<int>(l),
                                                                   best[l], bi[l], bj[l],
-                                                                  use ? &lane : nullptr);
+                                                                  use ? &lane : nullptr, gstride);
                     scores[i] = pairs[i]->score();
                 }
             }
@@ -840,6 +847,14 @@ private:
         band_ = std::move(Bg);
     }
 
+public:
+    // Ragged B: one group may mix B lengths (InterJobT::nb) — every lane is padded to the
+    // longest, so a group admits a pair only while that padding stays small.
+    static bool ragged_ok_(size_t shortest, size_t len_b) {
+        return len_b * 4 <= shortest * 5 + 16;   // <= 1.25x + 4 columns
+    }
+private:
+
     struct InterPlan {
         size_t generation = static_cast<size_t>(-1);
         int default_backend = -1000;
@@ -893,14 +908,15 @@ private:
         });
         P.elig.reserve(keys.size());
         for (const Key& k : keys) P.elig.push_back(k.i);
-        // Groups: runs of equal (backend, gap model, mode, len_b), cut every W.
+        // Groups: runs of equal (backend, gap model, mode), cut every W — and wherever
+        // len B outgrows the group's first (shortest) by more than ragged_ok_ allows.
         for (size_t s = 0; s < keys.size();) {
             const int W = inter_w_(level_kernels(keys[s].backend));
             size_t e = s + 1;
             while (e < keys.size() && e - s < static_cast<size_t>(W) &&
                    keys[e].backend == keys[s].backend && keys[e].gm == keys[s].gm &&
                    keys[e].mode == keys[s].mode &&
-                   keys[e].len_b == keys[s].len_b)
+                   ragged_ok_(keys[s].len_b, keys[e].len_b))
                 ++e;
             P.groups.emplace_back(s, e);
             s = e;

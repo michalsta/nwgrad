@@ -71,10 +71,16 @@ struct InterCommon {
         for (int j = 1; j <= n; ++j)
             for (int k = 0; k < levels; ++k) {
                 ivl v;
-                for (int l = 0; l < IW; ++l) v[l] = ((J.b[l][j - 1] >> k) & 1) ? -1 : 0;
+                for (int l = 0; l < IW; ++l) {
+                    const int bl = (!J.nb || j <= J.nb[l]) ? J.b[l][j - 1] : 0;   // ragged: pad
+                    v[l] = ((bl >> k) & 1) ? -1 : 0;
+                }
                 bits[3 * j + k] = v;
             }
+        if (J.nb)
+            for (int l = 0; l < IW; ++l) nbv[l] = static_cast<T>(J.nb[l]);
     }
+    typename IVT<T>::v nbv{};   // ragged: each lane's B length, as T
     static std::vector<ivl>& bits_buf() { static thread_local std::vector<ivl> b; return b; }
     // Row i's profile (P[c] = per lane, score of the lane's A residue i vs letter c) and
     // the lanes still inside their own A.
@@ -130,7 +136,7 @@ struct InterCommon {
 // not compute.  Its in-band cells read only cells of its own span, so they see exactly
 // the operands of its own fill; the cells outside its span are never read by its own
 // traceback or gradient.
-template <class T, bool Banded>
+template <class T, bool Banded, bool Ragged>
 static void inter_fill_linear(InterJobT<T>& J) noexcept {
     using C = InterCommon<T>;
     using ivd = typename C::ivd; using ivl = typename C::ivl;
@@ -179,7 +185,8 @@ static void inter_fill_linear(InterJobT<T>& J) noexcept {
             h[j] = v;
             lh = v;
             if (local) {
-                const ivl upd = rb < v;
+                ivl upd = rb < v;
+                if constexpr (Ragged) upd &= (z + static_cast<T>(j)) <= cm.nbv;
                 rb = ivsel(upd, v, rb);
                 rj = ivsel(upd, z + static_cast<T>(j), rj);
             }
@@ -197,7 +204,7 @@ static void inter_fill_linear(InterJobT<T>& J) noexcept {
 // Affine.  T = double or float32: the operations are the same in either precision, each
 // in T — at float32 exactly the scalar viterbi_affine<float>, whose penalties are cast to
 // T once and whose borders are -(go + T(i)*ge) in T.  Banded: as for linear above.
-template <class T, bool Banded>
+template <class T, bool Banded, bool Ragged>
 static void inter_fill_affine(InterJobT<T>& J) noexcept {
     using C = InterCommon<T>;
     using ivd = typename C::ivd; using ivl = typename C::ivl;
@@ -269,7 +276,8 @@ static void inter_fill_affine(InterJobT<T>& J) noexcept {
             lm = mv; lx = x; ly = y;
             if (local) {
                 const ivd cur = ivmax(mv, ivmax(x, y));
-                const ivl upd = rb < cur;          // first strict improvement in the row
+                ivl upd = rb < cur;                // first strict improvement in the row
+                if constexpr (Ragged) upd &= (z + static_cast<T>(j)) <= cm.nbv;
                 rb = ivsel(upd, cur, rb);
                 rj = ivsel(upd, z + static_cast<T>(j), rj);
             }
@@ -284,10 +292,15 @@ static void inter_fill_affine(InterJobT<T>& J) noexcept {
     if (local) cm.best_out(best, bi, bj);
 }
 
+// Banded needs no ragged variant: a lane's band never passes its own n (jhi <= n), and
+// the masked cells cannot be its Local best.  Only the bits' padding (InterCommon) is
+// needed there.  Full + ragged masks the Local best by column.
 template <class T>
 static void inter_fill_t(InterJobT<T>& J) noexcept {
-    if (J.blo) { if (J.linear) inter_fill_linear<T, true>(J);  else inter_fill_affine<T, true>(J); }
-    else       { if (J.linear) inter_fill_linear<T, false>(J); else inter_fill_affine<T, false>(J); }
+    const bool lin = J.linear, rag = J.nb != nullptr && J.align_mode == 1;
+    if (J.blo) { if (lin) inter_fill_linear<T, true, false>(J); else inter_fill_affine<T, true, false>(J); }
+    else if (rag) { if (lin) inter_fill_linear<T, false, true>(J); else inter_fill_affine<T, false, true>(J); }
+    else       { if (lin) inter_fill_linear<T, false, false>(J); else inter_fill_affine<T, false, false>(J); }
 }
 
 static void inter_fill_entry(InterJob& J) noexcept { inter_fill_t<double>(J); }

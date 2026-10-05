@@ -141,7 +141,7 @@ private:
         return backend;
     }
 
-    // Problems grouped W at a time by equal len B, sorted by len A (a counting sort per
+    // Problems grouped W at a time, sorted by len B then len A (a counting sort per
     // key — linear, since each align() brings new problems and nothing is cached).  The
     // rest run their own path in the same pass: an empty sequence, and an affine Global
     // Full pair longer than the Hirschberg cutoff (the default traceback splits those).
@@ -177,11 +177,13 @@ private:
         csort([&](size_t i) { return problems[i].seq_a.size(); }, maxa);
         csort([&](size_t i) { return problems[i].seq_b.size(); }, maxb);
         std::vector<std::pair<size_t, size_t>> groups;
+        // Cut every W, and where len B outgrows the group's shortest by more than the
+        // padding SeqPairBatch allows (ragged B, InterJobT::nb).
         for (size_t s = 0; s < elig.size();) {
             const size_t lb = problems[elig[s]].seq_b.size();
             size_t e = s + 1;
             while (e < elig.size() && e - s < static_cast<size_t>(W) &&
-                   problems[elig[e]].seq_b.size() == lb) ++e;
+                   problems[elig[e]].seq_b.size() * 4 <= lb * 5 + 16) ++e;
             groups.emplace_back(s, e);
             s = e;
         }
@@ -230,7 +232,7 @@ private:
         const Alphabet& alpha = params.matrix.alphabet();
         std::vector<std::vector<uint8_t>> ae(W), be(W);
         std::vector<const unsigned char*> a(W), b(W);
-        std::vector<int> m(W), bi(W), bj(W), blo, bhi, ulo, uhi, bri(W), brj(W);
+        std::vector<int> m(W), bi(W), bj(W), blo, bhi, ulo, uhi, bri(W), brj(W), nb(W);
         std::vector<T> best(W), blkT;
         const bool lin = GM == GapModel::Linear;
         const bool soft = grad_mode == GradMode::Soft;
@@ -268,7 +270,8 @@ private:
             const auto [s, e] = groups[t];
             const size_t real = e - s;
             if (soft && !soft_ok) { for (size_t k = s; k < e; ++k) own(elig[k]); continue; }
-            int M = 0;
+            int M = 0, n = 0;
+            bool ragged = false;
             for (int l = 0; l < W; ++l) {
                 // Spare lanes repeat the last problem; their results are dropped.
                 const size_t lr = std::min<size_t>(l, real - 1);
@@ -279,15 +282,19 @@ private:
                 }
                 a[l] = ae[lr].data(); b[l] = be[lr].data();
                 m[l] = static_cast<int>(ae[lr].size());
+                nb[l] = static_cast<int>(be[lr].size());
                 M = std::max(M, m[l]);
+                n = std::max(n, nb[l]);
+                ragged |= nb[l] != nb[0];
             }
-            const int n = static_cast<int>(be[0].size());
+            const size_t gstride = ragged ? static_cast<size_t>(n) + 1 : 0;
             if (soft) {
                 const size_t need = inter_soft_scratch(n, M, W);
                 if (sscr.size() < need) sscr.resize(need);
                 siscr.resize(static_cast<size_t>(M + 1) * W);
                 slogz.resize(W); scnt.resize(W * nn); sgap.resize(W * 4); sok.resize(W);
                 sj.a = a.data(); sj.m = m.data(); sj.b = b.data(); sj.n = n; sj.M = M;
+                sj.nb = ragged ? nb.data() : nullptr;
                 sj.align_mode = (AM == AlignMode::Local) ? 1 : 0;
                 sj.scratch = sscr.data(); sj.iscratch = siscr.data();
                 sj.logz = slogz.data(); sj.counts = scnt.data(); sj.gaps = sgap.data();
@@ -321,6 +328,7 @@ private:
             InterJobT<T> job{};
             job.a = a.data(); job.m = m.data(); job.b = b.data(); job.n = n; job.M = M;
             job.align_mode = (AM == AlignMode::Local) ? 1 : 0;
+            if (ragged) job.nb = nb.data();
             job.blk = blkT.data(); job.nalpha = params.matrix.size();
             job.go_a = static_cast<T>(params.gap_open_a); job.ge_a = static_cast<T>(params.gap_extend_a);
             job.go_b = static_cast<T>(params.gap_open_b); job.ge_b = static_cast<T>(params.gap_extend_b);
@@ -340,7 +348,7 @@ private:
             else                                     K.inter_fill_f(job);
             for (size_t l = 0; l < real; ++l) {
                 const size_t i = elig[s + l];
-                al[l].adopt_interleaved(buf, W, static_cast<int>(l), best[l], bi[l], bj[l]);
+                al[l].adopt_interleaved(buf, W, static_cast<int>(l), best[l], bi[l], bj[l], gstride);
                 scores[i] = al[l].score();
                 if (grad_mode == GradMode::Hard) al[l].hard_grad(buf, local_grad);
             }

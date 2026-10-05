@@ -170,3 +170,25 @@ def test_global_banded_guide_ending_short_of_n(prec, fill, band):
     r = ba.align(A, [b] * len(A), [x[0] for x in al], [x[1] for x in al])
     assert r.scores[-1] == 10.0
     assert list(r.scores) == [s.score for s in sp]
+
+
+@pytest.mark.parametrize("prec", ["double", "float32"])
+@pytest.mark.parametrize("gm", ["affine", "linear"])
+@pytest.mark.parametrize("mode", ["local", "global"])
+@pytest.mark.parametrize("grad", ["hard", "soft"])
+def test_ragged_b(prec, gm, mode, grad):
+    """B lengths 40..50: full groups mixing B lengths (padded to the longest)."""
+    A, B = _seqs(171, 8, 30, 53), _seqs(171, 40, 51, 54)
+    p = _params("ties" if grad == "hard" else "random", gm)
+    r0 = _align(prec, p, gm, mode, grad, A, B, "striped")
+    r1 = _align(prec, p, gm, mode, grad, A, B, "interpair")
+    for x, y in zip(r0, r1):
+        if grad == "hard":
+            assert np.array_equal(x, y)
+        else:
+            np.testing.assert_allclose(x, y, rtol=REL, atol=REL)
+    if gm == "affine" and grad == "hard":
+        r0 = _align(prec, p, gm, mode, grad, A, B, "striped", band=3)
+        r1 = _align(prec, p, gm, mode, grad, A, B, "interpair", band=3)
+        for x, y in zip(r0, r1):
+            assert np.array_equal(x, y)

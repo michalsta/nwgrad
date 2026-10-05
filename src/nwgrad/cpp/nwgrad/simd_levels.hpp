@@ -281,6 +281,11 @@ struct InterJobT {
     const int* blo = nullptr; const int* bhi = nullptr;
     const int* ulo = nullptr; const int* uhi = nullptr;
     const int* bri = nullptr; const int* brj = nullptr;
+    // Ragged B (nullptr = every lane's B has length n): W lengths <= n.  A lane's columns
+    // past its own length are computed from a padded residue and ignored — the DP flows
+    // right and down only, so they cannot reach its cells — and excluded from its Local
+    // best; its pair adopts the tables at the group's stride (n+1).
+    const int* nb = nullptr;
 };
 using InterJob = InterJobT<double>;
 using inter_fn   = void (*)(InterJobT<double>&);
@@ -298,6 +303,7 @@ using inter_fn_f = void (*)(InterJobT<float>&);
 struct InterSoftJob {
     const unsigned char* const* a; const int* m; const unsigned char* const* b;
     int n, M;
+    const int* nb = nullptr;           // ragged B: W lengths <= n (see InterJobT::nb)
     const double* es; int nalpha;      // exp(score / T), row-major nalpha x nalpha
     double oa, ea, ob, eb;             // exp(-(go+ge)/T), exp(-ge/T), per side
     int align_mode;                    // 0 = Global, 1 = Local

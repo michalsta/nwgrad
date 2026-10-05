@@ -458,3 +458,32 @@ def test_banded_grad_guides_match_realign_banded(prec, gm, mode, fill):
         sp.realign_banded(2)
         assert list(sp.guide_j) == list(b[i].guide_j)
         assert sp.score == b[i].score
+
+
+# ── Ragged B: one group mixing B lengths (InterJobT::nb, InterSoftJob::nb) ────────
+# B lengths 40..50 sit inside the padding cap, so groups are full and mixed: every lane
+# padded to its group's longest B, its own columns bit-identical (hard) or tolerance-
+# equal (soft) to its own path, the padded columns never reaching it.
+
+@pytest.mark.parametrize("prec", ["double", "float32"])
+@pytest.mark.parametrize("gm", ["affine", "linear"])
+@pytest.mark.parametrize("mode", ["local", "global"])
+@pytest.mark.parametrize("grad", ["hard", "soft"])
+@pytest.mark.parametrize("level", [l for l in nwgrad.available_isa_levels()
+                                   if l != "scalar_fallback"])
+def test_ragged_b_groups(prec, gm, mode, grad, level):
+    A, B = _seqs(173, 8, 30, 51), _seqs(173, 40, 51, 52)
+    p = _params("ties" if grad == "hard" else "random")
+    out = []
+    for fill in ("striped", "interpair"):
+        b = _CLS[prec][0](n_threads=3, traceback="pointers")
+        b.fill = fill
+        b.add_many(A, B, p, gap_model=gm, mode=mode, grad_mode=grad, kernel=level)
+        b.score_and_grad()
+        out.append((b.scores(), *b.grads(), [list(b[i].guide_j) for i in range(len(b))]))
+    for x, y in zip(out[0][:3], out[1][:3]):
+        if grad == "hard":
+            assert np.array_equal(x, y)
+        else:
+            np.testing.assert_allclose(x, y, rtol=1e-11, atol=1e-11)
+    assert out[0][3] == out[1][3]
