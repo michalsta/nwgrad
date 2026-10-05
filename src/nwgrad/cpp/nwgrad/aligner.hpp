@@ -378,8 +378,7 @@ struct Aligner {
 
     std::vector<std::pair<int,int>> alignment() const {
         check_viterbi();
-        if constexpr (GM == GapModel::Affine)
-            if (hirschberg_) return alignment_hb();
+        if (hirschberg_) return alignment_hb();
         if constexpr (GM == GapModel::Linear) return traceback_linear(own_buf_);
         else                                   return traceback_affine(own_buf_);
     }
@@ -509,8 +508,7 @@ struct Aligner {
 
     std::vector<int> guide_j_from_viterbi(const DpBuffer& buf) const {
         // Hirschberg holds the path itself, so there is nothing to walk back — replay it.
-        if constexpr (GM == GapModel::Affine)
-            if (hirschberg_) return guide_j_affine_hb();
+        if (hirschberg_) return guide_j_affine_hb();   // the move list is gap-model free
         if (pointers_) {
             if constexpr (GM == GapModel::Affine) return guide_j_affine_ptr(buf);
         }
@@ -528,8 +526,7 @@ struct Aligner {
 
     std::pair<std::string, std::string> aligned(const DpBuffer& buf) const {
         std::string a, b;
-        if constexpr (GM == GapModel::Affine)
-            if (hirschberg_) { aligned_hb(a, b); return {std::move(a), std::move(b)}; }
+        if (hirschberg_) { aligned_hb(a, b); return {std::move(a), std::move(b)}; }
         if constexpr (GM == GapModel::Linear) aligned_linear(buf, a, b);
         else                                   aligned_affine(buf, a, b);
         return {std::move(a), std::move(b)};
@@ -547,6 +544,8 @@ struct Aligner {
     }
 
     void hard_grad(const DpBuffer& buf, AlignParams& grad) const {
+        if constexpr (GM == GapModel::Linear)
+            if (hirschberg_) { hard_grad_linear_hb(grad); return; }
         if constexpr (GM == GapModel::Affine) {
             if (hirschberg_) { hard_grad_affine_hb(grad); return; }
             if (pointers_)   { hard_grad_affine_ptr(buf, grad); return; }
@@ -785,9 +784,9 @@ private:
     // Grow external buffer to fit current problem (thread-owned path).
     void ensure_viterbi_ptruf(DpBuffer& buf) const {
         if constexpr (GM == GapModel::Linear) {
-            // Full + Pointers keeps no H (viterbi_linear_ptr allocates its byte table).
+            // Full + Pointers / Hirschberg keeps no H (they allocate their own).
             if constexpr (AB == AlignBand::Full)
-                if (tb_ == TracebackMode::Pointers) return;
+                if (tb_ == TracebackMode::Pointers || is_hirschberg(tb_)) return;
             if (buf.H.size() < sz_) buf.H.resize(sz_);
         } else {
             // Pointers mode never touches VM/VX/VY — it keeps two rolling rows and byte
@@ -1250,17 +1249,16 @@ private:
         // silent substitution would make a benchmark of it meaningless and a gradient
         // from it unattributable.
         if (is_hirschberg(tb_)) {
-            if constexpr (GM != GapModel::Affine)
-                throw std::logic_error(
-                    "nwgrad: traceback=\"hirschberg\" is implemented for the affine gap "
-                    "model only (the linear model has no gap-open state to carry across "
-                    "a split)");
-            else if constexpr (AB != AlignBand::Full)
+            if constexpr (AB != AlignBand::Full)
                 throw std::logic_error(
                     "nwgrad: traceback=\"hirschberg\" is implemented for full DP only; a "
                     "guide band already bounds memory, which is the only thing Hirschberg buys");
             else if (m_ > hb_cutoff_) {
-                if constexpr (AM == AlignMode::Local) { viterbi_affine_hirschberg_local(buf); return; }
+                // Linear: one exact sweep for both "hirschberg" and "hirschberg_pmax" —
+                // the prefix-max carry exists to remove affine's lazy-F fixpoint, and the
+                // scalar linear sweep has none.
+                if constexpr (GM == GapModel::Linear) { viterbi_linear_hirschberg(buf); return; }
+                else if constexpr (AM == AlignMode::Local) { viterbi_affine_hirschberg_local(buf); return; }
                 else { viterbi_affine_hirschberg(buf); return; }
             }
             // A pair no longer than hb_cutoff never splits, so it is run AS Pointers —
@@ -1281,7 +1279,9 @@ private:
             // No simd linear kernel: every backend is scalar here.  Full + Pointers keeps
             // direction bytes, not H (viterbi_linear_ptr).
             if constexpr (AB == AlignBand::Full)
-                if (tb_ == TracebackMode::Pointers) { viterbi_linear_ptr(buf); return; }
+                if (tb_ == TracebackMode::Pointers || is_hirschberg(tb_)) {
+                    viterbi_linear_ptr(buf); return;
+                }
             viterbi_linear(buf);
             return;
         }
@@ -1446,14 +1446,19 @@ private:
             cur[0] = local ? static_cast<T>(0) : -static_cast<T>(i) * ge_b;
             d[0] = local ? 3 : 1;
             for (int j = 1; j <= n_; ++j) {
+                // Branch-free: the same comparisons in the same order as std::max over
+                // the initializer list, but as selects — data-dependent branches here
+                // mispredicted on every other cell (2x slower than the H fill, Global).
                 T v = prev[j - 1] + subT(i, j);
-                unsigned char c = 0;
                 const T u = prev[j] - ge_b, l = cur[j - 1] - ge_a;
-                if (v < u) { v = u; c = 1; }
-                if (v < l) { v = l; c = 2; }
+                const bool tu = v < u;
+                v = tu ? u : v;
+                const bool tl = v < l;
+                v = tl ? l : v;
+                unsigned char c = static_cast<unsigned char>(tl ? 2 : (tu ? 1 : 0));
                 if constexpr (local) {
                     v = std::max(v, static_cast<T>(0));
-                    if (v <= static_cast<T>(0)) c = 3;
+                    c = (v <= static_cast<T>(0)) ? static_cast<unsigned char>(3) : c;
                     if (v > best_local) { best_local = v; best_i_ = i; best_j_ = j; }
                 }
                 cur[j] = v; d[j] = c;
@@ -2220,6 +2225,183 @@ private:
                   : (hops_.back() == 1 ? TBTable::X
                      : (hops_.back() == 2 ? TBTable::Y : TBTable::M));
         hirschberg_ = true;
+    }
+
+    // ── Linear gaps in linear space ─────────────────────────────────────────────
+    //
+    // Hirschberg for linear gaps: no gap state crosses a row cut (a gap move costs ge
+    // whatever precedes it), so the join is a plain argmax of forward + reverse scores —
+    // none of the affine path's boundary flags or open refunds.  Scalar sweeps (linear
+    // has no simd per-pair kernel), O(n) rows; the base case is the Pointers fill on the
+    // sub-rectangle, walked back into hops_.  Local: the affine path's endpoint reduction
+    // — a clamped forward scan for the end (ie, je) and its score, an unclamped global-
+    // suffix scan for the start, then the global solve of the box.  Like affine
+    // Hirschberg it may pick a different optimal path at ties above hb_cutoff, never a
+    // worse one (the score is replayed from the path); a pair <= hb_cutoff runs AS
+    // Pointers (run_viterbi), bit-exact.
+
+    // Forward sweep from (i0, j0), Global borders, to row i1: out[c] = best score of
+    // A[i0..i1) x B[j0..j0+c).  Reverse (rev): from (i1, j1) back to row i0, out[d] =
+    // best score of A[i0..i1) x B[j1-d..j1).
+    void lhb_sweep(DpBuffer& buf, bool rev, int i0, int i1, int j0, int j1, T* out) {
+        const int W = j1 - j0;
+        hb_fit(buf.hfa, static_cast<std::size_t>(W) + 1);
+        T* row = buf.hfa.data();
+        const T ge_a = static_cast<T>(params_->gap_extend_a);
+        const T ge_b = static_cast<T>(params_->gap_extend_b);
+        row[0] = static_cast<T>(0);
+        for (int c = 1; c <= W; ++c) row[c] = row[c - 1] - ge_a;
+        for (int r = 1; r <= i1 - i0; ++r) {
+            const int i = rev ? i1 - r + 1 : i0 + r;   // 1-based DP row of A[i-1]
+            T diag = row[0];
+            row[0] = row[0] - ge_b;
+            for (int c = 1; c <= W; ++c) {
+                const int j = rev ? j1 - c + 1 : j0 + c;
+                T v = diag + subT(i, j);
+                const T u = row[c] - ge_b, l = row[c - 1] - ge_a;
+                if (v < u) v = u;
+                if (v < l) v = l;
+                diag = row[c];
+                row[c] = v;
+            }
+        }
+        std::copy(row, row + W + 1, out);
+    }
+
+    // Base case: Pointers on the sub-rectangle, Global borders, walked back from
+    // (i1, j1) to (i0, j0); the moves appended to hops_ in forward order.
+    void lhb_base(DpBuffer& buf, int i0, int i1, int j0, int j1) {
+        const int H = i1 - i0, W = j1 - j0;
+        const std::size_t st = static_cast<std::size_t>(W) + 1;
+        if (buf.DM.size() < (static_cast<std::size_t>(H) + 1) * st)
+            buf.DM.resize((static_cast<std::size_t>(H) + 1) * st);
+        hb_fit(buf.hfa, st); hb_fit(buf.hfb, st);
+        T* prev = buf.hfa.data(); T* cur = buf.hfb.data();
+        unsigned char* D = buf.DM.data();
+        const T ge_a = static_cast<T>(params_->gap_extend_a);
+        const T ge_b = static_cast<T>(params_->gap_extend_b);
+        prev[0] = static_cast<T>(0);
+        for (int c = 1; c <= W; ++c) { prev[c] = prev[c - 1] - ge_a; D[c] = 2; }
+        for (int r = 1; r <= H; ++r) {
+            unsigned char* d = D + static_cast<std::size_t>(r) * st;
+            cur[0] = prev[0] - ge_b; d[0] = 1;
+            for (int c = 1; c <= W; ++c) {
+                T v = prev[c - 1] + subT(i0 + r, j0 + c);
+                unsigned char k = 0;
+                const T u = prev[c] - ge_b, l = cur[c - 1] - ge_a;
+                if (v < u) { v = u; k = 1; }
+                if (v < l) { v = l; k = 2; }
+                cur[c] = v; d[c] = k;
+            }
+            std::swap(prev, cur);
+        }
+        const std::size_t at = hops_.size();
+        int r = H, c = W;
+        while (r > 0 || c > 0) {
+            const unsigned char k = D[static_cast<std::size_t>(r) * st + c];
+            hops_.push_back(k);
+            if (k == 0) { --r; --c; } else if (k == 1) --r; else --c;
+        }
+        std::reverse(hops_.begin() + static_cast<std::ptrdiff_t>(at), hops_.end());
+    }
+
+    void lhb_solve(DpBuffer& buf, int i0, int i1, int j0, int j1) {
+        const int H = i1 - i0, W = j1 - j0;
+        if (H <= hb_cutoff_) { lhb_base(buf, i0, i1, j0, j1); return; }
+        const int p = i0 + H / 2;
+        hb_fit(buf.hsM, static_cast<std::size_t>(W) + 1);
+        hb_fit(buf.hra, static_cast<std::size_t>(W) + 1);
+        lhb_sweep(buf, false, i0, p, j0, j1, buf.hsM.data());
+        lhb_sweep(buf, true, p, i1, j0, j1, buf.hra.data());
+        const T* F = buf.hsM.data(); const T* R = buf.hra.data();
+        T best = static_cast<T>(NEG_INF);
+        int cstar = 0;
+        for (int c = 0; c <= W; ++c) {
+            const T v = F[c] + R[W - c];
+            if (v > best) { best = v; cstar = c; }
+        }
+        lhb_solve(buf, i0, p, j0, j0 + cstar);
+        lhb_solve(buf, p, i1, j0 + cstar, j1);
+    }
+
+    void viterbi_linear_hirschberg(DpBuffer& buf) {
+        hops_.clear();
+        hb_start_i_ = 0; hb_start_j_ = 0;
+        int i_end = m_, j_end = n_;
+        const T ge_a = static_cast<T>(params_->gap_extend_a);
+        const T ge_b = static_cast<T>(params_->gap_extend_b);
+        if constexpr (AM == AlignMode::Local) {
+            // Forward clamped scan: the best cell, first row then first column (strict >,
+            // as viterbi_linear chooses it).
+            hb_fit(buf.hfa, static_cast<std::size_t>(n_) + 1);
+            T* row = buf.hfa.data();
+            std::fill(row, row + n_ + 1, static_cast<T>(0));
+            T best = static_cast<T>(0); int ie = 0, je = 0;
+            for (int i = 1; i <= m_; ++i) {
+                T diag = row[0];
+                for (int j = 1; j <= n_; ++j) {
+                    T v = diag + subT(i, j);
+                    const T u = row[j] - ge_b, l = row[j - 1] - ge_a;
+                    if (v < u) v = u;
+                    if (v < l) v = l;
+                    v = std::max(v, static_cast<T>(0));
+                    diag = row[j];
+                    row[j] = v;
+                    if (v > best) { best = v; ie = i; je = j; }
+                }
+            }
+            if (!(best > static_cast<T>(0))) {
+                viterbi_score_ = 0.0; best_i_ = 0; best_j_ = 0; hirschberg_ = true; return;
+            }
+            // Unclamped global-suffix scan over [0, ie) x [0, je): the start maximizing
+            // the box's global score (any argmax scores the local optimum).
+            hb_fit(buf.hfb, static_cast<std::size_t>(je) + 1);
+            T* g = buf.hfb.data();                       // g[q] = score from (p, q) to (ie, je)
+            g[je] = static_cast<T>(0);
+            for (int q = je - 1; q >= 0; --q) g[q] = g[q + 1] - ge_a;
+            T sbest = g[0]; int is = ie, js = 0;
+            for (int q = 0; q <= je; ++q) if (g[q] > sbest) { sbest = g[q]; js = q; }
+            for (int pi = ie - 1; pi >= 0; --pi) {
+                T diag = g[je];
+                g[je] = g[je] - ge_b;
+                if (g[je] > sbest) { sbest = g[je]; is = pi; js = je; }
+                for (int q = je - 1; q >= 0; --q) {
+                    T v = diag + subT(pi + 1, q + 1);
+                    const T u = g[q] - ge_b, l = g[q + 1] - ge_a;
+                    if (v < u) v = u;
+                    if (v < l) v = l;
+                    diag = g[q];
+                    g[q] = v;
+                    if (v > sbest) { sbest = v; is = pi; js = q; }
+                }
+            }
+            hb_start_i_ = is; hb_start_j_ = js;
+            i_end = ie; j_end = je;
+            lhb_solve(buf, is, ie, js, je);
+        } else {
+            lhb_solve(buf, 0, m_, 0, n_);
+        }
+        // Replay for the score, in T and in path order (the tests compare it exactly).
+        T sc = static_cast<T>(0);
+        int i = hb_start_i_, j = hb_start_j_;
+        for (unsigned char op : hops_) {
+            if (op == 0)      { ++i; ++j; sc += subT(i, j); }
+            else if (op == 1) { ++i; sc -= ge_b; }
+            else              { ++j; sc -= ge_a; }
+        }
+        viterbi_score_ = static_cast<double>(sc);
+        best_i_ = i_end; best_j_ = j_end;
+        hirschberg_ = true;
+    }
+
+    void hard_grad_linear_hb(AlignParams& grad) const {
+        double* gblk = grad_block(grad);
+        int i = hb_start_i_, j = hb_start_j_;
+        for (unsigned char op : hops_) {
+            if (op == 0)      { ++i; ++j; gblk[sub_off(i, j)] += 1.0; }
+            else if (op == 1) { ++i; grad.gap_extend_b -= 1.0; }
+            else              { ++j; grad.gap_extend_a -= 1.0; }
+        }
     }
 
     // ── Consumers of a Hirschberg path ────────────────────────────────────────

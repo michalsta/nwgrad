@@ -129,22 +129,82 @@ def test_local_no_longer_throws(params):
     assert sp.score == pytest.approx(ref.score, rel=1e-5, abs=1e-3)
 
 
-def test_local_linear_still_throws(params):
-    """The gap model, not the alignment mode, is what Local Hirschberg cannot do: there
-    is no affine gap-open state to carry across a row cut in the linear model."""
-    sp = nwgrad.SeqPair("ACDEFGHIK", "ACDWFGHIK", params, gap_model="linear",
-                        mode="local", grad_mode="hard", traceback="hirschberg")
+# ── the linear gap model (Aligner::viterbi_linear_hirschberg) ──────────────────
+# No gap state crosses a row cut, so the join is a plain argmax; Local uses the same
+# endpoint reduction as affine.  Held to the same bar: the optimal score (exactly, on
+# the tie-heavy integral fixture), a real alignment of the inputs, and the gradient of
+# that path (for linear gaps the score is linear in the params: g . params == score).
+
+def _lin(a, b, p, tb, mode, cls=nwgrad.SeqPairDouble, cutoff=HB_CUTOFF):
+    sp = cls(a, b, p, gap_model="linear", mode=mode, grad_mode="hard", traceback=tb)
+    sp.hb_cutoff = cutoff
     sp.alloc_dp()
-    with pytest.raises(RuntimeError, match="affine gap model only"):
-        sp.align_full()
+    sp.align_full()
+    sp.compute_grad()
+    return sp
 
 
-def test_linear_gap_model_throws(params):
-    sp = nwgrad.SeqPair("ACDEFGHIK", "ACDWFGHIK", params, gap_model="linear",
-                        mode="global", grad_mode="hard", traceback="hirschberg")
+def _lin_dot(g, p):
+    return (float(np.sum(np.asarray(g.matrix.to_matrix()) * np.asarray(p.matrix.to_matrix())))
+            + g.gap_extend_a * p.gap_extend_a + g.gap_extend_b * p.gap_extend_b)
+
+
+@pytest.mark.parametrize("fixture", ["params", "asym_params"])
+@pytest.mark.parametrize("mode", ["global", "local"])
+@pytest.mark.parametrize("tb", ["hirschberg", "hirschberg_pmax"])
+def test_linear_optimal_and_consistent(request, fixture, mode, tb):
+    p = request.getfixturevalue(fixture)
+    A, B = _seqs(40, 1, 120, 71), _seqs(40, 1, 120, 72)
+    for a, b in zip(A, B):
+        ref = _lin(a, b, p, "pointers", mode)
+        hb = _lin(a, b, p, tb, mode)
+        if fixture == "params":
+            assert hb.score == ref.score
+        else:
+            assert hb.score == pytest.approx(ref.score, rel=1e-12, abs=1e-9)
+        x, y = hb.aligned()
+        assert len(x) == len(y)
+        if mode == "global":
+            assert x.replace("-", "") == a and y.replace("-", "") == b
+        else:
+            assert x.replace("-", "") in a and y.replace("-", "") in b
+        assert _lin_dot(hb.grad, p) == pytest.approx(hb.score, rel=1e-12, abs=1e-9)
+        gj = list(hb.guide_j)
+        assert len(gj) == len(a) + 1 and gj == sorted(gj)
+
+
+@pytest.mark.parametrize("mode", ["global", "local"])
+def test_linear_float32_and_batch(params, mode):
+    A, B = _seqs(30, 20, 100, 73), _seqs(30, 20, 100, 74)
+    for a, b in zip(A, B):
+        assert (_lin(a, b, params, "hirschberg", mode, cls=nwgrad.SeqPair).score ==
+                _lin(a, b, params, "pointers", mode, cls=nwgrad.SeqPair).score)
+    tot = {}
+    for tb in ("pointers", "hirschberg"):
+        batch = nwgrad.SeqPairBatchDouble(n_threads=3, traceback=tb)
+        batch.hb_cutoff = HB_CUTOFF
+        batch.add_many(A, B, params, gap_model="linear", mode=mode, grad_mode="hard")
+        tot[tb] = batch.score_and_grad()
+    assert tot["hirschberg"] == tot["pointers"]
+
+
+def test_linear_short_pairs_run_as_pointers(asym_params):
+    """At or below hb_cutoff nothing splits: bit-identical to pointers, path included."""
+    for a, b in zip(_seqs(20, 1, 60, 75), _seqs(20, 1, 60, 76)):
+        for mode in ("global", "local"):
+            r = _lin(a, b, asym_params, "pointers", mode, cutoff=512)
+            h = _lin(a, b, asym_params, "hirschberg", mode, cutoff=512)
+            assert (h.score, h.aligned(), list(h.guide_j)) == (r.score, r.aligned(), list(r.guide_j))
+
+
+def test_banded_realign_unaffected(params):
+    b = nwgrad.SeqPairBatchDouble(n_threads=1, traceback="hirschberg")
+    sp = nwgrad.SeqPairDouble("ACDEFGHIK", "ACDWFGHIK", params, gap_model="linear",
+                              mode="global", grad_mode="hard", traceback="hirschberg")
     sp.alloc_dp()
-    with pytest.raises(RuntimeError, match="affine gap model only"):
-        sp.align_full()
+    sp.align_full()
+    sp.realign_banded(2)   # the banded aligner keeps tables; Hirschberg is Full only
+    assert sp.score is not None
 
 
 def test_unknown_traceback_still_rejected():

@@ -191,12 +191,19 @@ def test_float32_default_costs_nothing_beyond_float32(params):
     assert abs(ref - auto).max() <= abs(ref - ptr).max()
 
 
-def test_linear_gap_model_throws(params):
-    a, b = _seqs(2, 40, 60, 2)
-    with pytest.raises(RuntimeError, match="affine gap model only"):
-        sp = nwgrad.SeqPairDouble(a, b, params, gap_model="linear", mode="global",
-                                  grad_mode="hard", traceback="hirschberg_pmax")
-        sp.alloc_dp(); sp.align_full()
+def test_linear_gap_model_runs_the_exact_sweep(params):
+    """Linear has no lazy-F to remove: "hirschberg_pmax" runs the exact linear sweep
+    (the same path as "hirschberg"), optimal like pointers."""
+    for a, b in zip(*[_seqs(6, 40, 60, k) for k in (2, 3)]):
+        out = {}
+        for tb in ("pointers", "hirschberg", "hirschberg_pmax"):
+            sp = nwgrad.SeqPairDouble(a, b, params, gap_model="linear", mode="global",
+                                      grad_mode="hard", traceback=tb)
+            sp.hb_cutoff = 8
+            sp.alloc_dp(); sp.align_full()
+            out[tb] = (sp.score, sp.aligned())
+        assert out["hirschberg_pmax"] == out["hirschberg"]
+        assert out["hirschberg"][0] == pytest.approx(out["pointers"][0], rel=1e-12, abs=1e-9)
 
 
 def test_local_is_supported(lossy_params):
