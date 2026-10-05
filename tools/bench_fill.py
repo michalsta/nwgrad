@@ -32,6 +32,7 @@ ap.add_argument("--vary-b", type=int, nargs=2, metavar=("LO", "HI"), default=Non
 ap.add_argument("--protein", type=int, nargs=4, metavar=("ALO", "AHI", "BLO", "BHI"),
                 default=None, help="random canonical-20 protein pairs, len A in [ALO, AHI], "
                 "len B in [BLO, BHI] (--n of them, seed 2), random N(0,1) matrix; --data ignored")
+ap.add_argument("--grad", default="hard", choices=["hard", "soft"])
 ap.add_argument("--configs", nargs="+",
                 default=["local-affine", "global-affine", "local-linear", "global-linear"])
 args = ap.parse_args()
@@ -67,7 +68,7 @@ def run(prec, threads, mode, gap, tb, fill, bw=0):
     b = CLS[prec](n_threads=threads, traceback=tb)
     b.fill = fill
     b.add_many(A, B, params if gap == "affine" else lin, gap_model=gap, mode=mode,
-               grad_mode="hard")
+               grad_mode=args.grad)
     b.score_and_grad()  # warm: allocation, plan (and the guides banded_grad needs)
     step = (lambda: b.banded_grad(bw)) if bw else b.score_and_grad
     if bw:
@@ -80,7 +81,7 @@ def run(prec, threads, mode, gap, tb, fill, bw=0):
     return best / len(A) * 1e6
 
 
-print(f"isa={nwgrad.simd_isa()} n={len(A)}")
+print(f"isa={nwgrad.simd_isa()} n={len(A)} grad={args.grad}")
 print(f"{'prec':8s} {'thr':>3s} {'config':14s} {'tb':8s} {'striped':>8s} {'interpair':>9s} {'ratio':>6s}")
 for prec in args.prec:
     for t in args.threads:
