@@ -232,9 +232,12 @@ def test_is_the_default_where_it_applies(params):
                           mode="global").traceback == "hirschberg_pmax"
     assert nwgrad.SeqPairDouble("ACDE", "ACDE", params, gap_model="affine",
                                 mode="global").traceback == "hirschberg"
-    # everything Hirschberg does not implement resolves to pointers, not a throw
+    # Local affine: pmax at float32 (its endpoint scans take the carry), pointers at
+    # double; linear resolves to pointers
     assert nwgrad.SeqPair("ACDE", "ACDE", params, gap_model="affine",
-                          mode="local").traceback == "pointers"
+                          mode="local").traceback == "hirschberg_pmax"
+    assert nwgrad.SeqPairDouble("ACDE", "ACDE", params, gap_model="affine",
+                                mode="local").traceback == "pointers"
     assert nwgrad.SeqPair("ACDE", "ACDE", params, gap_model="linear",
                           mode="global").traceback == "pointers"
 

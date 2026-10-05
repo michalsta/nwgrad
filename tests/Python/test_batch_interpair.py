@@ -215,3 +215,15 @@ def test_protein(prec, gm, mode, grad):
             assert np.array_equal(x, y)
         else:
             np.testing.assert_allclose(x, y, rtol=REL, atol=REL)
+
+
+def test_long_local_float32_pairs_keep_their_hirschberg_default():
+    """Local float32 affine defaults to hirschberg_pmax: pairs past the cutoff run their
+    own path (and so equal fill='striped'), shorter ones join groups."""
+    A, B = _seqs(12, 500, 700, 81), _seqs(12, 600, 640, 82)
+    A += _seqs(40, 10, 30, 83); B += _seqs(40, 50, 51, 84)
+    p = _params("random", "affine")
+    r0 = _align("float32", p, "affine", "local", "hard", A, B, "striped")
+    r1 = _align("float32", p, "affine", "local", "hard", A, B, "interpair")
+    for x, y in zip(r0, r1):
+        assert np.array_equal(x, y)

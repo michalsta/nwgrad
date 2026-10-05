@@ -690,12 +690,20 @@ private:
     // 1.5-3.9x on homologous data.  T=double is chosen BY people who want exactness, so
     // it keeps the carry that has it: there the ramp would be the largest error term in
     // the computation (~9.1e-13 against the exact mode's ~1.6e-12) rather than a rounding
-    // lost in the noise.  Either default is overridable per problem; neither is reachable
-    // for Local, linear or banded, which resolve to Pointers above.
+    // lost in the noise.  Either default is overridable per problem.
+    //
+    // LOCAL affine Full at T=float defaults to HirschbergPmax too (2026-10-05), since its
+    // endpoint scans took the prefix-max carry: measured (nighthaven, AVX2, float32,
+    // 1000-3000 aa, 1 / 12 threads) 1.6x / 1.5-2.3x Pointers on 30%-mutated homologues
+    // and 2.8-3.6x / 3.7-5x on unrelated pairs, identical totals; pairs <= hb_cutoff run
+    // AS Pointers.  Local double stays Pointers (exact Local Hirschberg loses there; pmax
+    // at double is opt-in by the rule above).  Linear and banded resolve to Pointers.
     static constexpr TracebackMode kDefaultTb =
-        (GM == GapModel::Affine && AM == AlignMode::Global && AB == AlignBand::Full)
+        (GM == GapModel::Affine && AB == AlignBand::Full && AM == AlignMode::Global)
             ? (std::is_same_v<T, float> ? TracebackMode::HirschbergPmax
                                         : TracebackMode::Hirschberg)
+        : (GM == GapModel::Affine && AB == AlignBand::Full && std::is_same_v<T, float>)
+            ? TracebackMode::HirschbergPmax
             : TracebackMode::Pointers;
     TracebackMode tb_ = kDefaultTb;
     bool          tb_auto_ = true;   // tb_ came from "auto" (see linear_ptr_fill)

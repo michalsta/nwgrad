@@ -154,8 +154,10 @@ private:
         const int W = soft ? K.inter_w : inter_w_(K);
         const bool banded = banded_(problems);
         const int hb_cut = Aligner<GapModel::Affine, AlignMode::Global, AlignBand::Full, T>{}.hb_cutoff();
+        // The default traceback splits affine Full pairs past the cutoff: Global at
+        // either precision, Local at float32 (Aligner::kDefaultTb).
         const bool hb_case = !soft && !banded && gap_model == GapModel::Affine &&
-                             align_mode == AlignMode::Global;
+                             (align_mode == AlignMode::Global || std::is_same_v<T, float>);
         std::vector<size_t> other, elig;
         size_t maxa = 0, maxb = 0;
         for (size_t i = 0; i < N; ++i) {
