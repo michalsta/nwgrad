@@ -47,9 +47,10 @@ struct BatchAlignerT {
     int kernel;   // Viterbi backend (kBackendAuto/kBackendScalar or a SimdLevel index)
     SoftImpl soft_impl = SoftImpl::Scaled;   // soft-path evaluation, see SoftImpl
     double soft_temperature = 1.0;           // see Aligner::set_soft_temperature
-    // fill = "interpair": W problems per vector lane at once, as SeqPairBatch.fill —
-    // bit-identical scores and hard gradients; see align_inter_().  A speed knob only.
-    bool inter_fill = false;
+    // fill = "interpair" (the default): W problems per vector lane at once, as
+    // SeqPairBatch.fill — bit-identical scores and hard gradients; see align_inter_().
+    // A speed knob only (measured 0.21-0.93x striped's time on AVX2, every config).
+    bool inter_fill = true;
 
     BatchAlignerT(AlignParams p, int band,
                  GapModel gm, AlignMode am, GradMode gd, int nt,

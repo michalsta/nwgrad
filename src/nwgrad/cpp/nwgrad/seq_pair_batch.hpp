@@ -1209,10 +1209,12 @@ public:
     bool soft_guide_lazy = false;
     bool soft_guide_posterior = false;   // see SeqPair::set_soft_guide_posterior
 
-    // score_and_grad() fills W pairs at once, one per vector lane (InterJob), wherever
-    // a pair qualifies (inter_eligible_); the rest run their own fill.  Bit-identical
-    // results either way.  Python: fill = "interpair".
-    bool inter_fill = false;
+    // score_and_grad() and banded_grad() fill W pairs at once, one per vector lane
+    // (InterJobT), wherever a pair qualifies (inter_backend_); the rest run their own
+    // fill.  Bit-identical results either way.  The DEFAULT since 2026-10-05: measured
+    // 0.2-0.5x striped's time on short pairs (AVX2), the first call's plan included;
+    // the size cap keeps long pairs on their own path.  Python: fill = "interpair".
+    bool inter_fill = true;
 
 private:
 

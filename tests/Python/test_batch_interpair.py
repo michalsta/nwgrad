@@ -49,9 +49,9 @@ def _align(prec, p, gm, mode, grad, A, B, fill, band=0, kernel="auto", threads=3
 
 def test_fill_property():
     ba = nwgrad.BatchAligner(_params("ties", "affine"))
+    assert ba.fill == "interpair"   # the default
+    ba.fill = "striped"
     assert ba.fill == "striped"
-    ba.fill = "interpair"
-    assert ba.fill == "interpair"
     with pytest.raises(ValueError, match="unknown fill"):
         ba.fill = "rowwise"
 

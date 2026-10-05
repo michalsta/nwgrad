@@ -385,7 +385,7 @@ static void bind_batch_aligner(nb::module_& m, const char* name) {
                 else throw nb::value_error(("nwgrad: unknown fill \"" + v +
                                             "\" (expected \"striped\" or \"interpair\")").c_str());
             },
-            "\"striped\" (default) | \"interpair\": as SeqPairBatch.fill — align() runs\n"
+            "\"interpair\" (default) | \"striped\": as SeqPairBatch.fill — align() runs\n"
             "several problems at once, one per vector lane (DNA/RNA-sized alphabets, <= 8\n"
             "letters; hard, none and soft grad modes; full DP, and banded for affine\n"
             "Viterbi).  Problems it cannot take run their own path.  Scores and hard\n"
@@ -785,21 +785,25 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
                 s.inter_fill = inter;
                 for (auto* sp : s.pairs) sp->set_rowwise_full(s.rowwise_full);
             },
-            "Which vectorized fill full (unbanded) affine DP uses at double precision.\n"
-            "  \"striped\" (default): the striped kernel, fastest on long pairs.\n"
-            "  \"rowwise\": the row-wise kernel the banded path uses; no lazy-F\n"
-            "     fixpoint, so faster on short pairs (miRNA x site, ~22 x 50: 1.5-1.8x).\n"
-            "  \"interpair\": score_and_grad() fills several pairs at once, one per\n"
-            "     vector lane, grouped by length of B (fastest on many short pairs;\n"
-            "     ~4x the scalar fill at 22 x 50 on AVX2).  Pairs it cannot take —\n"
-            "     float32, linear gaps, alphabets over 8 letters, the\n"
-            "     scalar kernel — run the striped fill.  Other batch operations\n"
-            "     (align_full, banded) use the striped fill.\n"
-            "Scores, paths and gradients are bit-identical whichever fill runs.\n"
-            "\"rowwise\" and \"interpair\" keep three score tables (24 B/cell; interpair\n"
-            "per group of pairs) per thread even with traceback \"pointers\".  Ignored at\n"
-            "float32, for linear gaps, and on the scalar kernel.  Applies to the pairs in\n"
-            "the batch and to later add_many() ones.")
+            "How score_and_grad() and banded_grad() fill the DP.\n"
+            "  \"interpair\" (default): several pairs at once, one per vector lane (W = 4\n"
+            "     double / 8 float32 on AVX2), grouped by length (B lengths may differ by\n"
+            "     up to 1.25x + 4 within a group).  Both precisions, both gap models,\n"
+            "     any alphabet (over 8 letters: a per-row gathered profile), hard and\n"
+            "     soft (the soft forward-backward is shared too), full DP and — affine,\n"
+            "     hard — banded_grad().  Pairs it would slow down run their own fill in\n"
+            "     the same pass: a group's tables past L2 (1.25 MiB; soft pass 512 KiB),\n"
+            "     linear Global below 4 lanes or over 8 letters, Hirschberg pairs past\n"
+            "     hb_cutoff, the scalar kernel, groups mixing params.  Measured on\n"
+            "     nighthaven (AVX2): 0.2-0.5x striped's time on miRNA x site pairs.\n"
+            "  \"striped\": every pair its own fill — the striped kernel at double, the\n"
+            "     float32 / linear fills elsewhere.\n"
+            "  \"rowwise\": as striped, but the full affine double fill is the row-wise\n"
+            "     kernel (no lazy-F fixpoint; faster on short pairs than striped).\n"
+            "Scores, paths and hard gradients are bit-identical whichever fill runs; soft\n"
+            "results are tolerance-equal (the soft path is never bit-exact).  Other batch\n"
+            "operations (align_full, realign_banded) use the pairs' own fill.  Applies to\n"
+            "the pairs in the batch and to later add_many() ones.")
         .def_prop_rw(
             "soft_impl",
             [](const SPB& s) { return soft_impl_name(s.soft_impl); },

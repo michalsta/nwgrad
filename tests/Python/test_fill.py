@@ -64,6 +64,8 @@ def _run(seqs_a, seqs_b, params, mode, traceback, fill, kernel="auto", prec="dou
 
 def test_default_and_validation():
     b = nwgrad.SeqPairBatchDouble(n_threads=1)
+    assert b.fill == "interpair"   # the default
+    b.fill = "striped"
     assert b.fill == "striped"
     b.fill = "rowwise"
     assert b.fill == "rowwise"
