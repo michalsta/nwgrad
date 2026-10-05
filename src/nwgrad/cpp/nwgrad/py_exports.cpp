@@ -376,6 +376,20 @@ static void bind_batch_aligner(nb::module_& m, const char* name) {
                 s.soft_temperature = v;
             },
             NWGRAD_SOFT_TEMP_DOC)
+        .def_prop_rw(
+            "fill",
+            [](const BA& s) { return std::string(s.inter_fill ? "interpair" : "striped"); },
+            [](BA& s, const std::string& v) {
+                if (v == "striped") s.inter_fill = false;
+                else if (v == "interpair") s.inter_fill = true;
+                else throw nb::value_error(("nwgrad: unknown fill \"" + v +
+                                            "\" (expected \"striped\" or \"interpair\")").c_str());
+            },
+            "\"striped\" (default) | \"interpair\": as SeqPairBatch.fill — align() runs\n"
+            "several problems at once, one per vector lane (DNA/RNA-sized alphabets, <= 8\n"
+            "letters; hard, none and soft grad modes; full DP, and banded for affine\n"
+            "Viterbi).  Problems it cannot take run their own path.  Scores and hard\n"
+            "gradients are bit-identical either way; soft results tolerance-equal.")
         .def(
             "align",
             [](const BA& self,
