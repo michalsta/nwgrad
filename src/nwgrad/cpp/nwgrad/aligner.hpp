@@ -447,7 +447,15 @@ struct Aligner {
         pointers_       = false;
         hirschberg_     = false;
         inter_w_ = W; inter_lane_ = lane;
-        if constexpr (AM == AlignMode::Local) {
+        if constexpr (GM == GapModel::Linear) {
+            // Linear: H in buf.H's slot of the interleaved fill (InterJob.linear).
+            if constexpr (AM == AlignMode::Local) {
+                viterbi_score_ = static_cast<T>(local_best);
+                best_i_ = best_i; best_j_ = best_j;
+            } else {
+                viterbi_score_ = rat(buf.H, m_, n_);
+            }
+        } else if constexpr (AM == AlignMode::Local) {
             viterbi_score_ = static_cast<T>(local_best);
             best_i_ = best_i; best_j_ = best_j; best_tbl_ = TBTable::M;
             if (best_i > 0) {

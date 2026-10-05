@@ -32,7 +32,106 @@ typedef long long ivl __attribute__((vector_size(8 * IW)));
 static inline ivd ivmax(ivd a, ivd b) noexcept { return a < b ? b : a; }
 static inline ivd ivsel(ivl m, ivd a, ivd b) noexcept { return m ? a : b; }
 
+// Linear gaps: one table H (in J.VM), per lane exactly Aligner::viterbi_linear —
+// v = max(diag + s, up - ge_b, left - ge_a), Local clamped at 0, the same left-to-right
+// max order (std::max over an initializer list keeps the FIRST largest, as the ivmax
+// chain below does) and the same borders, so each lane's table is bit-identical to the
+// pair's own fill.  Row-wise vectorization of linear was measured at 0.90x and deleted
+// (the left carry is a pure latency chain); one PAIR per lane sidesteps that, since each
+// lane's chain is its own and W of them run side by side.
+static void inter_fill_linear(InterJob& J) noexcept {
+    const int n = J.n, M = J.M, st = n + 1;
+    const bool local = J.align_mode == 1;
+    ivd* H = reinterpret_cast<ivd*>(J.VM);
+    const ivd z = {}, ninf = z + (-std::numeric_limits<double>::infinity());
+
+    if (local) {
+        for (int j = 0; j <= n; ++j) H[j] = z;
+        for (int i = 1; i <= M; ++i) H[static_cast<size_t>(i) * st] = z;
+    } else {
+        H[0] = z;
+        for (int i = 1; i <= M; ++i)
+            H[static_cast<size_t>(i) * st] = z + (-static_cast<double>(i) * J.ge_b);
+        for (int j = 1; j <= n; ++j) H[j] = z + (-static_cast<double>(j) * J.ge_a);
+    }
+
+    const int na = J.nalpha;
+    const int levels = na <= 1 ? 0 : na <= 2 ? 1 : na <= 4 ? 2 : 3;
+    static thread_local std::vector<ivl> bits;
+    if (bits.size() < static_cast<size_t>(3 * (n + 1))) bits.resize(3 * (n + 1));
+    for (int j = 1; j <= n; ++j)
+        for (int k = 0; k < levels; ++k) {
+            ivl v;
+            for (int l = 0; l < IW; ++l) v[l] = ((J.b[l][j - 1] >> k) & 1) ? -1 : 0;
+            bits[3 * j + k] = v;
+        }
+
+    const ivd ge_a = z + J.ge_a, ge_b = z + J.ge_b;
+    ivd best = z, bi = z, bj = z;
+
+    for (int i = 1; i <= M; ++i) {
+        ivd P[8];
+        ivl live;
+        for (int c = 0; c < 8; ++c) {
+            const int cc = c < na ? c : 0;
+            for (int l = 0; l < IW; ++l) {
+                const int a = (i <= J.m[l]) ? J.a[l][i - 1] : 0;
+                P[c][l] = J.blk[a * na + cc];
+            }
+        }
+        for (int l = 0; l < IW; ++l) live[l] = (i <= J.m[l]) ? -1 : 0;
+
+        ivd* h = H + static_cast<size_t>(i) * st;
+        const ivd* p = h - st;
+        ivd lh = h[0];
+        ivd rb = ninf, rj = z;
+        for (int j = 1; j <= n; ++j) {
+            ivd s;
+            if (levels == 0) s = P[0];
+            else {
+                const ivl b0 = bits[3 * j];
+                ivd t0 = ivsel(b0, P[1], P[0]), t1 = ivsel(b0, P[3], P[2]);
+                if (levels == 1) s = t0;
+                else {
+                    const ivl b1 = bits[3 * j + 1];
+                    ivd u0 = ivsel(b1, t1, t0);
+                    if (levels == 2) s = u0;
+                    else {
+                        ivd t2 = ivsel(b0, P[5], P[4]), t3 = ivsel(b0, P[7], P[6]);
+                        ivd u1 = ivsel(b1, t3, t2);
+                        s = ivsel(bits[3 * j + 2], u1, u0);
+                    }
+                }
+            }
+            ivd v = p[j - 1] + s;
+            v = ivmax(v, p[j] - ge_b);
+            v = ivmax(v, lh - ge_a);
+            if (local) v = ivmax(v, z);
+            h[j] = v;
+            lh = v;
+            if (local) {
+                const ivl upd = rb < v;
+                rb = ivsel(upd, v, rb);
+                rj = ivsel(upd, z + static_cast<double>(j), rj);
+            }
+        }
+        if (local) {
+            const ivl imp = live & (rb > best);
+            best = ivsel(imp, rb, best);
+            bi = ivsel(imp, z + static_cast<double>(i), bi);
+            bj = ivsel(imp, rj, bj);
+        }
+    }
+    if (local)
+        for (int l = 0; l < IW; ++l) {
+            J.best[l] = best[l];
+            J.best_i[l] = static_cast<int>(bi[l]);
+            J.best_j[l] = static_cast<int>(bj[l]);
+        }
+}
+
 static void inter_fill_entry(InterJob& J) noexcept {
+    if (J.linear) { inter_fill_linear(J); return; }
     const double NINF = -std::numeric_limits<double>::infinity();
     const int n = J.n, M = J.M, st = n + 1;
     const bool local = J.align_mode == 1;

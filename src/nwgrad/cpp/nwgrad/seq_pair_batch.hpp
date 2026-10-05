@@ -502,7 +502,7 @@ struct SeqPairBatchT {
 
 private:
     // The vector backend an inter-pair fill of this pair would run on, or -1 when the
-    // pair must take its own fill: float32, linear gaps, an alphabet over 8 letters or
+    // pair must take its own fill: float32, an alphabet over 8 letters or
     // the scalar backend.  Soft pairs qualify: the shared fill is their guide Viterbi
     // (bit-identical to their own), and forward-backward then runs per pair. The mutable Hirschberg cutoff is
     // handled separately when building and validating the cached plan.
@@ -511,8 +511,6 @@ private:
     int inter_backend_(const SeqPair& p) const {
         if constexpr (!std::is_same_v<T, double>) return -1;
         else {
-            // Linear has no inter-pair Viterbi fill, only the soft pass: soft pairs only.
-            if (p.gap_model() != GapModel::Affine && p.grad_mode() != GradMode::Soft) return -1;
             if (p.len_a() == 0 || p.len_b() == 0) return -1;
             if (p.params_ptr()->matrix.size() > 8) return -1;
             const int backend = (p.kernel() == kBackendAuto) ? global_default_backend() : p.kernel();
@@ -591,24 +589,28 @@ private:
                 }
                 const int n = static_cast<int>(p0.len_b());
                 const AlignParams& P = *p0.params_ptr();
-                const bool lin = p0.gap_model() == GapModel::Linear;   // then all soft
+                const bool lin = p0.gap_model() == GapModel::Linear;
                 // A lazy-guide soft group needs no Viterbi at all: skip the shared fill.
                 bool lazy = p0.grad_mode() == GradMode::Soft && p0.soft_guide_lazy();
                 for (size_t l = 1; l < real && lazy; ++l) {
                     const SeqPair& p = *pairs[elig[s + l]];
                     lazy = p.grad_mode() == GradMode::Soft && p.soft_guide_lazy();
                 }
-                const bool skip_fill = lin || lazy;
+                const bool skip_fill = lazy;
                 InterJob job{};
                 job.a = a.data(); job.m = m.data(); job.b = b.data(); job.n = n; job.M = M;
                 job.align_mode = (p0.align_mode() == AlignMode::Local) ? 1 : 0;
                 if (!skip_fill) {
                     const size_t sz = static_cast<size_t>(M + 1) * (n + 1) * W;
-                    if (buf.VM.size() < sz) { buf.VM.resize(sz); buf.VX.resize(sz); buf.VY.resize(sz); }
+                    // Linear's one table rides in the H slot (adopt_interleaved reads buf.H).
+                    if (lin) { if (buf.H.size() < sz) buf.H.resize(sz); }
+                    else if (buf.VM.size() < sz) { buf.VM.resize(sz); buf.VX.resize(sz); buf.VY.resize(sz); }
                     job.blk = P.matrix.data(); job.nalpha = P.matrix.size();
                     job.go_a = P.gap_open_a; job.ge_a = P.gap_extend_a;
                     job.go_b = P.gap_open_b; job.ge_b = P.gap_extend_b;
-                    job.VM = buf.VM.data(); job.VX = buf.VX.data(); job.VY = buf.VY.data();
+                    job.linear = lin ? 1 : 0;
+                    if (lin) job.VM = buf.H.data();
+                    else { job.VM = buf.VM.data(); job.VX = buf.VX.data(); job.VY = buf.VY.data(); }
                     job.best = best.data(); job.best_i = bi.data(); job.best_j = bj.data();
                     K.inter_fill(job);
                 }

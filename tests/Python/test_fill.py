@@ -251,3 +251,58 @@ def test_guides_match_striped(fill, mode):
         out.append((batch.scores(), *batch.grads()))
     for x, y in zip(*out):
         assert np.array_equal(x, y)
+
+
+# ── Linear gaps under fill="interpair" (InterJob.linear) ─────────────────────
+# Each lane must write H bit-identical to the pair's own scalar viterbi_linear, so the
+# score, the traceback-derived guide and the hard gradient match striped bit for bit,
+# ties included (the "ties" fixture makes them common).
+
+def _run_linear(seqs_a, seqs_b, params, mode, fill, grad_mode="hard", kernel="auto"):
+    b = nwgrad.SeqPairBatchDouble(n_threads=4, traceback="pointers")
+    b.fill = fill
+    b.add_many(seqs_a, seqs_b, params, gap_model="linear", mode=mode,
+               grad_mode=grad_mode, kernel=kernel)
+    b.score_and_grad()
+    mats, gaps = b.grads()
+    guides = [list(b[i].guide_j) for i in range(len(b))]
+    return b.scores(), mats, gaps, guides
+
+
+@pytest.mark.parametrize("kind", ["ties", "cheap_gaps", "random"])
+@pytest.mark.parametrize("mode", ["local", "global"])
+@pytest.mark.parametrize("lengths", [(1, 30, 1, 60), (15, 30, 50, 51), (60, 200, 60, 200)])
+def test_linear_interpair_matches_striped(kind, mode, lengths):
+    a = _seqs(301, lengths[0], lengths[1], 11)
+    b = _seqs(301, lengths[2], lengths[3], 12)
+    p = _params(kind)
+    r0 = _run_linear(a, b, p, mode, "striped")
+    r1 = _run_linear(a, b, p, mode, "interpair")
+    for x, y in zip(r0[:3], r1[:3]):
+        assert np.array_equal(x, y)
+    assert r0[3] == r1[3]
+
+
+@pytest.mark.parametrize("mode", ["local", "global"])
+@pytest.mark.parametrize("level", [l for l in nwgrad.available_isa_levels()])
+def test_linear_interpair_every_isa_level(level, mode):
+    a, b = _seqs(203, 10, 40, 13), _seqs(203, 30, 33, 14)
+    p = _params("ties")
+    ref = _run_linear(a, b, p, mode, "striped", kernel="scalar_fallback")
+    got = _run_linear(a, b, p, mode, "interpair", kernel=level)
+    for x, y in zip(ref[:3], got[:3]):
+        assert np.array_equal(x, y)
+    assert ref[3] == got[3]
+
+
+@pytest.mark.parametrize("mode", ["local", "global"])
+def test_linear_interpair_soft_guides(mode):
+    """Eager soft linear pairs now take their guide from the inter-pair Viterbi fill:
+    guides bit-identical to striped; scores and gradients tolerance-equal (soft)."""
+    a, b = _seqs(150, 10, 40, 15), _seqs(150, 40, 41, 16)
+    p = _params("random")
+    r0 = _run_linear(a, b, p, mode, "striped", grad_mode="soft")
+    r1 = _run_linear(a, b, p, mode, "interpair", grad_mode="soft")
+    for x, y in zip(r0[:3], r1[:3]):
+        np.testing.assert_allclose(x, y, rtol=1e-11, atol=1e-11)
+    assert r0[3] == r1[3]

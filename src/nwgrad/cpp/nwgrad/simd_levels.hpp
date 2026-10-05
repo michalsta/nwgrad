@@ -266,6 +266,7 @@ struct InterJob {
     const double* blk; int nalpha;   // substitution block, row-major nalpha x nalpha
     double go_a, ge_a, go_b, ge_b;
     int align_mode;                  // 0 = Global, 1 = Local
+    int linear;                      // 1 = linear gaps: H in VM only (go_*, VX, VY unused)
     double* VM; double* VX; double* VY;   // (M+1)*(n+1)*W each
     double* best; int* best_i; int* best_j;   // W each, Local only
 };
