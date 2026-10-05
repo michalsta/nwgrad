@@ -93,16 +93,14 @@ Build dependencies: `scikit-build-core`, `nanobind>=3.0` (the bindings call its 
   `92f45e0`); still needs a stated contract against concurrent mutation of a batch from
   two Python threads. Nothing implemented or measured.
 - Default thread count for short pairs: see `TODO.md`.
-- **Soft path: what is left** (see "The soft path" below; all four levers of the first
-  round are done). Affine soft is 2.1–2.4× of hard interpair on AVX2 with
-  `soft_guide="lazy"` (3.1–3.2× eager); per-pair protein soft is 1.0–2.1× of hard
-  (pointers) up to len 300. Candidates, in expected value: (1) **the eager guide** still
-  costs ~1.3 µs of 4.2 on AVX2 Manakov — a soft guide from the posterior (max-posterior
-  path, no Viterbi) or an inter-pair Viterbi for linear; (2) **memory** at len ≥ 1000 (three
-  forward tables of 8 B/cell leave L3; a checkpointed forward — every k-th row kept,
-  recomputed in backward — would trade ~1.5× compute for ~k× less traffic); (3) a
-  vector-scan gap carry (the four-cell stepping already puts one FMA per 4 cells on the
-  chain); (4) the inter-pair soft pass for alphabets > 8 via a per-row profile gather.
+- **Soft path: what is left** (see "The soft path" below). Done since the last list:
+  the guide without a Viterbi (`soft_guide="posterior"`), the inter-pair soft pass for
+  alphabets > 8 and for mixed B lengths, float32 batches sharing the soft pass.
+  Remaining candidates: (1) **memory** at len ≥ 1000 (three forward tables of 8 B/cell
+  leave L3; a checkpointed forward — every k-th row kept, recomputed in backward — would
+  trade ~1.5× compute for ~k× less traffic); (2) a vector-scan gap carry (the four-cell
+  stepping already puts one FMA per 4 cells on the chain); (3) the soft pass's size cap
+  (512 KiB per group) is set from one host — re-derive it on others.
   Unmeasured: AVX-512 (W=8), NEON speed, wloczykij.
 - **Vector `exp`/`log` for the `"log"` soft path, if it ever matters.** The scaled path
   makes no per-cell transcendental call, so this only speeds the fallback. Candidates (from
@@ -231,9 +229,11 @@ The key that unlocked all of them was **striping** (Farrar's layout). Lane `l` o
 
 Myers-Miller, not plain Hirschberg: the affine gap state is carried across each row cut by two boundary flags (`in_x`/`out_x` in `aligner.hpp`), seeded by putting a block's origin in M or X. **Only X can straddle a row cut** — a Y run lives entirely within one row, and the cut is between rows — which is why there is no `in_y`. The join adds one `+go_b` refund where an X run spans the cut, because both halves otherwise charge the open. Getting that refund wrong does not crash and does not produce an invalid path; it silently returns a *suboptimal* one. The base case is a **vectorized** striped fill that records direction bytes (`hb_kernel_impl.inl::hb_base_striped`, leveled like the sweeps) — the striped Pointers kernel restricted to a sub-rectangle with the `in_x` seed and a carried (not closed-form) left edge; the aligner walks its striped direction tables back. Bit-exact with the scalar `hb_base` at every ISA width and both precisions (verified sse2/avx2/avx512/neon). This is what lets the cutoff be large without the base case dominating.
 
-**Affine + Full only — now BOTH Global and Local; linear and banded still THROW** rather than fall back. Deliberate: a silent fallback would make every benchmark of this mode a benchmark of Pointers instead, and nothing would fail.
+**Full only — affine Global and Local, and (since 2026-10-05) linear Global and Local (see "Linear gaps: Pointers and Hirschberg"); banded still THROWS** rather than fall back. Deliberate: a silent fallback would make every benchmark of this mode a benchmark of Pointers instead, and nothing would fail.
 
 **Local (Smith-Waterman) is the endpoint reduction.** A forward CLAMPED endpoint scan finds the optimal cell's end `(ie, je)` and score `S`; a reverse UNCLAMPED global-suffix scan over the prefix rectangle finds the start `(is, js)`; the optimal local path is then the **global** alignment of the box `A[is..ie) × B[js..je)`, which the existing `hb_solve` recursion computes — all in O(n) memory. Both scans are one new leveled striped kernel (`hb_kernel_impl.inl::hb_scan_impl`, `HbScanJob`, template `Local` picking clamped-local vs global-suffix borders) that keeps *no* row: it tracks the global argmax and reports the cell. The argmax is per-row vectorized (per-lane leftmost-column, then a horizontal reduce), topmost-row / leftmost-column with strict `>`, **bit-identical scalar vs simd** — the load-bearing property, since `set_kernel`/`NWGRAD_ISA` must never move the endpoint. The Local M-clamp makes padding lanes `0`, but they can never beat a real positive max nor lift the strict-`>` global best from its initial `0`, so no padding mask is needed. **The reverse scan is global-suffix, NOT clamped, on purpose:** a clamped reverse could, at a tie, pick a start whose box misses `(ie, je)` and silently score below `S` — forbidden (Hirschberg may differ at ties, never score worse). Any argmax cell of the global-suffix scan gives a box whose global optimum **is** `S`, so the tie-break cannot cost score. `hb_start_i_/j_` seed the five path consumers at the local start; for Global they are 0 and every consumer is byte-for-byte unchanged. Scalar-vs-simd bit-identity is proven for W=2 (sse2, skynet+wloczykij), W=4 (avx2, nighthaven) and — since 2026-07-28 — **W=8 (avx512, solace: `[hirschberg]`, 505 assertions, all four levels)** by `tests/cpp/test_hirschberg_scan.cpp` (which loops every level the running CPU offers) AND by the proteome oracle below (3000/3000 self-pairs the identity at sse2 and avx2). **neon: verified 2026-10-01** — the full C++ suite on spot (M1, Homebrew gcc 16), all `[hirschberg]` cases green. Its one failure there was a test bug, not a kernel one: `test_align_params.cpp` compared an exactly-cancelling `x - 0.1·(10x)` against a zero-margin `Approx`, and AArch64 gcc contracts the test's expectation into an FMA (one rounding vs the library's two) — now given an absolute margin.
+
+**Superseded at float32 (2026-10-05): `auto` is `hirschberg_pmax` for Local float32**, since the endpoint scans took the prefix-max carry too (see the pmax section). Measured (nighthaven, AVX2, float32, 1000–3000 aa, `/tmp`-style ad-hoc runs recorded in `soft-path-bench.md`): pmax/ptr throughput 1.6× (1 thread) and 1.5–2.3× (12 threads) on 30 %-mutated homologues, 2.8–3.6× / 3.7–5× on unrelated pairs, identical totals; ≤ `hb_cutoff` pairs run as Pointers (1.00×). Local **double** still resolves to Pointers — exact Local Hirschberg is ~0.6× Pointers per thread there, and pmax at double is opt-in by the precision rule. The record of the original decision follows; it still describes double.
 
 **`auto` stays Pointers for Local — a DELIBERATE non-flip, fleet-swept 2026-07-27 (`tools/bench_local_hb.py`, proteome self-pairs = the worst case for HB: full-diagonal box ⇒ ~4× Pointers' cells vs Global-HB's 2×).** Global flipped to Hirschberg because it won on speed on real hardware too; Local does **not**, so it must not flip. hb/ptr (self-pairs, <1 = HB faster):
 
@@ -295,7 +295,7 @@ For scale: float32 Pointers *alone* deviates from the double oracle by up to **1
 
 **The caveat that survives the decision, and it is the reason double did not flip:** the error is input-dependent and has no *proven* bound, only a measured one, and it buys nothing on unrelated sequences (0.99–1.11×) — the case a user who does not know their data lands in. The float32 default is safe because it is dominated by an error already present, not because the ramp is bounded. If a future change makes float32 itself more accurate, **re-examine this default rather than inheriting it.** `tests/Python/test_hirschberg_pmax.py::test_float32_default_costs_nothing_beyond_float32` is the pin: it re-measures the domination on splitting pairs rather than asserting it, and doubles as a dispatch-liveness check (`auto` must be bit-identical to explicit pmax, which is exactly what a silent fallback to the exact sweep would break).
 
-*Still open.* The pmax kernel is wired for the **sweep only** — the Local endpoint scan (`hb_scan_impl`) keeps the exact carry, deliberately, so `hirschberg_pmax` on Local speeds up the recursion but not the two endpoint scans that dominate it. Extending it there is the obvious next measurement.
+*Local endpoint scans (2026-10-05).* `hb_scan_impl<T, Local, Pmax>` takes the same closed-form carry when the job says `pmax` (Aligner::hb_scan passes `hb_pmax()`), and `hb_scan_scalar` the same arithmetic (ramp loaded, never multiplied in the loop), so `hirschberg_pmax` on Local speeds up the two endpoint scans that dominate it, not only the recursion: 2.1–2.4× exact Local Hirschberg on homologues (AVX2, float32). Bit-identity scalar vs every level, and one-sided optimality against Smith-Waterman, are pinned in `tests/cpp/test_hirschberg_scan.cpp` (`[pmax]`) on an integral and a lossy (`ge_a` = 0.1) fixture; a mutation that dropped the flag in the level dispatch fails it.
 
 **Why the old verdict was re-opened.** It rested on measurements taken at 12 threads on an i5 — *below* the memory-bandwidth wall, where "B is only 3–22% slower" is true and decisive. Above the wall the ordering inverts. Measured on skynet (sse2, 60 vCPU), streaming corpus ≥2000 aa, 3.00 Gcells, Mcell/s:
 
@@ -326,7 +326,7 @@ Scaling 1→60t: **pointers 13.7×, Hirschberg 37.1×.** Pointers is flat from 1
 
 So: **Pointers when it fits and threads ≤ its peak; Hirschberg above the crossover or whenever the tables will not fit.** The crossover moves *earlier and larger with sequence length* (Pointers' footprint and wall worsen with length while HB stays flat) — at len 8000 HB wins from a single thread on skynet. The default cutoff of 512 handles this automatically: pairs ≤512 never split and run *as* Pointers (no loss, bit-exact), so the only pairs that take the linear-space path are longer ones — exactly the ones where Pointers is memory-bound. The residual ~1.4× per-thread loss of pure Hirschberg therefore only applies to a pair *longer* than the cutoff run at *low* thread counts, a corner the default cutoff mostly sidesteps. On the M1 HB never wins on speed — there it is a pure *memory* play. Schedule: **dynamic** (dynamic ≈ sorted on all bare-metal; HB's footprint is already tiny so sorted bounds nothing).
 
-**`traceback="auto"` is the default** and resolves *per problem*, at compile time from the `Aligner` template case: Hirschberg for affine+global+full (the case it implements), Pointers for everything else. **It then resolves once more, on the scalar type**: the affine+global+full case is `hirschberg_pmax` at `T=float` and `hirschberg` at `T=double` (decided 2026-07-29 — see the pmax section for the measurements). So the two precisions do not merely differ in width; **they run different gap carries by default**, and a float32 `auto` result is not bit-comparable with a double `auto` result even in exact arithmetic. Naming `hirschberg` explicitly gets the exact carry at either precision. A blanket Hirschberg default is impossible — linear/banded have no Hirschberg variant and explicitly asking for it there throws, and Local has one but deliberately keeps Pointers as its `auto` default (fleet-swept 2026-07-27: Local HB does not win on speed on real hardware, only in memory — see the Local note above) — so "auto" is how "Hirschberg by default" is expressed without breaking them. `SeqPair.traceback` reports the *resolved* mode; `SeqPairBatch.traceback` reports `"auto"` (it resolves per pair). The sentinel is `TracebackMode::Default`, never stored on an Aligner.
+**`traceback="auto"` is the default** and resolves *per problem*, at compile time from the `Aligner` template case: Hirschberg for affine+global+full (the case it implements), Pointers for everything else. **It then resolves once more, on the scalar type**: the affine+global+full case is `hirschberg_pmax` at `T=float` and `hirschberg` at `T=double` (decided 2026-07-29 — see the pmax section for the measurements). So the two precisions do not merely differ in width; **they run different gap carries by default**, and a float32 `auto` result is not bit-comparable with a double `auto` result even in exact arithmetic. Naming `hirschberg` explicitly gets the exact carry at either precision. Since 2026-10-05 Local affine Full at `T=float` resolves to `hirschberg_pmax` too (its endpoint scans take the carry; see the Local note above), Local double to Pointers, linear to Pointers (whose fill keeps the H table up to 2 MiB under `auto` — see "Linear gaps"), banded to score tables; so "auto" is how "Hirschberg by default" is expressed without breaking the modes that have none. `SeqPair.traceback` reports the *resolved* mode; `SeqPairBatch.traceback` reports `"auto"` (it resolves per pair). The sentinel is `TracebackMode::Default`, never stored on an Aligner.
 
 **`hb_cutoff`** (rows per block at which the recursion stops splitting and runs the Pointers fill) is settable — `SeqPairBatch.hb_cutoff`, `SeqPair.hb_cutoff`, default **512 (fleet-swept 2026-07-23, AFTER hb_base was vectorized)**. Before vectorization the optimum was ~32 and it collapsed above ~128 (scalar base case); vectorizing the base case moved the optimum to **~512** and removed the collapse. At 512 the sweep is within ~2-3% of the per-host peak everywhere (skynet len2000 1.93×, len8000 3.19×; nighthaven len2000 2.00×; solace len8000 2.65×; wloczykij, the real-NUMA box, len8000 1.88×). Why 512 specifically — it is a three-way balance:
 - **exactness/speed for short pairs** — a pair no longer than the cutoff never splits, so it runs the exact (vectorized) Pointers fill: bit-identical to the old Pointers default AND at full Pointer speed (0.99-1.04× measured). 512 covers most proteins.
@@ -357,7 +357,7 @@ So: **Pointers when it fits and threads ≤ its peak; Hirschberg above the cross
 - **Segment-boundary "shift-as-load" — TRIED, REJECTED (net loss on all 5 machine×compiler combos).** The once-per-row s==0 lane shift compiles to `vbroadcastsd`/`vinsertf128` (both compilers) plus `vpermpd`/`vshufpd` (clang). The idea was to load the previous segment's last vector *one element early* (giving lanes 1..W-1 for free) and overwrite lane 0 with the border via a blend, turning the shuffle into a load. Bit-exact but **slower everywhere** (worst i5: −16% gcc, −22% clang): the compilers already lower the generator-constructor shift `vd([&](int i){...})` efficiently, and the replacement adds an *unaligned* load one element back plus a compare+blend. The boundary shift is O(m), already cheap — trust the compiler's shuffle lowering.
 - **64-byte-aligning the DP buffers — a real +15–18% win on AVX2, free, and now SHIPPED.** Chasing the "keep alignment" thread from the above found the actual lever: it is not the boundary shift, it is the *main-loop* W-wide loads/stores. `std::vector<double>` guarantees only **16-byte** alignment, so on AVX2 every 256-bit (32-byte) access is misaligned and some split cache lines. `dp_buffer.hpp`'s `AlignedAllocator` (C++17 aligned `operator new`, 64-byte, with `rebind`; `DVec` aliases `vector<double>` over it) backs every `DpBuffer` table, and the striped kernel pads each row to `rowsz = (seg+1)*W` with the striped columns starting at offset `W`, so every W-wide access is aligned. Measured on the shipped Full kernel (i5, forward-only, len=200): **594→698 Mcell/s (+17 %) on avx2**, `1.73×→2.06×`. **Nothing on SSE2/Piledriver or NEON/M1** (flat) — there W=2 is 16-byte and 16-byte alignment already suffices. So: worth doing on any 256-bit-or-wider target, pointless below.
 
-### Short pairs: `fill="rowwise"` and `fill="interpair"` (2026-10-02; in 0.5.2)
+### Short pairs: `fill="rowwise"` and `fill="interpair"` (2026-10-02; interpair the batch default since 2026-10-05)
 
 **Why.** On miRNA × target-site pairs (Manakov: 2.5M pairs, A ~22, B = 50) the striped Full kernel is the wrong tool. Its lazy-F fixpoint is data-dependent and worst when gaps are cheap: DiscrimAlign's fitted parameters (gaps at the −1e-4 cap) cost **+25%** over its starting ones on the same pairs (2.39 → 2.99 s, nighthaven, 12 threads, score-only nearly identical, so it is the fill, not the traceback). Both new fills are opt-in on `SeqPairBatch.fill` (`SeqPair.fill` takes the first two), default stays `"striped"`, and both give **bit-identical** scores, paths and gradients (`tests/Python/test_fill.py`; DiscrimAlign full fits identical to the last bit).
 
@@ -372,6 +372,93 @@ So: **Pointers when it fits and threads ≤ its peak; Hirschberg above the cross
 | 12 | ~3.0 s | 1.25 s | 0.76 s |
 
 skynet (Piledriver, W=2, 1 thread, 200k pairs): rowwise 12.4 µs/pair, interpair 12.1 — a tie; 128-bit lanes barely pay for the interleaved tables there. Not yet measured for speed: AVX-512 (W=8), NEON; their correctness is covered by the wheel workflow's test runs (linux-aarch64, macos-arm64) and by `test_every_isa_level` on whatever levels the runner offers.
+
+**Second round (2026-10-05) — what interpair now covers, and the default.**
+- **float32** (`InterJobT<float>`, `inter_fill_entry_f`, `LevelKernels::inter_fill_f` /
+  `inter_w_f`): the same kernel templated on T, twice the lanes in the same register
+  (8 on AVX2). Bit-identical to the float32 own fill: every penalty cast to T once, the
+  borders `-(go + T(i)*ge)` in T, exactly `viterbi_affine<float>` / `viterbi_linear<float>`.
+  The soft pass is double at any T, so a float32 group runs `inter_soft` in W/2-lane
+  chunks. Measured (AVX2, Manakov 100k, hard, µs/pair striped → interpair): local
+  affine 4.08 → **0.79 (0.19×)**, global affine 3.09 → 0.81, local linear 3.78 → 0.67,
+  global linear 1.76 → 1.07; 12 threads 0.33–0.76×. The Python default class is float32,
+  so this is the case most users hit.
+- **Banded** (`banded_grad()`; InterJobT `blo/bhi/ulo/uhi/bri/brj`, `Aligner::banded_lane_rows`,
+  `SeqPair::banded_lane_setup` / `banded_grad_interleaved`): each lane around its own
+  guide. A row is computed over the UNION of the lanes' initialised spans and a lane's
+  out-of-band cell is masked to -inf (after the Local clamp) — exactly what its own
+  banded fill leaves in every initialised cell it does not compute; its in-band cells
+  read only its own span, so the table is bit-identical. Groups are re-sorted by the
+  guide's middle column (`BandGroups`, rebuilt after each `score_and_grad()`: guides
+  only move wholesale then) — at W=4 that cut the union from 169 to 79 vector cells per
+  pair (Local Manakov). Hard **affine** only: linear's own banded fill is cheaper
+  (measured 0.83–1.27×). Affine: 0.45–0.83× at 1 thread, ~1.0× at 12 (per-pair setup and
+  the walk dominate a banded step on 22 × 50 pairs). The banded own path also got the
+  one-walk guide+gradient (`hard_grad_and_guide`), up to ~20 % faster.
+- **Mixed B lengths** (`InterJobT::nb`, `InterSoftJob::nb`): a group may mix B lengths
+  within 1.25× + 4 (`ragged_ok_`); every lane is padded to the longest — the DP flows
+  right and down, so padded columns cannot reach a lane's own cells — with the Local
+  best masked by column and, in the soft pass, every padded cell masked to 0 (Global's
+  backward starts and Z is read at (m, n_l)). The pair adopts the tables at the group
+  stride (`adopt_interleaved(..., stride)`, `inter_stride_`). It matters only when B
+  lengths are rare: 2000 pairs with B in [20, 200] gained 15–20 %; a 100k Manakov batch
+  was already in full groups.
+- **Alphabets over 8** (protein): the row's scores are GATHERED per lane into `srow`
+  (`InterCommon`, `levels = -1`), one scalar load per lane-cell outside the carry
+  chain; the soft pass gathers its weights and keeps each cell's match contribution in
+  `trow`, scattered into the counts per lane after the row. Measured (AVX2, random
+  protein pairs, µs/pair interpair/striped): 10–30 aa 0.28–0.37×, 30–60 aa 0.21–0.44×,
+  60–120 aa 0.21–0.50× (affine, 1 thread); soft 0.40–0.67× up to 60 aa. Linear Global over 8 letters
+  keeps its own Viterbi fill (1.10–1.22× at 12 threads).
+- **The size cap** (`inter_pair_fits`, `kInterGroupBytes` 1.25 MiB / `kInterSoftBytes`
+  512 KiB): without it protein pairs of 150–600 aa ran 1.6–11.5× SLOWER at 12 threads
+  (W pairs' tables past L2 while the per-pair fills keep 3 B/cell pointers). Affine won
+  up to 100–130 aa and lost from 130–160 — the same ~1.3 MB group crossover for linear
+  (one table); the soft pass crossed lower (~0.5 MB). Applies to DNA too.
+- **`BatchAligner`** (`fill`, `align_inter_`, `inter_loop`): the same kernels; problems
+  sorted by (len B, len A) with a linear counting sort per call (no plan to cache),
+  W aligners per worker. Hard/none: full and banded-affine Viterbi; soft: the soft pass
+  only (BatchAligner's soft mode runs no Viterbi). 0.21–0.93× striped in every measured
+  config (AVX2, Manakov, both precisions, 1 and 12 threads).
+- **The default** (`SeqPairBatch::inter_fill = true`, `BatchAlignerT::inter_fill = true`):
+  measured including the first call's plan build (1M Manakov pairs, 12 threads: striped
+  0.58 s, interpair 0.33 s first call / 0.21 s after; 1 thread 0.40 / 0.10 s). Every
+  path it would slow down is gated to the own fill (the cap, linear Global gates,
+  Hirschberg past the cutoff, scalar backend, mixed params). The full test suite now
+  runs interpair by default for every batch, in addition to the dedicated tests.
+
+### Linear gaps: Pointers and Hirschberg (2026-10-05)
+
+- **`traceback="pointers"` for linear** (`viterbi_linear_ptr`): one direction byte per
+  cell (`buf.DM`), two rolling rows, no H. Codes 0 diagonal / 1 up / 2 left / 3 stop.
+  Bit-exact with the H walk, ties included: the H walk tests diagonal, then up, then
+  left by equality, and the fill keeps the first largest of the same three — so both
+  pick the same move. All four linear walkers share one `walk_linear` (codes or
+  equality). Getting it FAST took four tries, each measured: a fused loop with ?:
+  selects compiled to `ucomisd`+`jp/jne` branches (2.6× slower than the H fill); a
+  shared compare put a blend on the chain; re-loading `cv[j-1]` put a store-forward on
+  it; the fix that mattered is TWO PASSES, as gcc -O3 splits viterbi_linear itself — the
+  carry-free `max(diag+s, up-ge_b)` and its code vectorize, only `max(t, left-ge_a)`
+  stays serial (codes as arithmetic, `tu + tl*(2-tu)`). A third pass reading the codes
+  off the values was slower again. Result: ~1.35× slower than the H fill per thread,
+  2.4–3.5× faster at 12 threads past L2, ~8× less memory.
+- **So `auto` picks by size** (`linear_ptr_fill`, `tb_auto_`, `kLinearHTableBytes` 2 MiB):
+  under `auto` (which resolves to pointers for linear) a pair whose H table is ≤ 2 MiB
+  keeps H. Measured (nighthaven, double Global, 12 threads): H 1.6× faster up to L=350,
+  tie at 500, pointers 2.4× at 700 and 3.5× at 1000; `auto` tracks the faster one on both
+  sides. Explicit `pointers` always records bytes.
+- **Linear Hirschberg** (`viterbi_linear_hirschberg`, `lhb_solve` / `lhb_sweep` / `lhb_base`):
+  no gap state crosses a row cut, so the join is a plain argmax of forward + reverse
+  scores. Local uses the affine path's endpoint reduction (clamped forward scan,
+  unclamped global-suffix scan, global solve of the box). The move list (`hops_`) and
+  every consumer except the gradient (`hard_grad_linear_hb`) are shared with affine.
+  `hirschberg_pmax` on linear is this exact sweep (no lazy-F to remove). Scalar sweeps,
+  so a speed loss bought for memory: against the pointer fill as it was BEFORE its
+  two-pass rewrite (which then got ~25 % faster), Global 0.84–1.08× and Local 0.55–0.6×
+  (the two endpoint scans) at 1–12 threads; O(n) memory (8000 × 8000 at 12 threads:
+  0.05 GB vs 0.79 GB pointers, 6.0 GB H).  Opt-in: `auto` never picks it for linear. Tests: optimal score (exact on the
+  integral fixture), real alignment, `g·params == score`; a mutation forcing the middle
+  split fails 10 of them.
 
 ### The soft path: scaled probability space (2026-10-05)
 
@@ -406,6 +493,16 @@ functions:
   plausible loop (in-place updates exist: `__iadd__`, the gap setters), and a lazy default
   would silently band around θ₁'s path instead of θ₀'s. Lazy is for loops that rescore in
   full every step (continuation); a lazy soft interpair group skips the Viterbi fill.
+  `"posterior"` (2026-10-05, opt-in): no Viterbi either — the soft pass reports, per row
+  of A, the column of greatest EXIT mass (the posterior that the path leaves row i at
+  column j: the cell's posterior minus the mass moving on left into (i, j+1)), made
+  non-decreasing (`Aligner::posterior_guide`, `SoftPairJob/InterSoftJob::gpost`, the log
+  path from its tables). Exit, not plain posterior: a Viterbi guide records the LAST
+  column of row i on the path, and along a gap run every cell has posterior ≈ 1, so a
+  plain argmax picks any of them on rounding (76 % row agreement with Viterbi at T =
+  0.05 before, ≥ 85 % after; Local compared on the aligned rows, since a local Viterbi
+  guide interpolates outside them). Computed under the params scored, so in-place
+  updates cannot move it.
 
 **Scaled algorithm.** The same recurrences with exp applied: each lse becomes +, each
 +score ×exp(score). Weights are exp'd once per problem (|Σ|² + 4 calls); a query profile
@@ -510,7 +607,7 @@ nanobind module `nwgrad_ext`, re-exported from `src/nwgrad/__init__.py`. Exposes
 - Alphabet constants: `nwgrad.DNA`, `DNA_N`, `RNA`, `RNA_N`, `PROTEIN`, `PROTEIN_X`, `PROTEIN_UO`, `PROTEIN_UOX`, plus `NCBI_PROTEIN` and `IUPAC_DNA` for the packaged matrices
 - Zero-copy numpy integration via nanobind buffer protocol
 - `kernel="auto"` (default) on the 12 functions, `BatchAligner` and `SeqPair` — the **one unified backend vocabulary** `scalar_fallback | auto | sse2 | avx2 | avx512 | neon`, the same words `set_isa_level()`/`NWGRAD_ISA` take (`auto` = the strongest simd level the CPU runs; `sse2` was formerly called `baseline`). Every simd level is **bit-exact** with `scalar_fallback` — identical tables, alignments and gradients — so it is a speed knob and never a correctness one. It is per-aligner (the level is no longer a global), and affects the **Viterbi/hard-gradient path only**: forward-backward and `soft_grad` are the same shared code either way, and the linear gap model has no simd kernel, so any simd backend is a legal no-op there. An unrecognised name — or a simd level this CPU cannot run — **throws** (a typo that silently gave you the wrong path would be undetectable).
-- `traceback="auto"` (default) on `SeqPair` and `SeqPairBatch` — **fixed at construction**, deliberately not settable afterwards, because it decides what the DP *retains* rather than how it computes. `auto` resolves per problem to a Hirschberg mode (affine+global+full) or `pointers` (else), and then on precision: **`hirschberg_pmax` at float32, `hirschberg` at double**. `pointers` records a 1-byte predecessor per cell per state during the fill (3 B/cell); `scores` keeps VM/VX/VY and re-derives the argmax (12 B/cell, and the only mode that leaves tables for `to_row_major()` to inspect); `hirschberg` keeps no table at all above its `hb_cutoff` base case. `hirschberg_pmax` is Hirschberg with the closed-form prefix-max gap carry — 1.5–3.9× faster on related sequences, the float32 default, and the one mode that can return a *suboptimal* path (see its section above; at float32 its error is measurably dominated by float32's own, which is what justifies the default). Pointers and Scores are **bit-identical**; Hirschberg is bit-exact with them only for pairs ≤ `hb_cutoff` (it degrades to the Pointers fill there), and a valid-but-different subgradient above. **Fixed 2026-10-01 (was a caveat measured 2026-07-28):** "bit-exact below the cutoff" used to hold for neither the score nor the path. A pair that never split ran the Hirschberg *base case*, whose borders are seeded and carried differently from the Pointers fill, so with a non-representable `gap_extend` (0.1) it settled float ties on a path one ULP worse (−4.3 vs −4.299999999999999) and replayed the score from that path: 27/41 short pairs differed. Such pairs are now run *as* Pointers in `run_viterbi` (same fill, table, traceback), so the promise holds by construction, at unchanged memory and speed. Consequence for tests: a Hirschberg test on short pairs at the default cutoff tests Pointers — `test_hirschberg.py` pins `HB_CUTOFF = 16` (1 for tiny inputs) so the recursion stays under test. An unknown name **throws**; explicit `hirschberg`/`hirschberg_pmax` on linear/banded **throws** (the `auto` default falls back instead); on **Local** both are supported (affine+full), though `auto` deliberately resolves Local to `pointers` (fleet-swept 2026-07-27: Local HB is a memory play, not a speed one — select it explicitly when memory-bound or aligning very long sequences). Note this is a different axis from `kernel=`: that one is bit-exact by contract, this one is not.
+- `traceback="auto"` (default) on `SeqPair` and `SeqPairBatch` — **fixed at construction**, deliberately not settable afterwards, because it decides what the DP *retains* rather than how it computes. `auto` resolves per problem: affine Full Global → **`hirschberg_pmax` at float32, `hirschberg` at double**; affine Full Local → `hirschberg_pmax` at float32, `pointers` at double; linear → `pointers` (H table kept up to 2 MiB); banded → score tables. `pointers` records a 1-byte predecessor per cell per state during the fill (3 B/cell); `scores` keeps VM/VX/VY and re-derives the argmax (12 B/cell, and the only mode that leaves tables for `to_row_major()` to inspect); `hirschberg` keeps no table at all above its `hb_cutoff` base case. `hirschberg_pmax` is Hirschberg with the closed-form prefix-max gap carry — 1.5–3.9× faster on related sequences, the float32 default, and the one mode that can return a *suboptimal* path (see its section above; at float32 its error is measurably dominated by float32's own, which is what justifies the default). Pointers and Scores are **bit-identical**; Hirschberg is bit-exact with them only for pairs ≤ `hb_cutoff` (it degrades to the Pointers fill there), and a valid-but-different subgradient above. **Fixed 2026-10-01 (was a caveat measured 2026-07-28):** "bit-exact below the cutoff" used to hold for neither the score nor the path. A pair that never split ran the Hirschberg *base case*, whose borders are seeded and carried differently from the Pointers fill, so with a non-representable `gap_extend` (0.1) it settled float ties on a path one ULP worse (−4.3 vs −4.299999999999999) and replayed the score from that path: 27/41 short pairs differed. Such pairs are now run *as* Pointers in `run_viterbi` (same fill, table, traceback), so the promise holds by construction, at unchanged memory and speed. Consequence for tests: a Hirschberg test on short pairs at the default cutoff tests Pointers — `test_hirschberg.py` pins `HB_CUTOFF = 16` (1 for tiny inputs) so the recursion stays under test. An unknown name **throws**; explicit `hirschberg`/`hirschberg_pmax` on banded **throws** (the `auto` default never picks them there); linear supports both (Full; `hirschberg_pmax` is the exact linear sweep); on **Local** affine both are supported, and `auto` resolves Local to `hirschberg_pmax` at float32 and `pointers` at double (see the Local note). Note this is a different axis from `kernel=`: that one is bit-exact by contract, this one is not.
 - `simd_isa()` reports which instruction set the kernel selected.
 
 `SubstMatrix` and `AlignParams` take the alphabet as a `str`, not an `Alphabet` object — there is no implicit conversion, so pass `.symbols` if you are holding one.
@@ -532,7 +629,7 @@ nanobind module `nwgrad_ext`, re-exported from `src/nwgrad/__init__.py`. Exposes
 
 `guide_j[i]` encodes the reference column after consuming i characters of sequence A, extracted from aligned strings containing `-` gap markers via `guide_j_from_aligned()`. Constrains the DP band around a cached path, enabling fast re-alignment when only the matrix changes.
 
-**A supplied guide is validated in `set_problem()`** (`validate_guide`, commit `20edcab`): exactly `m+1` entries, each in `[0, n]`, non-decreasing; a negative band is rejected too. All throw `std::invalid_argument` (Python `ValueError`) before any DP access, and `set_problem()` invalidates the aligner's previous results *first*, so a rejected problem cannot leave the old one readable. The band helpers (`jlo`/`jhi0`/`border_rows`) index `guide_j_[0..m]` unchecked, and `guide_j_from_aligned()` checks only the strings' own syntax — aligned strings `"A"`/`"A"` against a 4-residue A read past the vector. The empty guide stays the "make a diagonal guide" sentinel. **Do not require `guide_j.back() == n`**: trailing gaps in A consume B residues without appending an entry.
+**A supplied guide is validated in `set_problem()`** (`validate_guide`, commit `20edcab`): exactly `m+1` entries, each in `[0, n]`, non-decreasing; a negative band is rejected too. All throw `std::invalid_argument` (Python `ValueError`) before any DP access, and `set_problem()` invalidates the aligner's previous results *first*, so a rejected problem cannot leave the old one readable. The band helpers (`jlo`/`jhi0`/`border_rows`) index `guide_j_[0..m]` unchecked, and `guide_j_from_aligned()` checks only the strings' own syntax — aligned strings `"A"`/`"A"` against a 4-residue A read past the vector. The empty guide stays the "make a diagonal guide" sentinel. **Do not require `guide_j.back() == n`**: trailing gaps in A consume B residues without appending an entry. **For Global the last row's band always reaches n** (`jhi`/`jhi0`, 2026-10-05): every global path ends at (m, n), and a band that missed it left the score and the traceback's start reading a cell no fill had written — `BatchAligner(band=0)` with aligned strings `"ACGTACGTAC-------"` returned 0.0 for an optimal path scoring 10.0, whatever preceded it in the batch (`test_batch_interpair.py::test_global_banded_guide_ending_short_of_n`). Found because interpair, reading a fresh buffer, disagreed with the per-pair path reading a reused one.
 
 # Persona: The Lovecraftian Cosmic Horror Narrator
 
