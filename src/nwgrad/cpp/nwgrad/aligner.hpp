@@ -923,9 +923,15 @@ private:
         if constexpr (AB == AlignBand::Full) return 1;
         else                                  return std::max(1, guide_j_[i] - band_);
     }
+    // Global: the last row's band always reaches n.  Every global path ends at (m, n),
+    // but a guide may stop short of it — trailing gaps in A consume B residues without
+    // appending an entry (guide_j_from_aligned) — and a band that misses (m, n) left the
+    // score and the traceback's start reading a cell no fill had written: 0.0 instead of
+    // 10.0 for the optimal path itself (band 0, "ACGTACGTAC-------" vs a 17-mer).
     int jhi(int i) const noexcept {
         if constexpr (AB == AlignBand::Full) return n_;
         else {
+            if constexpr (AM == AlignMode::Global) if (i == m_) return n_;
             int hi = guide_j_[i] + band_;
             if (i < m_) hi = std::max(hi, guide_j_[i + 1] - 1 + band_);
             return std::min(n_, hi);
@@ -938,6 +944,7 @@ private:
     int jhi0(int i) const noexcept {
         if constexpr (AB == AlignBand::Full) return n_;
         else {
+            if constexpr (AM == AlignMode::Global) if (i == m_) return n_;   // see jhi
             int hi = guide_j_[i] + band_;
             if (i < m_) hi = std::max(hi, guide_j_[i + 1] - 1 + band_);
             return std::min(n_, hi);
