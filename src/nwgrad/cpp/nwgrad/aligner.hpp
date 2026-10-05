@@ -319,7 +319,8 @@ struct Aligner {
     // affine+global+full case, Pointers elsewhere) — so a caller can pass the sentinel
     // through without knowing the problem type.
     void set_traceback(TracebackMode t) noexcept {
-        tb_ = (t == TracebackMode::Default) ? kDefaultTb : t;
+        tb_auto_ = (t == TracebackMode::Default);
+        tb_ = tb_auto_ ? kDefaultTb : t;
     }
     TracebackMode traceback() const noexcept { return tb_; }
     // Rows per block at which the Hirschberg recursion stops splitting and solves
@@ -697,6 +698,7 @@ private:
                                         : TracebackMode::Hirschberg)
             : TracebackMode::Pointers;
     TracebackMode tb_ = kDefaultTb;
+    bool          tb_auto_ = true;   // tb_ came from "auto" (see linear_ptr_fill)
     int    striped_seg_    = 0;
     int    striped_w_      = 1;
 
@@ -799,11 +801,27 @@ private:
     }
 
     // Grow external buffer to fit current problem (thread-owned path).
+    // Linear Full: whether the fill keeps direction bytes (viterbi_linear_ptr) rather than
+    // H.  Explicit "pointers" (and Hirschberg's short pairs) always do.  Under "auto" —
+    // which resolves to pointers for linear — only a pair whose H table exceeds 2 MiB
+    // does: the pointer fill is ~1.35x slower per thread, but past L2 the H table's
+    // traffic dominates.  Measured (nighthaven, AVX2, double, Global, 12 threads): H
+    // wins 1.6x up to L=350 (1 MB), ties at L=500 (2 MB), loses 2.4x at 700 and 3.5x
+    // at 1000.  Same path either way, so this is a speed choice only.
+    static constexpr size_t kLinearHTableBytes = size_t(2) << 20;
+    bool linear_ptr_fill() const noexcept {
+        if constexpr (GM != GapModel::Linear || AB != AlignBand::Full) return false;
+        else {
+            if (is_hirschberg(tb_)) return true;
+            if (tb_ != TracebackMode::Pointers) return false;
+            return !tb_auto_ || sz_ * sizeof(T) > kLinearHTableBytes;
+        }
+    }
+
     void ensure_viterbi_ptruf(DpBuffer& buf) const {
         if constexpr (GM == GapModel::Linear) {
-            // Full + Pointers / Hirschberg keeps no H (they allocate their own).
-            if constexpr (AB == AlignBand::Full)
-                if (tb_ == TracebackMode::Pointers || is_hirschberg(tb_)) return;
+            // The pointer / Hirschberg fills keep no H (they allocate their own).
+            if (linear_ptr_fill()) return;
             if (buf.H.size() < sz_) buf.H.resize(sz_);
         } else {
             // Pointers mode never touches VM/VX/VY — it keeps two rolling rows and byte
@@ -1293,12 +1311,9 @@ private:
         // (the pointer kernels are chosen after the backend is resolved, below: every
         // simd level has its own, and only the scalar path falls back here.)
         if constexpr (GM == GapModel::Linear) {
-            // No simd linear kernel: every backend is scalar here.  Full + Pointers keeps
-            // direction bytes, not H (viterbi_linear_ptr).
-            if constexpr (AB == AlignBand::Full)
-                if (tb_ == TracebackMode::Pointers || is_hirschberg(tb_)) {
-                    viterbi_linear_ptr(buf); return;
-                }
+            // No simd per-pair linear kernel: every backend is scalar here.  The pointer
+            // fill keeps direction bytes, not H, where linear_ptr_fill() says so.
+            if (linear_ptr_fill()) { viterbi_linear_ptr(buf); return; }
             viterbi_linear(buf);
             return;
         }

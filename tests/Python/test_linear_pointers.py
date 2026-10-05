@@ -77,3 +77,18 @@ def test_batch_pointers_equal_scores(prec, mode):
     for x, y in zip(out[0][:3], out[1][:3]):
         assert np.array_equal(x, y)
     assert out[0][3] == out[1][3]
+
+
+@pytest.mark.parametrize("mode", ["global", "local"])
+def test_auto_switches_fill_by_size_same_path(mode):
+    """Under "auto" a small linear pair keeps H (faster), a large one direction bytes
+    (past 2 MiB); explicit "pointers" always the latter.  The path is the same."""
+    p = _params("ties")
+    for L in (40, 600):   # H table: 13 KB / 2.9 MB at double
+        a, b = _seqs(2, L, L + 1, 7 + L)
+        out = []
+        for tb in ("auto", "pointers", "scores"):
+            sp = nwgrad.SeqPairDouble(a, b, p, gap_model="linear", mode=mode, traceback=tb)
+            sp.alloc_dp(); sp.align_full()
+            out.append((sp.score, sp.aligned(), list(sp.guide_j)))
+        assert out[0] == out[1] == out[2]
