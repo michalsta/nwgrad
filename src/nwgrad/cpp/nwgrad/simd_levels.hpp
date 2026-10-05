@@ -272,7 +272,7 @@ struct InterJob {
 using inter_fn = void (*)(InterJob&);
 
 // Inter-pair SOFT pass (scaled forward-backward with the gradient fused), double: the
-// same W-lane grouping as InterJob, affine Full only, nalpha <= 8.  Per lane it is
+// same W-lane grouping as InterJob, Full band, affine or linear gaps, nalpha <= 8.  Per lane it is
 // Aligner::fwdbwd_affine_scaled — tolerance-equal, not bit-equal (the soft path is not
 // bit-exact).  The caller supplies exp'd weights (temperature already applied) and
 // scratch; per lane it receives log Z (of params/T, NOT yet multiplied by T), the
@@ -286,6 +286,7 @@ struct InterSoftJob {
     const double* es; int nalpha;      // exp(score / T), row-major nalpha x nalpha
     double oa, ea, ob, eb;             // exp(-(go+ge)/T), exp(-ge/T), per side
     int align_mode;                    // 0 = Global, 1 = Local
+    int linear;                        // 1 = linear gaps (oa/ob unused, gap opens 0)
     double* scratch;                   // inter_soft_scratch(n, M, W) doubles, 64-byte aligned
     int* iscratch;                     // (M+1)*W ints
     double* logz; double* counts; double* gaps; int* ok;   // W, W*nalpha^2, W*4, W

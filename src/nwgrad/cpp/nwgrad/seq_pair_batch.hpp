@@ -510,7 +510,8 @@ private:
     int inter_backend_(const SeqPair& p) const {
         if constexpr (!std::is_same_v<T, double>) return -1;
         else {
-            if (p.gap_model() != GapModel::Affine) return -1;
+            // Linear has no inter-pair Viterbi fill, only the soft pass: soft pairs only.
+            if (p.gap_model() != GapModel::Affine && p.grad_mode() != GradMode::Soft) return -1;
             if (p.len_a() == 0 || p.len_b() == 0) return -1;
             if (p.params_ptr()->matrix.size() > 8) return -1;
             const int backend = (p.kernel() == kBackendAuto) ? global_default_backend() : p.kernel();
@@ -588,18 +589,21 @@ private:
                     M = std::max(M, m[l]);
                 }
                 const int n = static_cast<int>(p0.len_b());
-                const size_t sz = static_cast<size_t>(M + 1) * (n + 1) * W;
-                if (buf.VM.size() < sz) { buf.VM.resize(sz); buf.VX.resize(sz); buf.VY.resize(sz); }
                 const AlignParams& P = *p0.params_ptr();
+                const bool lin = p0.gap_model() == GapModel::Linear;   // then all soft
                 InterJob job{};
                 job.a = a.data(); job.m = m.data(); job.b = b.data(); job.n = n; job.M = M;
-                job.blk = P.matrix.data(); job.nalpha = P.matrix.size();
-                job.go_a = P.gap_open_a; job.ge_a = P.gap_extend_a;
-                job.go_b = P.gap_open_b; job.ge_b = P.gap_extend_b;
                 job.align_mode = (p0.align_mode() == AlignMode::Local) ? 1 : 0;
-                job.VM = buf.VM.data(); job.VX = buf.VX.data(); job.VY = buf.VY.data();
-                job.best = best.data(); job.best_i = bi.data(); job.best_j = bj.data();
-                K.inter_fill(job);
+                if (!lin) {
+                    const size_t sz = static_cast<size_t>(M + 1) * (n + 1) * W;
+                    if (buf.VM.size() < sz) { buf.VM.resize(sz); buf.VX.resize(sz); buf.VY.resize(sz); }
+                    job.blk = P.matrix.data(); job.nalpha = P.matrix.size();
+                    job.go_a = P.gap_open_a; job.ge_a = P.gap_extend_a;
+                    job.go_b = P.gap_open_b; job.ge_b = P.gap_extend_b;
+                    job.VM = buf.VM.data(); job.VX = buf.VX.data(); job.VY = buf.VY.data();
+                    job.best = best.data(); job.best_i = bi.data(); job.best_j = bj.data();
+                    K.inter_fill(job);
+                }
                 // Soft lanes share the forward-backward too when every real lane is soft
                 // with one soft_impl (not "log") and one temperature, and the weights fit.
                 bool soft_group = K.inter_soft != nullptr && p0.grad_mode() == GradMode::Soft &&
@@ -620,7 +624,9 @@ private:
                     sj.ea = std::exp(-P.gap_extend_a * it);
                     sj.ob = std::exp(-(P.gap_open_b + P.gap_extend_b) * it);
                     sj.eb = std::exp(-P.gap_extend_b * it);
-                    bool fin = sj.oa <= DBL_MAX_ && sj.ea <= DBL_MAX_ && sj.ob <= DBL_MAX_ && sj.eb <= DBL_MAX_;
+                    sj.linear = lin ? 1 : 0;
+                    bool fin = sj.ea <= DBL_MAX_ && sj.eb <= DBL_MAX_ &&
+                               (lin || (sj.oa <= DBL_MAX_ && sj.ob <= DBL_MAX_));
                     for (size_t k = 0; k < nn; ++k) fin &= ses[k] <= DBL_MAX_;
                     soft_group = fin;
                     if (fin) {
@@ -642,9 +648,10 @@ private:
                     typename SeqPair::SoftLane lane{};
                     const bool use = soft_group && sok[l];
                     if (use) lane = {slogz[l], scnt.data() + l * nn, sgap.data() + l * 4};
-                    pairs[i]->score_and_grad_interleaved(buf, W, static_cast<int>(l),
-                                                         best[l], bi[l], bj[l],
-                                                         use ? &lane : nullptr);
+                    if (lin) pairs[i]->score_and_grad_with_soft_lane(buf, use ? &lane : nullptr);
+                    else     pairs[i]->score_and_grad_interleaved(buf, W, static_cast<int>(l),
+                                                                  best[l], bi[l], bj[l],
+                                                                  use ? &lane : nullptr);
                     scores[i] = pairs[i]->score();
                 }
             }
@@ -681,7 +688,7 @@ private:
         P.generation = generation_; P.default_backend = def_backend; P.n_pairs = N;
         P.backend.assign(N, -1);
         // Sort keys gathered once, so the sort does not chase pair pointers.
-        struct Key { int backend, mode; size_t len_b, len_a, i; };
+        struct Key { int backend, gm, mode; size_t len_b, len_a, i; };
         std::vector<Key> keys;
         keys.reserve(N);
         for (size_t i = 0; i < N; ++i) {
@@ -693,10 +700,12 @@ private:
                 if (!eligible) P.backend[i] = -1;
             }
             if (P.backend[i] < 0) { P.other.push_back(i); continue; }
-            keys.push_back({P.backend[i], static_cast<int>(p.align_mode()), p.len_b(), p.len_a(), i});
+            keys.push_back({P.backend[i], static_cast<int>(p.gap_model()),
+                            static_cast<int>(p.align_mode()), p.len_b(), p.len_a(), i});
         }
         std::sort(keys.begin(), keys.end(), [](const Key& x, const Key& y) {
             if (x.backend != y.backend) return x.backend < y.backend;
+            if (x.gm != y.gm) return x.gm < y.gm;
             if (x.mode != y.mode) return x.mode < y.mode;
             if (x.len_b != y.len_b) return x.len_b < y.len_b;
             if (x.len_a != y.len_a) return x.len_a < y.len_a;
@@ -704,12 +713,13 @@ private:
         });
         P.elig.reserve(keys.size());
         for (const Key& k : keys) P.elig.push_back(k.i);
-        // Groups: runs of equal (backend, mode, len_b), cut every W.
+        // Groups: runs of equal (backend, gap model, mode, len_b), cut every W.
         for (size_t s = 0; s < keys.size();) {
             const int W = level_kernels(keys[s].backend).inter_w;
             size_t e = s + 1;
             while (e < keys.size() && e - s < static_cast<size_t>(W) &&
-                   keys[e].backend == keys[s].backend && keys[e].mode == keys[s].mode &&
+                   keys[e].backend == keys[s].backend && keys[e].gm == keys[s].gm &&
+                   keys[e].mode == keys[s].mode &&
                    keys[e].len_b == keys[s].len_b)
                 ++e;
             P.groups.emplace_back(s, e);

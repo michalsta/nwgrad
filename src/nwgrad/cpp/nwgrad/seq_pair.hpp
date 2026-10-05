@@ -434,13 +434,7 @@ struct SeqPairT {
             } else {
                 guide_j_ = st.full_al.guide_j_from_viterbi(buf);
                 if (grad_mode_ == GradMode::Soft && soft) {
-                    score_ = soft->logz * soft_temp_;
-                    grad_.zero();
-                    const size_t nn = static_cast<size_t>(grad_.matrix.size()) * grad_.matrix.size();
-                    double* g = grad_.matrix.data();
-                    for (size_t k = 0; k < nn; ++k) g[k] = soft->counts[k];
-                    grad_.gap_open_a = soft->gaps[0]; grad_.gap_extend_a = soft->gaps[1];
-                    grad_.gap_open_b = soft->gaps[2]; grad_.gap_extend_b = soft->gaps[3];
+                    apply_soft_lane(*soft);
                 } else if (grad_mode_ == GradMode::Soft) {
                     st.full_al.compute_forward_back(buf);
                     score_ = st.full_al.log_z();
@@ -452,6 +446,24 @@ struct SeqPairT {
         path_valid_  = true;
         score_valid_ = true;
         grad_valid_  = (grad_mode_ != GradMode::None);
+        dp_valid_    = false;
+    }
+
+    // score_and_grad_with_dp() for a soft pair whose forward-backward ran as a lane of
+    // the inter-pair soft pass (a linear pair: there is no inter-pair Viterbi fill for
+    // linear gaps, so its guide Viterbi is its own).  soft == nullptr: own path.
+    void score_and_grad_with_soft_lane(DpBuffer& buf, const SoftLane* soft) {
+        if (!soft || grad_mode_ != GradMode::Soft) { score_and_grad_with_dp(buf); return; }
+        std::visit([&](auto& st) {
+            st.full_al.set_problem(a_idx_, b_idx_, *params_);
+            st.full_al.compute_viterbi(buf);
+            guide_j_ = st.full_al.guide_j_from_viterbi(buf);
+        }, state_);
+        last_banded_ = false;
+        apply_soft_lane(*soft);
+        path_valid_  = true;
+        score_valid_ = true;
+        grad_valid_  = true;
         dp_valid_    = false;
     }
 
@@ -526,6 +538,16 @@ private:
         } else {
             score_ = al.score();
         }
+    }
+
+    void apply_soft_lane(const SoftLane& soft) {
+        score_ = soft.logz * soft_temp_;
+        grad_.zero();
+        const size_t nn = static_cast<size_t>(grad_.matrix.size()) * grad_.matrix.size();
+        double* g = grad_.matrix.data();
+        for (size_t k = 0; k < nn; ++k) g[k] = soft.counts[k];
+        grad_.gap_open_a = soft.gaps[0]; grad_.gap_extend_a = soft.gaps[1];
+        grad_.gap_open_b = soft.gaps[2]; grad_.gap_extend_b = soft.gaps[3];
     }
 
     // Accumulate grad from `al` using external `buf` into grad_.

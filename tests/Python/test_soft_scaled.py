@@ -279,3 +279,29 @@ def test_soft_interpair_mixed_groups_and_temperature(mode):
     close(res[0][0], res[1][0])
     close(res[0][1], res[1][1])
     close(res[0][2], res[1][2])
+
+
+@pytest.mark.parametrize("mode", ["global", "local"])
+@pytest.mark.parametrize("T", [1.0, 0.6])
+def test_soft_interpair_linear(mode, T):
+    """Linear soft pairs under fill="interpair" share the forward-backward (InterSoftJob,
+    linear) but run their own guide Viterbi: scores/gradients to REL against the striped
+    fill, guides exact; uneven len(A), short groups and empty sequences included."""
+    rng = np.random.default_rng(71)
+    params = dna_params(rng, gaps=(0.0, 0.8, 0.0, 1.1))
+    lens = [(int(rng.integers(5, 28)), 45) for _ in range(29)] + [(0, 45), (12, 0), (20, 33)]
+    A = [rand_seq(rng, "ACGT", a) for a, _ in lens]
+    B = [rand_seq(rng, "ACGT", b) for _, b in lens]
+    out = []
+    for fill in ("striped", "interpair"):
+        b = nwgrad.SeqPairBatchDouble(n_threads=3)
+        b.fill = fill
+        b.soft_temperature = T
+        b.add_many(A, B, params, gap_model="linear", mode=mode, grad_mode="soft")
+        b.score_and_grad()
+        mats, gaps = b.grads()
+        out.append((b.scores(), mats, gaps, [list(b[i].guide_j) for i in range(len(b))]))
+    close(out[0][0], out[1][0])
+    close(out[0][1], out[1][1])
+    close(out[0][2], out[1][2])
+    assert out[0][3] == out[1][3]

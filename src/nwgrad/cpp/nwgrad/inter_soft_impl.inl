@@ -17,7 +17,7 @@
 #  error "inter_soft_impl.inl is included from a level TU (level_common.inc); not standalone"
 #endif
 
-static void inter_soft_entry(InterSoftJob& J) noexcept {
+static void inter_soft_affine(InterSoftJob& J) noexcept {
     const int n = J.n, M = J.M, st = n + 1, na = J.nalpha, w2 = n + 2;
     const bool local = J.align_mode == 1;
     const int kmin = local ? 1 : 0;   // Aligner::kGapTargetMin
@@ -273,4 +273,199 @@ static void inter_soft_entry(InterSoftJob& J) noexcept {
         J.gaps[l * 4 + 2] = -g_ob[l];
         J.gaps[l * 4 + 3] = -g_eb[l];
     }
+}
+
+// Linear gaps: one table, F(i,j) = F(i-1,j-1)·E + F(i-1,j)·eb + F(i,j-1)·ea (+ Local's
+// free start).  Per lane exactly Aligner::fwdbwd_linear_scaled; the same fused column
+// loops, lazy rescale and lost-mass bound as inter_soft_affine.  Gap opens are 0.
+static void inter_soft_linear(InterSoftJob& J) noexcept {
+    const int n = J.n, M = J.M, st = n + 1, na = J.nalpha, w2 = n + 2;
+    const bool local = J.align_mode == 1;
+    const int kmin = local ? 1 : 0;
+    const ivd z = {}, one = z + 1.0;
+    const ivd ea = z + J.ea, eb = z + J.eb;
+    const double DMIN = std::numeric_limits<double>::min();
+    const double DMAX = std::numeric_limits<double>::max();
+
+    ivd* F = reinterpret_cast<ivd*>(J.scratch);
+    ivd* ER = F + static_cast<size_t>(M + 1) * st;
+    ivd* cur = ER + static_cast<size_t>(M + 1) * w2;
+    ivd* nxt = cur + w2;
+    ivd* rs = nxt + w2;
+    ivd* mf = rs + (M + 1);
+    int* S = J.iscratch;
+
+    static thread_local std::vector<ivl> eqm;
+    if (eqm.size() < static_cast<size_t>(w2) * na) eqm.resize(static_cast<size_t>(w2) * na);
+    for (int j = 1; j <= n; ++j)
+        for (int c = 0; c < na; ++c) {
+            ivl v;
+            for (int l = 0; l < IW; ++l) v[l] = (J.b[l][j - 1] == c) ? -1 : 0;
+            eqm[static_cast<size_t>(j) * na + c] = v;
+        }
+    auto fill_E = [&](int i) {
+        ivd* E = ER + static_cast<size_t>(i) * w2;
+        ivd P[8];
+        for (int c = 0; c < na; ++c)
+            for (int l = 0; l < IW; ++l) {
+                const int a = (i <= J.m[l]) ? J.a[l][i - 1] : 0;
+                P[c][l] = J.es[a * na + c];
+            }
+        E[0] = z; E[n + 1] = z;
+        for (int j = 1; j <= n; ++j) {
+            ivd sv = z;
+            const ivl* mk = &eqm[static_cast<size_t>(j) * na];
+            for (int c = 0; c < na; ++c) sv = ivsel(mk[c], P[c], sv);
+            E[j] = sv;
+        }
+    };
+    int kv[IW];
+    bool bad[IW];
+    for (int l = 0; l < IW; ++l) bad[l] = false;
+    auto rescale = [&](ivd* r, ivd& mx) {
+        ivd sc;
+        bool any = false;
+        for (int l = 0; l < IW; ++l) {
+            int k = 0;
+            const double v = mx[l];
+            if (!(v <= DMAX)) bad[l] = true;
+            else if (v > 0.0 && (v > 0x1p256 || v < 0x1p-256)) k = std::ilogb(v);
+            kv[l] = k;
+            any |= (k != 0);
+            sc[l] = std::ldexp(1.0, -k);
+        }
+        if (!any) return;
+        for (int j = 0; j <= n; ++j) r[j] *= sc;
+        mx *= sc;
+    };
+
+    // ── Forward ──
+    if (local) { for (int j = 0; j <= n; ++j) F[j] = one; }
+    else { F[0] = one; for (int j = 1; j <= n; ++j) F[j] = F[j - 1] * ea; }
+    for (int l = 0; l < IW; ++l) S[l] = 0;
+    {
+        ivd sv = z, mx = z;
+        for (int j = 0; j <= n; ++j) { sv += F[j]; mx = ivmax(mx, F[j]); }
+        rs[0] = sv; mf[0] = mx;
+    }
+    for (int i = 1; i <= M; ++i) {
+        fill_E(i);
+        const ivd* E = ER + static_cast<size_t>(i) * w2;
+        ivd* r = F + static_cast<size_t>(i) * st;
+        const ivd* p = r - st;
+        ivd fr = z;
+        if (local) for (int l = 0; l < IW; ++l) fr[l] = std::ldexp(1.0, -S[(i - 1) * IW + l]);
+        ivd lv = local ? fr : p[0] * eb;
+        r[0] = lv;
+        ivd sv = lv, mx = lv;
+        for (int j = 1; j <= n; ++j) {
+            lv = p[j - 1] * E[j] + p[j] * eb + fr + lv * ea;
+            r[j] = lv; sv += lv; mx = ivmax(mx, lv);
+        }
+        rescale(r, mx);
+        for (int l = 0; l < IW; ++l) {
+            S[i * IW + l] = S[(i - 1) * IW + l] + kv[l];
+            if (kv[l]) sv[l] = std::ldexp(sv[l], -kv[l]);
+        }
+        rs[i] = sv; mf[i] = mx;
+    }
+
+    int ze[IW];
+    double izr[IW];
+    for (int l = 0; l < IW; ++l) {
+        const int ml = J.m[l];
+        double zr;
+        if (!local) {
+            ze[l] = S[ml * IW + l];
+            zr = F[static_cast<size_t>(ml) * st + n][l];
+        } else {
+            int e = S[l];
+            for (int i = 1; i <= ml; ++i) e = std::max(e, S[i * IW + l]);
+            ze[l] = e;
+            zr = 0.0;
+            for (int i = 0; i <= ml; ++i) zr += std::ldexp(rs[i][l], S[i * IW + l] - e);
+        }
+        if (!(zr > 0.0) || !(zr <= DMAX)) { bad[l] = true; zr = 1.0; }
+        const int kz = std::ilogb(zr);
+        zr = std::ldexp(zr, -kz); ze[l] += kz;
+        izr[l] = 1.0 / zr;
+        J.logz[l] = std::log(zr) + ze[l] * 0.69314718055994530942;
+    }
+
+    // ── Backward, gradient fused ──
+    for (int j = 0; j < w2; ++j) { cur[j] = z; nxt[j] = z; }
+    int Tn[IW];
+    double loss[IW], g_ea[IW], g_eb[IW];
+    for (int l = 0; l < IW; ++l) { Tn[l] = 0; loss[l] = g_ea[l] = g_eb[l] = 0.0; }
+    const size_t nn = static_cast<size_t>(na) * na;
+    for (int l = 0; l < IW; ++l)
+        for (size_t k = 0; k < nn; ++k) J.counts[l * nn + k] = 0.0;
+
+    for (int i = M; i >= 0; --i) {
+        ivl top;
+        ivd init = z;
+        for (int l = 0; l < IW; ++l) {
+            top[l] = (i == J.m[l]) ? -1 : 0;
+            if (local && i <= J.m[l]) init[l] = std::ldexp(1.0, -Tn[l]);
+        }
+        const ivd* En = (i < M) ? ER + static_cast<size_t>(i + 1) * w2 : nullptr;
+        const ivd* f = F + static_cast<size_t>(i) * st;
+        const ivd* q = f - st;
+        const ivd* Ec = ER + static_cast<size_t>(i) * w2;
+        ivd c = z, mx = z, sa = z, sb = z, acc[8];
+        for (int cc = 0; cc < na; ++cc) acc[cc] = z;
+        for (int j = n; j >= 0; --j) {
+            ivd b = (En ? En[j + 1] * nxt[j + 1] : z) + nxt[j] * eb + init + ea * c;
+            if (!local && j == n) b = ivsel(top, one, b);
+            cur[j] = b; c = b;
+            mx = ivmax(mx, b);
+            if (j >= 1) sa += f[j - 1] * b;
+            if (i >= 1) {
+                if (j >= kmin) sb += q[j] * b;
+                if (j >= 1) {
+                    const ivd t = q[j - 1] * Ec[j] * b;
+                    const ivl* mk = &eqm[static_cast<size_t>(j) * na];
+                    for (int cc = 0; cc < na; ++cc) acc[cc] += ivsel(mk[cc], t, z);
+                }
+            }
+        }
+        rescale(cur, mx);
+        for (int l = 0; l < IW; ++l)
+            if (kv[l]) {
+                const double fct = std::ldexp(1.0, -kv[l]);
+                sa[l] *= fct; sb[l] *= fct;
+                for (int cc = 0; cc < na; ++cc) acc[cc][l] *= fct;
+            }
+        for (int l = 0; l < IW; ++l) {
+            const int Ti = Tn[l] + kv[l];
+            if (i > J.m[l]) { Tn[l] = 0; continue; }
+            const double gh = std::ldexp(izr[l], S[i * IW + l] + Ti - ze[l]);
+            const double gv = i >= 1 ? std::ldexp(izr[l], S[(i - 1) * IW + l] + Ti - ze[l]) : 0.0;
+            if (!(gh <= DMAX) || !(gv <= DMAX)) bad[l] = true;
+            const int kf = i > 0 ? S[i * IW + l] - S[(i - 1) * IW + l] : 0, kb = kv[l];
+            const double lf = kf < 0 ? std::ldexp(1.0, -kf) : 1.0;
+            const double lb = kb < 0 ? std::ldexp(1.0, -kb) : 1.0;
+            loss[l] += 16.0 * (n + 1) * DMIN * (lf * mx[l] + lb * mf[i][l]) * gh;
+            if (i >= kmin) g_ea[l] += sa[l] * J.ea * gh;
+            if (i >= 1) {
+                g_eb[l] += sb[l] * J.eb * gv;
+                double* gr = J.counts + l * nn + static_cast<size_t>(J.a[l][i - 1]) * na;
+                for (int cc = 0; cc < na; ++cc) gr[cc] += acc[cc][l] * gv;
+            }
+            Tn[l] = Ti;
+        }
+        std::swap(cur, nxt);
+    }
+    for (int l = 0; l < IW; ++l) {
+        J.ok[l] = (!bad[l] && loss[l] <= 0x1p-45) ? 1 : 0;
+        J.gaps[l * 4 + 0] = 0.0;
+        J.gaps[l * 4 + 1] = -g_ea[l];
+        J.gaps[l * 4 + 2] = 0.0;
+        J.gaps[l * 4 + 3] = -g_eb[l];
+    }
+}
+
+static void inter_soft_entry(InterSoftJob& J) noexcept {
+    if (J.linear) inter_soft_linear(J);
+    else          inter_soft_affine(J);
 }
