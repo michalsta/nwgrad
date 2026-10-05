@@ -3,8 +3,8 @@
 python tools/bench_soft.py --data .../manakov_fit_rc.tsv --n 100000 --threads 1 12
 
 Per (mode, gap model): SeqPairBatchDouble.score_and_grad() with grad_mode="soft"
-(each soft_impl given) against grad_mode="hard", traceback="pointers",
-fill="interpair".  Reports us/pair, best of --reps, and soft/hard.  The matrix is
+(each soft_impl given) against grad_mode="hard"; both with traceback="pointers",
+fill="interpair" (soft pairs share only the guide Viterbi fill).  Reports us/pair, best of --reps, and soft/hard.  The matrix is
 DiscrimAlign's fitted local-linear one (entries ~ +-0.6); gaps as below.
 """
 import argparse, csv, time
@@ -62,6 +62,6 @@ for threads in args.threads:
         hard = run(threads, mode, gap, "hard", tb="pointers", fill="interpair")
         line = f"t={threads:3d} {cfg:14s} hard_interpair {hard:8.3f} us/pair"
         for impl in (args.impl or [None]):
-            soft = run(threads, mode, gap, "soft", impl=impl)
+            soft = run(threads, mode, gap, "soft", tb="pointers", fill="interpair", impl=impl)
             line += f" | soft[{impl or 'default'}] {soft:8.3f} ({soft / hard:5.1f}x)"
         print(line, flush=True)

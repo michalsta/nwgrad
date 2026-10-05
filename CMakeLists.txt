@@ -24,6 +24,11 @@ set(CMAKE_CXX_STANDARD 20)
 # weighted_grad, each fixed by hand; this closes the class.  Free here: the kernels are
 # max/add chains, with nothing for an FMA to speed up.
 add_compile_options($<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-ffp-contract=off>)
+# -fopenmp-simd enables ONLY `#pragma omp simd` (no OpenMP runtime, no other effect).
+# The scaled soft path (aligner.hpp, SoftImpl::Scaled) marks its reductions with it so
+# they vectorize; that path is tolerance-tested, not bit-exact.  No Viterbi/hard-path
+# loop carries the pragma, so their bit-exactness is untouched.
+add_compile_options($<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-fopenmp-simd>)
 
 # ── Per-ISA-level kernel TUs ──────────────────────────────────────────────────
 #

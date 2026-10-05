@@ -89,6 +89,11 @@ enum class TracebackMode { Scores, Pointers, Hirschberg, HirschbergPmax, Default
 // tolerances.  The Viterbi/hard path is unaffected by any of this.
 enum class SoftImpl { Scaled, ScaledOrLog, Log };
 
+// Reassociating reductions for the scaled soft path only (needs -fopenmp-simd, which
+// the build sets; without it the pragma is ignored and the loop stays scalar).
+#define NWGRAD_PRAGMA_(x) _Pragma(#x)
+#define NWGRAD_SOFT_SIMD_SUM(...) NWGRAD_PRAGMA_(omp simd reduction(+:__VA_ARGS__))
+
 // Both Hirschberg modes share the whole divide-and-conquer driver — the recursion, the
 // join, the base case, the memory story — and differ only in which carry the SWEEP uses.
 // Everything structural therefore asks this rather than naming one of them.
@@ -2867,25 +2872,6 @@ private:
         return !bad;
     }
 
-    // Rescale columns [lo, hi] of up to three rows by the power of two that brings
-    // their max into [1, 2).  Returns the exponent removed; sets `bad` on overflow.
-    static int rescale_rows(double* r0, double* r1, double* r2, int lo, int hi, bool& bad) noexcept {
-        double mx = 0.0;
-        for (int j = lo; j <= hi; ++j) {
-            double v = r0[j];
-            if (r1) v = std::max(v, std::max(r1[j], r2[j]));
-            mx = std::max(mx, v);
-        }
-        if (!(mx <= std::numeric_limits<double>::max())) { bad = true; return 0; }
-        if (mx == 0.0) return 0;
-        const int k = std::ilogb(mx);
-        if (k == 0) return 0;
-        const double sc = std::ldexp(1.0, -k);
-        for (int j = lo; j <= hi; ++j) r0[j] *= sc;
-        if (r1) for (int j = lo; j <= hi; ++j) { r1[j] *= sc; r2[j] *= sc; }
-        return k;
-    }
-
     // Row i's span [lo, hi] (Full: the whole row) — what the forward tables hold.
     void sc_span(int i, int& lo, int& hi) const noexcept {
         if constexpr (AB == AlignBand::Full) { lo = 0; hi = n_; }
@@ -2922,6 +2908,100 @@ private:
         return f;
     }
 
+    // ── Loop shapes (all three scaled kernels) ────────────────────────────────
+    // Every row is split into carry-free passes the compiler vectorizes (a query
+    // profile replaces the per-cell substitution gather) and ONE serial pass for the
+    // gap carry along the row.  The carry steps two cells at a time,
+    //   y[j+1] = (u[j+1] + e·u[j]) + e²·y[j-1],
+    // which halves its latency chain; it reassociates the recurrence, allowed here
+    // because the soft path is tolerance-tested, not bit-exact.
+
+    // y[j] = y[j] + e·y[j-1] for j = lo..hi (y[j] holds the carry-free term on entry).
+    static void carry_fwd(double* y, int lo, int hi, double e) noexcept {
+        double c = y[lo - 1];
+        const double e2 = e * e;
+        int j = lo;
+        for (; j < hi; j += 2) {
+            const double u1 = y[j], u2 = y[j + 1];
+            y[j] = u1 + e * c;
+            c = (u2 + e * u1) + e2 * c;
+            y[j + 1] = c;
+        }
+        if (j == hi) y[j] = y[j] + e * c;
+    }
+    // y[j] = y[j] + e·y[j+1] for j = hi..lo.
+    static void carry_bwd(double* y, int lo, int hi, double e) noexcept {
+        double c = y[hi + 1];
+        const double e2 = e * e;
+        int j = hi;
+        for (; j > lo; j -= 2) {
+            const double u1 = y[j], u2 = y[j - 1];
+            y[j] = u1 + e * c;
+            c = (u2 + e * u1) + e2 * c;
+            y[j - 1] = c;
+        }
+        if (j == lo) y[j] = y[j] + e * c;
+    }
+
+    // Query profile: prof[a·w + j] = exp(score(a, b[j-1])) for j = 1..n, 0 at j = 0
+    // and j = n+1, so a row reads its substitution weights contiguously.
+    const double* build_profile(DpBuffer& buf, size_t w) {
+        const size_t na = static_cast<size_t>(nalpha_);
+        buf.sqp.assign(na * w, 0.0);
+        double* P = buf.sqp.data();
+        for (size_t a = 0; a < na; ++a) {
+            const double* er = es_.data() + a * na;
+            double* pr = P + a * w;
+            for (int j = 1; j <= n_; ++j) pr[j] = er[b_idx_[static_cast<size_t>(j) - 1]];
+        }
+        return P;
+    }
+
+    // Rescale [lo, hi] of up to three rows so that the TOTAL (M+X+Y) max lands in
+    // [1, 2), writing the rescaled totals to tot.  Returns the exponent removed.
+    static int rescale_tot(double* r0, double* r1, double* r2, double* tot,
+                           int lo, int hi, bool& bad) noexcept {
+        double mx = 0.0;
+        if (r1 && tot) {
+            _Pragma("omp simd reduction(max:mx)")
+            for (int j = lo; j <= hi; ++j) {
+                const double t = r0[j] + r1[j] + r2[j];
+                tot[j] = t;
+                mx = t > mx ? t : mx;
+            }
+        } else if (r1) {
+            _Pragma("omp simd reduction(max:mx)")
+            for (int j = lo; j <= hi; ++j) {
+                const double t = r0[j] + r1[j] + r2[j];
+                mx = t > mx ? t : mx;
+            }
+        } else {
+            _Pragma("omp simd reduction(max:mx)")
+            for (int j = lo; j <= hi; ++j) mx = r0[j] > mx ? r0[j] : mx;
+        }
+        if (!(mx <= std::numeric_limits<double>::max())) { bad = true; return 0; }
+        if (mx == 0.0) return 0;
+        const int k = std::ilogb(mx);
+        if (k == 0) return 0;
+        const double sc = std::ldexp(1.0, -k);
+        for (int j = lo; j <= hi; ++j) r0[j] *= sc;
+        if (r1) for (int j = lo; j <= hi; ++j) { r1[j] *= sc; r2[j] *= sc; }
+        if (tot) for (int j = lo; j <= hi; ++j) tot[j] *= sc;
+        return k;
+    }
+
+    // Add the per-cell match posteriors tmp[j] (j in [lo, hi]) of row i into the
+    // count block row of a[i-1], times g.  The scatter is by B residue, per row.
+    void scatter_match(const double* tmp, int i, int lo, int hi, double g) {
+        const int na = nalpha_;
+        double* srow = srow_.data();
+        std::fill(srow, srow + na, 0.0);
+        const uint8_t* Bs = b_idx_.data();
+        for (int j = lo; j <= hi; ++j) srow[Bs[j - 1]] += tmp[j];
+        double* gr = scnt_.data() + static_cast<size_t>(a_idx_[static_cast<size_t>(i) - 1]) * na;
+        for (int b = 0; b < na; ++b) gr[b] += srow[b] * g;
+    }
+
     bool fwdbwd_linear_scaled(DpBuffer& buf) {
         if (!prepare_scaled()) return false;
         const double ea = std::exp(-params_->gap_extend_a), eb = std::exp(-params_->gap_extend_b);
@@ -2930,15 +3010,13 @@ private:
         auto& S = buf.sexp; S.assign(static_cast<size_t>(m_) + 1, 0);
         double* F = buf.F.data();
         const size_t st = stride_;
-        const double* E = es_.data();
-        const int na = nalpha_;
+        const size_t w = static_cast<size_t>(n_) + 2;
+        const double* P = build_profile(buf, w);
         const uint8_t* A = a_idx_.data();
-        const uint8_t* Bs = b_idx_.data();
         constexpr bool L = (AM == AlignMode::Local);
         bool bad = false;
 
         if constexpr (AB == AlignBand::GuideBanded) band_fill(buf.F, 0.0);
-        // Row 0.
         if constexpr (L) { for (int j = 0; j <= n_; ++j) F[j] = 1.0; }
         else {
             if constexpr (AB == AlignBand::Full) std::fill(F, F + n_ + 1, 0.0);
@@ -2948,23 +3026,17 @@ private:
         }
         const int bi = border_rows();
         for (int i = 1; i <= m_; ++i) {
-            double* r = F + static_cast<size_t>(i) * st;
-            const double* p = r - st;
+            double* __restrict r = F + static_cast<size_t>(i) * st;
+            const double* __restrict p = r - st;
             double fr = 0.0;
-            if constexpr (L) {
-                fr = std::ldexp(1.0, -S[i - 1]);
-                r[0] = fr;
-            } else {
-                r[0] = (i <= bi) ? p[0] * eb : 0.0;
-            }
-            const double* Er = E + static_cast<size_t>(A[i - 1]) * na;
+            if constexpr (L) { fr = std::ldexp(1.0, -S[i - 1]); r[0] = fr; }
+            else             r[0] = (i <= bi) ? p[0] * eb : 0.0;
+            const double* __restrict pr = P + static_cast<size_t>(A[i - 1]) * w;
             const int lo = jlo(i), hi = jhi(i);
-            for (int j = lo; j <= hi; ++j)
-                r[j] = p[j - 1] * Er[Bs[j - 1]] + p[j] * eb + fr;
-            for (int j = lo; j <= hi; ++j)
-                r[j] += r[j - 1] * ea;
+            for (int j = lo; j <= hi; ++j) r[j] = p[j - 1] * pr[j] + p[j] * eb + fr;
+            if (lo <= hi) carry_fwd(r, lo, hi, ea);
             int slo, shi; sc_span(i, slo, shi);
-            S[i] = S[i - 1] + rescale_rows(r, nullptr, nullptr, slo, shi, bad);
+            S[i] = S[i - 1] + rescale_tot(r, nullptr, nullptr, nullptr, slo, shi, bad);
             if (bad) return false;
         }
 
@@ -2976,57 +3048,51 @@ private:
         }, ze, zr);
         if (!(zr > 0.0)) return zero_z_ok();
 
-        // Backward, rolling rows, gradient fused.
-        auto& c0 = buf.sb0; auto& c1 = buf.sb1;
-        c0.assign(static_cast<size_t>(n_) + 2, 0.0);
-        c1.assign(static_cast<size_t>(n_) + 2, 0.0);
-        double* cur = c0.data();
-        double* nxt = c1.data();
-        int clo = 0, chi = n_, nlo = 0, nhi = n_;   // ranges last written into cur / nxt
-        int Tn = 0;                                 // T[i+1]
-        double* srow = srow_.data();
-        double* gblk = scnt_.data();
+        buf.sb0.assign(w, 0.0); buf.sb1.assign(w, 0.0); buf.sb2.assign(w, 0.0);
+        double* cur = buf.sb0.data();
+        double* nxt = buf.sb1.data();
+        double* tmp = buf.sb2.data();
+        int clo = 0, chi = n_, nlo = 0, nhi = n_;
+        int Tn = 0;
         double g_ea = 0.0, g_eb = 0.0, loss = 0.0;
         for (int i = m_; i >= 0; --i) {
             const int lo0 = jlo0(i), hi0 = jhi0(i);
             std::fill(cur + clo, cur + chi + 1, 0.0);
-            double init = 0.0;
-            if constexpr (L) {
-                init = std::ldexp(1.0, -Tn);
+            const double init = L ? std::ldexp(1.0, -Tn) : 0.0;
+            if (i < m_) {
+                const double* __restrict pn = P + static_cast<size_t>(A[i]) * w;
+                double* __restrict c = cur;
+                const double* __restrict nx = nxt;
+                for (int j = lo0; j <= hi0; ++j) c[j] = pn[j + 1] * nx[j + 1] + nx[j] * eb + init;
+            } else {
+                for (int j = lo0; j <= hi0; ++j) cur[j] = init;
+                if constexpr (!L) if (n_ >= lo0 && n_ <= hi0) cur[n_] = 1.0;
             }
-            const double* En = (i < m_) ? E + static_cast<size_t>(A[i]) * na : nullptr;
-            for (int j = lo0; j <= hi0; ++j) {
-                double v = nxt[j] * eb + init;
-                if (En && j < n_) v += En[Bs[j]] * nxt[j + 1];
-                cur[j] = v;
-            }
-            if constexpr (!L) if (i == m_ && n_ >= lo0 && n_ <= hi0) cur[n_] = 1.0;
-            for (int j = hi0 - 1; j >= lo0; --j) cur[j] += cur[j + 1] * ea;
+            if (lo0 <= hi0) carry_bwd(cur, lo0, hi0, ea);
             clo = lo0; chi = hi0;
-            const int Ti = Tn + rescale_rows(cur, nullptr, nullptr, lo0, hi0, bad);
+            const int Ti = Tn + rescale_tot(cur, nullptr, nullptr, nullptr, lo0, hi0, bad);
             if (bad) return false;
 
-            const double* Fi = F + static_cast<size_t>(i) * st;
+            const double* __restrict Fi = F + static_cast<size_t>(i) * st;
             const double gh = post_factor(S[i] + Ti - ze, zr, bad);
             loss += row_loss(i > 0 ? S[i] - S[i - 1] : 0, Ti - Tn, gh);
-            // gap_extend_a: A-gap steps (i, j-1) -> (i, j).
             if (i >= kGapTargetMin) {
                 double s = 0.0;
+                NWGRAD_SOFT_SIMD_SUM(s)
                 for (int j = std::max(1, lo0); j <= hi0; ++j) s += Fi[j - 1] * cur[j];
                 g_ea += s * ea * gh;
             }
             if (i >= 1) {
                 const double gv = post_factor(S[i - 1] + Ti - ze, zr, bad);
-                const double* Fp = Fi - st;
+                const double* __restrict Fp = Fi - st;
                 double s = 0.0;
+                NWGRAD_SOFT_SIMD_SUM(s)
                 for (int j = std::max(kGapTargetMin, lo0); j <= hi0; ++j) s += Fp[j] * cur[j];
                 g_eb += s * eb * gv;
-                const double* Er = E + static_cast<size_t>(A[i - 1]) * na;
-                std::fill(srow, srow + na, 0.0);
-                for (int j = jlo(i); j <= jhi(i); ++j)
-                    srow[Bs[j - 1]] += Fp[j - 1] * Er[Bs[j - 1]] * cur[j];
-                double* gr = gblk + static_cast<size_t>(A[i - 1]) * na;
-                for (int b = 0; b < na; ++b) gr[b] += srow[b] * gv;
+                const double* __restrict pr = P + static_cast<size_t>(A[i - 1]) * w;
+                const int lo = jlo(i), hi = jhi(i);
+                for (int j = lo; j <= hi; ++j) tmp[j] = Fp[j - 1] * pr[j] * cur[j];
+                scatter_match(tmp, i, lo, hi, gv);
             }
             if (bad) return false;
             Tn = Ti;
@@ -3048,12 +3114,13 @@ private:
         auto& S = buf.sexp; S.assign(static_cast<size_t>(m_) + 1, 0);
         double* FM = buf.FM.data(); double* FX = buf.FX.data(); double* FY = buf.FY.data();
         const size_t st = stride_;
-        const double* E = es_.data();
-        const int na = nalpha_;
+        const size_t w = static_cast<size_t>(n_) + 2;
+        const double* P = build_profile(buf, w);
         const uint8_t* A = a_idx_.data();
-        const uint8_t* Bs = b_idx_.data();
         constexpr bool L = (AM == AlignMode::Local);
         bool bad = false;
+        buf.sb5.assign(w, 0.0);
+        double* tp = buf.sb5.data();   // M+X+Y of the previous forward row
 
         if constexpr (AB == AlignBand::GuideBanded) {
             band_fill(buf.FM, 0.0); band_fill(buf.FX, 0.0); band_fill(buf.FY, 0.0);
@@ -3061,7 +3128,6 @@ private:
             std::fill(FM, FM + n_ + 1, 0.0); std::fill(FX, FX + n_ + 1, 0.0);
             std::fill(FY, FY + n_ + 1, 0.0);
         }
-        // Row 0.
         if constexpr (L) { for (int j = 0; j <= n_; ++j) FM[j] = 1.0; }
         else {
             FM[0] = 1.0;
@@ -3069,11 +3135,15 @@ private:
             if (bj >= 1) FY[1] = oa;
             for (int j = 2; j <= bj; ++j) FY[j] = FY[j - 1] * ea;
         }
+        { int slo, shi; sc_span(0, slo, shi);
+          for (int j = slo; j <= shi; ++j) tp[j] = FM[j] + FX[j] + FY[j]; }
         const int bi = border_rows();
         for (int i = 1; i <= m_; ++i) {
             const size_t ro = static_cast<size_t>(i) * st;
-            double* rM = FM + ro; double* rX = FX + ro; double* rY = FY + ro;
-            const double* pM = rM - st; const double* pX = rX - st; const double* pY = rY - st;
+            double* __restrict rM = FM + ro; double* __restrict rX = FX + ro;
+            double* __restrict rY = FY + ro;
+            const double* __restrict pM = rM - st; const double* __restrict pX = rX - st;
+            const double* __restrict pY = rY - st;
             double fr = 0.0;
             if constexpr (L) {
                 fr = std::ldexp(1.0, -S[i - 1]);
@@ -3082,16 +3152,17 @@ private:
                 rM[0] = 0.0; rY[0] = 0.0;
                 rX[0] = (i <= bi) ? (pM[0] + pY[0]) * ob + pX[0] * eb : 0.0;
             }
-            const double* Er = E + static_cast<size_t>(A[i - 1]) * na;
+            const double* __restrict pr = P + static_cast<size_t>(A[i - 1]) * w;
+            const double* __restrict tq = tp;
             const int lo = jlo(i), hi = jhi(i);
             for (int j = lo; j <= hi; ++j) {
-                rM[j] = (pM[j - 1] + pX[j - 1] + pY[j - 1]) * Er[Bs[j - 1]] + fr;
+                rM[j] = tq[j - 1] * pr[j] + fr;
                 rX[j] = (pM[j] + pY[j]) * ob + pX[j] * eb;
             }
-            for (int j = lo; j <= hi; ++j)
-                rY[j] = (rM[j - 1] + rX[j - 1]) * oa + rY[j - 1] * ea;
+            for (int j = lo; j <= hi; ++j) rY[j] = (rM[j - 1] + rX[j - 1]) * oa;
+            if (lo <= hi) carry_fwd(rY, lo, hi, ea);
             int slo, shi; sc_span(i, slo, shi);
-            S[i] = S[i - 1] + rescale_rows(rM, rX, rY, slo, shi, bad);
+            S[i] = S[i - 1] + rescale_tot(rM, rX, rY, tp, slo, shi, bad);
             if (bad) return false;
         }
 
@@ -3104,56 +3175,71 @@ private:
         }, ze, zr);
         if (!(zr > 0.0)) return zero_z_ok();
 
-        const size_t w = static_cast<size_t>(n_) + 2;
         buf.sb0.assign(w, 0.0); buf.sb1.assign(w, 0.0); buf.sb2.assign(w, 0.0);
-        buf.sb3.assign(w, 0.0); buf.sb4.assign(w, 0.0); buf.sb5.assign(w, 0.0);
+        buf.sb3.assign(w, 0.0); buf.sb4.assign(w, 0.0);
         double *cM = buf.sb0.data(), *cX = buf.sb1.data(), *cY = buf.sb2.data();
-        double *nM = buf.sb3.data(), *nX = buf.sb4.data(), *nY = buf.sb5.data();
+        double *nM = buf.sb3.data(), *nX = buf.sb4.data();
+        double* tmp = tp;   // forward totals are no longer needed
         int clo = 0, chi = n_, nlo = 0, nhi = n_;
         int Tn = 0;
-        double* srow = srow_.data();
-        double* gblk = scnt_.data();
         double g_ea = 0.0, g_eb = 0.0, g_oa = 0.0, g_ob = 0.0, loss = 0.0;
         for (int i = m_; i >= 0; --i) {
             const int lo0 = jlo0(i), hi0 = jhi0(i);
             std::fill(cM + clo, cM + chi + 1, 0.0);
             std::fill(cX + clo, cX + chi + 1, 0.0);
-            std::fill(cY + clo, cY + chi + 1, 0.0);
-            double init = 0.0;
-            if constexpr (L) {
-                init = std::ldexp(1.0, -Tn);
+            // cY is not swapped (only M and X of the next row are read), so it still
+            // holds row i+1 over [nlo, nhi].
+            std::fill(cY + nlo, cY + nhi + 1, 0.0);
+            const double init = L ? std::ldexp(1.0, -Tn) : 0.0;
+            {
+                // Carry-free part: d = diag + free end; M and Y share it with the
+                // vertical (X) predecessor at the open weight, X at the extend weight.
+                double* __restrict b1 = cM; double* __restrict b2 = cX;
+                double* __restrict y = cY;
+                const double* __restrict nm = nM; const double* __restrict nx = nX;
+                if (i < m_) {
+                    const double* __restrict pn = P + static_cast<size_t>(A[i]) * w;
+                    for (int j = lo0; j <= hi0; ++j) {
+                        const double d = pn[j + 1] * nm[j + 1] + init, v = nx[j];
+                        b1[j] = d + v * ob; b2[j] = d + v * eb; y[j] = b1[j];
+                    }
+                } else {
+                    for (int j = lo0; j <= hi0; ++j) { b1[j] = init; b2[j] = init; y[j] = init; }
+                    if constexpr (!L)
+                        if (n_ >= lo0 && n_ <= hi0) { b1[n_] = 1.0; b2[n_] = 1.0; y[n_] = 1.0; }
+                }
             }
-            const double* En = (i < m_) ? E + static_cast<size_t>(A[i]) * na : nullptr;
-            for (int j = lo0; j <= hi0; ++j) {
-                const double d = (En && j < n_) ? En[Bs[j]] * nM[j + 1] + init : init;
-                const double v = nX[j];
-                cM[j] = d + v * ob;
-                cX[j] = d + v * eb;
-                cY[j] = d + v * ob;
-            }
-            if constexpr (!L)
-                if (i == m_ && n_ >= lo0 && n_ <= hi0) { cM[n_] = 1.0; cX[n_] = 1.0; cY[n_] = 1.0; }
-            for (int j = hi0 - 1; j >= lo0; --j) {
-                const double h = cY[j + 1];
-                cM[j] += h * oa;
-                cX[j] += h * oa;
-                cY[j] += h * ea;
+            if (lo0 <= hi0) carry_bwd(cY, lo0, hi0, ea);
+            {
+                double* __restrict b1 = cM; double* __restrict b2 = cX;
+                const double* __restrict y = cY;
+                for (int j = lo0; j <= hi0; ++j) {
+                    const double h = y[j + 1] * oa;
+                    b1[j] += h; b2[j] += h;
+                }
             }
             clo = lo0; chi = hi0;
-            const int Ti = Tn + rescale_rows(cM, cX, cY, lo0, hi0, bad);
+            const int Ti = Tn + rescale_tot(cM, cX, cY, nullptr, lo0, hi0, bad);
             if (bad) return false;
 
             const size_t ro = static_cast<size_t>(i) * st;
-            const double* fM = FM + ro; const double* fX = FX + ro; const double* fY = FY + ro;
+            const double* __restrict fM = FM + ro; const double* __restrict fX = FX + ro;
+            const double* __restrict fY = FY + ro;
+            const double* __restrict bM = cM; const double* __restrict bX = cX;
+            const double* __restrict bY = cY;
             const double gh = post_factor(S[i] + Ti - ze, zr, bad);
             loss += row_loss(i > 0 ? S[i] - S[i - 1] : 0, Ti - Tn, gh);
             {
                 double sx = 0.0;   // gap_extend_b: X-state occupancy
-                if (i >= 1) for (int j = lo0; j <= hi0; ++j) sx += fX[j] * cX[j];
+                if (i >= 1) {
+                    NWGRAD_SOFT_SIMD_SUM(sx)
+                    for (int j = lo0; j <= hi0; ++j) sx += fX[j] * bX[j];
+                }
                 double sy = 0.0, so = 0.0;   // gap_extend_a: Y occupancy; gap_open_a: M/X -> Y
+                NWGRAD_SOFT_SIMD_SUM(sy, so)
                 for (int j = std::max(1, lo0); j <= hi0; ++j) {
-                    sy += fY[j] * cY[j];
-                    so += (fM[j - 1] + fX[j - 1]) * cY[j];
+                    sy += fY[j] * bY[j];
+                    so += (fM[j - 1] + fX[j - 1]) * bY[j];
                 }
                 g_eb += sx * gh;
                 g_ea += sy * gh;
@@ -3161,21 +3247,23 @@ private:
             }
             if (i >= 1) {
                 const double gv = post_factor(S[i - 1] + Ti - ze, zr, bad);
-                const double* qM = fM - st; const double* qX = fX - st; const double* qY = fY - st;
+                const double* __restrict qM = fM - st; const double* __restrict qX = fX - st;
+                const double* __restrict qY = fY - st;
                 double s = 0.0;   // gap_open_b: M/Y at (i-1, j) -> X at (i, j)
+                NWGRAD_SOFT_SIMD_SUM(s)
                 for (int j = std::max(kGapTargetMin, lo0); j <= hi0; ++j)
-                    s += (qM[j] + qY[j]) * cX[j];
+                    s += (qM[j] + qY[j]) * bX[j];
                 g_ob += s * ob * gv;
-                const double* Er = E + static_cast<size_t>(A[i - 1]) * na;
-                std::fill(srow, srow + na, 0.0);
-                for (int j = jlo(i); j <= jhi(i); ++j)
-                    srow[Bs[j - 1]] += (qM[j - 1] + qX[j - 1] + qY[j - 1]) * Er[Bs[j - 1]] * cM[j];
-                double* gr = gblk + static_cast<size_t>(A[i - 1]) * na;
-                for (int b = 0; b < na; ++b) gr[b] += srow[b] * gv;
+                const double* __restrict pr = P + static_cast<size_t>(A[i - 1]) * w;
+                double* __restrict t = tmp;
+                const int lo = jlo(i), hi = jhi(i);
+                for (int j = lo; j <= hi; ++j)
+                    t[j] = (qM[j - 1] + qX[j - 1] + qY[j - 1]) * pr[j] * bM[j];
+                scatter_match(tmp, i, lo, hi, gv);
             }
             if (bad) return false;
             Tn = Ti;
-            std::swap(cM, nM); std::swap(cX, nX); std::swap(cY, nY);
+            std::swap(cM, nM); std::swap(cX, nX);
             std::swap(clo, nlo); std::swap(chi, nhi);
         }
         if (!(loss <= kScaledLossTol)) return false;

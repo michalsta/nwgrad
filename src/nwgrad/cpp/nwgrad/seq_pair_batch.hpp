@@ -500,13 +500,14 @@ struct SeqPairBatchT {
 
 private:
     // The vector backend an inter-pair fill of this pair would run on, or -1 when the
-    // pair must take its own fill: float32, linear gaps, soft gradients, an alphabet
-    // over 8 letters or the scalar backend. The mutable Hirschberg cutoff is
+    // pair must take its own fill: float32, linear gaps, an alphabet over 8 letters or
+    // the scalar backend.  Soft pairs qualify: the shared fill is their guide Viterbi
+    // (bit-identical to their own), and forward-backward then runs per pair. The mutable Hirschberg cutoff is
     // handled separately when building and validating the cached plan.
     int inter_backend_(const SeqPair& p) const {
         if constexpr (!std::is_same_v<T, double>) return -1;
         else {
-            if (p.gap_model() != GapModel::Affine || p.grad_mode() == GradMode::Soft) return -1;
+            if (p.gap_model() != GapModel::Affine) return -1;
             if (p.len_a() == 0 || p.len_b() == 0) return -1;
             if (p.params_ptr()->matrix.size() > 8) return -1;
             const int backend = (p.kernel() == kBackendAuto) ? global_default_backend() : p.kernel();

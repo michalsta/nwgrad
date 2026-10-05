@@ -163,3 +163,30 @@ def test_soft_impl_rejects_unknown():
     b = nwgrad.SeqPairBatchDouble()
     with pytest.raises(ValueError):
         b.soft_impl = "fast"
+
+
+@pytest.mark.parametrize("mode", ["global", "local"])
+def test_soft_interpair_identical(mode):
+    """fill="interpair" shares only the guide Viterbi across lanes; forward-backward
+    is the pair's own, so scores, gradients and guides match the striped fill bit for
+    bit — including short groups and empty sequences, which take their own fill."""
+    rng = np.random.default_rng(21)
+    params = dna_params(rng)
+    lens = [(int(rng.integers(15, 25)), 50) for _ in range(37)] + [(0, 50), (20, 0), (22, 31)]
+    A = [rand_seq(rng, "ACGT", a) for a, _ in lens]
+    B = [rand_seq(rng, "ACGT", b) for _, b in lens]
+    out = []
+    for fill in ("striped", "interpair"):
+        b = nwgrad.SeqPairBatchDouble(n_threads=3, traceback="pointers")
+        b.fill = fill
+        b.add_many(A, B, params, gap_model="affine", mode=mode, grad_mode="soft")
+        b.score_and_grad()
+        mats, gaps = b.grads()
+        guides = [list(b[i].guide_j) for i in range(len(b))]
+        banded = b.banded_grad(3)
+        out.append((b.scores(), mats, gaps, guides, banded))
+    np.testing.assert_array_equal(out[0][0], out[1][0])
+    np.testing.assert_array_equal(out[0][1], out[1][1])
+    np.testing.assert_array_equal(out[0][2], out[1][2])
+    assert out[0][3] == out[1][3]
+    assert out[0][4] == out[1][4]

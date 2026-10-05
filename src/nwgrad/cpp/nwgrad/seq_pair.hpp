@@ -404,7 +404,9 @@ struct SeqPairT {
     bool score_valid() const noexcept { return score_valid_; }
     // score_and_grad_with_dp() for a pair whose affine Full DP was filled as lane `lane`
     // of an inter-pair fill (InterJob) into buf's interleaved tables: same results,
-    // bit for bit — only the fill was shared.  Hard or no gradient only.
+    // bit for bit — only the fill was shared.  Soft: the shared fill is the guide
+    // Viterbi, and forward-backward then runs on this pair alone (its tables are not
+    // the interleaved VM/VX/VY, so the group's other lanes are untouched).
     void score_and_grad_interleaved(DpBuffer& buf, int W, int lane,
                                     double local_best, int best_i, int best_j) {
         std::visit([&](auto& st) {
@@ -417,6 +419,12 @@ struct SeqPairT {
                 st.full_al.hard_grad_and_guide(buf, grad_, guide_j_);   // one walk for both
             } else {
                 guide_j_ = st.full_al.guide_j_from_viterbi(buf);
+                if (grad_mode_ == GradMode::Soft) {
+                    st.full_al.compute_forward_back(buf);
+                    score_ = st.full_al.log_z();
+                    grad_.zero();
+                    st.full_al.soft_grad(buf, grad_);
+                }
             }
         }, state_);
         path_valid_  = true;

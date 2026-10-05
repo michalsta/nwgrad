@@ -166,7 +166,8 @@ struct DpBufferT {
     // Scaled soft path (SoftImpl::Scaled): rolling backward rows (current/next, per
     // state) and the per-row power-of-two exponents of the forward tables.  The forward
     // tables reuse F / FM,FX,FY; the B tables are not used at all.
-    DVec sb0, sb1, sb2, sb3, sb4, sb5;
+    // sqp is the soft query profile, exp(score(a, b[j-1])) laid out per residue a.
+    DVec sb0, sb1, sb2, sb3, sb4, sb5, sqp;
     std::vector<int> sexp;
 
     void clear() noexcept {
@@ -186,7 +187,7 @@ struct DpBufferT {
         clrT(hsM); clrT(hsX); clrT(hsY);
         clrT(hprof); clrT(hov); clrT(hramp);
         clrB(hbD); clrB(hops);
-        clrD(sb0); clrD(sb1); clrD(sb2); clrD(sb3); clrD(sb4); clrD(sb5);
+        clrD(sb0); clrD(sb1); clrD(sb2); clrD(sb3); clrD(sb4); clrD(sb5); clrD(sqp);
         sexp.clear(); sexp.shrink_to_fit();
     }
 };

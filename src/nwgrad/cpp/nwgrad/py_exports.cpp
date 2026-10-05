@@ -757,7 +757,7 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             "  \"interpair\": score_and_grad() fills several pairs at once, one per\n"
             "     vector lane, grouped by length of B (fastest on many short pairs;\n"
             "     ~4x the scalar fill at 22 x 50 on AVX2).  Pairs it cannot take —\n"
-            "     float32, linear gaps, soft gradients, alphabets over 8 letters, the\n"
+            "     float32, linear gaps, alphabets over 8 letters, the\n"
             "     scalar kernel — run the striped fill.  Other batch operations\n"
             "     (align_full, banded) use the striped fill.\n"
             "Scores, paths and gradients are bit-identical whichever fill runs.\n"
