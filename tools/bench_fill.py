@@ -24,6 +24,8 @@ ap.add_argument("--threads", type=int, nargs="+", default=[1])
 ap.add_argument("--reps", type=int, default=3)
 ap.add_argument("--prec", nargs="+", default=["float32", "double"])
 ap.add_argument("--tb", nargs="+", default=["pointers", "auto"])
+ap.add_argument("--band", type=int, nargs="*", default=[],
+                help="also time banded_grad(bw) after one score_and_grad, per fill")
 ap.add_argument("--configs", nargs="+",
                 default=["local-affine", "global-affine", "local-linear", "global-linear"])
 args = ap.parse_args()
@@ -39,16 +41,19 @@ lin = nwgrad.AlignParams(nwgrad.SubstMatrix(np.array(M), "ACGT"), 0.0, 1.2147, 0
 CLS = {"float32": nwgrad.SeqPairBatch, "double": nwgrad.SeqPairBatchDouble}
 
 
-def run(prec, threads, mode, gap, tb, fill):
+def run(prec, threads, mode, gap, tb, fill, bw=0):
     b = CLS[prec](n_threads=threads, traceback=tb)
     b.fill = fill
     b.add_many(A, B, params if gap == "affine" else lin, gap_model=gap, mode=mode,
                grad_mode="hard")
-    b.score_and_grad()  # warm: allocation, plan
+    b.score_and_grad()  # warm: allocation, plan (and the guides banded_grad needs)
+    step = (lambda: b.banded_grad(bw)) if bw else b.score_and_grad
+    if bw:
+        step()
     best = 1e30
     for _ in range(args.reps):
         t = time.perf_counter()
-        b.score_and_grad()
+        step()
         best = min(best, time.perf_counter() - t)
     return best / len(A) * 1e6
 
@@ -62,7 +67,9 @@ for prec in args.prec:
             for tb in args.tb:
                 if tb == "auto" and prec == "double":
                     continue   # double auto = exact hirschberg; pointers row covers it
-                s = run(prec, t, mode, gap, tb, "striped")
-                i = run(prec, t, mode, gap, tb, "interpair")
-                print(f"{prec:8s} {t:3d} {cfg:14s} {tb:8s} {s:8.3f} {i:9.3f} {i / s:6.2f}",
-                      flush=True)
+                for bw in [0] + args.band:
+                    s = run(prec, t, mode, gap, tb, "striped", bw)
+                    i = run(prec, t, mode, gap, tb, "interpair", bw)
+                    lab = tb if not bw else f"band{bw}"
+                    print(f"{prec:8s} {t:3d} {cfg:14s} {lab:8s} {s:8.3f} {i:9.3f} {i / s:6.2f}",
+                          flush=True)
