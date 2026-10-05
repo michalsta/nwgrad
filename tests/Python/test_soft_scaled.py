@@ -167,9 +167,10 @@ def test_soft_impl_rejects_unknown():
 
 @pytest.mark.parametrize("mode", ["global", "local"])
 def test_soft_interpair_identical(mode):
-    """fill="interpair" shares only the guide Viterbi across lanes; forward-backward
-    is the pair's own, so scores, gradients and guides match the striped fill bit for
-    bit — including short groups and empty sequences, which take their own fill."""
+    """fill="interpair" runs the guide Viterbi AND the scaled forward-backward W pairs
+    per vector (InterSoftJob): guides and banded results match the striped fill bit for
+    bit (Viterbi is bit-exact), scores and gradients to REL — including short groups,
+    lanes of different len(A), and empty sequences, which take their own path."""
     rng = np.random.default_rng(21)
     params = dna_params(rng)
     lens = [(int(rng.integers(15, 25)), 50) for _ in range(37)] + [(0, 50), (20, 0), (22, 31)]
@@ -185,9 +186,9 @@ def test_soft_interpair_identical(mode):
         guides = [list(b[i].guide_j) for i in range(len(b))]
         banded = b.banded_grad(3)
         out.append((b.scores(), mats, gaps, guides, banded))
-    np.testing.assert_array_equal(out[0][0], out[1][0])
-    np.testing.assert_array_equal(out[0][1], out[1][1])
-    np.testing.assert_array_equal(out[0][2], out[1][2])
+    close(out[0][0], out[1][0])
+    close(out[0][1], out[1][1])
+    close(out[0][2], out[1][2])
     assert out[0][3] == out[1][3]
     assert out[0][4] == out[1][4]
 
@@ -255,3 +256,26 @@ def test_temperature_invalidates_and_validates():
     for bad in (0.0, -1.0, float("inf"), float("nan")):
         with pytest.raises(ValueError):
             sp.soft_temperature = bad
+
+
+@pytest.mark.parametrize("mode", ["global", "local"])
+def test_soft_interpair_mixed_groups_and_temperature(mode):
+    """Groups mixing soft and hard pairs (soft lanes then take their own path), and a
+    non-unit temperature through the inter-pair soft pass, against the striped fill."""
+    rng = np.random.default_rng(61)
+    params = dna_params(rng)
+    A = [rand_seq(rng, "ACGT", int(rng.integers(10, 30))) for _ in range(40)]
+    B = [rand_seq(rng, "ACGT", 40) for _ in range(40)]
+    res = []
+    for fill in ("striped", "interpair"):
+        b = nwgrad.SeqPairBatchDouble(n_threads=2, traceback="pointers")
+        b.fill = fill
+        b.soft_temperature = 0.4
+        b.add_many(A[:25], B[:25], params, gap_model="affine", mode=mode, grad_mode="soft")
+        b.add_many(A[25:], B[25:], params, gap_model="affine", mode=mode, grad_mode="hard")
+        b.score_and_grad()
+        mats, gaps = b.grads()
+        res.append((b.scores(), mats, gaps))
+    close(res[0][0], res[1][0])
+    close(res[0][1], res[1][1])
+    close(res[0][2], res[1][2])

@@ -505,6 +505,8 @@ private:
     // the scalar backend.  Soft pairs qualify: the shared fill is their guide Viterbi
     // (bit-identical to their own), and forward-backward then runs per pair. The mutable Hirschberg cutoff is
     // handled separately when building and validating the cached plan.
+    static constexpr double DBL_MAX_ = std::numeric_limits<double>::max();
+
     int inter_backend_(const SeqPair& p) const {
         if constexpr (!std::is_same_v<T, double>) return -1;
         else {
@@ -546,6 +548,10 @@ private:
             std::vector<const unsigned char*> a, b;
             std::vector<int> m, bi, bj;
             std::vector<double> best;
+            // Soft groups: the inter-pair soft pass's scratch and per-lane results.
+            DVec sscr;
+            std::vector<int> siscr, sok;
+            std::vector<double> ses, slogz, scnt, sgap;
             while (true) {
                 const size_t t = idx.fetch_add(1, std::memory_order_relaxed);
                 if (t >= tasks) break;
@@ -594,10 +600,51 @@ private:
                 job.VM = buf.VM.data(); job.VX = buf.VX.data(); job.VY = buf.VY.data();
                 job.best = best.data(); job.best_i = bi.data(); job.best_j = bj.data();
                 K.inter_fill(job);
+                // Soft lanes share the forward-backward too when every real lane is soft
+                // with one soft_impl (not "log") and one temperature, and the weights fit.
+                bool soft_group = K.inter_soft != nullptr && p0.grad_mode() == GradMode::Soft &&
+                                  p0.soft_impl() != SoftImpl::Log;
+                for (size_t l = 1; l < real && soft_group; ++l) {
+                    const SeqPair& p = *pairs[elig[s + l]];
+                    soft_group = p.grad_mode() == GradMode::Soft && p.soft_impl() == p0.soft_impl() &&
+                                 p.soft_temperature() == p0.soft_temperature();
+                }
+                const int na = P.matrix.size();
+                const size_t nn = static_cast<size_t>(na) * na;
+                if (soft_group) {
+                    const double it = 1.0 / p0.soft_temperature();
+                    ses.resize(nn);
+                    for (size_t k = 0; k < nn; ++k) ses[k] = std::exp(P.matrix.data()[k] * it);
+                    InterSoftJob sj{};
+                    sj.oa = std::exp(-(P.gap_open_a + P.gap_extend_a) * it);
+                    sj.ea = std::exp(-P.gap_extend_a * it);
+                    sj.ob = std::exp(-(P.gap_open_b + P.gap_extend_b) * it);
+                    sj.eb = std::exp(-P.gap_extend_b * it);
+                    bool fin = sj.oa <= DBL_MAX_ && sj.ea <= DBL_MAX_ && sj.ob <= DBL_MAX_ && sj.eb <= DBL_MAX_;
+                    for (size_t k = 0; k < nn; ++k) fin &= ses[k] <= DBL_MAX_;
+                    soft_group = fin;
+                    if (fin) {
+                        const size_t need = inter_soft_scratch(n, M, W);
+                        if (sscr.size() < need) sscr.resize(need);
+                        siscr.resize(static_cast<size_t>(M + 1) * W);
+                        slogz.resize(W); scnt.resize(W * nn); sgap.resize(W * 4); sok.resize(W);
+                        sj.a = job.a; sj.m = job.m; sj.b = job.b; sj.n = n; sj.M = M;
+                        sj.es = ses.data(); sj.nalpha = na;
+                        sj.align_mode = job.align_mode;
+                        sj.scratch = sscr.data(); sj.iscratch = siscr.data();
+                        sj.logz = slogz.data(); sj.counts = scnt.data(); sj.gaps = sgap.data();
+                        sj.ok = sok.data();
+                        K.inter_soft(sj);
+                    }
+                }
                 for (size_t l = 0; l < real; ++l) {
                     const size_t i = elig[s + l];
+                    typename SeqPair::SoftLane lane{};
+                    const bool use = soft_group && sok[l];
+                    if (use) lane = {slogz[l], scnt.data() + l * nn, sgap.data() + l * 4};
                     pairs[i]->score_and_grad_interleaved(buf, W, static_cast<int>(l),
-                                                         best[l], bi[l], bj[l]);
+                                                         best[l], bi[l], bj[l],
+                                                         use ? &lane : nullptr);
                     scores[i] = pairs[i]->score();
                 }
             }

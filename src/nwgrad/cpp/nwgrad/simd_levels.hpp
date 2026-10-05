@@ -271,6 +271,31 @@ struct InterJob {
 };
 using inter_fn = void (*)(InterJob&);
 
+// Inter-pair SOFT pass (scaled forward-backward with the gradient fused), double: the
+// same W-lane grouping as InterJob, affine Full only, nalpha <= 8.  Per lane it is
+// Aligner::fwdbwd_affine_scaled — tolerance-equal, not bit-equal (the soft path is not
+// bit-exact).  The caller supplies exp'd weights (temperature already applied) and
+// scratch; per lane it receives log Z (of params/T, NOT yet multiplied by T), the
+// expected match counts (nalpha x nalpha) and the four gap gradient fields
+// (go_a, ge_a, go_b, ge_b; already negative), and ok = 0 where the lane's lost-mass
+// bound or overflow check failed (the caller then runs that pair on its own path).
+// Body in inter_soft_impl.inl.
+struct InterSoftJob {
+    const unsigned char* const* a; const int* m; const unsigned char* const* b;
+    int n, M;
+    const double* es; int nalpha;      // exp(score / T), row-major nalpha x nalpha
+    double oa, ea, ob, eb;             // exp(-(go+ge)/T), exp(-ge/T), per side
+    int align_mode;                    // 0 = Global, 1 = Local
+    double* scratch;                   // inter_soft_scratch(n, M, W) doubles, 64-byte aligned
+    int* iscratch;                     // (M+1)*W ints
+    double* logz; double* counts; double* gaps; int* ok;   // W, W*nalpha^2, W*4, W
+};
+using inter_soft_fn = void (*)(InterSoftJob&);
+inline size_t inter_soft_scratch(int n, int M, int W) {
+    return (3 * static_cast<size_t>(M + 1) * (n + 1) + 8 * static_cast<size_t>(n + 2) +
+            static_cast<size_t>(M + 1)) * W;
+}
+
 // Whole-row banded kernel for the GuideBanded path.  viterbi_affine_simd (in
 // aligner_simd.hpp) owns the banded indexing and hands this one row's worth of
 // contiguous slices; it runs the whole interleaved block loop (carry-free VM/VX, serial
@@ -305,6 +330,7 @@ struct LevelKernels {
     int           row_block = 0;                // columns per interleaved block (per-µarch)
     inter_fn      inter_fill = nullptr;         // inter-pair affine Full fill, double
     int           inter_w = 0;                  // its lane count (pairs per call)
+    inter_soft_fn inter_soft = nullptr;         // inter-pair soft pass, double (same W)
 };
 
 // One slot per possible level; index by (int)SimdLevel.  Populated by the level TUs'
@@ -329,7 +355,8 @@ void register_level(SimdLevel l, viterbi_fn viterbi, viterbi_fn_f viterbi_f,
                     hb_fn hb_sweep_pmax, hb_fn_f hb_sweep_pmax_f,
                     hbbase_fn hb_base, hbbase_fn_f hb_base_f,
                     hbscan_fn hb_scan, hbscan_fn_f hb_scan_f,
-                    int row_block, inter_fn inter_fill, int inter_w);
+                    int row_block, inter_fn inter_fill, int inter_w,
+                    inter_soft_fn inter_soft);
 
 // ── The global default backend ────────────────────────────────────────────────
 //

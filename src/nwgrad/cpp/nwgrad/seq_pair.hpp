@@ -416,8 +416,13 @@ struct SeqPairT {
     // bit for bit — only the fill was shared.  Soft: the shared fill is the guide
     // Viterbi, and forward-backward then runs on this pair alone (its tables are not
     // the interleaved VM/VX/VY, so the group's other lanes are untouched).
+    // A soft lane's result from the inter-pair soft pass (InterSoftJob); used instead
+    // of this pair's own forward-backward when ok.
+    struct SoftLane { double logz; const double* counts; const double* gaps; };
+
     void score_and_grad_interleaved(DpBuffer& buf, int W, int lane,
-                                    double local_best, int best_i, int best_j) {
+                                    double local_best, int best_i, int best_j,
+                                    const SoftLane* soft = nullptr) {
         std::visit([&](auto& st) {
             st.full_al.set_problem(a_idx_, b_idx_, *params_);
             st.full_al.adopt_interleaved(buf, W, lane, local_best, best_i, best_j);
@@ -428,7 +433,15 @@ struct SeqPairT {
                 st.full_al.hard_grad_and_guide(buf, grad_, guide_j_);   // one walk for both
             } else {
                 guide_j_ = st.full_al.guide_j_from_viterbi(buf);
-                if (grad_mode_ == GradMode::Soft) {
+                if (grad_mode_ == GradMode::Soft && soft) {
+                    score_ = soft->logz * soft_temp_;
+                    grad_.zero();
+                    const size_t nn = static_cast<size_t>(grad_.matrix.size()) * grad_.matrix.size();
+                    double* g = grad_.matrix.data();
+                    for (size_t k = 0; k < nn; ++k) g[k] = soft->counts[k];
+                    grad_.gap_open_a = soft->gaps[0]; grad_.gap_extend_a = soft->gaps[1];
+                    grad_.gap_open_b = soft->gaps[2]; grad_.gap_extend_b = soft->gaps[3];
+                } else if (grad_mode_ == GradMode::Soft) {
                     st.full_al.compute_forward_back(buf);
                     score_ = st.full_al.log_z();
                     grad_.zero();
