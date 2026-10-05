@@ -137,6 +137,15 @@ struct SeqPairT {
     }
     SoftImpl soft_impl() const noexcept { return soft_impl_; }
 
+    // Soft temperature — see Aligner::set_soft_temperature.  Invalidates the cached
+    // score and gradient (they belong to the old temperature).
+    void set_soft_temperature(double t) {
+        std::visit([t](auto& st) { st.full_al.set_soft_temperature(t); st.band_al.set_soft_temperature(t); }, state_);
+        soft_temp_ = t;
+        if (grad_mode_ == GradMode::Soft) { score_valid_ = false; grad_valid_ = false; }
+    }
+    double soft_temperature() const noexcept { return soft_temp_; }
+
     // Swap alignment parameters.  Invalidates score, gradient and the retained DP
     // tables (aligned() throws until the next align); the guide path stays.
     // realign_banded() remains callable after this — it will re-score the
@@ -466,6 +475,7 @@ private:
     int                  hb_cutoff_ = 512;   // mirrors Aligner's default (fleet-swept)
     bool                 rowwise_full_ = false;
     SoftImpl             soft_impl_ = SoftImpl::Scaled;
+    double               soft_temp_ = 1.0;
 
     bool             path_valid_   = false;
     bool             score_valid_  = false;

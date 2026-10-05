@@ -539,7 +539,7 @@ struct Aligner {
     }
 
     void soft_grad(const DpBuffer& buf, AlignParams& grad) const {
-        if (soft_scaled_used_) { add_scaled_counts(grad); return; }
+        if (soft_counts_ready_) { add_scaled_counts(grad); return; }
         if constexpr (GM == GapModel::Linear) soft_grad_linear(buf, grad);
         else                                   soft_grad_affine(buf, grad);
     }
@@ -549,6 +549,18 @@ struct Aligner {
     SoftImpl soft_impl() const noexcept { return soft_impl_; }
     // Whether the most recent compute_forward_back() ran the scaled path (false: log).
     bool soft_scaled_used() const noexcept { return soft_scaled_used_; }
+
+    // Soft temperature T > 0 (default 1).  The soft path then evaluates the smoothed
+    // score T·log Z(θ/T) — log_z() returns that — and its gradient with respect to θ,
+    // which is the expected counts under θ/T.  T → 0 recovers the Viterbi score and
+    // (on tie-free inputs) the hard counts; T = 1 is the plain log Z.
+    void set_soft_temperature(double t) {
+        if (!(t > 0.0 && t <= std::numeric_limits<double>::max()))
+            throw std::invalid_argument("nwgrad: soft temperature must be finite and > 0, got " +
+                                        std::to_string(t));
+        soft_temp_ = t;
+    }
+    double soft_temperature() const noexcept { return soft_temp_; }
 
 private:
     static constexpr double NEG_INF = -std::numeric_limits<double>::infinity();
@@ -651,6 +663,8 @@ private:
     // ── Scaled soft path state ────────────────────────────────────────────────
     SoftImpl soft_impl_ = SoftImpl::Scaled;
     bool     soft_scaled_used_ = false;
+    bool     soft_counts_ready_ = false;   // scnt_/sg_* hold this run's gradient
+    double   soft_temp_ = 1.0;
     // exp(substitution block), and the expected counts the scaled backward pass
     // accumulated (matrix: +count; gaps: -count, i.e. already the gradient's sign).
     std::vector<double> es_, scnt_, srow_;
@@ -2814,11 +2828,16 @@ private:
     // whether that throws or falls back to the log path.
 
     void run_fwdbwd(DpBuffer& buf) {
+        soft_counts_ready_ = false;
         if (soft_impl_ != SoftImpl::Log) {
             bool ok;
             if constexpr (GM == GapModel::Linear) ok = fwdbwd_linear_scaled(buf);
             else                                   ok = fwdbwd_affine_scaled(buf);
-            if (ok) { soft_scaled_used_ = true; return; }
+            if (ok) {
+                soft_scaled_used_ = soft_counts_ready_ = true;
+                log_z_ *= soft_temp_;
+                return;
+            }
             if (soft_impl_ == SoftImpl::Scaled)
                 throw std::domain_error(
                     "nwgrad: soft path: this pair's dynamic range does not fit the scaled "
@@ -2830,8 +2849,31 @@ private:
         }
         soft_scaled_used_ = false;
         ensure_fwdbwd_buf(buf);
-        if constexpr (GM == GapModel::Linear) fwdbwd_linear(buf);
-        else                                   fwdbwd_affine(buf);
+        if (soft_temp_ == 1.0) {
+            if constexpr (GM == GapModel::Linear) fwdbwd_linear(buf);
+            else                                   fwdbwd_affine(buf);
+            return;   // soft_grad() sweeps the tables lazily, as it always has
+        }
+        // T != 1: run the log path on θ/T, and sweep the gradient NOW, while params_ and
+        // log_z_ still describe θ/T; the counts are kept like the scaled path's.
+        const AlignParams* orig = params_;
+        const double* orig_blk = blk_;
+        const AlignParams tp = (*orig) * (1.0 / soft_temp_);
+        params_ = &tp;
+        blk_ = tp.matrix.data();
+        try {
+            AlignParams g = AlignParams::zeros_like(tp);
+            if constexpr (GM == GapModel::Linear) { fwdbwd_linear(buf); soft_grad_linear(buf, g); }
+            else                                   { fwdbwd_affine(buf); soft_grad_affine(buf, g); }
+            const size_t nn = static_cast<size_t>(nalpha_) * nalpha_;
+            scnt_.assign(g.matrix.data(), g.matrix.data() + nn);
+            sg_go_a_ = g.gap_open_a; sg_ge_a_ = g.gap_extend_a;
+            sg_go_b_ = g.gap_open_b; sg_ge_b_ = g.gap_extend_b;
+        } catch (...) { params_ = orig; blk_ = orig_blk; throw; }
+        params_ = orig;
+        blk_ = orig_blk;
+        log_z_ *= soft_temp_;
+        soft_counts_ready_ = true;
     }
 
     void add_scaled_counts(AlignParams& grad) const {
@@ -2868,7 +2910,8 @@ private:
         srow_.resize(static_cast<size_t>(nalpha_));
         sg_go_a_ = sg_ge_a_ = sg_go_b_ = sg_ge_b_ = 0.0;
         bool bad = false;
-        for (size_t k = 0; k < nn; ++k) { es_[k] = std::exp(blk_[k]); bad |= weight_bad(es_[k]); }
+        const double it = 1.0 / soft_temp_;
+        for (size_t k = 0; k < nn; ++k) { es_[k] = std::exp(blk_[k] * it); bad |= weight_bad(es_[k]); }
         return !bad;
     }
 
@@ -3004,7 +3047,8 @@ private:
 
     bool fwdbwd_linear_scaled(DpBuffer& buf) {
         if (!prepare_scaled()) return false;
-        const double ea = std::exp(-params_->gap_extend_a), eb = std::exp(-params_->gap_extend_b);
+        const double it = 1.0 / soft_temp_;
+        const double ea = std::exp(-params_->gap_extend_a * it), eb = std::exp(-params_->gap_extend_b * it);
         if (weight_bad(ea) || weight_bad(eb)) return false;
         if (buf.F.size() < sz_) buf.F.resize(sz_);
         auto& S = buf.sexp; S.assign(static_cast<size_t>(m_) + 1, 0);
@@ -3105,10 +3149,11 @@ private:
 
     bool fwdbwd_affine_scaled(DpBuffer& buf) {
         if (!prepare_scaled()) return false;
-        const double oa = std::exp(-(params_->gap_open_a + params_->gap_extend_a));
-        const double ea = std::exp(-params_->gap_extend_a);
-        const double ob = std::exp(-(params_->gap_open_b + params_->gap_extend_b));
-        const double eb = std::exp(-params_->gap_extend_b);
+        const double it = 1.0 / soft_temp_;
+        const double oa = std::exp(-(params_->gap_open_a + params_->gap_extend_a) * it);
+        const double ea = std::exp(-params_->gap_extend_a * it);
+        const double ob = std::exp(-(params_->gap_open_b + params_->gap_extend_b) * it);
+        const double eb = std::exp(-params_->gap_extend_b * it);
         if (weight_bad(oa) || weight_bad(ea) || weight_bad(ob) || weight_bad(eb)) return false;
         if (buf.FM.size() < sz_) { buf.FM.resize(sz_); buf.FX.resize(sz_); buf.FY.resize(sz_); }
         auto& S = buf.sexp; S.assign(static_cast<size_t>(m_) + 1, 0);

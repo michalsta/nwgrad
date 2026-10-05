@@ -45,6 +45,7 @@ struct BatchAlignerT {
     // DISPATCH macro below at four arms rather than eight.
     int kernel;   // Viterbi backend (kBackendAuto/kBackendScalar or a SimdLevel index)
     SoftImpl soft_impl = SoftImpl::Scaled;   // soft-path evaluation, see SoftImpl
+    double soft_temperature = 1.0;           // see Aligner::set_soft_temperature
 
     BatchAlignerT(AlignParams p, int band,
                  GapModel gm, AlignMode am, GradMode gd, int nt,
@@ -140,6 +141,7 @@ private:
         Aligner<GM, AM, AB, T> al;
         al.set_kernel(kernel);
         al.set_soft_impl(soft_impl);
+        al.set_soft_temperature(soft_temperature);
         DpBuffer buf;  // reused across iterations; grows to the largest pair seen
         const Alphabet& alpha = params.matrix.alphabet();
         // Encoding buffers, reused across iterations: the batch never

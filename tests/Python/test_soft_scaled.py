@@ -190,3 +190,68 @@ def test_soft_interpair_identical(mode):
     np.testing.assert_array_equal(out[0][2], out[1][2])
     assert out[0][3] == out[1][3]
     assert out[0][4] == out[1][4]
+
+
+# ── soft temperature ──────────────────────────────────────────────────────────
+
+def scaled_params(params, f):
+    return params * f
+
+
+@pytest.mark.parametrize("gm,mode", MODES)
+@pytest.mark.parametrize("impl", ["scaled", "log"])
+def test_temperature_is_scaled_params(gm, mode, impl):
+    """soft_temperature=T returns T*log Z(params/T) and the expected counts under
+    params/T: the same as running at T=1 on params/T and multiplying the score by T."""
+    rng = np.random.default_rng(31)
+    params = dna_params(rng, gaps=(1.0, 0.5, 1.5, 0.3))
+    A = [rand_seq(rng, "ACGT", int(rng.integers(1, 30))) for _ in range(12)]
+    B = [rand_seq(rng, "ACGT", int(rng.integers(1, 40))) for _ in range(12)]
+    for T in (0.3, 2.5):
+        b = nwgrad.SeqPairBatchDouble(n_threads=2)
+        b.soft_impl = impl
+        b.soft_temperature = T
+        assert b.soft_temperature == T
+        b.add_many(A, B, params, gap_model=gm, mode=mode, grad_mode="soft")
+        b.score_and_grad()
+        m1, g1 = b.grads()
+        s2, m2, g2 = batch_results(A, B, scaled_params(params, 1.0 / T), gm, mode, impl)
+        close(b.scores(), T * s2)
+        close(m1, m2)
+        close(g1, g2)
+
+
+@pytest.mark.parametrize("fn,hard", [("nw_affine_soft_grad", "nw_affine_grad"),
+                                     ("sw_affine_soft_grad", "sw_affine_grad"),
+                                     ("nw_soft_grad", "nw_grad"),
+                                     ("sw_soft_grad", "sw_grad")])
+def test_temperature_low_limit(fn, hard):
+    """T -> 0: T*log Z -> the Viterbi score, expected counts -> the hard counts on a
+    tie-free pair.  At T = 0.02 the steps are ~150 nats, inside the scaled range."""
+    rng = np.random.default_rng(41)
+    M = rng.normal(0.0, 1.0, (4, 4)) + 3.0 * np.eye(4)
+    params = nwgrad.AlignParams(nwgrad.SubstMatrix(M, "ACGT"), 1.3, 0.7, 1.1, 0.9)
+    a, b = "ACGTTGCAAGT", "ACGTGCAAGGT"
+    vs, vg = getattr(nwgrad, hard)(a, b, params)
+    s, g = getattr(nwgrad, fn)(a, b, params, temperature=0.02)
+    assert s == pytest.approx(vs, abs=0.02 * 3)
+    np.testing.assert_allclose(g.matrix.to_matrix(), vg.matrix.to_matrix(), atol=1e-6)
+    s_log, g_log = getattr(nwgrad, fn)(a, b, params, temperature=0.02, soft_impl="log")
+    close(s, s_log)
+    close(g.matrix.to_matrix(), g_log.matrix.to_matrix())
+
+
+def test_temperature_invalidates_and_validates():
+    rng = np.random.default_rng(51)
+    params = dna_params(rng)
+    sp = nwgrad.SeqPairDouble("ACGTAC", "ACTTAC", params, grad_mode="soft")
+    sp.alloc_dp()
+    sp.align_full()
+    s1 = sp.score
+    sp.soft_temperature = 0.5
+    assert not sp.score_valid
+    sp.align_full()
+    assert sp.score != s1
+    for bad in (0.0, -1.0, float("inf"), float("nan")):
+        with pytest.raises(ValueError):
+            sp.soft_temperature = bad

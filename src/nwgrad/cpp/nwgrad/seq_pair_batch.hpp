@@ -230,6 +230,7 @@ struct SeqPairBatchT {
                 staged[i]->set_hb_cutoff(hb_cutoff);
                 staged[i]->set_rowwise_full(rowwise_full);
                 staged[i]->set_soft_impl(soft_impl);
+                staged[i]->set_soft_temperature(soft_temperature);
             }
         };
         run_workers(N, worker);
@@ -928,6 +929,8 @@ public:
     // Soft-path evaluation for pairs built by add_many() — see SoftImpl.  The Python
     // `soft_impl` property also applies it to the pairs already in the batch.
     SoftImpl soft_impl = SoftImpl::Scaled;
+    // Soft temperature for pairs built by add_many() — see Aligner::set_soft_temperature.
+    double soft_temperature = 1.0;
 
     // score_and_grad() fills W pairs at once, one per vector lane (InterJob), wherever
     // a pair qualifies (inter_eligible_); the rest run their own fill.  Bit-identical

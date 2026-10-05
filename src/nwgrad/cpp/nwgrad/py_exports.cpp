@@ -226,6 +226,12 @@ static const char* soft_impl_name(SoftImpl s) {
     "  \"scaled_or_log\": \"scaled\", silently falling back per pair to \"log\".\n" \
     "  \"log\": the log-space recurrences; unlimited range, far slower.\n" \
     "Results agree to ~1e-12 relative, not bit-for-bit; the hard path is unaffected."
+#define NWGRAD_SOFT_TEMP_DOC \
+    "Soft temperature T > 0 (default 1).  The soft score becomes T*log Z(params/T)\n" \
+    "and the gradient its derivative w.r.t. params: the expected counts under\n" \
+    "params/T.  T -> 0 approaches the Viterbi score and hard counts; lower T\n" \
+    "widens the dynamic range, so the default soft_impl=\"scaled\" eventually\n" \
+    "raises (use \"scaled_or_log\" when annealing towards 0)."
 static const char* traceback_name(TracebackMode t) {
     switch (t) {
         case TracebackMode::Pointers:   return "pointers";
@@ -301,17 +307,18 @@ static void bind_convenience(nb::module_& m, const std::string& sfx) {
     m.def((std::string(FN) + sfx).c_str(), \
         [](const std::string& a, const std::string& b, const AlignParams& params, int band, \
            const std::string& aligned_a, const std::string& aligned_b, const std::string& kernel, \
-           const std::string& soft_impl) { \
+           const std::string& soft_impl, double temperature) { \
             auto gj = make_guide(aligned_a, aligned_b); EncodedPair enc(a, b, params); \
             const SoftImpl si = parse_soft_impl(soft_impl); \
             WITH_ALIGNER_T(T, GM, AM, band, gj, { \
-                al.set_soft_impl(si); \
+                al.set_soft_impl(si); al.set_soft_temperature(temperature); \
                 al.set_problem(enc.a, enc.b, params, band, gj); al.compute_forward_back(_buf); \
                 AlignParams grad = AlignParams::zeros_like(params); al.soft_grad(_buf, grad); \
                 return nb::make_tuple(al.log_z(), grad); }); \
-        }, NWG_CONV_ARGS, nb::arg("soft_impl") = "scaled", \
+        }, NWG_CONV_ARGS, nb::arg("soft_impl") = "scaled", nb::arg("temperature") = 1.0, \
         DOC "\n\nsoft_impl: \"scaled\" (default) | \"scaled_or_log\" | \"log\" -- " \
-        "see SeqPairBatch.soft_impl.")
+        "see SeqPairBatch.soft_impl.\ntemperature: T > 0; returns (T*log Z(params/T), " \
+        "expected counts under params/T) -- see SeqPairBatch.soft_temperature.")
 
     NWG_SCORE("nw_score", Linear, Global, "Needleman-Wunsch global alignment score (linear gap penalty).");
     NWG_SCORE("sw_score", Linear, Local,  "Smith-Waterman local alignment score (linear gap penalty).");
@@ -360,6 +367,15 @@ static void bind_batch_aligner(nb::module_& m, const char* name) {
             [](const BA& s) { return soft_impl_name(s.soft_impl); },
             [](BA& s, const std::string& v) { s.soft_impl = parse_soft_impl(v); },
             NWGRAD_SOFT_IMPL_DOC)
+        .def_prop_rw(
+            "soft_temperature",
+            [](const BA& s) { return s.soft_temperature; },
+            [](BA& s, double v) {
+                if (!(v > 0.0 && v <= std::numeric_limits<double>::max()))
+                    throw nb::value_error("nwgrad: soft_temperature must be finite and > 0");
+                s.soft_temperature = v;
+            },
+            NWGRAD_SOFT_TEMP_DOC)
         .def(
             "align",
             [](const BA& self,
@@ -522,6 +538,11 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
             [](const SP& s) { return soft_impl_name(s.soft_impl()); },
             [](SP& s, const std::string& v) { s.set_soft_impl(parse_soft_impl(v)); },
             NWGRAD_SOFT_IMPL_DOC)
+        .def_prop_rw(
+            "soft_temperature",
+            [](const SP& s) { return s.soft_temperature(); },
+            [](SP& s, double v) { s.set_soft_temperature(v); },
+            NWGRAD_SOFT_TEMP_DOC)
         .def_prop_ro("seq_a", [](const SP& s) { return s.seq_a(); })
         .def_prop_ro("seq_b", [](const SP& s) { return s.seq_b(); });
 }
@@ -773,6 +794,16 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
                 for (auto* sp : s.pairs) sp->set_soft_impl(s.soft_impl);
             },
             NWGRAD_SOFT_IMPL_DOC "\nApplies to the pairs in the batch and to later add_many() ones.")
+        .def_prop_rw(
+            "soft_temperature",
+            [](const SPB& s) { return s.soft_temperature; },
+            [](SPB& s, double v) {
+                if (!(v > 0.0 && v <= std::numeric_limits<double>::max()))
+                    throw nb::value_error("nwgrad: soft_temperature must be finite and > 0");
+                s.soft_temperature = v;
+                for (auto* sp : s.pairs) sp->set_soft_temperature(v);
+            },
+            NWGRAD_SOFT_TEMP_DOC "\nApplies to the pairs in the batch and to later add_many() ones.")
         .def_prop_rw(
             "hb_cutoff",
             [](const SPB& s) { return s.hb_cutoff; },
