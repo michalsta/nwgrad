@@ -492,7 +492,12 @@ static void hb_sweep_pmax_entry_f(HbJob<float>&  j) { hb_sweep_striped_pmax<floa
 // mode they stay -inf.  Either way they lose every comparison.  The one masked op is the
 // leftmost-column blend, which takes the clang/AVX-512/double workaround like every other
 // masked select in these kernels.
-template <class T, bool Local>
+// Pmax: the VY carry is hb_sweep_striped_pmax's closed-form prefix max (see the note
+// there) instead of the exact chain + lazy-F — so Local traceback="hirschberg_pmax"
+// takes its carry in the endpoint scans too, which dominate Local Hirschberg.  Like the
+// sweep it is bit-identical across levels and with the scalar reference
+// (Aligner::hb_scan_scalar<..., true>), and not bit-exact with the exact scan.
+template <class T, bool Local, bool Pmax>
 static void hb_scan_impl(HbScanJob<T>& job) {
     using vd = stdx::native_simd<T>;
     constexpr int W = (int)vd::size();
@@ -519,10 +524,16 @@ static void hb_scan_impl(HbScanJob<T>& job) {
     fit(buf.hfd, sw); fit(buf.hfe, sw); fit(buf.hff, sw);
     fit(buf.hov, sw);
     fit(buf.hprof, (std::size_t)nalpha * sw);
+    if constexpr (Pmax) fit(buf.hramp, sw);
 
     T* pM = buf.hfa.data(); T* pX = buf.hfb.data(); T* pY = buf.hfc.data();
     T* cM = buf.hfd.data(); T* cX = buf.hfe.data(); T* cY = buf.hff.data();
     T* ov = buf.hov.data();
+    T* rmp = buf.hramp.data();
+    if constexpr (Pmax)   // the ramp k*ge_a, striped, loaded never multiplied (no FMA)
+        for (int l = 0; l < W; ++l)
+            for (int s = 0; s < seg; ++s)
+                rmp[(std::size_t)s * W + l] = static_cast<T>(l * seg + s) * ge_a;
 
     // Striped query profile over the block's column slice (padding -> -inf).  Serves this
     // block's sweep exactly as in hb_sweep_striped.
@@ -625,6 +636,32 @@ static void hb_scan_impl(HbScanJob<T>& job) {
                 .copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
         }
 
+        if constexpr (Pmax) {
+            // ── the carry as a prefix max (hb_sweep_striped_pmax, verbatim) ──────
+            vd P(NINF);
+            for (int s = 0; s < seg; ++s) {
+                vd O;
+                if (s == 0) {
+                    vd lo; lo.copy_from(ov + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                    O = vd([&](int q) { return q == 0 ? nbOpen : lo[q - 1]; });
+                } else {
+                    O.copy_from(ov + (std::size_t)(s - 1) * W, stdx::element_aligned);
+                }
+                vd rq; rq.copy_from(rmp + (std::size_t)s * W, stdx::element_aligned);
+                P = stdx::max(O + rq, P);
+                P.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
+            }
+            T tot[64], cin[64];
+            P.copy_to(tot, stdx::element_aligned);
+            T run = bY - ge_a;
+            for (int l = 0; l < W; ++l) { cin[l] = run; run = std::max(run, tot[l]); }
+            vd vcin; vcin.copy_from(cin, stdx::element_aligned);
+            for (int s = 0; s < seg; ++s) {
+                vd p; p.copy_from(cY + (std::size_t)s * W, stdx::element_aligned);
+                vd rq; rq.copy_from(rmp + (std::size_t)s * W, stdx::element_aligned);
+                (stdx::max(p, vcin) - rq).copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
+            }
+        } else {
         // ── the carry: VY, same-lane striped chain, then lazy-F (exact) ──────────
         vd prev([&](int q) { return q == 0 ? bY : NINF; });
         for (int s = 0; s < seg; ++s) {
@@ -663,6 +700,7 @@ static void hb_scan_impl(HbScanJob<T>& job) {
             }
             if (!changed) break;
         }
+        }   // Pmax
 
         // ── per-row argmax over the row's cells, leftmost-column per lane ────────
         vd vbest(NINF), vbcol(T(0));
@@ -700,12 +738,13 @@ static void hb_scan_impl(HbScanJob<T>& job) {
     job.best = gbest; job.best_i = gi; job.best_j = gj;
 }
 
-static void hb_scan_entry_d(HbScanJob<double>& j) {
-    if (j.local) hb_scan_impl<double, true>(j); else hb_scan_impl<double, false>(j);
+template <class T>
+static void hb_scan_dispatch(HbScanJob<T>& j) {
+    if (j.pmax) { if (j.local) hb_scan_impl<T, true, true>(j);  else hb_scan_impl<T, false, true>(j); }
+    else        { if (j.local) hb_scan_impl<T, true, false>(j); else hb_scan_impl<T, false, false>(j); }
 }
-static void hb_scan_entry_f(HbScanJob<float>& j) {
-    if (j.local) hb_scan_impl<float, true>(j); else hb_scan_impl<float, false>(j);
-}
+static void hb_scan_entry_d(HbScanJob<double>& j) { hb_scan_dispatch(j); }
+static void hb_scan_entry_f(HbScanJob<float>& j)  { hb_scan_dispatch(j); }
 
 // ── Hirschberg base case: striped fill that RECORDS direction bytes ───────────
 //

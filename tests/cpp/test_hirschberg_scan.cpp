@@ -46,10 +46,11 @@ struct Rng {
 // exercised and not just the base-case Pointers fill.
 template <class T>
 void scalar_vs_level(const std::string& A, const std::string& B, const AlignParams& p,
-                     int backend, int& mismatches) {
+                     int backend, int& mismatches,
+                     TracebackMode tb = TracebackMode::Hirschberg) {
     Aligner<GapModel::Affine, AlignMode::Local, AlignBand::Full, T> ref, dut;
     ref.set_kernel(kBackendScalar); dut.set_kernel(backend);
-    ref.set_traceback(TracebackMode::Hirschberg); dut.set_traceback(TracebackMode::Hirschberg);
+    ref.set_traceback(tb); dut.set_traceback(tb);
     ref.set_hb_cutoff(8); dut.set_hb_cutoff(8);
 
     const auto ea = p.matrix.alphabet().encode(A);
@@ -142,5 +143,49 @@ TEST_CASE("local Hirschberg handles degenerate and empty shapes", "[hirschberg]"
             }
         REQUIRE(mismatches == 0);
         REQUIRE(subopt == 0);
+    }
+}
+
+// HirschbergPmax on Local: the endpoint scans take the prefix-max carry too
+// (hb_scan_impl<..., Pmax>).  The family is bit-identical scalar vs every level — the
+// closed form depends on the absolute column only — on the tie-heavy integral fixture
+// and on a lossy one (ge_a = 0.1, where k*ge_a rounds), and never scores ABOVE
+// Smith-Waterman (it may score below: the trade pmax makes).
+TEST_CASE("local hirschberg_pmax: endpoint scans bit-identical scalar vs every level",
+          "[hirschberg][simd][pmax]") {
+    const Alphabet& al = Alphabet::get("ACDEFGHIKLMNPQRSTVWY");
+    SubstMatrix Mi(al), Mr(al);
+    Rng mr(0xBEEFu);
+    for (int x = 0; x < al.size(); ++x)
+        for (int y = 0; y < al.size(); ++y) {
+            Mi.at(x, y) = (x == y) ? 4.0 : -1.0;
+            Mr.at(x, y) = (x == y) ? 3.0 : -1.0 + (mr.in(0, 1000) / 1000.0);
+        }
+    const AlignParams pi(Mi, 11.0, 1.0, 11.0, 1.0), pr(Mr, 2.0, 0.1, 3.0, 0.3);
+
+    for (int backend : backends_under_test()) {
+        INFO("backend = " << backend_name(backend));
+        Rng rng(0xFACADEu);
+        int mismatches = 0, above = 0;
+        for (int t = 0; t < 200; ++t) {
+            std::string A, B;
+            for (int k = rng.in(0, 120); k > 0; --k) A += al.symbol_at(rng.in(0, al.size() - 1));
+            for (int k = rng.in(0, 120); k > 0; --k) B += al.symbol_at(rng.in(0, al.size() - 1));
+            for (const AlignParams* p : {&pi, &pr}) {
+                scalar_vs_level<double>(A, B, *p, backend, mismatches, TracebackMode::HirschbergPmax);
+                scalar_vs_level<float >(A, B, *p, backend, mismatches, TracebackMode::HirschbergPmax);
+                Aligner<GapModel::Affine, AlignMode::Local, AlignBand::Full, double> sw, pm;
+                sw.set_traceback(TracebackMode::Pointers);
+                pm.set_traceback(TracebackMode::HirschbergPmax); pm.set_hb_cutoff(8);
+                pm.set_kernel(backend);
+                const auto ea = p->matrix.alphabet().encode(A), eb = p->matrix.alphabet().encode(B);
+                DpBufferT<double> b1, b2;
+                sw.set_problem(ea, eb, *p); sw.compute_viterbi(b1);
+                pm.set_problem(ea, eb, *p); pm.compute_viterbi(b2);
+                if (pm.score() > sw.score() + 1e-9) ++above;
+            }
+        }
+        REQUIRE(mismatches == 0);
+        REQUIRE(above == 0);
     }
 }

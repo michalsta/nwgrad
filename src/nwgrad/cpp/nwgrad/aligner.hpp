@@ -2160,6 +2160,7 @@ private:
             if (reverse) { job.a_start = i1 - 1; job.a_step = -1; job.b_start = j1 - 1; job.b_step = -1; }
             else         { job.a_start = i0;     job.a_step = +1; job.b_start = j0;     job.b_step = +1; }
             job.H = H; job.ncols = NC; job.local = local ? 1 : 0;
+            job.pmax = hb_pmax() ? 1 : 0;
             job.buf = &buf;
             if constexpr (std::is_same_v<T, double>) K->hb_scan(job);
             else                                     K->hb_scan_f(job);
@@ -2190,6 +2191,11 @@ private:
         hb_fit(buf.hfd, stride); hb_fit(buf.hfe, stride); hb_fit(buf.hff, stride);
         T* pM = buf.hfa.data(); T* pX = buf.hfb.data(); T* pY = buf.hfc.data();
         T* cM = buf.hfd.data(); T* cX = buf.hfe.data(); T* cY = buf.hff.data();
+        // Pmax: the closed-form carry, as hb_scan_impl<..., true> (the ramp loaded, k*ge_a).
+        const bool pmax = hb_pmax();
+        if (pmax) hb_fit(buf.hramp, stride);
+        T* rmp = buf.hramp.data();
+        if (pmax) for (int k = 0; k < NC; ++k) rmp[k] = static_cast<T>(k) * ge_a;
 
         // Row 0.  Local: M = 0 for every column (fresh start anywhere).  Global: the
         // Y-gap-open series, so the reverse pass computes the suffixes' global alignment.
@@ -2208,12 +2214,20 @@ private:
             cM[0] = local ? static_cast<T>(0) : static_cast<T>(NEG_INF);
             cX[0] = std::max(std::max((pM[0] - go_b) - ge_b, pX[0] - ge_b), (pY[0] - go_b) - ge_b);
             cY[0] = static_cast<T>(NEG_INF);
+            T P = cY[0] - ge_a;   // Pmax: the running prefix max, the border as its seed
             for (int c = 1; c <= NC; ++c) {
                 const int bcol = b_start + (c - 1) * b_step;       // 0-based sequence col
                 T m = std::max({pM[c-1], pX[c-1], pY[c-1]}) + subT(arow + 1, bcol + 1);
                 if (local) m = std::max(m, static_cast<T>(0));
                 const T x = std::max(std::max((pM[c] - go_b) - ge_b, pX[c] - ge_b), (pY[c] - go_b) - ge_b);
-                const T y = std::max(std::max((cM[c-1] - go_a) - ge_a, (cX[c-1] - go_a) - ge_a), cY[c-1] - ge_a);
+                T y;
+                if (pmax) {
+                    const T g = (std::max(cM[c-1], cX[c-1]) - go_a) - ge_a;
+                    P = std::max(g + rmp[c-1], P);
+                    y = P - rmp[c-1];
+                } else {
+                    y = std::max(std::max((cM[c-1] - go_a) - ge_a, (cX[c-1] - go_a) - ge_a), cY[c-1] - ge_a);
+                }
                 cM[c] = m; cX[c] = x; cY[c] = y;
                 const T here = std::max({m, x, y});
                 if (here > gbest) { gbest = here; gi = t + 1; gj = c; }

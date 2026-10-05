@@ -208,6 +208,7 @@ struct HbScanJob {
     int H;                                  // rows to sweep
     int ncols;                              // columns in this block
     int local;                              // 1 = clamped local (forward end), 0 = global (reverse start)
+    int pmax;                               // 1 = the prefix-max VY carry (HirschbergPmax)
     DpBufferT<T>* buf;                      // scratch (striped rows, profile, open vector)
     // outputs: the best cell and its block-1-based coordinates.  Default 0 at (0,0), so
     // an all-nonpositive local block reports the empty alignment.
