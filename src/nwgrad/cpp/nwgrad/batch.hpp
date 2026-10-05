@@ -128,13 +128,12 @@ private:
         else                                     return K.inter_fill_f ? K.inter_w_f : 0;
     }
     int inter_backend_() const {
-        if (params.matrix.size() > 8) return -1;
         const int backend = (kernel == kBackendAuto) ? global_default_backend() : kernel;
         if (backend < 0) return -1;
         const LevelKernels& K = level_kernels(backend);
         if (grad_mode == GradMode::Soft)
-            return (K.inter_soft && K.inter_w > 0 && soft_impl != SoftImpl::Log && band == 0)
-                       ? backend : -1;
+            return (K.inter_soft && K.inter_w > 0 && soft_impl != SoftImpl::Log && band == 0 &&
+                    params.matrix.size() <= 8) ? backend : -1;
         if (inter_w_(K) <= 0) return -1;
         if (gap_model == GapModel::Linear && (band > 0 ||
             (align_mode == AlignMode::Global && inter_w_(K) < 4))) return -1;

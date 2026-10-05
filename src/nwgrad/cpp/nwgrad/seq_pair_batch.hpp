@@ -522,7 +522,6 @@ private:
     int inter_backend_(const SeqPair& p) const {
         {
             if (p.len_a() == 0 || p.len_b() == 0) return -1;
-            if (p.params_ptr()->matrix.size() > 8) return -1;
             const int backend = (p.kernel() == kBackendAuto) ? global_default_backend() : p.kernel();
             if (backend < 0) return -1;
             const LevelKernels& K = level_kernels(backend);
@@ -642,7 +641,7 @@ private:
                 // Soft lanes share the forward-backward too when every real lane is soft
                 // with one soft_impl (not "log") and one temperature, and the weights fit.
                 bool soft_group = K.inter_soft != nullptr && p0.grad_mode() == GradMode::Soft &&
-                                  p0.soft_impl() != SoftImpl::Log;
+                                  p0.soft_impl() != SoftImpl::Log && P.matrix.size() <= 8;
                 for (size_t l = 1; l < real && soft_group; ++l) {
                     const SeqPair& p = *pairs[elig[s + l]];
                     soft_group = p.grad_mode() == GradMode::Soft && p.soft_impl() == p0.soft_impl() &&

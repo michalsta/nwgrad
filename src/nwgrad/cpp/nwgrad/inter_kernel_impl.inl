@@ -57,6 +57,9 @@ static inline V inter_sub(const V* P, const L* bits, int j, int levels) noexcept
 }
 
 // The shared per-job setup: the B residues' bit masks and, per row, the profile.
+// Alphabets over 8 letters (levels = -1) take no blend tree: each row's scores are
+// GATHERED per lane into srow — one scalar load per lane-cell, outside the carry chain
+// (Rognes' query profile cannot serve here: each lane has its own row residue).
 template <class T>
 struct InterCommon {
     using ivd = typename IVT<T>::v; using ivl = typename IVT<T>::l;
@@ -64,9 +67,11 @@ struct InterCommon {
     const InterJobT<T>& J;
     int levels;
     std::vector<ivl>& bits;
-    explicit InterCommon(const InterJobT<T>& job) : J(job), bits(bits_buf()) {
+    std::vector<ivd>& srow;
+    explicit InterCommon(const InterJobT<T>& job) : J(job), bits(bits_buf()), srow(srow_buf()) {
         const int na = J.nalpha, n = J.n;
-        levels = na <= 1 ? 0 : na <= 2 ? 1 : na <= 4 ? 2 : 3;
+        levels = na <= 1 ? 0 : na <= 2 ? 1 : na <= 4 ? 2 : na <= 8 ? 3 : -1;
+        if (levels < 0 && srow.size() < static_cast<size_t>(n + 1)) srow.resize(n + 1);
         if (bits.size() < static_cast<size_t>(3 * (n + 1))) bits.resize(3 * (n + 1));
         for (int j = 1; j <= n; ++j)
             for (int k = 0; k < levels; ++k) {
@@ -82,10 +87,23 @@ struct InterCommon {
     }
     typename IVT<T>::v nbv{};   // ragged: each lane's B length, as T
     static std::vector<ivl>& bits_buf() { static thread_local std::vector<ivl> b; return b; }
+    static std::vector<ivd>& srow_buf() { static thread_local std::vector<ivd> b; return b; }
     // Row i's profile (P[c] = per lane, score of the lane's A residue i vs letter c) and
     // the lanes still inside their own A.
     void row(int i, ivd* P, ivl& live) const {
         const int na = J.nalpha;
+        for (int l = 0; l < IW; ++l) live[l] = (i <= J.m[l]) ? -1 : 0;
+        if (levels < 0) {
+            const int n = J.n;
+            for (int l = 0; l < IW; ++l) {
+                const T* pr = J.blk + static_cast<size_t>((i <= J.m[l]) ? J.a[l][i - 1] : 0) * na;
+                const unsigned char* bl = J.b[l];
+                const int nl = J.nb ? J.nb[l] : n;
+                for (int j = 1; j <= nl; ++j) srow[j][l] = pr[bl[j - 1]];
+                for (int j = nl + 1; j <= n; ++j) srow[j][l] = pr[0];   // ragged: pad
+            }
+            return;
+        }
         for (int c = 0; c < 8; ++c) {
             const int cc = c < na ? c : 0;
             for (int l = 0; l < IW; ++l) {
@@ -93,9 +111,10 @@ struct InterCommon {
                 P[c][l] = J.blk[a * na + cc];
             }
         }
-        for (int l = 0; l < IW; ++l) live[l] = (i <= J.m[l]) ? -1 : 0;
     }
-    ivd s(const ivd* P, int j) const { return inter_sub(P, bits.data(), j, levels); }
+    ivd s(const ivd* P, int j) const {
+        return levels < 0 ? srow[j] : inter_sub(P, bits.data(), j, levels);
+    }
     // Banded (InterJobT::blo != nullptr): row i's columns [j0, j1] to compute (the union
     // of the lanes' initialised spans) and the per-lane band [lo, hi] as T vectors.
     void band(int i, int& j0, int& j1, ivd& lo, ivd& hi) const {
