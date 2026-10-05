@@ -1176,11 +1176,13 @@ private:
     // The one place in the library where the scalar/simd choice exists.  The branch is
     // taken once per DP, not once per cell.  Every simd level writes tables bit-identical
     // to the scalar one, so nothing downstream can tell them apart.  The linear model has
-    // no simd kernel — deliberately.  Its recurrence collapses to a single carry that is a
-    // pure latency chain (~6 cycles/cell, unbreakable by any vector width), and the scalar
-    // loop already runs at ~9 cycles/cell against that floor.  A vectorized linear kernel
-    // was written, measured at 0.90x, and deleted.  So any simd backend is a legal request
-    // for a linear aligner; it simply runs the fastest linear kernel there is, the scalar.
+    // no PER-PAIR simd kernel — deliberately.  Its recurrence collapses to a single carry
+    // that is a pure latency chain along the row (~6 cycles/cell), and the scalar loop
+    // already runs at ~9 cycles/cell against that floor; a row-wise vectorized linear
+    // kernel was written, measured at 0.90x, and deleted.  So any simd backend is a legal
+    // request for a linear aligner and runs the scalar fill here.  (Batches of short pairs
+    // vectorize linear ACROSS pairs instead — SeqPairBatch fill="interpair", one pair per
+    // lane, bit-identical — which sidesteps the chain.)
     void run_viterbi(DpBuffer& buf) {
         // Default to row-major; only the striped Full kernel (run_dispatched_affine) flips
         // this back on.  Every other fill here writes VM/VX/VY row-major.
