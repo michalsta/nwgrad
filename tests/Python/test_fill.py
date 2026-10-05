@@ -37,8 +37,15 @@ def _seqs(n, lo, hi, seed):
     return ["".join(rng.choice(list(DNA), int(l))) for l in rng.integers(lo, hi, n)]
 
 
-def _run(seqs_a, seqs_b, params, mode, traceback, fill, kernel="auto"):
-    b = nwgrad.SeqPairBatchDouble(n_threads=4, traceback=traceback)
+# Batch and pair class per precision: float32 interpair (InterJobT<float>, twice the
+# lanes) is held to the same bit-identity as double, against the float32 own fill.
+_CLS = {"double": (nwgrad.SeqPairBatchDouble, nwgrad.SeqPairDouble),
+        "float32": (nwgrad.SeqPairBatch, nwgrad.SeqPair)}
+
+
+def _run(seqs_a, seqs_b, params, mode, traceback, fill, kernel="auto", prec="double"):
+    bcls, pcls = _CLS[prec]
+    b = bcls(n_threads=4, traceback=traceback)
     b.fill = fill
     b.add_many(seqs_a, seqs_b, params, gap_model="affine", mode=mode,
                grad_mode="hard", kernel=kernel)
@@ -46,8 +53,8 @@ def _run(seqs_a, seqs_b, params, mode, traceback, fill, kernel="auto"):
     mats, gaps = b.grads()
     aligned = []
     for i in range(0, len(seqs_a), 7):
-        sp = nwgrad.SeqPairDouble(seqs_a[i], seqs_b[i], params, gap_model="affine", mode=mode,
-                                  grad_mode="hard", kernel=kernel, traceback=traceback)
+        sp = pcls(seqs_a[i], seqs_b[i], params, gap_model="affine", mode=mode,
+                  grad_mode="hard", kernel=kernel, traceback=traceback)
         sp.fill = fill if fill != "interpair" else "striped"
         sp.alloc_dp()
         sp.align_full()
@@ -74,34 +81,36 @@ def _fixed_len_b(seqs, n, seed):
     return ["".join(rng.choice(list(DNA), n)) for _ in seqs]
 
 
-@pytest.mark.parametrize("fill", ["rowwise", "interpair"])
+@pytest.mark.parametrize("prec,fill", [("double", "rowwise"), ("double", "interpair"),
+                                       ("float32", "interpair")])
 @pytest.mark.parametrize("kind", ["ties", "cheap_gaps", "random"])
 @pytest.mark.parametrize("mode", ["local", "global"])
 @pytest.mark.parametrize("traceback", ["pointers", "scores"])
 @pytest.mark.parametrize("lengths", [(1, 30, 1, 60), (15, 30, 40, 60), (60, 200, 60, 200),
                                      (15, 30, 50, 51)])
-def test_fill_matches_striped(fill, kind, mode, traceback, lengths):
+def test_fill_matches_striped(prec, fill, kind, mode, traceback, lengths):
     # (15, 30, 50, 51): every B of length 50, so inter-pair groups are full, as in
     # miRNA x site data; the others mix lengths, so many groups are short.
     a = _seqs(301, lengths[0], lengths[1], 1)
     b = _seqs(301, lengths[2], lengths[3], 2)
     p = _params(kind)
-    s0, m0, g0, al0 = _run(a, b, p, mode, traceback, "striped")
-    s1, m1, g1, al1 = _run(a, b, p, mode, traceback, fill)
+    s0, m0, g0, al0 = _run(a, b, p, mode, traceback, "striped", prec=prec)
+    s1, m1, g1, al1 = _run(a, b, p, mode, traceback, fill, prec=prec)
     assert np.array_equal(s0, s1)
     assert np.array_equal(m0, m1)
     assert np.array_equal(g0, g1)
     assert al0 == al1
 
 
-@pytest.mark.parametrize("fill", ["rowwise", "interpair"])
+@pytest.mark.parametrize("prec,fill", [("double", "rowwise"), ("double", "interpair"),
+                                       ("float32", "interpair")])
 @pytest.mark.parametrize("mode", ["local", "global"])
 @pytest.mark.parametrize("level", [l for l in nwgrad.available_isa_levels()])
-def test_every_isa_level(level, mode, fill):
+def test_every_isa_level(level, mode, prec, fill):
     a, b = _seqs(203, 10, 40, 3), _seqs(203, 30, 33, 4)
     p = _params("cheap_gaps")
-    ref = _run(a, b, p, mode, "pointers", "striped", kernel="scalar_fallback")
-    got = _run(a, b, p, mode, "pointers", fill, kernel=level)
+    ref = _run(a, b, p, mode, "pointers", "striped", kernel="scalar_fallback", prec=prec)
+    got = _run(a, b, p, mode, "pointers", fill, kernel=level, prec=prec)
     for x, y in zip(ref[:3], got[:3]):
         assert np.array_equal(x, y)
     assert ref[3] == got[3]
@@ -151,6 +160,25 @@ def test_setting_fill_applies_to_existing_pairs():
     assert batch[0].fill == "striped"
     batch.fill = "rowwise"
     assert all(batch[i].fill == "rowwise" for i in range(len(batch)))
+
+
+def test_float32_default_batch_interpair():
+    """The Python default: a bare SeqPairBatch (float32, traceback="auto" — which is
+    hirschberg_pmax for affine Global, run as Pointers below hb_cutoff)."""
+    a, b = _seqs(301, 15, 30, 21), _fixed_len_b(range(301), 50, 22)
+    for mode in ("local", "global"):
+        for gm in ("affine", "linear"):
+            out = []
+            for fill in ("striped", "interpair"):
+                batch = nwgrad.SeqPairBatch(n_threads=3)
+                batch.fill = fill
+                batch.add_many(a, b, _params("ties"), gap_model=gm, mode=mode)
+                batch.score_and_grad()
+                out.append((batch.scores(), *batch.grads(),
+                            [list(batch[i].guide_j) for i in range(0, 301, 5)]))
+            for x, y in zip(out[0][:3], out[1][:3]):
+                assert np.array_equal(x, y)
+            assert out[0][3] == out[1][3]
 
 
 def test_float32_and_linear_ignore_it():
@@ -258,8 +286,9 @@ def test_guides_match_striped(fill, mode):
 # score, the traceback-derived guide and the hard gradient match striped bit for bit,
 # ties included (the "ties" fixture makes them common).
 
-def _run_linear(seqs_a, seqs_b, params, mode, fill, grad_mode="hard", kernel="auto"):
-    b = nwgrad.SeqPairBatchDouble(n_threads=4, traceback="pointers")
+def _run_linear(seqs_a, seqs_b, params, mode, fill, grad_mode="hard", kernel="auto",
+                prec="double"):
+    b = _CLS[prec][0](n_threads=4, traceback="pointers")
     b.fill = fill
     b.add_many(seqs_a, seqs_b, params, gap_model="linear", mode=mode,
                grad_mode=grad_mode, kernel=kernel)
@@ -269,40 +298,43 @@ def _run_linear(seqs_a, seqs_b, params, mode, fill, grad_mode="hard", kernel="au
     return b.scores(), mats, gaps, guides
 
 
+@pytest.mark.parametrize("prec", ["double", "float32"])
 @pytest.mark.parametrize("kind", ["ties", "cheap_gaps", "random"])
 @pytest.mark.parametrize("mode", ["local", "global"])
 @pytest.mark.parametrize("lengths", [(1, 30, 1, 60), (15, 30, 50, 51), (60, 200, 60, 200)])
-def test_linear_interpair_matches_striped(kind, mode, lengths):
+def test_linear_interpair_matches_striped(kind, mode, lengths, prec):
     a = _seqs(301, lengths[0], lengths[1], 11)
     b = _seqs(301, lengths[2], lengths[3], 12)
     p = _params(kind)
-    r0 = _run_linear(a, b, p, mode, "striped")
-    r1 = _run_linear(a, b, p, mode, "interpair")
+    r0 = _run_linear(a, b, p, mode, "striped", prec=prec)
+    r1 = _run_linear(a, b, p, mode, "interpair", prec=prec)
     for x, y in zip(r0[:3], r1[:3]):
         assert np.array_equal(x, y)
     assert r0[3] == r1[3]
 
 
+@pytest.mark.parametrize("prec", ["double", "float32"])
 @pytest.mark.parametrize("mode", ["local", "global"])
 @pytest.mark.parametrize("level", [l for l in nwgrad.available_isa_levels()])
-def test_linear_interpair_every_isa_level(level, mode):
+def test_linear_interpair_every_isa_level(level, mode, prec):
     a, b = _seqs(203, 10, 40, 13), _seqs(203, 30, 33, 14)
     p = _params("ties")
-    ref = _run_linear(a, b, p, mode, "striped", kernel="scalar_fallback")
-    got = _run_linear(a, b, p, mode, "interpair", kernel=level)
+    ref = _run_linear(a, b, p, mode, "striped", kernel="scalar_fallback", prec=prec)
+    got = _run_linear(a, b, p, mode, "interpair", kernel=level, prec=prec)
     for x, y in zip(ref[:3], got[:3]):
         assert np.array_equal(x, y)
     assert ref[3] == got[3]
 
 
+@pytest.mark.parametrize("prec", ["double", "float32"])
 @pytest.mark.parametrize("mode", ["local", "global"])
-def test_linear_interpair_soft_guides(mode):
+def test_linear_interpair_soft_guides(mode, prec):
     """Eager soft linear pairs now take their guide from the inter-pair Viterbi fill:
     guides bit-identical to striped; scores and gradients tolerance-equal (soft)."""
     a, b = _seqs(150, 10, 40, 15), _seqs(150, 40, 41, 16)
     p = _params("random")
-    r0 = _run_linear(a, b, p, mode, "striped", grad_mode="soft")
-    r1 = _run_linear(a, b, p, mode, "interpair", grad_mode="soft")
+    r0 = _run_linear(a, b, p, mode, "striped", grad_mode="soft", prec=prec)
+    r1 = _run_linear(a, b, p, mode, "interpair", grad_mode="soft", prec=prec)
     for x, y in zip(r0[:3], r1[:3]):
         np.testing.assert_allclose(x, y, rtol=1e-11, atol=1e-11)
     assert r0[3] == r1[3]

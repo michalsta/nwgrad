@@ -165,8 +165,14 @@ def test_soft_impl_rejects_unknown():
         b.soft_impl = "fast"
 
 
+# float32 batches: the guide fill is the float32 inter-pair kernel (2W lanes) and the
+# soft pass, double at any precision, runs over each group in W-lane halves.
+BATCHES = [nwgrad.SeqPairBatchDouble, nwgrad.SeqPairBatch]
+
+
+@pytest.mark.parametrize("cls", BATCHES)
 @pytest.mark.parametrize("mode", ["global", "local"])
-def test_soft_interpair_identical(mode):
+def test_soft_interpair_identical(mode, cls):
     """fill="interpair" runs the guide Viterbi AND the scaled forward-backward W pairs
     per vector (InterSoftJob): guides and banded results match the striped fill bit for
     bit (Viterbi is bit-exact), scores and gradients to REL — including short groups,
@@ -178,7 +184,7 @@ def test_soft_interpair_identical(mode):
     B = [rand_seq(rng, "ACGT", b) for _, b in lens]
     out = []
     for fill in ("striped", "interpair"):
-        b = nwgrad.SeqPairBatchDouble(n_threads=3, traceback="pointers")
+        b = cls(n_threads=3, traceback="pointers")
         b.fill = fill
         b.add_many(A, B, params, gap_model="affine", mode=mode, grad_mode="soft")
         b.score_and_grad()
@@ -281,9 +287,10 @@ def test_soft_interpair_mixed_groups_and_temperature(mode):
     close(res[0][2], res[1][2])
 
 
+@pytest.mark.parametrize("cls", BATCHES)
 @pytest.mark.parametrize("mode", ["global", "local"])
 @pytest.mark.parametrize("T", [1.0, 0.6])
-def test_soft_interpair_linear(mode, T):
+def test_soft_interpair_linear(mode, T, cls):
     """Linear soft pairs under fill="interpair" share the forward-backward (InterSoftJob,
     linear) but run their own guide Viterbi: scores/gradients to REL against the striped
     fill, guides exact; uneven len(A), short groups and empty sequences included."""
@@ -294,7 +301,7 @@ def test_soft_interpair_linear(mode, T):
     B = [rand_seq(rng, "ACGT", b) for _, b in lens]
     out = []
     for fill in ("striped", "interpair"):
-        b = nwgrad.SeqPairBatchDouble(n_threads=3)
+        b = cls(n_threads=3)
         b.fill = fill
         b.soft_temperature = T
         b.add_many(A, B, params, gap_model="linear", mode=mode, grad_mode="soft")

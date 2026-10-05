@@ -502,26 +502,31 @@ struct SeqPairBatchT {
 
 private:
     // The vector backend an inter-pair fill of this pair would run on, or -1 when the
-    // pair must take its own fill: float32, an alphabet over 8 letters or
-    // the scalar backend.  Soft pairs qualify: the shared fill is their guide Viterbi
+    // pair must take its own fill: an alphabet over 8 letters or the scalar backend.
+    // float32 runs the float kernel (inter_fill_f), twice the lanes in the same register.  Soft pairs qualify: the shared fill is their guide Viterbi
     // (bit-identical to their own), and forward-backward then runs per pair. The mutable Hirschberg cutoff is
     // handled separately when building and validating the cached plan.
     static constexpr double DBL_MAX_ = std::numeric_limits<double>::max();
 
+    // The inter-pair fill and its lane count at this batch's precision.
+    static int inter_w_(const LevelKernels& K) {
+        if constexpr (std::is_same_v<T, double>) return K.inter_fill ? K.inter_w : 0;
+        else                                     return K.inter_fill_f ? K.inter_w_f : 0;
+    }
+
     static bool linear_fill_ok_(const SeqPair& p, const LevelKernels& K) {
         return !(p.gap_model() == GapModel::Linear && p.align_mode() == AlignMode::Global &&
-                 K.inter_w < 4);
+                 inter_w_(K) < 4);
     }
 
     int inter_backend_(const SeqPair& p) const {
-        if constexpr (!std::is_same_v<T, double>) return -1;
-        else {
+        {
             if (p.len_a() == 0 || p.len_b() == 0) return -1;
             if (p.params_ptr()->matrix.size() > 8) return -1;
             const int backend = (p.kernel() == kBackendAuto) ? global_default_backend() : p.kernel();
             if (backend < 0) return -1;
             const LevelKernels& K = level_kernels(backend);
-            if (!K.inter_fill || K.inter_w <= 0) return -1;
+            if (inter_w_(K) <= 0) return -1;
             // The linear inter-pair VITERBI fill, Global, at 2 lanes is a measured LOSS
             // (skynet sse2: 0.76x the scalar fill, which is already cheap there); Local
             // wins at every width (1.41x sse2, 3.23x avx2) and Global from 4 lanes (1.41x
@@ -537,9 +542,6 @@ private:
     // group is one InterJob, then each lane's pair adopts its tables for score, path and
     // gradient.  The other pairs run their own fill.  One atomic counter over all tasks.
     void score_and_grad_inter_(std::vector<double>& scores) {
-        if constexpr (!std::is_same_v<T, double>) {
-            score_and_grad_dynamic_(scores);   // float32 never qualifies
-        } else {
         // Reuse the grouping until pairs are added, the default ISA changes, or a
         // Hirschberg cutoff crosses the pair's length. Only potentially eligible
         // Hirschberg pairs need cutoff checks; a Pointers batch has none. Re-sorting
@@ -559,7 +561,7 @@ private:
             DpBuffer buf;
             std::vector<const unsigned char*> a, b;
             std::vector<int> m, bi, bj;
-            std::vector<double> best;
+            std::vector<T> best, blkT;
             // Soft groups: the inter-pair soft pass's scratch and per-lane results.
             DVec sscr;
             std::vector<int> siscr, sok;
@@ -588,9 +590,9 @@ private:
                     continue;
                 }
                 const LevelKernels& K = level_kernels(backend[elig[s]]);
-                const int W = K.inter_w;
+                const int W = inter_w_(K);
                 a.assign(W, nullptr); b.assign(W, nullptr); m.assign(W, 0);
-                bi.assign(W, 0); bj.assign(W, 0); best.assign(W, 0.0);
+                bi.assign(W, 0); bj.assign(W, 0); best.assign(W, T(0));
                 int M = 0;
                 for (int l = 0; l < W; ++l) {
                     // Short group: the spare lanes repeat the last pair; their results are dropped.
@@ -609,7 +611,7 @@ private:
                     lazy = p.grad_mode() == GradMode::Soft && p.soft_guide_lazy();
                 }
                 const bool skip_fill = lazy || !linear_fill_ok_(p0, K);
-                InterJob job{};
+                InterJobT<T> job{};
                 job.a = a.data(); job.m = m.data(); job.b = b.data(); job.n = n; job.M = M;
                 job.align_mode = (p0.align_mode() == AlignMode::Local) ? 1 : 0;
                 if (!skip_fill) {
@@ -617,14 +619,19 @@ private:
                     // Linear's one table rides in the H slot (adopt_interleaved reads buf.H).
                     if (lin) { if (buf.H.size() < sz) buf.H.resize(sz); }
                     else if (buf.VM.size() < sz) { buf.VM.resize(sz); buf.VX.resize(sz); buf.VY.resize(sz); }
-                    job.blk = P.matrix.data(); job.nalpha = P.matrix.size();
-                    job.go_a = P.gap_open_a; job.ge_a = P.gap_extend_a;
-                    job.go_b = P.gap_open_b; job.ge_b = P.gap_extend_b;
+                    // In T, as the pair's own fill rounds them (blkT_, the cast penalties).
+                    const size_t nb = static_cast<size_t>(P.matrix.size()) * P.matrix.size();
+                    blkT.resize(nb);
+                    for (size_t k = 0; k < nb; ++k) blkT[k] = static_cast<T>(P.matrix.data()[k]);
+                    job.blk = blkT.data(); job.nalpha = P.matrix.size();
+                    job.go_a = static_cast<T>(P.gap_open_a); job.ge_a = static_cast<T>(P.gap_extend_a);
+                    job.go_b = static_cast<T>(P.gap_open_b); job.ge_b = static_cast<T>(P.gap_extend_b);
                     job.linear = lin ? 1 : 0;
                     if (lin) job.VM = buf.H.data();
                     else { job.VM = buf.VM.data(); job.VX = buf.VX.data(); job.VY = buf.VY.data(); }
                     job.best = best.data(); job.best_i = bi.data(); job.best_j = bj.data();
-                    K.inter_fill(job);
+                    if constexpr (std::is_same_v<T, double>) K.inter_fill(job);
+                    else                                     K.inter_fill_f(job);
                 }
                 // Soft lanes share the forward-backward too when every real lane is soft
                 // with one soft_impl (not "log") and one temperature, and the weights fit.
@@ -652,17 +659,24 @@ private:
                     for (size_t k = 0; k < nn; ++k) fin &= ses[k] <= DBL_MAX_;
                     soft_group = fin;
                     if (fin) {
-                        const size_t need = inter_soft_scratch(n, M, W);
-                        if (sscr.size() < need) sscr.resize(need);
-                        siscr.resize(static_cast<size_t>(M + 1) * W);
-                        slogz.resize(W); scnt.resize(W * nn); sgap.resize(W * 4); sok.resize(W);
-                        sj.a = job.a; sj.m = job.m; sj.b = job.b; sj.n = n; sj.M = M;
-                        sj.es = ses.data(); sj.nalpha = na;
+                        // The soft pass is double (the forward-backward is double at any
+                        // T), K.inter_w lanes: a float32 group runs it in W / SW chunks.
+                        const int SW = K.inter_w;
+                        slogz.resize(W); scnt.resize(W * nn); sgap.resize(W * 4); sok.assign(W, 0);
+                        sj.es = ses.data(); sj.nalpha = na; sj.n = n;
                         sj.align_mode = job.align_mode;
-                        sj.scratch = sscr.data(); sj.iscratch = siscr.data();
-                        sj.logz = slogz.data(); sj.counts = scnt.data(); sj.gaps = sgap.data();
-                        sj.ok = sok.data();
-                        K.inter_soft(sj);
+                        for (int c = 0; c < W && static_cast<size_t>(c) < real; c += SW) {
+                            int Mc = 0;
+                            for (int l = c; l < c + SW; ++l) Mc = std::max(Mc, m[l]);
+                            const size_t need = inter_soft_scratch(n, Mc, SW);
+                            if (sscr.size() < need) sscr.resize(need);
+                            siscr.resize(static_cast<size_t>(Mc + 1) * SW);
+                            sj.a = a.data() + c; sj.m = m.data() + c; sj.b = b.data() + c; sj.M = Mc;
+                            sj.scratch = sscr.data(); sj.iscratch = siscr.data();
+                            sj.logz = slogz.data() + c; sj.counts = scnt.data() + c * nn;
+                            sj.gaps = sgap.data() + c * 4; sj.ok = sok.data() + c;
+                            K.inter_soft(sj);
+                        }
                     }
                 }
                 for (size_t l = 0; l < real; ++l) {
@@ -679,7 +693,6 @@ private:
             }
         };
         run_workers(tasks, worker);
-        }
     }
 
     struct InterPlan {
@@ -737,7 +750,7 @@ private:
         for (const Key& k : keys) P.elig.push_back(k.i);
         // Groups: runs of equal (backend, gap model, mode, len_b), cut every W.
         for (size_t s = 0; s < keys.size();) {
-            const int W = level_kernels(keys[s].backend).inter_w;
+            const int W = inter_w_(level_kernels(keys[s].backend));
             size_t e = s + 1;
             while (e < keys.size() && e - s < static_cast<size_t>(W) &&
                    keys[e].backend == keys[s].backend && keys[e].gm == keys[s].gm &&

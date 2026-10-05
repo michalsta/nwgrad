@@ -26,11 +26,19 @@
 inline constexpr int IW = KW;
 typedef double ivd __attribute__((vector_size(8 * IW)));
 typedef long long ivl __attribute__((vector_size(8 * IW)));
+// float32: the same register holds twice the lanes.
+typedef float ivf __attribute__((vector_size(8 * IW)));
+typedef int ivi __attribute__((vector_size(8 * IW)));
+
+// Vector, mask and lane count per precision.
+template <class T> struct IVT;
+template <> struct IVT<double> { using v = ivd; using l = ivl; static constexpr int W = IW; };
+template <> struct IVT<float>  { using v = ivf; using l = ivi; static constexpr int W = 2 * IW; };
 
 // Lane-wise std::max(a, b), i.e. a < b ? b : a — the same choice on ties as the
 // scalar and row-wise kernels.
-static inline ivd ivmax(ivd a, ivd b) noexcept { return a < b ? b : a; }
-static inline ivd ivsel(ivl m, ivd a, ivd b) noexcept { return m ? a : b; }
+template <class V> static inline V ivmax(V a, V b) noexcept { return a < b ? b : a; }
+template <class L, class V> static inline V ivsel(L m, V a, V b) noexcept { return m ? a : b; }
 
 // Linear gaps: one table H (in J.VM), per lane exactly Aligner::viterbi_linear —
 // v = max(diag + s, up - ge_b, left - ge_a), Local clamped at 0, the same left-to-right
@@ -39,11 +47,14 @@ static inline ivd ivsel(ivl m, ivd a, ivd b) noexcept { return m ? a : b; }
 // pair's own fill.  Row-wise vectorization of linear was measured at 0.90x and deleted
 // (the left carry is a pure latency chain); one PAIR per lane sidesteps that, since each
 // lane's chain is its own and W of them run side by side.
-static void inter_fill_linear(InterJob& J) noexcept {
+template <class T>
+static void inter_fill_linear(InterJobT<T>& J) noexcept {
+    using ivd = typename IVT<T>::v; using ivl = typename IVT<T>::l;
+    constexpr int IW = IVT<T>::W;
     const int n = J.n, M = J.M, st = n + 1;
     const bool local = J.align_mode == 1;
     ivd* H = reinterpret_cast<ivd*>(J.VM);
-    const ivd z = {}, ninf = z + (-std::numeric_limits<double>::infinity());
+    const ivd z = {}, ninf = z + (-std::numeric_limits<T>::infinity());
 
     if (local) {
         for (int j = 0; j <= n; ++j) H[j] = z;
@@ -51,8 +62,8 @@ static void inter_fill_linear(InterJob& J) noexcept {
     } else {
         H[0] = z;
         for (int i = 1; i <= M; ++i)
-            H[static_cast<size_t>(i) * st] = z + (-static_cast<double>(i) * J.ge_b);
-        for (int j = 1; j <= n; ++j) H[j] = z + (-static_cast<double>(j) * J.ge_a);
+            H[static_cast<size_t>(i) * st] = z + (-static_cast<T>(i) * J.ge_b);
+        for (int j = 1; j <= n; ++j) H[j] = z + (-static_cast<T>(j) * J.ge_a);
     }
 
     const int na = J.nalpha;
@@ -112,13 +123,13 @@ static void inter_fill_linear(InterJob& J) noexcept {
             if (local) {
                 const ivl upd = rb < v;
                 rb = ivsel(upd, v, rb);
-                rj = ivsel(upd, z + static_cast<double>(j), rj);
+                rj = ivsel(upd, z + static_cast<T>(j), rj);
             }
         }
         if (local) {
             const ivl imp = live & (rb > best);
             best = ivsel(imp, rb, best);
-            bi = ivsel(imp, z + static_cast<double>(i), bi);
+            bi = ivsel(imp, z + static_cast<T>(i), bi);
             bj = ivsel(imp, rj, bj);
         }
     }
@@ -130,9 +141,15 @@ static void inter_fill_linear(InterJob& J) noexcept {
         }
 }
 
-static void inter_fill_entry(InterJob& J) noexcept {
+// Affine (and the linear dispatch).  T = double or float32: the operations are the same
+// in either precision, each in T — at float32 exactly the scalar viterbi_affine<float>,
+// whose penalties are cast to T once and whose borders are -(go + T(i)*ge) in T.
+template <class T>
+static void inter_fill_t(InterJobT<T>& J) noexcept {
     if (J.linear) { inter_fill_linear(J); return; }
-    const double NINF = -std::numeric_limits<double>::infinity();
+    using ivd = typename IVT<T>::v; using ivl = typename IVT<T>::l;
+    constexpr int IW = IVT<T>::W;
+    const T NINF = -std::numeric_limits<T>::infinity();
     const int n = J.n, M = J.M, st = n + 1;
     const bool local = J.align_mode == 1;
     ivd* VM = reinterpret_cast<ivd*>(J.VM);
@@ -152,9 +169,9 @@ static void inter_fill_entry(InterJob& J) noexcept {
     } else {
         VM[0] = z;
         for (int i = 1; i <= M; ++i)
-            VX[static_cast<size_t>(i) * st] = z + (-(J.go_b + i * J.ge_b));
+            VX[static_cast<size_t>(i) * st] = z + (-(J.go_b + static_cast<T>(i) * J.ge_b));
         for (int j = 1; j <= n; ++j)
-            VY[j] = z + (-(J.go_a + j * J.ge_a));
+            VY[j] = z + (-(J.go_a + static_cast<T>(j) * J.ge_a));
     }
 
     // Per column, the bits of each lane's B residue, as blend masks.
@@ -225,13 +242,13 @@ static void inter_fill_entry(InterJob& J) noexcept {
                 const ivd cur = ivmax(mv, ivmax(x, y));
                 const ivl upd = rb < cur;          // first strict improvement in the row
                 rb = ivsel(upd, cur, rb);
-                rj = ivsel(upd, z + static_cast<double>(j), rj);
+                rj = ivsel(upd, z + static_cast<T>(j), rj);
             }
         }
         if (local) {
             const ivl imp = live & (rb > best);
             best = ivsel(imp, rb, best);
-            bi = ivsel(imp, z + static_cast<double>(i), bi);
+            bi = ivsel(imp, z + static_cast<T>(i), bi);
             bj = ivsel(imp, rj, bj);
         }
     }
@@ -242,3 +259,6 @@ static void inter_fill_entry(InterJob& J) noexcept {
             J.best_j[l] = static_cast<int>(bj[l]);
         }
 }
+
+static void inter_fill_entry(InterJob& J) noexcept { inter_fill_t<double>(J); }
+static void inter_fill_entry_f(InterJobT<float>& J) noexcept { inter_fill_t<float>(J); }

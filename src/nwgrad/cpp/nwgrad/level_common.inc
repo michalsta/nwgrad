@@ -67,6 +67,8 @@ struct NwgradLevelRegistrar {
                        NWGRAD_LVL_NAME::ROW_BLOCK,
                        &NWGRAD_LVL_NAME::inter_fill_entry,      // inter-pair affine Full, double
                        NWGRAD_LVL_NAME::IW,
+                       &NWGRAD_LVL_NAME::inter_fill_entry_f,   // inter-pair Full, float32
+                       NWGRAD_LVL_NAME::IVT<float>::W,
                        &NWGRAD_LVL_NAME::inter_soft_entry,     // inter-pair soft pass, double
                        &NWGRAD_LVL_NAME::soft_pair_linear,     // per-pair soft, linear
                        &NWGRAD_LVL_NAME::soft_pair_affine);    // per-pair soft, affine

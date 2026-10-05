@@ -26,6 +26,8 @@ ap.add_argument("--impl", nargs="+", default=None,
                 help="soft_impl values to time (default: the build's default only)")
 ap.add_argument("--soft-guide", default="eager", choices=["eager", "lazy"],
                 help="SeqPairBatch.soft_guide for the soft arm")
+ap.add_argument("--prec", default="double", choices=["double", "float32"],
+                help="batch precision (float32: SeqPairBatch; the soft pass is double either way)")
 ap.add_argument("--configs", nargs="+",
                 default=["local-affine", "global-affine", "local-linear", "global-linear"])
 args = ap.parse_args()
@@ -41,7 +43,8 @@ lin = nwgrad.AlignParams(nwgrad.SubstMatrix(np.array(M), "ACGT"), 0.0, 1.2147, 0
 
 
 def run(threads, mode, gap, grad_mode, tb="auto", fill=None, impl=None):
-    b = nwgrad.SeqPairBatchDouble(n_threads=threads, traceback=tb)
+    cls = nwgrad.SeqPairBatch if args.prec == "float32" else nwgrad.SeqPairBatchDouble
+    b = cls(n_threads=threads, traceback=tb)
     if fill:
         b.fill = fill
     if impl is not None:
@@ -59,7 +62,7 @@ def run(threads, mode, gap, grad_mode, tb="auto", fill=None, impl=None):
     return best / len(A) * 1e6
 
 
-print(f"isa={nwgrad.simd_isa()} n={args.n} soft_guide={args.soft_guide}")
+print(f"isa={nwgrad.simd_isa()} n={args.n} soft_guide={args.soft_guide} prec={args.prec}")
 for threads in args.threads:
     for cfg in args.configs:
         mode, gap = cfg.split("-")

@@ -18,6 +18,7 @@ void register_level(SimdLevel l, viterbi_fn viterbi, viterbi_fn_f viterbi_f,
                     hbbase_fn hb_base, hbbase_fn_f hb_base_f,
                     hbscan_fn hb_scan, hbscan_fn_f hb_scan_f,
                     int row_block, inter_fn inter_fill, int inter_w,
+                    inter_fn_f inter_fill_f, int inter_w_f,
                     inter_soft_fn inter_soft,
                     soft_pair_fn soft_pair_linear, soft_pair_fn soft_pair_affine) {
     LevelKernels k;
@@ -38,6 +39,8 @@ void register_level(SimdLevel l, viterbi_fn viterbi, viterbi_fn_f viterbi_f,
     k.row_block         = row_block;
     k.inter_fill        = inter_fill;
     k.inter_w           = inter_w;
+    k.inter_fill_f      = inter_fill_f;
+    k.inter_w_f         = inter_w_f;
     k.inter_soft        = inter_soft;
     k.soft_pair_linear  = soft_pair_linear;
     k.soft_pair_affine  = soft_pair_affine;

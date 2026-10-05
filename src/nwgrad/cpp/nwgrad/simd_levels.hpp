@@ -257,20 +257,26 @@ using hbbase_fn_f = void (*)(HbBaseJob<float>&);
 // blending on the bits of the B residue: nalpha <= 8 only (the caller falls back
 // otherwise).  Local: also returns each lane's best cell, chosen as the per-pair fill
 // chooses it (first row, then first column, reaching the maximum; 0 if none > 0).
-struct InterJob {
+// Templated on the precision T (double or float32); at float32 W is twice the double
+// lane count (LevelKernels::inter_w_f) and every value, border and comparison is in T,
+// bit-identical to the scalar float fill.
+template <class T>
+struct InterJobT {
     const unsigned char* const* a;   // W pointers to A's codes
     const int* m;                    // W lengths of A
     const unsigned char* const* b;   // W pointers to B's codes (all of length n)
     int n;
     int M;                           // max m over the lanes (rows filled)
-    const double* blk; int nalpha;   // substitution block, row-major nalpha x nalpha
-    double go_a, ge_a, go_b, ge_b;
+    const T* blk; int nalpha;        // substitution block, row-major nalpha x nalpha
+    T go_a, ge_a, go_b, ge_b;
     int align_mode;                  // 0 = Global, 1 = Local
     int linear;                      // 1 = linear gaps: H in VM only (go_*, VX, VY unused)
-    double* VM; double* VX; double* VY;   // (M+1)*(n+1)*W each
-    double* best; int* best_i; int* best_j;   // W each, Local only
+    T* VM; T* VX; T* VY;             // (M+1)*(n+1)*W each
+    T* best; int* best_i; int* best_j;   // W each, Local only
 };
-using inter_fn = void (*)(InterJob&);
+using InterJob = InterJobT<double>;
+using inter_fn   = void (*)(InterJobT<double>&);
+using inter_fn_f = void (*)(InterJobT<float>&);
 
 // Inter-pair SOFT pass (scaled forward-backward with the gradient fused), double: the
 // same W-lane grouping as InterJob, Full band, affine or linear gaps, nalpha <= 8.  Per lane it is
@@ -357,6 +363,8 @@ struct LevelKernels {
     int           row_block = 0;                // columns per interleaved block (per-µarch)
     inter_fn      inter_fill = nullptr;         // inter-pair affine Full fill, double
     int           inter_w = 0;                  // its lane count (pairs per call)
+    inter_fn_f    inter_fill_f = nullptr;       // ditto, float32
+    int           inter_w_f = 0;                // its lane count (2 * inter_w)
     inter_soft_fn inter_soft = nullptr;         // inter-pair soft pass, double (same W)
     soft_pair_fn  soft_pair_linear = nullptr;   // per-pair scaled forward-backward ↓
     soft_pair_fn  soft_pair_affine = nullptr;
@@ -385,6 +393,7 @@ void register_level(SimdLevel l, viterbi_fn viterbi, viterbi_fn_f viterbi_f,
                     hbbase_fn hb_base, hbbase_fn_f hb_base_f,
                     hbscan_fn hb_scan, hbscan_fn_f hb_scan_f,
                     int row_block, inter_fn inter_fill, int inter_w,
+                    inter_fn_f inter_fill_f, int inter_w_f,
                     inter_soft_fn inter_soft,
                     soft_pair_fn soft_pair_linear, soft_pair_fn soft_pair_affine);
 
