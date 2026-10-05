@@ -1456,32 +1456,40 @@ private:
             prev[j] = local ? static_cast<T>(0) : -static_cast<T>(j) * ge_a;
             D[j] = local ? 3 : 2;
         }
-        best_i_ = 0; best_j_ = 0;
+        int bi = 0, bj = 0;   // locals: best_i_/best_j_ are members (see below)
         double best_local = 0.0;
+        const unsigned char* __restrict bcode = b_idx_.data();
         for (int i = 1; i <= m_; ++i) {
-            unsigned char* d = D + static_cast<size_t>(i) * st;
-            cur[0] = local ? static_cast<T>(0) : -static_cast<T>(i) * ge_b;
+            unsigned char* __restrict d = D + static_cast<size_t>(i) * st;
+            // Locals, not members: the byte stores below may alias anything, so a member
+            // read in the loop (subT's blkT_/a_idx_/b_idx_) would be reloaded every cell.
+            const T* __restrict prow = blkT_ + static_cast<size_t>(a_idx_[static_cast<size_t>(i) - 1]) * nalpha_;
+            const T* __restrict pv = prev;
+            T* __restrict cv = cur;
+            cv[0] = local ? static_cast<T>(0) : -static_cast<T>(i) * ge_b;
             d[0] = local ? 3 : 1;
             for (int j = 1; j <= n_; ++j) {
                 // Branch-free: the same comparisons in the same order as std::max over
                 // the initializer list, but as selects — data-dependent branches here
                 // mispredicted on every other cell (2x slower than the H fill, Global).
-                T v = prev[j - 1] + subT(i, j);
-                const T u = prev[j] - ge_b, l = cur[j - 1] - ge_a;
-                const bool tu = v < u;
-                v = tu ? u : v;
-                const bool tl = v < l;
-                v = tl ? l : v;
-                unsigned char c = static_cast<unsigned char>(tl ? 2 : (tu ? 1 : 0));
+                // The value exactly as viterbi_linear computes it (std::max, first largest),
+                // so only max(v1, l) and the - ge_a sit on the carry chain; the code is
+                // derived from the same two comparisons, off the chain.
+                const T d0 = pv[j - 1] + prow[bcode[j - 1]];
+                const T u = pv[j] - ge_b, l = cv[j - 1] - ge_a;
+                const T v1 = std::max(d0, u);
+                T v = std::max(v1, l);
+                unsigned char c = static_cast<unsigned char>((v1 < l) ? 2 : ((d0 < u) ? 1 : 0));
                 if constexpr (local) {
                     v = std::max(v, static_cast<T>(0));
                     c = (v <= static_cast<T>(0)) ? static_cast<unsigned char>(3) : c;
-                    if (v > best_local) { best_local = v; best_i_ = i; best_j_ = j; }
+                    if (v > best_local) { best_local = v; bi = i; bj = j; }
                 }
-                cur[j] = v; d[j] = c;
+                cv[j] = v; d[j] = c;
             }
             std::swap(prev, cur);
         }
+        best_i_ = bi; best_j_ = bj;
         viterbi_score_ = local ? best_local : prev[n_];
         pointers_ = true;
     }
