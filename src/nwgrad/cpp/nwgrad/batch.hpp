@@ -136,7 +136,8 @@ private:
                        ? backend : -1;
         if (inter_w_(K) <= 0) return -1;
         if (gap_model == GapModel::Linear && (band > 0 ||
-            (align_mode == AlignMode::Global && inter_w_(K) < 4))) return -1;
+            (align_mode == AlignMode::Global && (inter_w_(K) < 4 || params.matrix.size() > 8))))
+            return -1;
         return backend;
     }
 

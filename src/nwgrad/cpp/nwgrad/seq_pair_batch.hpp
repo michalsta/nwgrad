@@ -514,9 +514,12 @@ private:
         else                                     return K.inter_fill_f ? K.inter_w_f : 0;
     }
 
+    // Linear Global's own fill is cheap: the shared one loses below 4 lanes (DNA, W=2:
+    // 0.76x on SSE2) and for alphabets over 8 (protein, the per-row gather: 1.10-1.22x
+    // at 12 threads on AVX2).  Soft pairs still take the soft pass and skip the fill.
     static bool linear_fill_ok_(const SeqPair& p, const LevelKernels& K) {
         return !(p.gap_model() == GapModel::Linear && p.align_mode() == AlignMode::Global &&
-                 inter_w_(K) < 4);
+                 (inter_w_(K) < 4 || p.params_ptr()->matrix.size() > 8));
     }
 
     int inter_backend_(const SeqPair& p) const {

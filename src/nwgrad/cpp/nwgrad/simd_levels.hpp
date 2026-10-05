@@ -344,15 +344,19 @@ using soft_pair_fn = void (*)(SoftPairJob&);
 // residues (tables ~1.3 MB per group) and loses 2x at 130-160 (~1.6 MB); linear, one
 // table, still wins at 160-200 and loses at 150-300 — the same byte crossover.  Past
 // it W pairs' tables stream from L3/DRAM while the per-pair fills keep 3 B/cell
-// (pointers) and win by up to 11x.  Viterbi: `tables` T-tables of W lanes (3 affine, 1
-// linear); soft: the soft pass's 4 (affine) / 2 (linear) double tables of Ws lanes.
+// (pointers) and win by up to 11x.  Viterbi: 3 (affine) / 1 (linear) T-tables of W
+// lanes, capped at 1.25 MiB.  The soft pass crosses over lower: 30-60 residues (~0.3
+// MB per group) win 0.51-0.70x at 12 threads, 60-120 (~1.3 MB) lose up to 1.95x — so
+// its 5 (affine: 3 forward tables, the per-row weights, rows) / 2 (linear) double
+// tables of Ws lanes are capped at 512 KiB.
 inline constexpr size_t kInterGroupBytes = size_t(5) << 18;   // 1.25 MiB
+inline constexpr size_t kInterSoftBytes  = size_t(1) << 19;   // 512 KiB
 inline bool inter_pair_fits(size_t la, size_t lb, bool affine, bool soft, int W,
                             size_t tsize, int Ws) {
     const size_t cells = (la + 1) * (lb + 1);
     if (cells * static_cast<size_t>(W) * (affine ? 3 : 1) * tsize > kInterGroupBytes) return false;
-    return !soft || cells * static_cast<size_t>(Ws) * (affine ? 4 : 2) * sizeof(double) <=
-                        kInterGroupBytes;
+    return !soft || cells * static_cast<size_t>(Ws) * (affine ? 5 : 2) * sizeof(double) <=
+                        kInterSoftBytes;
 }
 
 inline size_t inter_soft_scratch(int n, int M, int W) {

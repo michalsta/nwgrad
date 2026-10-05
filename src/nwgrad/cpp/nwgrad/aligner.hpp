@@ -785,6 +785,9 @@ private:
     // Grow external buffer to fit current problem (thread-owned path).
     void ensure_viterbi_ptruf(DpBuffer& buf) const {
         if constexpr (GM == GapModel::Linear) {
+            // Full + Pointers keeps no H (viterbi_linear_ptr allocates its byte table).
+            if constexpr (AB == AlignBand::Full)
+                if (tb_ == TracebackMode::Pointers) return;
             if (buf.H.size() < sz_) buf.H.resize(sz_);
         } else {
             // Pointers mode never touches VM/VX/VY — it keeps two rolling rows and byte
@@ -1045,28 +1048,48 @@ private:
         std::vector<int> gj(static_cast<size_t>(m_ + 1), -1);
         gj[0] = 0;
         gj[static_cast<size_t>(m_)] = n_;
-
-        int i = (AM == AlignMode::Global) ? m_ : best_i_;
-        int j = (AM == AlignMode::Global) ? n_ : best_j_;
-        gj[static_cast<size_t>(i)] = j;
-
-        while (true) {
-            if constexpr (AM == AlignMode::Global) { if (i == 0 && j == 0) break; }
-            else                                    { if (rat(buf.H, i, j) <= 0.0) break; }
-            if (i > 0 && j > 0 &&
-                rat(buf.H, i, j) == rat(buf.H, i-1, j-1) + subT(i, j))
-            {
-                --i; --j;
-                gj[static_cast<size_t>(i)] = j;
-            } else if (i > 0 && (j == 0 || rat(buf.H, i, j) == rat(buf.H, i-1, j) - static_cast<T>(params_->gap_extend_b))) {
-                --i;
-                gj[static_cast<size_t>(i)] = j;
-            } else {
-                --j;  // gap in a: i stays, no gj update
-            }
-        }
+        const int i0 = (AM == AlignMode::Global) ? m_ : best_i_;
+        gj[static_cast<size_t>(i0)] = (AM == AlignMode::Global) ? n_ : best_j_;
+        walk_linear(buf, [&](int k, int i, int j) {
+            if (k == 0)      gj[static_cast<size_t>(i - 1)] = j - 1;
+            else if (k == 1) gj[static_cast<size_t>(i - 1)] = j;   // gap in a: no update
+        });
         fill_guide_gaps(gj);
         return gj;
+    }
+
+    // The one walk behind the four linear walkers: emit(k, i, j) for each move out of
+    // (i, j) — k = 0 diagonal, 1 up (gap in B), 2 left (gap in A) — from the optimum
+    // back to the start.  The move is read from the recorded code (pointers_, see
+    // viterbi_linear_ptr) or re-derived by exact equality on H, in the same order the
+    // fill's max chose it, so both give the same walk, ties included.
+    template <class Emit>
+    void walk_linear(const DpBuffer& buf, Emit&& emit) const {
+        int i = (AM == AlignMode::Global) ? m_ : best_i_;
+        int j = (AM == AlignMode::Global) ? n_ : best_j_;
+        while (true) {
+            if (i == 0 && j == 0) break;
+            int k;
+            if (pointers_) {
+                k = dcode(buf.DM, i, j);
+                if (k == 3) break;
+            } else {
+                if constexpr (AM == AlignMode::Local)
+                    if (rat(buf.H, i, j) <= 0.0) break;
+                if (i > 0 && j > 0 &&
+                    rat(buf.H, i, j) == rat(buf.H, i-1, j-1) + subT(i, j))
+                    k = 0;
+                else if (i > 0 && (j == 0 || rat(buf.H, i, j) == rat(buf.H, i-1, j) -
+                                                 static_cast<T>(params_->gap_extend_b)))
+                    k = 1;
+                else
+                    k = 2;
+            }
+            emit(k, i, j);
+            if (k == 0)      { --i; --j; }
+            else if (k == 1) --i;
+            else             --j;
+        }
     }
 
     // ── variant-B tracebacks: read the recorded predecessor, do not re-derive ──
@@ -1255,7 +1278,11 @@ private:
         // (the pointer kernels are chosen after the backend is resolved, below: every
         // simd level has its own, and only the scalar path falls back here.)
         if constexpr (GM == GapModel::Linear) {
-            viterbi_linear(buf);   // no simd linear kernel: every backend is scalar here
+            // No simd linear kernel: every backend is scalar here.  Full + Pointers keeps
+            // direction bytes, not H (viterbi_linear_ptr).
+            if constexpr (AB == AlignBand::Full)
+                if (tb_ == TracebackMode::Pointers) { viterbi_linear_ptr(buf); return; }
+            viterbi_linear(buf);
             return;
         }
         // Resolve this aligner's backend: auto -> the global default, then scalar or a level.
@@ -1388,77 +1415,79 @@ private:
         viterbi_score_ = (AM == AlignMode::Global) ? rat(buf.H, m_, n_) : best_local;
     }
 
+    // TracebackMode::Pointers for linear gaps (Full band): viterbi_linear's fill, in the
+    // same precision and the same order, retaining one direction byte per cell (buf.DM,
+    // row-major) and two rolling rows instead of H — 1 B/cell against 4 (float32) / 8
+    // (double), and no O(m*n) score table at all.  Codes: 0 diagonal, 1 up (gap in B),
+    // 2 left (gap in A), 3 stop.  Bit-exact with the H walk, ties included: the max below
+    // keeps the FIRST largest of (diag+s, up-ge_b, left-ge_a), exactly as std::max over
+    // the initializer list does, and the H walk tests the same three in the same order by
+    // equality — so both pick the first largest.  Local: stop where the clamped value is
+    // <= 0 (the H walk's stop test); borders stop (Local), go up / left (Global).
+    void viterbi_linear_ptr(DpBuffer& buf) {
+        const size_t st = stride_;
+        const size_t dsz = static_cast<size_t>(m_ + 1) * st;
+        if (buf.DM.size() < dsz) buf.DM.resize(dsz);
+        if (buf.rM.size() < st) { buf.rM.resize(st); buf.qM.resize(st); }
+        T* prev = buf.qM.data(); T* cur = buf.rM.data();
+        unsigned char* D = buf.DM.data();
+        const T ge_a = static_cast<T>(params_->gap_extend_a);
+        const T ge_b = static_cast<T>(params_->gap_extend_b);
+        constexpr bool local = AM == AlignMode::Local;
+        prev[0] = static_cast<T>(0); D[0] = 3;
+        for (int j = 1; j <= n_; ++j) {
+            prev[j] = local ? static_cast<T>(0) : -static_cast<T>(j) * ge_a;
+            D[j] = local ? 3 : 2;
+        }
+        best_i_ = 0; best_j_ = 0;
+        double best_local = 0.0;
+        for (int i = 1; i <= m_; ++i) {
+            unsigned char* d = D + static_cast<size_t>(i) * st;
+            cur[0] = local ? static_cast<T>(0) : -static_cast<T>(i) * ge_b;
+            d[0] = local ? 3 : 1;
+            for (int j = 1; j <= n_; ++j) {
+                T v = prev[j - 1] + subT(i, j);
+                unsigned char c = 0;
+                const T u = prev[j] - ge_b, l = cur[j - 1] - ge_a;
+                if (v < u) { v = u; c = 1; }
+                if (v < l) { v = l; c = 2; }
+                if constexpr (local) {
+                    v = std::max(v, static_cast<T>(0));
+                    if (v <= static_cast<T>(0)) c = 3;
+                    if (v > best_local) { best_local = v; best_i_ = i; best_j_ = j; }
+                }
+                cur[j] = v; d[j] = c;
+            }
+            std::swap(prev, cur);
+        }
+        viterbi_score_ = local ? best_local : prev[n_];
+        pointers_ = true;
+    }
+
     std::vector<std::pair<int,int>> traceback_linear(const DpBuffer& buf) const {
         std::vector<std::pair<int,int>> path;
-        int i = (AM == AlignMode::Global) ? m_ : best_i_;
-        int j = (AM == AlignMode::Global) ? n_ : best_j_;
-
-        while (true) {
-            if (i == 0 && j == 0) break;
-            if constexpr (AM == AlignMode::Local)
-                if (rat(buf.H, i, j) <= 0.0) break;
-            if (i > 0 && j > 0 &&
-                rat(buf.H, i, j) == rat(buf.H, i-1, j-1) + subT(i, j))
-            {
-                path.emplace_back(i-1, j-1);
-                --i; --j;
-            } else if (i > 0 && (j == 0 || rat(buf.H, i, j) == rat(buf.H, i-1, j) - static_cast<T>(params_->gap_extend_b))) {
-                --i;  // gap in B
-            } else {
-                --j;  // gap in A
-            }
-        }
+        walk_linear(buf, [&](int k, int i, int j) { if (k == 0) path.emplace_back(i - 1, j - 1); });
         std::reverse(path.begin(), path.end());
         return path;
     }
 
     void aligned_linear(const DpBuffer& buf, std::string& a, std::string& b) const {
-        int i = (AM == AlignMode::Global) ? m_ : best_i_;
-        int j = (AM == AlignMode::Global) ? n_ : best_j_;
-
-        while (true) {
-            if (i == 0 && j == 0) break;
-            if constexpr (AM == AlignMode::Local)
-                if (rat(buf.H, i, j) <= 0.0) break;
-            if (i > 0 && j > 0 &&
-                rat(buf.H, i, j) == rat(buf.H, i-1, j-1) + subT(i, j))
-            {
-                a.push_back(sym_a(i)); b.push_back(sym_b(j));
-                --i; --j;
-            } else if (i > 0 && (j == 0 || rat(buf.H, i, j) == rat(buf.H, i-1, j) - static_cast<T>(params_->gap_extend_b))) {
-                a.push_back(sym_a(i)); b.push_back('-');  // gap in B
-                --i;
-            } else {
-                a.push_back('-'); b.push_back(sym_b(j));  // gap in A
-                --j;
-            }
-        }
+        walk_linear(buf, [&](int k, int i, int j) {
+            if (k == 0)      { a.push_back(sym_a(i)); b.push_back(sym_b(j)); }
+            else if (k == 1) { a.push_back(sym_a(i)); b.push_back('-'); }   // gap in B
+            else             { a.push_back('-'); b.push_back(sym_b(j)); }   // gap in A
+        });
         std::reverse(a.begin(), a.end());
         std::reverse(b.begin(), b.end());
     }
 
     void hard_grad_linear(const DpBuffer& buf, AlignParams& grad) const {
         double* gblk = grad_block(grad);
-        int i = (AM == AlignMode::Global) ? m_ : best_i_;
-        int j = (AM == AlignMode::Global) ? n_ : best_j_;
-
-        while (true) {
-            if (i == 0 && j == 0) break;
-            if constexpr (AM == AlignMode::Local)
-                if (rat(buf.H, i, j) <= 0.0) break;
-            if (i > 0 && j > 0 &&
-                rat(buf.H, i, j) == rat(buf.H, i-1, j-1) + subT(i, j))
-            {
-                gblk[sub_off(i, j)] += 1.0;
-                --i; --j;
-            } else if (i > 0 && (j == 0 || rat(buf.H, i, j) == rat(buf.H, i-1, j) - static_cast<T>(params_->gap_extend_b))) {
-                grad.gap_extend_b -= 1.0;   // the score subtracts this penalty
-                --i;
-            } else {
-                grad.gap_extend_a -= 1.0;
-                --j;
-            }
-        }
+        walk_linear(buf, [&](int k, int i, int j) {
+            if (k == 0)      gblk[sub_off(i, j)] += 1.0;
+            else if (k == 1) grad.gap_extend_b -= 1.0;   // the score subtracts this penalty
+            else             grad.gap_extend_a -= 1.0;
+        });
     }
 
     // ═════════════════════════════════════════════════════════════════════════
