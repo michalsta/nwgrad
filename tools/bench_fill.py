@@ -26,6 +26,9 @@ ap.add_argument("--prec", nargs="+", default=["float32", "double"])
 ap.add_argument("--tb", nargs="+", default=["pointers", "auto"])
 ap.add_argument("--band", type=int, nargs="*", default=[],
                 help="also time banded_grad(bw) after one score_and_grad, per fill")
+ap.add_argument("--vary-b", type=int, nargs=2, metavar=("LO", "HI"), default=None,
+                help="replace each B by a random DNA sequence of length in [LO, HI] (seed 1): "
+                     "the ragged-B case, many B lengths each rare")
 ap.add_argument("--configs", nargs="+",
                 default=["local-affine", "global-affine", "local-linear", "global-linear"])
 args = ap.parse_args()
@@ -35,6 +38,10 @@ with open(args.data) as f:
 idx = np.random.default_rng(0).choice(len(rows), size=args.n, replace=False)
 A = [rows[i][0] for i in idx]
 B = [rows[i][1] for i in idx]
+if args.vary_b:
+    rng = np.random.default_rng(1)
+    B = ["".join(rng.choice(list("ACGT"), int(k)))
+         for k in rng.integers(args.vary_b[0], args.vary_b[1] + 1, len(B))]
 
 params = nwgrad.AlignParams(nwgrad.SubstMatrix(np.array(M), "ACGT"), 1.0, 0.5, 1.0, 0.5)
 lin = nwgrad.AlignParams(nwgrad.SubstMatrix(np.array(M), "ACGT"), 0.0, 1.2147, 0.0, 1.2147)
