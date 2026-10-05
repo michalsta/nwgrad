@@ -82,7 +82,7 @@ enum class TracebackMode { Scores, Pointers, Hirschberg, HirschbergPmax, Default
 //   Scaled (default): probability space with exact power-of-two row rescaling and the
 //     gradient fused into the backward pass — no transcendental call per cell.  Throws
 //     std::domain_error when a pair's dynamic range does not fit a double (see
-//     fwdbwd_*_scaled); it never returns a silently degraded result.
+//     run_fwdbwd and soft_kernel_impl.inl); it never returns a silently degraded result.
 //   ScaledOrLog: Scaled, falling back per problem to Log where Scaled would throw.
 //   Log: the original log-space recurrences (lse per cell).  Unlimited range, slow.
 // The soft path is NOT bit-exact across modes, ISAs or compilers; it is tested with

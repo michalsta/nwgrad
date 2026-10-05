@@ -93,16 +93,17 @@ Build dependencies: `scikit-build-core`, `nanobind>=3.0` (the bindings call its 
   `92f45e0`); still needs a stated contract against concurrent mutation of a batch from
   two Python threads. Nothing implemented or measured.
 - Default thread count for short pairs: see `TODO.md`.
-- **Soft path: the remaining gap to hard `interpair`** (see "The soft path" below). Affine
-  is 3.1–3.5× of hard interpair on AVX2 and 2.8–3.2× on SSE2 (skynet); linear 2.9–4.8×. Next
-  levers, in expected value: (1) **linear gaps in the inter-pair soft pass** (interpair has
-  never taken linear; the per-pair scaled kernel is all linear has); (2) a **leveled
-  per-pair soft kernel** (`std::simd`, row-wise or striped) for alphabets > 8 / long pairs —
-  the per-pair scaled path is compiled at baseline SSE2 in the main TU, so AVX2/AVX-512/NEON
-  width is unused there; (3) soft groups still run the **guide Viterbi** (+ a traceback per
-  pair, ~1 µs of 4.4 on AVX2) only to keep `guide_j`/`aligned()`; a lazy guide would drop
-  it; (4) explicit FMA on the soft path (allowed — not bit-exact) in the level TUs.
-  Unmeasured: AVX-512 (W=8), NEON, wloczykij.
+- **Soft path: what is left** (see "The soft path" below; all four levers of the first
+  round are done). Affine soft is 2.1–2.4× of hard interpair on AVX2 with
+  `soft_guide="lazy"` (3.1–3.2× eager); per-pair protein soft is 1.0–2.1× of hard
+  (pointers) up to len 300. Candidates, in expected value: (1) **the eager guide** still
+  costs ~1.3 µs of 4.2 on AVX2 Manakov — a soft guide from the posterior (max-posterior
+  path, no Viterbi) or an inter-pair Viterbi for linear; (2) **memory** at len ≥ 1000 (three
+  forward tables of 8 B/cell leave L3; a checkpointed forward — every k-th row kept,
+  recomputed in backward — would trade ~1.5× compute for ~k× less traffic); (3) a
+  vector-scan gap carry (the four-cell stepping already puts one FMA per 4 cells on the
+  chain); (4) the inter-pair soft pass for alphabets > 8 via a per-row profile gather.
+  Unmeasured: AVX-512 (W=8), NEON speed, wloczykij.
 - **Vector `exp`/`log` for the `"log"` soft path, if it ever matters.** The scaled path
   makes no per-cell transcendental call, so this only speeds the fallback. Candidates (from
   memory, unchecked): SLEEF inline headers (BSL-1.0, per ISA, large), Agner Fog's VCL
@@ -375,94 +376,128 @@ skynet (Piledriver, W=2, 1 thread, 200k pairs): rowwise 12.4 µs/pair, interpair
 ### The soft path: scaled probability space (2026-10-05)
 
 **The soft path is NOT bit-exact** — across `soft_impl`, ISA levels, compilers, `fill`,
-or architectures — by decision (2026-10-05). Everything in this section is tested with
-tolerances (`tests/Python/test_soft_scaled.py`: 1e-11 relative/absolute against the
-log path; observed ~1e-15). The never-place-a-multiply-next-to-an-add rule and every
-bit-identity contract above apply to the Viterbi/hard path only, which this work did not
-touch. (The one shared piece, the guide Viterbi a soft pair runs, is the bit-exact
-hard fill.)
+`soft_guide` or architectures — by decision (2026-10-05). Everything in this section is
+tested with tolerances (`tests/Python/test_soft_scaled.py`: 1e-11 relative/absolute
+against the log path; observed ~1e-15). The never-place-a-multiply-next-to-an-add rule
+and every bit-identity contract above apply to the Viterbi/hard path only, which this
+work did not touch. (The one shared piece, the guide Viterbi a soft pair runs, is the
+bit-exact hard fill.) FMA contraction is ENABLED in the soft kernels only (per function:
+gcc `optimize("fp-contract=fast")`, clang `#pragma clang fp contract(fast)`); verified by
+disassembly that every FMA in the level objects is inside a soft kernel.
 
 **Why.** DiscrimAlign wants continuation (optimize soft scores, anneal T → 0) to escape the
 hard objective's kinks; that needs a fast soft path. The log-space one made ~50
 transcendental calls per affine cell (3 `lse3` forward, 9 `lse2` backward pushes, the
 gradient sweep): **214–258× hard interpair** on Manakov pairs (AVX2), 49–135× on SSE2.
 
-**`SoftImpl` / `soft_impl=`** on `SeqPair`, `SeqPairBatch`, `BatchAligner` and the four
-soft convenience functions: `"scaled"` (default) raises `ValueError` (C++
-`std::domain_error`) when a pair is out of range; `"scaled_or_log"` falls back per pair,
-silently; `"log"` is the original path.
+**API.** On `SeqPair`, `SeqPairBatch`, `BatchAligner` and the four soft convenience
+functions:
+- `soft_impl=`: `"scaled"` (default) raises `ValueError` (C++ `std::domain_error`) when a
+  pair is out of range; `"scaled_or_log"` falls back per pair, silently; `"log"` is the
+  original path (and the test oracle).
+- `soft_temperature=` / `temperature=`: score T·log Z(θ/T), gradient = expected counts
+  under θ/T (the θ-derivative of that score). Scaled: weights exp(·/T). Log at T ≠ 1: runs
+  on a θ/T copy of the params and sweeps the gradient immediately (`soft_counts_ready_`).
+  Setting it on a `SeqPair` invalidates its cached score/grad.
+- `SeqPairBatch.soft_guide` (`SeqPair::set_soft_guide_lazy`): `"eager"` (default) — a soft
+  `score_and_grad()` runs the guide Viterbi as always; `"lazy"` — it does not, and the guide
+  is computed on first use (`guide_j`, `realign_banded`, `banded_grad`) under the params
+  CURRENT THEN. Deliberately opt-in: `score_and_grad(); params += lr*g; banded_grad()` is a
+  plausible loop (in-place updates exist: `__iadd__`, the gap setters), and a lazy default
+  would silently band around θ₁'s path instead of θ₀'s. Lazy is for loops that rescore in
+  full every step (continuation); a lazy soft interpair group skips the Viterbi fill.
 
-**Scaled (`fwdbwd_*_scaled` in `aligner.hpp`).** The same recurrences with exp applied:
-each lse becomes +, each +score ×exp(score). Weights are exp'd once per problem (|Σ|² +
-4 calls); a query profile (`buf.sqp`) makes rows read them contiguously. Each forward row
-is stored ×2^-S[i], each backward row ×2^-T[i] — POWERS OF TWO, so rescaling is exact —
-and Z = 2^ze·zr, so every posterior factor is an exact `ldexp(1/zr, S+T-ze)`: one `log`
-per pair, no transcendental call per cell or per row. Backward keeps two rolling rows (no
-B tables at all) and accumulates the gradient as it goes (`scnt_`/`sg_*`, added by
-`soft_grad()`): the separate gradient sweep is gone. Local's free start/end ("0 in log
-space") is `2^-S` / `2^-T` in scaled units. Rows are split into carry-free passes plus one
-serial gap carry stepped two cells at a time (`carry_fwd/bwd`, reassociated); the
-reductions carry `#pragma omp simd reduction` (the build adds `-fopenmp-simd`, which
-enables only that pragma; no hard-path loop has it).
+**Scaled algorithm.** The same recurrences with exp applied: each lse becomes +, each
++score ×exp(score). Weights are exp'd once per problem (|Σ|² + 4 calls); a query profile
+(`buf.sqp`) makes rows read them contiguously. Each forward row is stored ×2^-S[i], each
+backward row ×2^-T[i] — POWERS OF TWO, so rescaling is exact — and Z = 2^ze·zr (zr
+normalized into [1, 2)), so every posterior factor is an exact `ldexp(1/zr, S+T-ze)`: one
+`log` per pair, no transcendental call per cell or per row. Backward keeps rolling rows
+(no B tables at all) and accumulates the gradient as it goes (`scnt_`/`sg_*`, added by
+`soft_grad()`). Local's free start/end ("0 in log space") is `2^-S` / `2^-T` in scaled
+units. Rescaling is LAZY: a row is rescaled only when its max leaves [2^-256, 2^256].
 
 **Range — a rigorous bound, not a heuristic.** All terms are non-negative, so normal
 doubles carry full relative precision; the only error is mass LOST below `DBL_MIN`
 (subnormal cells, a weight like exp(-100), an underflowed free start). A lost term is
 < `DBL_MIN` in its row's stored units (×2^-k if the row was scaled UP), and mass lost at a
-cell moves any posterior — and Z — by at most its own posterior, lost·B̂·2^(S+T-ze)/zr.
-Each row's bound is thus computable from quantities in hand (`row_loss`); a pair fails
-when the sum exceeds 2^-45, or a weight/row overflows (a step score beyond ~709 nats).
-An earlier per-cell rule (every cell 0 or normal; weights ≥ 2^-50) was far too strict: it
-refused gap cost 100 and a 200-aa local protein self-pair whose log Z is ~1600 nats —
-both are fine and now pass (agreeing with the log path to 1e-11). What genuinely fails:
-extreme score ranges / very low T, where forward and backward mass of a row sit ~1000
-binary orders apart. `test_temperature_low_limit` runs T = 0.02 (steps ~150 nats) in range.
+cell moves any posterior — and Z — by at most its own posterior. So each row's damage is
+bounded by `32(n+1)·DBL_MIN·(lf·maxB̂ + lb·maxF̂)·2^(S+T-ze)/zr` with the rows' ACTUAL maxima
+(`sp_loss`), computable from quantities in hand; a pair fails when the sum exceeds 2^-45,
+or a weight/row overflows (a step score beyond ~709 nats). An earlier per-cell rule (every
+cell 0 or normal; weights ≥ 2^-50) refused gap cost 100 and a 200-aa local protein
+self-pair with log Z ~1600 nats — both are fine and pass (1e-11 vs log). What genuinely
+fails: extreme score ranges / very low T, where a row's forward and backward mass sit
+~1000 binary orders apart. `test_lazy_rescale_both_directions` forces rescales up and
+down, full and banded; `test_temperature_low_limit` runs T = 0.02 in range.
 
-**Temperature** (`soft_temperature=` / `temperature=`): score T·log Z(θ/T), gradient =
-expected counts under θ/T (the θ-derivative of that score). Scaled: weights exp(·/T).
-Log at T ≠ 1: runs on a θ/T copy of the params and sweeps the gradient immediately
-(`soft_counts_ready_`), since the lazy `soft_grad` would otherwise read θ. Setting it on a
-`SeqPair` invalidates its cached score/grad.
+**Kernels — two, both leveled.**
+- **Per pair: `soft_kernel_impl.inl`** (`SoftPairJob`; `soft_pair_linear/affine`). Any
+  alphabet, Full or GuideBanded (the `Aligner` precomputes per-row `jlo/jhi/jlo0/jhi0` and
+  the init span into arrays). No include guard: compiled once per ISA level (registered
+  as `LevelKernels::soft_pair_*`, with that level's `-march` and FMA) and once at baseline
+  inside `aligner.hpp` (`namespace nwgrad_soft_base`: `scalar_fallback`, header-only
+  builds, levels without a copy). All functions are `static` and namespaced, so the copies
+  never merge. Per row: one vector pass computing M, X and the Y carry's input; the carry
+  (four cells per step: one FMA per four cells on the serial chain); one vector pass for
+  totals/max. Backward: one vector pass, the carry, then ONE vector pass computing final
+  M/X, the max, every gradient sum and the match posteriors (`omp simd reduction`), on
+  pre-rescale values (weighted with the pre-rescale factor, so no correction is needed).
+  Leveling alone: **1.60–1.65×** on AVX2 (baseline copy 7.2 → 4.4 ns/cell, protein); the
+  restructuring and the four-cell carry: 4.4 → 3.4–3.6.
+- **Inter-pair: `inter_soft_impl.inl`** (`InterSoftJob`). Under `fill="interpair"`, a group
+  of W soft pairs (same params, gap model, len B, `soft_impl`, temperature; alphabet ≤ 8;
+  Full) runs one pair per lane: per-lane exponents, lazy rescale, each row's weights built
+  once by letter blend and reused by backward, ONE fused column loop per direction per
+  row, the gradient sums included, match counts accumulated per B letter by lane masks.
+  Lanes shorter than the group's longest A carry zero backward mass past their end. A
+  lane whose bound fails returns `ok = 0` and that pair runs its own path. Affine groups
+  share the interpair guide Viterbi fill (`score_and_grad_interleaved`); LINEAR groups
+  (interpair has no linear Viterbi) and lazy-guide groups skip it
+  (`score_and_grad_with_soft_lane`: own guide Viterbi, or none if lazy). Linear pairs are
+  eligible for interpair grouping only when soft; the plan's group key now includes the
+  gap model.
 
-**Inter-pair soft pass (`InterSoftJob`, `inter_soft_impl.inl`, leveled).** Under
-`fill="interpair"`, a group of W soft pairs (same params, len B, `soft_impl`,
-temperature) runs the scaled forward-backward one pair per lane, after the shared guide
-Viterbi. Per lane it is `fwdbwd_affine_scaled` with: per-lane exponents; LAZY rescale
-(only when a lane's row max leaves [2^-256, 2^256]; the loss bound then uses the rows'
-actual maxima, so nothing is lost in rigour); each row's weights built once (letter
-blend, as the Viterbi fill) and reused by backward; ONE fused column loop forward and ONE
-backward per row, the gradient sums included (they are linear in the row, so a rare
-rescale is applied to the sums afterwards); match counts accumulated per B letter by lane
-masks, no scatter. Lanes shorter than the group's longest A carry zero backward mass past
-their end. A lane whose bound fails returns `ok = 0` and that pair runs its own path
-(which then raises or falls back per `soft_impl`). Affine only; alphabets ≤ 8.
-
-**Measured** (`tools/bench_soft.py`, 100k Manakov pairs = `manakov_fit_rc.tsv` sampled
+**Measured — Manakov** (`tools/bench_soft.py`, 100k pairs of `manakov_fit_rc.tsv` sampled
 with seed 0, DiscrimAlign's fitted local DNA matrix, affine gaps 1.0/0.5, linear 1.2147,
-double; µs/pair, best of 3; ratio = soft / hard `interpair`+`pointers`):
+double; µs/pair, best of 3; ratio = soft / hard `interpair`+`pointers`; soft also
+`interpair`):
 
-| host | threads | config | hard interpair | soft log (before) | soft scaled (now) |
-|---|---|---|---|---|---|
-| nighthaven avx2 | 1 | local-affine | 1.32 | 334.6 (258×) | **4.40 (3.3×)** |
-| | 1 | global-affine | 1.11 | 241.4 (214×) | **3.86 (3.5×)** |
-| | 1 | local-linear | 3.45 | 140.6 (41×) | 10.10 (2.9×) |
-| | 1 | global-linear | 1.81 | 78.7 (42×) | 8.19 (4.5×) |
-| | 12 | local-affine | 0.246 | — | **0.774 (3.1×)** |
-| | 12 | global-affine | 0.216 | — | **0.702 (3.2×)** |
-| | 12 | local-linear | 0.422 | — | 1.263 (3.0×) |
-| | 12 | global-linear | 0.255 | — | 1.019 (4.0×) |
-| skynet sse2 | 1 | local-affine | 10.5 | 1422 (135×) | **30.98 (2.8×)** |
-| | 1 | global-affine | 8.1 | 1014 (125×) | **27.05 (3.2×)** |
-| | 1 | local-linear | 9.5 | 467 (49×) | 33.27 (3.4×) |
-| | 1 | global-linear | 5.4 | 298 (55×) | 25.92 (4.8×) |
+| host | thr | config | hard | soft log (before) | soft eager | soft lazy |
+|---|---|---|---|---|---|---|
+| nighthaven avx2 | 1 | local-affine | 1.32 | 334.6 (258×) | 4.19 (3.2×) | **2.87 (2.2×)** |
+| | 1 | global-affine | 1.17–1.21 | 241.4 (214×) | 3.86 (3.2×) | **2.66 (2.3×)** |
+| | 1 | local-linear | 3.42 | 140.6 (41×) | 5.51 (1.6×) | **2.08 (0.6×)** |
+| | 1 | global-linear | 1.84 | 78.7 (42×) | 3.42 (1.9×) | **1.84 (1.0×)** |
+| | 12 | local-affine | 0.25–0.26 | — | 0.774 (3.1×) | **0.539 (2.1×)** |
+| | 12 | global-affine | 0.22 | — | 0.709 (3.2×) | **0.510 (2.4×)** |
+| | 12 | local-linear | 0.42 | — | 0.735 (1.7×) | **0.365 (0.9×)** |
+| | 12 | global-linear | 0.26 | — | 0.546 (2.1×) | **0.330 (1.3×)** |
+| skynet sse2 | 1 | local-affine | 10.8 | 1422 (135×) | 31.3 (2.9×) | **20.5 (1.9×)** |
+| | 1 | global-affine | 8.1–8.3 | 1014 (125×) | 27.1 (3.3×) | **18.8 (2.3×)** |
+| | 1 | local-linear | 9.6 | 467 (49×) | 25.7 (2.7×) | **16.5 (1.7×)** |
+| | 1 | global-linear | 5.4 | 298 (55×) | 18.8 (3.5×) | **14.4 (2.7×)** |
 
-(log at 10k pairs on nighthaven, 20k on skynet.) Where the time goes, AVX2 local-affine:
-~1 µs guide Viterbi + traceback, ~3.4 µs soft. On SSE2 (W=2) the FIRST inter-pair soft
-pass (separate passes per row, eager rescale) was a wash against the per-pair kernel
-(~36 µs of soft work each); fusing it to one column loop per direction with lazy rescale
-took skynet local-affine from 45 to 31 µs/pair. The per-pair kernel (linear, protein,
-banded) is ~130 instructions/cell over many short passes — its next gain is width, not
-restructuring (see Open TODOs).
+(log at 10k pairs on nighthaven, 20k on skynet.) Linear soft beats hard linear on AVX2
+because hard linear has no simd kernel at all (see "no linear simd kernel" above).
+
+**Measured — per-pair protein** (`tools/bench_soft_protein.py`: random canonical-20
+sequences, BLOSUM62 ×0.3, gaps 11/1 ×0.3, affine, 200 pairs, 1 thread; hard = `pointers`):
+
+| host | len | mode | hard µs | soft eager | soft lazy | lazy ns/cell |
+|---|---|---|---|---|---|---|
+| nighthaven avx2 | 100 | local | 36.0 | 72.9 (2.0×) | **35.9 (1.0×)** | 3.59 |
+| | 100 | global | 20.2 | 55.1 (2.7×) | **34.2 (1.7×)** | 3.42 |
+| | 300 | local | 300.6 | 626 (2.1×) | **314 (1.0×)** | 3.49 |
+| | 300 | global | 144.4 | 451 (3.1×) | **303 (2.1×)** | 3.37 |
+| | 1000 | local | 3278 | 7790 (2.4×) | **4464 (1.4×)** | 4.46 |
+| | 1000 | global | 1577 | 6017 (3.8×) | **4330 (2.7×)** | 4.33 |
+| skynet sse2 | 100 | local | 152.0 | 350 (2.3×) | **202 (1.3×)** | 20.2 |
+| | 300 | global | 825.9 | 2407 (2.9×) | **1564 (1.9×)** | 17.4 |
+
+Before the leveled kernel the same protein runs were 23–26 ns/cell on skynet and
+7.2 ns/cell on nighthaven (baseline copy). At len 1000 the three forward tables (24
+B/cell, 24 MB) leave L3 and the kernel turns memory-bound (Open TODOs).
 
 ### Python bindings (`py_exports.cpp`)
 

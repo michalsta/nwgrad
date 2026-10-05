@@ -5,7 +5,7 @@
 //
 // The soft counterpart of inter_fill_entry: W pairs at once, one per vector lane, all
 // sharing B's length n, Full band.  Per lane it is exactly Aligner's scaled path
-// (fwdbwd_affine_scaled: probability space, power-of-two row rescaling, gradient fused
+// (soft_pair_affine in soft_kernel_impl.inl: probability space, power-of-two row rescaling, gradient fused
 // into the backward pass, the same lost-mass bound), so it is tolerance-equal to that
 // path, not bit-equal: the soft path is not bit-exact by design.  Per-lane differences:
 // each lane rescales by its own exponent (one scalar ilogb per lane per row), and a lane
@@ -294,7 +294,7 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_affine(InterSoftJob& J) noexcept {
 }
 
 // Linear gaps: one table, F(i,j) = F(i-1,j-1)·E + F(i-1,j)·eb + F(i,j-1)·ea (+ Local's
-// free start).  Per lane exactly Aligner::fwdbwd_linear_scaled; the same fused column
+// free start).  Per lane soft_pair_linear (soft_kernel_impl.inl); the same fused column
 // loops, lazy rescale and lost-mass bound as inter_soft_affine.  Gap opens are 0.
 NWGRAD_SOFT_FMA_FN static void inter_soft_linear(InterSoftJob& J) noexcept {
     NWGRAD_SOFT_FMA_BODY

@@ -273,7 +273,7 @@ using inter_fn = void (*)(InterJob&);
 
 // Inter-pair SOFT pass (scaled forward-backward with the gradient fused), double: the
 // same W-lane grouping as InterJob, Full band, affine or linear gaps, nalpha <= 8.  Per lane it is
-// Aligner::fwdbwd_affine_scaled — tolerance-equal, not bit-equal (the soft path is not
+// soft_pair_affine (soft_kernel_impl.inl) — tolerance-equal, not bit-equal (the soft path is not
 // bit-exact).  The caller supplies exp'd weights (temperature already applied) and
 // scratch; per lane it receives log Z (of params/T, NOT yet multiplied by T), the
 // expected match counts (nalpha x nalpha) and the four gap gradient fields
