@@ -390,3 +390,82 @@ def test_lazy_rescale_both_directions(gm, mode, bw):
         close(out[0][0], out[1][0])
         close(out[0][1], out[1][1])
         close(out[0][2], out[1][2])
+
+
+# ── soft_guide = "posterior" ──────────────────────────────────────────────────
+
+def _post_batch(A, B, params, gm, mode, fill, impl="scaled", T=1.0, guide="posterior",
+                cls=nwgrad.SeqPairBatchDouble):
+    b = cls(n_threads=2, traceback="pointers")
+    b.fill = fill
+    b.soft_impl = impl
+    b.soft_temperature = T
+    b.soft_guide = guide
+    b.add_many(A, B, params, gap_model=gm, mode=mode, grad_mode="soft")
+    b.score_and_grad()
+    return b
+
+
+@pytest.mark.parametrize("gm,mode", MODES)
+@pytest.mark.parametrize("cls", BATCHES)
+def test_soft_guide_posterior(gm, mode, cls):
+    """No Viterbi: the guide is the posterior's row argmax, non-decreasing.  Scores and
+    gradients are eager's; the guide agrees across scaled / log / interpair."""
+    rng = np.random.default_rng(91)
+    params = dna_params(rng, gaps=(1.0, 0.5, 1.5, 0.3) if gm == "affine" else (0, 0.9, 0, 1.2))
+    A = [rand_seq(rng, "ACGT", int(rng.integers(1, 30))) for _ in range(41)]
+    B = [rand_seq(rng, "ACGT", int(rng.integers(30, 36))) for _ in range(41)]
+    e = _post_batch(A, B, params, gm, mode, "striped", guide="eager", cls=cls)
+    runs = [_post_batch(A, B, params, gm, mode, f, impl=i, cls=cls)
+            for f, i in (("striped", "scaled"), ("striped", "log"), ("interpair", "scaled"))]
+    assert runs[0].soft_guide == "posterior"
+    for r in runs:
+        close(e.scores(), r.scores())
+        close(e.grads()[0], r.grads()[0])
+        close(e.grads()[1], r.grads()[1])
+    guides = [[list(r[i].guide_j) for i in range(len(A))] for r in runs]
+    # Not bit-exact: an exact tie in exact arithmetic (two exits scoring alike) may round
+    # either way per implementation, as the soft path does everywhere.
+    rows = sum(len(g) for g in guides[0])
+    for other in guides[1:]:
+        same = sum(x == y for g, h in zip(guides[0], other) for x, y in zip(g, h))
+        assert same / rows >= 0.97
+    for a, b, g in zip(A, B, guides[0]):
+        assert len(g) == len(a) + 1 and g == sorted(g) and 0 <= g[0] and g[-1] <= len(b)
+    runs[2].banded_grad(4)   # usable as a band centre
+
+
+@pytest.mark.parametrize("mode", ["global", "local"])
+def test_soft_guide_posterior_tracks_viterbi_when_cold(mode):
+    """At low temperature the posterior concentrates on the optimal path: its guide
+    and the Viterbi guide agree on nearly every row."""
+    rng = np.random.default_rng(92)
+    params = dna_params(rng, scale=2.0)
+    A = [rand_seq(rng, "ACGT", 25) for _ in range(30)]
+    B = [rand_seq(rng, "ACGT", 40) for _ in range(30)]
+    e = _post_batch(A, B, params, "affine", mode, "striped", impl="scaled_or_log", T=0.05,
+                    guide="eager")
+    p = _post_batch(A, B, params, "affine", mode, "striped", impl="scaled_or_log", T=0.05)
+    same = tot = 0
+    for i in range(30):
+        ge, gp = list(e[i].guide_j), list(p[i].guide_j)
+        lo, hi = 0, len(A[i])
+        if mode == "local":
+            # Outside its alignment a local Viterbi guide is interpolated (0,0)->(m,n);
+            # the posterior holds those rows at the alignment's ends.  Compare the rows
+            # the path actually crosses.
+            sp = nwgrad.SeqPairDouble(A[i], B[i], params, gap_model="affine", mode="local",
+                                      traceback="pointers")
+            sp.alloc_dp(); sp.align_full()
+            core = sp.aligned()[0].replace("-", "")
+            lo = A[i].find(core); hi = lo + len(core)
+            if not core:
+                continue
+        same += sum(x == y for x, y in zip(ge[lo:hi + 1], gp[lo:hi + 1])); tot += hi + 1 - lo
+    assert same / tot > 0.85
+
+
+def test_soft_guide_rejects_unknown_posterior_listed():
+    b = nwgrad.SeqPairBatchDouble(n_threads=1)
+    with pytest.raises(ValueError, match="posterior"):
+        b.soft_guide = "viterbi"

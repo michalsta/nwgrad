@@ -820,15 +820,19 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             NWGRAD_SOFT_TEMP_DOC "\nApplies to the pairs in the batch and to later add_many() ones.")
         .def_prop_rw(
             "soft_guide",
-            [](const SPB& s) { return s.soft_guide_lazy ? "lazy" : "eager"; },
+            [](const SPB& s) {
+                return s.soft_guide_lazy ? "lazy" : s.soft_guide_posterior ? "posterior" : "eager";
+            },
             [](SPB& s, const std::string& v) {
-                bool lazy;
-                if      (v == "eager") lazy = false;
-                else if (v == "lazy")  lazy = true;
+                bool lazy = false, post = false;
+                if      (v == "eager")     {}
+                else if (v == "lazy")      lazy = true;
+                else if (v == "posterior") post = true;
                 else throw nb::value_error(("nwgrad: unknown soft_guide \"" + v +
-                                            "\" (expected \"eager\" or \"lazy\")").c_str());
+                                            "\" (expected \"eager\", \"lazy\" or \"posterior\")").c_str());
                 s.soft_guide_lazy = lazy;
-                for (auto* sp : s.pairs) sp->set_soft_guide_lazy(lazy);
+                s.soft_guide_posterior = post;
+                for (auto* sp : s.pairs) { sp->set_soft_guide_lazy(lazy); sp->set_soft_guide_posterior(post); }
             },
             "When soft pairs compute their guide path (the Viterbi alignment that\n"
             "realign_banded()/banded_grad() band around).\n"
@@ -838,7 +842,12 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             "     set_params() or an in-place params update it follows the new params.\n"
             "     Saves the whole Viterbi for loops that rescore in full each step and\n"
             "     never band (soft-score continuation); use eager to band around the\n"
-            "     scored path.  Applies to the pairs in the batch and later add_many() ones.")
+            "     scored path.\n"
+            "  \"posterior\": it does not either; the guide comes from the forward-backward\n"
+            "     itself — per row of A the column of greatest posterior mass, made\n"
+            "     non-decreasing — under the params scored.  A band centre at no Viterbi\n"
+            "     cost, but the posterior's centre line, not the Viterbi path.\n"
+            "Applies to the pairs in the batch and later add_many() ones.")
         .def_prop_rw(
             "hb_cutoff",
             [](const SPB& s) { return s.hb_cutoff; },

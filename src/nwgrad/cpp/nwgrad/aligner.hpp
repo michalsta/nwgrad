@@ -433,6 +433,21 @@ struct Aligner {
         fwdbwd_is_newest_ = false;
     }
 
+    // soft_guide="posterior": the next forward-backward also records, per row of A, the
+    // column of greatest posterior mass; posterior_guide() turns those rows into a guide
+    // (non-decreasing, in [0, n]) — a band centre without running a Viterbi.
+    void set_posterior_guide(bool on) noexcept { want_post_ = on; }
+    static std::vector<int> monotone_guide(const int* rows, int m, int n) {
+        std::vector<int> gj(static_cast<size_t>(m) + 1);
+        int run = 0;
+        for (int i = 0; i <= m; ++i) {
+            run = std::max(run, std::min(std::max(rows[i], 0), n));
+            gj[static_cast<size_t>(i)] = run;
+        }
+        return gj;
+    }
+    std::vector<int> posterior_guide() const { return monotone_guide(post_rows_.data(), m_, n_); }
+
     // For a GuideBanded inter-pair fill (InterJobT::blo): this problem's rows as lane
     // `lane` of W — per row i (0..M) the computed columns [jlo, jhi] (empty past m) into
     // blo/bhi[i*W + lane], the initialised span (band_row_span, clipped to columns >= 1)
@@ -631,6 +646,8 @@ private:
     // Set by adopt_interleaved(): VM/VX/VY hold inter_w_ pairs' tables interleaved per
     // cell and this aligner's pair is lane inter_lane_.  0 = not interleaved; every fill
     // of this aligner's own clears it (run_viterbi).
+    bool             want_post_ = false;   // soft_guide="posterior": fill post_rows_
+    std::vector<int> post_rows_;
     int    inter_w_ = 0, inter_lane_ = 0;
     size_t inter_stride_ = 0;   // the interleaved tables' row length (>= stride_ if ragged)
     // Pointers mode: DM/DX/DY hold predecessor codes, VM/VX/VY are NOT retained.
@@ -3111,6 +3128,7 @@ private:
         if (soft_temp_ == 1.0) {
             if constexpr (GM == GapModel::Linear) fwdbwd_linear(buf);
             else                                   fwdbwd_affine(buf);
+            if (want_post_) posterior_rows_log(buf);
             return;   // soft_grad() sweeps the tables lazily, as it always has
         }
         // T != 1: run the log path on θ/T, and sweep the gradient NOW, while params_ and
@@ -3124,6 +3142,7 @@ private:
             AlignParams g = AlignParams::zeros_like(tp);
             if constexpr (GM == GapModel::Linear) { fwdbwd_linear(buf); soft_grad_linear(buf, g); }
             else                                   { fwdbwd_affine(buf); soft_grad_affine(buf, g); }
+            if (want_post_) posterior_rows_log(buf);
             const size_t nn = static_cast<size_t>(nalpha_) * nalpha_;
             scnt_.assign(g.matrix.data(), g.matrix.data() + nn);
             sg_go_a_ = g.gap_open_a; sg_ge_a_ = g.gap_extend_a;
@@ -3177,6 +3196,43 @@ private:
         return P;
     }
 
+    // soft_guide="posterior" on the log path: row i's column of greatest EXIT mass (see
+    // SoftPairJob::gpost), from the full log tables (first on ties, over the band) — as
+    // the scaled kernels.  Each row is taken relative to its largest posterior.
+    void posterior_rows_log(const DpBuffer& buf) {
+        post_rows_.assign(static_cast<size_t>(m_) + 1, 0);
+        std::vector<double> lp, ly;
+        const double lea = -params_->gap_extend_a;   // log ea (params_ is theta/T here)
+        for (int i = 0; i <= m_; ++i) {
+            const int lo = jlo0(i), hi = jhi0(i);
+            if (lo > hi) continue;
+            lp.assign(static_cast<size_t>(hi - lo + 2), NEG_INF);
+            ly.assign(static_cast<size_t>(hi - lo + 2), NEG_INF);
+            double rmax = NEG_INF;
+            for (int j = lo; j <= hi; ++j) {
+                double v, y;
+                if constexpr (GM == GapModel::Linear) {
+                    v = srat(buf.F, i, j) + srat(buf.B, i, j);
+                    y = (j < hi) ? srat(buf.F, i, j) + lea + srat(buf.B, i, j + 1) : NEG_INF;
+                } else {
+                    v = lse3(srat(buf.FM, i, j) + srat(buf.BM, i, j),
+                             srat(buf.FX, i, j) + srat(buf.BX, i, j),
+                             srat(buf.FY, i, j) + srat(buf.BY, i, j));
+                    y = (j < hi) ? srat(buf.FY, i, j + 1) + srat(buf.BY, i, j + 1) : NEG_INF;
+                }
+                lp[static_cast<size_t>(j - lo)] = v; ly[static_cast<size_t>(j - lo)] = y;
+                rmax = std::max(rmax, v);
+            }
+            double bv = -1.0; int bj = lo;
+            for (int j = lo; j <= hi; ++j) {
+                const double e = std::exp(lp[static_cast<size_t>(j - lo)] - rmax) -
+                                 std::exp(ly[static_cast<size_t>(j - lo)] - rmax);
+                if (e > bv) { bv = e; bj = j; }
+            }
+            post_rows_[static_cast<size_t>(i)] = bj;
+        }
+    }
+
     // Both gap models: build the SoftPairJob and run the per-pair kernel of this
     // aligner's backend (soft_kernel_impl.inl; the baseline copy when the backend is
     // scalar_fallback or its level has none).  False: out of range (see run_fwdbwd).
@@ -3185,6 +3241,7 @@ private:
         constexpr bool lin = (GM == GapModel::Linear);
         const double it = 1.0 / soft_temp_;
         SoftPairJob J{};
+        if (want_post_) { post_rows_.assign(static_cast<size_t>(m_) + 1, 0); J.gpost = post_rows_.data(); }
         J.ea = std::exp(-params_->gap_extend_a * it);
         J.eb = std::exp(-params_->gap_extend_b * it);
         if (!lin) {

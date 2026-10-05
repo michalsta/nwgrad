@@ -249,6 +249,10 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_affine(InterSoftJob& J) noexcept {
         ivd c = z, mx = z;
         ivd sx = z, sy = z, so = z, sob = z, acc[8];
         for (int cc = 0; cc < nm; ++cc) acc[cc] = z;
+        // soft_guide="posterior": each lane's row argmax of the posterior; the loop runs
+        // right to left, so >= keeps the leftmost (as the per-pair kernel's first >).
+        const bool post = J.gpost != nullptr;
+        ivd pbv = z - 1.0, pbj = z, pyn = z;   // pyn: the Y posterior at j+1 (exit mass)
         auto cell = [&](int j) {
             const ivd d = (En ? En[j + 1] * nM[j + 1] : z) + init;
             const ivd v = nX[j];
@@ -263,6 +267,14 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_affine(InterSoftJob& J) noexcept {
             cM[j] = mv; cX[j] = xv; cY[j] = y;
             c = y;
             mx = ivmax(mx, mv + xv + y);
+            if (post) {
+                const ivd py = fY[j] * y;
+                const ivd pv = fM[j] * mv + fX[j] * xv + py - pyn;
+                pyn = py;
+                const ivl up = pv >= pbv;
+                pbv = ivsel(up, pv, pbv);
+                pbj = ivsel(up, z + static_cast<double>(j), pbj);
+            }
             return std::make_pair(mv, xv);
         };
         if (i >= 1) {
@@ -291,6 +303,8 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_affine(InterSoftJob& J) noexcept {
             }
             cell(0);
         }
+        if (post)
+            for (int l = 0; l < IW; ++l) J.gpost[static_cast<size_t>(i) * IW + l] = static_cast<int>(pbj[l]);
         rescale(cM, cX, cY, nullptr, mx);
         for (int l = 0; l < IW; ++l)
             if (kv[l]) {
@@ -521,7 +535,10 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_linear(InterSoftJob& J) noexcept {
         const ivd* Ec = ER + static_cast<size_t>(i) * w2;
         ivd c = z, mx = z, sa = z, sb = z, acc[8];
         for (int cc = 0; cc < nm; ++cc) acc[cc] = z;
+        const bool post = J.gpost != nullptr;   // as in inter_soft_affine
+        ivd pbv = z - 1.0, pbj = z;
         for (int j = n; j >= 0; --j) {
+            const ivd bn = c;   // B at j+1 (exit mass)
             ivd b = (En ? En[j + 1] * nxt[j + 1] : z) + nxt[j] * eb + init + ea * c;
             if constexpr (Rag) {
                 if (!local) b = ivsel(top & endc[j], one, b);
@@ -529,6 +546,12 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_linear(InterSoftJob& J) noexcept {
             } else if (!local && j == n) b = ivsel(top, one, b);
             cur[j] = b; c = b;
             mx = ivmax(mx, b);
+            if (post) {
+                const ivd pv = f[j] * (b - ea * bn);
+                const ivl up = pv >= pbv;
+                pbv = ivsel(up, pv, pbv);
+                pbj = ivsel(up, z + static_cast<double>(j), pbj);
+            }
             if (j >= 1) sa += f[j - 1] * b;
             if (i >= 1) {
                 if (j >= kmin) sb += q[j] * b;
@@ -540,6 +563,8 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_linear(InterSoftJob& J) noexcept {
                 }
             }
         }
+        if (post)
+            for (int l = 0; l < IW; ++l) J.gpost[static_cast<size_t>(i) * IW + l] = static_cast<int>(pbj[l]);
         rescale(cur, mx);
         for (int l = 0; l < IW; ++l)
             if (kv[l]) {

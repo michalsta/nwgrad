@@ -245,6 +245,15 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear(SoftPairJob& J) noexcept {
                 sa += Fi[j - 1] * b;
             }
         }
+        if (J.gpost) {   // row argmax of the EXIT mass (see SoftPairJob::gpost)
+            int bj = lo0; double bv = -1.0;
+            for (int j = std::max(lo0, 0); j <= hi0; ++j) {
+                const double nb = j < hi0 ? cb[j + 1] : 0.0;
+                const double v = Fi[j] * (cb[j] - ea * nb);
+                if (v > bv) { bv = v; bj = j; }
+            }
+            J.gpost[i] = bj;
+        }
         const int kb = sp_lazy(mx, lo0, hi0, bad, cur);
         if (bad) return;
         const int Ti = Tn + kb;
@@ -448,6 +457,15 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine(SoftPairJob& J) noexcept {
                 sy += fY[j] * y;
                 so += (fM[j - 1] + fX[j - 1]) * y;
             }
+        }
+        if (J.gpost) {   // row argmax of the EXIT mass (see SoftPairJob::gpost)
+            int bj = lo0; double bv = -1.0;
+            for (int j = std::max(lo0, 0); j <= hi0; ++j) {
+                const double ny = j < hi0 ? fY[j + 1] * bY[j + 1] : 0.0;
+                const double v = fM[j] * bM[j] + fX[j] * bX[j] + fY[j] * bY[j] - ny;
+                if (v > bv) { bv = v; bj = j; }
+            }
+            J.gpost[i] = bj;
         }
         const int kb = sp_lazy(mx, lo0, hi0, bad, cM, cX, cY);
         if (bad) return;

@@ -153,8 +153,16 @@ struct SeqPairT {
     // set_params() or an in-place params update it follows the new params, not the ones
     // scored.  For loops that rescore in full every step and never band, lazy saves the
     // whole Viterbi; anything that bands around the scored path wants eager.
-    void set_soft_guide_lazy(bool lazy) noexcept { soft_guide_lazy_ = lazy; }
+    void set_soft_guide_lazy(bool lazy) noexcept { soft_guide_lazy_ = lazy; if (lazy) soft_guide_post_ = false; }
     bool soft_guide_lazy() const noexcept { return soft_guide_lazy_; }
+    // Posterior: score_and_grad() runs no Viterbi either; the guide is taken from the
+    // forward-backward itself — per row of A the column of greatest posterior mass, made
+    // non-decreasing (Aligner::posterior_guide).  Computed at score time under the params
+    // scored, like eager, so in-place params updates cannot move it; but it is the
+    // posterior's centre line, not the Viterbi path, so a band around it is a different
+    // band.  Deliberately opt-in.
+    void set_soft_guide_posterior(bool on) noexcept { soft_guide_post_ = on; if (on) soft_guide_lazy_ = false; }
+    bool soft_guide_posterior() const noexcept { return soft_guide_post_; }
 
     // Compute a pending lazy guide now (no-op otherwise).
     void resolve_guide(DpBuffer& buf) {
@@ -273,11 +281,14 @@ struct SeqPairT {
                 st.full_al.hard_grad_and_guide(buf, grad_, guide_j_);
                 return;
             }
-            if (grad_mode_ == GradMode::Soft && soft_guide_lazy_) {
+            if (grad_mode_ == GradMode::Soft && (soft_guide_lazy_ || soft_guide_post_)) {
+                st.full_al.set_posterior_guide(soft_guide_post_);
                 st.full_al.compute_forward_back(buf);
+                st.full_al.set_posterior_guide(false);
                 score_ = st.full_al.log_z();
                 grad_.zero();
                 grad_with_buf(st.full_al, buf);
+                if (soft_guide_post_) guide_j_ = st.full_al.posterior_guide();
                 return;
             }
             run_dp_with_buf(st.full_al, buf);
@@ -497,7 +508,9 @@ struct SeqPairT {
     // the interleaved VM/VX/VY, so the group's other lanes are untouched).
     // A soft lane's result from the inter-pair soft pass (InterSoftJob); used instead
     // of this pair's own forward-backward when ok.
-    struct SoftLane { double logz; const double* counts; const double* gaps; };
+    // gpost (posterior guide, optional): row i of this lane at gpost[i * gstride].
+    struct SoftLane { double logz; const double* counts; const double* gaps;
+                      const int* gpost = nullptr; int gstride = 0; };
 
     void score_and_grad_interleaved(DpBuffer& buf, int W, int lane,
                                     double local_best, int best_i, int best_j,
@@ -535,6 +548,7 @@ struct SeqPairT {
     void score_and_grad_with_soft_lane(DpBuffer& buf, const SoftLane* soft) {
         if (!soft || grad_mode_ != GradMode::Soft) { score_and_grad_with_dp(buf); return; }
         if (soft_guide_lazy_) guide_pending_ = true;
+        else if (soft_guide_post_ && soft->gpost) guide_pending_ = false;   // apply_soft_lane
         else {
             std::visit([&](auto& st) {
                 st.full_al.set_problem(a_idx_, b_idx_, *params_);
@@ -585,6 +599,7 @@ private:
     bool                 rowwise_full_ = false;
     SoftImpl             soft_impl_ = SoftImpl::Scaled;
     bool                 soft_guide_lazy_ = false;
+    bool                 soft_guide_post_ = false;
     bool                 guide_pending_ = false;   // lazy soft: guide not computed yet
     double               soft_temp_ = 1.0;
 
@@ -634,6 +649,12 @@ private:
         for (size_t k = 0; k < nn; ++k) g[k] = soft.counts[k];
         grad_.gap_open_a = soft.gaps[0]; grad_.gap_extend_a = soft.gaps[1];
         grad_.gap_open_b = soft.gaps[2]; grad_.gap_extend_b = soft.gaps[3];
+        if (soft_guide_post_ && soft.gpost) {
+            const int m = static_cast<int>(a_idx_.size()), n = static_cast<int>(b_idx_.size());
+            std::vector<int> rows(static_cast<size_t>(m) + 1);
+            for (int i = 0; i <= m; ++i) rows[static_cast<size_t>(i)] = soft.gpost[static_cast<size_t>(i) * soft.gstride];
+            guide_j_ = Aligner<GapModel::Linear, AlignMode::Global, AlignBand::Full, T>::monotone_guide(rows.data(), m, n);
+        }
     }
 
     // Accumulate grad from `al` using external `buf` into grad_.

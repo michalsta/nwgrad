@@ -24,7 +24,7 @@ ap.add_argument("--threads", type=int, nargs="+", default=[1])
 ap.add_argument("--reps", type=int, default=3)
 ap.add_argument("--impl", nargs="+", default=None,
                 help="soft_impl values to time (default: the build's default only)")
-ap.add_argument("--soft-guide", default="eager", choices=["eager", "lazy"],
+ap.add_argument("--soft-guide", default="eager", choices=["eager", "lazy", "posterior"],
                 help="SeqPairBatch.soft_guide for the soft arm")
 ap.add_argument("--prec", default="double", choices=["double", "float32"],
                 help="batch precision (float32: SeqPairBatch; the soft pass is double either way)")

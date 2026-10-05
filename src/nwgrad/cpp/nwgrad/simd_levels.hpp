@@ -311,6 +311,7 @@ struct InterSoftJob {
     double* scratch;                   // inter_soft_scratch(n, M, W) doubles, 64-byte aligned
     int* iscratch;                     // (M+1)*W ints
     double* logz; double* counts; double* gaps; int* ok;   // W, W*nalpha^2, W*4, W
+    int* gpost = nullptr;              // soft_guide="posterior": (M+1)*W, as SoftPairJob
 };
 using inter_soft_fn = void (*)(InterSoftJob&);
 
@@ -336,6 +337,13 @@ struct SoftPairJob {
     double* scnt; double* srow;     // nalpha^2, nalpha
     double log_z, g_oa, g_ea, g_ob, g_eb;
     int ok;
+    // soft_guide="posterior" (nullptr = not wanted): m+1 entries, row i's column of
+    // greatest EXIT mass (first on ties) — the posterior that the path leaves row i at
+    // column j: the cell's posterior minus the mass moving on left into (i, j+1) (the Y
+    // posterior there; linear: F(i,j)·ea·B(i,j+1)).  That is what a Viterbi guide
+    // records (the last column of row i on the path), so along a gap run only its last
+    // cell scores — a plain posterior argmax picks any cell of the run, on rounding.
+    int* gpost = nullptr;
 };
 using soft_pair_fn = void (*)(SoftPairJob&);
 // Whether a pair of lengths (la, lb) may join an inter-pair group: the group's
