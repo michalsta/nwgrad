@@ -292,8 +292,8 @@ struct InterSoftJob {
 };
 using inter_soft_fn = void (*)(InterSoftJob&);
 inline size_t inter_soft_scratch(int n, int M, int W) {
-    return (3 * static_cast<size_t>(M + 1) * (n + 1) + 8 * static_cast<size_t>(n + 2) +
-            static_cast<size_t>(M + 1)) * W;
+    return (3 * static_cast<size_t>(M + 1) * (n + 1) + static_cast<size_t>(M + 1) * (n + 2) +
+            7 * static_cast<size_t>(n + 2) + 2 * static_cast<size_t>(M + 1)) * W;
 }
 
 // Whole-row banded kernel for the GuideBanded path.  viterbi_affine_simd (in
