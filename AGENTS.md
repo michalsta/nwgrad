@@ -93,6 +93,24 @@ Build dependencies: `scikit-build-core`, `nanobind>=3.0` (the bindings call its 
   `92f45e0`); still needs a stated contract against concurrent mutation of a batch from
   two Python threads. Nothing implemented or measured.
 - Default thread count for short pairs: see `TODO.md`.
+- **Soft path: the remaining gap to hard `interpair`** (see "The soft path" below). Affine
+  is 3.1–3.5× of hard interpair on AVX2 and 2.8–3.2× on SSE2 (skynet); linear 2.9–4.8×. Next
+  levers, in expected value: (1) **linear gaps in the inter-pair soft pass** (interpair has
+  never taken linear; the per-pair scaled kernel is all linear has); (2) a **leveled
+  per-pair soft kernel** (`std::simd`, row-wise or striped) for alphabets > 8 / long pairs —
+  the per-pair scaled path is compiled at baseline SSE2 in the main TU, so AVX2/AVX-512/NEON
+  width is unused there; (3) soft groups still run the **guide Viterbi** (+ a traceback per
+  pair, ~1 µs of 4.4 on AVX2) only to keep `guide_j`/`aligned()`; a lazy guide would drop
+  it; (4) explicit FMA on the soft path (allowed — not bit-exact) in the level TUs.
+  Unmeasured: AVX-512 (W=8), NEON, wloczykij.
+- **Vector `exp`/`log` for the `"log"` soft path, if it ever matters.** The scaled path
+  makes no per-cell transcendental call, so this only speeds the fallback. Candidates (from
+  memory, unchecked): SLEEF inline headers (BSL-1.0, per ISA, large), Agner Fog's VCL
+  (Apache-2.0, x86 only — breaks arm64), xsimd (BSD-3, heavy), glibc libmvec (no
+  musl/macOS); libstdc++ `<experimental/simd>` math is believed to be per-element scalar —
+  check the disassembly. Preferred if needed: ~25-line hand-written `std::simd` exp (Cody–
+  Waite reduction + degree-11 polynomial + exponent bits) and log (frexp + atanh series),
+  ~1 ULP, which this path's tolerances allow.
 
 ## Architecture
 
@@ -343,7 +361,7 @@ So: **Pointers when it fits and threads ≤ its peak; Hirschberg above the cross
 **Why.** On miRNA × target-site pairs (Manakov: 2.5M pairs, A ~22, B = 50) the striped Full kernel is the wrong tool. Its lazy-F fixpoint is data-dependent and worst when gaps are cheap: DiscrimAlign's fitted parameters (gaps at the −1e-4 cap) cost **+25%** over its starting ones on the same pairs (2.39 → 2.99 s, nighthaven, 12 threads, score-only nearly identical, so it is the fill, not the traceback). Both new fills are opt-in on `SeqPairBatch.fill` (`SeqPair.fill` takes the first two), default stays `"striped"`, and both give **bit-identical** scores, paths and gradients (`tests/Python/test_fill.py`; DiscrimAlign full fits identical to the last bit).
 
 - **`"rowwise"`** — the Full band runs the row-wise kernel (`viterbi_affine_simd`, otherwise the GuideBanded path) instead of the striped one (`Aligner::set_rowwise_full`). No lazy-F; the VY carry is a plain serial chain. Keeps VM/VX/VY (24 B/cell) even under `traceback="pointers"`, read back by the Scores traceback. Two exact fixes made it faster still: the Full path initialises only row 0 and column 0 instead of `band_fill`ing all three tables (−12%), and the Local best-cell rescan stops at the first cell equal to the row max instead of scanning the row against a moving best (−6%; it was 17% of a pair's instructions under callgrind).
-- **`"interpair"`** — `score_and_grad()` fills W pairs at once, one per vector lane (`InterJob`, `inter_kernel_impl.inl`, leveled, W = KW: 2 on SSE2/NEON, 4 on AVX2, 8 on AVX-512). Each lane runs the row-wise recurrence (same max/add/sub, same order — so each lane's table is bit-identical to the pair's own fill), the VY carry is a lane-wise chain with no cross-lane fixup, and the substitution score is a blend tree on the B residue's bits (alphabets ≤ 8; DNA = 2 levels), not a gather. Tables are interleaved per cell; the pair then `adopt_interleaved()`s its lane (a `cell_index` layout, `inter_w_`/`inter_lane_`), so the existing traceback, `guide_j` and `hard_grad` run unchanged. Pairs are grouped by (backend, mode, len B), sorted by len A; the grouping is built once and cached (`plan_`, keyed by a generation counter bumped by `add`/`add_many`, and the default ISA) — rebuilding it per call was **~0.9 s serial on 2.5M pairs** and capped scaling at 3.4×. Pairs it cannot take (float32, linear, soft, alphabet > 8, scalar backend, Hirschberg past its cutoff, a group whose pairs carry different params) run their own fill in the same pass. This is the inter-sequence layout the vectorization notes above reject *for protein alphabets*: with 4 letters the lookup is 3 blends per vector, not a gather.
+- **`"interpair"`** — `score_and_grad()` fills W pairs at once, one per vector lane (`InterJob`, `inter_kernel_impl.inl`, leveled, W = KW: 2 on SSE2/NEON, 4 on AVX2, 8 on AVX-512). Each lane runs the row-wise recurrence (same max/add/sub, same order — so each lane's table is bit-identical to the pair's own fill), the VY carry is a lane-wise chain with no cross-lane fixup, and the substitution score is a blend tree on the B residue's bits (alphabets ≤ 8; DNA = 2 levels), not a gather. Tables are interleaved per cell; the pair then `adopt_interleaved()`s its lane (a `cell_index` layout, `inter_w_`/`inter_lane_`), so the existing traceback, `guide_j` and `hard_grad` run unchanged. Pairs are grouped by (backend, mode, len B), sorted by len A; the grouping is built once and cached (`plan_`, keyed by a generation counter bumped by `add`/`add_many`, and the default ISA) — rebuilding it per call was **~0.9 s serial on 2.5M pairs** and capped scaling at 3.4×. Pairs it cannot take (float32, linear, alphabet > 8, scalar backend, Hirschberg past its cutoff, a group whose pairs carry different params) run their own fill in the same pass. Soft pairs DO join (since 2026-10-05): the shared fill is their guide Viterbi, and a group whose real lanes are all soft with one `soft_impl` (not `"log"`) and one temperature also shares the forward-backward (`InterSoftJob`, see "The soft path"). This is the inter-sequence layout the vectorization notes above reject *for protein alphabets*: with 4 letters the lookup is 3 blends per vector, not a gather.
 
 **Measured** (nighthaven i5-12500, AVX2, all 2.5M Manakov pairs, DiscrimAlign's fitted parameters, `score_and_grad()`):
 
@@ -354,10 +372,102 @@ So: **Pointers when it fits and threads ≤ its peak; Hirschberg above the cross
 
 skynet (Piledriver, W=2, 1 thread, 200k pairs): rowwise 12.4 µs/pair, interpair 12.1 — a tie; 128-bit lanes barely pay for the interleaved tables there. Not yet measured for speed: AVX-512 (W=8), NEON; their correctness is covered by the wheel workflow's test runs (linux-aarch64, macos-arm64) and by `test_every_isa_level` on whatever levels the runner offers.
 
+### The soft path: scaled probability space (2026-10-05)
+
+**The soft path is NOT bit-exact** — across `soft_impl`, ISA levels, compilers, `fill`,
+or architectures — by decision (2026-10-05). Everything in this section is tested with
+tolerances (`tests/Python/test_soft_scaled.py`: 1e-11 relative/absolute against the
+log path; observed ~1e-15). The never-place-a-multiply-next-to-an-add rule and every
+bit-identity contract above apply to the Viterbi/hard path only, which this work did not
+touch. (The one shared piece, the guide Viterbi a soft pair runs, is the bit-exact
+hard fill.)
+
+**Why.** DiscrimAlign wants continuation (optimize soft scores, anneal T → 0) to escape the
+hard objective's kinks; that needs a fast soft path. The log-space one made ~50
+transcendental calls per affine cell (3 `lse3` forward, 9 `lse2` backward pushes, the
+gradient sweep): **214–258× hard interpair** on Manakov pairs (AVX2), 49–135× on SSE2.
+
+**`SoftImpl` / `soft_impl=`** on `SeqPair`, `SeqPairBatch`, `BatchAligner` and the four
+soft convenience functions: `"scaled"` (default) raises `ValueError` (C++
+`std::domain_error`) when a pair is out of range; `"scaled_or_log"` falls back per pair,
+silently; `"log"` is the original path.
+
+**Scaled (`fwdbwd_*_scaled` in `aligner.hpp`).** The same recurrences with exp applied:
+each lse becomes +, each +score ×exp(score). Weights are exp'd once per problem (|Σ|² +
+4 calls); a query profile (`buf.sqp`) makes rows read them contiguously. Each forward row
+is stored ×2^-S[i], each backward row ×2^-T[i] — POWERS OF TWO, so rescaling is exact —
+and Z = 2^ze·zr, so every posterior factor is an exact `ldexp(1/zr, S+T-ze)`: one `log`
+per pair, no transcendental call per cell or per row. Backward keeps two rolling rows (no
+B tables at all) and accumulates the gradient as it goes (`scnt_`/`sg_*`, added by
+`soft_grad()`): the separate gradient sweep is gone. Local's free start/end ("0 in log
+space") is `2^-S` / `2^-T` in scaled units. Rows are split into carry-free passes plus one
+serial gap carry stepped two cells at a time (`carry_fwd/bwd`, reassociated); the
+reductions carry `#pragma omp simd reduction` (the build adds `-fopenmp-simd`, which
+enables only that pragma; no hard-path loop has it).
+
+**Range — a rigorous bound, not a heuristic.** All terms are non-negative, so normal
+doubles carry full relative precision; the only error is mass LOST below `DBL_MIN`
+(subnormal cells, a weight like exp(-100), an underflowed free start). A lost term is
+< `DBL_MIN` in its row's stored units (×2^-k if the row was scaled UP), and mass lost at a
+cell moves any posterior — and Z — by at most its own posterior, lost·B̂·2^(S+T-ze)/zr.
+Each row's bound is thus computable from quantities in hand (`row_loss`); a pair fails
+when the sum exceeds 2^-45, or a weight/row overflows (a step score beyond ~709 nats).
+An earlier per-cell rule (every cell 0 or normal; weights ≥ 2^-50) was far too strict: it
+refused gap cost 100 and a 200-aa local protein self-pair whose log Z is ~1600 nats —
+both are fine and now pass (agreeing with the log path to 1e-11). What genuinely fails:
+extreme score ranges / very low T, where forward and backward mass of a row sit ~1000
+binary orders apart. `test_temperature_low_limit` runs T = 0.02 (steps ~150 nats) in range.
+
+**Temperature** (`soft_temperature=` / `temperature=`): score T·log Z(θ/T), gradient =
+expected counts under θ/T (the θ-derivative of that score). Scaled: weights exp(·/T).
+Log at T ≠ 1: runs on a θ/T copy of the params and sweeps the gradient immediately
+(`soft_counts_ready_`), since the lazy `soft_grad` would otherwise read θ. Setting it on a
+`SeqPair` invalidates its cached score/grad.
+
+**Inter-pair soft pass (`InterSoftJob`, `inter_soft_impl.inl`, leveled).** Under
+`fill="interpair"`, a group of W soft pairs (same params, len B, `soft_impl`,
+temperature) runs the scaled forward-backward one pair per lane, after the shared guide
+Viterbi. Per lane it is `fwdbwd_affine_scaled` with: per-lane exponents; LAZY rescale
+(only when a lane's row max leaves [2^-256, 2^256]; the loss bound then uses the rows'
+actual maxima, so nothing is lost in rigour); each row's weights built once (letter
+blend, as the Viterbi fill) and reused by backward; ONE fused column loop forward and ONE
+backward per row, the gradient sums included (they are linear in the row, so a rare
+rescale is applied to the sums afterwards); match counts accumulated per B letter by lane
+masks, no scatter. Lanes shorter than the group's longest A carry zero backward mass past
+their end. A lane whose bound fails returns `ok = 0` and that pair runs its own path
+(which then raises or falls back per `soft_impl`). Affine only; alphabets ≤ 8.
+
+**Measured** (`tools/bench_soft.py`, 100k Manakov pairs = `manakov_fit_rc.tsv` sampled
+with seed 0, DiscrimAlign's fitted local DNA matrix, affine gaps 1.0/0.5, linear 1.2147,
+double; µs/pair, best of 3; ratio = soft / hard `interpair`+`pointers`):
+
+| host | threads | config | hard interpair | soft log (before) | soft scaled (now) |
+|---|---|---|---|---|---|
+| nighthaven avx2 | 1 | local-affine | 1.32 | 334.6 (258×) | **4.40 (3.3×)** |
+| | 1 | global-affine | 1.11 | 241.4 (214×) | **3.86 (3.5×)** |
+| | 1 | local-linear | 3.45 | 140.6 (41×) | 10.10 (2.9×) |
+| | 1 | global-linear | 1.81 | 78.7 (42×) | 8.19 (4.5×) |
+| | 12 | local-affine | 0.246 | — | **0.774 (3.1×)** |
+| | 12 | global-affine | 0.216 | — | **0.702 (3.2×)** |
+| | 12 | local-linear | 0.422 | — | 1.263 (3.0×) |
+| | 12 | global-linear | 0.255 | — | 1.019 (4.0×) |
+| skynet sse2 | 1 | local-affine | 10.5 | 1422 (135×) | **30.98 (2.8×)** |
+| | 1 | global-affine | 8.1 | 1014 (125×) | **27.05 (3.2×)** |
+| | 1 | local-linear | 9.5 | 467 (49×) | 33.27 (3.4×) |
+| | 1 | global-linear | 5.4 | 298 (55×) | 25.92 (4.8×) |
+
+(log at 10k pairs on nighthaven, 20k on skynet.) Where the time goes, AVX2 local-affine:
+~1 µs guide Viterbi + traceback, ~3.4 µs soft. On SSE2 (W=2) the FIRST inter-pair soft
+pass (separate passes per row, eager rescale) was a wash against the per-pair kernel
+(~36 µs of soft work each); fusing it to one column loop per direction with lazy rescale
+took skynet local-affine from 45 to 31 µs/pair. The per-pair kernel (linear, protein,
+banded) is ~130 instructions/cell over many short passes — its next gain is width, not
+restructuring (see Open TODOs).
+
 ### Python bindings (`py_exports.cpp`)
 
 nanobind module `nwgrad_ext`, re-exported from `src/nwgrad/__init__.py`. Exposes:
-- 12 single-pair convenience functions, all with the signature `f(seq_a, seq_b, params, band=0, aligned_a="", aligned_b="", kernel="auto")` — they take plain `str` and encode internally, and the gap penalties ride in `params`, not the argument list. The affine naming is irregular and worth checking before use: `nw_score_affine` / `sw_score_affine` (suffix), but `nw_affine_grad` / `sw_affine_grad` / `nw_affine_soft_grad` / `sw_affine_soft_grad` (infix).
+- 12 single-pair convenience functions, all with the signature `f(seq_a, seq_b, params, band=0, aligned_a="", aligned_b="", kernel="auto")` (the four `*soft_grad` ones add `soft_impl="scaled"` and `temperature=1.0`) — they take plain `str` and encode internally, and the gap penalties ride in `params`, not the argument list. The affine naming is irregular and worth checking before use: `nw_score_affine` / `sw_score_affine` (suffix), but `nw_affine_grad` / `sw_affine_grad` / `nw_affine_soft_grad` / `sw_affine_soft_grad` (infix).
 - Classes: `Alphabet`, `SubstMatrix`, `AlignParams`, `BatchAligner`, `BatchResult`, `SeqPair`, `SeqPairBatch`
 - Alphabet constants: `nwgrad.DNA`, `DNA_N`, `RNA`, `RNA_N`, `PROTEIN`, `PROTEIN_X`, `PROTEIN_UO`, `PROTEIN_UOX`, plus `NCBI_PROTEIN` and `IUPAC_DNA` for the packaged matrices
 - Zero-copy numpy integration via nanobind buffer protocol
@@ -372,7 +482,7 @@ nanobind module `nwgrad_ext`, re-exported from `src/nwgrad/__init__.py`. Exposes
 ### Gradient modes
 
 - **Hard gradient** (`hard_grad`): Viterbi traceback → integer (a,b) amino acid pair counts along the optimal path. This is a subgradient.
-- **Soft gradient** (`soft_grad`): Forward-backward in log-space → expected pair counts over the Boltzmann ensemble (all alignments weighted by score). Uses `lse2(a,b) = a + log(1 + exp(b−a))` for numerical stability. This is the true gradient of the log-partition function.
+- **Soft gradient** (`soft_grad`): forward-backward → expected pair counts over the Boltzmann ensemble (all alignments weighted by score), the true gradient of the log-partition function. Default implementation: scaled probability space (`SoftImpl::Scaled`, see "The soft path"); the original log-space recurrences (`lse2(a,b) = a + log(1 + exp(b−a))`) remain as `soft_impl="log"` and as the test oracle. With `soft_temperature=T` the score is T·log Z(θ/T) and the gradient its θ-derivative, the expected counts under θ/T.
 
 **Local borders are free starts, not gap moves.** The local forward pass sets the border cells to constants (`F(i,0) = F(0,j) = 0`, `FM` likewise; `FX`/`FY` unreachable there), so a gap transition *into* a border cell does not exist. The gap loops in `soft_grad_linear`/`soft_grad_affine` therefore start their targets at `kGapTargetMin` = 1 for Local (0 for Global, whose borders genuinely are charged gap runs). The backward pass still leaves finite values on the borders; they are simply never consumed as a gap target. Until `03b2a7d` they were, and the local gap gradient disagreed with the derivative of the very log Z the library returned (one-cell oracle: `tests/Python/test_local_soft_gap_derivatives.py`, `tests/cpp/test_gradient.cpp`).
 
