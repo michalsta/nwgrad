@@ -469,6 +469,7 @@ struct SeqPairBatchT {
         const size_t N = pairs.size();
         if (N == 0) return 0.0;
         std::vector<double> scores(N, 0.0);
+        ++full_calls_;   // guides may have moved: the banded grouping is stale
 
         if (inter_fill)           score_and_grad_inter_(scores);
         else if (sorted_schedule) score_and_grad_sorted_(scores);
@@ -494,8 +495,9 @@ struct SeqPairBatchT {
                 std::to_string(bandwidth) + "); use score_and_grad() for full DP");
         std::vector<double> scores(N, 0.0);
 
-        if (sorted_schedule) banded_grad_lpt_(scores, bandwidth);
-        else                 banded_grad_dynamic_(scores, bandwidth);
+        if (inter_fill)           banded_grad_inter_(scores, bandwidth);
+        else if (sorted_schedule) banded_grad_lpt_(scores, bandwidth);
+        else                      banded_grad_dynamic_(scores, bandwidth);
 
         return std::accumulate(scores.begin(), scores.end(), 0.0);
     }
@@ -693,6 +695,156 @@ private:
             }
         };
         run_workers(tasks, worker);
+    }
+
+    // banded_grad() under fill = "interpair": the same groups as score_and_grad(), each
+    // a GuideBanded InterJob — every lane around its own guide, its tables bit-identical
+    // to its own banded fill (see InterJobT::blo).  Hard pairs only: a group with a soft
+    // lane (banded forward-backward), mixed params, or linear Global below 4 lanes runs
+    // each pair's own banded path, as do the pairs outside the plan.
+    void banded_grad_inter_(std::vector<double>& scores, int bandwidth) {
+        const int def_backend = global_default_backend();
+        if (plan_.generation != generation_ || plan_.default_backend != def_backend ||
+            plan_.n_pairs != pairs.size() || !inter_plan_cutoffs_match_())
+            build_inter_plan_(def_backend);
+        if (band_.plan_gen != plan_.generation || band_.plan_n != plan_.n_pairs ||
+            band_.full_calls != full_calls_ || band_.default_backend != def_backend)
+            build_band_groups_();
+        const auto& elig = band_.elig;
+        const auto& other = plan_.other;
+        const auto& backend = plan_.backend;
+        const auto& groups = band_.groups;
+        const size_t G = groups.size(), tasks = G + other.size();
+        std::atomic<size_t> idx{0};
+        auto worker = [&]() {
+            DpBuffer buf;
+            std::vector<const unsigned char*> a, b;
+            std::vector<int> m, bi, bj, blo, bhi, ulo, uhi, bri, brj;
+            std::vector<T> best, blkT;
+            auto own = [&](size_t i) {
+                pairs[i]->banded_grad_with_dp(buf, bandwidth);
+                scores[i] = pairs[i]->score();
+            };
+            while (true) {
+                const size_t t = idx.fetch_add(1, std::memory_order_relaxed);
+                if (t >= tasks) break;
+                if (t >= G) { own(other[t - G]); continue; }
+                const auto [s, e] = groups[t];
+                const size_t real = e - s;
+                const SeqPair& p0 = *pairs[elig[s]];
+                const LevelKernels& K = level_kernels(backend[elig[s]]);
+                bool shared = linear_fill_ok_(p0, K);
+                for (size_t l = 0; l < real && shared; ++l) {
+                    const SeqPair& p = *pairs[elig[s + l]];
+                    shared = p.params_ptr() == p0.params_ptr() && p.grad_mode() != GradMode::Soft;
+                }
+                if (!shared) { for (size_t l = 0; l < real; ++l) own(elig[s + l]); continue; }
+                const int W = inter_w_(K);
+                int M = 0;
+                for (size_t l = 0; l < real; ++l)
+                    M = std::max(M, static_cast<int>(pairs[elig[s + l]]->len_a()));
+                const int n = static_cast<int>(p0.len_b());
+                a.assign(W, nullptr); b.assign(W, nullptr); m.assign(W, 0);
+                bi.assign(W, 0); bj.assign(W, 0); best.assign(W, T(0));
+                bri.assign(W, 0); brj.assign(W, 0);
+                blo.assign(static_cast<size_t>(M + 1) * W, 1);
+                bhi.assign(static_cast<size_t>(M + 1) * W, 0);
+                ulo.assign(M + 1, n + 1); uhi.assign(M + 1, 0);
+                for (int l = 0; l < W; ++l) {
+                    // Spare lanes: the last pair's codes, no rows (m = 0), empty bands.
+                    SeqPair& p = *pairs[elig[s + std::min<size_t>(l, real - 1)]];
+                    a[l] = p.a_codes().data(); b[l] = p.b_codes().data();
+                    if (static_cast<size_t>(l) >= real) continue;
+                    m[l] = static_cast<int>(p.len_a());
+                    p.banded_lane_setup(bandwidth, W, l, M, blo.data(), bhi.data(),
+                                        ulo.data(), uhi.data(), bri[l], brj[l]);
+                }
+                const AlignParams& P = *p0.params_ptr();
+                const bool lin = p0.gap_model() == GapModel::Linear;
+                const size_t sz = static_cast<size_t>(M + 1) * (n + 1) * W;
+                if (lin) { if (buf.H.size() < sz) buf.H.resize(sz); }
+                else if (buf.VM.size() < sz) { buf.VM.resize(sz); buf.VX.resize(sz); buf.VY.resize(sz); }
+                InterJobT<T> job{};
+                job.a = a.data(); job.m = m.data(); job.b = b.data(); job.n = n; job.M = M;
+                job.align_mode = (p0.align_mode() == AlignMode::Local) ? 1 : 0;
+                const size_t nb = static_cast<size_t>(P.matrix.size()) * P.matrix.size();
+                blkT.resize(nb);
+                for (size_t k = 0; k < nb; ++k) blkT[k] = static_cast<T>(P.matrix.data()[k]);
+                job.blk = blkT.data(); job.nalpha = P.matrix.size();
+                job.go_a = static_cast<T>(P.gap_open_a); job.ge_a = static_cast<T>(P.gap_extend_a);
+                job.go_b = static_cast<T>(P.gap_open_b); job.ge_b = static_cast<T>(P.gap_extend_b);
+                job.linear = lin ? 1 : 0;
+                if (lin) job.VM = buf.H.data();
+                else { job.VM = buf.VM.data(); job.VX = buf.VX.data(); job.VY = buf.VY.data(); }
+                job.best = best.data(); job.best_i = bi.data(); job.best_j = bj.data();
+                job.blo = blo.data(); job.bhi = bhi.data();
+                job.ulo = ulo.data(); job.uhi = uhi.data();
+                job.bri = bri.data(); job.brj = brj.data();
+                if constexpr (std::is_same_v<T, double>) K.inter_fill(job);
+                else                                     K.inter_fill_f(job);
+                for (size_t l = 0; l < real; ++l) {
+                    const size_t i = elig[s + l];
+                    pairs[i]->banded_grad_interleaved(buf, W, static_cast<int>(l),
+                                                      best[l], bi[l], bj[l]);
+                    scores[i] = pairs[i]->score();
+                }
+            }
+        };
+        run_workers(tasks, worker);
+    }
+
+    // The banded grouping: the plan's eligible pairs, within each run of equal (backend,
+    // gap model, mode, len B), re-sorted by where the guide runs (its column at the
+    // middle row of A, then len A) — lanes whose bands overlap make the union each row
+    // computes narrow (Manakov local, W=4: 79 vector cells per pair against 169 sorted by
+    // len A).  Speed only: any grouping is bit-exact.  Rebuilt when the plan is, or after
+    // a score_and_grad() (which recomputes every guide); banded_grad() steps reuse it.
+    struct BandGroups {
+        size_t plan_gen = static_cast<size_t>(-1), plan_n = 0, full_calls = static_cast<size_t>(-1);
+        int default_backend = -1000;
+        std::vector<size_t> elig;
+        std::vector<std::pair<size_t, size_t>> groups;
+    };
+    BandGroups band_;
+    size_t full_calls_ = 0;
+
+    void build_band_groups_() {
+        const auto& E = plan_.elig;
+        BandGroups Bg;
+        Bg.plan_gen = plan_.generation; Bg.plan_n = plan_.n_pairs;
+        Bg.full_calls = full_calls_; Bg.default_backend = plan_.default_backend;
+        Bg.elig = E;
+        struct Key { int mid, len_a; size_t i; };
+        std::vector<Key> keys;
+        for (size_t s = 0; s < E.size();) {
+            const SeqPair& p0 = *pairs[E[s]];
+            const int be = plan_.backend[E[s]];
+            size_t e = s + 1;
+            while (e < E.size()) {
+                const SeqPair& p = *pairs[E[e]];
+                if (plan_.backend[E[e]] != be || p.gap_model() != p0.gap_model() ||
+                    p.align_mode() != p0.align_mode() || p.len_b() != p0.len_b()) break;
+                ++e;
+            }
+            keys.clear();
+            for (size_t k = s; k < e; ++k) {
+                const SeqPair& p = *pairs[E[k]];
+                const auto& g = p.guide_j_raw();
+                const int la = static_cast<int>(p.len_a());
+                keys.push_back({g.size() > static_cast<size_t>(la / 2) ? g[la / 2] : 0, la, E[k]});
+            }
+            std::sort(keys.begin(), keys.end(), [](const Key& x, const Key& y) {
+                if (x.mid != y.mid) return x.mid < y.mid;
+                if (x.len_a != y.len_a) return x.len_a < y.len_a;
+                return x.i < y.i;
+            });
+            for (size_t k = s; k < e; ++k) Bg.elig[k] = keys[k - s].i;
+            const int W = inter_w_(level_kernels(be));
+            for (size_t g = s; g < e; g += W)
+                Bg.groups.emplace_back(g, std::min(e, g + static_cast<size_t>(W)));
+            s = e;
+        }
+        band_ = std::move(Bg);
     }
 
     struct InterPlan {

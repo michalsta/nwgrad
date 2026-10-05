@@ -273,6 +273,14 @@ struct InterJobT {
     int linear;                      // 1 = linear gaps: H in VM only (go_*, VX, VY unused)
     T* VM; T* VX; T* VY;             // (M+1)*(n+1)*W each
     T* best; int* best_i; int* best_j;   // W each, Local only
+    // GuideBanded (nullptr = Full): each lane around its own guide, its tables bit-
+    // identical to that pair's own banded fill (Aligner::banded_lane_rows fills these).
+    // blo/bhi: (M+1)*W, row i lane l computes columns [blo, bhi] (empty past its m);
+    // ulo/uhi: M+1, the columns >= 1 the row computes — the union of the lanes'
+    // initialised spans; bri/brj: W, Global border_rows / border_cols.
+    const int* blo = nullptr; const int* bhi = nullptr;
+    const int* ulo = nullptr; const int* uhi = nullptr;
+    const int* bri = nullptr; const int* brj = nullptr;
 };
 using InterJob = InterJobT<double>;
 using inter_fn   = void (*)(InterJobT<double>&);

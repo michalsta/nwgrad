@@ -326,6 +326,42 @@ struct SeqPairT {
         dp_valid_    = false;
     }
 
+    // banded_grad_with_dp() in two halves around a GuideBanded inter-pair fill (hard
+    // pairs; SeqPairBatch fill="interpair").  Setup: the banded problem, and this pair's
+    // rows as lane `lane` of the job (Aligner::banded_lane_rows).  Then, after the fill,
+    // adopt the lane: score, the new guide and the gradient exactly as the own fill.
+    void banded_lane_setup(int bandwidth, int W, int lane, int M, int* blo, int* bhi,
+                           int* slo, int* shi, int& bri, int& brj) {
+        if (!path_valid_)
+            throw std::logic_error(
+                "nwgrad: banded_grad_with_dp() needs a guide path; run the full "
+                "score_and_grad_with_dp() (or align_full()) at least once first");
+        std::visit([&](auto& st) {
+            st.band_al.set_problem(a_idx_, b_idx_, *params_, bandwidth, guide_j_);
+            st.band_al.banded_lane_rows(W, lane, M, blo, bhi, slo, shi, bri, brj);
+        }, state_);
+    }
+    void banded_grad_interleaved(DpBuffer& buf, int W, int lane,
+                                 double local_best, int best_i, int best_j) {
+        std::visit([&](auto& st) {
+            st.band_al.adopt_interleaved(buf, W, lane, local_best, best_i, best_j);
+            guide_j_ = st.band_al.guide_j_from_viterbi(buf);
+            score_ = st.band_al.score();
+            last_banded_ = true;
+            if (grad_mode_ != GradMode::None) {
+                grad_.zero();
+                grad_with_buf(st.band_al, buf);
+            }
+        }, state_);
+        path_valid_  = true;
+        score_valid_ = true;
+        grad_valid_  = (grad_mode_ != GradMode::None);
+        dp_valid_    = false;
+    }
+    bool soft_guide_pending() const noexcept { return guide_pending_; }
+    // The cached guide as stored (no lazy resolution) — for the scheduler's grouping.
+    const std::vector<int>& guide_j_raw() const noexcept { return guide_j_; }
+
     // Release the DP table memory of both full and banded aligners.
     // Cached score, gradient, and guide_j remain valid.
     // compute_grad() will throw until the next align_full() / realign_banded() call.

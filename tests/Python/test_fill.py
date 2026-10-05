@@ -338,3 +338,97 @@ def test_linear_interpair_soft_guides(mode, prec):
     for x, y in zip(r0[:3], r1[:3]):
         np.testing.assert_allclose(x, y, rtol=1e-11, atol=1e-11)
     assert r0[3] == r1[3]
+
+
+# ── banded_grad() under fill="interpair" (InterJobT::blo) ─────────────────────
+# Each lane is banded around its own guide: every row is computed over the union of the
+# lanes' spans with out-of-band cells set to -inf, which must leave each lane's table
+# bit-identical to its own banded fill — so scores, gradients and the updated guides
+# match the per-pair path exactly, ties included.
+
+def _banded(prec, gm, mode, A, B, p, fill, bws, kernel="auto", p2=None):
+    b = _CLS[prec][0](n_threads=3, traceback="pointers")
+    b.fill = fill
+    b.add_many(A, B, p, gap_model=gm, mode=mode, grad_mode="hard", kernel=kernel)
+    b.score_and_grad()
+    if p2 is not None:
+        b.set_params(p2)
+    out = []
+    for bw in bws:
+        tot = b.banded_grad(bw)
+        out.append((tot, b.scores(), *b.grads(), [list(b[i].guide_j) for i in range(len(b))]))
+    return out
+
+
+def _assert_same(r0, r1):
+    for x, y in zip(r0, r1):
+        assert x[0] == y[0]
+        for u, v in zip(x[1:4], y[1:4]):
+            assert np.array_equal(u, v)
+        assert x[4] == y[4]
+
+
+@pytest.mark.parametrize("prec", ["double", "float32"])
+@pytest.mark.parametrize("gm", ["affine", "linear"])
+@pytest.mark.parametrize("mode", ["local", "global"])
+@pytest.mark.parametrize("kind", ["ties", "cheap_gaps", "random"])
+@pytest.mark.parametrize("lengths", [(1, 30, 1, 60), (15, 30, 50, 51), (40, 120, 40, 120)])
+def test_banded_interpair_matches_own(prec, gm, mode, kind, lengths):
+    A = _seqs(203, lengths[0], lengths[1], 31)
+    B = _seqs(203, lengths[2], lengths[3], 32)
+    p = _params(kind)
+    p2 = _params("random" if kind != "random" else "ties")
+    bws = [1, 3, 8, 3]   # repeated: each call re-bands around the guide the last one left
+    for q2 in (None, p2):
+        r0 = _banded(prec, gm, mode, A, B, p, "striped", bws, p2=q2)
+        r1 = _banded(prec, gm, mode, A, B, p, "interpair", bws, p2=q2)
+        _assert_same(r0, r1)
+
+
+@pytest.mark.parametrize("prec", ["double", "float32"])
+@pytest.mark.parametrize("gm", ["affine", "linear"])
+@pytest.mark.parametrize("mode", ["local", "global"])
+@pytest.mark.parametrize("level", [l for l in nwgrad.available_isa_levels()])
+def test_banded_interpair_every_isa_level(level, mode, gm, prec):
+    A, B = _seqs(150, 10, 40, 33), _seqs(150, 30, 33, 34)
+    p = _params("ties")
+    r0 = _banded(prec, gm, mode, A, B, p, "striped", [2, 5], kernel="scalar_fallback")
+    r1 = _banded(prec, gm, mode, A, B, p, "interpair", [2, 5], kernel=level)
+    _assert_same(r0, r1)
+
+
+def test_banded_interpair_paths_and_soft_lanes():
+    """Alignment strings after a banded interpair pass equal the own path's; soft pairs
+    in the batch keep their own banded forward-backward (tolerance-equal: soft)."""
+    A, B = _seqs(120, 10, 30, 35), _fixed_len_b(range(120), 40, 36)
+    p = _params("ties")
+    res = []
+    for fill in ("striped", "interpair"):
+        b = nwgrad.SeqPairBatchDouble(n_threads=2, traceback="pointers")
+        b.fill = fill
+        b.add_many(A[:80], B[:80], p, gap_model="affine", mode="local", grad_mode="hard")
+        b.add_many(A[80:], B[80:], p, gap_model="affine", mode="local", grad_mode="soft")
+        b.score_and_grad()
+        b.banded_grad(3)
+        res.append((b.scores(), *b.grads()))
+        res.append([b[i].guide_j for i in range(120)])
+    np.testing.assert_allclose(res[0][0], res[2][0], rtol=1e-11, atol=1e-11)
+    np.testing.assert_allclose(res[0][1], res[2][1], rtol=1e-11, atol=1e-11)
+    np.testing.assert_allclose(res[0][2], res[2][2], rtol=1e-11, atol=1e-11)
+    assert np.array_equal(res[0][0][:80], res[2][0][:80])
+    assert [list(g) for g in res[1]] == [list(g) for g in res[3]]
+    # paths: a pair's own banded realign around the same guide gives the same strings
+    for i in range(0, 80, 9):
+        sp = nwgrad.SeqPairDouble(A[i], B[i], p, gap_model="affine", mode="local",
+                                  grad_mode="hard", traceback="pointers")
+        sp.alloc_dp(); sp.align_full(); sp.realign_banded(3)
+        assert list(sp.guide_j) == list(res[1][i])
+
+
+def test_banded_interpair_needs_a_guide():
+    A, B = _seqs(20, 10, 30, 37), _fixed_len_b(range(20), 40, 38)
+    b = nwgrad.SeqPairBatch(n_threads=2)
+    b.fill = "interpair"
+    b.add_many(A, B, _params("random"), gap_model="affine", mode="local", grad_mode="hard")
+    with pytest.raises(Exception, match="guide"):
+        b.banded_grad(3)

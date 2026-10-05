@@ -434,6 +434,26 @@ struct Aligner {
         fwdbwd_is_newest_ = false;
     }
 
+    // For a GuideBanded inter-pair fill (InterJobT::blo): this problem's rows as lane
+    // `lane` of W — per row i (0..M) the computed columns [jlo, jhi] (empty past m) into
+    // blo/bhi[i*W + lane], the initialised span (band_row_span, clipped to columns >= 1)
+    // into slo/shi[i] — min/max-merged with the other lanes' — and the Global border
+    // extents.  set_problem() first.  Full: nothing to do.
+    void banded_lane_rows(int W, int lane, int M, int* blo, int* bhi, int* slo, int* shi,
+                          int& bri, int& brj) const {
+        if constexpr (AB == AlignBand::GuideBanded) {
+            for (int i = 1; i <= M; ++i) {
+                const size_t k = static_cast<size_t>(i) * W + lane;
+                if (i > m_) { blo[k] = 1; bhi[k] = 0; continue; }
+                blo[k] = jlo(i); bhi[k] = jhi(i);
+                int lo, hi; band_row_span(i, lo, hi);
+                slo[i] = std::min(slo[i], std::max(1, lo));
+                shi[i] = std::max(shi[i], hi);
+            }
+            bri = border_rows(); brj = border_cols();
+        }
+    }
+
     // In place of compute_viterbi(buf): adopt lane `lane` of an inter-pair fill
     // (InterJob, inter_kernel_impl.inl) that left W pairs' tables interleaved in
     // buf.VM/VX/VY, this aligner's pair being that lane.  The tables are bit-identical

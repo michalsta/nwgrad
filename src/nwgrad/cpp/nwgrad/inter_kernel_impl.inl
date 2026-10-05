@@ -40,49 +40,46 @@ template <> struct IVT<float>  { using v = ivf; using l = ivi; static constexpr 
 template <class V> static inline V ivmax(V a, V b) noexcept { return a < b ? b : a; }
 template <class L, class V> static inline V ivsel(L m, V a, V b) noexcept { return m ? a : b; }
 
-// Linear gaps: one table H (in J.VM), per lane exactly Aligner::viterbi_linear —
-// v = max(diag + s, up - ge_b, left - ge_a), Local clamped at 0, the same left-to-right
-// max order (std::max over an initializer list keeps the FIRST largest, as the ivmax
-// chain below does) and the same borders, so each lane's table is bit-identical to the
-// pair's own fill.  Row-wise vectorization of linear was measured at 0.90x and deleted
-// (the left carry is a pure latency chain); one PAIR per lane sidesteps that, since each
-// lane's chain is its own and W of them run side by side.
+
+// Per lane, the score of this row's A residue against the column's B residue: a blend
+// tree on the B residue's bits (bits[3*j + k] = bit k of each lane's b[j-1], as masks).
+template <class V, class L>
+static inline V inter_sub(const V* P, const L* bits, int j, int levels) noexcept {
+    if (levels == 0) return P[0];
+    const L b0 = bits[3 * j];
+    const V t0 = ivsel(b0, P[1], P[0]);
+    if (levels == 1) return t0;
+    const L b1 = bits[3 * j + 1];
+    const V u0 = ivsel(b1, ivsel(b0, P[3], P[2]), t0);
+    if (levels == 2) return u0;
+    const V u1 = ivsel(b1, ivsel(b0, P[7], P[6]), ivsel(b0, P[5], P[4]));
+    return ivsel(bits[3 * j + 2], u1, u0);
+}
+
+// The shared per-job setup: the B residues' bit masks and, per row, the profile.
 template <class T>
-static void inter_fill_linear(InterJobT<T>& J) noexcept {
+struct InterCommon {
     using ivd = typename IVT<T>::v; using ivl = typename IVT<T>::l;
-    constexpr int IW = IVT<T>::W;
-    const int n = J.n, M = J.M, st = n + 1;
-    const bool local = J.align_mode == 1;
-    ivd* H = reinterpret_cast<ivd*>(J.VM);
-    const ivd z = {}, ninf = z + (-std::numeric_limits<T>::infinity());
-
-    if (local) {
-        for (int j = 0; j <= n; ++j) H[j] = z;
-        for (int i = 1; i <= M; ++i) H[static_cast<size_t>(i) * st] = z;
-    } else {
-        H[0] = z;
-        for (int i = 1; i <= M; ++i)
-            H[static_cast<size_t>(i) * st] = z + (-static_cast<T>(i) * J.ge_b);
-        for (int j = 1; j <= n; ++j) H[j] = z + (-static_cast<T>(j) * J.ge_a);
+    static constexpr int IW = IVT<T>::W;
+    const InterJobT<T>& J;
+    int levels;
+    std::vector<ivl>& bits;
+    explicit InterCommon(const InterJobT<T>& job) : J(job), bits(bits_buf()) {
+        const int na = J.nalpha, n = J.n;
+        levels = na <= 1 ? 0 : na <= 2 ? 1 : na <= 4 ? 2 : 3;
+        if (bits.size() < static_cast<size_t>(3 * (n + 1))) bits.resize(3 * (n + 1));
+        for (int j = 1; j <= n; ++j)
+            for (int k = 0; k < levels; ++k) {
+                ivl v;
+                for (int l = 0; l < IW; ++l) v[l] = ((J.b[l][j - 1] >> k) & 1) ? -1 : 0;
+                bits[3 * j + k] = v;
+            }
     }
-
-    const int na = J.nalpha;
-    const int levels = na <= 1 ? 0 : na <= 2 ? 1 : na <= 4 ? 2 : 3;
-    static thread_local std::vector<ivl> bits;
-    if (bits.size() < static_cast<size_t>(3 * (n + 1))) bits.resize(3 * (n + 1));
-    for (int j = 1; j <= n; ++j)
-        for (int k = 0; k < levels; ++k) {
-            ivl v;
-            for (int l = 0; l < IW; ++l) v[l] = ((J.b[l][j - 1] >> k) & 1) ? -1 : 0;
-            bits[3 * j + k] = v;
-        }
-
-    const ivd ge_a = z + J.ge_a, ge_b = z + J.ge_b;
-    ivd best = z, bi = z, bj = z;
-
-    for (int i = 1; i <= M; ++i) {
-        ivd P[8];
-        ivl live;
+    static std::vector<ivl>& bits_buf() { static thread_local std::vector<ivl> b; return b; }
+    // Row i's profile (P[c] = per lane, score of the lane's A residue i vs letter c) and
+    // the lanes still inside their own A.
+    void row(int i, ivd* P, ivl& live) const {
+        const int na = J.nalpha;
         for (int c = 0; c < 8; ++c) {
             const int cc = c < na ? c : 0;
             for (int l = 0; l < IW; ++l) {
@@ -91,33 +88,94 @@ static void inter_fill_linear(InterJobT<T>& J) noexcept {
             }
         }
         for (int l = 0; l < IW; ++l) live[l] = (i <= J.m[l]) ? -1 : 0;
+    }
+    ivd s(const ivd* P, int j) const { return inter_sub(P, bits.data(), j, levels); }
+    // Banded (InterJobT::blo != nullptr): row i's columns [j0, j1] to compute (the union
+    // of the lanes' initialised spans) and the per-lane band [lo, hi] as T vectors.
+    void band(int i, int& j0, int& j1, ivd& lo, ivd& hi) const {
+        j0 = J.ulo[i]; j1 = J.uhi[i];
+        for (int l = 0; l < IW; ++l) {
+            lo[l] = static_cast<T>(J.blo[static_cast<size_t>(i) * IW + l]);
+            hi[l] = static_cast<T>(J.bhi[static_cast<size_t>(i) * IW + l]);
+        }
+    }
+    // Banded Global: a border cell is the closed form up to the lane's border_rows /
+    // border_cols, -inf past it (as Aligner::viterbi_affine / viterbi_linear leave it).
+    ivd border_mask(ivd v, int k, const int* lim) const {
+        ivd kv, limv;
+        for (int l = 0; l < IW; ++l) { kv[l] = static_cast<T>(k); limv[l] = static_cast<T>(lim[l]); }
+        return ivsel(kv <= limv, v, ivd{} + (-std::numeric_limits<T>::infinity()));
+    }
+    // Local: the row's first strict best folded into the running best (row-major order).
+    void best_out(const ivd& best, const ivd& bi, const ivd& bj) const {
+        for (int l = 0; l < IW; ++l) {
+            J.best[l] = best[l];
+            J.best_i[l] = static_cast<int>(bi[l]);
+            J.best_j[l] = static_cast<int>(bj[l]);
+        }
+    }
+};
+
+// Linear gaps: one table H (in J.VM), per lane exactly Aligner::viterbi_linear —
+// v = max(diag + s, up - ge_b, left - ge_a), Local clamped at 0, the same left-to-right
+// max order (std::max over an initializer list keeps the FIRST largest, as the ivmax
+// chain below does) and the same borders, so each lane's table is bit-identical to the
+// pair's own fill.  Row-wise vectorization of linear was measured at 0.90x and deleted
+// (the left carry is a pure latency chain); one PAIR per lane sidesteps that, since each
+// lane's chain is its own and W of them run side by side.
+//
+// Banded: GuideBanded, each lane around its own guide.  Every row is computed over the
+// union of the lanes' initialised spans, and a lane's cell outside its own band is set to
+// -inf — which is what the pair's own banded fill leaves in every initialised cell it does
+// not compute.  Its in-band cells read only cells of its own span, so they see exactly
+// the operands of its own fill; the cells outside its span are never read by its own
+// traceback or gradient.
+template <class T, bool Banded>
+static void inter_fill_linear(InterJobT<T>& J) noexcept {
+    using C = InterCommon<T>;
+    using ivd = typename C::ivd; using ivl = typename C::ivl;
+    const C cm(J);
+    const int n = J.n, M = J.M, st = n + 1;
+    const bool local = J.align_mode == 1;
+    ivd* H = reinterpret_cast<ivd*>(J.VM);
+    const ivd z = {}, ninf = z + (-std::numeric_limits<T>::infinity()), one = z + T(1);
+
+    if (local) {
+        for (int j = 0; j <= n; ++j) H[j] = z;
+        for (int i = 1; i <= M; ++i) H[static_cast<size_t>(i) * st] = z;
+    } else {
+        H[0] = z;
+        for (int i = 1; i <= M; ++i) {
+            const ivd v = z + (-static_cast<T>(i) * J.ge_b);
+            H[static_cast<size_t>(i) * st] = Banded ? cm.border_mask(v, i, J.bri) : v;
+        }
+        for (int j = 1; j <= n; ++j) {
+            const ivd v = z + (-static_cast<T>(j) * J.ge_a);
+            H[j] = Banded ? cm.border_mask(v, j, J.brj) : v;
+        }
+    }
+
+    const ivd ge_a = z + J.ge_a, ge_b = z + J.ge_b;
+    ivd best = z, bi = z, bj = z;
+
+    for (int i = 1; i <= M; ++i) {
+        ivd P[8];
+        ivl live;
+        cm.row(i, P, live);
+        int j0 = 1, j1 = n;
+        ivd lo = z, hi = z, jv = z;
+        if constexpr (Banded) { cm.band(i, j0, j1, lo, hi); jv = z + static_cast<T>(j0); }
 
         ivd* h = H + static_cast<size_t>(i) * st;
         const ivd* p = h - st;
-        ivd lh = h[0];
+        ivd lh = (!Banded || j0 == 1) ? h[j0 - 1] : ninf;
         ivd rb = ninf, rj = z;
-        for (int j = 1; j <= n; ++j) {
-            ivd s;
-            if (levels == 0) s = P[0];
-            else {
-                const ivl b0 = bits[3 * j];
-                ivd t0 = ivsel(b0, P[1], P[0]), t1 = ivsel(b0, P[3], P[2]);
-                if (levels == 1) s = t0;
-                else {
-                    const ivl b1 = bits[3 * j + 1];
-                    ivd u0 = ivsel(b1, t1, t0);
-                    if (levels == 2) s = u0;
-                    else {
-                        ivd t2 = ivsel(b0, P[5], P[4]), t3 = ivsel(b0, P[7], P[6]);
-                        ivd u1 = ivsel(b1, t3, t2);
-                        s = ivsel(bits[3 * j + 2], u1, u0);
-                    }
-                }
-            }
-            ivd v = p[j - 1] + s;
+        for (int j = j0; j <= j1; ++j) {
+            ivd v = p[j - 1] + cm.s(P, j);
             v = ivmax(v, p[j] - ge_b);
             v = ivmax(v, lh - ge_a);
             if (local) v = ivmax(v, z);
+            if constexpr (Banded) { v = ivsel((jv >= lo) & (jv <= hi), v, ninf); jv += one; }
             h[j] = v;
             lh = v;
             if (local) {
@@ -133,29 +191,23 @@ static void inter_fill_linear(InterJobT<T>& J) noexcept {
             bj = ivsel(imp, rj, bj);
         }
     }
-    if (local)
-        for (int l = 0; l < IW; ++l) {
-            J.best[l] = best[l];
-            J.best_i[l] = static_cast<int>(bi[l]);
-            J.best_j[l] = static_cast<int>(bj[l]);
-        }
+    if (local) cm.best_out(best, bi, bj);
 }
 
-// Affine (and the linear dispatch).  T = double or float32: the operations are the same
-// in either precision, each in T — at float32 exactly the scalar viterbi_affine<float>,
-// whose penalties are cast to T once and whose borders are -(go + T(i)*ge) in T.
-template <class T>
-static void inter_fill_t(InterJobT<T>& J) noexcept {
-    if (J.linear) { inter_fill_linear(J); return; }
-    using ivd = typename IVT<T>::v; using ivl = typename IVT<T>::l;
-    constexpr int IW = IVT<T>::W;
-    const T NINF = -std::numeric_limits<T>::infinity();
+// Affine.  T = double or float32: the operations are the same in either precision, each
+// in T — at float32 exactly the scalar viterbi_affine<float>, whose penalties are cast to
+// T once and whose borders are -(go + T(i)*ge) in T.  Banded: as for linear above.
+template <class T, bool Banded>
+static void inter_fill_affine(InterJobT<T>& J) noexcept {
+    using C = InterCommon<T>;
+    using ivd = typename C::ivd; using ivl = typename C::ivl;
+    const C cm(J);
     const int n = J.n, M = J.M, st = n + 1;
     const bool local = J.align_mode == 1;
     ivd* VM = reinterpret_cast<ivd*>(J.VM);
     ivd* VX = reinterpret_cast<ivd*>(J.VX);
     ivd* VY = reinterpret_cast<ivd*>(J.VY);
-    const ivd z = {}, ninf = z + NINF;
+    const ivd z = {}, ninf = z + (-std::numeric_limits<T>::infinity()), one = z + T(1);
 
     // Borders, as viterbi_affine_simd's Full path sets them.
     for (int j = 0; j <= n; ++j) { VM[j] = ninf; VX[j] = ninf; VY[j] = ninf; }
@@ -168,64 +220,36 @@ static void inter_fill_t(InterJobT<T>& J) noexcept {
         for (int j = 0; j <= n; ++j) VM[j] = z;
     } else {
         VM[0] = z;
-        for (int i = 1; i <= M; ++i)
-            VX[static_cast<size_t>(i) * st] = z + (-(J.go_b + static_cast<T>(i) * J.ge_b));
-        for (int j = 1; j <= n; ++j)
-            VY[j] = z + (-(J.go_a + static_cast<T>(j) * J.ge_a));
-    }
-
-    // Per column, the bits of each lane's B residue, as blend masks.
-    const int na = J.nalpha;
-    const int levels = na <= 1 ? 0 : na <= 2 ? 1 : na <= 4 ? 2 : 3;
-    static thread_local std::vector<ivl> bits;
-    if (bits.size() < static_cast<size_t>(3 * (n + 1))) bits.resize(3 * (n + 1));
-    for (int j = 1; j <= n; ++j)
-        for (int k = 0; k < levels; ++k) {
-            ivl v;
-            for (int l = 0; l < IW; ++l) v[l] = ((J.b[l][j - 1] >> k) & 1) ? -1 : 0;
-            bits[3 * j + k] = v;
+        for (int i = 1; i <= M; ++i) {
+            const ivd v = z + (-(J.go_b + static_cast<T>(i) * J.ge_b));
+            VX[static_cast<size_t>(i) * st] = Banded ? cm.border_mask(v, i, J.bri) : v;
         }
+        for (int j = 1; j <= n; ++j) {
+            const ivd v = z + (-(J.go_a + static_cast<T>(j) * J.ge_a));
+            VY[j] = Banded ? cm.border_mask(v, j, J.brj) : v;
+        }
+    }
 
     const ivd go_a = z + J.go_a, ge_a = z + J.ge_a, go_b = z + J.go_b, ge_b = z + J.ge_b;
     ivd best = z, bi = z, bj = z;   // Local: running best and its cell, per lane
 
     for (int i = 1; i <= M; ++i) {
-        // Row profile: P[c] holds, per lane, the score of this row's A residue vs c.
         ivd P[8];
         ivl live;
-        for (int c = 0; c < 8; ++c) {
-            const int cc = c < na ? c : 0;
-            for (int l = 0; l < IW; ++l) {
-                const int a = (i <= J.m[l]) ? J.a[l][i - 1] : 0;
-                P[c][l] = J.blk[a * na + cc];
-            }
-        }
-        for (int l = 0; l < IW; ++l) live[l] = (i <= J.m[l]) ? -1 : 0;
+        cm.row(i, P, live);
+        int j0 = 1, j1 = n;
+        ivd lo = z, hi = z, jv = z;
+        if constexpr (Banded) { cm.band(i, j0, j1, lo, hi); jv = z + static_cast<T>(j0); }
 
         ivd* vm = VM + static_cast<size_t>(i) * st;
         ivd* vx = VX + static_cast<size_t>(i) * st;
         ivd* vy = VY + static_cast<size_t>(i) * st;
         const ivd* pm = vm - st; const ivd* px = vx - st; const ivd* py = vy - st;
-        ivd lm = vm[0], lx = vx[0], ly = vy[0];   // column j-1 of this row
+        ivd lm = ninf, lx = ninf, ly = ninf;   // column j0-1 of this row
+        if (!Banded || j0 == 1) { lm = vm[j0 - 1]; lx = vx[j0 - 1]; ly = vy[j0 - 1]; }
         ivd rb = ninf, rj = z;
-        for (int j = 1; j <= n; ++j) {
-            ivd s;
-            if (levels == 0) s = P[0];
-            else {
-                const ivl b0 = bits[3 * j];
-                ivd t0 = ivsel(b0, P[1], P[0]), t1 = ivsel(b0, P[3], P[2]);
-                if (levels == 1) s = t0;
-                else {
-                    const ivl b1 = bits[3 * j + 1];
-                    ivd u0 = ivsel(b1, t1, t0);
-                    if (levels == 2) s = u0;
-                    else {
-                        ivd t2 = ivsel(b0, P[5], P[4]), t3 = ivsel(b0, P[7], P[6]);
-                        ivd u1 = ivsel(b1, t3, t2);
-                        s = ivsel(bits[3 * j + 2], u1, u0);
-                    }
-                }
-            }
+        for (int j = j0; j <= j1; ++j) {
+            const ivd s = cm.s(P, j);
             ivd d = pm[j - 1];
             d = ivmax(d, px[j - 1]);
             d = ivmax(d, py[j - 1]);
@@ -236,6 +260,11 @@ static void inter_fill_t(InterJobT<T>& J) noexcept {
             x = ivmax(x, (py[j] - go_b) - ge_b);
             ivd open = (ivmax(lm, lx) - go_a) - ge_a;
             ivd y = ivmax(open, ly - ge_a);
+            if constexpr (Banded) {
+                const ivl inb = (jv >= lo) & (jv <= hi);
+                mv = ivsel(inb, mv, ninf); x = ivsel(inb, x, ninf); y = ivsel(inb, y, ninf);
+                jv += one;
+            }
             vm[j] = mv; vx[j] = x; vy[j] = y;
             lm = mv; lx = x; ly = y;
             if (local) {
@@ -252,12 +281,13 @@ static void inter_fill_t(InterJobT<T>& J) noexcept {
             bj = ivsel(imp, rj, bj);
         }
     }
-    if (local)
-        for (int l = 0; l < IW; ++l) {
-            J.best[l] = best[l];
-            J.best_i[l] = static_cast<int>(bi[l]);
-            J.best_j[l] = static_cast<int>(bj[l]);
-        }
+    if (local) cm.best_out(best, bi, bj);
+}
+
+template <class T>
+static void inter_fill_t(InterJobT<T>& J) noexcept {
+    if (J.blo) { if (J.linear) inter_fill_linear<T, true>(J);  else inter_fill_affine<T, true>(J); }
+    else       { if (J.linear) inter_fill_linear<T, false>(J); else inter_fill_affine<T, false>(J); }
 }
 
 static void inter_fill_entry(InterJob& J) noexcept { inter_fill_t<double>(J); }
