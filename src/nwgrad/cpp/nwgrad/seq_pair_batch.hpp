@@ -508,6 +508,11 @@ private:
     // handled separately when building and validating the cached plan.
     static constexpr double DBL_MAX_ = std::numeric_limits<double>::max();
 
+    static bool linear_fill_ok_(const SeqPair& p, const LevelKernels& K) {
+        return !(p.gap_model() == GapModel::Linear && p.align_mode() == AlignMode::Global &&
+                 K.inter_w < 4);
+    }
+
     int inter_backend_(const SeqPair& p) const {
         if constexpr (!std::is_same_v<T, double>) return -1;
         else {
@@ -516,7 +521,14 @@ private:
             const int backend = (p.kernel() == kBackendAuto) ? global_default_backend() : p.kernel();
             if (backend < 0) return -1;
             const LevelKernels& K = level_kernels(backend);
-            return (K.inter_fill && K.inter_w > 0) ? backend : -1;
+            if (!K.inter_fill || K.inter_w <= 0) return -1;
+            // The linear inter-pair VITERBI fill, Global, at 2 lanes is a measured LOSS
+            // (skynet sse2: 0.76x the scalar fill, which is already cheap there); Local
+            // wins at every width (1.41x sse2, 3.23x avx2) and Global from 4 lanes (1.41x
+            // avx2).  NEON (W=2) unmeasured, so held to the same rule.  Soft pairs still
+            // qualify — their soft pass wins — and skip the fill (linear_fill_ok_).
+            if (!linear_fill_ok_(p, K) && p.grad_mode() != GradMode::Soft) return -1;
+            return backend;
         }
     }
 
@@ -596,7 +608,7 @@ private:
                     const SeqPair& p = *pairs[elig[s + l]];
                     lazy = p.grad_mode() == GradMode::Soft && p.soft_guide_lazy();
                 }
-                const bool skip_fill = lazy;
+                const bool skip_fill = lazy || !linear_fill_ok_(p0, K);
                 InterJob job{};
                 job.a = a.data(); job.m = m.data(); job.b = b.data(); job.n = n; job.M = M;
                 job.align_mode = (p0.align_mode() == AlignMode::Local) ? 1 : 0;
