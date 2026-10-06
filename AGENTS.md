@@ -426,6 +426,13 @@ skynet (Piledriver, W=2, 1 thread, 200k pairs): rowwise 12.4 µs/pair, interpair
   path it would slow down is gated to the own fill (the cap, linear Global gates,
   Hirschberg past the cutoff, scalar backend, mixed params). The full test suite now
   runs interpair by default for every batch, in addition to the dedicated tests.
+- **C++ coverage** (`tests/cpp/test_interpair.cpp`, `[interpair]`): interpair vs own
+  fill for DNA and protein, hard and soft, both gap models, modes and precisions, mixed
+  B lengths, banded affine and BatchAligner — so the C++ sanitizer jobs (ASan+UBSan,
+  TSan, gcc and clang, `_GLIBCXX_ASSERTIONS`) run the inter-pair kernels. Added after the
+  Python sanitizer jobs caught `&eqm[j * nm]` on an EMPTY vector (`nm = 0` for alphabets
+  over 8) in the soft pass: undefined behaviour that release builds never notice and no
+  C++ test reached. The new test aborts on the unfixed kernel.
 
 ### Linear gaps: Pointers and Hirschberg (2026-10-05)
 
