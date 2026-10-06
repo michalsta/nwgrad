@@ -38,6 +38,13 @@
 // and every forward and backward cell there is masked to 0, so they add nothing to
 // its row sums, maxima or gradient sums; Global starts its backward at (m, n_l) and
 // reads Z there.  Rag = false compiles none of it.
+// No thread_local scratch in these kernels: every buffer is carved from the caller's
+// J.scratch (inter_soft_scratch).  With static thread_local std::vectors here, every
+// inter-pair soft call aborted on macOS (spot, M1, gcc 16.2: gcc implements thread_local
+// there as emulated TLS), whether the vectors were declared in the kernels or behind
+// accessor functions; one such run first grew to 5.6 GB.  Linux was unaffected.  The
+// mechanism is unproven — removing the thread_locals is what was verified.
+
 template <bool Rag>
 NWGRAD_SOFT_FMA_FN static void inter_soft_affine(InterSoftJob& J) noexcept {
     NWGRAD_SOFT_FMA_BODY
@@ -66,12 +73,13 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_affine(InterSoftJob& J) noexcept {
     // counts per lane after the row.  nm = the letters accumulated through masks.
     const bool big = na > 8;
     const int nm = big ? 0 : na;
-    static thread_local std::vector<ivd> trowv;
-    if (big && trowv.size() < static_cast<size_t>(w2)) trowv.resize(w2);
-    ivd* trow = trowv.data();
+    // The tail of the scratch (inter_soft_scratch: 11 rows past mf): letter masks (8
+    // rows max), ragged column masks (2), the gathered match row (1).
+    ivl* eqm = reinterpret_cast<ivl*>(mf + (M + 1));
+    ivl* cokv = eqm + static_cast<size_t>(w2) * 8;
+    ivl* endv = cokv + w2;
+    ivd* trow = reinterpret_cast<ivd*>(endv + w2);
     (void)trow;
-    static thread_local std::vector<ivl> eqm;
-    if (eqm.size() < static_cast<size_t>(w2) * nm) eqm.resize(static_cast<size_t>(w2) * nm);
     for (int j = 1; j <= n; ++j)
         for (int c = 0; c < nm; ++c) {
             ivl v;
@@ -80,16 +88,14 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_affine(InterSoftJob& J) noexcept {
             eqm[static_cast<size_t>(j) * na + c] = v;
         }
     // Ragged: cok[j] = lanes whose B reaches column j; endc[j] = lanes whose B ends there.
-    static thread_local std::vector<ivl> cokv, endv;
     const ivl* cok = nullptr; const ivl* endc = nullptr;
     if constexpr (Rag) {
-        if (cokv.size() < static_cast<size_t>(w2)) { cokv.resize(w2); endv.resize(w2); }
         for (int j = 0; j < w2; ++j)
             for (int l = 0; l < IW; ++l) {
                 cokv[j][l] = j <= J.nb[l] ? -1 : 0;
                 endv[j][l] = j == J.nb[l] ? -1 : 0;
             }
-        cok = cokv.data(); endc = endv.data();
+        cok = cokv; endc = endv;
     }
     (void)cok; (void)endc;
     // ER[i][j] = exp(score(a_l[i-1], b_l[j-1]) / T) per lane; [0] = [n+1] = 0.  Built
@@ -115,7 +121,7 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_affine(InterSoftJob& J) noexcept {
             }
         for (int j = 1; j <= n; ++j) {
             ivd s = z;
-            const ivl* mk = eqm.data() + static_cast<size_t>(j) * na;
+            const ivl* mk = eqm + static_cast<size_t>(j) * na;
             for (int c = 0; c < na; ++c) s = ivsel(mk[c], P[c], s);
             E[j] = s;
         }
@@ -287,7 +293,7 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_affine(InterSoftJob& J) noexcept {
                 sob += (qM[j] + qY[j]) * xv;
                 const ivd t = (qM[j - 1] + qX[j - 1] + qY[j - 1]) * Ec[j] * mv;
                 if (big) trow[j] = t;
-                const ivl* mk = eqm.data() + static_cast<size_t>(j) * nm;   // nm may be 0: no [] on an empty vector
+                const ivl* mk = eqm + static_cast<size_t>(j) * nm;
                 for (int cc = 0; cc < nm; ++cc) acc[cc] += ivsel(mk[cc], t, z);
             }
             const auto [mv0, xv0] = cell(0);
@@ -386,12 +392,13 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_linear(InterSoftJob& J) noexcept {
     // counts per lane after the row.  nm = the letters accumulated through masks.
     const bool big = na > 8;
     const int nm = big ? 0 : na;
-    static thread_local std::vector<ivd> trowv;
-    if (big && trowv.size() < static_cast<size_t>(w2)) trowv.resize(w2);
-    ivd* trow = trowv.data();
+    // The tail of the scratch (inter_soft_scratch: 11 rows past mf): letter masks (8
+    // rows max), ragged column masks (2), the gathered match row (1).
+    ivl* eqm = reinterpret_cast<ivl*>(mf + (M + 1));
+    ivl* cokv = eqm + static_cast<size_t>(w2) * 8;
+    ivl* endv = cokv + w2;
+    ivd* trow = reinterpret_cast<ivd*>(endv + w2);
     (void)trow;
-    static thread_local std::vector<ivl> eqm;
-    if (eqm.size() < static_cast<size_t>(w2) * nm) eqm.resize(static_cast<size_t>(w2) * nm);
     for (int j = 1; j <= n; ++j)
         for (int c = 0; c < nm; ++c) {
             ivl v;
@@ -400,16 +407,14 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_linear(InterSoftJob& J) noexcept {
             eqm[static_cast<size_t>(j) * na + c] = v;
         }
     // Ragged: cok[j] = lanes whose B reaches column j; endc[j] = lanes whose B ends there.
-    static thread_local std::vector<ivl> cokv, endv;
     const ivl* cok = nullptr; const ivl* endc = nullptr;
     if constexpr (Rag) {
-        if (cokv.size() < static_cast<size_t>(w2)) { cokv.resize(w2); endv.resize(w2); }
         for (int j = 0; j < w2; ++j)
             for (int l = 0; l < IW; ++l) {
                 cokv[j][l] = j <= J.nb[l] ? -1 : 0;
                 endv[j][l] = j == J.nb[l] ? -1 : 0;
             }
-        cok = cokv.data(); endc = endv.data();
+        cok = cokv; endc = endv;
     }
     (void)cok; (void)endc;
     auto fill_E = [&](int i) {
@@ -433,7 +438,7 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_linear(InterSoftJob& J) noexcept {
             }
         for (int j = 1; j <= n; ++j) {
             ivd sv = z;
-            const ivl* mk = eqm.data() + static_cast<size_t>(j) * na;
+            const ivl* mk = eqm + static_cast<size_t>(j) * na;
             for (int c = 0; c < na; ++c) sv = ivsel(mk[c], P[c], sv);
             E[j] = sv;
         }
@@ -558,7 +563,7 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_linear(InterSoftJob& J) noexcept {
                 if (j >= 1) {
                     const ivd t = q[j - 1] * Ec[j] * b;
                     if (big) trow[j] = t;
-                    const ivl* mk = eqm.data() + static_cast<size_t>(j) * nm;   // nm may be 0: no [] on an empty vector
+                    const ivl* mk = eqm + static_cast<size_t>(j) * nm;
                     for (int cc = 0; cc < nm; ++cc) acc[cc] += ivsel(mk[cc], t, z);
                 }
             }

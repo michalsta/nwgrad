@@ -368,9 +368,14 @@ inline bool inter_pair_fits(size_t la, size_t lb, bool affine, bool soft, int W,
                         kInterSoftBytes;
 }
 
+// Doubles of scratch the inter-pair soft pass needs for W lanes (the caller allocates it,
+// 64-byte aligned): the forward tables, the per-row weights, 7 rolling rows, row sums and
+// maxima, and 11 more rows for the letter masks (<= 8), the two ragged column masks and
+// the gathered match row — kept here and NOT in thread_local vectors, which made every
+// soft call abort on macOS (gcc's emulated TLS; see inter_soft_impl.inl).
 inline size_t inter_soft_scratch(int n, int M, int W) {
     return (3 * static_cast<size_t>(M + 1) * (n + 1) + static_cast<size_t>(M + 1) * (n + 2) +
-            7 * static_cast<size_t>(n + 2) + 2 * static_cast<size_t>(M + 1)) * W;
+            18 * static_cast<size_t>(n + 2) + 2 * static_cast<size_t>(M + 1)) * W;
 }
 
 // Whole-row banded kernel for the GuideBanded path.  viterbi_affine_simd (in

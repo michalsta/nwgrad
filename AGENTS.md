@@ -433,6 +433,15 @@ skynet (Piledriver, W=2, 1 thread, 200k pairs): rowwise 12.4 µs/pair, interpair
   Python sanitizer jobs caught `&eqm[j * nm]` on an EMPTY vector (`nm = 0` for alphabets
   over 8) in the soft pass: undefined behaviour that release builds never notice and no
   C++ test reached. The new test aborts on the unfixed kernel.
+- **No `thread_local` in the soft kernels** (2026-10-06). With `static thread_local
+  std::vector` scratch, every inter-pair SOFT call aborted on macOS (spot, M1, gcc 16.2,
+  which implements thread_local as emulated TLS) — silently, `abort()` beside
+  `__emutls_register_common`; one run first grew to 5.6 GB and pushed spot into OOM.
+  Moving the vectors behind accessor functions did not help; carving them from the
+  caller's `J.scratch` (`inter_soft_scratch` grew by 11 rows) did. Mechanism unproven.
+  Linux and CI's ARM64 (Linux) job never saw it; the hard kernel's `thread_local`
+  buffers (`InterCommon`) work on macOS. Test on spot before trusting new
+  `thread_local` state in a kernel.
 
 ### Linear gaps: Pointers and Hirschberg (2026-10-05)
 
