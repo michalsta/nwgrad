@@ -115,7 +115,7 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_affine(InterSoftJob& J) noexcept {
             }
         for (int j = 1; j <= n; ++j) {
             ivd s = z;
-            const ivl* mk = &eqm[static_cast<size_t>(j) * na];
+            const ivl* mk = eqm.data() + static_cast<size_t>(j) * na;
             for (int c = 0; c < na; ++c) s = ivsel(mk[c], P[c], s);
             E[j] = s;
         }
@@ -287,7 +287,7 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_affine(InterSoftJob& J) noexcept {
                 sob += (qM[j] + qY[j]) * xv;
                 const ivd t = (qM[j - 1] + qX[j - 1] + qY[j - 1]) * Ec[j] * mv;
                 if (big) trow[j] = t;
-                const ivl* mk = &eqm[static_cast<size_t>(j) * nm];
+                const ivl* mk = eqm.data() + static_cast<size_t>(j) * nm;   // nm may be 0: no [] on an empty vector
                 for (int cc = 0; cc < nm; ++cc) acc[cc] += ivsel(mk[cc], t, z);
             }
             const auto [mv0, xv0] = cell(0);
@@ -433,7 +433,7 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_linear(InterSoftJob& J) noexcept {
             }
         for (int j = 1; j <= n; ++j) {
             ivd sv = z;
-            const ivl* mk = &eqm[static_cast<size_t>(j) * na];
+            const ivl* mk = eqm.data() + static_cast<size_t>(j) * na;
             for (int c = 0; c < na; ++c) sv = ivsel(mk[c], P[c], sv);
             E[j] = sv;
         }
@@ -558,7 +558,7 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_linear(InterSoftJob& J) noexcept {
                 if (j >= 1) {
                     const ivd t = q[j - 1] * Ec[j] * b;
                     if (big) trow[j] = t;
-                    const ivl* mk = &eqm[static_cast<size_t>(j) * nm];
+                    const ivl* mk = eqm.data() + static_cast<size_t>(j) * nm;   // nm may be 0: no [] on an empty vector
                     for (int cc = 0; cc < nm; ++cc) acc[cc] += ivsel(mk[cc], t, z);
                 }
             }

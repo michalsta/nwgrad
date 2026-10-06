@@ -200,6 +200,7 @@ if (NWGRAD_BUILD_TESTS)
         tests/cpp/test_hirschberg_scan.cpp
         tests/cpp/test_hirschberg_pmax.cpp
         tests/cpp/test_add_many.cpp
+        tests/cpp/test_interpair.cpp
         tests/cpp/test_weighted_grad.cpp
         tests/cpp/test_logistic.cpp
         tests/cpp/test_simd_bitexact.cpp
