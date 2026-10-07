@@ -840,7 +840,7 @@ private:
             // inside the recursion, and the whole point is that no O(m*n) table exists.
             if constexpr (AB == AlignBand::Full)
                 if ((tb_ == TracebackMode::Pointers || is_hirschberg(tb_)) && !uses_rowwise_full()) return;
-            if (buf.VM.size() < sz_) { buf.VM.resize(sz_); buf.VX.resize(sz_); buf.VY.resize(sz_); }
+            for (auto* v : {&buf.VM, &buf.VX, &buf.VY}) if (v->size() < sz_) v->resize(sz_);
         }
     }
 
@@ -3303,7 +3303,7 @@ private:
         }
         if (weight_bad(J.ea) || weight_bad(J.eb)) return false;
         if constexpr (lin) { if (buf.F.size() < sz_) buf.F.resize(sz_); }
-        else if (buf.FM.size() < sz_) { buf.FM.resize(sz_); buf.FX.resize(sz_); buf.FY.resize(sz_); }
+        else for (auto* v : {&buf.FM, &buf.FX, &buf.FY}) if (v->size() < sz_) v->resize(sz_);
         const size_t w = static_cast<size_t>(n_) + 2;
         for (DVec* r : {&buf.sb0, &buf.sb1, &buf.sb2, &buf.sb3, &buf.sb4, &buf.sb5})
             if (r->size() < w) r->resize(w);
