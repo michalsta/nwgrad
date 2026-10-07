@@ -355,14 +355,18 @@ public:
 
     // Free the stored paths.  Scores, released gradients and guides stay; a held
     // gradient goes with the path (as the old drop_dp() made compute_grad() throw).
+    // Both also free the single-pair DP buffer (solo_): it is only a cache, and drop_dp()
+    // promised to release DP memory.
     void drop_paths() noexcept {
         std::vector<std::vector<uint32_t>>().swap(path_);
         std::vector<std::array<int, 2>>().swap(path_end_);
         for (auto& f : flags_) f &= static_cast<uint8_t>(~(kStored | kHeld));
+        solo_.reset();
     }
     void drop_path(size_t i) noexcept {
         if (i < path_.size()) { std::vector<uint32_t>().swap(path_[i]); }
         flags_[i] &= static_cast<uint8_t>(~(kStored | kHeld));
+        solo_.reset();
     }
 
     // One pair, on the calling thread (SeqPair's own operations).
@@ -479,7 +483,7 @@ public:
         }
         const bool banded = band > 0 || !problems[0].guide_j.empty();
         if (inter_fill) {
-            const int be = stream_inter_backend_(params, band, kernel);
+            const int be = stream_inter_backend_(params, kernel, banded);
             if (be >= 0) {
                 if (banded) stream_inter_<AlignBand::GuideBanded>(problems, params, band, kernel, result, be);
                 else        stream_inter_<AlignBand::Full>(problems, params, band, kernel, result, be);
@@ -559,16 +563,19 @@ private:
     }
     // The level a shared pass would run on, or -1 (every problem its own path): the
     // scalar backend, soft_impl "log" or a banded soft call, linear Global Viterbi below
-    // 4 lanes or over 8 letters, linear banded.
-    int stream_inter_backend_(const AlignParams& params, int band, int kernel) const {
+    // 4 lanes or over 8 letters, linear banded.  "Banded" includes band == 0 WITH guides
+    // (GuideBanded at width 0): the shared soft pass is Full-only, and it used to be
+    // admitted there — ignoring every guide and returning the unbanded log Z, so
+    // fill="interpair" and fill="striped" disagreed (inherited from BatchAligner).
+    int stream_inter_backend_(const AlignParams& params, int kernel, bool banded) const {
         const int backend = (kernel == kBackendAuto) ? global_default_backend() : kernel;
         if (backend < 0) return -1;
         const LevelKernels& K = level_kernels(backend);
         if (grad_mode_ == GradMode::Soft)
-            return (K.inter_soft && K.inter_w > 0 && soft_impl_ != SoftImpl::Log && band == 0) ? backend : -1;
+            return (K.inter_soft && K.inter_w > 0 && soft_impl_ != SoftImpl::Log && !banded) ? backend : -1;
         if (inter_w_(K) <= 0) return -1;
         if (GM == GapModel::Linear &&
-            (band > 0 || (AM == AlignMode::Global && (inter_w_(K) < 4 || params.matrix.size() > 8))))
+            (banded || (AM == AlignMode::Global && (inter_w_(K) < 4 || params.matrix.size() > 8))))
             return -1;
         return backend;
     }
@@ -832,7 +839,11 @@ private:
     }
     void prepare_paths_(bool keep, bool all = true) {
         if (!keep) {
-            if (all) for (auto& f : flags_) f &= static_cast<uint8_t>(~kStored);
+            if (all) {   // every path is about to be stale: free them, don't just flag them
+                for (auto& f : flags_) f &= static_cast<uint8_t>(~kStored);
+                std::vector<std::vector<uint32_t>>().swap(path_);
+                std::vector<std::array<int, 2>>().swap(path_end_);
+            }
             return;
         }
         if (path_.size() != size()) { path_.resize(size()); path_end_.resize(size()); }

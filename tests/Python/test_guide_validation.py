@@ -31,3 +31,18 @@ else:
     raise AssertionError("a guide shorter than the input sequence was accepted")
 """)
     assert proc.returncode == 0, describe(proc)
+
+
+@pytest.mark.parametrize("cls", ["SeqPairBatch", "SeqPairBatchDouble"])
+def test_align_validates_each_guide_pair(cls):
+    """align()'s gapped strings go through guide_j_from_aligned, as BatchAligner.align's
+    did: one empty string against a non-empty one is a caller error, not "no guide"
+    (which would silently band around the diagonal instead)."""
+    import numpy as np
+    import nwgrad
+    p = nwgrad.AlignParams(3 * np.eye(4) - 1, alphabet="ACGT", gap_open_a=2, gap_extend_a=1,
+                           gap_open_b=2, gap_extend_b=1)
+    batch = getattr(nwgrad, cls)(1, grad_mode="hard")
+    with pytest.raises(ValueError):
+        batch.align(["ACGT"], ["ACGT"], p, band=2, aligned_a=["AC-GT"], aligned_b=[""])
+

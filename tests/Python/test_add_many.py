@@ -386,3 +386,18 @@ def test_grad_mode_none_still_scores():
     assert not batch[0].grad_valid
     # The binding reports an uncomputed gradient as None rather than raising.
     assert batch[0].grad is None
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+def test_untyped_batch_takes_its_type_from_the_first_add_many_that_adds_pairs():
+    """An empty or failing first add_many() on a deprecated untyped batch must not fix its
+    type: before 0.6 an empty add_many() was a no-op."""
+    batch = nwgrad.SeqPairBatch(n_threads=2)
+    batch.add_many([], [], dna_params())                      # adds nothing
+    assert batch.gap_model is None
+    with pytest.raises(ValueError):
+        batch.add_many(["ACGZ"], ["ACGT"], dna_params())      # throws: adds nothing
+    assert batch.gap_model is None and len(batch) == 0
+    batch.add_many(DNA_A, DNA_B, dna_params(), gap_model="linear", mode="local",
+                   grad_mode="soft")                          # this one types it
+    assert (batch.gap_model, batch.mode, batch.grad_mode) == ("linear", "local", "soft")

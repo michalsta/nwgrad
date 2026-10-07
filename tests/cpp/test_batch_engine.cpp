@@ -282,7 +282,11 @@ void stream_sweep(int n) {
         INFO("stream case " << k << " gd " << gi << " band " << band << " guides " << guides
              << " inter " << inter << " threads " << threads << " protein " << protein);
         BA ba(p, band, GM, AM, bgds[gi], threads);
-        ba.inter_fill = inter; ba.soft_temperature = temp;
+        // The one known-wrong oracle path: a soft guided band-0 call under interpair ran
+        // the Full-only shared soft pass and ignored the guides (fixed in align_stream).
+        // There the oracle's own-path answer, the correct one, is the reference.
+        const bool oracle_bug = gds[gi] == GradMode::Soft && band == 0 && guides && inter;
+        ba.inter_fill = inter && !oracle_bug; ba.soft_temperature = temp;
         BatchEngine<T, GM, AM> eng(threads, gds[gi]);
         eng.inter_fill = inter; eng.set_soft_temperature(temp);
         const BatchResult ro = ba.align(probs);

@@ -228,3 +228,23 @@ def test_long_local_float32_pairs_keep_their_hirschberg_default():
     r1 = _align("float32", p, "affine", "local", "hard", A, B, "interpair")
     for x, y in zip(r0, r1):
         assert np.array_equal(x, y)
+
+
+@pytest.mark.parametrize("prec", ["double", "float32"])
+def test_soft_guided_band0_align_ignores_no_guide(prec):
+    """align(band=0, aligned_a/aligned_b) is GuideBanded at width 0.  The shared soft pass
+    is Full-only and used to be admitted anyway, returning the unbanded log Z: 8.047 under
+    fill="interpair" against 8.0 under "striped" (inherited from BatchAligner).  At width
+    0 the soft score is the guide path's own score, the hard one."""
+    p = nwgrad.AlignParams(nwgrad.SubstMatrix(np.eye(4) * 2 - 1, alphabet=DNA), 2, 1, 2, 1)
+    A, B = ["ACGTACGTAC", "ACGTTACG"], ["ACGAACGTAC", "ACGTACG"]
+    ga, gb = ["ACGTACGTAC", "ACGTTACG"], ["ACGAACGTAC", "ACGT-ACG"]
+    cls = nwgrad.SeqPairBatchDouble if prec == "double" else nwgrad.SeqPairBatch
+    got = {}
+    for gd in ("soft", "hard"):
+        for fill in ("interpair", "striped"):
+            b = cls(1, grad_mode=gd)
+            b.fill = fill
+            got[gd, fill] = np.asarray(b.align(A, B, p, 0, ga, gb).scores)
+    np.testing.assert_allclose(got["soft", "interpair"], got["soft", "striped"], rtol=1e-11)
+    np.testing.assert_allclose(got["soft", "striped"], got["hard", "striped"], rtol=1e-11)

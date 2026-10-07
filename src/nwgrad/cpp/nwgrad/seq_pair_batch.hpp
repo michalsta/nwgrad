@@ -103,7 +103,18 @@ public:
                 throw std::invalid_argument(
                     "nwgrad: this batch has no problem type yet; construct it with gap_model, "
                     "mode and grad_mode (or pass all three to its first add_many())");
+            // Provisional: an untyped batch takes its type from the first add_many() that
+            // ADDS pairs.  One that adds nothing, or throws, leaves it untyped (as before
+            // 0.6, when an empty add_many() was a no-op).
             make_engine_(*gm, *am, *gd);
+            try {
+                visit([&](auto& e) { e.add_many(seqs_a, seqs_b, params, kernel); });
+            } catch (...) {
+                e_.template emplace<0>();
+                throw;
+            }
+            if (size() == 0) e_.template emplace<0>();
+            return;
         } else {
             auto clash = [&](const char* what, const char* have, const char* want) {
                 throw std::invalid_argument(
@@ -147,6 +158,7 @@ public:
     void set_params(const AlignParams& p) { if (typed()) visit([&](auto& e) { e.set_params(p); }); }
     double score_and_grad(bool keep_paths = false, bool hold_grads = false) {
         if (!typed()) return 0.0;
+        sync_schedule();
         return visit([&](auto& e) { return e.score_and_grad(keep_paths, hold_grads); });
     }
     double banded_grad(int bandwidth, bool keep_paths = false, bool hold_grads = false) {
@@ -156,6 +168,7 @@ public:
                                             std::to_string(bandwidth) + "); use score_and_grad() for full DP");
             return 0.0;
         }
+        sync_schedule();
         return visit([&](auto& e) { return e.banded_grad(bandwidth, keep_paths, hold_grads); });
     }
     void drop_paths() { if (typed()) visit([](auto& e) { e.drop_paths(); }); }
@@ -225,7 +238,8 @@ public:
         soft_lazy_ = lazy && !posterior; soft_post_ = posterior;
         if (typed()) visit([&](auto& e) { e.set_soft_guide(lazy, posterior); });
     }
-    // Scheduling knobs: plain fields, pushed to the engine at every batch operation.
+    // Scheduling knobs: plain fields, pushed to the engine by score_and_grad() and
+    // banded_grad() (sync_schedule) — set them freely between calls.
     bool   sorted_schedule = false;
     double reserve_frac    = 0.0;
     double long_cost_ratio = 1.0;

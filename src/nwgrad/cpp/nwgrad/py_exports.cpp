@@ -598,7 +598,7 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             "gradients and stored paths; guides stay, for banded_grad().")
         .def(
             "score_and_grad",
-            [](SPB& self, bool keep_paths) { self.sync_schedule(); return self.score_and_grad(keep_paths); },
+            [](SPB& self, bool keep_paths) { return self.score_and_grad(keep_paths); },
             nb::arg("keep_paths") = false,
             "Full DP on every pair: score, guide and (unless grad_mode \"none\") gradient,\n"
             "cached per pair.  keep_paths=True also stores each alignment path\n"
@@ -607,7 +607,6 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
         .def(
             "banded_grad",
             [](SPB& self, int bandwidth, bool keep_paths) {
-                self.sync_schedule();
                 return self.banded_grad(bandwidth, keep_paths);
             },
             nb::arg("bandwidth"), nb::arg("keep_paths") = false,
@@ -629,7 +628,10 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
                 for (size_t i = 0; i < seqs_a.size(); ++i) {
                     problems[i].seq_a = seqs_a[i];
                     problems[i].seq_b = seqs_b[i];
-                    if (guides) problems[i].guide_j = make_guide(aligned_a[i], aligned_b[i]);
+                    // Straight through guide_j_from_aligned, which validates the two
+                    // strings (as BatchAligner.align did); make_guide would read an empty
+                    // string as "no guide" and silently band around the diagonal.
+                    if (guides) problems[i].guide_j = guide_j_from_aligned(aligned_a[i], aligned_b[i]);
                 }
                 return self.align(problems, params, band, parse_backend(kernel));
             },
@@ -709,7 +711,6 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
              [](SPB& self) {
                  deprecated("SeqPairBatch.align_full() is deprecated: use "
                             "score_and_grad(keep_paths=True)");
-                 self.sync_schedule();
                  return self.score_and_grad(/*keep_paths=*/true, /*hold_grads=*/true);
              },
              "Deprecated: score_and_grad(keep_paths=True), with each gradient held until\n"
@@ -718,7 +719,6 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
              [](SPB& self, int bandwidth) {
                  deprecated("SeqPairBatch.realign_banded() is deprecated: use "
                             "banded_grad(bandwidth, keep_paths=True)");
-                 self.sync_schedule();
                  return self.banded_grad(bandwidth, /*keep_paths=*/true, /*hold_grads=*/true);
              },
              nb::arg("bandwidth"),
