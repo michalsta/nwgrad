@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Differential fuzz: SeqPairBatch fill="interpair" against fill="striped".
 
-Each seed builds one random batch -- several add_many() groups, each with its own gap
-model, mode, grad mode and parameters (ties, integer, real-valued; cheap and dear gaps),
+Each seed builds one random batch of one problem type (gap model, mode, grad mode --
+one per batch since 0.6) from several add_many() segments, each with its own
+parameters (ties, integer, real-valued; cheap and dear gaps),
 empty and one-residue sequences, lengths past hb_cutoff, shared and ragged len B, both
 precisions, every traceback -- and runs score_and_grad() and then banded_grad(bw) under
 both fills.  Hard scores and gradients must be bit-identical (the documented contract),
@@ -15,7 +16,9 @@ ending the sweep:
     python tools/fuzz_fill.py --seed 6        # one seed, in this process (for gdb)
 
 This is the harness that found the linear/affine DpBuffer overrun (test_buffer_reuse.cpp):
-39 of 400 seeds crashed before the guard fix, none after.
+39 of 400 seeds crashed before the guard fix, none after.  (Its batches then mixed gap
+models; since 0.6 a batch holds one type, which removes that mix but not the bug class:
+`auto` still switches fills within a type, and test_buffer_reuse.cpp covers the class.)
 """
 import argparse
 import subprocess
@@ -70,10 +73,10 @@ def make_case(seed):
     prec = str(rng.choice(["double", "float32"]))
     tb = str(rng.choice(["auto", "pointers", "scores"]))
     specs = []
+    gm = str(rng.choice(["affine", "linear"]))
+    mode = str(rng.choice(["global", "local"]))
+    gr = str(rng.choice(["hard", "hard", "none", "soft"]))
     for _ in range(int(rng.integers(1, 5))):
-        gm = str(rng.choice(["affine", "linear"]))
-        mode = str(rng.choice(["global", "local"]))
-        gr = str(rng.choice(["hard", "hard", "none", "soft"]))
         p = rparams(rng, alpha, gm)
         k = int(rng.integers(1, 40))
         lb = rlen(rng)
@@ -85,10 +88,11 @@ def make_case(seed):
 
 
 def run_fill(prec, tb, specs, fill, bw):
-    b = CLS[prec](n_threads=3, traceback=tb)
+    _, _, _, gm, mode, gr = specs[0]
+    b = CLS[prec](n_threads=3, traceback=tb, gap_model=gm, mode=mode, grad_mode=gr)
     b.fill = fill
-    for A, B, p, gm, mode, gr in specs:
-        b.add_many(A, B, p, gap_model=gm, mode=mode, grad_mode=gr)
+    for A, B, p, _, _, _ in specs:
+        b.add_many(A, B, p)
     try:
         b.score_and_grad()
     except Exception as e:  # must match across fills, checked by the caller
