@@ -10,7 +10,8 @@ building from source, see [cpp.md](cpp.md).
 - [`Alphabet`](#alphabet) · [`SubstMatrix`](#substmatrix) · [`AlignParams`](#alignparams)
   (with [gap penalty conventions](#gap-penalty-conventions))
 - [`SeqPair`](#seqpair) · [`SeqPairBatch`](#seqpairbatch) · [`nwgrad.logistic`](#nwgradlogistic)
-- [`BatchAligner`](#batchaligner) · [`BatchResult`](#batchresult)
+  · [`BatchResult`](#batchresult)
+- [Migrating from 0.5](#migrating-from-05)
 - [Single-pair convenience functions](#single-pair-convenience-functions)
 
 ## `Alphabet`
@@ -142,41 +143,48 @@ nwgrad.SeqPair(
 )
 ```
 
-Persistent sequence-pair object. Sequences and alignment mode are fixed at
-construction; the alignment parameters can be swapped cheaply via `set_params()`.
-The pair holds its `AlignParams` alive automatically, so you don't need to keep
-a separate reference to it.
+One sequence pair, aligned on the calling thread. Sequences and problem type are fixed
+at construction; the parameters can be swapped cheaply with `set_params()`. The pair
+keeps its `AlignParams` alive, so you don't need a separate reference to it.
+
+A `SeqPair` is also what `batch[i]` returns: a **view** of pair `i` of a
+[`SeqPairBatch`](#seqpairbatch), with the same methods and properties. A view's
+results are the batch's (a view never copies), and its settings — params, `fill`, the
+soft options, `hb_cutoff` — belong to the batch: setting them on a view raises
+`RuntimeError`; set them on the batch.
 
 **Methods:**
 
 | Method | Description |
 |---|---|
-| `alloc_dp()` | Pre-allocate own DP tables (needed before `align_full()` / `realign_banded()`; not needed if using `SeqPairBatch.score_and_grad()`). |
-| `align_full()` | Full DP alignment. Sets `score` and `guide_j`; clears `grad`. |
-| `realign_banded(bandwidth)` | Banded DP around the current path. Requires prior `align_full()`. Sets `score`; clears `grad`. |
-| `compute_grad()` | Compute and cache the gradient from the current alignment. Requires `align_full()` or `realign_banded()` to have been called first. |
-| `score_and_grad()` | Convenience: `alloc_dp()` + `align_full()` + `compute_grad()` in one call. Returns `(score, grad)`. |
-| `aligned()` | Return the alignment as a pair of gapped strings `(seq_a, seq_b)`. Requires the DP tables of the current params: raises `RuntimeError` after `drop_dp()` or `set_params()` until the next `align_full()` / `realign_banded()`. With `grad_mode="soft"` it is the Viterbi alignment. |
+| `align_full()` | Full DP: sets `score`, `guide_j` and the stored alignment path. The gradient is computed too but **held**: `grad` stays `None` until `compute_grad()`. |
+| `realign_banded(bandwidth)` | Banded DP around the current path, under the current params. Requires a prior `align_full()` (or a batch `score_and_grad()`). Same holding of the gradient. |
+| `compute_grad()` | Release the gradient of the last `align_full()` / `realign_banded()`. Raises if there is none (no alignment yet, `set_params()` or `drop_dp()` since, or `grad_mode="none"`). |
+| `score_and_grad()` | `align_full()` + `compute_grad()`. Returns `(score, grad)`; raises if `grad_mode` is `"none"`. |
+| `aligned()` | The alignment as a pair of gapped strings `(seq_a, seq_b)`. Needs a stored path: raises after `drop_dp()` or `set_params()` until the next align. With `grad_mode="soft"` it is the Viterbi alignment. |
 | `coordinates()` | The alignment as Biopython-style coordinates: an `int64` array of shape `(2, k)`, row 0 positions in `seq_a`, row 1 in `seq_b`, with a column at the start, at each change between aligned and gap columns, and at the end. `Bio.Align.Alignment([seq_a, seq_b], coordinates)` rebuilds it. A local alignment starts where its path starts. Same availability as `aligned()`. |
 | `formatted(width=60)` | Pretty-printed alignment block (seq A / match line / seq B), wrapped at `width` columns (`0` = no wrap). Same availability as `aligned()`. |
-| `set_params(params)` | Swap alignment parameters. Clears `score` and `grad` and invalidates the retained DP tables (`dp_valid` becomes `False`, so `aligned()` raises until you re-align: the tables belong to the replaced params, which may already be freed). Preserves `guide_j`, so `realign_banded()` works straight after. |
-| `drop_dp()` | Free O(m×n) DP table memory. Cached `score`, `grad`, and `guide_j` survive (but `aligned()` / `compute_grad()` then need a re-align). |
+| `set_params(params)` | (Standalone pairs.) Swap alignment parameters. Clears `score`, `grad` and the stored path; preserves `guide_j`, so `realign_banded()` works straight after. |
+| `drop_dp()` | Free the stored path. `score`, a released `grad` and `guide_j` survive. |
+| `alloc_dp()` | **Deprecated** no-op (there are no per-pair DP tables any more). |
 
 **Properties:**
 
 | Property | Type | Description |
 |---|---|---|
 | `score` | `float \| None` | Alignment score (or `log Z` for soft), or `None` if not computed |
-| `grad` | `AlignParams \| None` | Gradient, or `None` if not computed |
+| `grad` | `AlignParams \| None` | Gradient, or `None` if not computed (or held) |
 | `guide_j` | `list[int] \| None` | Alignment path (length m+1), or `None` if not computed |
 | `seq_a`, `seq_b` | `str` | The fixed sequences |
+| `gap_model`, `mode`, `grad_mode` | `str` | The problem type |
 | `path_valid` | `bool` | `guide_j` is usable as a banding guide |
-| `score_valid` | `bool` | `score` matches current matrix and path |
+| `score_valid` | `bool` | `score` matches the current params |
 | `grad_valid` | `bool` | `grad` is populated |
-| `dp_valid` | `bool` | DP tables are in memory (`compute_grad()` is callable) |
-| `traceback` | `str` | The traceback mode this pair *resolved* to (never `"auto"`) |
-| `hb_cutoff` | `int` | Hirschberg base-case size in rows (settable; default 512) |
-| `fill` | `str` | Full-DP simd fill at double precision: `"striped"` (default) or `"rowwise"` (settable; see `SeqPairBatch.fill`) |
+| `dp_valid` | `bool` | A stored path is available (`aligned()`, `coordinates()`) |
+| `traceback` | `str` | The traceback mode the pair *resolved* to (never `"auto"`) |
+| `hb_cutoff` | `int` | Hirschberg base-case size in rows (settable on a standalone pair; default 512) |
+| `fill` | `str` | Full-DP simd fill at double precision: `"striped"` (default) or `"rowwise"` (settable on a standalone pair; see `SeqPairBatch.fill`) |
+| `soft_impl`, `soft_temperature` | | As on `SeqPairBatch` (settable on a standalone pair) |
 
 **Gradient modes:**
 
@@ -184,57 +192,62 @@ a separate reference to it.
 |---|---|---|
 | `"hard"` | Viterbi alignment score | Substitution-pair counts (integer-valued subgradient) |
 | `"soft"` | Log-partition function `log Z` | Expected substitution counts (true gradient of `log Z`) |
-| `"none"` | Viterbi alignment score | `compute_grad()` throws |
+| `"none"` | Viterbi alignment score | `compute_grad()` raises |
 
 ---
 
 ## `SeqPairBatch`
 
 ```python
-nwgrad.SeqPairBatch(n_threads=0, traceback="auto")
+nwgrad.SeqPairBatch(
+    n_threads=0, traceback="auto", *,
+    gap_model="affine",     # "linear" | "affine"
+    mode="global",          # "global" | "local"
+    grad_mode="hard",       # "hard" | "soft" | "none"
+)
 ```
+
+Many sequence pairs of **one problem type** — one gap model, alignment mode and grad
+mode — aligned in parallel. Each pair's state (its encoded sequences, score, guide and
+gradient: a few hundred bytes) lives in the batch's own arrays, and the DP runs on
+per-thread buffers. Naming any of `gap_model` / `mode` / `grad_mode` fixes the type
+(the others take their defaults); naming none is the deprecated pre-0.6 form, where the
+first `add_many()` fixes it (see [Migrating from 0.5](#migrating-from-05)).
 
 `n_threads=0` (default) uses the number of *physical* cores (falling back to
 `hardware_concurrency` where that cannot be determined): the DP is stall-bound, so
-SMT siblings contend and the logical count measured up to 1.44× slower. `add()` keeps each `SeqPair` (and, transitively, its `AlignParams`) alive for the lifetime of the batch.
+SMT siblings contend and the logical count measured up to 1.44× slower.
 
 **Methods:**
 
 | Method | Returns | Description |
 |---|---|---|
-| `add(seq_pair)` | — | Append a `SeqPair` |
-| `add_many(seqs_a, seqs_b, params, gap_model="affine", mode="global", grad_mode="hard", kernel="auto")` | — | Build N `SeqPair`s in C++ and append them — much faster than N `add()` calls. The pairs take the batch's `traceback` and `hb_cutoff`. |
-| `set_params(params)` | — | Call `set_params()` on all pairs, in parallel. The alphabet is checked once first, so a mismatch raises without changing any pair. |
-| `score_and_grad(bandwidth=0)` | `float` (sum of scores) | Full-pipeline parallel alignment. Uses per-thread DP buffers (pair-owned tables are never allocated). If `bandwidth > 0`, runs a full DP for the guide path then a banded DP. Results are cached on each `SeqPair`. |
-| `compute_grad()` | `AlignParams` | Sum cached per-pair gradients. No DP work if all `grad_valid` are already true. |
-| `scores()` | `numpy.ndarray` (float64) | The cached per-pair scores, in pair order, gathered in parallel. Runs no DP; raises if any pair has no valid score. |
+| `add_many(seqs_a, seqs_b, params, kernel="auto")` | — | Append the pairs `(seqs_a[i], seqs_b[i])` under `params`: one **segment**. Params may differ between calls (one alphabet); `set_params()` replaces them all. Sequences are validated and encoded in parallel; a bad character raises and adds nothing. The batch keeps `params` alive. |
+| `set_params(params)` | — | Point every pair at `params` (same alphabet; a mismatch raises without changing anything). Clears cached scores, gradients and stored paths; keeps the guides, for `banded_grad()`. |
+| `score_and_grad(keep_paths=False)` | `float` (sum of scores) | Full DP on every pair: score, guide and (unless `grad_mode="none"`) gradient, cached per pair. `keep_paths=True` also stores each alignment path, so `batch[i].aligned()` / `.coordinates()` work (a few bytes per alignment column). |
+| `banded_grad(bandwidth, keep_paths=False)` | `float` (sum of scores) | Banded re-align + gradient around each pair's cached guide. Run `score_and_grad()` once to establish the guides, then `set_params()` + `banded_grad(bw)` after each update; no full DP is run. |
+| `align(seqs_a, seqs_b, params, band=0, aligned_a=[], aligned_b=[], kernel="auto")` | [`BatchResult`](#batchresult) | Align pairs **without adding them** (what `BatchAligner` was): scores plus the gradient summed over the pairs, nothing kept per pair, so memory stays O(threads). Uses the batch's type, grad mode, threads and settings. `band > 0` bands every pair (`aligned_a` / `aligned_b`, one gapped string per pair, give the guides; the diagonal otherwise); `band == 0` with guides bands at width 0, so all pairs or none must carry one. Soft: forward-backward only (no Viterbi). |
+| `compute_grad()` | `AlignParams` | The cached gradients summed over all pairs. Summed in fixed blocks, so bit-reproducible whatever `n_threads`. Raises on an empty batch. |
+| `scores()` | `numpy.ndarray` (float64) | The cached per-pair scores, in pair order. Runs no DP; raises if any pair has no valid score. |
 | `weighted_grad(weights)` | `AlignParams` | `sum_i weights[i] * grad_i` over the cached per-pair gradients. `weights` is a 1-D numeric array with one entry per pair. Runs no DP; raises if any pair has no valid gradient. Summed in fixed blocks of 4096 pairs (each in pair order, the blocks in parallel), then over the blocks in order, so the result is bit-reproducible and does not depend on `n_threads`. |
-| `grads()` | `(numpy.ndarray, numpy.ndarray)` (float64) | The cached per-pair gradients as two arrays, in pair order: `matrices` of shape `(N, n, n)`, rows and columns in the order of `alphabet`, and `gaps` of shape `(N, 4)` with columns `gap_open_a`, `gap_extend_a`, `gap_open_b`, `gap_extend_b`. The same numbers as `batch[i].grad`, without one `AlignParams` object per pair. Runs no DP; raises on an empty batch and if any pair has no valid gradient. |
-| `align_full()` | `float` (sum of scores) | Full DP on all pairs in parallel using pair-owned buffers. Call `alloc_dp()` first. |
-| `realign_banded(bandwidth)` | `float` (sum of scores) | Banded DP on all pairs in parallel using pair-owned buffers. |
-| `banded_grad(bandwidth)` | `float` (sum of scores) | Banded re-align + gradient around each pair's cached path, using per-thread buffers. Run `score_and_grad()` once to establish the paths, then `set_params()` + `banded_grad(bw)` after each update. |
-| `alloc_dp()` | — | Pre-allocate pair-owned DP tables in parallel. |
-| `drop_dp()` | — | Free pair-owned DP tables in parallel. |
+| `grads()` | `(numpy.ndarray, numpy.ndarray)` (float64) | The cached per-pair gradients as two arrays, in pair order: `matrices` of shape `(N, n, n)`, rows and columns in the order of `alphabet`, and `gaps` of shape `(N, 4)` with columns `gap_open_a`, `gap_extend_a`, `gap_open_b`, `gap_extend_b`. Runs no DP; raises on an empty batch and if any pair has no valid gradient. |
+| `drop_paths()` | — | Free the stored alignment paths. |
 
 The batch is also a sequence: `len(batch)` is the number of pairs and `batch[i]`
-returns the `i`-th `SeqPair` (negative indices allowed), so per-pair results can be
-read back without keeping a separate list. A pair taken out this way keeps its batch alive, so it
-stays usable after the batch itself is dropped.
-
-Each `SeqPair` may appear in a batch **once**: adding the same object twice raises
-`ValueError` at the next batch operation (the workers would otherwise align it
-concurrently). The same pair may belong to several batches.
+returns pair `i` as a [`SeqPair`](#seqpair) view (negative indices allowed). A view
+keeps its batch alive, so it stays usable after the batch itself is dropped.
 
 **Properties:**
 
 | Property | Type | Description |
 |---|---|---|
 | `n_threads` | `int` | Thread count |
+| `gap_model`, `mode`, `grad_mode` | `str \| None` | The batch's problem type (`None` while a deprecated untyped batch has no pairs) |
 | `alphabet` | `str` | The symbols of the alphabet every pair shares (the row and column order of `grads()`). Raises on an empty batch. |
-| `traceback` | `str` | The batch's traceback mode as given (`"auto"` resolves per pair) |
-| `hb_cutoff` | `int` | Hirschberg base-case size applied by `add_many()` (default 512) |
-| `schedule` | `str` | `"dynamic"` (default; atomic counter) or `"sorted"` (length-sorted equal-work chunks — bounds peak DP memory). Results are identical either way. |
-| `fill` | `str` | How `score_and_grad()` / `banded_grad()` vectorize the DP: `"interpair"` (default), `"striped"` or `"rowwise"`. Settable; applies to the pairs already in the batch and to later `add_many()` ones. Hard results are bit-identical whichever fill runs. See below. |
+| `traceback` | `str` | The traceback mode as constructed (`"auto"` reported as such; `batch[i].traceback` shows what it resolves to) |
+| `hb_cutoff` | `int` | Hirschberg base-case size in rows (default 512), for every pair |
+| `schedule` | `str` | `"dynamic"` (default; atomic counter) or `"sorted"` (length-sorted equal-work chunks — bounds peak DP memory) for the per-pair fills. Results are identical either way. |
+| `fill` | `str` | How `score_and_grad()` / `banded_grad()` / `align()` vectorize the DP: `"interpair"` (default), `"striped"` or `"rowwise"`. Hard results are bit-identical whichever fill runs. See below. |
 | `soft_impl` | `str` | Soft-path evaluation: `"scaled"` (default; scaled probability space, raises `ValueError` for a pair out of its range), `"scaled_or_log"` (falls back to log space per pair, silently) or `"log"` (the log-space recurrences). |
 | `soft_temperature` | `float` | Soft score `T·log Z(θ/T)`; the gradient is the expected counts under `θ/T`. Default 1. |
 | `soft_guide` | `str` | When soft pairs get the guide path that `banded_grad()` bands around: `"eager"` (default; `score_and_grad()` runs the guide Viterbi), `"lazy"` (computed on first use, under the params current then) or `"posterior"` (no Viterbi: per row of A the column where the posterior path most likely leaves the row, made non-decreasing — a band centre from the soft pass itself, under the params scored). |
@@ -252,8 +265,7 @@ slow down, silently runs its own fill instead, with the same results.
 
 Which pairs each fill applies to:
 
-- **`"interpair"`** (`SeqPairBatch`, `SeqPairBatchDouble`, `BatchAligner`,
-  `BatchAlignerDouble`): both precisions, affine and linear gaps, any alphabet (over 8
+- **`"interpair"`** (`SeqPairBatch` / `SeqPairBatchDouble`, including `align()`): both precisions, affine and linear gaps, any alphabet (over 8
   letters the substitution scores are gathered per row), hard and soft pairs — the soft
   forward-backward is shared too, and a soft pair's guide Viterbi rides the shared fill —
   full DP and, for hard affine pairs, `banded_grad()`. Pairs in one group must share
@@ -262,8 +274,7 @@ Which pairs each fill applies to:
   leave L2 (1.25 MiB; 512 KiB for the soft pass — long pairs, where the per-pair fills
   win), hard linear Global pairs below 4 lanes or with alphabets over 8 letters (their
   own fill is cheaper), empty sequences, Hirschberg pairs longer than `hb_cutoff`, and
-  `kernel="scalar_fallback"`. Every other batch operation (`align_full()`,
-  `realign_banded()`) uses the pair's own fill.
+  `kernel="scalar_fallback"`.
 - **`"rowwise"`**: affine gaps at double precision on a simd kernel. Float32, linear
   gaps, `kernel="scalar_fallback"` and Hirschberg pairs longer than `hb_cutoff` ignore
   it.
@@ -279,29 +290,29 @@ grouping is built once and reused until pairs are added.
 **Typical optimization loop:**
 
 ```python
+import numpy as np
+import nwgrad
 from nwgrad.matrices import BLOSUM62
 
-# Learnable matrix starts from BLOSUM62; keep its alphabet to stay consistent.
+# The learnable matrix starts from BLOSUM62; keep its alphabet to stay consistent.
 alphabet = BLOSUM62.alphabet
 mat_array = BLOSUM62.to_matrix()
 
-# Build pairs once
-params = nwgrad.AlignParams(nwgrad.SubstMatrix(mat_array, alphabet),
-                            gap_open_a=11.0, gap_extend_a=1.0,
-                            gap_open_b=11.0, gap_extend_b=1.0)
-batch = nwgrad.SeqPairBatch(n_threads=8)
-for a, b in zip(seqs_a, seqs_b):
-    batch.add(nwgrad.SeqPair(a, b, params,
-                             gap_model="affine", mode="global", grad_mode="soft"))
+def make_params(m):
+    return nwgrad.AlignParams(nwgrad.SubstMatrix(m, alphabet),
+                              gap_open_a=11.0, gap_extend_a=1.0,
+                              gap_open_b=11.0, gap_extend_b=1.0)
 
+batch = nwgrad.SeqPairBatch(n_threads=8, gap_model="affine", mode="global",
+                            grad_mode="soft")
+batch.add_many(seqs_a, seqs_b, make_params(mat_array))    # encoded once
+
+batch.score_and_grad()                  # full DP: establishes every pair's guide
 for step in range(n_steps):
-    total_log_z = batch.score_and_grad(bandwidth=bw if step > 0 else 0)
     grad = batch.compute_grad()
-    mat_array += lr * grad.matrix.to_matrix()   # both in `alphabet` order
-    params = nwgrad.AlignParams(nwgrad.SubstMatrix(mat_array, alphabet),
-                                gap_open_a=11.0, gap_extend_a=1.0,
-                                gap_open_b=11.0, gap_extend_b=1.0)
-    batch.set_params(params)
+    mat_array += lr * grad.matrix.to_matrix()             # both in `alphabet` order
+    batch.set_params(make_params(mat_array))
+    total_log_z = batch.banded_grad(bw)  # re-align around the cached guides only
 ```
 
 ---
@@ -323,37 +334,9 @@ added in order, so results do not depend on `n_threads` (0 = the default thread 
 | `log_likelihood(scores, labels, alpha, n_threads=0)` | `float` | Σ y log c + (1 − y) log1p(−c), with c = expit(α + score) clipped to [ε, 1 − ε]. |
 | `probabilities(scores, alpha, n_threads=0)` | `numpy.ndarray` | expit(α + scores), bit-identical to `scipy.special.expit`. |
 
-## `BatchAligner`
-
-Stateless batch alignment: constructs a fresh DP buffer per call and does not preserve alignment paths across calls. Simpler API when you do not need to reuse paths for banded re-alignment.
-
-```python
-nwgrad.BatchAligner(
-    params,               # AlignParams — matrix and gap penalties together
-    band=0,               # 0 = full DP; >0 = banded half-width
-    gap_model="affine",   # "linear" | "affine"
-    mode="global",        # "global" | "local"
-    grad_mode="hard",     # "hard" | "soft" | "none"
-    n_threads=1,
-    kernel="auto",        # Viterbi backend, see tuning.md#kernel-selection
-)
-```
-
-**`.align(sequences_a, sequences_b, aligned_a=[], aligned_b=[]) -> BatchResult`**
-
-Aligns each pair `(sequences_a[i], sequences_b[i])`. `aligned_a` / `aligned_b`, if
-given, are gapped alignment strings (one per pair) used as banding guides. Each guide
-must describe its own pair — see [guide validation](#guide-validation).
-
-**Properties** (settable): `fill` — `"interpair"` (default) or `"striped"`, as
-`SeqPairBatch.fill` (see "Choosing a fill" above): problems grouped W per vector lane, hard, none
-and soft grad modes, full DP and banded affine Viterbi; scores and hard gradients are
-bit-identical either way. `soft_impl` and `soft_temperature`, as on `SeqPairBatch`.
-A Global banded guide that stops short of the last column (trailing gaps in the
-aligned strings) is now always banded through to `(m, n)`; before 2026-10-05 such a
-band read an unwritten cell and returned a wrong score.
-
 ## `BatchResult`
+
+Returned by `SeqPairBatch.align()`.
 
 | Attribute | Type | Description |
 |---|---|---|
@@ -422,3 +405,32 @@ the affine *gradient* functions infix it.)
 ```python
 score, grad = nwgrad.nw_affine_grad("PLEASANTLY", "MEANLY", params)
 ```
+
+---
+
+## Migrating from 0.5
+
+0.6 restructured the batch layer: a `SeqPairBatch` holds pairs of **one problem type**
+in its own arrays (about 10× less memory per pair, faster batch-wide steps), and
+`BatchAligner` became `SeqPairBatch.align()`. Old calls either still work with a
+`DeprecationWarning`, or raise with a message that names the replacement:
+
+| 0.5 | 0.6 | |
+|---|---|---|
+| `SeqPairBatch(n)` + `add_many(A, B, p, gap_model=…, mode=…, grad_mode=…)` | `SeqPairBatch(n, gap_model=…, mode=…, grad_mode=…)` + `add_many(A, B, p)` | deprecated, works: the first `add_many()` fixes the type (missing names take the old defaults `"affine"` / `"global"` / `"hard"`); later calls must agree |
+| one batch mixing gap models, modes or grad modes | one batch per problem type | raises `ValueError` |
+| `batch.add(seq_pair)` | `batch.add_many([...], [...], params)` | removed |
+| `BatchAligner(p, band, gap_model, mode, grad_mode, n_threads, kernel).align(A, B, ga, gb)` | `SeqPairBatch(n_threads, gap_model=…, mode=…, grad_mode=…).align(A, B, p, band, ga, gb, kernel)` | removed; same results |
+| `batch.alloc_dp(); batch.align_full()` | `batch.score_and_grad(keep_paths=True)` | deprecated, works (the gradient is held until `compute_grad()`, as before) |
+| `batch.realign_banded(bw)` | `batch.banded_grad(bw, keep_paths=True)` | deprecated, works |
+| `batch.drop_dp()` | `batch.drop_paths()` | deprecated, works |
+| `pair.alloc_dp()` | (nothing) | deprecated no-op |
+| `batch[i].set_params(p)`, `batch[i].hb_cutoff = …`, `.fill`, `.soft_impl`, `.soft_temperature` | set them on the batch | raises: a pair in a batch is a view, its settings are the batch's (`hb_cutoff` now applies to every pair) |
+| `batch[i] is batch[i]` | — | `batch[i]` returns a new view each time |
+
+Results are unchanged: scores, alignments and hard gradients are bit-identical to
+0.5.2's, and soft per-pair results too. Two sums differ in the last bits for soft
+pairs only, because they are now reproducible: `compute_grad()` (0.5 merged per-thread
+sums in completion order) and the scores of a deprecated `align_full()` under
+`fill="interpair"` (0.5 ran each pair's own forward-backward; the shared soft pass
+agrees within the soft path's usual tolerance).

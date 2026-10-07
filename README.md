@@ -15,7 +15,8 @@ params = params + 0.01 * grad   # every matrix cell and all four gap costs move 
 - **Gradients, not just scores.** The *hard* gradient counts substitution pairs and
   gap positions along the optimal path (a subgradient of the Viterbi score). The
   *soft* gradient is the exact gradient of the log-partition function over **all**
-  alignments, computed by forward–backward in log space. Matrix and gap fields share
+  alignments, computed by forward–backward (in scaled probability space by default, no
+  logarithm per cell; log space on request). Matrix and gap fields share
   one sign convention, so a single update rule moves them all.
 - **Fast.** Striped SIMD kernels for SSE2, AVX2, AVX-512 and NEON ship in one binary
   and are chosen at runtime. Every one is **bit-exact** with the scalar reference: the
@@ -79,10 +80,10 @@ Any differentiable objective over alignment scores works. Here, a contrastive on
 make a set of pairs you believe are homologous score higher than a set of decoys.
 
 ```python
-pos = nwgrad.SeqPairBatch()                 # all cores by default
-neg = nwgrad.SeqPairBatch()
-pos.add_many(homologs_a, homologs_b, params, grad_mode="soft")
-neg.add_many(decoys_a, decoys_b, params, grad_mode="soft")
+pos = nwgrad.SeqPairBatch(grad_mode="soft")     # all cores by default
+neg = nwgrad.SeqPairBatch(grad_mode="soft")     # one problem type per batch
+pos.add_many(homologs_a, homologs_b, params)
+neg.add_many(decoys_a, decoys_b, params)
 
 for step in range(100):
     margin = pos.score_and_grad() - neg.score_and_grad()     # sums of log Z
@@ -92,8 +93,9 @@ for step in range(100):
     neg.set_params(params)
 ```
 
-`add_many()` builds the pairs in parallel C++ with no per-pair Python objects, so
-batches of millions of pairs are cheap to set up. Per-pair scores and gradients are
+`add_many()` encodes the pairs in parallel straight into the batch's arrays — a few
+hundred bytes per pair, no per-pair objects — so batches of millions of pairs are cheap
+to set up and to keep. Per-pair scores and gradients are
 available too (`batch.scores()`, `batch.grads()`, `batch.weighted_grad(weights)`, `batch[i]`), for
 objectives that weight each pair differently.
 
@@ -102,10 +104,12 @@ objectives that weight each pair differently.
 - **Precision.** The plain names (`SeqPair`, `SeqPairBatch`, `nw_score`, …) run the
   DP in float32; `SeqPairDouble`, `SeqPairBatchDouble`, `nw_score_double`, … run it in
   float64. Inputs and outputs are float64 either way.
-- **Many short pairs.** For millions of short pairs (e.g. miRNA × target site),
-  `batch.fill = "interpair"` aligns several pairs per vector instruction — about 6×
-  the default `"striped"` fill per pair on AVX2 — with bit-identical results; see
+- **Many short pairs.** For millions of short pairs (e.g. miRNA × target site), a
+  batch's default `fill="interpair"` aligns several pairs per vector instruction —
+  2.5–5× the per-pair `"striped"` fill on AVX2 — with bit-identical results; see
   [`SeqPairBatch.fill`](docs/api.md#seqpairbatch).
+- **Scoring without keeping pairs.** `batch.align(seqs_a, seqs_b, params)` returns the
+  scores and the summed gradient and stores nothing per pair.
 - **Stateless one-offs.** Twelve functions (`nw_score`, `sw_affine_grad`,
   `nw_affine_soft_grad`, …) align a single pair without keeping any state.
 - **C++.** `python -m nwgrad --include` prints the path to the header-only library.
@@ -113,8 +117,9 @@ objectives that weight each pair differently.
 ## Documentation
 
 - [Python API reference](https://github.com/michalsta/nwgrad/blob/main/docs/api.md) —
-  `Alphabet`, `SubstMatrix`, `AlignParams`, `SeqPair`, `SeqPairBatch`, `BatchAligner`
-  and the convenience functions, with every argument and contract.
+  `Alphabet`, `SubstMatrix`, `AlignParams`, `SeqPair`, `SeqPairBatch` and the
+  convenience functions, with every argument and contract, and a guide to migrating
+  from 0.5.
 - [Precision, traceback modes and SIMD kernels](https://github.com/michalsta/nwgrad/blob/main/docs/tuning.md) —
   what the defaults are, when to change them, and what each choice costs.
 - [C++ library and building from source](https://github.com/michalsta/nwgrad/blob/main/docs/cpp.md) —
