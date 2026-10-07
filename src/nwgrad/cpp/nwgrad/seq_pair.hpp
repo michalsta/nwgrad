@@ -10,6 +10,7 @@
 
 #include "align_params.hpp"
 #include "aligner.hpp"
+#include "grad_mode.hpp"
 
 // ── Internal per-(GapModel, AlignMode) state ─────────────────────────────────
 // Holds one Full and one GuideBanded aligner, reusing their DP buffers across
@@ -20,8 +21,6 @@ struct SeqPairState {
     Aligner<GM, AM, AlignBand::Full,        T> full_al;
     Aligner<GM, AM, AlignBand::GuideBanded, T> band_al;
 };
-
-enum class GradMode { None, Hard, Soft };
 
 // ── SeqPair ───────────────────────────────────────────────────────────────────
 //
