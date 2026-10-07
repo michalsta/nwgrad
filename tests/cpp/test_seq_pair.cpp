@@ -104,10 +104,13 @@ TEST_CASE("SeqPair: accessors throw before anything is computed", "[seq_pair]") 
     REQUIRE_THROWS_AS(sp.grad(),  std::logic_error);
 }
 
-TEST_CASE("SeqPair: align_full without alloc_dp throws", "[seq_pair]") {
+TEST_CASE("SeqPair: align_full needs no alloc_dp", "[seq_pair]") {
+    // The DP runs on a worker buffer; there are no pair-owned tables to allocate, and
+    // alloc_dp() is kept only as a no-op for old callers.
     auto p = asym_params(4.0, 0.5, 1.5, 2.0);
     SeqPair sp(A, B, p, GapModel::Affine, AlignMode::Global, GradMode::Hard);
-    REQUIRE_THROWS(sp.align_full());
+    sp.align_full();
+    REQUIRE(sp.score() == Approx(aligner_score<GapModel::Affine, AlignMode::Global>(p, A, B)));
 }
 
 TEST_CASE("SeqPair: validity flags follow the lifecycle", "[seq_pair]") {
@@ -255,22 +258,23 @@ struct Corpus {
 
 }  // namespace
 
-TEST_CASE("SeqPairBatch: align_full matches per-pair alignment", "[seq_pair_batch]") {
+static std::vector<std::string_view> views(const std::vector<std::string>& v) {
+    return std::vector<std::string_view>(v.begin(), v.end());
+}
+
+static SeqPairBatch corpus_batch(const Corpus& c, const AlignParams& p, int threads) {
+    SeqPairBatch batch(GapModel::Affine, AlignMode::Global, GradMode::Hard, threads);
+    batch.add_many(views(c.as), views(c.bs), p);
+    return batch;
+}
+
+TEST_CASE("SeqPairBatch: full DP with stored paths matches per-pair alignment", "[seq_pair_batch]") {
     auto p = asym_params(4.0, 0.5, 1.5, 2.0);
     Corpus c;
-
-    std::vector<SeqPair> pairs;
-    pairs.reserve(c.as.size());
-    for (size_t i = 0; i < c.as.size(); ++i)
-        pairs.emplace_back(c.as[i], c.bs[i], p,
-                           GapModel::Affine, AlignMode::Global, GradMode::Hard);
-
-    SeqPairBatch batch(2);
-    for (auto& sp : pairs) batch.add(&sp);
+    SeqPairBatch batch = corpus_batch(c, p, 2);
     REQUIRE(batch.size() == c.as.size());
 
-    batch.alloc_dp();
-    const double total = batch.align_full();
+    const double total = batch.score_and_grad(/*keep_paths=*/true, /*hold_grads=*/true);
 
     double expected = 0.0;
     for (size_t i = 0; i < c.as.size(); ++i)
@@ -278,24 +282,19 @@ TEST_CASE("SeqPairBatch: align_full matches per-pair alignment", "[seq_pair_batc
             p, c.as[i], c.bs[i]);
 
     REQUIRE(total == Approx(expected));
-    for (auto& sp : pairs) REQUIRE(sp.score_valid());
+    for (size_t i = 0; i < batch.size(); ++i) {
+        REQUIRE(batch[i].score_valid());
+        REQUIRE(batch[i].dp_valid());
+        REQUIRE_FALSE(batch[i].grad_valid());   // held until compute_grad()
+    }
 }
 
 TEST_CASE("SeqPairBatch: compute_grad sums the per-pair gradients",
           "[seq_pair_batch]") {
     auto p = asym_params(4.0, 0.5, 1.5, 2.0);
     Corpus c;
-
-    std::vector<SeqPair> pairs;
-    pairs.reserve(c.as.size());
-    for (size_t i = 0; i < c.as.size(); ++i)
-        pairs.emplace_back(c.as[i], c.bs[i], p,
-                           GapModel::Affine, AlignMode::Global, GradMode::Hard);
-
-    SeqPairBatch batch(3);
-    for (auto& sp : pairs) batch.add(&sp);
-    batch.alloc_dp();
-    batch.align_full();
+    SeqPairBatch batch = corpus_batch(c, p, 3);
+    batch.score_and_grad(true, true);
     const AlignParams total = batch.compute_grad();
 
     AlignParams expected(Alphabet::protein());
@@ -314,60 +313,35 @@ TEST_CASE("SeqPairBatch: compute_grad sums the per-pair gradients",
             REQUIRE(total.matrix.at(i, j) == Approx(expected.matrix.at(i, j)));
 }
 
-TEST_CASE("SeqPairBatch: score_and_grad matches align_full + compute_grad",
+TEST_CASE("SeqPairBatch: held and immediate gradients agree",
           "[seq_pair_batch]") {
     auto p = asym_params(4.0, 0.5, 1.5, 2.0);
     Corpus c;
-
-    auto build = [&](std::vector<SeqPair>& out) {
-        out.reserve(c.as.size());
-        for (size_t i = 0; i < c.as.size(); ++i)
-            out.emplace_back(c.as[i], c.bs[i], p,
-                             GapModel::Affine, AlignMode::Global, GradMode::Hard);
-    };
-
-    std::vector<SeqPair> stepwise, fused;
-    build(stepwise);
-    build(fused);
-
-    SeqPairBatch b1(2);
-    for (auto& sp : stepwise) b1.add(&sp);
-    b1.alloc_dp();
-    const double total_stepwise = b1.align_full();
+    SeqPairBatch b1 = corpus_batch(c, p, 2);
+    const double total_stepwise = b1.score_and_grad(true, true);
     const AlignParams grad_stepwise = b1.compute_grad();
 
-    SeqPairBatch b2(2);
-    for (auto& sp : fused) b2.add(&sp);
+    SeqPairBatch b2 = corpus_batch(c, p, 2);
     const double total_fused = b2.score_and_grad();
     const AlignParams grad_fused = b2.compute_grad();
 
-    REQUIRE(total_fused == Approx(total_stepwise));
-    REQUIRE(grad_fused.gap_open_b   == Approx(grad_stepwise.gap_open_b));
-    REQUIRE(grad_fused.gap_extend_b == Approx(grad_stepwise.gap_extend_b));
+    REQUIRE(total_fused == total_stepwise);
+    REQUIRE(grad_fused.gap_open_b   == grad_stepwise.gap_open_b);
+    REQUIRE(grad_fused.gap_extend_b == grad_stepwise.gap_extend_b);
     for (int i = 0; i < 20; ++i)
         for (int j = 0; j < 20; ++j)
-            REQUIRE(grad_fused.matrix.at(i, j) ==
-                    Approx(grad_stepwise.matrix.at(i, j)));
+            REQUIRE(grad_fused.matrix.at(i, j) == grad_stepwise.matrix.at(i, j));
 }
 
-TEST_CASE("SeqPairBatch: set_params then realign_banded", "[seq_pair_batch][banded]") {
+TEST_CASE("SeqPairBatch: set_params then banded_grad", "[seq_pair_batch][banded]") {
     auto p = asym_params(4.0, 0.5, 1.5, 2.0);
     Corpus c;
-
-    std::vector<SeqPair> pairs;
-    pairs.reserve(c.as.size());
-    for (size_t i = 0; i < c.as.size(); ++i)
-        pairs.emplace_back(c.as[i], c.bs[i], p,
-                           GapModel::Affine, AlignMode::Global, GradMode::Hard);
-
-    SeqPairBatch batch(2);
-    for (auto& sp : pairs) batch.add(&sp);
-    batch.alloc_dp();
-    batch.align_full();
+    SeqPairBatch batch = corpus_batch(c, p, 2);
+    batch.score_and_grad(true, true);
 
     auto p2 = asym_params(0.5, 0.25, 0.5, 0.25);
     batch.set_params(p2);
-    const double total = batch.realign_banded(64);   // band wider than any pair
+    const double total = batch.banded_grad(64, true);   // band wider than any pair
 
     double expected = 0.0;
     for (size_t i = 0; i < c.as.size(); ++i)
@@ -375,8 +349,8 @@ TEST_CASE("SeqPairBatch: set_params then realign_banded", "[seq_pair_batch][band
             p2, c.as[i], c.bs[i]);
     REQUIRE(total == Approx(expected));
 
-    batch.drop_dp();
-    for (auto& sp : pairs) REQUIRE_FALSE(sp.dp_valid());
+    batch.drop_paths();
+    for (size_t i = 0; i < batch.size(); ++i) REQUIRE_FALSE(batch[i].dp_valid());
 }
 
 TEST_CASE("SeqPairBatch: an empty batch has no gradient", "[seq_pair_batch]") {
@@ -384,8 +358,7 @@ TEST_CASE("SeqPairBatch: an empty batch has no gradient", "[seq_pair_batch]") {
     REQUIRE(batch.size() == 0);
 
     // Scoring an empty batch is still a no-op summing to zero.
-    batch.alloc_dp();
-    REQUIRE(batch.align_full() == Approx(0.0));
+    REQUIRE(batch.score_and_grad(true) == Approx(0.0));
 
     // The gradient is not: the sum of no gradients has no alphabet, and there
     // is nothing in scope to infer one from.  Returning a zero gradient would
@@ -401,14 +374,7 @@ TEST_CASE("SeqPairBatch: single-threaded and multi-threaded agree",
     Corpus c;
 
     auto run = [&](int threads) {
-        std::vector<SeqPair> pairs;
-        pairs.reserve(c.as.size());
-        for (size_t i = 0; i < c.as.size(); ++i)
-            pairs.emplace_back(c.as[i], c.bs[i], p,
-                               GapModel::Affine, AlignMode::Global, GradMode::Hard);
-
-        SeqPairBatch batch(threads);
-        for (auto& sp : pairs) batch.add(&sp);
+        SeqPairBatch batch = corpus_batch(c, p, threads);
         const double total = batch.score_and_grad();
         return std::make_pair(total, batch.compute_grad());
     };
@@ -416,83 +382,17 @@ TEST_CASE("SeqPairBatch: single-threaded and multi-threaded agree",
     auto [total1, grad1] = run(1);
     auto [total8, grad8] = run(8);
 
-    REQUIRE(total8 == Approx(total1));
-    REQUIRE(grad8.gap_open_a   == Approx(grad1.gap_open_a));
-    REQUIRE(grad8.gap_extend_b == Approx(grad1.gap_extend_b));
+    REQUIRE(total8 == total1);
+    REQUIRE(grad8.gap_open_a   == grad1.gap_open_a);
+    REQUIRE(grad8.gap_extend_b == grad1.gap_extend_b);
     for (int i = 0; i < 20; ++i)
         for (int j = 0; j < 20; ++j)
-            REQUIRE(grad8.matrix.at(i, j) == Approx(grad1.matrix.at(i, j)));
+            REQUIRE(grad8.matrix.at(i, j) == grad1.matrix.at(i, j));
 }
 
-// ── Issue 4: the same SeqPair twice in one batch ─────────────────────────────
-//
-// Two workers would align one object concurrently — writing its DP tables and
-// cached state at once.  Observed before the fix: wrong totals, some above the
-// optimum, a segfault at double precision, and a hang under TSan.  The guard must live
-// HERE, in the header, not only in the bindings: header-only users call add()
-// directly.  Rejection may happen at add() or at the next dispatch; both are
-// accepted.  Single-threaded on purpose — with one thread nothing races, so this
-// stays safe to run under ASan while the bug is still present.
-//
-TEST_CASE("SeqPairBatch: a pair added twice is rejected",
-          "[seq_pair_batch]") {
-    auto p = asym_params(4.0, 0.5, 1.5, 2.0);
-    SeqPair sp("WWKKLLMMFF", "WWKLLMMFFA", p,
-               GapModel::Affine, AlignMode::Global, GradMode::Hard);
-    SeqPairBatch batch(1);
-    REQUIRE_THROWS_AS([&] {
-        batch.add(&sp);
-        batch.add(&sp);
-        batch.score_and_grad();
-    }(), std::invalid_argument);
-}
-
-TEST_CASE("SeqPairBatch: a duplicate is rejected before any worker runs",
-          "[seq_pair_batch][threads]") {
-    // The multi-threaded case — the one that actually raced.  The check runs before
-    // the workers launch, so under the TSan job this must throw and report nothing;
-    // a check that ran after (or inside) the workers would show up as a race here.
-    // Every dispatch path, and a duplicate of an add_many()-owned pair via add().
-    auto p = asym_params(4.0, 0.5, 1.5, 2.0);
-    Corpus c;
-    std::vector<SeqPair> pairs;
-    pairs.reserve(c.as.size());
-    for (size_t i = 0; i < c.as.size(); ++i)
-        pairs.emplace_back(c.as[i], c.bs[i], p,
-                           GapModel::Affine, AlignMode::Global, GradMode::Hard);
-
-    SeqPairBatch batch(4);
-    for (auto& sp : pairs) batch.add(&sp);
-    batch.add(&pairs[2]);
-    REQUIRE_THROWS_AS(batch.score_and_grad(), std::invalid_argument);
-    REQUIRE_THROWS_AS(batch.alloc_dp(),       std::invalid_argument);
-    REQUIRE_THROWS_AS(batch.align_full(),     std::invalid_argument);
-    batch.sorted_schedule = true;
-    REQUIRE_THROWS_AS(batch.score_and_grad(), std::invalid_argument);
-
-    SeqPairBatch owned(4);
-    owned.add_many(std::vector<std::string_view>(c.as.begin(), c.as.end()),
-                   std::vector<std::string_view>(c.bs.begin(), c.bs.end()),
-                   p, GapModel::Affine, AlignMode::Global, GradMode::Hard);
-    REQUIRE_NOTHROW(owned.score_and_grad());   // add_many alone cannot duplicate
-    owned.add(&owned[1]);
-    REQUIRE_THROWS_AS(owned.score_and_grad(), std::invalid_argument);
-}
-
-TEST_CASE("SeqPairBatch: one pair in two batches is not a duplicate",
-          "[seq_pair_batch]") {
-    // The legal neighbour of the case above: a fix for issue 4 must not reject it.
-    auto p = asym_params(4.0, 0.5, 1.5, 2.0);
-    SeqPair sp("WWKKLLMMFF", "WWKLLMMFFA", p,
-               GapModel::Affine, AlignMode::Global, GradMode::Hard);
-    const double want = aligner_score<GapModel::Affine, AlignMode::Global>(
-        p, "WWKKLLMMFF", "WWKLLMMFFA");
-    SeqPairBatch b1(2), b2(2);
-    b1.add(&sp);
-    b2.add(&sp);
-    REQUIRE(b1.score_and_grad() == Approx(want));
-    REQUIRE(b2.score_and_grad() == Approx(want));
-}
+// (The duplicate-pair tests that stood here — one SeqPair added to a batch twice, raced
+// by two workers — went with add(): a batch's pairs are now rows of its own arrays, and
+// there is no way to put one in twice.)
 
 // set_params() may be the last moment the old params are alive: the Python binding
 // drops its reference right after.  The retained tables (and the params pointer the

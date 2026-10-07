@@ -1,7 +1,7 @@
 // ── BatchEngine against the classes it replaces ─────────────────────────────
 //
 // BatchEngine<T, GM, AM> keeps every pair's state in flat arrays and runs each pair
-// through a per-worker Aligner; SeqPairBatchT<T> held one SeqPair object (two Aligners)
+// through a per-worker Aligner; the pre-0.6 SeqPairBatchT<T> (frozen in legacy/) held one SeqPair object (two Aligners)
 // per pair.  The engine's per-pair operations are ports of SeqPair's, so every result
 // must be BIT-identical: scores, gradients, guides and validity flags after
 // score_and_grad(), after set_params() + banded_grad(), the stored paths against
@@ -23,8 +23,8 @@
 #include <vector>
 
 #include "batch_engine.hpp"
-#include "batch.hpp"
-#include "seq_pair_batch.hpp"
+#include "legacy/legacy_batch.hpp"
+#include "legacy/legacy_seq_pair_batch.hpp"
 
 namespace {
 
@@ -92,7 +92,7 @@ void run_case(unsigned seed, const Cfg& c) {
     std::vector<std::string_view> A2(A.begin() + N1, A.end()), B2(B.begin() + N1, B.end());
     const int k2 = c.scalar_second ? kBackendScalar : kBackendAuto;
 
-    SeqPairBatchT<T> old(c.threads, c.tb);
+    legacy::SeqPairBatchT<T> old(c.threads, c.tb);
     old.inter_fill = c.inter; old.rowwise_full = c.rowwise; old.sorted_schedule = c.sorted;
     old.soft_impl = c.soft_impl; old.soft_temperature = c.temp;
     old.soft_guide_lazy = c.soft_guide == 1; old.soft_guide_posterior = c.soft_guide == 2;
@@ -251,7 +251,7 @@ template <class T, GapModel GM, AlignMode AM>
 void stream_sweep(int n) {
     std::mt19937 rng(77u + static_cast<unsigned>(GM) * 10u + static_cast<unsigned>(AM) +
                      (std::is_same_v<T, float> ? 100u : 0u));
-    using BA = BatchAlignerT<T>;
+    using BA = legacy::BatchAlignerT<T>;
     const GradMode gds[] = {GradMode::Hard, GradMode::Soft, GradMode::None};
     const typename BA::GradMode bgds[] = {BA::GradMode::Hard, BA::GradMode::Soft, BA::GradMode::None};
     for (int k = 0; k < n; ++k) {

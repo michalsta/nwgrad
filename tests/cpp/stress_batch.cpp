@@ -1,4 +1,5 @@
-// stress_batch.cpp — single-batch CLI benchmark for BatchAligner
+// stress_batch.cpp — single-batch CLI benchmark for SeqPairBatch::align (the streaming
+// call that was BatchAligner)
 //
 // Usage:
 //   ./stress_batch
@@ -23,7 +24,7 @@
 #include <string>
 #include <vector>
 
-#include "batch.hpp"
+#include "seq_pair_batch.hpp"
 
 // ── BLOSUM62 (canonical AA order: ACDEFGHIKLMNPQRSTVWY) ──────────────────────
 
@@ -67,7 +68,7 @@ struct Args {
     int         seq_len_hi  = 50;       // == lo means fixed length
     GapModel    gap_model   = GapModel::Affine;
     AlignMode   align_mode  = AlignMode::Global;
-    BatchAligner::GradMode grad_mode = BatchAligner::GradMode::Hard;
+    GradMode grad_mode = GradMode::Hard;
     double      gap_open    = 11.0;
     double      gap_extend  = 1.0;
     std::vector<int> n_threads = {4};
@@ -152,9 +153,9 @@ static Args parse_args(int argc, char** argv) {
             else throw std::invalid_argument("unknown mode: " + std::string(argv[i]));
         } else if (std::strcmp(argv[i], "--grad-mode") == 0) {
             need(1); ++i;
-            if      (std::strcmp(argv[i], "none") == 0) a.grad_mode = BatchAligner::GradMode::None;
-            else if (std::strcmp(argv[i], "hard") == 0) a.grad_mode = BatchAligner::GradMode::Hard;
-            else if (std::strcmp(argv[i], "soft") == 0) a.grad_mode = BatchAligner::GradMode::Soft;
+            if      (std::strcmp(argv[i], "none") == 0) a.grad_mode = GradMode::None;
+            else if (std::strcmp(argv[i], "hard") == 0) a.grad_mode = GradMode::Hard;
+            else if (std::strcmp(argv[i], "soft") == 0) a.grad_mode = GradMode::Soft;
             else throw std::invalid_argument("unknown grad-mode: " + std::string(argv[i]));
         } else if (std::strcmp(argv[i], "--gap-open") == 0) {
             need(1); a.gap_open = parse_double(argv[++i]);
@@ -220,8 +221,8 @@ static void print_header(const Args& a) {
 
     const char* gm  = (a.gap_model  == GapModel::Affine)  ? "affine"  : "linear";
     const char* mo  = (a.align_mode == AlignMode::Global)  ? "global"  : "local";
-    const char* grd = (a.grad_mode  == BatchAligner::GradMode::Hard) ? "hard"
-                    : (a.grad_mode  == BatchAligner::GradMode::Soft) ? "soft" : "none";
+    const char* grd = (a.grad_mode  == GradMode::Hard) ? "hard"
+                    : (a.grad_mode  == GradMode::Soft) ? "soft" : "none";
 
     std::string kn = backend_name(a.kernel);
 
@@ -302,22 +303,23 @@ int main(int argc, char** argv) {
     print_header(a);
     print_seq_stats(seqs_a);
 
-    bool has_grad = (a.grad_mode != BatchAligner::GradMode::None);
+    bool has_grad = (a.grad_mode != GradMode::None);
 
     for (int n_threads : a.n_threads) {
-        BatchAligner aligner(params, /*band=*/0,
-                             a.gap_model, a.align_mode, a.grad_mode, n_threads,
-                             a.kernel);
+        SeqPairBatch batch(a.gap_model, a.align_mode, a.grad_mode, n_threads);
+        auto align = [&](const std::vector<ProblemInstance>& p) {
+            return batch.align(p, params, /*band=*/0, a.kernel);
+        };
 
         if (a.warmup) {
             size_t warmup_n = std::min<size_t>(16, static_cast<size_t>(a.n));
             std::vector<ProblemInstance> wp(problems.begin(),
                                            problems.begin() + static_cast<ptrdiff_t>(warmup_n));
-            aligner.align(wp);
+            align(wp);
         }
 
         auto t0 = std::chrono::steady_clock::now();
-        BatchResult result = aligner.align(problems);
+        BatchResult result = align(problems);
         auto t1 = std::chrono::steady_clock::now();
         double elapsed = std::chrono::duration<double>(t1 - t0).count();
 

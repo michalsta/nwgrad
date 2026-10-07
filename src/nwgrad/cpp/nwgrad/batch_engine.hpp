@@ -115,7 +115,7 @@ public:
                                         std::to_string(t));
         soft_temp_ = t;
         if (grad_mode_ == GradMode::Soft)
-            for (auto& f : flags_) f &= static_cast<uint8_t>(~(kScore | kGrad));
+            for (auto& f : flags_) f &= static_cast<uint8_t>(~(kScore | kGrad | kHeld));
     }
     // Soft guide policy (see SeqPair::set_soft_guide_lazy / _posterior): at most one set.
     bool soft_guide_lazy() const noexcept { return soft_lazy_; }
@@ -296,7 +296,7 @@ public:
                 "nwgrad: set_params() cannot change the alphabet (\"" + alpha_->symbols() +
                 "\" -> \"" + params.matrix.alphabet().symbols() + "\"); construct new pairs instead");
         for (auto& s : segs_) s.params = &params;
-        for (auto& f : flags_) f &= static_cast<uint8_t>(~(kScore | kGrad | kStored));
+        for (auto& f : flags_) f &= static_cast<uint8_t>(~(kScore | kGrad | kStored | kHeld));
     }
     // set_params for one pair's segment only (a single-pair batch: SeqPair).
     void set_params_segment(size_t seg, const AlignParams& params) {
@@ -307,14 +307,18 @@ public:
         segs_[seg].params = &params;
         const size_t end = seg + 1 < segs_.size() ? segs_[seg + 1].begin : size();
         for (size_t i = segs_[seg].begin; i < end; ++i)
-            flags_[i] &= static_cast<uint8_t>(~(kScore | kGrad | kStored));
+            flags_[i] &= static_cast<uint8_t>(~(kScore | kGrad | kStored | kHeld));
     }
 
     // Full DP on every pair: score, guide and (unless grad_mode None) gradient, cached
     // per pair.  keep_paths: also store each pair's alignment path (aligned(),
     // coordinates()); it forces the Viterbi a lazy or posterior soft guide would skip.
     // Returns the sum of scores, in pair order (bit-reproducible whatever the schedule).
-    double score_and_grad(bool keep_paths = false) {
+    //
+    // hold_grads: leave each gradient computed but NOT valid until compute_grad() — the
+    // state the old align_full() / realign_banded() left (they computed no gradient;
+    // compute_grad() derived it from the retained tables).  The deprecated wrappers use it.
+    double score_and_grad(bool keep_paths = false, bool hold_grads = false) {
         const size_t N = size();
         if (N == 0) return 0.0;
         prepare_paths_(keep_paths);
@@ -322,12 +326,13 @@ public:
         if (inter_fill)           score_and_grad_inter_(keep_paths);
         else if (sorted_schedule) score_and_grad_sorted_(keep_paths);
         else                      score_and_grad_dynamic_(keep_paths);
+        if (hold_grads) hold_all_();
         return sum_scores_();
     }
 
     // Banded re-align + gradient around every pair's cached guide (the training-loop
     // step after set_params()).  Throws if any pair has no guide yet.
-    double banded_grad(int bandwidth, bool keep_paths = false) {
+    double banded_grad(int bandwidth, bool keep_paths = false, bool hold_grads = false) {
         const size_t N = size();
         if (N == 0) return 0.0;
         if (bandwidth <= 0)
@@ -343,28 +348,50 @@ public:
         if (inter_fill && !keep_paths) banded_grad_inter_(bandwidth);
         else if (sorted_schedule)      banded_grad_lpt_(bandwidth, keep_paths);
         else                           banded_grad_dynamic_(bandwidth, keep_paths);
+        if (hold_grads) hold_all_();
         return sum_scores_();
     }
 
-    // Free the stored paths.  Scores, gradients and guides stay.
+    // Free the stored paths.  Scores, released gradients and guides stay; a held
+    // gradient goes with the path (as the old drop_dp() made compute_grad() throw).
     void drop_paths() noexcept {
         std::vector<std::vector<uint32_t>>().swap(path_);
         std::vector<std::array<int, 2>>().swap(path_end_);
-        for (auto& f : flags_) f &= static_cast<uint8_t>(~kStored);
+        for (auto& f : flags_) f &= static_cast<uint8_t>(~(kStored | kHeld));
+    }
+    void drop_path(size_t i) noexcept {
+        if (i < path_.size()) { std::vector<uint32_t>().swap(path_[i]); }
+        flags_[i] &= static_cast<uint8_t>(~(kStored | kHeld));
     }
 
     // One pair, on the calling thread (SeqPair's own operations).
-    void score_and_grad_one(size_t i, bool keep_path) {
+    void score_and_grad_one(size_t i, bool keep_path, bool hold_grad = false) {
         prepare_paths_(keep_path, /*all=*/false);
         Work w(*this);
         run_full_(i, w, keep_path);
+        if (hold_grad) hold_(i);
     }
-    void banded_one(size_t i, int bandwidth, bool keep_path) {
+    void banded_one(size_t i, int bandwidth, bool keep_path, bool hold_grad = false) {
         if (!path_valid(i))
             throw std::logic_error("nwgrad: call align_full() before realign_banded()");
         prepare_paths_(keep_path, /*all=*/false);
         Work w(*this);
         run_banded_(i, w, bandwidth, keep_path);
+        if (hold_grad) hold_(i);
+    }
+    // SeqPair::compute_grad: release pair i's held gradient, with the old preconditions
+    // and messages, in the old order.
+    void compute_grad_one(size_t i) {
+        if (grad_valid(i)) return;
+        if (!score_valid(i))
+            throw std::logic_error("nwgrad: call align_full() or realign_banded() first");
+        if (!(flags_[i] & kHeld) && !(grad_mode_ == GradMode::None && path_stored(i)))
+            throw std::logic_error(
+                "nwgrad: DP tables have been dropped; call align_full() or realign_banded() first");
+        if (grad_mode_ == GradMode::None)
+            throw std::logic_error(
+                "nwgrad: grad_mode is None; construct with Hard or Soft to enable gradients");
+        flags_[i] = static_cast<uint8_t>((flags_[i] & ~kHeld) | kGrad);
     }
 
     // The cached scores, in pair order.  Throws if any pair has none.
@@ -393,12 +420,11 @@ public:
     }
     // The summed gradient (weights all 1: w*g == g exactly, so this is the plain blocked
     // sum).  Unlike the old per-thread completion-order merge, reproducible bit for bit.
-    AlignParams compute_grad() const {
+    // Releases held gradients first (compute_grad_one, in pair order: the first pair
+    // that cannot raises its own message).
+    AlignParams compute_grad() {
         const Alphabet& alpha = alphabet();
-        if (grad_mode_ == GradMode::None)
-            throw std::logic_error(
-                "nwgrad: grad_mode is None; construct with Hard or Soft to enable gradients");
-        check_all_grads_();
+        for (size_t i = 0; i < size(); ++i) compute_grad_one(i);
         return blocked_sum_(alpha, nullptr);
     }
     // The cached gradients as arrays: matrices[i*n*n ..] (row-major, alphabet order) and
@@ -743,6 +769,7 @@ private:
         kPending = 8,      // lazy soft guide not computed yet
         kLastBanded = 16,  // the cached results came from a banded DP
         kStored = 32,      // path_ holds the current alignment
+        kHeld = 64,        // grad_ holds a gradient compute_grad() has not released yet
     };
     struct Segment { const AlignParams* params; int kernel; size_t begin; };
 
@@ -927,6 +954,10 @@ private:
             score_[i] = al.score();
         }
     }
+    void hold_(size_t i) noexcept {
+        if (flags_[i] & kGrad) flags_[i] = static_cast<uint8_t>((flags_[i] & ~kGrad) | kHeld);
+    }
+    void hold_all_() noexcept { for (size_t i = 0; i < size(); ++i) hold_(i); }
     void finish_(size_t i, bool banded, bool pending) {
         uint8_t f = flags_[i] & kStored;
         f |= kPath | kScore;

@@ -62,35 +62,33 @@ static std::vector<double> grad_fingerprint(SeqPairBatch& b) {
     return out;
 }
 
-// ── add_many() is indistinguishable from adding pairs by hand ────────────────
+// ── add_many() is indistinguishable from aligning the pairs one by one ───────
 
-TEST_CASE("add_many: matches a hand-built batch", "[add_many]") {
+TEST_CASE("add_many: matches standalone pairs", "[add_many]") {
     auto p = aa_params();
 
-    // Hand-built: the pairs are borrowed, so they must outlive the batch.
-    std::vector<SeqPair> hand;
-    hand.reserve(AA_A.size());
-    SeqPairBatch ref(1);
-    for (size_t i = 0; i < AA_A.size(); ++i)
-        hand.emplace_back(AA_A[i], AA_B[i], p, GapModel::Affine,
-                          AlignMode::Local, GradMode::Hard);
-    for (auto& sp : hand) ref.add(&sp);
+    SeqPairBatch bulk(GapModel::Affine, AlignMode::Local, GradMode::Hard, 4);
+    bulk.add_many(views(AA_A), views(AA_B), p);
+    REQUIRE(bulk.size() == AA_A.size());
+    const double bulk_sum = bulk.score_and_grad();
 
-    SeqPairBatch bulk(4);
-    bulk.add_many(views(AA_A), views(AA_B), p, GapModel::Affine,
-                  AlignMode::Local, GradMode::Hard);
-
-    REQUIRE(bulk.size() == ref.size());
-    double ref_sum  = ref.score_and_grad();
-    double bulk_sum = bulk.score_and_grad();
-    REQUIRE(bulk_sum == Approx(ref_sum));
-
+    double ref_sum = 0.0;
+    AlignParams ref_grad(p.matrix.alphabet());
     for (size_t i = 0; i < AA_A.size(); ++i) {
-        REQUIRE(bulk[i].score() == Approx(ref[i].score()));
+        SeqPair one(AA_A[i], AA_B[i], p, GapModel::Affine, AlignMode::Local, GradMode::Hard);
+        const auto [s, g] = one.score_and_grad();
+        ref_sum += s;
+        ref_grad += g;
+        REQUIRE(bulk[i].score() == s);
         REQUIRE(bulk[i].seq_a() == AA_A[i]);
         REQUIRE(bulk[i].seq_b() == AA_B[i]);
     }
-    REQUIRE(grad_fingerprint(bulk) == grad_fingerprint(ref));
+    REQUIRE(bulk_sum == ref_sum);
+    std::vector<double> ref(400);
+    ref_grad.matrix.to_array(ref.data());
+    ref.insert(ref.end(), {ref_grad.gap_open_a, ref_grad.gap_extend_a,
+                           ref_grad.gap_open_b, ref_grad.gap_extend_b});
+    REQUIRE(grad_fingerprint(bulk) == ref);   // integer path counts: exact in any order
 }
 
 TEST_CASE("add_many: parallel construction preserves order and content", "[add_many]") {
@@ -120,8 +118,7 @@ TEST_CASE("add_many: owned pairs support the full SeqPair lifecycle", "[add_many
     batch.add_many(views(AA_A), views(AA_B), p, GapModel::Affine,
                    AlignMode::Local, GradMode::Hard);
 
-    batch.alloc_dp();
-    batch.align_full();
+    batch.score_and_grad(/*keep_paths=*/true, /*hold_grads=*/true);
     for (size_t i = 0; i < batch.size(); ++i) {
         REQUIRE(batch[i].path_valid());
         REQUIRE(batch[i].dp_valid());
@@ -129,25 +126,37 @@ TEST_CASE("add_many: owned pairs support the full SeqPair lifecycle", "[add_many
         REQUIRE(aa.size() == bb.size());
     }
     batch.compute_grad();
-    batch.realign_banded(8);
-    batch.drop_dp();
+    batch.banded_grad(8, /*keep_paths=*/true);
+    batch.drop_paths();
     for (size_t i = 0; i < batch.size(); ++i)
         REQUIRE_FALSE(batch[i].dp_valid());
 }
 
-TEST_CASE("add_many: mixes with add()", "[add_many]") {
+TEST_CASE("add_many: a batch holds one problem type", "[add_many]") {
     auto p = aa_params();
-    SeqPair hand(AA_A[0], AA_B[0], p, GapModel::Affine, AlignMode::Local, GradMode::Hard);
-
-    SeqPairBatch batch(2);
-    batch.add(&hand);
-    batch.add_many(views({AA_A.begin() + 1, AA_A.end()}),
-                   views({AA_B.begin() + 1, AA_B.end()}),
-                   p, GapModel::Affine, AlignMode::Local, GradMode::Hard);
+    SeqPairBatch batch(GapModel::Affine, AlignMode::Local, GradMode::Hard, 2);
+    batch.add_many(views(AA_A), views(AA_B), p);
+    // Another gap model, mode or grad mode is a different batch, not more pairs.
+    REQUIRE_THROWS_AS(batch.add_many(views(AA_A), views(AA_B), p, GapModel::Linear,
+                                     AlignMode::Local, GradMode::Hard), std::invalid_argument);
+    REQUIRE_THROWS_AS(batch.add_many(views(AA_A), views(AA_B), p, GapModel::Affine,
+                                     AlignMode::Global, GradMode::Hard), std::invalid_argument);
+    REQUIRE_THROWS_AS(batch.add_many(views(AA_A), views(AA_B), p, GapModel::Affine,
+                                     AlignMode::Local, GradMode::Soft), std::invalid_argument);
     REQUIRE(batch.size() == AA_A.size());
+    // The same type (named or not) is just another segment.
+    batch.add_many(views(AA_A), views(AA_B), p, GapModel::Affine, AlignMode::Local, GradMode::Hard);
+    batch.add_many(views(AA_A), views(AA_B), p);
+    REQUIRE(batch.size() == 3 * AA_A.size());
     batch.score_and_grad();
-    REQUIRE(batch[0].seq_a() == AA_A[0]);
-    REQUIRE(batch[1].seq_a() == AA_A[1]);
+    REQUIRE(batch[AA_A.size()].score() == batch[0].score());
+
+    // An untyped batch takes its type from the first add_many() that names one.
+    SeqPairBatch untyped(2);
+    REQUIRE_THROWS_AS(untyped.add_many(views(AA_A), views(AA_B), p), std::invalid_argument);
+    untyped.add_many(views(AA_A), views(AA_B), p, GapModel::Linear, AlignMode::Global, GradMode::None);
+    REQUIRE(untyped.gap_model() == GapModel::Linear);
+    REQUIRE(untyped.grad_mode() == GradMode::None);
 }
 
 // ── failures leave the batch exactly as it was, and leak nothing ─────────────

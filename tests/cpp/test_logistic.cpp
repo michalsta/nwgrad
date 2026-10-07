@@ -100,7 +100,7 @@ TEST_CASE("logistic: step is its parts composed", "[logistic]") {
 }
 
 TEST_CASE("SeqPairBatch: parallel set_params and scores match the pairs", "[logistic]") {
-    Fixture f(2 * SeqPairBatchT<double>::SCORES_BLOCK + 9);
+    Fixture f(2 * 4096 + 9);   // more than one of the old 4096-pair scores() blocks
     auto p1 = params_over("ACGT", 2.0);
     auto p2 = params_over("ACGT", 3.0);
     SeqPairBatchT<double> batch(5);

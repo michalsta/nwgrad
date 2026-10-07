@@ -1,4 +1,12 @@
 #pragma once
+// FROZEN ORACLE — not part of the library.
+//
+// The batch classes as they were before the 0.6 restructure (SeqPair with two Aligners
+// per pair, SeqPairBatch over SeqPair objects, BatchAligner), kept verbatim inside
+// namespace legacy so tests/cpp/test_batch_engine.cpp can keep proving that the
+// restructured BatchEngine / SeqPairBatch / align_stream return bit-identical results.
+// They share the CURRENT Aligner, so the comparison isolates the batch layer.  Delete
+// this directory together with that test once the equivalence no longer needs proving.
 
 #include <atomic>
 #include <cstdint>
@@ -14,6 +22,9 @@
 #include "batch_result.hpp"
 #include "parallel.hpp"
 #include "simd_levels.hpp"
+
+
+namespace legacy {
 
 template<class T = double>
 struct BatchAlignerT {
@@ -441,3 +452,5 @@ private:
 
 // Default (double) alias; Python binds BatchAlignerT<float> as `BatchAligner`.
 using BatchAligner = BatchAlignerT<double>;
+
+} // namespace legacy
