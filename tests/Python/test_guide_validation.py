@@ -23,8 +23,8 @@ try:
         n.{function}{suffix}("ACGT", "ACGT", p, band=1,
                              aligned_a="A", aligned_b="A")
     else:
-        batch = n.BatchAligner{precision}(p, band=1, grad_mode={grad_mode!r}, n_threads=1)
-        batch.align(["ACGT"], ["ACGT"], aligned_a=["A"], aligned_b=["A"])
+        batch = n.SeqPairBatch{precision}(1, grad_mode={grad_mode!r})
+        batch.align(["ACGT"], ["ACGT"], p, band=1, aligned_a=["A"], aligned_b=["A"])
 except ValueError:
     pass
 else:

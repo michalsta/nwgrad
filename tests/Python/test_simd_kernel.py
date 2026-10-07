@@ -16,6 +16,7 @@ import random
 import pytest
 
 import nwgrad
+from conftest import StreamAligner, StreamAlignerDouble
 from nwgrad.matrices import BLOSUM62
 
 # BLOSUM62 is integer-valued, which is the point: exact ties between competing
@@ -95,7 +96,7 @@ def test_batch_aligner_kernels_agree():
 
     out = {}
     for kern in ("scalar_fallback", "auto"):
-        ba = nwgrad.BatchAligner(p, gap_model="affine", mode="global",
+        ba = StreamAligner(p, gap_model="affine", mode="global",
                                  grad_mode="hard", n_threads=4, kernel=kern)
         out[kern] = ba.align(sa, sb)
 
@@ -113,7 +114,6 @@ def test_seq_pair_kernels_agree_including_banded_realign():
     for kern in ("scalar_fallback", "auto"):
         sp = nwgrad.SeqPair(a, b, p, gap_model="affine", mode="global",
                             grad_mode="hard", kernel=kern)
-        sp.alloc_dp()
         sp.align_full()
         full = sp.score
         # realign_banded takes the per-row gather path inside the simd kernel rather

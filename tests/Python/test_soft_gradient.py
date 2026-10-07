@@ -14,6 +14,7 @@ The soft gradient replaces max with log-sum-exp, so:
 import numpy as np
 import pytest
 import nwgrad
+from conftest import StreamAligner, StreamAlignerDouble
 from test_subst_matrix import BLOSUM62
 
 AA_ORDER = "ACDEFGHIKLMNPQRSTVWY"
@@ -152,7 +153,7 @@ def test_batch_soft_grad_matches_single():
     params = make_params(BLOSUM62, 1.0, 11.0)
     test_pairs = [("ACDE", "ACDF"), ("MADEEKLF", "MADEEKLF"), ("A", "A")]
 
-    ba = nwgrad.BatchAligner(
+    ba = StreamAligner(
         params=params, gap_model="affine", mode="global", grad_mode="soft", n_threads=2
     )
     res = ba.align([pr[0] for pr in test_pairs], [pr[1] for pr in test_pairs])

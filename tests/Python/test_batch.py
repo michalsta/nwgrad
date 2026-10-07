@@ -3,6 +3,7 @@
 import numpy as np
 import pytest
 import nwgrad
+from conftest import StreamAligner, StreamAlignerDouble
 from test_subst_matrix import BLOSUM62
 
 AA_ORDER = "ACDEFGHIKLMNPQRSTVWY"
@@ -51,7 +52,7 @@ def test_batch_scores_match_single(gap_model, mode, gap_open, gap_extend,
 
     expected = [score_fn(a, b, p) for a, b in PAIRS]
 
-    aligner = nwgrad.BatchAligner(
+    aligner = StreamAligner(
         params=p,
         gap_model=gap_model,
         mode=mode,
@@ -82,7 +83,7 @@ def test_batch_grad_matches_sum_of_singles(gap_model, mode, gap_open, gap_extend
     expected_grads = [grad_matrix(grad_fn(a, b, p)[1]) for a, b in PAIRS]
     expected_total = sum(expected_grads)
 
-    aligner = nwgrad.BatchAligner(
+    aligner = StreamAligner(
         params=p,
         gap_model=gap_model,
         mode=mode,
@@ -104,14 +105,14 @@ def test_multithread_scores_match_singlethread(n_threads):
     seqs_b = [p[1] for p in PAIRS] * 5
     p = make_params(1.0, 11.0)
 
-    ref_aligner = nwgrad.BatchAligner(
+    ref_aligner = StreamAligner(
         params=p, gap_model="affine", mode="global", grad_mode="hard", n_threads=1,
     )
     ref = ref_aligner.align(seqs_a, seqs_b)
     ref_scores = np.array(ref.scores)
     ref_grad   = grad_matrix(ref.grad)
 
-    multi_aligner = nwgrad.BatchAligner(
+    multi_aligner = StreamAligner(
         params=p, gap_model="affine", mode="global", grad_mode="hard", n_threads=n_threads,
     )
     got = multi_aligner.align(seqs_a, seqs_b)
@@ -128,7 +129,7 @@ def test_multithread_scores_match_singlethread(n_threads):
 
 def test_empty_batch():
     p = make_params(1.0, 11.0)
-    aligner = nwgrad.BatchAligner(params=p, n_threads=1)
+    aligner = StreamAligner(params=p, n_threads=1)
     result = aligner.align([], [])
     assert np.array(result.scores).shape == (0,)
     assert grad_matrix(result.grad).shape == (20, 20)
@@ -137,7 +138,7 @@ def test_empty_batch():
 
 def test_grad_none_returns_zero_grad():
     p = make_params(1.0, 11.0)
-    aligner = nwgrad.BatchAligner(
+    aligner = StreamAligner(
         params=p, gap_model="affine", mode="global", grad_mode="none", n_threads=1,
     )
     result = aligner.align(["ACDE"], ["ACDE"])
@@ -146,14 +147,14 @@ def test_grad_none_returns_zero_grad():
 
 def test_mismatched_lengths_raises():
     p = make_params(1.0)
-    aligner = nwgrad.BatchAligner(params=p)
+    aligner = StreamAligner(params=p)
     with pytest.raises(Exception):
         aligner.align(["A", "C"], ["A"])
 
 
 def test_result_scores_shape():
     p = make_params(1.0)
-    aligner = nwgrad.BatchAligner(params=p, n_threads=1)
+    aligner = StreamAligner(params=p, n_threads=1)
     seqs = ["ACDE", "MADEEKLF", "A"]
     result = aligner.align(seqs, seqs)
     assert np.array(result.scores).shape == (3,)
@@ -161,7 +162,7 @@ def test_result_scores_shape():
 
 def test_result_grad_shape():
     p = make_params(1.0)
-    aligner = nwgrad.BatchAligner(params=p, n_threads=1)
+    aligner = StreamAligner(params=p, n_threads=1)
     result = aligner.align(["ACDE"], ["ACDE"])
     assert grad_matrix(result.grad).shape == (20, 20)
 
@@ -177,11 +178,11 @@ def test_large_batch_multithreaded():
               for _ in range(200)]
     p = make_params(1.0, 11.0)
 
-    ref = nwgrad.BatchAligner(
+    ref = StreamAligner(
         params=p, gap_model="affine", mode="global", grad_mode="hard", n_threads=1,
     ).align(seqs_a, seqs_b)
 
-    got = nwgrad.BatchAligner(
+    got = StreamAligner(
         params=p, gap_model="affine", mode="global", grad_mode="hard", n_threads=4,
     ).align(seqs_a, seqs_b)
 

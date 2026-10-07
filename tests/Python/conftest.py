@@ -161,3 +161,48 @@ def force_kernel(request):
     _current_backend = getattr(request, "param", _KERNEL)
     print(f"nwgrad: forcing backend {_current_backend!r}")
 
+
+
+class StreamAligner:
+    """BatchAligner's call shape over SeqPairBatch.align() (BatchAligner was removed in 0.6).
+
+    For the tests of the streaming semantics — score a list of pairs under fixed params,
+    return a BatchResult, keep nothing per pair — which are unchanged; only the entry point
+    moved.  kernel=None follows NWGRAD_FORCE_KERNEL's current backend, so these tests stay
+    in the forced sweep as BatchAligner's did (its __init__ took kernel=, and was patched).
+    """
+    _batch_cls = None
+
+    def __init__(self, params, band=0, gap_model="affine", mode="global", grad_mode="hard",
+                 n_threads=1, kernel=None):
+        import nwgrad
+        cls = self._batch_cls or nwgrad.SeqPairBatch
+        self.params, self.band = params, band
+        self.kernel = kernel if kernel is not None else (_current_backend or "auto")
+        self._b = cls(n_threads, gap_model=gap_model, mode=mode, grad_mode=grad_mode)
+
+    def align(self, seqs_a, seqs_b, aligned_a=(), aligned_b=()):
+        return self._b.align(list(seqs_a), list(seqs_b), self.params, self.band,
+                             list(aligned_a), list(aligned_b), self.kernel)
+
+    @property
+    def fill(self):
+        return self._b.fill
+
+    @fill.setter
+    def fill(self, v):
+        if v not in ("interpair", "striped"):   # BatchAligner never had "rowwise"
+            raise ValueError(f'unknown fill "{v}" (expected "interpair" or "striped")')
+        self._b.fill = v
+
+    soft_impl = property(lambda s: s._b.soft_impl, lambda s, v: setattr(s._b, "soft_impl", v))
+    soft_temperature = property(lambda s: s._b.soft_temperature,
+                                lambda s, v: setattr(s._b, "soft_temperature", v))
+    n_threads = property(lambda s: s._b.n_threads)
+
+
+class StreamAlignerDouble(StreamAligner):
+    def __init__(self, *args, **kwargs):
+        import nwgrad
+        self._batch_cls = nwgrad.SeqPairBatchDouble
+        super().__init__(*args, **kwargs)

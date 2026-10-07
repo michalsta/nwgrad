@@ -15,6 +15,7 @@ DP table, rather than on the main diagonal.  Tests here verify:
 import numpy as np
 import pytest
 import nwgrad
+from conftest import StreamAligner, StreamAlignerDouble
 from test_subst_matrix import BLOSUM62
 
 IDENTITY = np.zeros((20, 20), dtype=np.float64)
@@ -211,7 +212,7 @@ class TestBatchGuided:
     ]
 
     def test_scores_match_single_pair(self, unit):
-        ba = nwgrad.BatchAligner(params=unit, gap_model="linear", mode="global",
+        ba = StreamAligner(params=unit, gap_model="linear", mode="global",
                                   grad_mode="none", n_threads=1)
         seqs_a = [p[0] for p in self.PAIRS]
         seqs_b = [p[1] for p in self.PAIRS]
@@ -232,9 +233,9 @@ class TestBatchGuided:
         aa     = [p[2] for p in self.PAIRS]
         ab     = [p[3] for p in self.PAIRS]
 
-        single = nwgrad.BatchAligner(params=unit, gap_model="linear", mode="global",
+        single = StreamAligner(params=unit, gap_model="linear", mode="global",
                                       grad_mode="hard", n_threads=1)
-        multi  = nwgrad.BatchAligner(params=unit, gap_model="linear", mode="global",
+        multi  = StreamAligner(params=unit, gap_model="linear", mode="global",
                                       grad_mode="hard", n_threads=4)
 
         r1 = single.align(seqs_a, seqs_b, aligned_a=aa, aligned_b=ab)
@@ -250,9 +251,9 @@ class TestBatchGuided:
         aa     = [p[2] for p in self.PAIRS]
         ab     = [p[3] for p in self.PAIRS]
 
-        ba_full   = nwgrad.BatchAligner(params=unit, gap_model="linear", mode="global",
+        ba_full   = StreamAligner(params=unit, gap_model="linear", mode="global",
                                          grad_mode="hard", n_threads=2)
-        ba_guided = nwgrad.BatchAligner(params=unit, gap_model="linear", mode="global",
+        ba_guided = StreamAligner(params=unit, gap_model="linear", mode="global",
                                          grad_mode="hard", n_threads=2)
 
         r_full   = ba_full.align(seqs_a, seqs_b)
@@ -291,7 +292,6 @@ def test_narrow_band_does_not_crash():
         batch = nwgrad.SeqPairBatch(n_threads=1)
         batch.add_many([a], [b], params, gap_model="affine", mode=mode,
                        grad_mode="hard", kernel="auto")
-        batch.alloc_dp()
         full = batch.align_full()
         for band in (1, 2, 4, 8, 16, 32, 64, 128):
             got = batch.realign_banded(band)

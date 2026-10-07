@@ -6,13 +6,14 @@ right to be trusted, and every test here is really the same test — that a batc
 built in bulk is *indistinguishable* from one built by hand.
 
 Coverage:
-  - add_many() == add() for per-pair score, per-pair grad, and summed grad,
+  - add_many() == the pairs aligned one by one (standalone SeqPairs) for per-pair
+    score, per-pair grad, and summed grad,
     across every gap_model x mode x grad_mode combination
   - per-pair gradients survive: batch[i].grad is the whole point of the API
   - len / indexing / negative indexing / out-of-range
   - the pairs are usable through the full SeqPair lifecycle (alloc_dp,
     align_full, compute_grad, realign_banded, aligned, drop_dp)
-  - mixing add() and add_many() in one batch
+  - several add_many() segments in one batch (one problem type, params per segment)
   - single-thread == multi-thread (construction is parallel)
   - params lifetime: the batch pins params, including across two add_many()
     calls with *different* params objects
@@ -60,20 +61,44 @@ def dna_params(gap_open=3.0, gap_extend=1.0):
                               gap_open_b=gap_open, gap_extend_b=gap_extend)
 
 
+class HandBatch:
+    """The pairs aligned one by one as standalone SeqPairs — what add_many() must be
+    indistinguishable from (a batch used to be built from such pairs with add())."""
+
+    def __init__(self, pairs, gd):
+        self.pairs, self.gd = pairs, gd
+
+    def __len__(self):
+        return len(self.pairs)
+
+    def __getitem__(self, i):
+        return self.pairs[i]
+
+    def score_and_grad(self):
+        total = 0.0
+        for sp in self.pairs:
+            sp.align_full()
+            if self.gd != "none":
+                sp.compute_grad()
+            total += sp.score
+        return total
+
+    def compute_grad(self):
+        g = self.pairs[0].grad
+        for sp in self.pairs[1:]:
+            g = g + sp.grad
+        return g
+
+
 def build_by_hand(seqs_a, seqs_b, params, gm, md, gd, n_threads=1):
-    """The batch add_many() must be indistinguishable from."""
-    batch = nwgrad.SeqPairBatch(n_threads=n_threads)
     pairs = [nwgrad.SeqPair(a, b, params, gap_model=gm, mode=md, grad_mode=gd)
              for a, b in zip(seqs_a, seqs_b)]
-    for sp in pairs:
-        batch.add(sp)
-    # The caller must keep `pairs` alive: batch.add() borrows.
-    return batch, pairs
+    return HandBatch(pairs, gd), pairs
 
 
 def build_bulk(seqs_a, seqs_b, params, gm, md, gd, n_threads=1):
-    batch = nwgrad.SeqPairBatch(n_threads=n_threads)
-    batch.add_many(seqs_a, seqs_b, params, gap_model=gm, mode=md, grad_mode=gd)
+    batch = nwgrad.SeqPairBatch(n_threads=n_threads, gap_model=gm, mode=md, grad_mode=gd)
+    batch.add_many(seqs_a, seqs_b, params)
     return batch
 
 
@@ -143,8 +168,7 @@ def test_full_seqpair_lifecycle_on_owned_pairs():
     params = prot_params()
     batch = build_bulk(PROT_A, PROT_B, params, "affine", "local", "hard")
 
-    batch.alloc_dp()
-    total = batch.align_full()
+    total = batch.score_and_grad(keep_paths=True)
     assert total == pytest.approx(sum(batch[i].score for i in range(len(batch))))
 
     for i in range(len(batch)):
@@ -155,8 +179,8 @@ def test_full_seqpair_lifecycle_on_owned_pairs():
     g = batch.compute_grad()
     assert g.to_dict()["matrix"].shape == (20, 20)
 
-    batch.realign_banded(8)
-    batch.drop_dp()
+    batch.banded_grad(8, keep_paths=True)
+    batch.drop_paths()
     for i in range(len(batch)):
         assert not batch[i].dp_valid
 
@@ -185,14 +209,11 @@ def test_indexing():
 
 # ── mixing, threading ─────────────────────────────────────────────────────────
 
-def test_mixed_add_and_add_many():
+def test_several_add_many_segments():
     params = prot_params()
-    batch = nwgrad.SeqPairBatch(n_threads=2)
-    hand = nwgrad.SeqPair(PROT_A[0], PROT_B[0], params,
-                          gap_model="affine", mode="local", grad_mode="hard")
-    batch.add(hand)
-    batch.add_many(PROT_A[1:], PROT_B[1:], params,
-                   gap_model="affine", mode="local", grad_mode="hard")
+    batch = nwgrad.SeqPairBatch(n_threads=2, gap_model="affine", mode="local", grad_mode="hard")
+    batch.add_many(PROT_A[:1], PROT_B[:1], params)
+    batch.add_many(PROT_A[1:], PROT_B[1:], params)
     assert len(batch) == len(PROT_A)
 
     ref, _keep = build_by_hand(PROT_A, PROT_B, params, "affine", "local", "hard")

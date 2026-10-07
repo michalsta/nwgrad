@@ -101,7 +101,6 @@ def test_aligned_strings_identical(params, mode):
     out = {}
     for tb in MODES:
         batch = _batch(a_seqs, b_seqs, params, mode, tb, threads=1)
-        batch.alloc_dp()
         out[tb] = (batch.align_full(),
                    [batch[i].aligned() for i in range(len(a_seqs))],
                    [list(batch[i].guide_j) for i in range(len(a_seqs))])
@@ -158,15 +157,13 @@ def test_soft_gradient_unaffected(params):
 
 
 def test_seq_pair_traceback_argument(params):
-    """The per-pair constructor takes it too, and pairs added by add() keep it."""
+    """The per-pair constructor takes it too."""
     a, b = "ACDEFGHIKLMNPQ", "ACDWFGHIKLMNPQ"
     got = {}
     for tb in MODES:
         sp = nwgrad.SeqPair(a, b, params, gap_model="affine", mode="global",
                             grad_mode="hard", traceback=tb)
         assert sp.traceback == tb
-        batch = nwgrad.SeqPairBatch(n_threads=1)
-        batch.add(sp)
-        batch.alloc_dp()
-        got[tb] = (batch.align_full(), sp.aligned())
+        sp.align_full()
+        got[tb] = (sp.score, sp.aligned())
     assert got["scores"] == got["pointers"]

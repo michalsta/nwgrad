@@ -24,14 +24,10 @@ def make_params(gap_extend=1.0, gap_open=11.0):
 
 
 def make_batch(params, grad_mode="hard"):
-    pairs = [nwgrad.SeqPair("ACDEFGHIK", "ACDEFGHIK", params,
-                            gap_model="affine", mode="local", grad_mode=grad_mode)
-             for _ in range(N_PAIRS)]
-    batch = nwgrad.SeqPairBatch(n_threads=N_THREADS)
-    for sp in pairs:
-        batch.add(sp)
-    # Keep the SeqPairs alive for the caller: the batch holds them by pointer.
-    return batch, pairs
+    batch = nwgrad.SeqPairBatch(n_threads=N_THREADS, gap_model="affine", mode="local",
+                                grad_mode=grad_mode)
+    batch.add_many(["ACDEFGHIK"] * N_PAIRS, ["ACDEFGHIK"] * N_PAIRS, params)
+    return batch, list(batch)
 
 
 def test_compute_grad_before_align_raises_not_aborts():
@@ -39,7 +35,6 @@ def test_compute_grad_before_align_raises_not_aborts():
     exception, not SIGABRT."""
     params = make_params()
     batch, _pairs = make_batch(params)
-    batch.alloc_dp()
     with pytest.raises(RuntimeError, match="align_full"):
         batch.compute_grad()
 
@@ -48,76 +43,31 @@ def test_compute_grad_with_grad_mode_none_raises():
     """grad_mode=None makes SeqPair::compute_grad() throw, again from a worker."""
     params = make_params()
     batch, _pairs = make_batch(params, grad_mode="none")
-    batch.alloc_dp()
     batch.align_full()
     with pytest.raises(RuntimeError, match="grad_mode"):
         batch.compute_grad()
 
 
-def test_align_full_without_alloc_dp_raises():
-    """The own-buffer precondition throw, from a worker."""
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+def test_align_full_without_alloc_dp_works():
+    """There are no pair-owned tables any more: alloc_dp() is a deprecated no-op and
+    align_full() needs nothing allocated first."""
     params = make_params()
     batch, _pairs = make_batch(params)
-    with pytest.raises(RuntimeError):
-        batch.align_full()
+    assert batch.align_full() == pytest.approx(N_PAIRS * batch[0].score)
 
 
 def test_realign_banded_without_path_raises():
     """realign_banded() requires a prior align_full(); throws from a worker."""
     params = make_params()
     batch, _pairs = make_batch(params)
-    batch.alloc_dp()
     with pytest.raises(RuntimeError, match="align_full"):
         batch.realign_banded(3)
 
 
-def test_batch_add_keeps_seqpairs_alive():
-    """The batch holds SeqPairs by raw pointer, so add() must own a reference.
-    Dropping every Python reference must not leave the batch dangling."""
-    params = make_params()
-    batch = nwgrad.SeqPairBatch(n_threads=2)
-    for _ in range(4):
-        batch.add(nwgrad.SeqPair("ACDEFGHIK", "ACDEFGHIK", params,
-                                 gap_model="affine", mode="local", grad_mode="hard"))
-    import gc
-    gc.collect()                       # nothing else references the SeqPairs
-    total = batch.score_and_grad()     # must not use-after-free
-    assert total == pytest.approx(4 * batch[0].score)
-
-
-def test_batch_add_is_linear_not_quadratic():
-    """add() used to be O(N^2): nanobind's keep_alive walks the nurse's patient
-    list on every call to deduplicate.  The memory bug hid it -- you OOMed at
-    513 KiB/pair long before N got big enough to notice."""
-    import time
-    params = make_params()
-
-    def time_adds(n):
-        pairs = [nwgrad.SeqPair("ACDEFGHIK", "ACDEFGHIK", params, gap_model="affine",
-                                mode="local", grad_mode="hard") for _ in range(n)]
-        batch = nwgrad.SeqPairBatch(n_threads=1)
-        t = time.perf_counter()
-        for sp in pairs:
-            batch.add(sp)
-        return time.perf_counter() - t
-
-    # Two sizes 16x apart: linear add() predicts ~16x the time, quadratic ~256x, and
-    # the bound sits between them, 4x from each.  A 4x step with an 8x bound used to
-    # be too tight: linear add() still gets slower per pair as the 160k wrappers and
-    # nanobind's keep-alive table outgrow the cache (macOS arm64 runner, v0.5.2:
-    # 235 ns/pair at 40k, 480 ns/pair at 160k, read as 8.2x for 4x the pairs).
-    # Before that, a single 2 ms run read a one-off lump -- the keep-alive hash map
-    # growing, or a GC pass -- as 13.1x and failed the v0.5.0 wheel; best-of-N keeps
-    # dropping those, since repeats reuse the grown table.
-    time_adds(2_000)                   # warm up
-    small = min(time_adds(10_000) for _ in range(5))
-    large = min(time_adds(160_000) for _ in range(3))
-
-    ratio = large / max(small, 1e-9)
-    assert ratio < 64, (
-        f"batch.add() looks super-linear: 10k took {small:.4f}s, "
-        f"160k took {large:.4f}s ({ratio:.1f}x for 16x the pairs; linear ~16x, "
-        f"quadratic ~256x)")
+# (Two add() tests stood here: that add() kept its borrowed SeqPairs alive, and that it
+# stayed linear as nanobind's keep-alive table grew.  add() is gone — a batch's pairs are
+# rows of its own arrays — and neither property has a subject any more.)
 
 
 def _fresh_params(scale):
@@ -134,7 +84,6 @@ def test_set_params_keeps_the_current_params_alive():
     sp.set_params(_fresh_params(2.0))     # no local reference kept
     import gc
     gc.collect()
-    sp.alloc_dp()
     sp.align_full()                       # must not use-after-free
     _score, grad = sp.score_and_grad()
 
@@ -215,7 +164,6 @@ def test_batch_still_usable_after_a_caught_worker_exception():
     batch, driven correctly, still produces the right answer."""
     params = make_params()
     batch, _pairs = make_batch(params)
-    batch.alloc_dp()
 
     with pytest.raises(RuntimeError):
         batch.compute_grad()          # too early

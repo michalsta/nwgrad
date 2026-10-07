@@ -56,7 +56,6 @@ def _run(seqs_a, seqs_b, params, mode, traceback, fill, kernel="auto", prec="dou
         sp = pcls(seqs_a[i], seqs_b[i], params, gap_model="affine", mode=mode,
                   grad_mode="hard", kernel=kernel, traceback=traceback)
         sp.fill = fill if fill != "interpair" else "striped"
-        sp.alloc_dp()
         sp.align_full()
         aligned.append((sp.score, sp.aligned()))
     return b.scores(), mats, gaps, aligned
@@ -119,7 +118,8 @@ def test_every_isa_level(level, mode, prec, fill):
 
 
 def test_interpair_falls_back_where_it_cannot_run():
-    """A protein alphabet (over 8 letters) and a linear-gap pair in the same batch."""
+    """A protein alphabet (over 8 letters), affine local and linear global (one batch per
+    problem type: a batch holds one)."""
     AA = "ARNDCQEGHILKMFPSTWYV"
     rng = np.random.default_rng(9)
     pa = [ "".join(rng.choice(list(AA), int(l))) for l in rng.integers(5, 40, 50)]
@@ -127,28 +127,30 @@ def test_interpair_falls_back_where_it_cannot_run():
     m = rng.normal(size=(20, 20))
     p = nwgrad.AlignParams(nwgrad.SubstMatrix(m, alphabet=AA), gap_open_a=2.0,
                            gap_extend_a=0.5, gap_open_b=2.0, gap_extend_b=0.5)
-    out = []
-    for fill in ("striped", "interpair"):
-        batch = nwgrad.SeqPairBatchDouble(n_threads=3, traceback="pointers")
-        batch.fill = fill
-        batch.add_many(pa, pb, p, gap_model="affine", mode="local")
-        batch.add_many(pa, pb, p, gap_model="linear", mode="global")
-        batch.score_and_grad()
-        out.append((batch.scores(), *batch.grads()))
-    for x, y in zip(*out):
-        assert np.array_equal(x, y)
+    for gm, mode in (("affine", "local"), ("linear", "global")):
+        out = []
+        for fill in ("striped", "interpair"):
+            batch = nwgrad.SeqPairBatchDouble(n_threads=3, traceback="pointers",
+                                              gap_model=gm, mode=mode)
+            batch.fill = fill
+            batch.add_many(pa, pb, p)
+            batch.score_and_grad()
+            out.append((batch.scores(), *batch.grads()))
+        for x, y in zip(*out):
+            assert np.array_equal(x, y)
 
 
-def test_interpair_mixed_models_in_one_batch():
+@pytest.mark.parametrize("gm,mode", [("affine", "local"), ("affine", "global"),
+                                     ("linear", "local")])
+def test_interpair_every_problem_type(gm, mode):
     a, b = _seqs(97, 10, 30, 11), _fixed_len_b(range(97), 50, 12)
     p = _params("random")
     out = []
     for fill in ("striped", "interpair"):
-        batch = nwgrad.SeqPairBatchDouble(n_threads=3, traceback="pointers")
+        batch = nwgrad.SeqPairBatchDouble(n_threads=3, traceback="pointers",
+                                          gap_model=gm, mode=mode)
         batch.fill = fill
-        batch.add_many(a, b, p, gap_model="affine", mode="local")
-        batch.add_many(a, b, p, gap_model="affine", mode="global")
-        batch.add_many(a, b, p, gap_model="linear", mode="local")
+        batch.add_many(a, b, p)
         batch.score_and_grad()
         out.append((batch.scores(), *batch.grads()))
     for x, y in zip(*out):
@@ -224,35 +226,32 @@ def test_interpair_plan_follows_set_params_and_add_many():
 @pytest.mark.parametrize("traceback", ["hirschberg", "hirschberg_pmax"])
 @pytest.mark.parametrize("threads", [1, 3])
 @pytest.mark.parametrize("initial_cutoff", [1, 512])
-def test_interpair_plan_follows_pair_cutoff_changes(traceback, threads, initial_cutoff):
-    """A cached plan must honor cutoff changes on any lane, in both directions."""
+def test_interpair_plan_follows_cutoff_changes(traceback, threads, initial_cutoff):
+    """A cached interpair plan must honor hb_cutoff changes, in both directions: pairs
+    past the cutoff split (Hirschberg, no shared fill), pairs under it share one.  (The
+    cutoff was per pair before 0.6; it is the batch's now.)"""
     p = nwgrad.AlignParams(np.eye(4) * 3 - 1, alphabet=DNA,
                           gap_open_a=2, gap_extend_a=.5,
                           gap_open_b=2, gap_extend_b=.5)
     a = ["AGGGTTGGACTTACCGACCATGATGAGCCC"] * 17
     b = ["TATATTATACGGAACTCGATTCTCCCATAC"] * 17
 
-    def make(fill, cutoffs):
-        batch = nwgrad.SeqPairBatchDouble(n_threads=threads, traceback=traceback)
+    def make(fill, cutoff):
+        batch = nwgrad.SeqPairBatchDouble(n_threads=threads, traceback=traceback,
+                                          grad_mode="hard")
         batch.fill = fill
+        batch.hb_cutoff = cutoff
         batch.add_many(a, b, p)
-        for i, cutoff in enumerate(cutoffs):
-            batch[i].hb_cutoff = cutoff
         batch.score_and_grad()
         return batch
 
-    cutoffs = [initial_cutoff] * len(a)
-    batch = make("interpair", cutoffs)
+    batch = make("interpair", initial_cutoff)
     original = batch.grads()
-    # Index 1 catches checks limited to a group's first pair; the last index
-    # also exercises a partially populated vector group.
     for cutoff in (513 - initial_cutoff, initial_cutoff):
-        for i in (1, len(a) - 1):
-            cutoffs[i] = cutoff
-            batch[i].hb_cutoff = cutoff
+        batch.hb_cutoff = cutoff          # the plan is cached: it must notice
         batch.score_and_grad()
         for fill in ("striped", "interpair"):
-            ref = make(fill, cutoffs)
+            ref = make(fill, cutoff)
             np.testing.assert_array_equal(batch.scores(), ref.scores())
             for got, expected in zip(batch.grads(), ref.grads()):
                 np.testing.assert_array_equal(got, expected)
@@ -406,14 +405,19 @@ def test_banded_interpair_paths_and_soft_lanes():
     p = _params("ties")
     res = []
     for fill in ("striped", "interpair"):
-        b = nwgrad.SeqPairBatchDouble(n_threads=2, traceback="pointers")
-        b.fill = fill
-        b.add_many(A[:80], B[:80], p, gap_model="affine", mode="local", grad_mode="hard")
-        b.add_many(A[80:], B[80:], p, gap_model="affine", mode="local", grad_mode="soft")
-        b.score_and_grad()
-        b.banded_grad(3)
-        res.append((b.scores(), *b.grads()))
-        res.append([b[i].guide_j for i in range(120)])
+        out, guides = [], []
+        for gd, lo, hi in (("hard", 0, 80), ("soft", 80, 120)):   # one batch per grad mode
+            b = nwgrad.SeqPairBatchDouble(n_threads=2, traceback="pointers",
+                                          gap_model="affine", mode="local", grad_mode=gd)
+            b.fill = fill
+            b.add_many(A[lo:hi], B[lo:hi], p)
+            b.score_and_grad()
+            b.banded_grad(3)
+            s, m, g = b.scores(), *b.grads()
+            out.append((s, m, g))
+            guides += [b[i].guide_j for i in range(hi - lo)]
+        res.append(tuple(np.concatenate([o[k] for o in out]) for k in range(3)))
+        res.append(guides)
     np.testing.assert_allclose(res[0][0], res[2][0], rtol=1e-11, atol=1e-11)
     np.testing.assert_allclose(res[0][1], res[2][1], rtol=1e-11, atol=1e-11)
     np.testing.assert_allclose(res[0][2], res[2][2], rtol=1e-11, atol=1e-11)
@@ -423,7 +427,7 @@ def test_banded_interpair_paths_and_soft_lanes():
     for i in range(0, 80, 9):
         sp = nwgrad.SeqPairDouble(A[i], B[i], p, gap_model="affine", mode="local",
                                   grad_mode="hard", traceback="pointers")
-        sp.alloc_dp(); sp.align_full(); sp.realign_banded(3)
+        sp.align_full(); sp.realign_banded(3)
         assert list(sp.guide_j) == list(res[1][i])
 
 
@@ -455,7 +459,6 @@ def test_banded_grad_guides_match_realign_banded(prec, gm, mode, fill):
     for i in range(90):
         sp = pcls(A[i], B[i], p, gap_model=gm, mode=mode, grad_mode="hard",
                   traceback="pointers")
-        sp.alloc_dp()
         sp.align_full()
         sp.realign_banded(2)
         assert list(sp.guide_j) == list(b[i].guide_j)

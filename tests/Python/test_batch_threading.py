@@ -38,82 +38,9 @@ def dna_params():
 
 
 # --- Issue 4: duplicate pair pointers ---------------------------------------------------
-
-@pytest.mark.parametrize("sp,spb", PRECISIONS, ids=PRECISION_IDS)
-def test_duplicate_pair_rejected_or_correct(sp, spb):
-    """One pair added twice among distinct ones, on several threads, both dispatch paths.
-    Long enough that two workers genuinely overlap on it."""
-    proc = run_isolated(f"""
-        import numpy as np, nwgrad as n
-        SP, SPB = n.{sp}, n.{spb}
-        rng = np.random.default_rng(1)
-        rand = lambda k: "".join(rng.choice(list("ACGT"), k))
-        p = n.AlignParams(2 * np.eye(4) - np.ones((4, 4)), alphabet="ACGT",
-                          gap_open_a=2.0, gap_extend_a=1.0, gap_open_b=2.0, gap_extend_b=1.0)
-        A, B = rand(1500), rand(1450)
-        others = [(rand(300), rand(290)) for _ in range(4)]
-        want = 2 * SP(A, B, p, traceback="pointers").score_and_grad()[0] + sum(
-            SP(a, b, p, traceback="pointers").score_and_grad()[0] for a, b in others)
-
-        s = SP(A, B, p, traceback="pointers")
-        keep = [SP(a, b, p, traceback="pointers") for a, b in others]
-        b = SPB(n_threads=4)
-        try:
-            b.add(s)
-            for o in keep: b.add(o)
-            b.add(s)
-            b.alloc_dp()
-            for it in range(10):
-                got = b.align_full(); b.compute_grad()
-                assert got == want, f"align_full iter {{it}}: {{got}} != {{want}}"
-                got = b.score_and_grad()
-                assert got == want, f"score_and_grad iter {{it}}: {{got}} != {{want}}"
-        except ValueError as e:
-            print("REJECTED", e)
-        print("OK")
-    """, timeout=300)
-    assert proc.returncode == 0 and "OK" in proc.stdout, describe(proc)
-
-
-def test_duplicate_owned_pair_via_indexing():
-    """The other way to duplicate: re-add a pair the batch already owns (from add_many).
-    Single-threaded, so in-process is safe; the contract is rejection, since with one
-    thread nothing races and a 'serialize' fix would have nothing to prove."""
-    b = nwgrad.SeqPairBatch(n_threads=1)
-    b.add_many(["ACGT"], ["AGT"], dna_params())
-    with pytest.raises(ValueError):
-        b.add(b[0])
-        b.alloc_dp()
-        b.align_full()
-
-
-def test_duplicate_pair_single_thread_rejected():
-    """With one thread a duplicate cannot race, but it is still a caller error (it double
-    counts the pair in every sum).  Rejected at add() or at the first dispatch."""
-    p = dna_params()
-    s = nwgrad.SeqPair("ACGTACGT", "ACGTTCGT", p)
-    b = nwgrad.SeqPairBatch(n_threads=1)
-    with pytest.raises(ValueError):
-        b.add(s)
-        b.add(s)
-        b.score_and_grad()
-
-
-@pytest.mark.parametrize("sp,spb", PRECISIONS, ids=PRECISION_IDS)
-def test_same_pair_in_two_batches_is_legal(sp, spb):
-    """Not a duplicate: one pair in two batches, run one after the other.  A fix for
-    issue 4 must not reject this (e.g. by a per-pair 'already in a batch' flag)."""
-    SP, SPB = getattr(nwgrad, sp), getattr(nwgrad, spb)
-    p = dna_params()
-    s = SP("ACGTACGT", "ACGTTCGT", p)
-    want = SP("ACGTACGT", "ACGTTCGT", p).score_and_grad()[0]
-    b1, b2 = SPB(n_threads=2), SPB(n_threads=2)
-    b1.add(s)
-    b2.add(s)
-    assert b1.score_and_grad() == want
-    assert b2.score_and_grad() == want
-    b1.add(SP("ACGT", "AGT", p))  # adding more after the fact is still fine
-    assert b1.score_and_grad() == want + SP("ACGT", "AGT", p).score_and_grad()[0]
+#
+# (Gone with add(): one SeqPair added twice used to be raced by two workers.  A batch's
+# pairs are now rows of its own arrays, so there is nothing to add twice.)
 
 
 # --- Issue 5: thread-launch failure ------------------------------------------------------
@@ -143,8 +70,6 @@ def test_thread_launch_failure_does_not_abort(entry):
             b.schedule = "sorted"
         if "{entry}" != "add_many":
             b.add_many(A, B, p)
-            if "{entry}" == "align_full":
-                b.alloc_dp()
         # Count every thread this user owns (RLIMIT_NPROC's unit), leave room for 3.
         uid = os.getuid(); used = 0
         for pid in filter(str.isdigit, os.listdir("/proc")):

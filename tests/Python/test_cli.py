@@ -32,7 +32,7 @@ def test_include_prints_a_directory_that_holds_the_headers():
     # The path is meant to be passed to a compiler as -I, with sources doing
     # #include <nwgrad/aligner.hpp>, so the headers must sit one level down.
     for header in ("aligner.hpp", "align_params.hpp", "subst_matrix.hpp",
-                   "batch.hpp", "seq_pair.hpp", "seq_pair_batch.hpp"):
+                   "batch_engine.hpp", "seq_pair.hpp", "seq_pair_batch.hpp"):
         assert (include_dir / "nwgrad" / header).is_file(), header
 
 

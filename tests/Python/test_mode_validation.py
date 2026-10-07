@@ -7,7 +7,7 @@ import nwgrad
 
 
 @pytest.mark.parametrize("suffix", ["", "Double"])
-@pytest.mark.parametrize("surface", ["SeqPair", "BatchAligner", "add_many"])
+@pytest.mark.parametrize("surface", ["SeqPair", "SeqPairBatch", "add_many"])
 @pytest.mark.parametrize(
     "field, typo, choices",
     [
@@ -26,10 +26,12 @@ def test_invalid_modes_raise(suffix, surface, field, typo, choices, invalid_kind
     with pytest.raises(ValueError) as exc:
         if surface == "SeqPair":
             getattr(nwgrad, surface + suffix)("ACGT", "ACGT", params, **kwargs)
-        elif surface == "BatchAligner":
-            getattr(nwgrad, surface + suffix)(params, **kwargs)
+        elif surface == "SeqPairBatch":
+            getattr(nwgrad, surface + suffix)(n_threads=1, **kwargs)
         else:
-            batch = getattr(nwgrad, "SeqPairBatch" + suffix)(n_threads=1)
+            # The deprecated per-call form: the name is validated first, before the
+            # deprecation warning and before any pair is appended.
+            batch = getattr(nwgrad, "SeqPairBatch" + suffix)(n_threads=1, grad_mode="hard")
             batch.add_many(["ACGT"], ["ACGT"], params)
             batch.add_many(["ACGT"], ["ACGT"], params, **kwargs)
 

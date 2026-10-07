@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Single-batch stress runner for BatchAligner.
+"""Single-batch stress runner for SeqPairBatch.align (the streaming call that was
+BatchAligner).
 
 Generates a random batch of sequence pairs, runs alignment, and prints
 timing and score/gradient statistics.
@@ -52,7 +53,7 @@ BLOSUM62 = np.array([
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
-        description="Run a single BatchAligner stress batch and report timing/stats.",
+        description="Run a single SeqPairBatch.align stress batch and report timing/stats.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--n", type=int, default=1000, metavar="N",
@@ -136,14 +137,15 @@ def main(argv=None):
     print(f"actual seq_len: mean={mean_len}  min={min_len}  max={max_len}")
     print()
 
-    aligner = nwgrad.BatchAligner(
-        matrix=blosum,
-        gap_open=go, gap_extend=ge,
-        gap_model=args.gap_model,
-        mode=args.mode,
-        grad_mode=args.grad_mode,
-        n_threads=args.n_threads,
-    )
+    params = nwgrad.AlignParams(blosum, go, ge, go, ge)
+    batch = nwgrad.SeqPairBatch(args.n_threads, gap_model=args.gap_model, mode=args.mode,
+                                grad_mode=args.grad_mode)
+
+    class _Aligner:   # one params, streaming: nothing kept per pair
+        def align(self, a, b):
+            return batch.align(a, b, params)
+
+    aligner = _Aligner()
 
     if args.warmup:
         aligner.align(seqs_a[:min(args.n, 16)], seqs_b[:min(args.n, 16)])

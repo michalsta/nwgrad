@@ -29,6 +29,7 @@ from typing import List, Tuple
 import numpy as np
 import pytest
 import nwgrad
+from conftest import StreamAligner, StreamAlignerDouble
 from test_subst_matrix import BLOSUM62
 
 AA_ORDER = "ACDEFGHIKLMNPQRSTVWY"
@@ -102,12 +103,12 @@ def random_seqs(rng: np.random.Generator, n: int, lo: int, hi: int) -> List[str]
 
 
 def _ref(params, gap_model="affine", mode="global", grad_mode="hard"):
-    return nwgrad.BatchAligner(params=params, gap_model=gap_model, mode=mode,
+    return StreamAligner(params=params, gap_model=gap_model, mode=mode,
                                grad_mode=grad_mode, n_threads=1)
 
 
 def _multi(params, n_threads, gap_model="affine", mode="global", grad_mode="hard"):
-    return nwgrad.BatchAligner(params=params, gap_model=gap_model, mode=mode,
+    return StreamAligner(params=params, gap_model=gap_model, mode=mode,
                                grad_mode=grad_mode, n_threads=n_threads)
 
 
@@ -144,7 +145,7 @@ def check_batch_grad_equals_sum_of_singles(seqs_a, seqs_b,
         _, g = grad_fn(a, b, params)
         expected += g.matrix.to_matrix()
 
-    ba = nwgrad.BatchAligner(params=params, gap_model=gap_model, mode=mode,
+    ba = StreamAligner(params=params, gap_model=gap_model, mode=mode,
                              grad_mode="hard", n_threads=4)
     result = ba.align(seqs_a, seqs_b)
     np.testing.assert_allclose(result.grad.matrix.to_matrix(), expected, atol=1e-10,
@@ -153,7 +154,7 @@ def check_batch_grad_equals_sum_of_singles(seqs_a, seqs_b,
 
 def check_concurrent_scores(seqs_a, seqs_b, n_concurrent: int, p: Params = PARAMS):
     params = make_params(p.gap_extend, p.gap_open)
-    aligner = nwgrad.BatchAligner(params=params, gap_model="affine", mode="global",
+    aligner = StreamAligner(params=params, gap_model="affine", mode="global",
                                    grad_mode="none", n_threads=2)
     ref_scores = np.array(aligner.align(seqs_a, seqs_b).scores)
 
@@ -180,7 +181,7 @@ def check_concurrent_scores(seqs_a, seqs_b, n_concurrent: int, p: Params = PARAM
 
 def check_concurrent_gradients(seqs_a, seqs_b, n_concurrent: int, p: Params = PARAMS):
     params = make_params(p.gap_extend, p.gap_open)
-    aligner = nwgrad.BatchAligner(params=params, gap_model="affine", mode="global",
+    aligner = StreamAligner(params=params, gap_model="affine", mode="global",
                                    grad_mode="hard", n_threads=4)
     ref = aligner.align(seqs_a, seqs_b)
     ref_scores = np.array(ref.scores)
@@ -224,7 +225,7 @@ def check_long_seq_determinism(seqs_a, seqs_b, n_threads, p: Params = PARAMS):
 
 def check_very_long_no_crash(seqs_a, seqs_b, p: Params = PARAMS):
     params = make_params(p.gap_extend, p.gap_open)
-    result = nwgrad.BatchAligner(params=params, gap_model="affine", mode="global",
+    result = StreamAligner(params=params, gap_model="affine", mode="global",
                                   grad_mode="hard", n_threads=4).align(seqs_a, seqs_b)
     scores = np.array(result.scores)
     assert scores.shape == (len(seqs_a),), f"wrong score shape: {scores.shape}"
@@ -234,9 +235,9 @@ def check_very_long_no_crash(seqs_a, seqs_b, p: Params = PARAMS):
 
 def check_soft_grad_determinism(seqs_a, seqs_b, n_threads, p: Params = PARAMS):
     params = make_params(p.gap_extend, p.gap_open)
-    ref = nwgrad.BatchAligner(params=params, gap_model="affine", mode="global",
+    ref = StreamAligner(params=params, gap_model="affine", mode="global",
                                grad_mode="soft", n_threads=1).align(seqs_a, seqs_b)
-    got = nwgrad.BatchAligner(params=params, gap_model="affine", mode="global",
+    got = StreamAligner(params=params, gap_model="affine", mode="global",
                                grad_mode="soft", n_threads=n_threads).align(seqs_a, seqs_b)
     np.testing.assert_allclose(np.array(got.scores), np.array(ref.scores), atol=1e-10,
                                 err_msg=f"soft scores differ at n_threads={n_threads}")
@@ -247,9 +248,9 @@ def check_soft_grad_determinism(seqs_a, seqs_b, n_threads, p: Params = PARAMS):
 
 def check_soft_geq_hard(seqs_a, seqs_b, p: Params = PARAMS):
     params = make_params(p.gap_extend, p.gap_open)
-    hard_res = nwgrad.BatchAligner(params=params, gap_model="affine", mode="global",
+    hard_res = StreamAligner(params=params, gap_model="affine", mode="global",
                                     grad_mode="none", n_threads=4).align(seqs_a, seqs_b)
-    soft_res = nwgrad.BatchAligner(params=params, gap_model="affine", mode="global",
+    soft_res = StreamAligner(params=params, gap_model="affine", mode="global",
                                     grad_mode="soft", n_threads=4).align(seqs_a, seqs_b)
     hard_scores = np.array(hard_res.scores)
     soft_scores = np.array(soft_res.scores)
@@ -262,7 +263,7 @@ def check_soft_geq_hard(seqs_a, seqs_b, p: Params = PARAMS):
 
 def check_hard_grad_integer(seqs_a, seqs_b, p: Params = PARAMS):
     params = make_params(p.gap_extend, p.gap_open)
-    result = nwgrad.BatchAligner(params=params, gap_model="affine", mode="global",
+    result = StreamAligner(params=params, gap_model="affine", mode="global",
                                   grad_mode="hard", n_threads=4).align(seqs_a, seqs_b)
     g = result.grad.matrix.to_matrix()
     assert (g >= 0).all(), "negative entries in hard gradient"
@@ -276,7 +277,7 @@ def check_reproducibility(p: Params = PARAMS):
         rng = np.random.default_rng(12345)
         seqs_a = random_seqs(rng, 300, p.large_lo, p.large_hi)
         seqs_b = random_seqs(rng, 300, p.large_lo, p.large_hi)
-        return nwgrad.BatchAligner(params=params, gap_model="affine", mode="global",
+        return StreamAligner(params=params, gap_model="affine", mode="global",
                                     grad_mode="hard", n_threads=4).align(seqs_a, seqs_b)
 
     r1, r2 = run(), run()
@@ -297,7 +298,7 @@ def check_more_threads_than_pairs(p: Params = PARAMS):
 
 def check_throughput(seqs_a, seqs_b, limit: float, p: Params = PARAMS):
     params = make_params(p.gap_extend, p.gap_open)
-    aligner = nwgrad.BatchAligner(params=params, gap_model="affine", mode="global",
+    aligner = StreamAligner(params=params, gap_model="affine", mode="global",
                                    grad_mode="hard", n_threads=8)
     t0 = time.monotonic()
     result = aligner.align(seqs_a, seqs_b)
@@ -309,7 +310,7 @@ def check_throughput(seqs_a, seqs_b, limit: float, p: Params = PARAMS):
 
 def check_grad_symmetry_symmetric_input(seqs, grad_mode: str, p: Params = PARAMS):
     params = make_params(p.gap_extend, p.gap_open)
-    result = nwgrad.BatchAligner(params=params, gap_model="affine", mode="global",
+    result = StreamAligner(params=params, gap_model="affine", mode="global",
                                   grad_mode=grad_mode, n_threads=4).align(seqs, seqs)
     g = result.grad.matrix.to_matrix()
     np.testing.assert_allclose(g, g.T, atol=1e-10,
@@ -328,7 +329,7 @@ def check_concurrent_different_aligners(seqs_a, seqs_b, p: Params = PARAMS):
         dict(params=make_params(ge, 0.0), gap_model="linear",  mode="local",
              grad_mode="soft",  n_threads=2),
     ]
-    refs = [np.array(nwgrad.BatchAligner(**cfg).align(seqs_a, seqs_b).scores)
+    refs = [np.array(StreamAligner(**cfg).align(seqs_a, seqs_b).scores)
             for cfg in configs]
 
     results = [None] * len(configs)
@@ -337,7 +338,7 @@ def check_concurrent_different_aligners(seqs_a, seqs_b, p: Params = PARAMS):
     def run(idx, cfg):
         try:
             results[idx] = np.array(
-                nwgrad.BatchAligner(**cfg).align(seqs_a, seqs_b).scores
+                StreamAligner(**cfg).align(seqs_a, seqs_b).scores
             )
         except Exception as e:
             errors.append((idx, e))

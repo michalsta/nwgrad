@@ -9,10 +9,11 @@ import numpy as np
 import pytest
 
 import nwgrad
+from conftest import StreamAligner, StreamAlignerDouble
 
 DNA = "ACGT"
 REL = 1e-11
-CLS = {"double": nwgrad.BatchAlignerDouble, "float32": nwgrad.BatchAligner}
+CLS = {"double": StreamAlignerDouble, "float32": StreamAligner}
 
 
 def _params(kind, gm):
@@ -48,7 +49,7 @@ def _align(prec, p, gm, mode, grad, A, B, fill, band=0, kernel="auto", threads=3
 
 
 def test_fill_property():
-    ba = nwgrad.BatchAligner(_params("ties", "affine"))
+    ba = StreamAligner(_params("ties", "affine"))
     assert ba.fill == "interpair"   # the default
     ba.fill = "striped"
     assert ba.fill == "striped"
@@ -93,7 +94,7 @@ def test_guided_matches(prec):
     sp = [nwgrad.SeqPairDouble(a, b, p, gap_model="affine", mode="global") for a, b in zip(A, B)]
     al = []
     for s in sp:
-        s.alloc_dp(); s.align_full(); al.append(s.aligned())
+        s.align_full(); al.append(s.aligned())
     aligned = ([x[0] for x in al], [x[1] for x in al])
     for band in (0, 3):
         r0 = _align(prec, p, "affine", "global", "hard", A, B, "striped", band=band, aligned=aligned)
@@ -140,7 +141,7 @@ def test_falls_back_and_raises_like_striped():
     r1 = _align("double", p, "affine", "local", "hard", A, B, "interpair")
     for x, y in zip(r0, r1):
         assert np.array_equal(x, y)
-    ba = nwgrad.BatchAligner(_params("ties", "affine"))
+    ba = StreamAligner(_params("ties", "affine"))
     ba.fill = "interpair"
     with pytest.raises(ValueError, match="pair 3, sequence b"):
         ba.align(["ACGT"] * 5, ["ACGT", "ACGT", "ACGT", "ACXT", "ACGT"])
@@ -163,7 +164,7 @@ def test_global_banded_guide_ending_short_of_n(prec, fill, band):
     sp = [nwgrad.SeqPairDouble(x, b, p, gap_model="affine", mode="global") for x in A]
     al = []
     for s in sp:
-        s.alloc_dp(); s.align_full(); al.append(s.aligned())
+        s.align_full(); al.append(s.aligned())
     al[-1] = ("ACGTACGTAC-------", b)
     ba = CLS[prec](p, band=band, gap_model="affine", mode="global", n_threads=1)
     ba.fill = fill

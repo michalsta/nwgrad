@@ -69,7 +69,6 @@ def test_aligned_strings_are_consistent(gap_model, mode):
     p = _affine_params(BLOSUM62)
     sp = nwgrad.SeqPair("PLEASANTLY", "MEANLY", p, gap_model=gap_model,
                         mode=mode, grad_mode="hard")
-    sp.alloc_dp()
     sp.align_full()
     a, b = sp.aligned()
 
@@ -90,7 +89,6 @@ def test_global_affine_aligned_exact():
     p = _affine_params(BLOSUM62)
     sp = nwgrad.SeqPair("PLEASANTLY", "MEANLY", p, gap_model="affine",
                         mode="global", grad_mode="hard")
-    sp.alloc_dp()
     sp.align_full()
     assert sp.aligned() == ("PLEASANTLY", "-MEAN---LY")
 
@@ -99,7 +97,6 @@ def test_formatted_three_lines_and_match_markers():
     p = _affine_params(BLOSUM62)
     sp = nwgrad.SeqPair("PLEASANTLY", "MEANLY", p, gap_model="affine",
                         mode="global", grad_mode="hard")
-    sp.alloc_dp()
     sp.align_full()
     a, mid, b = sp.formatted(width=0).split("\n")
     assert (a, b) == ("PLEASANTLY", "-MEAN---LY")
@@ -116,7 +113,6 @@ def test_formatted_wraps_at_width():
     p = _affine_params(BLOSUM62)
     sp = nwgrad.SeqPair("ACDEFGHIKLMNPQRSTVWY", "ACDEFGHIKLMNPQRSTVWY", p,
                         gap_model="affine", mode="global", grad_mode="hard")
-    sp.alloc_dp()
     sp.align_full()
     blocks = sp.formatted(width=8).split("\n\n")
     assert len(blocks) == 3            # 20 columns / 8 -> 3 blocks
@@ -127,7 +123,6 @@ def test_aligned_requires_dp_tables():
     p = _affine_params(BLOSUM62)
     sp = nwgrad.SeqPair("ACDE", "ACDF", p, gap_model="affine",
                         mode="global", grad_mode="hard")
-    sp.alloc_dp()
     sp.align_full()
     sp.drop_dp()
     with pytest.raises(Exception):
@@ -144,7 +139,6 @@ def test_score_and_grad_matches_separate_calls():
 
     sp2 = nwgrad.SeqPair("PLEASANTLY", "MEANLY", p, gap_model="affine",
                          mode="global", grad_mode="hard")
-    sp2.alloc_dp()
     sp2.align_full()
     sp2.compute_grad()
     assert score == pytest.approx(sp2.score)
@@ -173,12 +167,9 @@ def test_gradient_uses_matrix_alphabet():
 
 def test_batch_gradient_uses_matrix_alphabet():
     p = _affine_params(BLOSUM62)
-    pairs = [nwgrad.SeqPair(a, b, p, gap_model="affine", mode="global",
-                            grad_mode="hard")
-             for a, b in [("PLEASANTLY", "MEANLY"), ("ACDE", "ACDF")]]
-    batch = nwgrad.SeqPairBatch(n_threads=2)
-    for sp in pairs:
-        batch.add(sp)
+    batch = nwgrad.SeqPairBatch(n_threads=2, gap_model="affine", mode="global",
+                                grad_mode="hard")
+    batch.add_many(["PLEASANTLY", "ACDE"], ["MEANLY", "ACDF"], p)
     batch.score_and_grad()
     grad = batch.compute_grad()
     assert grad.matrix.alphabet == BLOSUM62.alphabet
@@ -203,10 +194,9 @@ def test_seqpair_keeps_params_alive():
 
 def _build_batch_with_local_everything():
     p = _affine_params(BLOSUM62)
-    batch = nwgrad.SeqPairBatch(n_threads=2)
-    for a, b in [("PLEASANTLY", "MEANLY"), ("ACDE", "ACDF")]:
-        batch.add(nwgrad.SeqPair(a, b, p, gap_model="affine",
-                                 mode="global", grad_mode="hard"))
+    batch = nwgrad.SeqPairBatch(n_threads=2, gap_model="affine", mode="global",
+                                grad_mode="hard")
+    batch.add_many(["PLEASANTLY", "ACDE"], ["MEANLY", "ACDF"], p)
     return batch
 
 
