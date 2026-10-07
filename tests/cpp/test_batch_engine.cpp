@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "batch_engine.hpp"
+#include "batch.hpp"
 #include "seq_pair_batch.hpp"
 
 namespace {
@@ -240,4 +241,77 @@ TEST_CASE("BatchEngine == SeqPairBatch, float32", "[batch_engine]") {
     sweep<float, GapModel::Affine, AlignMode::Local>(24);
     sweep<float, GapModel::Linear, AlignMode::Global>(24);
     sweep<float, GapModel::Linear, AlignMode::Local>(24);
+}
+
+// ── align_stream against BatchAligner ───────────────────────────────────────
+
+namespace {
+
+template <class T, GapModel GM, AlignMode AM>
+void stream_sweep(int n) {
+    std::mt19937 rng(77u + static_cast<unsigned>(GM) * 10u + static_cast<unsigned>(AM) +
+                     (std::is_same_v<T, float> ? 100u : 0u));
+    using BA = BatchAlignerT<T>;
+    const GradMode gds[] = {GradMode::Hard, GradMode::Soft, GradMode::None};
+    const typename BA::GradMode bgds[] = {BA::GradMode::Hard, BA::GradMode::Soft, BA::GradMode::None};
+    for (int k = 0; k < n; ++k) {
+        const int gi = k % 3;
+        const bool protein = rng() % 4 == 0, inter = rng() % 3 != 0;
+        const int band = rng() % 3 == 0 ? 1 + static_cast<int>(rng() % 6) : 0;
+        const bool guides = rng() % 3 == 0;
+        const int threads = 1 + static_cast<int>(rng() % 4);
+        const double temp = rng() % 3 == 0 ? 0.5 : 1.0;
+        const Alphabet& alpha = Alphabet::get(protein ? "ACDEFGHIKLMNPQRSTVWY" : "ACGT");
+        const AlignParams p = rparams(rng, alpha, GM, static_cast<int>(rng() % 3));
+        const int N = 1 + static_cast<int>(rng() % 40), lb = rlen(rng);
+        std::vector<std::string> A, B;
+        for (int i = 0; i < N; ++i) {
+            A.push_back(rseq(rng, alpha.symbols(), rlen(rng)));
+            B.push_back(rseq(rng, alpha.symbols(), rng() % 4 ? lb : rlen(rng)));
+        }
+        std::vector<ProblemInstance> probs;
+        for (int i = 0; i < N; ++i) {
+            ProblemInstance pi{A[i], B[i], {}};
+            if (guides) {   // a diagonal guide, as a caller's aligned strings would give
+                const int m = static_cast<int>(A[i].size()), nb = static_cast<int>(B[i].size());
+                for (int r = 0; r <= m; ++r) pi.guide_j.push_back(m ? r * nb / m : 0);
+                if (!pi.guide_j.empty()) pi.guide_j.back() = nb;
+            }
+            probs.push_back(pi);
+        }
+        INFO("stream case " << k << " gd " << gi << " band " << band << " guides " << guides
+             << " inter " << inter << " threads " << threads << " protein " << protein);
+        BA ba(p, band, GM, AM, bgds[gi], threads);
+        ba.inter_fill = inter; ba.soft_temperature = temp;
+        BatchEngine<T, GM, AM> eng(threads, gds[gi]);
+        eng.inter_fill = inter; eng.set_soft_temperature(temp);
+        const BatchResult ro = ba.align(probs);
+        const BatchResult re = eng.align_stream(probs, p, band);
+        REQUIRE(ro.scores.size() == re.scores.size());
+        for (int i = 0; i < N; ++i) {
+            INFO("problem " << i);
+            if (gds[gi] == GradMode::Soft)
+                CHECK(std::abs(ro.scores[i] - re.scores[i]) <= 1e-11 * (1 + std::abs(ro.scores[i])));
+            else
+                CHECK(same(ro.scores[i], re.scores[i]));
+        }
+        for (int q = 0; q < alpha.size() * alpha.size(); ++q) {
+            const double x = ro.grad.matrix.data()[q], y = re.grad.matrix.data()[q];
+            if (gds[gi] == GradMode::Soft) CHECK(std::abs(x - y) <= 1e-9 * (1 + std::abs(x)));
+            else                           CHECK(same(x, y));
+        }
+    }
+}
+
+} // namespace
+
+TEST_CASE("BatchEngine::align_stream == BatchAligner::align", "[batch_engine]") {
+    stream_sweep<double, GapModel::Affine, AlignMode::Global>(30);
+    stream_sweep<double, GapModel::Affine, AlignMode::Local>(30);
+    stream_sweep<double, GapModel::Linear, AlignMode::Global>(30);
+    stream_sweep<double, GapModel::Linear, AlignMode::Local>(30);
+    stream_sweep<float, GapModel::Affine, AlignMode::Global>(30);
+    stream_sweep<float, GapModel::Affine, AlignMode::Local>(30);
+    stream_sweep<float, GapModel::Linear, AlignMode::Global>(30);
+    stream_sweep<float, GapModel::Linear, AlignMode::Local>(30);
 }

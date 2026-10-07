@@ -11,21 +11,9 @@
 
 #include "align_params.hpp"
 #include "aligner.hpp"
+#include "batch_result.hpp"
 #include "parallel.hpp"
 #include "simd_levels.hpp"
-
-struct ProblemInstance {
-    std::string_view seq_a;
-    std::string_view seq_b;
-    std::vector<int> guide_j;  // empty → trivial diagonal guide (band around main diagonal)
-};
-
-struct BatchResult {
-    std::vector<double> scores;
-    AlignParams grad;
-
-    explicit BatchResult(const Alphabet& alpha) : grad(alpha) {}
-};
 
 template<class T = double>
 struct BatchAlignerT {

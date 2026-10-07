@@ -39,6 +39,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <span>
 #include <numeric>
 #include <stdexcept>
@@ -48,6 +49,7 @@
 
 #include "align_params.hpp"
 #include "aligner.hpp"
+#include "batch_result.hpp"
 #include "grad_mode.hpp"
 #include "parallel.hpp"
 #include "simd_levels.hpp"
@@ -411,6 +413,327 @@ public:
         }
     }
 
+    // ── Streaming align (what BatchAligner was) ─────────────────────────────
+    //
+    // Align `problems` under `params` and return each score plus the gradient SUMMED over
+    // them, storing nothing per pair: sequences are encoded per worker as they are
+    // reached, so memory stays O(threads), not O(N).  The batch's own pairs are not
+    // touched; its type, grad mode, threads, soft settings, traceback and fill apply.
+    // Hard: Viterbi + path counts; Soft: forward-backward only (no Viterbi); None:
+    // Viterbi score.  band > 0 bands every problem (an empty guide_j gets the diagonal);
+    // band == 0 with guides bands at width 0 — all problems or none must carry one.
+    // A port of BatchAlignerT::align: same per-problem calls, same grouping.  The
+    // gradient is merged per thread in completion order (hard counts: exact; soft: the
+    // last bits may vary between runs).
+    BatchResult align_stream(const std::vector<ProblemInstance>& problems,
+                             const AlignParams& params, int band = 0,
+                             int kernel = kBackendAuto) const {
+        const size_t N = problems.size();
+        BatchResult result(params.matrix.alphabet());
+        result.scores.resize(N, 0.0);
+        if (N == 0) return result;
+        if (alpha_ && &params.matrix.alphabet() != alpha_)
+            throw std::invalid_argument(
+                "nwgrad: align() params over alphabet \"" + params.matrix.alphabet().symbols() +
+                "\" in a batch over alphabet \"" + alpha_->symbols() + "\"");
+        if (band < 0)
+            throw std::invalid_argument("nwgrad: band must be >= 0, got " + std::to_string(band));
+        // AlignBand is a compile-time parameter: one call is either all Full or all
+        // GuideBanded.  A band-0 call where only SOME problems carry a guide would drop
+        // the guides silently — reject it on the caller's thread.
+        if (band == 0) {
+            bool any_guided = false, any_unguided = false;
+            for (const auto& p : problems) (p.guide_j.empty() ? any_unguided : any_guided) = true;
+            if (any_guided && any_unguided)
+                throw std::invalid_argument(
+                    "nwgrad: mixed batch with band == 0 — some problems carry a "
+                    "guide_j and others don't. All problems in one align() call "
+                    "must either all supply a guide_j or none of them; split "
+                    "into separate align() calls, or set band > 0 so an unguided "
+                    "problem gets an automatic diagonal guide instead.");
+        }
+        const bool banded = band > 0 || !problems[0].guide_j.empty();
+        if (inter_fill) {
+            const int be = stream_inter_backend_(params, band, kernel);
+            if (be >= 0) {
+                if (banded) stream_inter_<AlignBand::GuideBanded>(problems, params, band, kernel, result, be);
+                else        stream_inter_<AlignBand::Full>(problems, params, band, kernel, result, be);
+                return result;
+            }
+        }
+        std::atomic<size_t> work_idx{0};
+        std::mutex grad_mutex;
+        auto worker = [&]() {
+            AlignParams local_grad = AlignParams::zeros_like(params);
+            if (banded) stream_loop_<AlignBand::GuideBanded>(problems, params, band, kernel, work_idx, result.scores, local_grad);
+            else        stream_loop_<AlignBand::Full>(problems, params, band, kernel, work_idx, result.scores, local_grad);
+            if (grad_mode_ != GradMode::None) {
+                std::lock_guard<std::mutex> lock(grad_mutex);
+                result.grad += local_grad;
+            }
+        };
+        run_workers_guarded(std::min<int>(n_threads_, static_cast<int>(std::min<size_t>(N, 1u << 30))), worker);
+        return result;
+    }
+
+private:
+    // Validate and encode one sequence, naming the PAIR and which sequence on failure —
+    // the aligner's own message could only name a position in an anonymous string.
+    static void stream_encode_(const Alphabet& alpha, std::string_view s, std::vector<uint8_t>& out,
+                               size_t pair_idx, char which) {
+        out.clear();
+        out.reserve(s.size());
+        for (size_t k = 0; k < s.size(); ++k) {
+            const int i = alpha.index_of(s[k]);
+            if (i < 0) {
+                std::string msg = "nwgrad: pair " + std::to_string(pair_idx) + ", sequence ";
+                msg += which;
+                msg += ": character '";
+                msg += s[k];
+                msg += "' at position " + std::to_string(k) + " is not in alphabet \"" +
+                       alpha.symbols() + "\"";
+                throw std::invalid_argument(msg);
+            }
+            out.push_back(static_cast<uint8_t>(i));
+        }
+    }
+    template<AlignBand AB>
+    void configure_stream_(Aligner<GM, AM, AB, T>& al, int kernel) const {
+        al.set_kernel(kernel);
+        al.set_soft_impl(soft_impl_);
+        al.set_soft_temperature(soft_temp_);
+        if constexpr (AB == AlignBand::Full) {
+            al.set_traceback(tb_);
+            al.set_hb_cutoff(hb_cutoff_);
+            al.set_rowwise_full(rowwise_full);
+        }
+    }
+    template<AlignBand AB>
+    void stream_loop_(const std::vector<ProblemInstance>& problems, const AlignParams& params,
+                      int band, int kernel, std::atomic<size_t>& work_idx,
+                      std::vector<double>& scores, AlignParams& local_grad) const {
+        Aligner<GM, AM, AB, T> al;
+        configure_stream_<AB>(al, kernel);
+        DpBuffer buf;
+        const Alphabet& alpha = params.matrix.alphabet();
+        std::vector<uint8_t> a_enc, b_enc;
+        const size_t N = problems.size();
+        for (size_t idx; (idx = work_idx.fetch_add(1, std::memory_order_relaxed)) < N; ) {
+            const auto& p = problems[idx];
+            stream_encode_(alpha, p.seq_a, a_enc, idx, 'a');
+            stream_encode_(alpha, p.seq_b, b_enc, idx, 'b');
+            al.set_problem(a_enc, b_enc, params, band, p.guide_j);
+            if (grad_mode_ == GradMode::Hard) {
+                al.compute_viterbi(buf); scores[idx] = al.score(); al.hard_grad(buf, local_grad);
+            } else if (grad_mode_ == GradMode::Soft) {
+                al.compute_forward_back(buf); scores[idx] = al.log_z(); al.soft_grad(buf, local_grad);
+            } else {
+                al.compute_viterbi(buf); scores[idx] = al.score();
+            }
+        }
+    }
+    // The level a shared pass would run on, or -1 (every problem its own path): the
+    // scalar backend, soft_impl "log" or a banded soft call, linear Global Viterbi below
+    // 4 lanes or over 8 letters, linear banded.
+    int stream_inter_backend_(const AlignParams& params, int band, int kernel) const {
+        const int backend = (kernel == kBackendAuto) ? global_default_backend() : kernel;
+        if (backend < 0) return -1;
+        const LevelKernels& K = level_kernels(backend);
+        if (grad_mode_ == GradMode::Soft)
+            return (K.inter_soft && K.inter_w > 0 && soft_impl_ != SoftImpl::Log && band == 0) ? backend : -1;
+        if (inter_w_(K) <= 0) return -1;
+        if (GM == GapModel::Linear &&
+            (band > 0 || (AM == AlignMode::Global && (inter_w_(K) < 4 || params.matrix.size() > 8))))
+            return -1;
+        return backend;
+    }
+    // Problems grouped W at a time, sorted by len B then len A (counting sorts: each call
+    // brings new problems, nothing is cached).  The rest run their own path in the same
+    // pass: empty sequences, and Full pairs the traceback would split (Hirschberg past
+    // the cutoff).  A guided band-0 call is GuideBanded and stays so.
+    template<AlignBand AB>
+    void stream_inter_(const std::vector<ProblemInstance>& problems, const AlignParams& params,
+                       int band, int kernel, BatchResult& result, int backend) const {
+        const size_t N = problems.size();
+        const LevelKernels& K = level_kernels(backend);
+        const bool soft = grad_mode_ == GradMode::Soft;
+        const int W = soft ? K.inter_w : inter_w_(K);
+        const bool hb_case = !soft && AB == AlignBand::Full && is_hirschberg(tb_resolved_);
+        std::vector<size_t> other, elig;
+        size_t maxa = 0, maxb = 0;
+        for (size_t i = 0; i < N; ++i) {
+            const size_t la = problems[i].seq_a.size(), lb = problems[i].seq_b.size();
+            if (la == 0 || lb == 0 || (hb_case && la > static_cast<size_t>(hb_cutoff_)) ||
+                !inter_pair_fits(la, lb, GM == GapModel::Affine, soft, inter_w_(K), sizeof(T), K.inter_w)) {
+                other.push_back(i); continue;
+            }
+            elig.push_back(i);
+            maxa = std::max(maxa, la); maxb = std::max(maxb, lb);
+        }
+        auto csort = [&](auto key, size_t kmax) {   // LSD counting sort: len A, then len B
+            std::vector<size_t> cnt(kmax + 2, 0), out(elig.size());
+            for (size_t i : elig) ++cnt[key(i) + 1];
+            for (size_t k = 1; k < cnt.size(); ++k) cnt[k] += cnt[k - 1];
+            for (size_t i : elig) out[cnt[key(i)]++] = i;
+            elig.swap(out);
+        };
+        csort([&](size_t i) { return problems[i].seq_a.size(); }, maxa);
+        csort([&](size_t i) { return problems[i].seq_b.size(); }, maxb);
+        std::vector<std::pair<size_t, size_t>> groups;
+        for (size_t s = 0; s < elig.size();) {
+            const size_t lb = problems[elig[s]].seq_b.size();
+            size_t e = s + 1;
+            while (e < elig.size() && e - s < static_cast<size_t>(W) &&
+                   problems[elig[e]].seq_b.size() * 4 <= lb * 5 + 16) ++e;
+            groups.emplace_back(s, e);
+            s = e;
+        }
+        std::atomic<size_t> idx{0};
+        std::mutex grad_mutex;
+        auto worker = [&]() {
+            AlignParams local_grad = AlignParams::zeros_like(params);
+            stream_inter_loop_<AB>(problems, params, band, kernel, elig, groups, other, idx,
+                                   result.scores, local_grad, K, W);
+            if (grad_mode_ != GradMode::None) {
+                std::lock_guard<std::mutex> lock(grad_mutex);
+                result.grad += local_grad;
+            }
+        };
+        const size_t tasks = groups.size() + other.size();
+        run_workers_guarded(std::min<int>(n_threads_, static_cast<int>(std::max<size_t>(tasks, 1))), worker);
+    }
+    template<AlignBand AB>
+    void stream_inter_loop_(const std::vector<ProblemInstance>& problems, const AlignParams& params,
+                            int band, int kernel, const std::vector<size_t>& elig,
+                            const std::vector<std::pair<size_t, size_t>>& groups,
+                            const std::vector<size_t>& other, std::atomic<size_t>& idx,
+                            std::vector<double>& scores, AlignParams& local_grad,
+                            const LevelKernels& K, int W) const {
+        using Al = Aligner<GM, AM, AB, T>;
+        std::vector<Al> al(W);
+        for (Al& x : al) configure_stream_<AB>(x, kernel);
+        DpBuffer buf;
+        const Alphabet& alpha = params.matrix.alphabet();
+        std::vector<std::vector<uint8_t>> ae(W), be(W);
+        std::vector<const unsigned char*> a(W), b(W);
+        std::vector<int> m(W), bi(W), bj(W), blo, bhi, ulo, uhi, bri(W), brj(W), nb(W);
+        std::vector<T> best(W), blkT;
+        constexpr bool lin = GM == GapModel::Linear;
+        const bool soft = grad_mode_ == GradMode::Soft;
+        std::vector<double> es, slogz, scnt, sgap;
+        DVec sscr;
+        std::vector<int> siscr, sok;
+        InterSoftJob sj{};
+        const bool soft_ok = soft && inter_soft_weights(params, soft_temp_, lin, es, sj);
+        const size_t nn = static_cast<size_t>(params.matrix.size()) * params.matrix.size();
+        if (!soft) {
+            blkT.resize(nn);
+            for (size_t k = 0; k < nn; ++k) blkT[k] = static_cast<T>(params.matrix.data()[k]);
+        }
+        auto own = [&](size_t i) {   // one problem on its own path: stream_loop_'s body
+            Al& x = al[0];
+            const auto& p = problems[i];
+            stream_encode_(alpha, p.seq_a, ae[0], i, 'a');
+            stream_encode_(alpha, p.seq_b, be[0], i, 'b');
+            x.set_problem(ae[0], be[0], params, band, p.guide_j);
+            if (grad_mode_ == GradMode::Hard) {
+                x.compute_viterbi(buf); scores[i] = x.score(); x.hard_grad(buf, local_grad);
+            } else if (grad_mode_ == GradMode::Soft) {
+                x.compute_forward_back(buf); scores[i] = x.log_z(); x.soft_grad(buf, local_grad);
+            } else {
+                x.compute_viterbi(buf); scores[i] = x.score();
+            }
+        };
+        const size_t G = groups.size(), tasks = G + other.size();
+        for (size_t t; (t = idx.fetch_add(1, std::memory_order_relaxed)) < tasks; ) {
+            if (t >= G) { own(other[t - G]); continue; }
+            const auto [s, e] = groups[t];
+            const size_t real = e - s;
+            if (soft && !soft_ok) { for (size_t k = s; k < e; ++k) own(elig[k]); continue; }
+            int M = 0, n = 0;
+            bool ragged = false;
+            for (int l = 0; l < W; ++l) {
+                const size_t lr = std::min<size_t>(l, real - 1);   // spare lanes repeat the last
+                if (static_cast<size_t>(l) == lr) {
+                    const size_t i = elig[s + lr];
+                    stream_encode_(alpha, problems[i].seq_a, ae[l], i, 'a');
+                    stream_encode_(alpha, problems[i].seq_b, be[l], i, 'b');
+                }
+                a[l] = ae[lr].data(); b[l] = be[lr].data();
+                m[l] = static_cast<int>(ae[lr].size());
+                nb[l] = static_cast<int>(be[lr].size());
+                M = std::max(M, m[l]);
+                n = std::max(n, nb[l]);
+                ragged |= nb[l] != nb[0];
+            }
+            const size_t gstride = ragged ? static_cast<size_t>(n) + 1 : 0;
+            if (soft) {
+                const size_t need = inter_soft_scratch(n, M, W);
+                if (sscr.size() < need) sscr.resize(need);
+                siscr.resize(static_cast<size_t>(M + 1) * W);
+                slogz.resize(W); scnt.resize(W * nn); sgap.resize(W * 4); sok.resize(W);
+                sj.a = a.data(); sj.m = m.data(); sj.b = b.data(); sj.n = n; sj.M = M;
+                sj.nb = ragged ? nb.data() : nullptr;
+                sj.align_mode = (AM == AlignMode::Local) ? 1 : 0;
+                sj.scratch = sscr.data(); sj.iscratch = siscr.data();
+                sj.logz = slogz.data(); sj.counts = scnt.data(); sj.gaps = sgap.data();
+                sj.ok = sok.data();
+                K.inter_soft(sj);
+                for (size_t l = 0; l < real; ++l) {
+                    const size_t i = elig[s + l];
+                    if (!sok[l]) { own(i); continue; }
+                    scores[i] = slogz[l] * soft_temp_;
+                    double* g = local_grad.matrix.data();
+                    for (size_t k = 0; k < nn; ++k) g[k] += scnt[l * nn + k];
+                    local_grad.gap_open_a += sgap[l * 4 + 0]; local_grad.gap_extend_a += sgap[l * 4 + 1];
+                    local_grad.gap_open_b += sgap[l * 4 + 2]; local_grad.gap_extend_b += sgap[l * 4 + 3];
+                }
+                continue;
+            }
+            if constexpr (AB == AlignBand::GuideBanded) {
+                blo.assign(static_cast<size_t>(M + 1) * W, 1);
+                bhi.assign(static_cast<size_t>(M + 1) * W, 0);
+                ulo.assign(M + 1, n + 1); uhi.assign(M + 1, 0);
+                std::fill(bri.begin(), bri.end(), 0); std::fill(brj.begin(), brj.end(), 0);
+            }
+            for (size_t l = 0; l < real; ++l) {
+                al[l].set_problem(ae[l], be[l], params, band, problems[elig[s + l]].guide_j);
+                if constexpr (AB == AlignBand::GuideBanded)
+                    al[l].banded_lane_rows(W, static_cast<int>(l), M, blo.data(), bhi.data(),
+                                           ulo.data(), uhi.data(), bri[l], brj[l]);
+            }
+            const size_t sz = static_cast<size_t>(M + 1) * (n + 1) * W;
+            InterJobT<T> job{};
+            job.a = a.data(); job.m = m.data(); job.b = b.data(); job.n = n; job.M = M;
+            job.align_mode = (AM == AlignMode::Local) ? 1 : 0;
+            if (ragged) job.nb = nb.data();
+            job.blk = blkT.data(); job.nalpha = params.matrix.size();
+            job.go_a = static_cast<T>(params.gap_open_a); job.ge_a = static_cast<T>(params.gap_extend_a);
+            job.go_b = static_cast<T>(params.gap_open_b); job.ge_b = static_cast<T>(params.gap_extend_b);
+            job.linear = lin ? 1 : 0;
+            if constexpr (lin) { if (buf.H.size() < sz) buf.H.resize(sz); job.VM = buf.H.data(); }
+            else {
+                for (auto* v : {&buf.VM, &buf.VX, &buf.VY}) if (v->size() < sz) v->resize(sz);
+                job.VM = buf.VM.data(); job.VX = buf.VX.data(); job.VY = buf.VY.data();
+            }
+            job.best = best.data(); job.best_i = bi.data(); job.best_j = bj.data();
+            if constexpr (AB == AlignBand::GuideBanded) {
+                job.blo = blo.data(); job.bhi = bhi.data();
+                job.ulo = ulo.data(); job.uhi = uhi.data();
+                job.bri = bri.data(); job.brj = brj.data();
+            }
+            if constexpr (std::is_same_v<T, double>) K.inter_fill(job);
+            else                                     K.inter_fill_f(job);
+            for (size_t l = 0; l < real; ++l) {
+                const size_t i = elig[s + l];
+                al[l].adopt_interleaved(buf, W, static_cast<int>(l), best[l], bi[l], bj[l], gstride);
+                scores[i] = al[l].score();
+                if (grad_mode_ == GradMode::Hard) al[l].hard_grad(buf, local_grad);
+            }
+        }
+    }
+
+public:
 private:
     // ── Per-pair state ───────────────────────────────────────────────────────
     enum : uint8_t {
