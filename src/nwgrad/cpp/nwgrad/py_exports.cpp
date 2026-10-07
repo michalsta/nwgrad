@@ -547,15 +547,22 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
                const OS& grad_mode, const std::string& kernel) {
                 SPB& self = nb::cast<SPB&>(self_obj);
                 const AlignParams& params = nb::cast<const AlignParams&>(params_obj);
+                // Parse first: a bad name is reported as such, whatever the batch's state.
+                auto gm = parse_opt<std::optional<GapModel>>(gap_model, parse_gap_model);
+                auto am = parse_opt<std::optional<AlignMode>>(mode, parse_align_mode);
+                auto gd = parse_opt<std::optional<GradMode>>(grad_mode, parse_grad_mode<GradMode>);
+                const int kn = parse_backend(kernel);
                 if (gap_model || mode || grad_mode)
                     deprecated(
                         "add_many(gap_model=..., mode=..., grad_mode=...) is deprecated: a batch "
                         "holds one problem type; pass them to the SeqPairBatch constructor");
-                self.add_many(seqs_a, seqs_b, params,
-                              parse_opt<std::optional<GapModel>>(gap_model, parse_gap_model),
-                              parse_opt<std::optional<AlignMode>>(mode, parse_align_mode),
-                              parse_opt<std::optional<GradMode>>(grad_mode, parse_grad_mode<GradMode>),
-                              parse_backend(kernel));
+                if (!self.typed()) {
+                    // The pre-0.6 add_many() defaults, for an untyped (deprecated) batch.
+                    if (!gm) gm = GapModel::Affine;
+                    if (!am) am = AlignMode::Global;
+                    if (!gd) gd = GradMode::Hard;
+                }
+                self.add_many(seqs_a, seqs_b, params, gm, am, gd, kn);
                 NWGRAD_ATTR_LIST(self_obj, "_owned_params").append(params_obj);
             },
             nb::arg("seqs_a"), nb::arg("seqs_b"), nb::arg("params"),

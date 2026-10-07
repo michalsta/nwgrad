@@ -1,4 +1,4 @@
-"""BatchAligner.align() per fill, on miRNA x target-site pairs.
+"""Streaming align (BatchAligner.align, SeqPairBatch.align from 0.6) per fill, on miRNA x target-site pairs.
 
 python tools/bench_batch_aligner.py --data .../manakov_fit_rc.tsv --n 100000 --threads 1 12
 
@@ -9,6 +9,7 @@ import argparse, csv, time
 
 import numpy as np
 import nwgrad
+from _stream import Stream
 
 M = [[0.5317913251634095, -0.6093661897398082, -0.6015643682535813, -0.5647387919107214],
      [-0.4403381513087269, 0.5844189960899253, -0.573571888213131, -0.4814330380001284],
@@ -35,12 +36,11 @@ B = [rows[i][1] for i in idx]
 
 params = nwgrad.AlignParams(nwgrad.SubstMatrix(np.array(M), "ACGT"), 1.0, 0.5, 1.0, 0.5)
 lin = nwgrad.AlignParams(nwgrad.SubstMatrix(np.array(M), "ACGT"), 0.0, 1.2147, 0.0, 1.2147)
-CLS = {"float32": nwgrad.BatchAligner, "double": nwgrad.BatchAlignerDouble}
 
 
 def run(prec, threads, mode, gap, grad, fill):
-    ba = CLS[prec](params if gap == "affine" else lin, band=args.band, gap_model=gap,
-                   mode=mode, grad_mode=grad, n_threads=threads)
+    ba = Stream(params if gap == "affine" else lin, band=args.band, gap_model=gap,
+                mode=mode, grad_mode=grad, n_threads=threads, double=prec == "double")
     ba.fill = fill
     ba.align(A, B)
     best = 1e30
