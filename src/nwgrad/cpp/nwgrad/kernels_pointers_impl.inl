@@ -53,12 +53,12 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
     if (buf.sopenv.size() < 2 * sw) buf.sopenv.resize(2 * sw);   // ov | openk
     if (buf.sprof.size()  < (std::size_t)nalpha * sw) buf.sprof.resize((std::size_t)nalpha * sw);
     const std::size_t dsz = (std::size_t)(m + 1) * rowsz;
-    if (buf.DM.size() < dsz) { buf.DM.resize(dsz); buf.DX.resize(dsz); buf.DY.resize(dsz); }
+    // Each vector is checked on its own: a linear pointer fill sharing this buffer grows
+    // DM, rM and qM alone, so one size no longer speaks for the group.
+    for (auto* d : {&buf.DM, &buf.DX, &buf.DY}) if (d->size() < dsz) d->resize(dsz);
     // rolling score rows: 2 x rowsz instead of (m+1) x rowsz -- the whole point
-    if (buf.rM.size() < rowsz) {
-        buf.rM.resize(rowsz); buf.rX.resize(rowsz); buf.rY.resize(rowsz);
-        buf.qM.resize(rowsz); buf.qX.resize(rowsz); buf.qY.resize(rowsz);
-    }
+    for (auto* r : {&buf.rM, &buf.rX, &buf.rY, &buf.qM, &buf.qX, &buf.qY})
+        if (r->size() < rowsz) r->resize(rowsz);
     if (buf.subbuf.size() < sw) buf.subbuf.resize(sw);           // y-code scratch
 
     auto scol = [seg](int j) -> std::size_t {

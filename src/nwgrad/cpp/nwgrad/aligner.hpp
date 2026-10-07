@@ -1582,11 +1582,10 @@ private:
 
         const std::size_t stride = stride_;   // row-major, matches cell_index()
         const std::size_t dsz    = static_cast<std::size_t>(m_ + 1) * stride;
-        if (buf.DM.size() < dsz) { buf.DM.resize(dsz); buf.DX.resize(dsz); buf.DY.resize(dsz); }
-        if (buf.rM.size() < stride) {
-            buf.rM.resize(stride); buf.rX.resize(stride); buf.rY.resize(stride);
-            buf.qM.resize(stride); buf.qX.resize(stride); buf.qY.resize(stride);
-        }
+        // Per vector, not keyed on DM / rM: viterbi_linear_ptr grows only DM, rM and qM.
+        for (auto* d : {&buf.DM, &buf.DX, &buf.DY}) if (d->size() < dsz) d->resize(dsz);
+        for (auto* r : {&buf.rM, &buf.rX, &buf.rY, &buf.qM, &buf.qX, &buf.qY})
+            if (r->size() < stride) r->resize(stride);
         T* pM = buf.qM.data(); T* pX = buf.qX.data(); T* pY = buf.qY.data();  // row i-1
         T* cM = buf.rM.data(); T* cX = buf.rX.data(); T* cY = buf.rY.data();  // row i
         unsigned char* dM = buf.DM.data();
