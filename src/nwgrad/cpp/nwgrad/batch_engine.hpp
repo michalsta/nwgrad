@@ -39,6 +39,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <numeric>
@@ -240,7 +241,7 @@ public:
     std::vector<int> guide_j(size_t i) {
         if (!path_valid(i))
             throw std::logic_error("nwgrad: alignment not computed; call align_full() first");
-        if (guide_pending(i)) { Work w(*this); resolve_guide_(i, w); }
+        if (guide_pending(i)) resolve_guide_(i, solo_work_());
         const int* g = guide_ptr_(i);
         return {g, g + len_a(i) + 1};
     }
@@ -367,16 +368,14 @@ public:
     // One pair, on the calling thread (SeqPair's own operations).
     void score_and_grad_one(size_t i, bool keep_path, bool hold_grad = false) {
         prepare_paths_(keep_path, /*all=*/false);
-        Work w(*this);
-        run_full_(i, w, keep_path);
+        run_full_(i, solo_work_(), keep_path);
         if (hold_grad) hold_(i);
     }
     void banded_one(size_t i, int bandwidth, bool keep_path, bool hold_grad = false) {
         if (!path_valid(i))
             throw std::logic_error("nwgrad: call align_full() before realign_banded()");
         prepare_paths_(keep_path, /*all=*/false);
-        Work w(*this);
-        run_banded_(i, w, bandwidth, keep_path);
+        run_banded_(i, solo_work_(), bandwidth, keep_path);
         if (hold_grad) hold_(i);
     }
     // SeqPair::compute_grad: release pair i's held gradient, with the old preconditions
@@ -887,7 +886,9 @@ private:
         BandAl band;
         AlignParams g;
         std::vector<int> gj;
-        explicit Work(const BatchEngine& e) : g(e.alphabet()) {
+        explicit Work(const BatchEngine& e) : g(e.alphabet()) { configure(e); }
+        // The batch's settings, (re)applied: a reused Work follows setting changes.
+        void configure(const BatchEngine& e) {
             full.set_traceback(e.tb_);
             full.set_hb_cutoff(e.hb_cutoff_);
             full.set_rowwise_full(e.rowwise_full);
@@ -900,6 +901,16 @@ private:
             band.set_soft_temperature(e.soft_temp_);
         }
     };
+    // The calling thread's Work for single-pair operations (SeqPair's align_full() and
+    // friends), kept between calls: a fresh one per call re-allocated the DP tables
+    // every time, which the pre-0.6 SeqPair (pair-owned tables) did not — measured
+    // 4-10 % per repeated call.  Same thread-safety as SeqPair had: one caller at a time.
+    std::unique_ptr<Work> solo_;
+    Work& solo_work_() {
+        if (!solo_) solo_ = std::make_unique<Work>(*this);
+        else        solo_->configure(*this);
+        return *solo_;
+    }
 
     template<class Al>
     void set_problem_(Al& al, size_t i) const {
