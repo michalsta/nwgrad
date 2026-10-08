@@ -462,7 +462,10 @@ static void inter_score_linear(InterJobT<T>& J) noexcept {
 // open every state of the cell (its D = max(M, X, Y)) adds only dominated candidates and
 // drops none that could win:
 //   X(i,j) = max((D(i-1,j) - go_b) - ge_b, X(i-1,j) - ge_b)
-//   Y(i,j) = max((D(i,j-1) - go_a) - ge_a, Y(i,j-1) - ge_a)
+//   Y(i,j) = max((max(M,X)(i,j-1) - go_a) - ge_a, Y(i,j-1) - ge_a)   (as the fill: the
+//            open must NOT come from D, which holds Y — that would put the max of three
+//            and two subtractions on the loop-carried Y chain; measured 1.03x of the fill
+//            with it, against 0.83x without)
 //   M(i,j) = D(i-1,j-1) + s            (Local: clamped at 0)
 // the same maxima, so the same values, as inter_score_affine's three-operand forms.  The
 // row keeps D and X; M is never stored, Y lives in a register.  With the extends >= 0
@@ -499,19 +502,20 @@ static void inter_score_affine_pos(InterJobT<T>& J) noexcept {
         cm.row(i, P, live);
         ivd dd = D[0];                                           // D(i-1, 0)
         const ivd x0 = local ? ninf : ivsplat<ivd>(-(J.go_b + static_cast<T>(i) * J.ge_b));
-        ivd dl = local ? z : x0;                                 // D(i, 0)
+        ivd lmx = local ? z : x0;                                // max(M, X)(i, 0)
         ivd ly = ninf;                                           // Y(i, 0)
-        D[0] = dl; X[0] = x0;
+        D[0] = lmx; X[0] = x0;                                   // D(i, 0): Y(i, 0) is -inf
         for (int j = 1; j <= n; ++j) {
             const ivd s = cm.s(P, j);
             const ivd du = D[j], xu = X[j];                      // row i-1, column j
             ivd mv = dd + s;
             if (local) mv = ivmax(mv, z);
             const ivd x = ivmax((du - go_b) - ge_b, xu - ge_b);
-            const ivd y = ivmax((dl - go_a) - ge_a, ly - ge_a);
-            const ivd dn = ivmax(mv, ivmax(x, y));
+            const ivd mx = ivmax(mv, x);
+            const ivd y = ivmax((lmx - go_a) - ge_a, ly - ge_a);
+            const ivd dn = ivmax(mx, y);
             D[j] = dn; X[j] = x;
-            dd = du; dl = dn; ly = y;
+            dd = du; lmx = mx; ly = y;
             if (local) {
                 ivl keep = live;
                 if constexpr (Ragged) keep &= (z + static_cast<T>(j)) <= cm.nbv;
