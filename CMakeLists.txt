@@ -197,6 +197,8 @@ if (NWGRAD_BUILD_TESTS)
         tests/cpp/test_seq_pair.cpp
         tests/cpp/test_traceback_modes.cpp
         tests/cpp/test_viterbi_then_fwdbwd.cpp
+        tests/cpp/test_buffer_reuse.cpp
+        tests/cpp/test_batch_engine.cpp
         tests/cpp/test_hirschberg_scan.cpp
         tests/cpp/test_hirschberg_pmax.cpp
         tests/cpp/test_add_many.cpp

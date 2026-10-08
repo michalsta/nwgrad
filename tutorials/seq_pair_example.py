@@ -15,7 +15,10 @@ GRAD_MODE   = "hard"    # "hard"  — Viterbi subgradient (pair counts)
                         # "soft"  — forward-backward expected counts (log Z score)
 
 BAND_WIDTH  = 15        # half-width for banded realignment in the second pass
-LR          = 0.1       # step size: new_matrix = old_matrix + LR * grad
+LR          = 1e-3      # step size: new_params = params + LR * grad.  The gradient sums
+                        # counts over every pair, so keep LR small: at 0.1 the gap
+                        # costs step below zero, gaps become rewards, and the "best"
+                        # alignment is all gaps.
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 AA = list("ACDEFGHIKLMNPQRSTVWY")
@@ -64,13 +67,9 @@ print(f"Config: {GAP_MODEL} gap, {ALIGN_MODE} align, {GRAD_MODE} grad")
 print(f"        gap_open={GAP_OPEN}  gap_extend={GAP_EXTEND}  band={BAND_WIDTH}  lr={LR}")
 
 # ── Build upper-triangle pairs ────────────────────────────────────────────────
-batch = nwgrad.SeqPairBatch()
-for i in range(N_SEQS):
-    for j in range(i + 1, N_SEQS):
-        batch.add(nwgrad.SeqPair(
-            seqs[i], seqs[j], params,
-            gap_model=GAP_MODEL, mode=ALIGN_MODE, grad_mode=GRAD_MODE,
-        ))
+batch = nwgrad.SeqPairBatch(gap_model=GAP_MODEL, mode=ALIGN_MODE, grad_mode=GRAD_MODE)
+ii, jj = np.triu_indices(N_SEQS, k=1)
+batch.add_many([seqs[i] for i in ii], [seqs[j] for j in jj], params)
 
 print(batch[7])
 print(f"\nSequence pairs: {len(batch)}  ({N_SEQS} sequences, upper triangle)")
@@ -78,10 +77,9 @@ print(f"Threads: {batch.n_threads}")
 
 # ── Pass 1: full alignment + gradient, using thread-owned DP buffers ──────────
 #
-# score_and_grad() runs the full DP (and optionally a banded DP) on every pair
-# in parallel, using one DpBuffer per thread.  The per-pair SeqPair objects store
-# the resulting score, alignment path, and gradient, but their own O(mn) DP tables
-# are never allocated — dp_valid stays False after this call.
+# score_and_grad() runs the full DP on every pair in parallel, using one DP buffer
+# per thread.  The batch keeps each pair's score, alignment path (guide) and
+# gradient — a few hundred bytes per pair — but not the DP tables.
 #
 total_score = batch.score_and_grad()
 print(f"\nSum of {score_label} (full DP, pass 1): {total_score:.3f}")
@@ -98,11 +96,10 @@ batch.set_params(new_params)
 
 # ── Pass 2: banded alignment + gradient under the updated matrix ───────────────
 #
-# score_and_grad(bandwidth=BAND_WIDTH) first runs a full viterbi on each pair to
-# get its guide path, then runs a banded DP of half-width BAND_WIDTH around that
-# path.  Again, all DP work uses per-thread buffers; pair DP tables stay empty.
+# banded_grad(BAND_WIDTH) re-aligns every pair under the new params in a band of
+# half-width BAND_WIDTH around the path pass 1 found — no full DP.
 #
-total_score_banded = batch.score_and_grad(bandwidth=BAND_WIDTH)
+total_score_banded = batch.banded_grad(BAND_WIDTH)
 print(f"\nSum of {score_label} (banded, new params, pass 2): {total_score_banded:.3f}")
 print(f"Delta vs pass 1: {total_score_banded - total_score:+.3f}")
 

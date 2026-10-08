@@ -10,15 +10,20 @@ optimisation: the same set of sequence pairs is aligned repeatedly as the matrix
 changes. Compared to looping over `SeqPair` objects in Python:
 
 1. **Thread-level parallelism** — pairs are distributed across CPU cores via a
-   lock-free work queue.
-2. **Memory efficiency** — `score_and_grad()` allocates one DP buffer per thread
-   (sized to the largest pair) and reuses it across all assigned pairs. Peak
-   memory is `n_threads × max(m×n)`, not `N × max(m×n)`.
-3. **Path reuse** — alignment paths (guide_j) are cached on each `SeqPair`.
-   After `set_params()`, `score_and_grad(bandwidth=bw)` runs a cheap banded DP
-   around the old path rather than a full DP.
+   lock-free work queue, and short pairs are aligned several per vector instruction
+   (`fill="interpair"`, the default).
+2. **Memory efficiency** — a pair costs a few hundred bytes in the batch's own arrays
+   (its encoded sequences, score, alignment path and gradient), and the DP runs on one
+   buffer per thread, reused across pairs: peak DP memory is `n_threads × max(m×n)`,
+   not `N × max(m×n)`.
+3. **Path reuse** — each pair's alignment path (`guide_j`) is cached. After
+   `set_params()`, `banded_grad(bw)` runs a cheap banded DP around the old path
+   rather than a full DP.
 
 ## Basic usage
+
+A batch holds pairs of **one problem type**: one gap model, one alignment mode and
+one gradient mode, given to the constructor.
 
 ```python
 import numpy as np
@@ -34,34 +39,28 @@ params = nwgrad.AlignParams(BLOSUM62,
                             gap_open_a=11.0, gap_extend_a=1.0,
                             gap_open_b=11.0, gap_extend_b=1.0)
 
-# Build SeqPair objects once; they will be reused across iterations.
-pairs = [
-    nwgrad.SeqPair(a, b, params,
-                   gap_model="affine",
-                   mode="global",
-                   grad_mode="soft")
-    for a, b in zip(seqs_a, seqs_b)
-]
-
-batch = nwgrad.SeqPairBatch(n_threads=4)   # 0 = physical core count
-for sp in pairs:
-    batch.add(sp)
+batch = nwgrad.SeqPairBatch(n_threads=4,           # 0 = physical core count
+                            gap_model="affine", mode="global", grad_mode="soft")
+batch.add_many(seqs_a, seqs_b, params)              # encoded once, in parallel
+print(len(batch))                                   # 4
 ```
 
-`batch.add()` keeps each `SeqPair` (and, transitively, its `AlignParams`) alive
-for the lifetime of the batch.
+The batch keeps `params` alive. `add_many()` may be called again to append more pairs,
+with the same or other parameters (over the same alphabet).
 
 ## `score_and_grad()`
 
-The primary batch operation. Aligns all pairs in parallel using per-thread DP
-buffers, then caches the score, gradient, and alignment path on each `SeqPair`.
+The primary batch operation. Aligns all pairs in parallel and caches each pair's score,
+gradient and alignment path.
 
 ```python
 total_log_z = batch.score_and_grad()
 print(f"Sum of log Z: {total_log_z:.3f}")
 
-# Access per-pair results
-for sp in pairs:
+# Per-pair results: as arrays, or one pair at a time
+print(batch.scores())                     # float64 array, pair order
+for i in range(len(batch)):
+    sp = batch[i]                         # a SeqPair view of pair i
     print(f"  score={sp.score:.2f}  grad_valid={sp.grad_valid}")
 
 # Sum gradients across all pairs → AlignParams
@@ -69,38 +68,34 @@ grad = batch.compute_grad()
 print(f"Gradient matrix shape: {grad.matrix.to_matrix().shape}")   # (N, N)
 ```
 
-`compute_grad()` reads the cached per-pair gradients. No DP work is done if all
-pairs already have `grad_valid == True`.
+`compute_grad()` sums the cached per-pair gradients; it runs no DP.
 
 ## Updating the matrix and banded re-alignment
 
 After a gradient step, call `set_params()` on the batch to push the new parameters
-to all pairs at once. The alignment paths are preserved so the next call to
-`score_and_grad(bandwidth=bw)` can use banded DP instead of full DP:
+to all pairs at once. The alignment paths are kept, so `banded_grad(bw)` can re-align
+around them instead of running the full DP again:
 
 ```python
 alphabet  = BLOSUM62.alphabet
 mat_array = BLOSUM62.to_matrix()        # learnable array, in `alphabet` order
 
+batch.score_and_grad()                  # full DP once: every pair gets a path
 for step in range(20):
-    total = batch.score_and_grad(bandwidth=30 if step > 0 else 0)
-    grad  = batch.compute_grad()
-
+    grad = batch.compute_grad()
     mat_array += 0.01 * grad.matrix.to_matrix()   # grad is in the same alphabet order
     params = nwgrad.AlignParams(nwgrad.SubstMatrix(mat_array, alphabet),
                                 gap_open_a=11.0, gap_extend_a=1.0,
                                 gap_open_b=11.0, gap_extend_b=1.0)
     batch.set_params(params)
-
+    total = batch.banded_grad(30)       # banded DP around the previous paths
     print(f"step {step:2d}  total log Z = {total:.2f}")
 ```
 
-On the first iteration `bandwidth=0` forces a full DP (no path exists yet).
-Subsequent iterations use banded DP around the previous alignment path.
-
-The `bandwidth` is the half-width of the band in DP cells. If the true optimal
-path under the new matrix lies outside the band, the score is silently
-sub-optimal. Wider bands are safer but slower.
+The bandwidth is the half-width of the band in DP cells. If the true optimal path
+under the new matrix lies outside the band, the score is silently sub-optimal. Wider
+bands are safer but slower; re-run the full `score_and_grad()` now and then to
+re-centre the paths.
 
 ## Gradient modes
 
@@ -110,24 +105,20 @@ sub-optimal. Wider bands are safer but slower.
 | `"hard"` | Viterbi alignment score | Substitution-pair counts (integer-valued) |
 | `"none"` | Viterbi alignment score | Raises |
 
-Use `"none"` when you only need scores — it skips the traceback/backward pass. It
-does not produce a zero gradient: `compute_grad()` on a `"none"` pair (or on a batch
-containing one) raises, rather than handing back a zero that would quietly cancel
-out of a sum.
+Use `"none"` when you only need scores — it skips the gradient. It does not produce a
+zero gradient: `compute_grad()` on a `"none"` batch raises, rather than handing back a
+zero that would quietly cancel out of a sum.
 
 ## All four alignment modes
 
-`SeqPairBatch` supports all combinations; the mode is fixed per `SeqPair` at
-construction time. You can mix modes in the same batch if needed.
+`SeqPairBatch` supports all combinations of gap model and mode — one per batch. To
+align the same pairs under several, use one batch for each:
 
 ```python
 params_lin = nwgrad.AlignParams(BLOSUM62, gap_extend_a=1.0, gap_extend_b=1.0)
-batch_lin_global = nwgrad.SeqPairBatch(n_threads=4)
-for a, b in zip(seqs_a, seqs_b):
-    batch_lin_global.add(nwgrad.SeqPair(
-        a, b, params_lin,
-        gap_model="linear", mode="global", grad_mode="hard",
-    ))
+batch_lin_global = nwgrad.SeqPairBatch(n_threads=4, gap_model="linear",
+                                       mode="global", grad_mode="hard")
+batch_lin_global.add_many(seqs_a, seqs_b, params_lin)
 
 total = batch_lin_global.score_and_grad()
 grad  = batch_lin_global.compute_grad()
@@ -135,79 +126,71 @@ grad  = batch_lin_global.compute_grad()
 
 ## Thread count and reproducibility
 
-Results agree across thread counts to floating-point rounding, not bit-for-bit.
-Pairs are handed to threads by an atomic counter and the per-thread gradient
-accumulations are merged in whatever order the threads reach the mutex at join, so
-the summation order varies from run to run. Compare with a tolerance:
+Results are bit-for-bit independent of the thread count: every pair is computed the
+same way whichever thread takes it, and the sums (`score_and_grad()`'s total,
+`compute_grad()`, `weighted_grad()`) run in a fixed order.
 
 ```python
-params_orig = nwgrad.AlignParams(BLOSUM62,
-                                  gap_open_a=11.0, gap_extend_a=1.0,
-                                  gap_open_b=11.0, gap_extend_b=1.0)
-ref_total = None
+ref = None
 for n in [1, 2, 4, 8]:
-    b = nwgrad.SeqPairBatch(n_threads=n)
-    for sp in pairs:
-        b.add(sp)
-    # Re-run from a clean state
-    for sp in pairs:
-        sp.set_params(params_orig)
+    b = nwgrad.SeqPairBatch(n_threads=n, gap_model="affine", mode="global",
+                            grad_mode="soft")
+    b.add_many(seqs_a, seqs_b, params)
     total = b.score_and_grad()
-    grad  = b.compute_grad()
-    if ref_total is None:
-        ref_total = total
-    assert abs(total - ref_total) < 1e-10
+    g = b.compute_grad().matrix.to_matrix()
+    if ref is None:
+        ref = (total, g)
+    assert total == ref[0] and np.array_equal(g, ref[1])
 ```
 
 `n_threads=0` (the default) uses the number of physical cores (SMT siblings
-contend in this DP, so the logical count is slower). Thread count is automatically
-clamped to the number of pairs.
-
-If you need a gradient that is bit-for-bit independent of the thread count, read
-the per-pair results back with `batch.scores()` and sum them with
-`batch.weighted_grad(weights)` — it sums in pair order (use `np.ones(len(batch))`
-for a plain sum).
+contend in this DP, so the logical count is slower). The thread count is clamped to
+the amount of work.
 
 ## All-vs-all pairs
 
-Batch input is a flat list — not necessarily same-length lists. To align every
-sequence against every other:
+Batch input is a flat list of pairs. To align every sequence against every other:
 
 ```python
 sequences = ["ACDEFG", "MADEEKLF", "PLEASANTLY", "ACDE", "CDEFGHIKLM"]
+ii, jj = np.triu_indices(len(sequences), k=1)
 
 params_ava = nwgrad.AlignParams(BLOSUM62,
-                                 gap_open_a=11.0, gap_extend_a=1.0,
-                                 gap_open_b=11.0, gap_extend_b=1.0)
-batch = nwgrad.SeqPairBatch(n_threads=4)
-for i in range(len(sequences)):
-    for j in range(i + 1, len(sequences)):
-        batch.add(nwgrad.SeqPair(
-            sequences[i], sequences[j], params_ava,
-            gap_model="affine", mode="global", grad_mode="soft",
-        ))
+                                gap_open_a=11.0, gap_extend_a=1.0,
+                                gap_open_b=11.0, gap_extend_b=1.0)
+batch = nwgrad.SeqPairBatch(n_threads=4, gap_model="affine", mode="global",
+                            grad_mode="soft")
+batch.add_many([sequences[i] for i in ii], [sequences[j] for j in jj], params_ava)
 
 total_log_z = batch.score_and_grad()
 grad = batch.compute_grad()
 ```
 
-## Memory management
+## Reading the alignments
 
-`score_and_grad()` uses per-thread DP buffers and never allocates pair-owned DP
-tables (`dp_valid` remains `False`). The gradient is cached on each `SeqPair`.
-
-If you need pair-owned DP tables (e.g., to call `compute_grad()` after
-`align_full()` / `realign_banded()` individually), call `alloc_dp()` first:
+`score_and_grad()` keeps scores, gradients and paths (`guide_j`), but not the
+alignments themselves. Ask for them with `keep_paths=True` — a few bytes per alignment
+column:
 
 ```python
-batch.alloc_dp()         # allocates O(mn) per pair — can be large
-batch.align_full()
-# compute_grad() on individual pairs is now possible
-batch.compute_grad()     # still works as batch operation
-batch.drop_dp()          # free the pair-owned tables; cached results survive
+batch.score_and_grad(keep_paths=True)
+a_al, b_al = batch[0].aligned()
+print(batch[0].formatted())
+print(batch[0].coordinates())        # Biopython-style, for Bio.Align.Alignment
+batch.drop_paths()                   # free them; scores and gradients stay
 ```
 
-In practice, `score_and_grad()` is preferred because it avoids allocating N
-full DP tables simultaneously.
+## Scoring without keeping the pairs
+
+When you only need the scores and the summed gradient of a set of pairs once — not
+their individual results, and not again — `align()` aligns them without adding them,
+so its memory stays proportional to the thread count:
+
+```python
+result = batch.align(seqs_a, seqs_b, params)
+print(result.scores, result.grad.matrix.to_matrix().sum())
+```
+
+It uses the batch's problem type, gradient mode and settings.
 
 Next: [Tutorial 3 — Gradient-based substitution matrix optimisation](03_matrix_optimization.md)

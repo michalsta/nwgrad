@@ -1,15 +1,26 @@
 # TODO
 
-## Batch-wide walks over SeqPair objects are memory-bound and do not scale
+## Batch-wide walks over SeqPair objects were memory-bound — DONE in the 0.6 restructure
 
 Measured 2026-10-02 on nighthaven, 2.5M Manakov pairs: `set_params()` 56 ms at 12
-threads vs 61 ms at 1; `scores()` 25 vs 33 ms; `weighted_grad()` ~50 ms. perf puts
-the time in the worker loop itself: each pair is a separate ~1 KB heap object, so
-touching a few fields per pair is close to one DRAM miss per pair, and more threads
-do not help. With `fill="interpair"` these walks are ~14% of a DiscrimAlign
-iteration (0.13 of 0.94 s). The fix is structural: keep the hot per-pair state
-(score, validity flags, params pointer, the gradient's counts) in contiguous
-batch-owned arrays, so these become streaming passes.
+threads vs 61 ms at 1; `scores()` 25 vs 33 ms; `weighted_grad()` ~50 ms — one ~1 KB heap
+object per pair, close to one DRAM miss per pair. The 0.6 restructure (branch
+`restructure`, 2026-10-07) did the structural fix proposed here: per-pair state in flat
+batch-owned arrays (`batch_engine.hpp`). Measured with `tools/bench_ab.py` (100k pairs,
+nighthaven, 12 threads): a whole hard training step (set_params + score_and_grad +
+scores + weighted_grad) 0.76x the old time, a banded step 0.62x, resident memory
+385 -> 34 MB. See AGENTS.md "batch_engine.hpp".
+
+## Drop the deprecated 0.5 batch API once DiscrimAlign is ported
+
+Kept at the maintainer's request (2026-10-07) so DiscrimAlign runs unchanged: untyped
+`SeqPairBatch(...)` + `add_many(gap_model=, mode=, grad_mode=)`, and the batch's
+`alloc_dp` / `align_full` / `realign_banded` / `drop_dp` (plus `SeqPair.alloc_dp`).
+DiscrimAlign's call sites: `src/nwgrad_engine.py` 121-126 and 156-169, `src/adaptive.py`
+143-159. Port them to `SeqPairBatch(n, traceback, gap_model=, mode=, grad_mode=)`,
+`add_many(A, B, params)` and `score_and_grad(keep_paths=True)` + `batch[i].coordinates()`,
+check its acceptance fits stay bit-identical, then delete the wrappers, the `kHeld` /
+`hold_grads` machinery that exists only for them, and their tests.
 
 ## Default thread count (`n_threads=0`): physical cores are wrong for short pairs
 

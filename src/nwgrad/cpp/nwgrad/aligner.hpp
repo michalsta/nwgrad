@@ -840,7 +840,7 @@ private:
             // inside the recursion, and the whole point is that no O(m*n) table exists.
             if constexpr (AB == AlignBand::Full)
                 if ((tb_ == TracebackMode::Pointers || is_hirschberg(tb_)) && !uses_rowwise_full()) return;
-            if (buf.VM.size() < sz_) { buf.VM.resize(sz_); buf.VX.resize(sz_); buf.VY.resize(sz_); }
+            for (auto* v : {&buf.VM, &buf.VX, &buf.VY}) if (v->size() < sz_) v->resize(sz_);
         }
     }
 
@@ -1582,11 +1582,10 @@ private:
 
         const std::size_t stride = stride_;   // row-major, matches cell_index()
         const std::size_t dsz    = static_cast<std::size_t>(m_ + 1) * stride;
-        if (buf.DM.size() < dsz) { buf.DM.resize(dsz); buf.DX.resize(dsz); buf.DY.resize(dsz); }
-        if (buf.rM.size() < stride) {
-            buf.rM.resize(stride); buf.rX.resize(stride); buf.rY.resize(stride);
-            buf.qM.resize(stride); buf.qX.resize(stride); buf.qY.resize(stride);
-        }
+        // Per vector, not keyed on DM / rM: viterbi_linear_ptr grows only DM, rM and qM.
+        for (auto* d : {&buf.DM, &buf.DX, &buf.DY}) if (d->size() < dsz) d->resize(dsz);
+        for (auto* r : {&buf.rM, &buf.rX, &buf.rY, &buf.qM, &buf.qX, &buf.qY})
+            if (r->size() < stride) r->resize(stride);
         T* pM = buf.qM.data(); T* pX = buf.qX.data(); T* pY = buf.qY.data();  // row i-1
         T* cM = buf.rM.data(); T* cX = buf.rX.data(); T* cY = buf.rY.data();  // row i
         unsigned char* dM = buf.DM.data();
@@ -3304,7 +3303,7 @@ private:
         }
         if (weight_bad(J.ea) || weight_bad(J.eb)) return false;
         if constexpr (lin) { if (buf.F.size() < sz_) buf.F.resize(sz_); }
-        else if (buf.FM.size() < sz_) { buf.FM.resize(sz_); buf.FX.resize(sz_); buf.FY.resize(sz_); }
+        else for (auto* v : {&buf.FM, &buf.FX, &buf.FY}) if (v->size() < sz_) v->resize(sz_);
         const size_t w = static_cast<size_t>(n_) + 2;
         for (DVec* r : {&buf.sb0, &buf.sb1, &buf.sb2, &buf.sb3, &buf.sb4, &buf.sb5})
             if (r->size() < w) r->resize(w);

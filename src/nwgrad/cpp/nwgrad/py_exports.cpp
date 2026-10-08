@@ -6,16 +6,16 @@
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/string_view.h>
 #include <nanobind/stl/vector.h>
+#include <nanobind/stl/optional.h>
 
 #include <algorithm>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "align_params.hpp"
 #include "aligner.hpp"
-#include "batch.hpp"
-#include "seq_pair.hpp"
 #include "seq_pair_batch.hpp"
 
 namespace nb = nanobind;
@@ -102,24 +102,10 @@ static void keep_current_params(nb::object owner, nb::object params) {
     owner.attr("_params") = params;
 }
 
-// `nurse` keeps `patient` alive, through nanobind's own keep-alive table: a C++ hash
-// map, not a Python container, so it adds nothing for the cyclic GC to walk.  That
-// is the point.  Pinning via an attribute instead created a __dict__ and a list per
-// pair, and on 3.14's GC that cost ~3 us per first add() (707 -> 3575 ns, 200k
-// pairs; ~2.5 us of it was the GC re-walking those containers).  The table is
-// invisible to the GC, so only use it where the patient can never reach back to the
-// nurse.  NB_CALL(keep_alive_py) is the entry nanobind's own keep_alive<> call policy
-// uses; it needs nanobind >= 3.0, which pyproject.toml and CMakeLists.txt enforce.
-static void pin(nb::handle nurse, nb::handle patient) {
-    NB_CALL(keep_alive_py)(NB_CTX, nurse.ptr(), patient.ptr());
-}
-
 // The list stored in obj.<name>, created empty on first use.  Looked up in the
 // instance __dict__ rather than with nb::hasattr, which raises and discards an
-// AttributeError on every miss.  (Not a measurable win here — the first-add cost
-// it was suspected of turned out to be the GC — just the direct way to ask.)
-// `name` must be a string literal: its interned str is created once per call site
-// and deliberately never released (a handful of immortal attribute names).
+// AttributeError on every miss.  `name` must be a string literal: its interned str is
+// created once per call site and deliberately never released.
 static nb::list attr_list(nb::handle obj, PyObject* key) {
     nb::dict d = nb::borrow<nb::dict>(obj.attr("__dict__"));
     if (PyObject* v = PyDict_GetItemWithError(d.ptr(), key))
@@ -131,22 +117,6 @@ static nb::list attr_list(nb::handle obj, PyObject* key) {
 }
 #define NWGRAD_ATTR_LIST(obj, name) \
     attr_list((obj), [] { static PyObject* k = PyUnicode_InternFromString(name); return k; }())
-
-// A batch's params pin is a one-slot CELL (a list) rather than an attribute, so it can
-// be SHARED with every pair added to the batch.  batch.set_params() re-points all its
-// pairs in C++, including borrowed ones that may outlive the batch; each of those must
-// keep the new params alive, and re-pinning them one by one cost ~570 ns per pair per
-// swap (a Python setattr on a scattered wrapper — measured, 3.5% of a 50x50 DP step).
-// With the cell, set_params() writes one slot and every pair that holds the cell is
-// covered.  Safe because a pair's C++ params were set either by pair.set_params()
-// (pinned in its own _params) or by some batch's set_params() (pinned in that batch's
-// cell, which the pair holds from add() on).  The cost is mild over-retention: a pair
-// keeps alive the LAST params of each batch it was ever added to.
-static nb::list batch_params_cell(nb::handle batch) {
-    nb::list cell = NWGRAD_ATTR_LIST(batch, "_params_cell");
-    if (cell.size() == 0) cell.append(nb::none());
-    return cell;
-}
 
 static GapModel parse_gap_model(const std::string& name) {
     if (name == "linear") return GapModel::Linear;
@@ -164,7 +134,6 @@ static AlignMode parse_align_mode(const std::string& name) {
          "\" (expected \"global\" or \"local\")").c_str());
 }
 
-// BatchAligner and SeqPair use separate gradient-mode enum types.
 template<class Mode>
 static Mode parse_grad_mode(const std::string& name) {
     if (name == "hard") return Mode::Hard;
@@ -338,91 +307,20 @@ static void bind_convenience(nb::module_& m, const std::string& sfx) {
 #undef NWG_CONV_ARGS
 }
 
-template<class T>
-static void bind_batch_aligner(nb::module_& m, const char* name) {
-    using BA = BatchAlignerT<T>;
-    nb::class_<BA>(m, name)
-        .def(
-            "__init__",
-            [](BA* self, const AlignParams& params, int band,
-               const std::string& gap_model, const std::string& mode,
-               const std::string& grad_mode, int n_threads, const std::string& kernel) {
-                const GapModel gm = parse_gap_model(gap_model);
-                const AlignMode am = parse_align_mode(mode);
-                const auto gd = parse_grad_mode<typename BA::GradMode>(grad_mode);
-                new (self) BA(params, band, gm, am, gd, n_threads, parse_backend(kernel));
-            },
-            nb::arg("params"), nb::arg("band") = 0, nb::arg("gap_model") = "affine",
-            nb::arg("mode") = "global", nb::arg("grad_mode") = "hard",
-            nb::arg("n_threads") = 1, nb::arg("kernel") = "auto",
-            "Create a BatchAligner.\n"
-            "  gap_model : \"linear\" | \"affine\"\n"
-            "  mode      : \"global\" | \"local\"\n"
-            "  grad_mode : \"hard\" | \"soft\" | \"none\"\n"
-            "  band      : 0 = full DP; >0 = banded half-width\n"
-            "  kernel    : \"auto\" (default) | \"scalar_fallback\" | \"sse2\" | \"avx2\" |\n"
-            "              \"avx512\" | \"neon\" — bit-exact Viterbi backends; a speed knob.")
-        .def_prop_rw(
-            "soft_impl",
-            [](const BA& s) { return soft_impl_name(s.soft_impl); },
-            [](BA& s, const std::string& v) { s.soft_impl = parse_soft_impl(v); },
-            NWGRAD_SOFT_IMPL_DOC)
-        .def_prop_rw(
-            "soft_temperature",
-            [](const BA& s) { return s.soft_temperature; },
-            [](BA& s, double v) {
-                if (!(v > 0.0 && v <= std::numeric_limits<double>::max()))
-                    throw nb::value_error("nwgrad: soft_temperature must be finite and > 0");
-                s.soft_temperature = v;
-            },
-            NWGRAD_SOFT_TEMP_DOC)
-        .def_prop_rw(
-            "fill",
-            [](const BA& s) { return std::string(s.inter_fill ? "interpair" : "striped"); },
-            [](BA& s, const std::string& v) {
-                if (v == "striped") s.inter_fill = false;
-                else if (v == "interpair") s.inter_fill = true;
-                else throw nb::value_error(("nwgrad: unknown fill \"" + v +
-                                            "\" (expected \"striped\" or \"interpair\")").c_str());
-            },
-            "\"interpair\" (default) | \"striped\": as SeqPairBatch.fill — align() runs\n"
-            "several problems at once, one per vector lane (DNA/RNA-sized alphabets, <= 8\n"
-            "letters; hard, none and soft grad modes; full DP, and banded for affine\n"
-            "Viterbi).  Problems it cannot take run their own path.  Scores and hard\n"
-            "gradients are bit-identical either way; soft results tolerance-equal.")
-        .def(
-            "align",
-            [](const BA& self,
-               const std::vector<std::string>& seqs_a,
-               const std::vector<std::string>& seqs_b,
-               const std::vector<std::string>& aligned_a,
-               const std::vector<std::string>& aligned_b) -> BatchResult {
-                if (seqs_a.size() != seqs_b.size())
-                    throw std::invalid_argument(
-                        "sequences_a and sequences_b must have the same length");
-                const bool has_guide = !aligned_a.empty();
-                if (has_guide) {
-                    if (aligned_a.size() != seqs_a.size() || aligned_b.size() != seqs_a.size())
-                        throw std::invalid_argument(
-                            "aligned_a and aligned_b must have the same length as sequences");
-                }
-                const size_t N = seqs_a.size();
-                std::vector<ProblemInstance> problems;
-                problems.reserve(N);
-                for (size_t k = 0; k < N; ++k) {
-                    ProblemInstance pi{seqs_a[k], seqs_b[k], {}};
-                    if (has_guide)
-                        pi.guide_j = guide_j_from_aligned(aligned_a[k], aligned_b[k]);
-                    problems.push_back(std::move(pi));
-                }
-                return self.align(problems);
-            },
-            nb::arg("sequences_a"), nb::arg("sequences_b"),
-            nb::arg("aligned_a") = std::vector<std::string>{},
-            nb::arg("aligned_b") = std::vector<std::string>{},
-            "Align N sequence pairs.  Returns a BatchResult with .scores and .grad.");
+// A DeprecationWarning at the Python caller (stacklevel 1 = the frame calling us).
+static void deprecated(const char* msg) {
+    if (PyErr_WarnEx(PyExc_DeprecationWarning, msg, 1) != 0) throw nb::python_error();
 }
 
+static nb::object numpy_1d(const std::vector<double>& v) {
+    double* buf = new double[v.size() ? v.size() : 1];
+    std::copy(v.begin(), v.end(), buf);
+    nb::capsule owner(buf, [](void* p) noexcept { delete[] static_cast<double*>(p); });
+    size_t shape[1] = {v.size()};
+    return nb::cast(nb::ndarray<nb::numpy, double>(buf, 1, shape, owner));
+}
+
+// ── SeqPair: a standalone pair, or a view of pair i of a batch ───────────────
 template<class T>
 static void bind_seq_pair(nb::module_& m, const char* name) {
     using SP = SeqPairT<T>;
@@ -433,29 +331,30 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
                const AlignParams& params, const std::string& gap_model,
                const std::string& mode, const std::string& grad_mode,
                const std::string& kernel, const std::string& traceback) {
-                const GapModel gm = parse_gap_model(gap_model);
-                const AlignMode am = parse_align_mode(mode);
-                const auto gd = parse_grad_mode<GradMode>(grad_mode);
-                new (self) SP(seq_a, seq_b, params, gm, am, gd, parse_backend(kernel),
-                              parse_traceback(traceback));
+                new (self) SP(seq_a, seq_b, params, parse_gap_model(gap_model),
+                              parse_align_mode(mode), parse_grad_mode<GradMode>(grad_mode),
+                              parse_backend(kernel), parse_traceback(traceback));
             },
             nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("params"),
             nb::arg("gap_model") = "affine", nb::arg("mode") = "global",
             nb::arg("grad_mode") = "hard", nb::arg("kernel") = "auto",
             nb::arg("traceback") = "auto",
             nb::keep_alive<1, 4>(),
-            "Persistent sequence pair.\n"
+            "One sequence pair, aligned on the calling thread.\n"
             "  gap_model : \"linear\" | \"affine\"\n"
             "  mode      : \"global\" | \"local\"\n"
             "  grad_mode : \"hard\" | \"soft\" | \"none\"\n"
             "  kernel    : \"auto\" (default) | \"scalar_fallback\" | \"sse2\" | \"avx2\" |\n"
             "              \"avx512\" | \"neon\" — bit-exact speed knob (Viterbi path).\n"
             "  traceback : \"auto\" (default) | \"pointers\" | \"scores\" | \"hirschberg\"\n"
-            "              | \"hirschberg_pmax\"\n"
-            "     — see SeqPairBatch.traceback.  \"auto\" = Hirschberg where it applies\n"
-            "     (the prefix-max carry at float32, the exact one at double).")
-        .def("alloc_dp", &SP::alloc_dp,
-             "Pre-allocate own DP tables for the fixed sequences.")
+            "              | \"hirschberg_pmax\" — see SeqPairBatch.\n"
+            "A pair taken from a batch (batch[i]) is a view of that batch's pair i: its\n"
+            "results are the batch's, and its settings (params, fill, soft options,\n"
+            "hb_cutoff) are the batch's too — set them on the batch.")
+        .def("alloc_dp",
+             [](SP&) { deprecated("SeqPair.alloc_dp() does nothing and is deprecated: the DP "
+                                  "runs on a worker buffer, there are no pair tables to allocate"); },
+             "Deprecated no-op (there are no per-pair DP tables to allocate).")
         .def(
             "set_params",
             [](nb::object self_obj, nb::object params_obj) {
@@ -464,20 +363,22 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
                 keep_current_params(self_obj, params_obj);
             },
             nb::arg("params"),
-            "Swap alignment parameters.  Invalidates cached score, gradient and DP\n"
-            "tables (aligned() raises until the next align); guide_j is kept for\n"
-            "realign_banded().")
-        .def("align_full",     &SP::align_full,
-             "Full DP alignment.  Updates score and alignment path; clears gradient cache.")
+            "Swap alignment parameters (a standalone pair; a batch's pair takes the\n"
+            "batch's set_params).  Invalidates the score, gradient and stored path\n"
+            "(aligned() raises until the next align); guide_j is kept for realign_banded().")
+        .def("align_full", &SP::align_full,
+             "Full DP: score, guide and stored path.  The gradient is computed but held:\n"
+             "compute_grad() releases it.")
         .def("realign_banded", &SP::realign_banded, nb::arg("bandwidth"),
-             "Banded DP centred on the current alignment path.")
-        .def("compute_grad",   &SP::compute_grad,
-             "Compute and cache the gradient from the current alignment.")
+             "Banded DP centred on the current guide path, under the current params.")
+        .def("compute_grad", &SP::compute_grad,
+             "Release the gradient of the last align_full() / realign_banded().")
         .def("score_and_grad", &SP::score_and_grad,
-             "Allocate DP, align, and compute the gradient in one call.\n"
-             "Returns (score, AlignParams grad).  Raises if grad_mode is \"none\".")
+             "align_full() then compute_grad().  Returns (score, AlignParams grad).\n"
+             "Raises if grad_mode is \"none\".")
         .def("drop_dp", &SP::drop_dp,
-             "Free DP table memory.  Cached score, gradient, and guide_j remain valid.")
+             "Free the stored path (aligned() raises until the next align).  Score,\n"
+             "released gradient and guide_j remain valid.")
         .def("aligned", &SP::aligned,
              "Return the alignment as a pair of gapped strings (seq_a, seq_b).")
         .def(
@@ -518,13 +419,12 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
                 if (!self.grad_valid()) return nb::none();
                 return nb::cast(self.grad());
             },
-            nb::rv_policy::copy,
             "Gradient as an AlignParams object, or None if not computed.")
         .def_prop_ro(
             "guide_j",
             [](SP& self) -> nb::object {
                 if (!self.path_valid()) return nb::none();
-                return nb::cast(std::vector<int>(self.guide_j()));
+                return nb::cast(self.guide_j());
             },
             "Current alignment as a guide_j vector (length m+1), or None.")
         .def_prop_ro("traceback",
@@ -534,14 +434,13 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
         .def_prop_ro("path_valid",  &SP::path_valid)
         .def_prop_ro("score_valid", &SP::score_valid)
         .def_prop_ro("grad_valid",  &SP::grad_valid)
-        .def_prop_ro("dp_valid",    &SP::dp_valid)
+        .def_prop_ro("dp_valid",    &SP::dp_valid,
+                     "Whether a stored path is available (aligned(), coordinates()).")
         .def_prop_rw(
             "hb_cutoff",
             [](const SP& s) { return s.hb_cutoff(); },
             [](SP& s, int v) { s.set_hb_cutoff(v); },
-            "Hirschberg base-case size in rows — see SeqPairBatch.hb_cutoff.  Settable\n"
-            "(unlike traceback) because it changes how the DP divides, not what it\n"
-            "retains, so no allocation decision depends on it.")
+            "Hirschberg base-case size in rows — see SeqPairBatch.hb_cutoff.")
         .def_prop_rw(
             "fill",
             [](const SP& s) { return s.rowwise_full() ? "rowwise" : "striped"; },
@@ -557,22 +456,55 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
             [](const SP& s) { return s.soft_temperature(); },
             [](SP& s, double v) { s.set_soft_temperature(v); },
             NWGRAD_SOFT_TEMP_DOC)
+        .def_prop_ro("gap_model", [](const SP& s) { return gap_model_name(s.gap_model()); })
+        .def_prop_ro("mode",      [](const SP& s) { return align_mode_name(s.align_mode()); })
+        .def_prop_ro("grad_mode", [](const SP& s) { return grad_mode_name(s.grad_mode()); })
         .def_prop_ro("seq_a", [](const SP& s) { return s.seq_a(); })
         .def_prop_ro("seq_b", [](const SP& s) { return s.seq_b(); });
 }
 
+template<class Opt, class Parse>
+static Opt parse_opt(const std::optional<std::string>& v, Parse parse) {
+    if (!v) return std::nullopt;
+    return parse(*v);
+}
+
+// ── SeqPairBatch ─────────────────────────────────────────────────────────────
 template<class T>
 static void bind_seq_pair_batch(nb::module_& m, const char* name) {
     using SPB = SeqPairBatchT<T>;
     using SP  = SeqPairT<T>;
+    using OS  = std::optional<std::string>;
     nb::class_<SPB>(m, name, nb::dynamic_attr())
         .def(
             "__init__",
-            [](SPB* self, int n_threads, const std::string& traceback) {
-                new (self) SPB(n_threads, parse_traceback(traceback));
+            [](SPB* self, int n_threads, const std::string& traceback, const OS& gap_model,
+               const OS& mode, const OS& grad_mode) {
+                const TracebackMode tb = parse_traceback(traceback);
+                if (!gap_model && !mode && !grad_mode) {
+                    deprecated(
+                        "SeqPairBatch() without gap_model, mode and grad_mode is deprecated: "
+                        "a batch holds one problem type, now fixed by the first add_many(); "
+                        "pass them here, e.g. SeqPairBatch(gap_model=\"affine\", mode=\"local\", "
+                        "grad_mode=\"hard\")");
+                    new (self) SPB(n_threads, tb);
+                    return;
+                }
+                new (self) SPB(parse_gap_model(gap_model.value_or("affine")),
+                               parse_align_mode(mode.value_or("global")),
+                               parse_grad_mode<GradMode>(grad_mode.value_or("hard")),
+                               n_threads, tb);
             },
-            nb::arg("n_threads") = 0, nb::arg("traceback") = "auto",
-            "Threaded batch of SeqPair objects.\n"
+            nb::arg("n_threads") = 0, nb::arg("traceback") = "auto", nb::kw_only(),
+            nb::arg("gap_model") = nb::none(), nb::arg("mode") = nb::none(),
+            nb::arg("grad_mode") = nb::none(),
+            "A batch of sequence pairs of ONE problem type, aligned in parallel.\n"
+            "  gap_model : \"affine\" (default) | \"linear\"\n"
+            "  mode      : \"global\" (default) | \"local\"\n"
+            "  grad_mode : \"hard\" (default) | \"soft\" | \"none\"\n"
+            "     — every pair in the batch; naming any of the three fixes the type (the\n"
+            "     others take their defaults).  Naming none is the deprecated form: the\n"
+            "     first add_many() then fixes the type.\n"
             "  n_threads=0 (default) uses the PHYSICAL core count (falling back to\n"
             "  hardware_concurrency): this DP is stall-bound, so SMT siblings\n"
             "  contend and the logical count measured up to 1.44x slower.\n"
@@ -604,110 +536,121 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             "     grows with the column index.  It is the float32 \"auto\" default and\n"
             "     opt-in at double; it stays bit-identical across ISA levels but not\n"
             "     with any other mode.\n"
-            "     Applies to pairs built by add_many().")
-        .def(
-            "add",
-            [](nb::object self_obj, nb::object sp_obj) {
-                SPB& self = nb::cast<SPB&>(self_obj);
-                self.add(nb::cast<SP*>(sp_obj));
-                NWGRAD_ATTR_LIST(self_obj, "_keepalive").append(sp_obj);
-                // Share the batch's params cell with the pair: once this batch's
-                // set_params() re-points the pair, the cell is what keeps those params
-                // alive for it — even after the batch is gone.  See batch_params_cell().
-                // pin(), not an attribute: no per-pair container for the GC, and no
-                // cycle is possible — the cell holds only params, never a pair or batch.
-                pin(sp_obj, batch_params_cell(self_obj));
-            },
-            nb::arg("seq_pair"),
-            "Append a SeqPair to the batch.")
+            "Pairs live in the batch's own arrays (codes, scores, guides, gradients, a few\n"
+            "hundred bytes per pair) and are aligned on per-thread buffers.")
         .def(
             "add_many",
             [](nb::object self_obj,
                const std::vector<std::string_view>& seqs_a,
                const std::vector<std::string_view>& seqs_b,
-               nb::object params_obj,
-               const std::string& gap_model, const std::string& mode,
-               const std::string& grad_mode, const std::string& kernel) {
+               nb::object params_obj, const OS& gap_model, const OS& mode,
+               const OS& grad_mode, const std::string& kernel) {
                 SPB& self = nb::cast<SPB&>(self_obj);
                 const AlignParams& params = nb::cast<const AlignParams&>(params_obj);
-                const GapModel gm = parse_gap_model(gap_model);
-                const AlignMode am = parse_align_mode(mode);
-                const auto gd = parse_grad_mode<GradMode>(grad_mode);
-                int  kn = parse_backend(kernel);
+                // Parse first: a bad name is reported as such, whatever the batch's state.
+                auto gm = parse_opt<std::optional<GapModel>>(gap_model, parse_gap_model);
+                auto am = parse_opt<std::optional<AlignMode>>(mode, parse_align_mode);
+                auto gd = parse_opt<std::optional<GradMode>>(grad_mode, parse_grad_mode<GradMode>);
+                const int kn = parse_backend(kernel);
+                if (gap_model || mode || grad_mode)
+                    deprecated(
+                        "add_many(gap_model=..., mode=..., grad_mode=...) is deprecated: a batch "
+                        "holds one problem type; pass them to the SeqPairBatch constructor");
+                if (!self.typed()) {
+                    // The pre-0.6 add_many() defaults, for an untyped (deprecated) batch.
+                    if (!gm) gm = GapModel::Affine;
+                    if (!am) am = AlignMode::Global;
+                    if (!gd) gd = GradMode::Hard;
+                }
                 self.add_many(seqs_a, seqs_b, params, gm, am, gd, kn);
                 NWGRAD_ATTR_LIST(self_obj, "_owned_params").append(params_obj);
             },
             nb::arg("seqs_a"), nb::arg("seqs_b"), nb::arg("params"),
-            nb::arg("gap_model") = "affine", nb::arg("mode") = "global",
-            nb::arg("grad_mode") = "hard", nb::arg("kernel") = "auto",
-            "Bulk-construct N SeqPairs in C++ and append them to the batch.\n"
-            "Per-pair results remain available via batch[i].score / .grad / .aligned().")
+            nb::arg("gap_model") = nb::none(), nb::arg("mode") = nb::none(),
+            nb::arg("grad_mode") = nb::none(), nb::arg("kernel") = "auto",
+            "Append the pairs (seqs_a[i], seqs_b[i]) under `params` (one segment: params\n"
+            "may differ between add_many() calls; set_params() replaces them all).\n"
+            "Sequences are validated and encoded in parallel; a bad character raises and\n"
+            "adds nothing.  gap_model / mode / grad_mode: deprecated (the type is the\n"
+            "batch's); if given they must match it.")
         .def("__len__", &SPB::size)
         .def(
             "__getitem__",
-            [](nb::object self_obj, int i) -> nb::object {
+            [](nb::object self_obj, long i) -> nb::object {
                 SPB& self = nb::cast<SPB&>(self_obj);
-                if (i < 0) i += static_cast<int>(self.size());
-                if (i < 0 || static_cast<size_t>(i) >= self.size())
-                    throw nb::index_error("SeqPairBatch index out of range");
-                SP& sp = self[static_cast<size_t>(i)];
-                // A pair with a live wrapper is returned as is: either Python built it
-                // (add() holds it in _keepalive, so its wrapper cannot have died) or it
-                // was indexed before and that wrapper already pins its owner.
-                nb::handle existing = nb::find(sp);
-                if (existing.is_valid())
-                    return nb::borrow(existing);
-                // No wrapper, so add_many() built it and THIS batch owns it: the
-                // wrapper must keep the batch alive, or it dangles once the batch dies.
-                // Pinned through a __dict__ attribute rather than keep_alive or
-                // rv_policy::reference_internal: the cyclic GC can see an attribute,
-                // so a cycle (b1.add(b2[0]) with b2.add(b1[0])) is collectable instead
-                // of leaking both batches through nanobind's keep-alive table.  And
-                // only owned pairs get it: pinning a borrowed pair's wrapper to the
-                // batch would close a cycle on every add() + index.
-                nb::object w = nb::cast(&sp, nb::rv_policy::reference);
-                w.attr("_owner") = self_obj;
+                const long n = static_cast<long>(self.size());
+                if (i < 0) i += n;
+                if (i < 0 || i >= n) throw nb::index_error("SeqPairBatch index out of range");
+                nb::object w = nb::cast(SP(self, static_cast<size_t>(i)));
+                w.attr("_owner") = self_obj;   // the view keeps its batch alive
                 return w;
             },
-            nb::arg("i"))
-        .def("alloc_dp", [](SPB& self) { self.alloc_dp(); },
-             "Pre-allocate own DP tables on all pairs in parallel.")
+            nb::arg("i"),
+            "Pair i as a SeqPair view (score, grad, guide_j, aligned(), ...).")
         .def(
             "set_params",
             [](nb::object self_obj, nb::object params_obj) {
-                SPB& self = nb::cast<SPB&>(self_obj);
-                self.set_params(nb::cast<const AlignParams&>(params_obj));
-                // One slot, shared by the batch and every pair it borrowed: O(1)
-                // however many pairs, superseded params released at once.  It used
-                // to pin only the batch, so a borrowed pair outliving the batch
-                // pointed at freed params.  See batch_params_cell().
-                batch_params_cell(self_obj)[0] = params_obj;
+                nb::cast<SPB&>(self_obj).set_params(nb::cast<const AlignParams&>(params_obj));
+                keep_current_params(self_obj, params_obj);
             },
             nb::arg("params"),
-            "Set alignment parameters on all pairs (clears score and grad caches).")
-        .def("align_full", [](SPB& self) { return self.align_full(); },
-             "Full DP alignment of all pairs in parallel.  Returns sum of scores.")
-        .def("realign_banded",
-             [](SPB& self, int bandwidth) { return self.realign_banded(bandwidth); },
-             nb::arg("bandwidth"),
-             "Banded realignment of all pairs in parallel.  Returns sum of scores.")
+            "Set the params of every pair (one alphabet).  Clears the cached scores,\n"
+            "gradients and stored paths; guides stay, for banded_grad().")
+        .def(
+            "score_and_grad",
+            [](SPB& self, bool keep_paths) { return self.score_and_grad(keep_paths); },
+            nb::arg("keep_paths") = false,
+            "Full DP on every pair: score, guide and (unless grad_mode \"none\") gradient,\n"
+            "cached per pair.  keep_paths=True also stores each alignment path\n"
+            "(batch[i].aligned() / .coordinates(); a few bytes per column).  Returns the\n"
+            "sum of scores, in pair order.")
+        .def(
+            "banded_grad",
+            [](SPB& self, int bandwidth, bool keep_paths) {
+                return self.banded_grad(bandwidth, keep_paths);
+            },
+            nb::arg("bandwidth"), nb::arg("keep_paths") = false,
+            "Banded re-align + gradient around each pair's cached guide path: run\n"
+            "score_and_grad() once, then set_params() + banded_grad(bw) after each update;\n"
+            "no full DP is run.  Returns the sum of scores.")
+        .def(
+            "align",
+            [](const SPB& self, const std::vector<std::string_view>& seqs_a,
+               const std::vector<std::string_view>& seqs_b, const AlignParams& params, int band,
+               const std::vector<std::string>& aligned_a, const std::vector<std::string>& aligned_b,
+               const std::string& kernel) {
+                if (seqs_a.size() != seqs_b.size())
+                    throw nb::value_error("nwgrad: align() needs seqs_a and seqs_b of equal length");
+                const bool guides = !aligned_a.empty() || !aligned_b.empty();
+                if (guides && (aligned_a.size() != seqs_a.size() || aligned_b.size() != seqs_a.size()))
+                    throw nb::value_error("nwgrad: aligned_a / aligned_b need one entry per pair");
+                std::vector<ProblemInstance> problems(seqs_a.size());
+                for (size_t i = 0; i < seqs_a.size(); ++i) {
+                    problems[i].seq_a = seqs_a[i];
+                    problems[i].seq_b = seqs_b[i];
+                    // Straight through guide_j_from_aligned, which validates the two
+                    // strings (as BatchAligner.align did); make_guide would read an empty
+                    // string as "no guide" and silently band around the diagonal.
+                    if (guides) problems[i].guide_j = guide_j_from_aligned(aligned_a[i], aligned_b[i]);
+                }
+                return self.align(problems, params, band, parse_backend(kernel));
+            },
+            nb::arg("seqs_a"), nb::arg("seqs_b"), nb::arg("params"), nb::arg("band") = 0,
+            nb::arg("aligned_a") = std::vector<std::string>{},
+            nb::arg("aligned_b") = std::vector<std::string>{}, nb::arg("kernel") = "auto",
+            "Align (seqs_a[i], seqs_b[i]) under `params` WITHOUT adding them to the batch\n"
+            "(what BatchAligner was): returns a BatchResult (scores, gradient summed over\n"
+            "the pairs), storing nothing per pair, so memory stays O(threads).  Uses the\n"
+            "batch's problem type, grad mode, threads and settings.  band > 0 bands every\n"
+            "pair (aligned_a / aligned_b, one gapped string per pair, give the guides; the\n"
+            "diagonal otherwise).  Soft: forward-backward only.")
         .def("compute_grad", [](SPB& self) { return self.compute_grad(); },
              nb::rv_policy::move,
-             "Compute gradient on all pairs in parallel.  Returns summed AlignParams.")
-        .def("score_and_grad", [](SPB& self) { return self.score_and_grad(); },
-             "Full-DP batch op using per-thread DP buffers.  Returns sum of scores.")
-        .def(
-            "scores",
-            [](const SPB& self) {
-                std::vector<double> v = self.scores();
-                double* buf = new double[v.size()];
-                std::copy(v.begin(), v.end(), buf);
-                nb::capsule owner(buf, [](void* p) noexcept { delete[] static_cast<double*>(p); });
-                size_t shape[1] = {v.size()};
-                return nb::ndarray<nb::numpy, double>(buf, 1, shape, owner);
-            },
-            "The pairs' cached scores as a float64 array, in pair order.  Runs no\n"
-            "alignment; raises if any pair has no valid score.")
+             "The gradient summed over all pairs (cached; no DP).  Summed in fixed blocks\n"
+             "of pairs, so it is bit-reproducible whatever n_threads.")
+        .def("scores", [](const SPB& self) { return numpy_1d(self.scores()); },
+             "The pairs' cached scores as a float64 array, in pair order.  Runs no\n"
+             "alignment; raises if any pair has no valid score.")
         .def(
             "weighted_grad",
             [](const SPB& self,
@@ -716,20 +659,19 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             },
             nb::arg("weights"), nb::rv_policy::move,
             "sum_i weights[i] * grad_i over the pairs' CACHED gradients, as one\n"
-            "AlignParams.  Runs no alignment: call score_and_grad() (or compute_grad())\n"
-            "first, derive the weights from scores() if they depend on them, then call\n"
-            "this.  Summed in fixed blocks of pairs (in parallel), then over the\n"
-            "blocks in order, so the result does not depend on n_threads.\n"
-            "Raises on an empty batch, on len(weights) != len(batch), and on a pair\n"
-            "without a valid gradient.")
+            "AlignParams.  Runs no alignment: call score_and_grad() first, derive the\n"
+            "weights from scores() if they depend on them, then call this.  Summed in\n"
+            "fixed blocks of pairs (in parallel), then over the blocks in order, so the\n"
+            "result does not depend on n_threads.  Raises on an empty batch, on\n"
+            "len(weights) != len(batch), and on a pair without a valid gradient.")
         .def(
             "grads",
             [](const SPB& self) {
                 const size_t N = self.size();
                 const size_t n = static_cast<size_t>(self.alphabet().size());   // throws if empty
-                double* mats = new double[N * n * n];
+                double* mats = new double[std::max<size_t>(N * n * n, 1)];
                 nb::capsule mats_owner(mats, [](void* p) noexcept { delete[] static_cast<double*>(p); });
-                double* gaps = new double[N * 4];
+                double* gaps = new double[std::max<size_t>(N * 4, 1)];
                 nb::capsule gaps_owner(gaps, [](void* p) noexcept { delete[] static_cast<double*>(p); });
                 self.grads_into(mats, gaps);
                 size_t mats_shape[3] = {N, n, n};
@@ -740,35 +682,64 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             "The pairs' CACHED gradients as two float64 arrays, in pair order:\n"
             "(matrices, gaps).  matrices has shape (N, n, n), rows and columns in the\n"
             "order of the batch's alphabet; gaps has shape (N, 4), with columns\n"
-            "gap_open_a, gap_extend_a, gap_open_b, gap_extend_b.  The same numbers as\n"
-            "batch[i].grad, without one AlignParams object per pair.  Runs no\n"
-            "alignment: call score_and_grad() (or compute_grad()) first.  Raises on an\n"
-            "empty batch and on a pair without a valid gradient.")
+            "gap_open_a, gap_extend_a, gap_open_b, gap_extend_b.  Runs no alignment.\n"
+            "Raises on an empty batch and on a pair without a valid gradient.")
+        .def("drop_paths", &SPB::drop_paths,
+             "Free the stored alignment paths (score_and_grad(keep_paths=True)).")
         .def_prop_ro(
             "alphabet",
             [](const SPB& self) { return self.alphabet().symbols(); },
             "The symbols of the alphabet every pair in the batch shares.  Raises on an\n"
             "empty batch.")
-        .def("banded_grad",
-             [](SPB& self, int bandwidth) { return self.banded_grad(bandwidth); },
+        .def_prop_ro("gap_model",
+                     [](const SPB& s) -> nb::object {
+                         return s.typed() ? nb::cast(gap_model_name(s.gap_model())) : nb::none(); },
+                     "The batch's gap model (None until a deprecated untyped batch gets pairs).")
+        .def_prop_ro("mode",
+                     [](const SPB& s) -> nb::object {
+                         return s.typed() ? nb::cast(align_mode_name(s.align_mode())) : nb::none(); },
+                     "The batch's alignment mode (None while untyped).")
+        .def_prop_ro("grad_mode",
+                     [](const SPB& s) -> nb::object {
+                         return s.typed() ? nb::cast(grad_mode_name(s.grad_mode())) : nb::none(); },
+                     "The batch's grad mode (None while untyped).")
+        // ── Deprecated: the pair-owned-table API (kept for DiscrimAlign; see TODO.md) ──
+        .def("alloc_dp",
+             [](SPB&) { deprecated("SeqPairBatch.alloc_dp() does nothing and is deprecated"); },
+             "Deprecated no-op.")
+        .def("align_full",
+             [](SPB& self) {
+                 deprecated("SeqPairBatch.align_full() is deprecated: use "
+                            "score_and_grad(keep_paths=True)");
+                 return self.score_and_grad(/*keep_paths=*/true, /*hold_grads=*/true);
+             },
+             "Deprecated: score_and_grad(keep_paths=True), with each gradient held until\n"
+             "compute_grad() (as before).  Returns the sum of scores.")
+        .def("realign_banded",
+             [](SPB& self, int bandwidth) {
+                 deprecated("SeqPairBatch.realign_banded() is deprecated: use "
+                            "banded_grad(bandwidth, keep_paths=True)");
+                 return self.banded_grad(bandwidth, /*keep_paths=*/true, /*hold_grads=*/true);
+             },
              nb::arg("bandwidth"),
-             "Banded re-align + grad around each pair's cached guide path, using\n"
-             "per-thread DP buffers.  Run score_and_grad() once to establish guides,\n"
-             "then set_params() + banded_grad(bw) after each matrix update; no full\n"
-             "DP is run.  Returns sum of scores.  Uses its own LPT scheduler.")
-        .def("drop_dp", [](SPB& self) { self.drop_dp(); },
-             "Drop DP tables on all pairs in parallel.")
+             "Deprecated: banded_grad(bandwidth, keep_paths=True), gradients held.")
+        .def("drop_dp",
+             [](SPB& self) {
+                 deprecated("SeqPairBatch.drop_dp() is deprecated: use drop_paths()");
+                 self.drop_paths();
+             },
+             "Deprecated: drop_paths().")
         .def_prop_rw(
             "schedule",
-            [](const SPB& s) { return s.sorted_schedule ? "sorted" : "dynamic"; },
+            [](const SPB& s) { return s.sorted_schedule() ? "sorted" : "dynamic"; },
             [](SPB& s, const std::string& v) {
-                if      (v == "dynamic") s.sorted_schedule = false;
-                else if (v == "sorted")  s.sorted_schedule = true;
+                if      (v == "dynamic") s.set_sorted_schedule(false);
+                else if (v == "sorted")  s.set_sorted_schedule(true);
                 else throw nb::value_error(
                     ("nwgrad: unknown schedule \"" + v +
                      "\" (expected \"dynamic\" or \"sorted\")").c_str());
             },
-            "Work-scheduling policy for score_and_grad().\n"
+            "Work-scheduling policy for score_and_grad() when fill is not \"interpair\".\n"
             "  \"dynamic\" (default): one atomic counter, tasks in insertion order.\n"
             "  \"sorted\": length-sorted equal-work chunks, one per thread, with a\n"
             "     reserve of the smallest tasks for threads that finish early.\n"
@@ -777,13 +748,11 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
         .def_prop_rw(
             "fill",
             [](const SPB& s) {
-                return s.inter_fill ? "interpair" : s.rowwise_full ? "rowwise" : "striped";
+                return s.inter_fill() ? "interpair" : s.rowwise_full() ? "rowwise" : "striped";
             },
             [](SPB& s, const std::string& v) {
                 const auto [rowwise, inter] = parse_batch_fill(v);
-                s.rowwise_full = rowwise;
-                s.inter_fill = inter;
-                for (auto* sp : s.pairs) sp->set_rowwise_full(s.rowwise_full);
+                s.set_fill(rowwise, inter);
             },
             "How score_and_grad() and banded_grad() fill the DP.\n"
             "  \"interpair\" (default): several pairs at once, one per vector lane (W = 4\n"
@@ -801,31 +770,21 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             "  \"rowwise\": as striped, but the full affine double fill is the row-wise\n"
             "     kernel (no lazy-F fixpoint; faster on short pairs than striped).\n"
             "Scores, paths and hard gradients are bit-identical whichever fill runs; soft\n"
-            "results are tolerance-equal (the soft path is never bit-exact).  Other batch\n"
-            "operations (align_full, realign_banded) use the pairs' own fill.  Applies to\n"
-            "the pairs in the batch and to later add_many() ones.")
+            "results are tolerance-equal (the soft path is never bit-exact).\n"            "Applies to every pair in the batch.")
         .def_prop_rw(
             "soft_impl",
-            [](const SPB& s) { return soft_impl_name(s.soft_impl); },
-            [](SPB& s, const std::string& v) {
-                s.soft_impl = parse_soft_impl(v);
-                for (auto* sp : s.pairs) sp->set_soft_impl(s.soft_impl);
-            },
-            NWGRAD_SOFT_IMPL_DOC "\nApplies to the pairs in the batch and to later add_many() ones.")
+            [](const SPB& s) { return soft_impl_name(s.soft_impl()); },
+            [](SPB& s, const std::string& v) { s.set_soft_impl(parse_soft_impl(v)); },
+            NWGRAD_SOFT_IMPL_DOC "\nApplies to every pair in the batch.")
         .def_prop_rw(
             "soft_temperature",
-            [](const SPB& s) { return s.soft_temperature; },
-            [](SPB& s, double v) {
-                if (!(v > 0.0 && v <= std::numeric_limits<double>::max()))
-                    throw nb::value_error("nwgrad: soft_temperature must be finite and > 0");
-                s.soft_temperature = v;
-                for (auto* sp : s.pairs) sp->set_soft_temperature(v);
-            },
-            NWGRAD_SOFT_TEMP_DOC "\nApplies to the pairs in the batch and to later add_many() ones.")
+            [](const SPB& s) { return s.soft_temperature(); },
+            [](SPB& s, double v) { s.set_soft_temperature(v); },
+            NWGRAD_SOFT_TEMP_DOC "\nApplies to every pair in the batch.")
         .def_prop_rw(
             "soft_guide",
             [](const SPB& s) {
-                return s.soft_guide_lazy ? "lazy" : s.soft_guide_posterior ? "posterior" : "eager";
+                return s.soft_guide_lazy() ? "lazy" : s.soft_guide_posterior() ? "posterior" : "eager";
             },
             [](SPB& s, const std::string& v) {
                 bool lazy = false, post = false;
@@ -834,9 +793,7 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
                 else if (v == "posterior") post = true;
                 else throw nb::value_error(("nwgrad: unknown soft_guide \"" + v +
                                             "\" (expected \"eager\", \"lazy\" or \"posterior\")").c_str());
-                s.soft_guide_lazy = lazy;
-                s.soft_guide_posterior = post;
-                for (auto* sp : s.pairs) { sp->set_soft_guide_lazy(lazy); sp->set_soft_guide_posterior(post); }
+                s.set_soft_guide(lazy, post);
             },
             "When soft pairs compute their guide path (the Viterbi alignment that\n"
             "realign_banded()/banded_grad() band around).\n"
@@ -851,16 +808,13 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             "     itself — per row of A the column of greatest posterior mass, made\n"
             "     non-decreasing — under the params scored.  A band centre at no Viterbi\n"
             "     cost, but the posterior's centre line, not the Viterbi path.\n"
-            "Applies to the pairs in the batch and later add_many() ones.")
+            "Applies to every pair in the batch.")
         .def_prop_rw(
             "hb_cutoff",
-            [](const SPB& s) { return s.hb_cutoff; },
-            [](SPB& s, int v) {
-                if (v < 1) throw nb::value_error("nwgrad: hb_cutoff must be >= 1");
-                s.hb_cutoff = v;
-            },
+            [](const SPB& s) { return s.hb_cutoff(); },
+            [](SPB& s, int v) { s.set_hb_cutoff(v); },
             "Rows per block at which Hirschberg stops splitting and solves the block\n"
-            "outright with the (vectorized) pointers fill.  Applied by add_many(); ignored\n"
+            "outright with the (vectorized) pointers fill.  Applies to every pair; ignored\n"
             "unless the traceback resolves to Hirschberg.  Default 512.\n"
             "\n"
             "This is a THREE-way trade, not just a speed knob:\n"
@@ -878,38 +832,39 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             "512 from a fleet sweep (sse2/avx2/avx512/neon, len 500-8000) with the base\n"
             "case vectorized: pairs <= 512 run at full pointer speed and bit-exact,\n"
             "longer pairs win 1.4-2.7x at high thread counts.")
-        .def_prop_rw(
-            "reserve_frac",
-            [](const SPB& s) { return s.reserve_frac; },
-            [](SPB& s, double v) { s.reserve_frac = v; },
-            "Fraction of total work held back as filler for early-finishing\n"
-            "threads under schedule=\"sorted\".  Default 0.0 (no reserve): a\n"
-            "300-arm sweep over 4 machines found no reserve was fastest on\n"
-            "tailed length distributions and immaterial on flat ones.  Raise it\n"
-            "only if your workload behaves unlike either.")
-        .def_rw("long_cost_ratio", &SPB::long_cost_ratio,
+        .def_prop_rw("reserve_frac", [](const SPB& s) { return s.reserve_frac(); },
+                     [](SPB& s, double v) { s.set_reserve_frac(v); },
+                "Fraction of total work held back as filler for early-finishing\n"
+                "threads under schedule=\"sorted\".  Default 0.0 (no reserve): a\n"
+                "300-arm sweep over 4 machines found no reserve was fastest on\n"
+                "tailed length distributions and immaterial on flat ones.  Raise it\n"
+                "only if your workload behaves unlike either.")
+        .def_prop_rw("long_cost_ratio", [](const SPB& s) { return s.long_cost_ratio(); },
+                     [](SPB& s, double v) { s.set_long_cost_ratio(v); },
                 "schedule=\"sorted\" cost weight: how much more a cell costs once the DP\n"
                 "tables no longer fit cache.  DEFAULT 1.0 = OFF: correcting the\n"
                 "imbalance measured slower (it fixes balance but converts idle\n"
                 "threads into memory contention).  Raise it to move the straggler\n"
                 "toward the short-sequence chunks; expect to pay ~4-6%.")
-        .def_rw("weight_lo", &SPB::weight_lo,
+        .def_prop_rw("weight_lo", [](const SPB& s) { return s.weight_lo(); },
+                     [](SPB& s, double v) { s.set_weight_lo(v); },
                 "Effective length below which cells are unweighted (default 500).")
-        .def_rw("weight_hi", &SPB::weight_hi,
+        .def_prop_rw("weight_hi", [](const SPB& s) { return s.weight_hi(); },
+                     [](SPB& s, double v) { s.set_weight_hi(v); },
                 "Effective length at which the weight saturates (default 1700).")
         .def_prop_ro("traceback",
                      [](const SPB& s) { return traceback_name(s.traceback()); },
                      "The traceback mode the batch was constructed with — \"auto\" (the\n"
-                     "default) is reported as-is, since it resolves per pair (read\n"
-                     "batch[i].traceback for a pair's resolved mode).  See the constructor\n"
-                     "docstring for what each mode retains.")
-        .def_rw("profile", &SPB::profile,
+                     "default) is reported as-is (read batch[i].traceback for the mode it\n"
+                     "resolves to).  See the constructor docstring for what each retains.")
+        .def_prop_rw("profile", [](const SPB& s) { return s.profile(); },
+                     [](SPB& s, bool v) { s.set_profile(v); },
                 "Record per-thread phase timings during schedule=\"sorted\" runs "
                 "(off by default).  Read them back with schedule_profile().")
         .def("schedule_profile",
              [](const SPB& self) {
                  nb::list out;
-                 for (const auto& p : self.profile_out) {
+                 for (const auto& p : self.profile_out()) {
                      nb::dict d;
                      d["chunk_s"]       = p.chunk_s;
                      d["reserve_s"]     = p.reserve_s;
@@ -925,7 +880,7 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
              "Per-thread phase timings from the last sorted-schedule run (needs "
              "profile=True).  One dict per worker: busy seconds, cells and task "
              "counts for the chunk and reserve phases, plus finish time.")
-        .def_prop_ro("n_threads", [](const SPB& s) { return s.n_threads; });
+        .def_prop_ro("n_threads", [](const SPB& s) { return s.n_threads(); });
 }
 
 NB_MODULE(nwgrad_ext, m) {
@@ -1189,10 +1144,6 @@ NB_MODULE(nwgrad_ext, m) {
             [](const BatchResult& self) -> const AlignParams& { return self.grad; },
             nb::rv_policy::reference_internal,
             "Summed gradient over the batch as an AlignParams object.");
-
-    // ── BatchAligner (float32 default) / BatchAlignerDouble ───────────────────
-    bind_batch_aligner<float >(m, "BatchAligner");
-    bind_batch_aligner<double>(m, "BatchAlignerDouble");
 
     // ── SeqPair (float32 default) / SeqPairDouble ─────────────────────────────
     bind_seq_pair<float >(m, "SeqPair");

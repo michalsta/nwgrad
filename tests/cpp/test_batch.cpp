@@ -1,6 +1,6 @@
 #include "catch.hpp"
 #include "align_params.hpp"
-#include "batch.hpp"
+#include "seq_pair_batch.hpp"
 #include <array>
 
 static AlignParams unit_params(double gap_extend = 1.0, double gap_open = 0.0) {
@@ -13,20 +13,28 @@ static AlignParams unit_params(double gap_extend = 1.0, double gap_open = 0.0) {
     return p;
 }
 
-static BatchAligner make_aligner(int n_threads, bool grad = true,
-                                  GapModel gm = GapModel::Linear,
-                                  AlignMode am = AlignMode::Global) {
-    auto gd = grad ? BatchAligner::GradMode::Hard : BatchAligner::GradMode::None;
-    return BatchAligner(unit_params(), /*band=*/0, gm, am, gd, n_threads);
+// What BatchAligner was: SeqPairBatch's streaming align() under fixed params and band.
+struct Stream {
+    SeqPairBatch batch;
+    AlignParams params;
+    int band = 0;
+    BatchResult align(const std::vector<ProblemInstance>& p) { return batch.align(p, params, band); }
+};
+
+static Stream make_aligner(int n_threads, bool grad = true,
+                           GapModel gm = GapModel::Linear,
+                           AlignMode am = AlignMode::Global) {
+    return Stream{SeqPairBatch(gm, am, grad ? GradMode::Hard : GradMode::None, n_threads),
+                  unit_params(), 0};
 }
 
-TEST_CASE("BatchAligner: empty problem list", "[batch]") {
+TEST_CASE("SeqPairBatch::align: empty problem list", "[batch]") {
     auto ba = make_aligner(2);
     auto result = ba.align({});
     REQUIRE(result.scores.empty());
 }
 
-TEST_CASE("BatchAligner: single pair, single thread", "[batch]") {
+TEST_CASE("SeqPairBatch::align: single pair, single thread", "[batch]") {
     auto ba = make_aligner(1);
     std::string a = "ACDE", b = "ACDE";
     std::vector<ProblemInstance> problems{{a, b, {}}};
@@ -36,7 +44,7 @@ TEST_CASE("BatchAligner: single pair, single thread", "[batch]") {
     REQUIRE(result.scores[0] == Approx(4.0));
 }
 
-TEST_CASE("BatchAligner: gradient matches GradAligner single-threaded", "[batch]") {
+TEST_CASE("SeqPairBatch::align: gradient matches GradAligner single-threaded", "[batch]") {
     auto ba = make_aligner(1, /*grad=*/true);
     std::string a = "ACDE", b = "ACDE";
     std::vector<ProblemInstance> problems{{a, b, {}}};
@@ -48,7 +56,7 @@ TEST_CASE("BatchAligner: gradient matches GradAligner single-threaded", "[batch]
     REQUIRE(result.grad.matrix.at(Alphabet::protein().index_of('E'), Alphabet::protein().index_of('E')) == Approx(1.0));
 }
 
-TEST_CASE("BatchAligner: multi-thread scores match single-thread", "[batch]") {
+TEST_CASE("SeqPairBatch::align: multi-thread scores match single-thread", "[batch]") {
     std::vector<std::string> seqs_a = {"ACDE", "ADE", "MMMADE", "A", "ACDEFGHIK"};
     std::vector<std::string> seqs_b = {"ACDE", "ACDE", "ADE",   "",  "ACDEFGHIK"};
 
@@ -67,7 +75,7 @@ TEST_CASE("BatchAligner: multi-thread scores match single-thread", "[batch]") {
         REQUIRE(r1.scores[i] == Approx(r2.scores[i]));
 }
 
-TEST_CASE("BatchAligner: multi-thread gradient matches single-thread", "[batch]") {
+TEST_CASE("SeqPairBatch::align: multi-thread gradient matches single-thread", "[batch]") {
     std::vector<std::string> seqs_a = {"ACDE", "ADE", "A"};
     std::vector<std::string> seqs_b = {"ACDE", "ADE", "A"};
     std::vector<ProblemInstance> problems;
@@ -85,7 +93,7 @@ TEST_CASE("BatchAligner: multi-thread gradient matches single-thread", "[batch]"
             REQUIRE(r1.grad.matrix.at(i, j) == Approx(r2.grad.matrix.at(i, j)));
 }
 
-TEST_CASE("BatchAligner: no gradient mode skips accumulation", "[batch]") {
+TEST_CASE("SeqPairBatch::align: no gradient mode skips accumulation", "[batch]") {
     auto ba = make_aligner(2, /*grad=*/false);
     std::string a = "ACDE", b = "ACDE";
     std::vector<ProblemInstance> problems{{a, b, {}}};
@@ -99,7 +107,7 @@ TEST_CASE("BatchAligner: no gradient mode skips accumulation", "[batch]") {
     REQUIRE(total == Approx(0.0));
 }
 
-TEST_CASE("BatchAligner: mixed guided/unguided problems throw when band == 0", "[batch]") {
+TEST_CASE("SeqPairBatch::align: mixed guided/unguided problems throw when band == 0", "[batch]") {
     auto ba = make_aligner(2);
     std::vector<ProblemInstance> problems{
         {"ACDE", "ACDE", {}},                                    // unguided
@@ -108,7 +116,7 @@ TEST_CASE("BatchAligner: mixed guided/unguided problems throw when band == 0", "
     REQUIRE_THROWS_AS(ba.align(problems), std::invalid_argument);
 }
 
-TEST_CASE("BatchAligner: all-unguided batch with band == 0 does not throw", "[batch]") {
+TEST_CASE("SeqPairBatch::align: all-unguided batch with band == 0 does not throw", "[batch]") {
     auto ba = make_aligner(2);
     std::vector<ProblemInstance> problems{
         {"ACDE", "ACDE", {}},
@@ -117,7 +125,7 @@ TEST_CASE("BatchAligner: all-unguided batch with band == 0 does not throw", "[ba
     REQUIRE_NOTHROW(ba.align(problems));
 }
 
-TEST_CASE("BatchAligner: all-guided batch with band == 0 does not throw", "[batch]") {
+TEST_CASE("SeqPairBatch::align: all-guided batch with band == 0 does not throw", "[batch]") {
     auto ba = make_aligner(2);
     std::vector<ProblemInstance> problems{
         {"ACDE", "ACDE", guide_j_from_aligned("ACDE", "ACDE")},
@@ -126,7 +134,7 @@ TEST_CASE("BatchAligner: all-guided batch with band == 0 does not throw", "[batc
     REQUIRE_NOTHROW(ba.align(problems));
 }
 
-TEST_CASE("BatchAligner: mixed guided/unguided problems do not throw when band > 0", "[batch]") {
+TEST_CASE("SeqPairBatch::align: mixed guided/unguided problems do not throw when band > 0", "[batch]") {
     auto ba = make_aligner(2);
     ba.band = 2;
     std::vector<ProblemInstance> problems{
@@ -136,7 +144,7 @@ TEST_CASE("BatchAligner: mixed guided/unguided problems do not throw when band >
     REQUIRE_NOTHROW(ba.align(problems));
 }
 
-TEST_CASE("BatchAligner: scores are indexed correctly (not scrambled by threading)", "[batch]") {
+TEST_CASE("SeqPairBatch::align: scores are indexed correctly (not scrambled by threading)", "[batch]") {
     std::vector<std::string> seqs_a = {"A", "AC", "ACD", "ACDE"};
     std::vector<std::string> seqs_b = {"A", "AC", "ACD", "ACDE"};
     std::vector<ProblemInstance> problems;

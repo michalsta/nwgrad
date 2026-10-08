@@ -216,7 +216,7 @@ Step step(const SeqPairBatchT<T>& batch, const double* y, size_t n, double alpha
                                     std::to_string(n) + " labels for " +
                                     std::to_string(batch.size()) + " pairs)");
     check_labels(y, n);
-    const int threads = batch.n_threads;
+    const int threads = batch.n_threads();
     const std::vector<double> s = batch.scores();
     const Sums at0 = evaluate(s.data(), y, n, alpha0, true, threads);
     const double alpha = fit_alpha(s.data(), y, n, alpha0, threads, 1e-12, 8, 200, &at0);

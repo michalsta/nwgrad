@@ -136,7 +136,6 @@ def test_weighted_grad_is_independent_of_threads_and_schedule(cls):
 
 def test_weighted_grad_after_align_full_and_compute_grad():
     batch, _ = make_batch(nwgrad.SeqPairBatchDouble)
-    batch.alloc_dp()
     batch.align_full()
     batch.compute_grad()
     w = np.linspace(-1.0, 1.0, len(batch))

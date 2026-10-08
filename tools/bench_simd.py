@@ -113,6 +113,7 @@ class SeqPool:
 
 def worker(args):
     import nwgrad
+    from _stream import Stream
     from nwgrad.matrices import BLOSUM62
 
     isa = nwgrad.simd_isa()
@@ -120,9 +121,8 @@ def worker(args):
                                 args.gap_open, args.gap_extend)
 
     def aligner(kernel, threads, band):
-        return nwgrad.BatchAligner(params, band=band, gap_model=args.gap_model,
-                                   mode=args.mode, grad_mode=args.grad_mode,
-                                   n_threads=threads, kernel=kernel)
+        return Stream(params, band=band, gap_model=args.gap_model, mode=args.mode,
+                      grad_mode=args.grad_mode, n_threads=threads, kernel=kernel)
 
     def time_once(kernel, threads, band, sa, sb):
         al = aligner(kernel, threads, band)

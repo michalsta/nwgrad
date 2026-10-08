@@ -10,6 +10,7 @@ silently tolerated.
 import numpy as np
 import pytest
 import nwgrad
+from conftest import StreamAligner, StreamAlignerDouble
 
 
 DNA_ARR = np.eye(4) * 2 - 1
@@ -159,7 +160,7 @@ def test_convenience_fn_rejects_out_of_alphabet_sequence():
 
 def test_batch_aligner_names_the_offending_pair():
     p = dna_params(gap_extend_a=1.0, gap_extend_b=1.0)
-    al = nwgrad.BatchAligner(p, gap_model="linear", mode="local",
+    al = StreamAligner(p, gap_model="linear", mode="local",
                              grad_mode="hard", n_threads=1)
     with pytest.raises(ValueError, match=r"pair 1"):
         al.align(["ACGT", "ACGT"], ["ACGT", "ACGZ"])
@@ -183,13 +184,10 @@ def test_batch_rejects_a_pair_over_a_different_alphabet():
     dna = dna_params(gap_extend_a=1.0, gap_extend_b=1.0)
     aa = nwgrad.AlignParams(nwgrad.SubstMatrix(AA_ARR), gap_extend_a=1.0,
                             gap_extend_b=1.0)
-    sp_dna = nwgrad.SeqPair("ACGT", "ACGT", dna, gap_model="linear", mode="local")
-    sp_aa = nwgrad.SeqPair("ACDE", "ACDE", aa, gap_model="linear", mode="local")
-
-    batch = nwgrad.SeqPairBatch(n_threads=2)
-    batch.add(sp_dna)
+    batch = nwgrad.SeqPairBatch(n_threads=2, gap_model="linear", mode="local")
+    batch.add_many(["ACGT"], ["ACGT"], dna)
     with pytest.raises(ValueError, match="cannot join a batch"):
-        batch.add(sp_aa)
+        batch.add_many(["ACDE"], ["ACDE"], aa)
     assert len(batch) == 1
 
 
@@ -208,7 +206,6 @@ def test_same_alphabet_set_params_still_works():
     p1 = dna_params(gap_extend_a=1.0, gap_extend_b=1.0)
     p2 = dna_params(gap_extend_a=2.0, gap_extend_b=2.0)
     sp = nwgrad.SeqPair("ACGTACGT", "ACGTACGT", p1, gap_model="linear", mode="local")
-    sp.alloc_dp()
     sp.align_full()
     first = sp.score
     sp.set_params(p2)

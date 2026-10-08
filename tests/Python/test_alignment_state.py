@@ -99,7 +99,6 @@ def test_batch_set_params_invalidates_owned_pair_traceback(precision, traceback,
 b = n.SeqPairBatch{precision}(n_threads=1, traceback={traceback!r})
 b.add_many(["ACGT", "ACGTT"], ["ACGT", "ACGT"], params(), kernel="scalar_fallback")
 b.set_params(params(4))
-b.alloc_dp()
 b.align_full()
 expected = [b[i].aligned() for i in range(len(b))]
 b.set_params(params(5))

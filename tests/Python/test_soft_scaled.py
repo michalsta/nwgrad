@@ -10,6 +10,7 @@ leaves two orders of headroom for longer pairs and other compilers/ISAs.
 import numpy as np
 import pytest
 import nwgrad
+from conftest import StreamAligner, StreamAlignerDouble
 
 REL = 1e-11
 ABS = 1e-11
@@ -78,7 +79,6 @@ def test_scaled_matches_log_banded(gm, mode, bw):
         for impl in ("scaled", "log"):
             sp = nwgrad.SeqPairDouble(a, b, params, gap_model=gm, mode=mode, grad_mode="soft")
             sp.soft_impl = impl
-            sp.alloc_dp()
             sp.align_full()
             sp.realign_banded(bw)
             sp.compute_grad()
@@ -97,7 +97,7 @@ def test_batch_aligner_soft_impl():
     B = [rand_seq(rng, "ACGT", 45) for _ in range(20)]
     res = []
     for impl in ("scaled", "log"):
-        ba = nwgrad.BatchAlignerDouble(params, gap_model="affine", mode="local",
+        ba = StreamAlignerDouble(params, gap_model="affine", mode="local",
                                        grad_mode="soft", n_threads=2)
         ba.soft_impl = impl
         assert ba.soft_impl == impl
@@ -252,7 +252,6 @@ def test_temperature_invalidates_and_validates():
     rng = np.random.default_rng(51)
     params = dna_params(rng)
     sp = nwgrad.SeqPairDouble("ACGTAC", "ACTTAC", params, grad_mode="soft")
-    sp.alloc_dp()
     sp.align_full()
     s1 = sp.score
     sp.soft_temperature = 0.5
@@ -266,22 +265,24 @@ def test_temperature_invalidates_and_validates():
 
 @pytest.mark.parametrize("mode", ["global", "local"])
 def test_soft_interpair_mixed_groups_and_temperature(mode):
-    """Groups mixing soft and hard pairs (soft lanes then take their own path), and a
-    non-unit temperature through the inter-pair soft pass, against the striped fill."""
+    """A non-unit temperature through the inter-pair soft pass, against the striped fill
+    (soft and hard pairs are separate batches since 0.6: one problem type per batch)."""
     rng = np.random.default_rng(61)
     params = dna_params(rng)
     A = [rand_seq(rng, "ACGT", int(rng.integers(10, 30))) for _ in range(40)]
     B = [rand_seq(rng, "ACGT", 40) for _ in range(40)]
     res = []
     for fill in ("striped", "interpair"):
-        b = nwgrad.SeqPairBatchDouble(n_threads=2, traceback="pointers")
-        b.fill = fill
-        b.soft_temperature = 0.4
-        b.add_many(A[:25], B[:25], params, gap_model="affine", mode=mode, grad_mode="soft")
-        b.add_many(A[25:], B[25:], params, gap_model="affine", mode=mode, grad_mode="hard")
-        b.score_and_grad()
-        mats, gaps = b.grads()
-        res.append((b.scores(), mats, gaps))
+        parts = []
+        for gd, lo, hi in (("soft", 0, 25), ("hard", 25, 40)):
+            b = nwgrad.SeqPairBatchDouble(n_threads=2, traceback="pointers",
+                                          gap_model="affine", mode=mode, grad_mode=gd)
+            b.fill = fill
+            b.soft_temperature = 0.4
+            b.add_many(A[lo:hi], B[lo:hi], params)
+            b.score_and_grad()
+            parts.append((b.scores(), *b.grads()))
+        res.append(tuple(np.concatenate([q[k] for q in parts]) for k in range(3)))
     close(res[0][0], res[1][0])
     close(res[0][1], res[1][1])
     close(res[0][2], res[1][2])
@@ -378,7 +379,6 @@ def test_lazy_rescale_both_directions(gm, mode, bw):
         for impl in ("scaled", "log"):
             sp = nwgrad.SeqPairDouble(a, b, params, gap_model=gm, mode=mode, grad_mode="soft")
             sp.soft_impl = impl
-            sp.alloc_dp()
             sp.align_full()
             if bw:
                 sp.realign_banded(bw)
@@ -456,7 +456,7 @@ def test_soft_guide_posterior_tracks_viterbi_when_cold(mode):
             # the path actually crosses.
             sp = nwgrad.SeqPairDouble(A[i], B[i], params, gap_model="affine", mode="local",
                                       traceback="pointers")
-            sp.alloc_dp(); sp.align_full()
+            sp.align_full()
             core = sp.aligned()[0].replace("-", "")
             lo = A[i].find(core); hi = lo + len(core)
             if not core:

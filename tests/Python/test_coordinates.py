@@ -29,7 +29,6 @@ def _params(seed, go, ge):
 
 def _pair(a, b, p, gap_model, mode, traceback="pointers"):
     sp = nwgrad.SeqPairDouble(a, b, p, gap_model=gap_model, mode=mode, traceback=traceback)
-    sp.alloc_dp()
     sp.align_full()
     return sp
 

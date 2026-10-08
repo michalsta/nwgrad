@@ -149,7 +149,7 @@ TEST_CASE("grads_into: preconditions throw", "[weighted_grad]") {
 // blocks in order, whatever the thread count.  The reference rounds every
 // product on its own (volatile), as in the test above, and adds in that order.
 TEST_CASE("weighted_grad: block order, bit-identical across thread counts", "[weighted_grad]") {
-    const size_t B = SeqPairBatchT<double>::WEIGHTED_GRAD_BLOCK;
+    const size_t B = BatchEngine<double, GapModel::Linear, AlignMode::Global>::WEIGHTED_GRAD_BLOCK;
     const size_t N = 3 * B + 17;
     static const char ACGT[] = "ACGT";
     std::vector<std::string> a(N), b(N);

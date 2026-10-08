@@ -84,6 +84,16 @@ public:
         return out;
     }
 
+    // encode() into a caller's buffer of s.size() bytes: the same validation and the
+    // same error, no allocation (SeqPairBatch encodes a whole batch into one array).
+    void encode_into(std::string_view s, uint8_t* out) const {
+        for (size_t k = 0; k < s.size(); ++k) {
+            int i = index_of(s[k]);
+            if (i < 0) throw_bad_char(s[k], k);
+            out[k] = static_cast<uint8_t>(i);
+        }
+    }
+
     std::string decode(const std::vector<uint8_t>& idx) const {
         std::string out;
         out.reserve(idx.size());

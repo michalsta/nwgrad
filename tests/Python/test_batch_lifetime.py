@@ -1,8 +1,8 @@
 """Object lifetimes across SeqPairBatch: pairs that outlive their batch, params that
 outlive their Python name.
 
-The C++ side holds raw pointers everywhere — a SeqPair points at its AlignParams, a
-batch points at its pairs — and Python keep-alives are what make that safe.  Each test
+The C++ side holds raw pointers — a batch points at its params, a pair taken out of a
+batch (a view) points at the batch — and Python keep-alives are what make that safe.  Each test
 here builds a situation where one of those keep-alives is missing, deletes the Python
 name that was (accidentally) keeping the memory alive, churns the allocator so freed
 storage is reused, and then uses the survivor.  The correct answer is computed from a
@@ -13,10 +13,11 @@ a use-after-free, which in-process would crash pytest or corrupt its heap and fa
 unrelated later test.  Observed on the unfixed tree: a segfault (exit 139) for an
 indexed pair, and a silently wrong score (396 where 8 is correct) for stale params.
 
-The fix: an indexed batch-owned pair pins its batch through an `_owner` attribute, and
-batch.set_params() re-pins every borrowed pair's `_params`.  Attributes rather than
-nanobind keep_alive, so any cycle they close stays visible to the cyclic GC — the last
-two tests check that nothing leaks.
+The fix: an indexed pair (a view) pins its batch through an `_owner` attribute, and the
+batch pins its params (`_owned_params` per add_many(), `_params` for set_params()).
+Attributes rather than nanobind keep_alive, so any cycle stays visible to the cyclic GC.
+(Since 0.6 there is no add(): the borrowed-pair and shared-pair scenarios that stood
+here have no subject any more.)
 """
 
 import pytest
@@ -100,111 +101,11 @@ expect(held[-1], 2, *seqs[-1])
 """)
 
 
-@pytest.mark.parametrize("sp,spb", PRECISIONS, ids=PRECISION_IDS)
-def test_owned_pair_borrowed_by_second_batch(sp, spb):
-    """A pair owned by batch 1, added to batch 2: batch 2's keep-alive holds the wrapper,
-    so the wrapper must be what keeps batch 1 (the real owner) alive."""
-    run(sp, spb, """
-p = params(2)
-b1 = SPB(n_threads=1)
-b1.add_many([A], [B], p)
-b2 = SPB(n_threads=1)
-b2.add(b1[0])
-del b1
-trash = churn()
-total = b2.score_and_grad()
-ref = SP(A, B, params(2)).score_and_grad()[0]
-assert total == ref, f"batch total {total} != {ref}"
-""")
-
-
-@pytest.mark.parametrize("sp,spb", PRECISIONS, ids=PRECISION_IDS)
-def test_python_pair_outlives_batch(sp, spb):
-    """The already-safe half of the model, pinned so a fix for issue 2 cannot break it:
-    a Python-constructed pair added to a batch, then the batch dropped."""
-    run(sp, spb, """
-p = params(2)
-s = SP(A, B, p)
-b = SPB(n_threads=1)
-b.add(s)
-b.score_and_grad()
-del b
-trash = churn()
-expect(s, 2)
-""")
-
-
 # --- Issue 3: batch.set_params() must pin the new params for every surviving pair -------
 #
 # The batch re-points every pair at the new params.  It used to pin them only in the
 # BATCH's _params, so a borrowed pair outliving the batch pointed at freed params; it
 # now re-pins each borrowed pair's own _params as well.
-
-
-@pytest.mark.parametrize("sp,spb", PRECISIONS, ids=PRECISION_IDS)
-def test_borrowed_pair_keeps_batch_params(sp, spb):
-    run(sp, spb, """
-s = SP(A, B, params(1))
-b = SPB(n_threads=1)
-b.add(s)
-q = params(2)
-b.set_params(q)
-del b, q
-trash = churn()
-expect(s, 2)
-""")
-
-
-@pytest.mark.parametrize("sp,spb", PRECISIONS, ids=PRECISION_IDS)
-def test_borrowed_pair_after_repeated_set_params(sp, spb):
-    """A training loop: many replacements, each new params' only name dropped at once.
-    The pair must end on the LAST params — and the earlier ones need not be retained
-    (that is the O(1) replacement the bindings' keep_current_params() exists for)."""
-    run(sp, spb, """
-s = SP(A, B, params(1))
-b = SPB(n_threads=1)
-b.add(s)
-for k in range(2, 12):
-    b.set_params(params(k))
-    b.score_and_grad()
-del b
-trash = churn()
-expect(s, 11)
-""")
-
-
-@pytest.mark.parametrize("sp,spb", PRECISIONS, ids=PRECISION_IDS)
-def test_pair_shared_by_two_batches(sp, spb):
-    """Last set_params() wins, whichever batch made it, and the pair outlives both."""
-    run(sp, spb, """
-s = SP(A, B, params(1))
-b1, b2 = SPB(n_threads=1), SPB(n_threads=1)
-b1.add(s); b2.add(s)
-b1.set_params(params(2))
-b2.set_params(params(3))
-del b2
-trash = churn()
-expect(s, 3)
-del b1
-trash = churn()
-expect(s, 3)
-""")
-
-
-@pytest.mark.parametrize("sp,spb", PRECISIONS, ids=PRECISION_IDS)
-def test_pair_set_params_after_batch_set_params(sp, spb):
-    """pair.set_params() after batch.set_params(): the pair's own pin must win.  Passes
-    today; pinned so that the issue 3 fix does not leave a stale batch pin in charge."""
-    run(sp, spb, """
-s = SP(A, B, params(1))
-b = SPB(n_threads=1)
-b.add(s)
-b.set_params(params(2))
-s.set_params(params(4))
-del b
-trash = churn()
-expect(s, 4)
-""")
 
 
 @pytest.mark.parametrize("sp,spb", PRECISIONS, ids=PRECISION_IDS)
@@ -234,36 +135,32 @@ def live_batches():
 
 
 @pytest.mark.parametrize("sp,spb", PRECISIONS, ids=PRECISION_IDS)
-def test_indexing_borrowed_pair_does_not_pin_batch(sp, spb):
-    """Index a pair that was add()-ed: the batch already holds that wrapper, so pinning
-    the batch from it would be a cycle.  The batch must die by refcount alone."""
-    run(sp, spb, _live_batches() + """
-gc.disable()
-s = SP(A, B, params(2))
-b = SPB(n_threads=1)
-b.add(s)
-assert b[0] is s
+def test_view_keeps_batch_and_current_params(sp, spb):
+    """A view outlives its batch AFTER set_params() with the new params' name dropped:
+    view -> batch -> current params must all hold."""
+    run(sp, spb, """
+b = SPB(n_threads=1, gap_model="affine", mode="global", grad_mode="hard")
+b.add_many([A], [B], params(1))
 b.set_params(params(3))
+v = b[0]
 del b
-gc.enable()
-assert live_batches() == 0, "batch kept alive by its own borrowed pair"
-expect(s, 3)
+trash = churn()
+expect(v, 3)
 """)
 
 
 @pytest.mark.parametrize("sp,spb", PRECISIONS, ids=PRECISION_IDS)
-def test_cross_batch_owned_pairs_are_collectable(sp, spb):
-    """b1 borrows a pair b2 owns and vice versa: a genuine cycle, b1 -> b2[0] -> b2 ->
-    b1[0] -> b1.  It must be collectable, and both must stay usable until then."""
+def test_views_do_not_leak_their_batch(sp, spb):
+    """The view's pin is an attribute: once view and batch are both gone, the batch is
+    collected — no keep-alive table entry outliving them."""
     run(sp, spb, _live_batches() + """
-b1, b2 = SPB(n_threads=1), SPB(n_threads=1)
-b1.add_many([A], [B], params(2))
-b2.add_many([A], [B], params(2))
-b1.add(b2[0]); b2.add(b1[0])
-w = b1[0]
-del b1, b2
+b = SPB(n_threads=1, gap_model="affine", mode="global", grad_mode="hard")
+b.add_many([A, A], [B, B], params(2))
+views = [b[0], b[1], b[0]]
+b.score_and_grad()
+del b
 trash = churn()
-expect(w, 2)
-del w
-assert live_batches() == 0, "cross-batch cycle leaked"
+expect(views[0], 2)
+del views
+assert live_batches() == 0, "views leaked their batch"
 """)

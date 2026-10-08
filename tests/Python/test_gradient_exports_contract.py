@@ -71,8 +71,9 @@ def test_exported_arrays_outlive_batch(class_name):
 def test_gradient_exports_reject_invalid_later_pair(class_name):
     batch, params = make_batch(getattr(nwgrad, class_name))
     batch.score_and_grad()
-    # A valid first pair must not hide an invalid cache later in the batch.
-    batch[-1].set_params(params)
+    # A valid first pair must not hide an invalid cache later in the batch: a new
+    # add_many() segment has no results yet.
+    batch.add_many(["ACGT"], ["AGT"], params)
     with pytest.raises(RuntimeError, match="gradient not computed"):
         batch.grads()
     with pytest.raises(RuntimeError, match="gradient not computed"):

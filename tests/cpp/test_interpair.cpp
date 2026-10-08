@@ -2,7 +2,7 @@
 // (ASan+UBSan, TSan, gcc and clang, all with _GLIBCXX_ASSERTIONS) runs the inter-pair
 // kernels: DNA (blend tree) and protein (gathered profile and gathered soft weights),
 // hard and soft, both gap models and modes, both precisions, B lengths mixed within a
-// group, banded affine, and BatchAligner.  Hard results must be bit-identical, soft ones
+// group, banded affine, and the streaming SeqPairBatch::align().  Hard results must be bit-identical, soft ones
 // tolerance-equal (the soft path is never bit-exact).
 //
 // Written after the Python sanitizer jobs caught `&eqm[j * nm]` on an EMPTY vector
@@ -13,7 +13,6 @@
 #include "catch.hpp"
 #include "align_params.hpp"
 #include "aligner.hpp"
-#include "batch.hpp"
 #include "seq_pair.hpp"
 #include "seq_pair_batch.hpp"
 
@@ -65,8 +64,8 @@ void batch_case(const std::string& alpha, GapModel gm, AlignMode am, GradMode gd
     make_seqs(alpha, 61, 1, 30, 30, 38, seed, A, B);   // B lengths mixed within the cap
     const AlignParams p = params_for(alpha, gm == GapModel::Linear, seed);
     SeqPairBatchT<T> own(3, TracebackMode::Pointers), inter(3, TracebackMode::Pointers);
-    own.inter_fill = false;
-    inter.inter_fill = true;
+    own.set_fill(false, false);
+    inter.set_fill(false, true);
     own.add_many(views(A), views(B), p, gm, am, gd);
     inter.add_many(views(A), views(B), p, gm, am, gd);
     own.score_and_grad();
@@ -105,24 +104,24 @@ TEST_CASE("interpair: SeqPairBatch matches each pair's own fill", "[interpair]")
                 }
 }
 
-TEST_CASE("interpair: BatchAligner matches its own path", "[interpair]") {
+TEST_CASE("interpair: SeqPairBatch::align matches its own path", "[interpair]") {
     const std::string DNA = "ACGT", AA = "ACDEFGHIKLMNPQRSTVWY";
     uint64_t seed = 301;
     for (const std::string* alpha : {&DNA, &AA})
         for (GapModel gm : {GapModel::Affine, GapModel::Linear})
             for (AlignMode am : {AlignMode::Global, AlignMode::Local})
-                for (auto gd : {BatchAligner::GradMode::Hard, BatchAligner::GradMode::Soft}) {
+                for (auto gd : {GradMode::Hard, GradMode::Soft}) {
                     std::vector<std::string> A, B;
                     make_seqs(*alpha, 53, 0, 30, 30, 38, ++seed, A, B);
                     const AlignParams p = params_for(*alpha, gm == GapModel::Linear, seed);
                     std::vector<ProblemInstance> probs;
                     for (size_t i = 0; i < A.size(); ++i) probs.push_back({A[i], B[i], {}});
-                    BatchAligner own(p, 0, gm, am, gd, 3), inter(p, 0, gm, am, gd, 3);
-                    own.inter_fill = false;
-                    inter.inter_fill = true;
-                    const BatchResult r0 = own.align(probs), r1 = inter.align(probs);
+                    SeqPairBatch own(gm, am, gd, 3), inter(gm, am, gd, 3);
+                    own.set_fill(false, false);
+                    inter.set_fill(false, true);
+                    const BatchResult r0 = own.align(probs, p), r1 = inter.align(probs, p);
                     for (size_t i = 0; i < A.size(); ++i) {
-                        if (gd == BatchAligner::GradMode::Hard) REQUIRE(r0.scores[i] == r1.scores[i]);
+                        if (gd == GradMode::Hard) REQUIRE(r0.scores[i] == r1.scores[i]);
                         else REQUIRE(r0.scores[i] == Approx(r1.scores[i]).epsilon(1e-11).margin(1e-11));
                     }
                 }

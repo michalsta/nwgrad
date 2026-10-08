@@ -6,9 +6,9 @@ instruction set runs it. See the [API reference](api.md) for where each is set.
 
 ## Precision
 
-The plain names — `SeqPair`, `SeqPairBatch`, `BatchAligner` and the twelve
+The plain names — `SeqPair`, `SeqPairBatch` and the twelve
 convenience functions — run the Viterbi DP in **float32**. The `*Double` classes
-(`SeqPairDouble`, `SeqPairBatchDouble`, `BatchAlignerDouble`) and `_double`
+(`SeqPairDouble`, `SeqPairBatchDouble`) and `_double`
 functions run it in **float64**. Inputs and outputs are float64 either way
 (`AlignParams`, scores, gradients); only the DP arithmetic differs. Over 400
 protein pairs measured against a float64 reference, float32 scores deviated by up

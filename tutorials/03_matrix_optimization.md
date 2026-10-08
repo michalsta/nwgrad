@@ -71,20 +71,16 @@ seqs_b = [mutate(s, rate=0.15) for s in base_seqs]
 
 ## Building the batch
 
-`SeqPair` objects are constructed once and reused across all optimisation
-iterations. Only the matrix (inside `AlignParams`) changes between iterations —
-the sequences and alignment mode are fixed.
+The batch is built once and reused across all optimisation iterations. Only the
+matrix (inside `AlignParams`) changes between iterations — the sequences and the
+problem type are fixed.
 
 ```python
 params = make_params(mat_array)
 
-batch = nwgrad.SeqPairBatch(n_threads=4)
-for a, b in zip(seqs_a, seqs_b):
-    batch.add(nwgrad.SeqPair(
-        a, b, params,
-        gap_model="affine", mode="global",
-        grad_mode="soft",
-    ))
+batch = nwgrad.SeqPairBatch(n_threads=4, gap_model="affine", mode="global",
+                            grad_mode="soft")
+batch.add_many(seqs_a, seqs_b, params)
 ```
 
 ## Gradient descent loop
@@ -94,9 +90,9 @@ LEARNING_RATE = 1e-4
 BANDWIDTH = 30   # banded DP half-width for iterations 2+
 
 for step in range(50):
-    # First step: full DP (no path yet). Subsequent steps: banded DP.
-    bw = 0 if step == 0 else BANDWIDTH
-    total_log_z = batch.score_and_grad(bandwidth=bw)
+    # First step: full DP (no path yet). Subsequent steps: banded DP around the
+    # previous step's paths.
+    total_log_z = batch.score_and_grad() if step == 0 else batch.banded_grad(BANDWIDTH)
 
     # Summed gradient over all pairs → AlignParams
     grad = batch.compute_grad()
@@ -110,8 +106,8 @@ for step in range(50):
 ```
 
 `batch.set_params()` invalidates cached scores and gradients on all pairs but
-preserves the alignment paths, so the next `score_and_grad(bandwidth=bw)` uses
-banded DP instead of a full re-alignment. The batch keeps `params` alive
+preserves the alignment paths, so the next `banded_grad(bw)` re-aligns around them
+instead of running the full DP. The batch keeps `params` alive
 automatically.
 
 ## Learning the gap penalties too
@@ -126,7 +122,7 @@ params = make_params(mat_array)
 batch.set_params(params)
 
 for step in range(50):
-    total_log_z = batch.score_and_grad(bandwidth=0 if step == 0 else BANDWIDTH)
+    total_log_z = batch.score_and_grad() if step == 0 else batch.banded_grad(BANDWIDTH)
     grad = batch.compute_grad()
 
     params = params + LEARNING_RATE * grad   # matrix and all four gap fields at once
@@ -156,11 +152,17 @@ def objective_and_grad(matrix_flat):
 
     return -float(total_log_z), -grad.matrix.to_matrix().ravel()
 
+# log Z grows without limit as the matrix entries grow, so an unconstrained
+# maximiser keeps stepping outward; box bounds keep the problem well posed.  (They
+# also keep every step score far from the ~709 at which exp() overflows: the default
+# soft_impl="scaled" raises there rather than return a degraded result; set
+# batch.soft_impl = "scaled_or_log" to fall back to log space per pair instead.)
 result = minimize(
     fun=objective_and_grad,
     x0=mat_array.ravel(),
     method="L-BFGS-B",
     jac=True,
+    bounds=[(-20.0, 20.0)] * (N * N),
     options={"maxiter": 50, "ftol": 1e-10, "gtol": 1e-6, "disp": True},
 )
 
@@ -190,12 +192,9 @@ for epoch in range(5):
         idx = all_pairs[start:start + BATCH_SIZE]
         p = make_params(mat_array)
 
-        mini_batch = nwgrad.SeqPairBatch(n_threads=4)
-        for i in idx:
-            mini_batch.add(nwgrad.SeqPair(
-                seqs_a[i], seqs_b[i], p,
-                gap_model="affine", mode="global", grad_mode="soft",
-            ))
+        mini_batch = nwgrad.SeqPairBatch(n_threads=4, gap_model="affine",
+                                         mode="global", grad_mode="soft")
+        mini_batch.add_many([seqs_a[i] for i in idx], [seqs_b[i] for i in idx], p)
 
         loss = -mini_batch.score_and_grad()
         grad = mini_batch.compute_grad()
@@ -221,11 +220,10 @@ EPS = 1e-5
 
 sp = nwgrad.SeqPair(a, b, make_params(blosum_arr),
                     gap_model="affine", mode="global", grad_mode="soft")
-sp.alloc_dp()
 sp.align_full()
 sp.compute_grad()
 log_z = sp.score
-grad  = sp.grad.matrix.to_matrix().copy()
+g_ana = sp.grad.matrix.to_matrix().copy()   # (not `grad`: the loops' AlignParams)
 
 # Check entry (0, 0) — A-A substitution (index 0 in ALPHABET)
 i, j = 0, 0
@@ -235,17 +233,15 @@ m_minus = blosum_arr.copy(); m_minus[i, j] -= EPS; m_minus[j, i] -= EPS
 p_plus  = make_params(m_plus)
 sp_p = nwgrad.SeqPair(a, b, p_plus,
                       gap_model="affine", mode="global", grad_mode="soft")
-sp_p.alloc_dp()
 sp_p.align_full()
 
 p_minus = make_params(m_minus)
 sp_m = nwgrad.SeqPair(a, b, p_minus,
                       gap_model="affine", mode="global", grad_mode="soft")
-sp_m.alloc_dp()
 sp_m.align_full()
 
 numerical  = (sp_p.score - sp_m.score) / (2 * EPS)
-analytical = grad[i, j] + grad[j, i]   # both entries changed by the perturbation
+analytical = g_ana[i, j] + g_ana[j, i]   # both entries changed by the perturbation
 print(f"Numerical:  {numerical:.8f}")
 print(f"Analytical: {analytical:.8f}")
 ```
@@ -283,12 +279,9 @@ be annealed because the subgradient is not a descent direction in general.
 
 ```python
 params_hard = make_params(mat_array)
-batch_hard = nwgrad.SeqPairBatch(n_threads=4)
-for a, b in zip(seqs_a, seqs_b):
-    batch_hard.add(nwgrad.SeqPair(
-        a, b, params_hard,
-        gap_model="affine", mode="global", grad_mode="hard",
-    ))
+batch_hard = nwgrad.SeqPairBatch(n_threads=4, gap_model="affine", mode="global",
+                                 grad_mode="hard")
+batch_hard.add_many(seqs_a, seqs_b, params_hard)
 
 for t in range(200):
     lr = 1e-2 * (0.99 ** t)

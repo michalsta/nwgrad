@@ -97,7 +97,9 @@ static void striped_affine_full(ViterbiJob<T>& job) {
     if (buf.sopenv.size() < sw)     buf.sopenv.resize(sw);
     if (buf.sprof.size()  < (std::size_t)nalpha * sw) buf.sprof.resize((std::size_t)nalpha * sw);
     const std::size_t vsz = (std::size_t)(m + 1) * rowsz;
-    if (buf.VM.size() < vsz) { buf.VM.resize(vsz); buf.VX.resize(vsz); buf.VY.resize(vsz); }
+    // Per vector, never keyed on one (see kernels_pointers_impl.inl): a fill that grows
+    // only part of a group must not leave the rest short for the next one.
+    for (auto* v : {&buf.VM, &buf.VX, &buf.VY}) if (v->size() < vsz) v->resize(vsz);
     // striped slot within a row (offset past slot 0) for DP column j in 1..n
     auto scol = [seg](int j) -> std::size_t {
         return (std::size_t)((j - 1) % seg) * W + (j - 1) / seg;

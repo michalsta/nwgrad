@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 
 import nwgrad
+from conftest import StreamAligner, StreamAlignerDouble
 
 import bruteforce as bf
 
@@ -134,7 +135,6 @@ def test_a_penalties_suppress_gaps_in_a(matrix):
     a, b = "AC", "ACGTGT"  # b is longer, so alignment needs gaps in a
     cheap = nwgrad.SeqPair(a, b, params(matrix, 0.5, 0.5, 20.0, 20.0),
                            gap_model="affine", mode="global", grad_mode="none")
-    cheap.alloc_dp()
     cheap.align_full()
     aligned_a, _ = cheap.aligned()
     assert "-" in aligned_a  # gaps land in a, which is where they are cheap
@@ -144,7 +144,6 @@ def test_b_penalties_suppress_gaps_in_b(matrix):
     a, b = "ACGTGT", "AC"  # mirror image: now a is longer
     cheap = nwgrad.SeqPair(a, b, params(matrix, 20.0, 20.0, 0.5, 0.5),
                            gap_model="affine", mode="global", grad_mode="none")
-    cheap.alloc_dp()
     cheap.align_full()
     _, aligned_b = cheap.aligned()
     assert "-" in aligned_b
@@ -290,7 +289,6 @@ def test_seq_pair_agrees_with_single_pair_functions(matrix, mode, gap_model, gra
     p = params(matrix, 4.0, 0.5, 1.5, 2.0)  # deliberately lopsided
 
     sp = nwgrad.SeqPair(a, b, p, gap_model=gap_model, mode=mode, grad_mode=grad_mode)
-    sp.alloc_dp()
     sp.align_full()
 
     fn = {
@@ -315,7 +313,7 @@ def test_batch_aligner_accumulates_asymmetric_gap_gradients(matrix, grad_mode):
     pairs = [("ACGTACGTAA", "AGTACTG"), ("AC", "ACGTGT"), ("ACGTGT", "AC")]
     p = params(matrix, 4.0, 0.5, 1.5, 2.0)
 
-    batch = nwgrad.BatchAligner(p, gap_model="affine", mode="global",
+    batch = StreamAligner(p, gap_model="affine", mode="global",
                                 grad_mode=grad_mode, n_threads=2)
     result = batch.align([a for a, _ in pairs], [b for _, b in pairs])
 

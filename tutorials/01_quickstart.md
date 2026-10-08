@@ -140,16 +140,13 @@ separate reference to `params`.
 ### Computing the score
 
 ```python
-sp.alloc_dp()     # allocate own DP buffer before the first alignment
 sp.align_full()
 print(sp.score)   # -3.0
 ```
 
-`alloc_dp()` must be called once before `align_full()`. It is not needed when
-using `SeqPairBatch.score_and_grad()`, which allocates per-thread buffers
-instead.
-
 `align_full()` runs the full O(m×n) DP and caches the alignment path (`guide_j`).
+The DP tables are temporary; what the pair keeps is the result — score, path and
+gradient.
 
 ### Inspecting the alignment
 
@@ -212,7 +209,6 @@ sp_soft = nwgrad.SeqPair(
     gap_model="affine", mode="global",
     grad_mode="soft",
 )
-sp_soft.alloc_dp()
 sp_soft.align_full()
 print(sp_soft.score)    # log Z — always >= hard score
 
@@ -236,7 +232,6 @@ for gap_model in ("linear", "affine"):
         p = nwgrad.AlignParams(BLOSUM62, **kw)
         sp = nwgrad.SeqPair("PLEASANTLY", "MEANLY", p,
                             gap_model=gap_model, mode=mode)
-        sp.alloc_dp()
         sp.align_full()
         print(f"{gap_model:6s} {mode:6s}  score={sp.score:.1f}")
 ```
