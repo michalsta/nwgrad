@@ -113,3 +113,45 @@ slimming the per-pair objects (2.8 KB/pair is what made DiscrimAlign's
 2.5M-pair Manakov fit peak at 10 GB); not worth it on its own while the
 block-parallel sum is already ~2% of a DiscrimAlign iteration. Keep the
 block order (and the no-FMA rule) so results do not change.
+
+## Package-scan follow-ups (scan of 2026-10-07; correctness items fixed 2026-10-08)
+
+The scan's correctness and maintenance findings (B1–B8, S1–S4) are closed: fixed on
+branch `scan-fixes` or already gone with the 0.6 restructure. What remains is
+performance work, none of it measured yet; the cost notes are estimates.
+
+- **O1 — a score-only fill.** `nw_score*` / `sw_score*` and `grad_mode="none"` batches
+  run the full traceback machinery to return one number: Hirschberg recursion past
+  `hb_cutoff`, direction bytes (Pointers) below it, then a path replay. A rolling-row
+  forward pass (O(n) memory, no traceback) would do strictly less work. Decide first
+  whether it must reproduce today's results: at float32 `auto` is `hirschberg_pmax`,
+  whose score may sit (≤ the measured shortfall) below the exact optimum a plain forward
+  pass returns. Benchmark short/long × Global/Local; keep the bit-identity contracts.
+- **O3 — release the GIL in long batch calls.** Same item as AGENTS.md's Open TODO.
+  ~0.1 µs per call: release around batch calls only, not the µs-scale single-pair
+  functions. Blocked on a stated contract against two Python threads mutating one batch.
+- **O4 — logistic fitting starts threads per evaluation.** `detail::for_blocks`
+  (`logistic.hpp`) → `run_workers_guarded` spawns and joins workers on every Newton /
+  bracketing / bisection evaluation, and their `thread_local` scratch dies with them.
+  One-block inputs already run on the calling thread. Try a call-scoped pool (spawn once
+  per `fit_alpha`); the fixed block order must survive so results stay bit-identical.
+- **O5 — per-problem parameter setup is redone for every pair.** `Aligner::set_problem`
+  converts the substitution block to float32 per problem (`blkT_storage_`), and the
+  scaled soft path exponentiates its weights per problem. The batch now owns
+  deduplicated params copies per segment (`params_own_`, scan fix B3) — the natural
+  place to cache the converted block / weights, invalidated by `set_params()`. Matters
+  for many short protein pairs; measure the setup share first.
+- **O2 remainder — cgroup CPU quotas.** `default_thread_count()` now respects the
+  affinity mask (`allowed_cpus()`), but not a container's `cpu.max` quota. One file read
+  per process; mind cgroup v1 vs v2.
+
+Also open from the same work:
+- **Verify the unified affine walk (`walk_affine`, S3) on AVX-512 and NEON.** It was
+  differentially checked against the six old walkers on scalar/sse2/avx2 only (solace
+  and spot were off). The harness compiles the old `aligner.hpp` (from `5d97c38`) inside
+  a namespace next to the new one — copy `aligner_simd.hpp` alongside it under another
+  name with different content, or GCC's `#pragma once` (content + mtime) skips it.
+- **Release notes: B3 changes behaviour.** Batches and pairs own a copy of their params:
+  an in-place change (`*=`, the gap/matrix setters) no longer reaches them — call
+  `set_params()` — and the Python side no longer keeps the params object alive.
+  DiscrimAlign is unaffected (it builds fresh params and calls `set_params()`).
