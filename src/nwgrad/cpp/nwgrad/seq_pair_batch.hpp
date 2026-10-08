@@ -93,8 +93,8 @@ public:
 
     // ── Adding pairs ─────────────────────────────────────────────────────────
 
-    // Append a segment of pairs under `params` (kept by pointer: it must outlive the
-    // batch's use of it).  gm/am/gd: fix the type of an untyped batch; on a typed one,
+    // Append a segment of pairs under a copy of `params` (the batch owns it; a later
+    // in-place change to the caller's object does not reach the batch).  gm/am/gd: fix the type of an untyped batch; on a typed one,
     // they must agree with it (one batch, one problem type).
     void add_many(const std::vector<std::string_view>& seqs_a,
                   const std::vector<std::string_view>& seqs_b,
@@ -297,7 +297,7 @@ class SeqPairT {
 public:
     using Batch = SeqPairBatchT<T>;
 
-    // Standalone: a one-pair batch of its own.  `params` must outlive the pair.
+    // Standalone: a one-pair batch of its own, holding a copy of `params`.
     SeqPairT(std::string_view a, std::string_view b, const AlignParams& params,
              GapModel gm, AlignMode am, GradMode gd = GradMode::Hard,
              int kernel = kBackendAuto, TracebackMode tb = TracebackMode::Default)

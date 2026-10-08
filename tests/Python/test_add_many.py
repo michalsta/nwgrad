@@ -267,51 +267,44 @@ def test_dropping_params_after_two_add_many_calls():
     assert batch[len(PROT_A)].score_valid
 
 
-def test_add_many_holds_a_reference_to_params():
-    """The pinning contract, asserted directly.
-
-    The pairs are C++-owned and hold a *bare pointer* to params; none of them
-    holds a Python reference of its own.  So the batch must hold one for them.
-
-    This is checked on the refcount rather than by aligning after `del params`
-    and seeing whether the numbers look right: reading freed memory is undefined
-    behaviour, not a crash, and freed heap usually still holds its old bytes.
-    Such a test passes whether or not the reference is held, which makes it
-    worthless as a regression test.  The refcount either goes up or it does not.
-    """
+def test_add_many_copies_params():
+    """The batch owns a COPY of its params: it holds no reference to the caller's
+    object, and an in-place change to that object does not reach the batch (the
+    scan's B3: cached results stayed "valid" under params that had changed).
+    set_params() is how new params reach it."""
     params = prot_params()
     before = sys.getrefcount(params)
+    batch = nwgrad.SeqPairBatch(n_threads=2, gap_model="affine", mode="local")
+    batch.add_many(PROT_A, PROT_B, params)
+    assert sys.getrefcount(params) == before
+    first = batch.score_and_grad()
 
-    batch = nwgrad.SeqPairBatch(n_threads=2)
-    batch.add_many(PROT_A, PROT_B, params,
-                   gap_model="affine", mode="local", grad_mode="hard")
+    params.gap_open_a = 50.0              # in place: the batch must not see it
+    params *= 3.0
+    assert batch[0].score_valid
+    assert batch.score_and_grad() == first
 
-    assert sys.getrefcount(params) > before      # the batch took a reference
-    assert any(p is params for p in batch._owned_params)
+    batch.set_params(params)              # ... until it is handed over
+    assert not batch[0].score_valid
+    assert batch.score_and_grad() != first
 
 
-def test_two_add_many_calls_pin_both_params():
-    """A second add_many() must not evict the first call's params.
+def test_standalone_pair_copies_params():
+    params = prot_params()
+    sp = nwgrad.SeqPairDouble(PROT_A[0], PROT_B[0], params, traceback="scores")
+    s0 = sp.score_and_grad()[0]
+    params *= 3.0
+    assert sp.score_valid and sp.score == s0
+    assert nwgrad.SeqPairDouble(PROT_A[0], PROT_B[0], params).score_and_grad()[0] != s0
 
-    Pinning into a single `_params` slot (as set_params() does) would overwrite
-    it, drop the last reference to p1, and leave the first call's pairs pointing
-    at a freed object.  Again asserted on references, not on whether the wrong
-    answer happens to look right.
-    """
+
+def test_two_add_many_calls_keep_their_own_params():
+    """A second add_many() must not replace the first call's params."""
     p1 = prot_params(gap_extend=1.0)
     p2 = prot_params(gap_extend=9.0)
-    p1_before, p2_before = sys.getrefcount(p1), sys.getrefcount(p2)
-
     batch = nwgrad.SeqPairBatch(n_threads=2)
     batch.add_many(PROT_A, PROT_B, p1, gap_model="affine", mode="local", grad_mode="hard")
     batch.add_many(PROT_A, PROT_B, p2, gap_model="affine", mode="local", grad_mode="hard")
-
-    # BOTH are still referenced -- the second call did not evict the first.
-    assert sys.getrefcount(p1) > p1_before
-    assert sys.getrefcount(p2) > p2_before
-    pinned = batch._owned_params
-    assert any(p is p1 for p in pinned)
-    assert any(p is p2 for p in pinned)
 
     # And the values are intact and distinct, so the halves really did use
     # different params -- guarding against both being pinned but one ignored.

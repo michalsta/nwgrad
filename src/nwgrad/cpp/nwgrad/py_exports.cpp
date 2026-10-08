@@ -85,39 +85,6 @@ struct EncodedPair {
         : a(p.matrix.alphabet().encode(sa)), b(p.matrix.alphabet().encode(sb)) {}
 };
 
-// Hold a reference to the params a SeqPair / SeqPairBatch currently points at.
-//
-// C++ stores params as a bare pointer, so Python must keep the object alive.
-// nb::keep_alive<1,2> is the obvious tool and the wrong one here, twice over:
-//
-//   - It appends to a linked list that nanobind walks on every call to
-//     deduplicate (nb_type.cpp:1585), so K swaps cost O(K^2).
-//   - It never releases.  A gradient-descent loop builds a fresh AlignParams
-//     each step, so every superseded one stays pinned for the object's life.
-//
-// Only the *current* params needs to be alive — C++ has already dropped the
-// pointer to the old one.  So overwrite a single attribute: O(1), and the
-// superseded params is released on the spot.
-static void keep_current_params(nb::object owner, nb::object params) {
-    owner.attr("_params") = params;
-}
-
-// The list stored in obj.<name>, created empty on first use.  Looked up in the
-// instance __dict__ rather than with nb::hasattr, which raises and discards an
-// AttributeError on every miss.  `name` must be a string literal: its interned str is
-// created once per call site and deliberately never released.
-static nb::list attr_list(nb::handle obj, PyObject* key) {
-    nb::dict d = nb::borrow<nb::dict>(obj.attr("__dict__"));
-    if (PyObject* v = PyDict_GetItemWithError(d.ptr(), key))
-        return nb::borrow<nb::list>(v);
-    if (PyErr_Occurred()) throw nb::python_error();
-    nb::list l;
-    if (PyDict_SetItem(d.ptr(), key, l.ptr()) != 0) throw nb::python_error();
-    return l;
-}
-#define NWGRAD_ATTR_LIST(obj, name) \
-    attr_list((obj), [] { static PyObject* k = PyUnicode_InternFromString(name); return k; }())
-
 static GapModel parse_gap_model(const std::string& name) {
     if (name == "linear") return GapModel::Linear;
     if (name == "affine") return GapModel::Affine;
@@ -213,7 +180,9 @@ static const char* traceback_name(TracebackMode t) {
 
 static std::vector<int> make_guide(const std::string& aligned_a,
                                     const std::string& aligned_b) {
-    if (!aligned_a.empty() && !aligned_b.empty())
+    if (aligned_a.empty() != aligned_b.empty())
+        throw nb::value_error("nwgrad: a guide needs both aligned_a and aligned_b (got only one)");
+    if (!aligned_a.empty())
         return guide_j_from_aligned(aligned_a, aligned_b);
     return {};
 }
@@ -339,7 +308,6 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
             nb::arg("gap_model") = "affine", nb::arg("mode") = "global",
             nb::arg("grad_mode") = "hard", nb::arg("kernel") = "auto",
             nb::arg("traceback") = "auto",
-            nb::keep_alive<1, 4>(),
             "One sequence pair, aligned on the calling thread.\n"
             "  gap_model : \"linear\" | \"affine\"\n"
             "  mode      : \"global\" | \"local\"\n"
@@ -360,7 +328,6 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
             [](nb::object self_obj, nb::object params_obj) {
                 SP& self = nb::cast<SP&>(self_obj);
                 self.set_params(nb::cast<const AlignParams&>(params_obj));
-                keep_current_params(self_obj, params_obj);
             },
             nb::arg("params"),
             "Swap alignment parameters (a standalone pair; a batch's pair takes the\n"
@@ -505,8 +472,9 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             "     — every pair in the batch; naming any of the three fixes the type (the\n"
             "     others take their defaults).  Naming none is the deprecated form: the\n"
             "     first add_many() then fixes the type.\n"
-            "  n_threads=0 (default) uses the PHYSICAL core count (falling back to\n"
-            "  hardware_concurrency): this DP is stall-bound, so SMT siblings\n"
+            "  n_threads=0 (default) uses the PHYSICAL core count among the CPUs this\n"
+            "  process may run on (its affinity mask; falling back to the allowed\n"
+            "  logical count): this DP is stall-bound, so SMT siblings\n"
             "  contend and the logical count measured up to 1.44x slower.\n"
             "  traceback : \"auto\" (default) | \"pointers\" | \"scores\" | \"hirschberg\"\n"
             "              | \"hirschberg_pmax\"\n"
@@ -563,7 +531,6 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
                     if (!gd) gd = GradMode::Hard;
                 }
                 self.add_many(seqs_a, seqs_b, params, gm, am, gd, kn);
-                NWGRAD_ATTR_LIST(self_obj, "_owned_params").append(params_obj);
             },
             nb::arg("seqs_a"), nb::arg("seqs_b"), nb::arg("params"),
             nb::arg("gap_model") = nb::none(), nb::arg("mode") = nb::none(),
@@ -591,7 +558,6 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             "set_params",
             [](nb::object self_obj, nb::object params_obj) {
                 nb::cast<SPB&>(self_obj).set_params(nb::cast<const AlignParams&>(params_obj));
-                keep_current_params(self_obj, params_obj);
             },
             nb::arg("params"),
             "Set the params of every pair (one alphabet).  Clears the cached scores,\n"
@@ -800,7 +766,7 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             "  \"eager\" (default): score_and_grad() runs the guide Viterbi, as always.\n"
             "  \"lazy\": it does not; the guide is computed on first use (guide_j,\n"
             "     realign_banded, banded_grad) under the params CURRENT THEN — after\n"
-            "     set_params() or an in-place params update it follows the new params.\n"
+            "     set_params() it follows the new params.\n"
             "     Saves the whole Viterbi for loops that rescore in full each step and\n"
             "     never band (soft-score continuation); use eager to band around the\n"
             "     scored path.\n"
