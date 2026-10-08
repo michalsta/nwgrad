@@ -32,8 +32,8 @@ params = params + 0.01 * grad   # every matrix cell and all four gap costs move 
   path costs O(length × bandwidth) instead of a full O(m × n) DP.
 - **Any alphabet.** Protein, DNA, RNA or your own symbol set; asymmetric matrices and
   asymmetric gap costs; BLOSUM, PAM, VTML and NUC44 included.
-- **Python and C++.** nanobind bindings with zero-copy numpy interop over a
-  header-only C++20 core.
+- **Python and C++.** nanobind bindings with numpy interop (matrices and gradients
+  are copied in and out as numpy arrays) over a header-only C++20 core.
 
 ## Installation
 

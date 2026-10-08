@@ -46,3 +46,45 @@ def test_align_validates_each_guide_pair(cls):
     with pytest.raises(ValueError):
         batch.align(["ACGT"], ["ACGT"], p, band=2, aligned_a=["AC-GT"], aligned_b=[""])
 
+
+
+def _dna_params(nwgrad):
+    import numpy as np
+    return nwgrad.AlignParams(3 * np.eye(4) - 1, alphabet="ACGT", gap_open_a=2, gap_extend_a=1,
+                              gap_open_b=2, gap_extend_b=1)
+
+
+@pytest.mark.parametrize("which", ["a", "b"])
+def test_convenience_rejects_half_a_guide(which):
+    """Only one of aligned_a / aligned_b used to mean "no guide": the string given was
+    never even validated (scan B8)."""
+    import nwgrad
+    p = _dna_params(nwgrad)
+    kw = {"aligned_a": "malformed"} if which == "a" else {"aligned_b": "malformed"}
+    with pytest.raises(ValueError, match="both aligned_a and aligned_b"):
+        nwgrad.nw_score_affine("ACGT", "ACGT", p, band=1, **kw)
+
+
+@pytest.mark.parametrize("cls", ["SeqPairBatch", "SeqPairBatchDouble"])
+def test_align_rejects_half_a_guide_list(cls):
+    import nwgrad
+    batch = getattr(nwgrad, cls)(1, grad_mode="hard")
+    with pytest.raises(ValueError):
+        batch.align(["ACGT"], ["ACGT"], _dna_params(nwgrad), band=1, aligned_b=["malformed"])
+
+
+def test_negative_band_is_rejected_everywhere():
+    """band < 0 used to select the Full DP, where the band check never ran (scan B6)."""
+    import nwgrad
+    p = _dna_params(nwgrad)
+    with pytest.raises(ValueError, match="band must be >= 0"):
+        nwgrad.nw_score_affine("ACGT", "ACGT", p, band=-1)
+    with pytest.raises(ValueError, match="band must be >= 0"):
+        nwgrad.SeqPairBatchDouble(1, grad_mode="hard").align(["ACGT"], ["ACGT"], p, band=-1)
+
+
+def test_huge_band_equals_full():
+    import nwgrad
+    p = _dna_params(nwgrad)
+    assert nwgrad.nw_score_affine_double("ACGTAC", "AGTTACG", p, band=2**31 - 1) == \
+        nwgrad.nw_score_affine_double("ACGTAC", "AGTTACG", p)

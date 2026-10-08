@@ -115,3 +115,11 @@ def test_log_likelihood_is_not_provided():
     """Removed: it clipped probabilities. Evaluate it from the logits instead."""
     assert not hasattr(L, "log_likelihood")
     assert not hasattr(L.Step, "loglik_at_alpha0")
+
+
+def test_fit_alpha_rejects_nan_scores():
+    """NaN scores used to "converge" to a plausible intercept (scan B5)."""
+    import numpy as np
+    import nwgrad.logistic as L
+    with pytest.raises(ValueError, match="non-finite"):
+        L.fit_alpha(np.array([np.nan, 0.0]), np.array([0.0, 1.0]), 0.0, n_threads=1)

@@ -46,6 +46,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include "align_params.hpp"
@@ -161,8 +162,9 @@ public:
 
     // ── Adding pairs ─────────────────────────────────────────────────────────
 
-    // Append N pairs as one segment under `params` (which must outlive the batch's use
-    // of it) and Viterbi backend `kernel`.  Sequences are validated and encoded here, in
+    // Append N pairs as one segment under a copy of `params` (the batch owns its params:
+    // a later in-place change to the caller's object does not reach it — set_params()
+    // does) and Viterbi backend `kernel`.  Sequences are validated and encoded here, in
     // parallel, straight into the batch's arrays; an out-of-alphabet character throws
     // (naming it and its position) and leaves the batch exactly as it was.
     void add_many(const std::vector<std::string_view>& seqs_a,
@@ -203,7 +205,7 @@ public:
         }
         alpha_ = &alpha;
         nn_ = static_cast<size_t>(alpha.size()) * static_cast<size_t>(alpha.size());
-        segs_.push_back({&params, kernel, N0});
+        segs_.push_back({own_params_(params), kernel, N0});
         seg_.resize(N0 + N, static_cast<uint32_t>(segs_.size() - 1));
         score_.resize(N0 + N, 0.0);
         flags_.resize(N0 + N, 0);
@@ -305,7 +307,7 @@ public:
 
     // ── Batch operations ─────────────────────────────────────────────────────
 
-    // Point every segment at `params` (same alphabet).  Clears every cached score,
+    // Point every segment at a copy of `params` (same alphabet).  Clears every cached score,
     // gradient and stored path; guides stay (banded_grad() bands around them).
     void set_params(const AlignParams& params) {
         if (empty()) return;
@@ -313,7 +315,9 @@ public:
             throw std::invalid_argument(
                 "nwgrad: set_params() cannot change the alphabet (\"" + alpha_->symbols() +
                 "\" -> \"" + params.matrix.alphabet().symbols() + "\"); construct new pairs instead");
-        for (auto& s : segs_) s.params = &params;
+        const AlignParams* own = own_params_(params);
+        for (auto& s : segs_) s.params = own;
+        drop_unused_params_();
         for (auto& f : flags_) f &= static_cast<uint8_t>(~(kScore | kGrad | kStored | kHeld));
     }
     // set_params for one pair's segment only (a single-pair batch: SeqPair).
@@ -322,7 +326,8 @@ public:
             throw std::invalid_argument(
                 "nwgrad: set_params() cannot change the alphabet (\"" + alpha_->symbols() +
                 "\" -> \"" + params.matrix.alphabet().symbols() + "\"); construct a new SeqPair instead");
-        segs_[seg].params = &params;
+        segs_[seg].params = own_params_(params);
+        drop_unused_params_();
         const size_t end = seg + 1 < segs_.size() ? segs_[seg + 1].begin : size();
         for (size_t i = segs_[seg].begin; i < end; ++i)
             flags_[i] &= static_cast<uint8_t>(~(kScore | kGrad | kStored | kHeld));
@@ -779,6 +784,57 @@ private:
         kHeld = 64,        // grad_ holds a gradient compute_grad() has not released yet
     };
     struct Segment { const AlignParams* params; int kernel; size_t begin; };
+
+    // The batch's own copies of its params, one per distinct VALUE: add_many() calls
+    // with equal params share one copy, so the inter-pair plan (which groups pairs by
+    // params address) still shares a fill across them.  Behind unique_ptr so the
+    // addresses survive a move of the engine.
+    std::vector<std::unique_ptr<const AlignParams>> params_own_;
+    std::unordered_multimap<size_t, const AlignParams*> params_idx_;
+
+    static size_t params_hash_(const AlignParams& p) noexcept {
+        size_t h = 1469598103934665603ull;
+        auto mix = [&](const void* d, size_t n) {
+            const auto* c = static_cast<const unsigned char*>(d);
+            for (size_t k = 0; k < n; ++k) { h ^= c[k]; h *= 1099511628211ull; }
+        };
+        const double g[4] = {p.gap_open_a, p.gap_extend_a, p.gap_open_b, p.gap_extend_b};
+        mix(g, sizeof g);
+        const size_t na = p.matrix.alphabet().size();
+        mix(p.matrix.data(), na * na * sizeof(double));
+        return h;
+    }
+    // Bitwise, so equal copies are interchangeable bit for bit (0.0 vs -0.0 and NaNs
+    // simply do not share).
+    static bool params_same_(const AlignParams& x, const AlignParams& y) noexcept {
+        if (&x.matrix.alphabet() != &y.matrix.alphabet()) return false;
+        const double gx[4] = {x.gap_open_a, x.gap_extend_a, x.gap_open_b, x.gap_extend_b};
+        const double gy[4] = {y.gap_open_a, y.gap_extend_a, y.gap_open_b, y.gap_extend_b};
+        const size_t na = x.matrix.alphabet().size();
+        return std::memcmp(gx, gy, sizeof gx) == 0 &&
+               std::memcmp(x.matrix.data(), y.matrix.data(), na * na * sizeof(double)) == 0;
+    }
+    const AlignParams* own_params_(const AlignParams& p) {
+        const size_t h = params_hash_(p);
+        auto [lo, hi] = params_idx_.equal_range(h);
+        for (auto it = lo; it != hi; ++it)
+            if (params_same_(*it->second, p)) return it->second;
+        params_own_.push_back(std::make_unique<const AlignParams>(p));
+        const AlignParams* q = params_own_.back().get();
+        params_idx_.emplace(h, q);
+        return q;
+    }
+    // Free the copies no segment points at any more (after set_params*).
+    void drop_unused_params_() {
+        std::vector<const AlignParams*> used;
+        used.reserve(segs_.size());
+        for (const auto& s : segs_) used.push_back(s.params);
+        std::sort(used.begin(), used.end());
+        auto in_use = [&](const AlignParams* q) { return std::binary_search(used.begin(), used.end(), q); };
+        for (auto it = params_idx_.begin(); it != params_idx_.end();)
+            it = in_use(it->second) ? std::next(it) : params_idx_.erase(it);
+        std::erase_if(params_own_, [&](const auto& u) { return !in_use(u.get()); });
+    }
 
     BatchSettings s_;
     GradMode grad_mode_;

@@ -2,11 +2,11 @@
 //
 // The header documents alignment() as part of the public pipeline, but nothing
 // called it: the Python bindings expose the gapped *strings* (aligned()), and no
-// test touched the index-pair form.  Its whole affine traceback
-// (traceback_affine -> traceback_affine_impl) was therefore dead to the suite.
+// test touched the index-pair form.  Its whole affine traceback (then a walk of its
+// own) was therefore dead to the suite.
 //
-// The two tracebacks are separate implementations of the same walk, so the
-// strongest check is to hold them against each other: the index pairs from
+// The two forms now share one walk (walk_affine) but are separate consumers of it,
+// so the check still holds them against each other: the index pairs from
 // alignment() must be exactly the non-gap columns of aligned().
 
 #include "catch.hpp"

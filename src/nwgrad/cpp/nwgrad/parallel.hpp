@@ -12,6 +12,28 @@
 #if defined(__APPLE__)
 #  include <sys/sysctl.h>
 #endif
+#if defined(__linux__)
+#  include <sched.h>
+#endif
+
+// The CPU ids this process may run on (Linux: its affinity mask, so taskset, cpusets
+// and container pinning are respected, and ids need not be contiguous); empty when
+// unknown, and always empty elsewhere.
+inline std::vector<int> allowed_cpus() noexcept {
+    std::vector<int> ids;
+#if defined(__linux__)
+    try {
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        if (sched_getaffinity(0, sizeof set, &set) == 0)
+            for (int i = 0; i < CPU_SETSIZE; ++i)
+                if (CPU_ISSET(i, &set)) ids.push_back(i);
+    } catch (...) {
+        ids.clear();
+    }
+#endif
+    return ids;
+}
 
 // Number of PHYSICAL cores, or 0 if it cannot be determined.
 //
@@ -44,9 +66,14 @@ inline int physical_cores() noexcept {
 #if defined(__linux__)
         // Count distinct (package, core) pairs.  Unprivileged; absent in some
         // containers and on some VMs, in which case we fall through to 0.
+        // Only CPUs in the affinity mask count: under `taskset -c 0` this is 1, not the
+        // host's core count.
         std::set<std::pair<int, int>> cores;
-        unsigned int hw = std::thread::hardware_concurrency();
-        for (unsigned int i = 0; i < hw; ++i) {
+        std::vector<int> ids = allowed_cpus();
+        if (ids.empty())
+            for (unsigned int i = 0; i < std::thread::hardware_concurrency(); ++i)
+                ids.push_back(static_cast<int>(i));
+        for (int i : ids) {
             const std::string base =
                 "/sys/devices/system/cpu/cpu" + std::to_string(i) + "/topology/";
             std::ifstream pkg(base + "physical_package_id");
@@ -67,11 +94,15 @@ inline int physical_cores() noexcept {
     return 0;
 }
 
-// Physical cores if discoverable, else the logical count, else 1.
+// Physical cores (among the CPUs this process may use) if discoverable, else the
+// allowed logical count, else hardware_concurrency(), else 1.  Computed once: a later
+// change of affinity is not seen.
 inline int default_thread_count() noexcept {
     static const int cached = [] {
         int p = physical_cores();
         if (p > 0) return p;
+        const size_t allowed = allowed_cpus().size();
+        if (allowed > 0) return static_cast<int>(allowed);
         unsigned int hw = std::thread::hardware_concurrency();
         return hw > 0 ? static_cast<int>(hw) : 1;
     }();

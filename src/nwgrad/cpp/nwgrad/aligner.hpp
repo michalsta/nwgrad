@@ -219,6 +219,15 @@ struct Aligner {
     // tables inside DpBufferT<T> are double regardless of T.
     using DpBuffer = DpBufferT<T>;
 
+    // Not copyable: a_idx_/b_idx_ and blkT_ may point into this aligner's own vectors
+    // (a_own_, b_own_, blkT_storage_), which a copy duplicates without re-aiming them.
+    // Moving keeps each vector's heap buffer, so the pointers stay valid.
+    Aligner() = default;
+    Aligner(const Aligner&) = delete;
+    Aligner& operator=(const Aligner&) = delete;
+    Aligner(Aligner&&) = default;
+    Aligner& operator=(Aligner&&) = default;
+
     // ── Public pipeline API — own internal buffer ─────────────────────────────
 
     // Convenience: take characters, validate and encode them against the params'
@@ -231,9 +240,12 @@ struct Aligner {
                      const AlignParams& params,
                      int band = 0,
                      std::vector<int> guide_j = {}) {
+        // Encode both before touching a_own_/b_own_: a bad character in B must not
+        // free A's codes under the previous problem's spans.
         const Alphabet& alpha = params.matrix.alphabet();
-        a_own_ = alpha.encode(a);
-        b_own_ = alpha.encode(b);
+        std::vector<uint8_t> ea = alpha.encode(a), eb = alpha.encode(b);
+        a_own_ = std::move(ea);
+        b_own_ = std::move(eb);
         set_problem(std::span<const uint8_t>(a_own_),
                     std::span<const uint8_t>(b_own_),
                     params, band, std::move(guide_j));
@@ -275,10 +287,15 @@ struct Aligner {
         n_      = static_cast<int>(b.size());
         stride_ = static_cast<size_t>(n_ + 1);
         sz_     = static_cast<size_t>(m_ + 1) * stride_;
+        // Checked for Full too: the entry points pick GuideBanded only for band > 0, so
+        // a negative band would otherwise slip through as a full DP.
+        if (band_ < 0)
+            throw std::invalid_argument(
+                "nwgrad: band must be >= 0, got " + std::to_string(band_));
+        // Every guide entry is in [0, n], so a band >= n already covers whole rows;
+        // clamping keeps guide_j_[i] + band_ (jhi/jhi0) from overflowing int.
+        if (band_ > n_) band_ = n_;
         if constexpr (AB == AlignBand::GuideBanded) {
-            if (band_ < 0)
-                throw std::invalid_argument(
-                    "nwgrad: band must be >= 0, got " + std::to_string(band_));
             if (guide_j.empty()) {
                 guide_j_.resize(static_cast<size_t>(m_ + 1));
                 if (m_ > 0)
@@ -525,9 +542,6 @@ struct Aligner {
     std::vector<int> guide_j_from_viterbi(const DpBuffer& buf) const {
         // Hirschberg holds the path itself, so there is nothing to walk back — replay it.
         if (hirschberg_) return guide_j_affine_hb();   // the move list is gap-model free
-        if (pointers_) {
-            if constexpr (GM == GapModel::Affine) return guide_j_affine_ptr(buf);
-        }
         if constexpr (GM == GapModel::Linear) return guide_j_linear(buf);
         else                                   return guide_j_affine(buf);
     }
@@ -549,11 +563,11 @@ struct Aligner {
     }
 
     // guide_j_from_viterbi(buf) and hard_grad(buf, grad) in one traceback walk where
-    // the path is read from score tables (affine, not Pointers or Hirschberg); two walks
-    // otherwise.  Same guide, same gradient either way.
+    // the path is walked back over the DP's own record (affine, scores or Pointers); two
+    // walks otherwise (linear, Hirschberg).  Same guide, same gradient either way.
     void hard_grad_and_guide(const DpBuffer& buf, AlignParams& grad, std::vector<int>& gj) const {
         if constexpr (GM == GapModel::Affine) {
-            if (!hirschberg_ && !pointers_) { hard_grad_affine(buf, grad, &gj); return; }
+            if (!hirschberg_) { hard_grad_affine(buf, grad, &gj); return; }
         }
         gj = guide_j_from_viterbi(buf);
         hard_grad(buf, grad);
@@ -564,7 +578,6 @@ struct Aligner {
             if (hirschberg_) { hard_grad_linear_hb(grad); return; }
         if constexpr (GM == GapModel::Affine) {
             if (hirschberg_) { hard_grad_affine_hb(grad); return; }
-            if (pointers_)   { hard_grad_affine_ptr(buf, grad); return; }
         }
         if constexpr (GM == GapModel::Linear) hard_grad_linear(buf, grad);
         else                                   hard_grad_affine(buf, grad);
@@ -1134,137 +1147,170 @@ private:
         }
     }
 
-    // ── variant-B tracebacks: read the recorded predecessor, do not re-derive ──
+    // ── The affine traceback: one walk, every consumer ───────────────────────
     //
-    // These mirror guide_j_affine()/hard_grad_affine() step for step; the only
-    // change is where the predecessor comes from.  The forward pass recorded it
-    // with the same `>=` M>X>Y chain those functions run, so the walk is identical
-    // — including at ties, which is the property Hirschberg could not offer.
-    // Directions live in whatever layout the fill used -- row-major from the scalar
-    // B fill, striped from the leveled B kernel -- so index them through the same
-    // cell_index() the score tables use.  One copy of the striping arithmetic, not two.
+    // Directions (Pointers, variant B) live in whatever layout the fill used -- row-major
+    // from the scalar B fill, striped from the leveled B kernel -- so index them through
+    // the same cell_index() the score tables use.  One copy of the striping arithmetic.
     unsigned char dcode(const BVec& d, int i, int j) const noexcept {
         return d[cell_index(i, j)];
     }
 
-    std::vector<int> guide_j_affine_ptr(const DpBuffer& buf) const {
-        std::vector<int> gj(static_cast<size_t>(m_ + 1), -1);
-        gj[0] = 0;
-        gj[static_cast<size_t>(m_)] = n_;
-        int i = best_i_, j = best_j_;
-        TBTable tbl = best_tbl_;
-        gj[static_cast<size_t>(i)] = j;
-        while (true) {
-            if (i == 0 && j == 0) break;
-            if constexpr (AM == AlignMode::Local)
-                if (tbl == TBTable::M && dcode(buf.DM, i, j) == 3) break;
-            // Same border guard as the score-table walks — see the note there.
-            if      (i == 0) tbl = TBTable::Y;
-            else if (j == 0) tbl = TBTable::X;
-            unsigned char c;
-            if (tbl == TBTable::M) {
-                c = dcode(buf.DM, i, j); --i; --j; gj[static_cast<size_t>(i)] = j;
-            } else if (tbl == TBTable::X) {
-                c = dcode(buf.DX, i, j); --i; gj[static_cast<size_t>(i)] = j;
-            } else {
-                c = dcode(buf.DY, i, j); --j;
-            }
-            tbl = (c == 1) ? TBTable::X : (c == 2 ? TBTable::Y : TBTable::M);
-        }
-        fill_guide_gaps(gj);
-        return gj;
+    // emit(s, i, j, open) for each move out of (i, j), from the optimum back to the
+    // start: s = M diagonal to (i-1, j-1), X up to (i-1, j) (gap in B), Y left to
+    // (i, j-1) (gap in A); `open` is true when that gap move opens its run (the state
+    // it came from is not the same gap), always false for M.  The predecessor state is
+    // read from the code the fill recorded (pointers_) or re-derived from VM/VX/VY by
+    // the same `>=` M>X>Y chain the fill ran, in the same T-precision penalties, so the
+    // two walks take the same steps, ties included -- the property Hirschberg cannot
+    // offer.  VM/VX/VY share one layout, so a move indexes its predecessor cell once
+    // (cell_index costs a division in the striped layout) and reads all three there.  (This replaced six hand-written copies of the walk -- guide, gradient,
+    // aligned strings and path, each over codes or scores -- whose border fixes had to
+    // be made in every copy, and once were not: a missing pointers branch segfaulted.)
+    //
+    // Global borders: on row 0 or column 0 one move remains all the way to the origin,
+    // so the rest of the path is one leading gap run, opened at its last move, out of
+    // M(0,0).  It is emitted without reading the tables, because a guide band need not
+    // cover the border: guide_j[0] is where the old path LEFT row 0, so after a long
+    // leading gap the band misses the origin, and stepping read cells never initialised
+    // for this pair (stale data from the thread's previous one: banded_grad gap-open
+    // counts that changed with the thread count).  It is the walk a Full DP's border
+    // values give (VY(0,k) extends from VY(0,k-1) back to (0,1), which opens), and
+    // exactly the codes viterbi_affine_ptr records there.
+    //
+    // Local borders are free starts: the M stop ends the walk there.  The forced moves
+    // below remain for a GuideBanded band narrower than the path needs: the band can
+    // fail to admit any route back to the origin, leaving every predecessor at -inf.
+    // The M>=X>=Y tie-break then picks M, and M steps DIAGONALLY -- so i or j goes
+    // negative, cell_index() turns that into a huge size_t, and the walk reads off the
+    // end of the table.  That was a segfault, not a suboptimal score (realign_banded:
+    // "A"*22 vs "C"*87 at band<=32).  At a border only one move is legal; forcing it is
+    // what a well-formed DP would have chosen anyway.
+    template <class Emit>
+    void walk_affine(const DpBuffer& buf, Emit&& emit) const {
+        if (pointers_) walk_affine_impl<true>(buf, emit);
+        else           walk_affine_impl<false>(buf, emit);
     }
 
-    void hard_grad_affine_ptr(const DpBuffer& buf, AlignParams& grad) const {
-        double* gblk = grad_block(grad);
-        int i = best_i_, j = best_j_;
-        TBTable tbl = best_tbl_;
-        while (true) {
-            if (i == 0 && j == 0) break;
-            if constexpr (AM == AlignMode::Local)
-                if (tbl == TBTable::M && dcode(buf.DM, i, j) == 3) break;
-            // Same border guard as the score-table walks — see the note there.
-            if      (i == 0) tbl = TBTable::Y;
-            else if (j == 0) tbl = TBTable::X;
-            unsigned char c;
-            if (tbl == TBTable::M) {
-                gblk[sub_off(i, j)] += 1.0;
-                c = dcode(buf.DM, i, j); --i; --j;
-                tbl = (c == 1) ? TBTable::X : (c == 2 ? TBTable::Y : TBTable::M);
-            } else if (tbl == TBTable::X) {
-                grad.gap_extend_b -= 1.0;
-                c = dcode(buf.DX, i, j); --i;
-                const TBTable prev = (c == 1) ? TBTable::X : (c == 2 ? TBTable::Y : TBTable::M);
-                if (prev != TBTable::X) grad.gap_open_b -= 1.0;
-                tbl = prev;
-            } else {
-                grad.gap_extend_a -= 1.0;
-                c = dcode(buf.DY, i, j); --j;
-                const TBTable prev = (c == 1) ? TBTable::X : (c == 2 ? TBTable::Y : TBTable::M);
-                if (prev != TBTable::Y) grad.gap_open_a -= 1.0;
-                tbl = prev;
-            }
-        }
-    }
-
-    std::vector<int> guide_j_affine(const DpBuffer& buf) const {
-        std::vector<int> gj(static_cast<size_t>(m_ + 1), -1);
-        gj[0] = 0;
-        gj[static_cast<size_t>(m_)] = n_;
-
-        int i = best_i_, j = best_j_;
-        TBTable tbl = best_tbl_;
-        gj[static_cast<size_t>(i)] = j;
+    template <bool Ptr, class Emit>
+    void walk_affine_impl(const DpBuffer& buf, Emit& emit) const {
+        auto from_code = [](unsigned char c) {
+            return c == 1 ? TBTable::X : (c == 2 ? TBTable::Y : TBTable::M);
+        };
+        auto argmax = [](T vm, T vx, T vy) {
+            if (vm >= vx && vm >= vy) return TBTable::M;
+            return vx >= vy ? TBTable::X : TBTable::Y;
+        };
         const T go_a = static_cast<T>(params_->gap_open_a);
         const T ge_a = static_cast<T>(params_->gap_extend_a);
         const T go_b = static_cast<T>(params_->gap_open_b);
         const T ge_b = static_cast<T>(params_->gap_extend_b);
 
+        int i = best_i_, j = best_j_;
+        TBTable tbl = best_tbl_;
         while (true) {
             if (i == 0 && j == 0) break;
-            if constexpr (AM == AlignMode::Local)
-                if (tbl == TBTable::M && rat(buf.VM, i, j) <= 0.0) break;
-            // GuideBanded with a band narrower than the path needs: the band can fail
-            // to admit any route back to the origin, leaving every predecessor at
-            // -inf.  The M>=X>=Y tie-break then picks M, and M steps DIAGONALLY — so
-            // i or j goes negative, cell_index() turns that into a huge size_t, and
-            // the walk reads off the end of the table.  That was a segfault, not a
-            // suboptimal score (realign_banded: "A"*22 vs "C"*87 at band<=32).
-            // At a border only one move is legal; forcing it is what a well-formed
-            // DP would have chosen anyway, so valid alignments are unaffected.
+            if constexpr (AM == AlignMode::Local) {
+                if (tbl == TBTable::M) {
+                    if constexpr (Ptr) { if (dcode(buf.DM, i, j) == 3) break; }
+                    else               { if (rat(buf.VM, i, j) <= 0.0) break; }
+                }
+            } else {
+                if (i == 0) { for (; j > 0; --j) emit(TBTable::Y, 0, j, j == 1); break; }
+                if (j == 0) { for (; i > 0; --i) emit(TBTable::X, i, 0, i == 1); break; }
+            }
             if      (i == 0) tbl = TBTable::Y;   // row 0: only leftward moves remain
             else if (j == 0) tbl = TBTable::X;   // col 0: only upward moves remain
 
+            TBTable prev;
             if (tbl == TBTable::M) {
-                T vm = rat(buf.VM,i-1,j-1), vx = rat(buf.VX,i-1,j-1), vy = rat(buf.VY,i-1,j-1);
+                if constexpr (Ptr) prev = from_code(dcode(buf.DM, i, j));
+                else { const size_t k = cell_index(i-1, j-1);
+                       prev = argmax(buf.VM[k], buf.VX[k], buf.VY[k]); }
+                emit(TBTable::M, i, j, false);
                 --i; --j;
-                gj[static_cast<size_t>(i)] = j;
-                if      (vm >= vx && vm >= vy) tbl = TBTable::M;
-                else if (vx >= vy)             tbl = TBTable::X;
-                else                            tbl = TBTable::Y;
-            } else if (tbl == TBTable::X) {
-                // X state: gap in B (advance i), uses gap_b params
-                T fm = rat(buf.VM,i-1,j) - go_b - ge_b;
-                T fx = rat(buf.VX,i-1,j)        - ge_b;
-                T fy = rat(buf.VY,i-1,j) - go_b - ge_b;
+            } else if (tbl == TBTable::X) {   // gap in B: advance i, gap_b penalties
+                if constexpr (Ptr) prev = from_code(dcode(buf.DX, i, j));
+                else { const size_t k = cell_index(i-1, j);
+                       prev = argmax(buf.VM[k] - go_b - ge_b,
+                                     buf.VX[k]        - ge_b,
+                                     buf.VY[k] - go_b - ge_b); }
+                emit(TBTable::X, i, j, prev != TBTable::X);
                 --i;
-                gj[static_cast<size_t>(i)] = j;
-                if      (fm >= fx && fm >= fy) tbl = TBTable::M;
-                else if (fx >= fy)             tbl = TBTable::X;
-                else                            tbl = TBTable::Y;
-            } else {
-                // Y state: gap in A (advance j), uses gap_a params
-                T fm = rat(buf.VM,i,j-1) - go_a - ge_a;
-                T fx = rat(buf.VX,i,j-1) - go_a - ge_a;
-                T fy = rat(buf.VY,i,j-1)        - ge_a;
-                --j;  // gap in a: i stays, no gj update
-                if      (fm >= fx && fm >= fy) tbl = TBTable::M;
-                else if (fx >= fy)             tbl = TBTable::X;
-                else                            tbl = TBTable::Y;
+            } else {                          // gap in A: advance j, gap_a penalties
+                if constexpr (Ptr) prev = from_code(dcode(buf.DY, i, j));
+                else { const size_t k = cell_index(i, j-1);
+                       prev = argmax(buf.VM[k] - go_a - ge_a,
+                                     buf.VX[k] - go_a - ge_a,
+                                     buf.VY[k]        - ge_a); }
+                emit(TBTable::Y, i, j, prev != TBTable::Y);
+                --j;
             }
+            tbl = prev;
         }
+    }
+
+    // gj[i] = the column after consuming i residues of A: set by M and X moves (Y moves
+    // stay in the row), the end cell, row 0 and row m; fill_guide_gaps interpolates the
+    // rows a Local path does not cover.
+    void guide_affine_init(std::vector<int>& gj) const {
+        gj.assign(static_cast<size_t>(m_ + 1), -1);
+        gj[0] = 0;
+        gj[static_cast<size_t>(m_)] = n_;
+        gj[static_cast<size_t>(best_i_)] = best_j_;
+    }
+
+    std::vector<int> guide_j_affine(const DpBuffer& buf) const {
+        std::vector<int> gj;
+        guide_affine_init(gj);
+        walk_affine(buf, [&](TBTable s, int i, int j, bool) {
+            if      (s == TBTable::M) gj[static_cast<size_t>(i - 1)] = j - 1;
+            else if (s == TBTable::X) gj[static_cast<size_t>(i - 1)] = j;
+        });
         fill_guide_gaps(gj);
         return gj;
+    }
+
+    // gj != nullptr: also record the guide path in the same walk.  Each gap move charges
+    // one extend, plus one open if it opens its run; the score subtracts penalties, so
+    // the gap fields count down (see the sign convention).
+    void hard_grad_affine(const DpBuffer& buf, AlignParams& grad,
+                          std::vector<int>* gj = nullptr) const {
+        double* gblk = grad_block(grad);
+        if (gj) guide_affine_init(*gj);
+        walk_affine(buf, [&](TBTable s, int i, int j, bool open) {
+            if (s == TBTable::M) {
+                gblk[sub_off(i, j)] += 1.0;
+                if (gj) (*gj)[static_cast<size_t>(i - 1)] = j - 1;
+            } else if (s == TBTable::X) {
+                grad.gap_extend_b -= 1.0;
+                if (open) grad.gap_open_b -= 1.0;
+                if (gj) (*gj)[static_cast<size_t>(i - 1)] = j;
+            } else {
+                grad.gap_extend_a -= 1.0;
+                if (open) grad.gap_open_a -= 1.0;
+            }
+        });
+        if (gj) fill_guide_gaps(*gj);
+    }
+
+    void aligned_affine(const DpBuffer& buf, std::string& a, std::string& b) const {
+        walk_affine(buf, [&](TBTable s, int i, int j, bool) {
+            a.push_back(s == TBTable::Y ? '-' : sym_a(i));
+            b.push_back(s == TBTable::X ? '-' : sym_b(j));
+        });
+        std::reverse(a.begin(), a.end());
+        std::reverse(b.begin(), b.end());
+    }
+
+    // The aligned residue pairs (0-based), start to end.
+    std::vector<std::pair<int,int>> traceback_affine(const DpBuffer& buf) const {
+        std::vector<std::pair<int,int>> path;
+        walk_affine(buf, [&](TBTable s, int i, int j, bool) {
+            if (s == TBTable::M) path.emplace_back(i - 1, j - 1);
+        });
+        std::reverse(path.begin(), path.end());
+        return path;
     }
 
     // ── Backend dispatch ──────────────────────────────────────────────────────
@@ -2607,268 +2653,6 @@ private:
         } else {
             viterbi_score_ = best_local;
         }
-    }
-
-    template<typename EmitFn>
-    void traceback_affine_impl(const DpBuffer& buf, EmitFn&& emit) const {
-        int i = best_i_, j = best_j_;
-        TBTable tbl = best_tbl_;
-        // Variant B retains predecessor codes, not score tables — reading VM/VX/VY
-        // below would walk off an unallocated vector.  (It did: align_full() +
-        // aligned() segfaulted before this branch existed.)
-        if (pointers_) {
-            while (true) {
-                if (i == 0 && j == 0) break;
-                if constexpr (AM == AlignMode::Local)
-                    if (tbl == TBTable::M && dcode(buf.DM, i, j) == 3) break;
-                // Same border guard as the score-table walks — see the note there.
-                if      (i == 0) tbl = TBTable::Y;
-                else if (j == 0) tbl = TBTable::X;
-                unsigned char c;
-                if (tbl == TBTable::M) {
-                    emit(i - 1, j - 1);
-                    c = dcode(buf.DM, i, j); --i; --j;
-                } else if (tbl == TBTable::X) {
-                    c = dcode(buf.DX, i, j); --i;
-                } else {
-                    c = dcode(buf.DY, i, j); --j;
-                }
-                tbl = (c == 1) ? TBTable::X : (c == 2 ? TBTable::Y : TBTable::M);
-            }
-            return;
-        }
-        // Same T-precision penalties as the forward pass, so the predecessor argmax
-        // re-derived here reproduces the branch the fill took, bit for bit.
-        const T go_a = static_cast<T>(params_->gap_open_a);
-        const T ge_a = static_cast<T>(params_->gap_extend_a);
-        const T go_b = static_cast<T>(params_->gap_open_b);
-        const T ge_b = static_cast<T>(params_->gap_extend_b);
-
-        while (true) {
-            if (i == 0 && j == 0) break;
-            if constexpr (AM == AlignMode::Local)
-                if (tbl == TBTable::M && rat(buf.VM, i, j) <= 0.0) break;
-            // GuideBanded with a band narrower than the path needs: the band can fail
-            // to admit any route back to the origin, leaving every predecessor at
-            // -inf.  The M>=X>=Y tie-break then picks M, and M steps DIAGONALLY — so
-            // i or j goes negative, cell_index() turns that into a huge size_t, and
-            // the walk reads off the end of the table.  That was a segfault, not a
-            // suboptimal score (realign_banded: "A"*22 vs "C"*87 at band<=32).
-            // At a border only one move is legal; forcing it is what a well-formed
-            // DP would have chosen anyway, so valid alignments are unaffected.
-            if      (i == 0) tbl = TBTable::Y;   // row 0: only leftward moves remain
-            else if (j == 0) tbl = TBTable::X;   // col 0: only upward moves remain
-
-            if (tbl == TBTable::M) {
-                emit(i-1, j-1);
-                T vm = rat(buf.VM,i-1,j-1), vx = rat(buf.VX,i-1,j-1), vy = rat(buf.VY,i-1,j-1);
-                --i; --j;
-                if      (vm >= vx && vm >= vy) tbl = TBTable::M;
-                else if (vx >= vy)             tbl = TBTable::X;
-                else                            tbl = TBTable::Y;
-            } else if (tbl == TBTable::X) {
-                T fm = rat(buf.VM,i-1,j) - go_b - ge_b;
-                T fx = rat(buf.VX,i-1,j)        - ge_b;
-                T fy = rat(buf.VY,i-1,j) - go_b - ge_b;
-                --i;
-                if      (fm >= fx && fm >= fy) tbl = TBTable::M;
-                else if (fx >= fy)             tbl = TBTable::X;
-                else                            tbl = TBTable::Y;
-            } else {
-                T fm = rat(buf.VM,i,j-1) - go_a - ge_a;
-                T fx = rat(buf.VX,i,j-1) - go_a - ge_a;
-                T fy = rat(buf.VY,i,j-1)        - ge_a;
-                --j;
-                if      (fm >= fx && fm >= fy) tbl = TBTable::M;
-                else if (fx >= fy)             tbl = TBTable::X;
-                else                            tbl = TBTable::Y;
-            }
-        }
-    }
-
-    std::vector<std::pair<int,int>> traceback_affine(const DpBuffer& buf) const {
-        std::vector<std::pair<int,int>> path;
-        traceback_affine_impl(buf, [&](int i, int j) { path.emplace_back(i, j); });
-        std::reverse(path.begin(), path.end());
-        return path;
-    }
-
-    void aligned_affine(const DpBuffer& buf, std::string& a, std::string& b) const {
-        int i = best_i_, j = best_j_;
-        TBTable tbl = best_tbl_;
-        // Pointers: no score tables to read.  (This is the FOURTH copy of this walk
-        // in the file — guide_j, hard_grad, traceback_impl and here — and missing it
-        // was a segfault, not a wrong answer, because B leaves VM/VX/VY unallocated.)
-        if (pointers_) {
-            while (true) {
-                if (i == 0 && j == 0) break;
-                if constexpr (AM == AlignMode::Local)
-                    if (tbl == TBTable::M && dcode(buf.DM, i, j) == 3) break;
-                // Same border guard as the score-table walks — see the note there.
-                if      (i == 0) tbl = TBTable::Y;
-                else if (j == 0) tbl = TBTable::X;
-                unsigned char c;
-                if (tbl == TBTable::M) {
-                    a.push_back(sym_a(i)); b.push_back(sym_b(j));
-                    c = dcode(buf.DM, i, j); --i; --j;
-                } else if (tbl == TBTable::X) {
-                    a.push_back(sym_a(i)); b.push_back('-');
-                    c = dcode(buf.DX, i, j); --i;
-                } else {
-                    a.push_back('-'); b.push_back(sym_b(j));
-                    c = dcode(buf.DY, i, j); --j;
-                }
-                tbl = (c == 1) ? TBTable::X : (c == 2 ? TBTable::Y : TBTable::M);
-            }
-            std::reverse(a.begin(), a.end());
-            std::reverse(b.begin(), b.end());
-            return;
-        }
-        const T go_a = static_cast<T>(params_->gap_open_a);
-        const T ge_a = static_cast<T>(params_->gap_extend_a);
-        const T go_b = static_cast<T>(params_->gap_open_b);
-        const T ge_b = static_cast<T>(params_->gap_extend_b);
-
-        while (true) {
-            if (i == 0 && j == 0) break;
-            if constexpr (AM == AlignMode::Local)
-                if (tbl == TBTable::M && rat(buf.VM, i, j) <= 0.0) break;
-            // GuideBanded with a band narrower than the path needs: the band can fail
-            // to admit any route back to the origin, leaving every predecessor at
-            // -inf.  The M>=X>=Y tie-break then picks M, and M steps DIAGONALLY — so
-            // i or j goes negative, cell_index() turns that into a huge size_t, and
-            // the walk reads off the end of the table.  That was a segfault, not a
-            // suboptimal score (realign_banded: "A"*22 vs "C"*87 at band<=32).
-            // At a border only one move is legal; forcing it is what a well-formed
-            // DP would have chosen anyway, so valid alignments are unaffected.
-            if      (i == 0) tbl = TBTable::Y;   // row 0: only leftward moves remain
-            else if (j == 0) tbl = TBTable::X;   // col 0: only upward moves remain
-
-            if (tbl == TBTable::M) {
-                a.push_back(sym_a(i)); b.push_back(sym_b(j));
-                T vm = rat(buf.VM,i-1,j-1), vx = rat(buf.VX,i-1,j-1), vy = rat(buf.VY,i-1,j-1);
-                --i; --j;
-                if      (vm >= vx && vm >= vy) tbl = TBTable::M;
-                else if (vx >= vy)             tbl = TBTable::X;
-                else                            tbl = TBTable::Y;
-            } else if (tbl == TBTable::X) {
-                a.push_back(sym_a(i)); b.push_back('-');  // gap in B
-                T fm = rat(buf.VM,i-1,j) - go_b - ge_b;
-                T fx = rat(buf.VX,i-1,j)        - ge_b;
-                T fy = rat(buf.VY,i-1,j) - go_b - ge_b;
-                --i;
-                if      (fm >= fx && fm >= fy) tbl = TBTable::M;
-                else if (fx >= fy)             tbl = TBTable::X;
-                else                            tbl = TBTable::Y;
-            } else {
-                a.push_back('-'); b.push_back(sym_b(j));  // gap in A
-                T fm = rat(buf.VM,i,j-1) - go_a - ge_a;
-                T fx = rat(buf.VX,i,j-1) - go_a - ge_a;
-                T fy = rat(buf.VY,i,j-1)        - ge_a;
-                --j;
-                if      (fm >= fx && fm >= fy) tbl = TBTable::M;
-                else if (fx >= fy)             tbl = TBTable::X;
-                else                            tbl = TBTable::Y;
-            }
-        }
-        std::reverse(a.begin(), a.end());
-        std::reverse(b.begin(), b.end());
-    }
-
-    // gj != nullptr: also record the guide path, exactly as guide_j_affine() would —
-    // the two walks take the same steps — so one walk serves both.
-    void hard_grad_affine(const DpBuffer& buf, AlignParams& grad,
-                          std::vector<int>* gj = nullptr) const {
-        double* gblk = grad_block(grad);
-        int i = best_i_, j = best_j_;
-        TBTable tbl = best_tbl_;
-        if (gj) {
-            gj->assign(static_cast<size_t>(m_ + 1), -1);
-            (*gj)[0] = 0;
-            (*gj)[static_cast<size_t>(m_)] = n_;
-            (*gj)[static_cast<size_t>(i)] = j;
-        }
-        // T-precision penalties for the predecessor argmax; the gradient counts
-        // themselves accumulate into the double grad block, exact for integer counts.
-        const T go_a = static_cast<T>(params_->gap_open_a);
-        const T ge_a = static_cast<T>(params_->gap_extend_a);
-        const T go_b = static_cast<T>(params_->gap_open_b);
-        const T ge_b = static_cast<T>(params_->gap_extend_b);
-
-        while (true) {
-            if (i == 0 && j == 0) break;
-            if constexpr (AM == AlignMode::Local)
-                if (tbl == TBTable::M && rat(buf.VM, i, j) <= 0.0) break;
-            if constexpr (AM == AlignMode::Global) {
-                // On row 0 or column 0 one move remains all the way to the origin: the
-                // path ends in a single leading gap run, which is one open and i or j
-                // extends — exactly what stepping through the Full DP's border values
-                // counts.  Counted directly because a guide band need not cover the
-                // border: guide_j[0] is where the old path LEFT row 0, so after a long
-                // leading gap the band misses the origin, and stepping read cells never
-                // initialised for this pair (stale data from the thread's previous one:
-                // banded_grad gap-open counts that changed with the thread count).
-                if (i == 0) {
-                    grad.gap_extend_a -= static_cast<double>(j);
-                    grad.gap_open_a   -= 1.0;   // (moves along row 0 add no guide entry)
-                    break;
-                }
-                if (j == 0) {
-                    grad.gap_extend_b -= static_cast<double>(i);
-                    grad.gap_open_b   -= 1.0;
-                    if (gj) for (int r = i - 1; r >= 0; --r) (*gj)[static_cast<size_t>(r)] = 0;  // as the X steps would
-                    break;
-                }
-            }
-            // GuideBanded with a band narrower than the path needs: the band can fail
-            // to admit any route back to the origin, leaving every predecessor at
-            // -inf.  The M>=X>=Y tie-break then picks M, and M steps DIAGONALLY — so
-            // i or j goes negative, cell_index() turns that into a huge size_t, and
-            // the walk reads off the end of the table.  That was a segfault, not a
-            // suboptimal score (realign_banded: "A"*22 vs "C"*87 at band<=32).
-            // At a border only one move is legal; forcing it is what a well-formed
-            // DP would have chosen anyway, so valid alignments are unaffected.
-            if      (i == 0) tbl = TBTable::Y;   // row 0: only leftward moves remain
-            else if (j == 0) tbl = TBTable::X;   // col 0: only upward moves remain
-
-            if (tbl == TBTable::M) {
-                gblk[sub_off(i, j)] += 1.0;
-                T vm = rat(buf.VM,i-1,j-1), vx = rat(buf.VX,i-1,j-1), vy = rat(buf.VY,i-1,j-1);
-                --i; --j;
-                if (gj) (*gj)[static_cast<size_t>(i)] = j;
-                if      (vm >= vx && vm >= vy) tbl = TBTable::M;
-                else if (vx >= vy)             tbl = TBTable::X;
-                else                            tbl = TBTable::Y;
-            } else if (tbl == TBTable::X) {
-                // X state: gap in B (advance i), uses gap_b params
-                grad.gap_extend_b -= 1.0;   // the score subtracts this penalty
-                T fm = rat(buf.VM,i-1,j) - go_b - ge_b;
-                T fx = rat(buf.VX,i-1,j)        - ge_b;
-                T fy = rat(buf.VY,i-1,j) - go_b - ge_b;
-                --i;
-                if (gj) (*gj)[static_cast<size_t>(i)] = j;
-                TBTable prev;
-                if      (fm >= fx && fm >= fy) prev = TBTable::M;
-                else if (fx >= fy)             prev = TBTable::X;
-                else                            prev = TBTable::Y;
-                if (prev != TBTable::X) grad.gap_open_b -= 1.0;  // gap opening
-                tbl = prev;
-            } else {
-                // Y state: gap in A (advance j), uses gap_a params
-                grad.gap_extend_a -= 1.0;
-                T fm = rat(buf.VM,i,j-1) - go_a - ge_a;
-                T fx = rat(buf.VX,i,j-1) - go_a - ge_a;
-                T fy = rat(buf.VY,i,j-1)        - ge_a;
-                --j;
-                TBTable prev;
-                if      (fm >= fx && fm >= fy) prev = TBTable::M;
-                else if (fx >= fy)             prev = TBTable::X;
-                else                            prev = TBTable::Y;
-                if (prev != TBTable::Y) grad.gap_open_a -= 1.0;  // gap opening
-                tbl = prev;
-            }
-        }
-        if (gj) fill_guide_gaps(*gj);
     }
 
     // ═════════════════════════════════════════════════════════════════════════
