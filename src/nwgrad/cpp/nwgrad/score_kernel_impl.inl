@@ -246,15 +246,191 @@ static void score_affine_striped(ScoreJob<T>& job) {
     }
 }
 
-// The registered entry: Global or Local, fused (default) or two-pass (job.twopass, set
-// from NWGRAD_SCORE_VARIANT=twopass by the caller, to measure the two in one binary).
+// ── Fused, non-negative opens: the previous row as D = max(M, X, Y) and X only ──
+// With go >= 0 an open from a cell is never above the extension from the same cell
+// ((v - go) - ge <= v - ge, rounding being monotone), so X's open may be offered every
+// state of the cell above: X = max((D_up - go_b) - ge_b, X_up - ge_b) — the same maximum
+// as the three-operand form — and the diagonal is D(i-1, j-1).  The previous row needs D
+// and X only; the current row still writes Y, which lazy-F corrects in place (each
+// correction raises that cell's D too: Y only grows, so D = max(D, v) is exact).  Y's
+// own open stays (max(M, X) - go_a) - ge_a, OFF the loop-carried chain: taking it from D
+// put a max of three and two subtractions on the carry and made the inter-pair form
+// slower than the fill (1.03x) before it was moved back.  MOnly (extends >= 0 too): no
+// gap cell exceeds the cell it extends from, so the Local maximum is over M alone — and
+// M's padding slots are clamped to exactly 0, so they need no mask.
+template <class T, bool Local, bool MOnly>
+static void score_affine_striped_pos(ScoreJob<T>& job) {
+    using vd = stdx::native_simd<T>;
+    const int W = (int)vd::size();
+    const T NINF = -std::numeric_limits<T>::infinity();
+
+    const int m = job.m, n = job.n, nalpha = job.nalpha;
+    const T go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;
+    const unsigned char* a = job.a;
+    const unsigned char* b = job.b;
+    DpBufferT<T>& buf = *job.buf;
+
+    if (n == 0) {
+        if constexpr (Local) job.score = 0.0;
+        else job.score = (m == 0) ? 0.0 : static_cast<double>(-(go_b + static_cast<T>(m) * ge_b));
+        return;
+    }
+
+    const int seg = (n + W - 1) / W;
+    const std::size_t sw = (std::size_t)seg * W;
+    if (buf.sprof.size() < (std::size_t)nalpha * sw) buf.sprof.resize((std::size_t)nalpha * sw);
+    for (auto* v : {&buf.rM, &buf.rX, &buf.rY, &buf.qM, &buf.qX})
+        if (v->size() < sw) v->resize(sw);
+    const T* pad = nullptr;
+    if constexpr (Local && !MOnly) {
+        if (buf.spad.size() < sw) buf.spad.resize(sw);
+        for (int l = 0; l < W; ++l)
+            for (int s = 0; s < seg; ++s)
+                buf.spad[(std::size_t)s * W + l] = (l * seg + s + 1 <= n) ? T(0) : NINF;
+        pad = buf.spad.data();
+    }
+    auto padded = [&](const vd& v, int s) {
+        vd p; p.copy_from(pad + (std::size_t)s * W, stdx::element_aligned);
+        return v + p;
+    };
+
+    for (int c = 0; c < nalpha; ++c) {
+        const T* row = job.blk + (std::size_t)c * nalpha;
+        T* dst = buf.sprof.data() + (std::size_t)c * sw;
+        for (int l = 0; l < W; ++l)
+            for (int s = 0; s < seg; ++s) {
+                const int j = l * seg + s + 1;
+                dst[(std::size_t)s * W + l] = (j <= n) ? row[b[j - 1]] : NINF;
+            }
+    }
+
+    T* pD = buf.qM.data(); T* pX = buf.qX.data();                          // row i-1
+    T* cD = buf.rM.data(); T* cX = buf.rX.data(); T* cY = buf.rY.data();   // row i
+
+    // row 0: D = max(M, X, Y) of the three-state row 0, X = -inf; padding -inf
+    for (std::size_t k = 0; k < sw; ++k) { pD[k] = NINF; pX[k] = NINF; }
+    for (int l = 0; l < W; ++l)
+        for (int s = 0; s < seg; ++s) {
+            const int j = l * seg + s + 1;
+            if (j <= n) {
+                const std::size_t k = (std::size_t)s * W + l;
+                if constexpr (Local) pD[k] = 0;
+                else                 pD[k] = -(go_a + j * ge_a);
+            }
+        }
+
+    const vd vgo_a(go_a), vge_a(ge_a), vgo_b(go_b), vge_b(ge_b);
+    const vd vzero(static_cast<T>(0)), vninf(NINF);
+    vd vbest = vzero;
+    T bD = 0;                               // D of column 0, previous row (M(0,0) = 0)
+
+    auto any_gt = [](const vd& x, const vd& y) -> bool {
+#if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
+        if constexpr (std::is_same_v<T, double>) return avx512d_gt(x, y) != 0;
+        else                                     return stdx::any_of(x > y);
+#else
+        return stdx::any_of(x > y);
+#endif
+    };
+
+    for (int i = 1; i <= m; ++i) {
+        const T nbM = Local ? T(0) : NINF;
+        const T nbX = Local ? NINF : -(go_b + i * ge_b);
+        const T nbD = std::max(nbM, nbX);   // column 0's VY is -inf
+        const T nbOpen = (nbD - go_a) - ge_a;
+        const T* sub = buf.sprof.data() + (std::size_t)a[i - 1] * sw;
+
+        vd Oin([&](int q) { return q == 0 ? nbOpen : NINF; });
+        vd Yin = vninf;
+        for (int s = 0; s < seg; ++s) {
+            vd dD;
+            if (s == 0) {
+                vd lD; lD.copy_from(pD + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                dD = vd([&](int q) { return q == 0 ? bD : lD[q - 1]; });
+            } else {
+                dD.copy_from(pD + (std::size_t)(s - 1) * W, stdx::element_aligned);
+            }
+            vd sb; sb.copy_from(sub + (std::size_t)s * W, stdx::element_aligned);
+            vd vmv = dD + sb;
+            if constexpr (Local) vmv = stdx::max(vmv, vzero);
+            vd uD, uX;
+            uD.copy_from(pD + (std::size_t)s * W, stdx::element_aligned);
+            uX.copy_from(pX + (std::size_t)s * W, stdx::element_aligned);
+            const vd vxv = stdx::max((uD - vgo_b) - vge_b, uX - vge_b);
+            const vd vyv = stdx::max(Oin, Yin - vge_a);
+            const vd mx = stdx::max(vmv, vxv);
+            const vd dn = stdx::max(mx, vyv);
+            vxv.copy_to(cX + (std::size_t)s * W, stdx::element_aligned);
+            vyv.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
+            dn.copy_to(cD + (std::size_t)s * W, stdx::element_aligned);
+            if constexpr (Local) {
+                if constexpr (MOnly) vbest = stdx::max(vbest, vmv);
+                else                 vbest = stdx::max(vbest, padded(dn, s));
+            }
+            Oin = (mx - vgo_a) - vge_a;
+            Yin = vyv;
+        }
+        const vd Olast = Oin;
+
+        for (int r = 0; r < W; ++r) {
+            vd last; last.copy_from(cY + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+            vd F([&](int q) { return q == 0 ? NINF : last[q - 1]; });
+            F = F - vge_a;
+            if (r == 0) {
+                vd Os([&](int q) { return q == 0 ? NINF : Olast[q - 1]; });
+                F = stdx::max(Os, F);
+            }
+            bool changed = false;
+            for (int s = 0; s < seg; ++s) {
+                vd v; v.copy_from(cY + (std::size_t)s * W, stdx::element_aligned);
+                if (!any_gt(F, v)) break;
+                v = stdx::max(v, F);
+                v.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
+                vd d; d.copy_from(cD + (std::size_t)s * W, stdx::element_aligned);
+                d = stdx::max(d, v);
+                d.copy_to(cD + (std::size_t)s * W, stdx::element_aligned);
+                if constexpr (Local && !MOnly) vbest = stdx::max(vbest, padded(v, s));
+                F = v - vge_a;
+                changed = true;
+            }
+            if (!changed) break;
+        }
+
+        std::swap(pD, cD); std::swap(pX, cX);
+        bD = nbD;
+    }
+
+    if constexpr (Local) {
+        T best = 0;
+        for (int q = 0; q < W; ++q) best = std::max(best, static_cast<T>(vbest[q]));
+        job.score = static_cast<double>(best);
+    } else {
+        const std::size_t k = (std::size_t)((n - 1) % seg) * W + (std::size_t)((n - 1) / seg);
+        job.score = static_cast<double>(pD[k]);
+    }
+}
+
+// The registered entry: Global or Local; job.variant 0 = the D/X form when both opens
+// are >= 0 (else fused three-state), 1 = two-pass, 2 = fused three-state (for measuring
+// the forms in one binary; NWGRAD_SCORE_VARIANT=twopass / fused3).
 template <class T>
 static void score_entry(ScoreJob<T>& job) {
-    if (job.twopass) {
+    if (job.variant == 1) {
         if (job.local) score_affine_striped<T, true, false>(job);
         else           score_affine_striped<T, false, false>(job);
-    } else {
-        if (job.local) score_affine_striped<T, true, true>(job);
-        else           score_affine_striped<T, false, true>(job);
+        return;
     }
+    const bool pos_open = job.go_a >= T(0) && job.go_b >= T(0);   // NaN: false
+    if (job.variant == 0 && pos_open) {
+        const bool pos_ext = job.ge_a >= T(0) && job.ge_b >= T(0);
+        if (job.local) {
+            if (pos_ext) score_affine_striped_pos<T, true, true>(job);
+            else         score_affine_striped_pos<T, true, false>(job);
+        } else {
+            score_affine_striped_pos<T, false, false>(job);
+        }
+        return;
+    }
+    if (job.local) score_affine_striped<T, true, true>(job);
+    else           score_affine_striped<T, false, true>(job);
 }

@@ -492,7 +492,7 @@ struct Aligner {
                     job.go_b = lin ? T(0) : static_cast<T>(params_->gap_open_b);
                     job.ge_b = static_cast<T>(params_->gap_extend_b);
                     job.local = AM == AlignMode::Local;
-                    job.twopass = score_twopass_env();
+                    job.variant = score_variant_env();
                     job.buf = &buf;
                     fn(job);
                     return job.score;
@@ -2662,10 +2662,13 @@ private:
         if constexpr (GM == GapModel::Linear) return ext;
         else return ext && p.gap_open_a >= 0.0 && p.gap_open_b >= 0.0;
     }
-    static bool score_twopass_env() {
-        static const bool v = [] {
+    // NWGRAD_SCORE_VARIANT: unset = auto (0), "twopass" (1), "fused3" (2) — for measuring.
+    static int score_variant_env() {
+        static const int v = [] {
             const char* e = std::getenv("NWGRAD_SCORE_VARIANT");
-            return e && std::string_view(e) == "twopass";
+            if (!e) return 0;
+            const std::string_view s(e);
+            return s == "twopass" ? 1 : s == "fused3" ? 2 : 0;
         }();
         return v;
     }

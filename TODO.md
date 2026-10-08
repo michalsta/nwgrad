@@ -121,9 +121,10 @@ branch `scan-fixes` or already gone with the 0.6 restructure. What remains is
 performance work, none of it measured yet; the cost notes are estimates.
 
 - **O1 — score-only: DONE 2026-10-08** (`compute_score`, `score_kernel_impl.inl`, inter-pair
-  `inter_score_*`; see AGENTS.md "Score only").  Left: (a) the per-pair striped kernel's
-  two-row form (D = max(M,X,Y) and X instead of M/X/Y, as `inter_score_affine_pos` — exact
-  for non-negative opens; fewer loads and maxes per cell; est. 15-25 %); (b) float32 on
+  `inter_score_*`; see AGENTS.md "Score only").  (a) DONE 2026-10-08: the per-pair striped
+  kernel's D/X form (`score_affine_striped_pos`, non-negative opens): nighthaven AVX2 vs the
+  three-state fused form 1.0-1.5x at 1 thread, 1.0-1.6x at 12; float32 Global ~neutral
+  (0.95-1.16, lazy-F also updates D).  Left: (b) float32 on
   AVX-512 (W=16): lazy-F rounds make long Global pairs 0.89x `hirschberg_pmax` — consider a
   W=8 (256-bit) float kernel there, or an opt-in prefix-max score; (c) the score kernels on
   NEON/AVX-512 were verified before negative penalties entered the tests — rerun

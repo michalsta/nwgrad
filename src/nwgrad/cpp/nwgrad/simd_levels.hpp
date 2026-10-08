@@ -168,7 +168,7 @@ struct ScoreJob {
     const T* blk; int nalpha;
     T go_a, ge_a, go_b, ge_b;
     int local;                              // 0 = Global, 1 = Local
-    int twopass;                            // 1: the unfused two-pass carry (for measuring)
+    int variant;                            // 0 auto, 1 two-pass, 2 fused three-state (measuring)
     DpBufferT<T>* buf;
     double score;                           // out
 };
