@@ -27,9 +27,9 @@ void bind_step(nb::module_& m) {
         },
         nb::arg("batch"), nb::arg("labels"), nb::arg("alpha0"),
         "One iteration's logistic work over a batch whose scores and gradients are\n"
-        "cached (call score_and_grad() first).  Returns a Step: the log-likelihood\n"
-        "at alpha0 (loglik_at_alpha0), the fitted intercept (alpha, as fit_alpha()),\n"
-        "and grad = sum_i (labels[i] - expit(alpha + score_i)) * grad_i, as\n"
+        "cached (call score_and_grad() first).  Returns a Step: the fitted\n"
+        "intercept (alpha, as fit_alpha()), and\n"
+        "grad = sum_i (labels[i] - expit(alpha + score_i)) * grad_i, as\n"
         "weighted_grad() would return it.  labels: float64 array of 0s and 1s, one\n"
         "per pair, both classes present.  Uses the batch's n_threads; the result\n"
         "does not depend on it.");
@@ -47,13 +47,10 @@ void bind_logistic(nb::module_& parent) {
 
     nb::class_<nwgrad::logistic::Step>(m, "Step")
         .def_ro("alpha", &nwgrad::logistic::Step::alpha, "The fitted intercept.")
-        .def_ro("loglik_at_alpha0", &nwgrad::logistic::Step::loglik_at_alpha0,
-                "The log-likelihood at the starting intercept alpha0.")
         .def_ro("grad", &nwgrad::logistic::Step::grad,
                 "sum_i (y_i - p_i) grad_i at the fitted alpha, as an AlignParams.")
         .def("__repr__", [](const nwgrad::logistic::Step& st) {
-            return "Step(alpha=" + std::to_string(st.alpha) +
-                   ", loglik_at_alpha0=" + std::to_string(st.loglik_at_alpha0) + ")";
+            return "Step(alpha=" + std::to_string(st.alpha) + ")";
         });
 
     m.def(
@@ -68,18 +65,6 @@ void bind_logistic(nb::module_& parent) {
         },
         nb::arg("scores"), nb::arg("alpha"), nb::arg("n_threads") = 0,
         "expit(alpha + scores) as a float64 array.");
-
-    m.def(
-        "log_likelihood",
-        [](vec_f64 scores, vec_f64 labels, double alpha, int n_threads) {
-            check_same_length(scores, labels);
-            nwgrad::logistic::check_labels(labels.data(), labels.shape(0));
-            return nwgrad::logistic::log_likelihood(scores.data(), labels.data(),
-                                                    scores.shape(0), alpha, n_threads);
-        },
-        nb::arg("scores"), nb::arg("labels"), nb::arg("alpha"), nb::arg("n_threads") = 0,
-        "sum_i y_i log(c_i) + (1 - y_i) log1p(-c_i), c_i = expit(alpha + score_i)\n"
-        "clipped to [eps, 1 - eps].  labels: float64 0s and 1s, both classes present.");
 
     m.def(
         "fit_alpha",

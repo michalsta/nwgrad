@@ -57,40 +57,33 @@ inline void check_labels(const double* y, size_t n) {
             "likelihood has no finite maximum in alpha");
 }
 
-// Sums over all elements at one alpha.
+// Sums over all elements at one alpha.  The log-likelihood itself is not
+// computed: the alpha fit needs only its derivatives, and a caller that wants
+// L evaluates it in a stable form from the logits (e.g. DiscrimAlign's
+// logit_logL) rather than from clipped probabilities.
 struct Sums {
     double g  = 0.0;   // dL/dalpha = sum (y - p)
     double h  = 0.0;   // -d2L/dalpha2 = sum p (1 - p)
-    double ll = 0.0;   // L = sum y log(c) + (1 - y) log1p(-c), c = clip(p, eps, 1 - eps)
 };
 
 namespace detail {
 
 // Per-element terms of one block, stored out of line (no product beside an add).
 [[gnu::noinline]] inline void block_terms(const double* s, const double* y, size_t n,
-                                          double alpha, bool with_ll,
-                                          double* tg, double* th, double* t1, double* t2) {
-    const double eps = std::numeric_limits<double>::epsilon();
+                                          double alpha, double* tg, double* th) {
     for (size_t i = 0; i < n; ++i) {
         const double p = expit(alpha + s[i]);
         tg[i] = y[i] - p;
         th[i] = p * (1.0 - p);
-        if (with_ll) {
-            const double c = std::min(std::max(p, eps), 1.0 - eps);
-            t1[i] = y[i] * std::log(c);
-            t2[i] = (1.0 - y[i]) * std::log1p(-c);
-        }
     }
 }
 
 // Sums of one block's stored terms, in index order.
-[[gnu::noinline]] inline Sums block_sums(size_t n, bool with_ll, const double* tg,
-                                         const double* th, const double* t1, const double* t2) {
+[[gnu::noinline]] inline Sums block_sums(size_t n, const double* tg, const double* th) {
     Sums out;
     for (size_t i = 0; i < n; ++i) {
         out.g += tg[i];
         out.h += th[i];
-        if (with_ll) out.ll += t1[i] + t2[i];
     }
     return out;
 }
@@ -111,32 +104,22 @@ void for_blocks(size_t n, int n_threads, Fn&& fn) {
 
 }  // namespace detail
 
-// g, h and, if with_ll, the log-likelihood at alpha.
-inline Sums evaluate(const double* s, const double* y, size_t n, double alpha,
-                     bool with_ll, int n_threads) {
+// g and h at alpha.
+inline Sums evaluate(const double* s, const double* y, size_t n, double alpha, int n_threads) {
     const size_t nblocks = (n + BLOCK - 1) / BLOCK;
     std::vector<Sums> partial(nblocks);
     detail::for_blocks(n, n_threads, [&](size_t b, size_t lo, size_t hi) {
-        thread_local std::vector<double> tg, th, t1, t2;
-        tg.resize(BLOCK); th.resize(BLOCK); t1.resize(BLOCK); t2.resize(BLOCK);
-        detail::block_terms(s + lo, y + lo, hi - lo, alpha, with_ll,
-                            tg.data(), th.data(), t1.data(), t2.data());
-        partial[b] = detail::block_sums(hi - lo, with_ll, tg.data(), th.data(),
-                                        t1.data(), t2.data());
+        thread_local std::vector<double> tg, th;
+        tg.resize(BLOCK); th.resize(BLOCK);
+        detail::block_terms(s + lo, y + lo, hi - lo, alpha, tg.data(), th.data());
+        partial[b] = detail::block_sums(hi - lo, tg.data(), th.data());
     });
     Sums out;
     for (const Sums& p : partial) {
         out.g += p.g;
         out.h += p.h;
-        out.ll += p.ll;
     }
     return out;
-}
-
-// The log-likelihood at alpha (probabilities clipped to [eps, 1 - eps]).
-inline double log_likelihood(const double* s, const double* y, size_t n, double alpha,
-                             int n_threads) {
-    return evaluate(s, y, n, alpha, true, n_threads).ll;
 }
 
 // expit(alpha + s_i) for every i, into out.
@@ -157,7 +140,7 @@ inline double fit_alpha(const double* s, const double* y, size_t n, double alpha
                         int maxiter = 200, const Sums* at_alpha0 = nullptr) {
     check_labels(y, n);
     auto derivatives = [&](double alpha) {
-        const Sums d = evaluate(s, y, n, alpha, false, n_threads);
+        const Sums d = evaluate(s, y, n, alpha, n_threads);
         return std::pair<double, double>(d.g, d.h);
     };
 
@@ -201,11 +184,10 @@ inline double fit_alpha(const double* s, const double* y, size_t n, double alpha
 }
 
 // One iteration's logistic work over a batch whose scores and gradients are
-// cached (after score_and_grad()): the log-likelihood at alpha0, the fitted
-// alpha, and sum_i (y_i - p_i) grad_i at that alpha.
+// cached (after score_and_grad()): the fitted alpha, and
+// sum_i (y_i - p_i) grad_i at that alpha.
 struct Step {
     double alpha;
-    double loglik_at_alpha0;
     AlignParams grad;
 };
 
@@ -218,13 +200,13 @@ Step step(const SeqPairBatchT<T>& batch, const double* y, size_t n, double alpha
     check_labels(y, n);
     const int threads = batch.n_threads();
     const std::vector<double> s = batch.scores();
-    const Sums at0 = evaluate(s.data(), y, n, alpha0, true, threads);
+    const Sums at0 = evaluate(s.data(), y, n, alpha0, threads);
     const double alpha = fit_alpha(s.data(), y, n, alpha0, threads, 1e-12, 8, 200, &at0);
     std::vector<double> w(n);
     detail::for_blocks(n, threads, [&](size_t, size_t lo, size_t hi) {
         for (size_t i = lo; i < hi; ++i) w[i] = y[i] - expit(alpha + s[i]);
     });
-    return Step{alpha, at0.ll, batch.weighted_grad(w.data(), n)};
+    return Step{alpha, batch.weighted_grad(w.data(), n)};
 }
 
 }  // namespace nwgrad::logistic

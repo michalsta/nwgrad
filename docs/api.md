@@ -325,13 +325,15 @@ its own module (`src/nwgrad/cpp/nwgrad/logistic/`) and uses only `SeqPairBatch`'
 interface. Every sum is taken over fixed blocks of 4096 elements and the block sums are
 added in order, so results do not depend on `n_threads` (0 = the default thread count).
 `labels` are float64 arrays of 0s and 1s with both classes present; anything else raises
-`ValueError`.
+`ValueError`. The log-likelihood itself is not provided (`log_likelihood()` and
+`Step.loglik_at_alpha0` were removed after 0.5.2: they clipped probabilities to
+[ε, 1 − ε]). Evaluate it from the logits z = α + score as Σ y·z − Σ log(1 + eᶻ), e.g.
+`np.dot(labels, z) - np.logaddexp(0, z).sum()`, which needs no clipping.
 
 | Function | Returns | Description |
 |---|---|---|
-| `step(batch, labels, alpha0)` | `Step` | One optimisation iteration's logistic work after `batch.score_and_grad()`: `loglik_at_alpha0`, the fitted `alpha` (as `fit_alpha`), and `grad = Σᵢ (labels[i] − expit(alpha + scoreᵢ)) gradᵢ` as an `AlignParams` (as `weighted_grad` returns it). Uses the batch's `n_threads`. `SeqPairBatch` and `SeqPairBatchDouble`. |
+| `step(batch, labels, alpha0)` | `Step` | One optimisation iteration's logistic work after `batch.score_and_grad()`: the fitted `alpha` (as `fit_alpha`) and `grad = Σᵢ (labels[i] − expit(alpha + scoreᵢ)) gradᵢ` as an `AlignParams` (as `weighted_grad` returns it). Uses the batch's `n_threads`. `SeqPairBatch` and `SeqPairBatchDouble`. |
 | `fit_alpha(scores, labels, alpha0, n_threads=0, tol=1e-12, max_newton=8, maxiter=200)` | `float` | The intercept maximising the likelihood: the root of dL/dα = Σ(y − p), which is strictly decreasing in α. Plain Newton steps while \|step\| ≤ 1, otherwise a bracketed safeguarded Newton (Numerical Recipes' rtsafe). Exact to rounding from any start. |
-| `log_likelihood(scores, labels, alpha, n_threads=0)` | `float` | Σ y log c + (1 − y) log1p(−c), with c = expit(α + score) clipped to [ε, 1 − ε]. |
 | `probabilities(scores, alpha, n_threads=0)` | `numpy.ndarray` | expit(α + scores), bit-identical to `scipy.special.expit`. |
 
 ## `BatchResult`

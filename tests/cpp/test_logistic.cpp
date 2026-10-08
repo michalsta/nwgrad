@@ -61,16 +61,16 @@ TEST_CASE("logistic: sums and the fitted alpha do not depend on the thread count
         s[i] = std::sin(0.37 * static_cast<double>(i)) * 4.0 - 2.0;
         y[i] = (std::cos(0.11 * static_cast<double>(i)) > 0.2) ? 1.0 : 0.0;
     }
-    const auto ref = nwgrad::logistic::evaluate(s.data(), y.data(), n, -0.3, true, 1);
+    const auto ref = nwgrad::logistic::evaluate(s.data(), y.data(), n, -0.3, 1);
     const double ref_alpha = nwgrad::logistic::fit_alpha(s.data(), y.data(), n, 7.0, 1);
     for (int t : {2, 3, 8}) {
-        const auto e = nwgrad::logistic::evaluate(s.data(), y.data(), n, -0.3, true, t);
+        const auto e = nwgrad::logistic::evaluate(s.data(), y.data(), n, -0.3, t);
         REQUIRE(std::memcmp(&e, &ref, sizeof e) == 0);
         const double a = nwgrad::logistic::fit_alpha(s.data(), y.data(), n, 7.0, t);
         REQUIRE(std::memcmp(&a, &ref_alpha, sizeof a) == 0);
     }
     // alpha is the root of dL/dalpha.
-    const auto at = nwgrad::logistic::evaluate(s.data(), y.data(), n, ref_alpha, false, 1);
+    const auto at = nwgrad::logistic::evaluate(s.data(), y.data(), n, ref_alpha, 1);
     REQUIRE(std::abs(at.g) < 1e-8 * static_cast<double>(n));
 }
 
@@ -91,7 +91,6 @@ TEST_CASE("logistic: step is its parts composed", "[logistic]") {
     batch.score_and_grad();
     const auto st = nwgrad::logistic::step(batch, f.y.data(), f.y.size(), -0.4);
     const auto s = batch.scores();
-    REQUIRE(st.loglik_at_alpha0 == nwgrad::logistic::log_likelihood(s.data(), f.y.data(), s.size(), -0.4, 4));
     REQUIRE(st.alpha == nwgrad::logistic::fit_alpha(s.data(), f.y.data(), s.size(), -0.4, 4));
     std::vector<double> w(s.size());
     for (size_t i = 0; i < s.size(); ++i) w[i] = f.y[i] - nwgrad::logistic::expit(st.alpha + s[i]);
