@@ -1,7 +1,8 @@
 // ── Score only (Aligner::compute_score): bit-identical to the exact fill ─────────
 //
 // compute_score() keeps rolling rows instead of tables and returns the optimal score.
-// Its contract is bit-identity with score() after compute_viterbi() under an exact
+// Its contract is bit-identity (but for the sign of a zero score) with score() after
+// compute_viterbi() under an exact
 // traceback mode (Pointers and Scores both checked) — at every backend the CPU offers,
 // both precisions, Global and Local, affine and linear (linear runs through the affine
 // kernel with zero opens).  Random problems mix ties (small-integer matrices and gaps),
@@ -34,7 +35,14 @@ long fuzz_iters(long dflt) {
     return e ? std::atol(e) : dflt;
 }
 
-bool same_bits(double x, double y) { return std::memcmp(&x, &y, sizeof x) == 0; }
+// Bit-identical except possibly the sign of a zero: +0 and -0 can come out of different
+// but equal-valued expression trees (a zero gap extend of either sign meets the borders'
+// -(go + i*ge) / -i*ge and max's first-of-equals choice), and nothing downstream can tell
+// them apart.  Every other bit is compared.
+bool same_bits(double x, double y) {
+    if (x == 0.0 && y == 0.0) return true;
+    return std::memcmp(&x, &y, sizeof x) == 0;
+}
 
 template <GapModel GM, AlignMode AM, class T>
 void check_one(const std::string& a, const std::string& b, const AlignParams& p, int kern,
@@ -55,7 +63,18 @@ void check_one(const std::string& a, const std::string& b, const AlignParams& p,
         const double got = al.compute_score(buf);
         INFO("a=" << a << " b=" << b << " kern=" << kern << " tb=" << static_cast<int>(tb)
              << " T=" << sizeof(T) << " GM=" << static_cast<int>(GM)
-             << " AM=" << static_cast<int>(AM) << " want=" << want << " got=" << got);
+             << " AM=" << static_cast<int>(AM) << " want=" << want << " got=" << got
+             << " gaps " << p.gap_open_a << "/" << p.gap_extend_a << " " << p.gap_open_b << "/" << p.gap_extend_b
+             << " diag " << p.matrix.at(0, 0) << "," << p.matrix.at(1, 1) << " off " << p.matrix.at(0, 1)
+             << "," << p.matrix.at(1, 0) << "," << p.matrix.at(2, 3));
+        if (!same_bits(got, want)) {   // diagnose: who agrees with the scalar fill?
+            Aligner<GM, AM, AlignBand::Full, T> sf, ss;
+            sf.set_kernel(kBackendScalar); sf.set_traceback(tb); ss.set_kernel(kBackendScalar);
+            DpBufferT<T> b1, b2;
+            sf.set_problem(a, b, p); sf.compute_viterbi(b1);
+            ss.set_problem(a, b, p);
+            UNSCOPED_INFO("scalar fill " << sf.score() << " scalar score " << ss.compute_score(b2));
+        }
         REQUIRE(same_bits(got, want));
         ++n_checked;
     }
@@ -96,6 +115,12 @@ TEST_CASE("compute_score is bit-identical to the exact fill's score", "[score]")
         };
         p.gap_open_a = gap(false); p.gap_extend_a = gap(true);
         p.gap_open_b = gap(false); p.gap_extend_b = gap(true);
+        if (ri(0, 3) == 0) {   // learned params can go negative: open, extend or both
+            if (ri(0, 1)) p.gap_open_a = -p.gap_open_a;
+            if (ri(0, 1)) p.gap_open_b = -p.gap_open_b;
+            if (ri(0, 2) == 0) p.gap_extend_a = -0.5 * p.gap_extend_a;
+            if (ri(0, 2) == 0) p.gap_extend_b = -0.5 * p.gap_extend_b;
+        }
         auto seq = [&](int len) {
             std::string s;
             for (int k = 0; k < len; ++k) s.push_back(A.symbols()[ri(0, na - 1)]);
@@ -194,7 +219,12 @@ void inter_check(const LevelKernels& K, int W, std::mt19937_64& rng, const Alpha
     J.go_a = lin ? T(0) : static_cast<T>(p.gap_open_a); J.ge_a = static_cast<T>(p.gap_extend_a);
     J.go_b = lin ? T(0) : static_cast<T>(p.gap_open_b); J.ge_b = static_cast<T>(p.gap_extend_b);
     J.align_mode = AM == AlignMode::Local; J.linear = lin;
-    std::vector<T> vm(static_cast<size_t>(n + 1) * W), vx(vm.size()), vy(vm.size()), best(W);
+    // The kernel stores whole vectors (32 / 64 bytes at AVX2 / AVX-512), which the compiler
+    // may emit as ALIGNED moves: the rows need the DP buffers' 64-byte allocator, as every
+    // library caller gives them (std::vector's 16 bytes faulted on nighthaven, AVX2).
+    using AV = std::vector<T, AlignedAllocator<T, 64>>;
+    AV vm(static_cast<size_t>(n + 1) * W), vx(vm.size()), vy(vm.size());
+    std::vector<T> best(W);
     J.VM = vm.data(); J.VX = vx.data(); J.VY = vy.data(); J.best = best.data();
     if (ragged) J.nb = nbs.data();
     if constexpr (std::is_same_v<T, double>) K.inter_score(J); else K.inter_score_f(J);
@@ -206,7 +236,9 @@ void inter_check(const LevelKernels& K, int W, std::mt19937_64& rng, const Alpha
         const double want = al.compute_score(buf);
         INFO("lane " << l << " m=" << ms[l] << " nb=" << nbs[l] << " n=" << n << " T=" << sizeof(T)
              << " GM=" << (int)GM << " AM=" << (int)AM << " ragged=" << ragged
-             << " want=" << want << " got=" << static_cast<double>(best[l]));
+             << " want=" << want << " got=" << static_cast<double>(best[l])
+             << " gaps " << p.gap_open_a << "/" << p.gap_extend_a << " " << p.gap_open_b << "/" << p.gap_extend_b
+             << " a=" << (ms[l] ? (int)as[l][0] : -1) << " b0=" << (nbs[l] ? (int)bs[l][0] : -1));
         REQUIRE(same_bits(static_cast<double>(best[l]), want));
         ++n_checked;
     }
@@ -233,6 +265,12 @@ TEST_CASE("inter-pair score: every lane equals its pair's compute_score", "[scor
                                              : static_cast<double>(x == y ? ri(1, 3) : ri(-2, 1));
             p.gap_open_a = real ? 2.7 : ri(0, 4); p.gap_extend_a = real ? 0.1 * ri(1, 9) : ri(0, 2);
             p.gap_open_b = real ? 1.9 : ri(0, 4); p.gap_extend_b = real ? 0.3 : ri(0, 2);
+            switch (ri(0, 5)) {   // negative penalties take the general / not-M-only forms
+                case 0: p.gap_open_a = -p.gap_open_a; break;
+                case 1: p.gap_extend_b = -0.5 * p.gap_extend_b; break;
+                case 2: p.gap_open_b = -p.gap_open_b; p.gap_extend_a = -0.3 * p.gap_extend_a; break;
+                default: break;
+            }
             const bool rag = ri(0, 2) == 0;
             inter_check<double, GapModel::Affine, AlignMode::Global>(K, K.inter_w, rng, A, p, rag, n_checked);
             inter_check<double, GapModel::Affine, AlignMode::Local >(K, K.inter_w, rng, A, p, rag, n_checked);

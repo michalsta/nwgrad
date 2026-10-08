@@ -118,6 +118,7 @@ struct DpBufferT {
     // striped openv row (the VM/VX open values feeding the VY carry); `sprof` is the
     // query profile in striped order.  Both O(n), not O(m·n).
     TVec sopenv, sprof;
+    TVec spad;     // score-only Local: per striped slot, 0 (real column) or -inf (padding)
 
     // ── TracebackMode::Pointers: predecessors instead of retained score tables ─
     //
@@ -178,7 +179,7 @@ struct DpBufferT {
         clrD(F);  clrD(B);
         clrD(FM); clrD(FX); clrD(FY); clrD(BM); clrD(BX); clrD(BY);
         clrT(prof); clrT(subbuf);
-        clrT(sopenv); clrT(sprof);
+        clrT(sopenv); clrT(sprof); clrT(spad);
         auto clrB = [](BVec& v) noexcept { v.clear(); v.shrink_to_fit(); };
         clrB(DM); clrB(DX); clrB(DY);
         clrT(rM); clrT(rX); clrT(rY); clrT(qM); clrT(qX); clrT(qY);

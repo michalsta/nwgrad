@@ -56,6 +56,22 @@ static void score_affine_striped(ScoreJob<T>& job) {
     for (auto* v : {&buf.rM, &buf.rX, &buf.rY, &buf.qM, &buf.qX, &buf.qY})
         if (v->size() < sw) v->resize(sw);
     if constexpr (!Fused) if (buf.sopenv.size() < sw) buf.sopenv.resize(sw);
+    // Local: the padding slots (columns > n) must not reach the maximum.  With a negative
+    // gap extend a gap run GAINS score along the padding, so they can exceed every real
+    // cell (the fill's argmax scans real columns only).  Added, not selected: x + 0 = x
+    // exactly, x + -inf = -inf, and no mask op (see kernels_impl.inl's AVX-512/clang note).
+    const T* pad = nullptr;
+    if constexpr (Local) {
+        if (buf.spad.size() < sw) buf.spad.resize(sw);
+        for (int l = 0; l < W; ++l)
+            for (int s = 0; s < seg; ++s)
+                buf.spad[(std::size_t)s * W + l] = (l * seg + s + 1 <= n) ? T(0) : NINF;
+        pad = buf.spad.data();
+    }
+    auto padded = [&](const vd& v, int s) {
+        vd p; p.copy_from(pad + (std::size_t)s * W, stdx::element_aligned);
+        return v + p;
+    };
 
     // striped query profile, padding columns -inf (as striped_affine_full)
     for (int c = 0; c < nalpha; ++c) {
@@ -137,7 +153,7 @@ static void score_affine_striped(ScoreJob<T>& job) {
 
                 vd vyv = stdx::max(Oin, Yin - vge_a);
                 vyv.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
-                if constexpr (Local) vbest = stdx::max(vbest, stdx::max(stdx::max(vmv, vxv), vyv));
+                if constexpr (Local) vbest = stdx::max(vbest, padded(stdx::max(stdx::max(vmv, vxv), vyv), s));
                 Oin = (stdx::max(vmv, vxv) - vgo_a) - vge_a;
                 Yin = vyv;
             }
@@ -169,7 +185,7 @@ static void score_affine_striped(ScoreJob<T>& job) {
                 uY.copy_from(pY + (std::size_t)s * W, stdx::element_aligned);
                 vd vxv = stdx::max(stdx::max((uM - vgo_b) - vge_b, uX - vge_b), (uY - vgo_b) - vge_b);
                 vxv.copy_to(cX + (std::size_t)s * W, stdx::element_aligned);
-                if constexpr (Local) vbest = stdx::max(vbest, stdx::max(vmv, vxv));
+                if constexpr (Local) vbest = stdx::max(vbest, padded(stdx::max(vmv, vxv), s));
                 ((stdx::max(vmv, vxv) - vgo_a) - vge_a).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
             }
             vd prev([&](int q) { return q == 0 ? bY : NINF; });
@@ -183,7 +199,7 @@ static void score_affine_striped(ScoreJob<T>& job) {
                 }
                 vd v = stdx::max(O, prev - vge_a);
                 v.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
-                if constexpr (Local) vbest = stdx::max(vbest, v);
+                if constexpr (Local) vbest = stdx::max(vbest, padded(v, s));
                 prev = v;
             }
         }
@@ -208,7 +224,7 @@ static void score_affine_striped(ScoreJob<T>& job) {
                 if (!any_gt(F, v)) break;
                 v = stdx::max(v, F);
                 v.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
-                if constexpr (Local) vbest = stdx::max(vbest, v);
+                if constexpr (Local) vbest = stdx::max(vbest, padded(v, s));
                 F = v - vge_a;
                 changed = true;
             }

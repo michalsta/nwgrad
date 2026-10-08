@@ -204,7 +204,21 @@ soft options, `hb_cutoff` — belong to the batch: setting them on a view raises
 |---|---|---|
 | `"hard"` | Viterbi alignment score | Substitution-pair counts (integer-valued subgradient) |
 | `"soft"` | Log-partition function `log Z` | Expected substitution counts (true gradient of `log Z`) |
-| `"none"` | Viterbi alignment score | `compute_grad()` raises |
+| `"none"` | Optimal alignment score, **score only** (see below) | `compute_grad()` raises |
+
+<a id="score-only"></a>**`grad_mode="none"` is score only.** No DP table is kept and no
+traceback runs: rolling rows (O(n) memory) through a SIMD kernel per pair, and the
+inter-pair kernel for short pairs (one pair per vector lane, one row in place). The
+score is the exact optimum — bit-identical to a `traceback="pointers"` pair's at every
+`kernel=` level — so it does not depend on `traceback`: under float32's `auto` default
+(`hirschberg_pmax`), the hard and soft modes report the score replayed along the
+prefix-max path instead, which can sit a hair below. A batch's `score_and_grad()` in this
+mode defers the guides `banded_grad()` bands around: each is computed on first use
+(`banded_grad()`, `batch[i].guide_j`) under the params that were scored, so it is
+exactly the guide the traceback would have stored, even after `set_params()`.
+`keep_paths=True` runs the traceback as before. Measured against 0.6's table-filling
+path on single pairs (AVX2, 1 thread): 1.2–3.1× affine Global, 3–6.5× affine Local,
+1.5–14.5× linear; it keeps that lead with threads, having no table to stream.
 
 ---
 
@@ -238,9 +252,9 @@ the logical count measured up to 1.44× slower.
 |---|---|---|
 | `add_many(seqs_a, seqs_b, params, kernel="auto")` | — | Append the pairs `(seqs_a[i], seqs_b[i])` under `params`: one **segment**. Params may differ between calls (one alphabet); `set_params()` replaces them all. Sequences are validated and encoded in parallel; a bad character raises and adds nothing. The batch keeps a **copy** of `params` (calls with equal params share one); later changes to the object do not reach the batch — use `set_params()`. |
 | `set_params(params)` | — | Give every pair a copy of `params` (same alphabet; a mismatch raises without changing anything). Clears cached scores, gradients and stored paths; keeps the guides, for `banded_grad()`. |
-| `score_and_grad(keep_paths=False)` | `float` (sum of scores) | Full DP on every pair: score, guide and (unless `grad_mode="none"`) gradient, cached per pair. `keep_paths=True` also stores each alignment path, so `batch[i].aligned()` / `.coordinates()` work (a few bytes per alignment column). |
+| `score_and_grad(keep_paths=False)` | `float` (sum of scores) | Full DP on every pair: score, guide and (unless `grad_mode="none"`) gradient, cached per pair. With `grad_mode="none"` and no `keep_paths`: [score only](#score-only), guides deferred. `keep_paths=True` also stores each alignment path, so `batch[i].aligned()` / `.coordinates()` work (a few bytes per alignment column). |
 | `banded_grad(bandwidth, keep_paths=False)` | `float` (sum of scores) | Banded re-align + gradient around each pair's cached guide. Run `score_and_grad()` once to establish the guides, then `set_params()` + `banded_grad(bw)` after each update; no full DP is run. |
-| `align(seqs_a, seqs_b, params, band=0, aligned_a=[], aligned_b=[], kernel="auto")` | [`BatchResult`](#batchresult) | Align pairs **without adding them** (what `BatchAligner` was): scores plus the gradient summed over the pairs, nothing kept per pair, so memory stays O(threads). Uses the batch's type, grad mode, threads and settings. `band > 0` bands every pair (`aligned_a` / `aligned_b`, one gapped string per pair, give the guides; the diagonal otherwise); `band == 0` with guides bands at width 0, so all pairs or none must carry one. Soft: forward-backward only (no Viterbi). |
+| `align(seqs_a, seqs_b, params, band=0, aligned_a=[], aligned_b=[], kernel="auto")` | [`BatchResult`](#batchresult) | Align pairs **without adding them** (what `BatchAligner` was): scores plus the gradient summed over the pairs, nothing kept per pair, so memory stays O(threads). Uses the batch's type, grad mode, threads and settings. `band > 0` bands every pair (`aligned_a` / `aligned_b`, one gapped string per pair, give the guides; the diagonal otherwise); `band == 0` with guides bands at width 0, so all pairs or none must carry one. Soft: forward-backward only (no Viterbi). None, unbanded: [score only](#score-only). |
 | `compute_grad()` | `AlignParams` | The cached gradients summed over all pairs. Summed in fixed blocks, so bit-reproducible whatever `n_threads`. Raises on an empty batch. |
 | `scores()` | `numpy.ndarray` (float64) | The cached per-pair scores, in pair order. Runs no DP; raises if any pair has no valid score. |
 | `weighted_grad(weights)` | `AlignParams` | `sum_i weights[i] * grad_i` over the cached per-pair gradients. `weights` is a 1-D numeric array with one entry per pair. Runs no DP; raises if any pair has no valid gradient. Summed in fixed blocks of 4096 pairs (each in pair order, the blocks in parallel), then over the blocks in order, so the result is bit-reproducible and does not depend on `n_threads`. |
@@ -392,7 +406,9 @@ every column in `[0, len(seq_b)]`, never decreasing. Anything else raises
 is the full DP. The last guide entry need not equal `len(seq_b)`: B residues after the
 last A residue (trailing gaps in A) do not add an entry.
 
-**Score only** — return `float`:
+**Score only** — return `float`. They run the [score-only](#score-only) kernels (no
+table, no traceback; `band > 0` runs the banded fill): the exact optimum, bit-identical to
+a `traceback="pointers"` pair's.
 
 | Function | Gap model | Alignment |
 |---|---|---|
@@ -463,6 +479,12 @@ Other behaviour changes since 0.5.2:
   on non-finite scores (NaN used to "converge" to a plausible intercept).
 - **`n_threads=0` respects the CPU affinity mask** (`taskset`, cpusets): under
   `taskset -c 0` it is now 1, not the host's core count.
+- **Score only.** `grad_mode="none"` batches (`score_and_grad()`, `align()`) and the
+  `nw_score*` / `sw_score*` functions keep no table and run no traceback, and return the
+  exact optimum. For float32 pairs longer than `hb_cutoff` under `traceback="auto"`, 0.5's
+  score (replayed along the `hirschberg_pmax` path) could sit a hair below it, so such a
+  score may now come out slightly higher. A none-mode `score_and_grad()` defers the guides
+  (same guides, computed on first use).
 - `logistic.log_likelihood()` and `Step.loglik_at_alpha0` were removed (see
   [`nwgrad.logistic`](#nwgradlogistic)).
 - **`logistic` labels are no longer checked**, and soft labels in [0, 1] are accepted.

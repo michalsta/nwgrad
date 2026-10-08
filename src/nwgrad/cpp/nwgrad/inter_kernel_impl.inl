@@ -456,10 +456,90 @@ static void inter_score_linear(InterJobT<T>& J) noexcept {
     if (local) for (int l = 0; l < W; ++l) J.best[l] = vbest[l];
 }
 
+// Affine with non-negative OPEN penalties (the usual case): the same values from two
+// stored rows instead of three.  With go >= 0, an open from a cell is never above the
+// extension from it — (v - go) - ge <= v - ge, rounding being monotone — so offering the
+// open every state of the cell (its D = max(M, X, Y)) adds only dominated candidates and
+// drops none that could win:
+//   X(i,j) = max((D(i-1,j) - go_b) - ge_b, X(i-1,j) - ge_b)
+//   Y(i,j) = max((D(i,j-1) - go_a) - ge_a, Y(i,j-1) - ge_a)
+//   M(i,j) = D(i-1,j-1) + s            (Local: clamped at 0)
+// the same maxima, so the same values, as inter_score_affine's three-operand forms.  The
+// row keeps D and X; M is never stored, Y lives in a register.  With the extends >= 0
+// too, no gap cell exceeds the cell it extends from, so the Local maximum is the
+// maximum over M alone (MOnly).
+template <class T, bool Ragged, bool MOnly>
+static void inter_score_affine_pos(InterJobT<T>& J) noexcept {
+    using C = InterCommon<T>;
+    using ivd = typename C::ivd; using ivl = typename C::ivl;
+    constexpr int W = C::IW;
+    const C cm(J);
+    const int n = J.n, M = J.M;
+    const bool local = J.align_mode == 1;
+    ivd* D = reinterpret_cast<ivd*>(J.VM);
+    ivd* X = reinterpret_cast<ivd*>(J.VX);
+    const ivd z = {}, ninf = z + (-std::numeric_limits<T>::infinity());
+    const ivd go_a = z + J.go_a, ge_a = z + J.ge_a, go_b = z + J.go_b, ge_b = z + J.ge_b;
+
+    // row 0: D = max(M, X, Y) of inter_score_affine's row 0, X as there
+    for (int j = 0; j <= n; ++j) {
+        D[j] = local ? z : (j == 0 ? z : ivsplat<ivd>(-(J.go_a + static_cast<T>(j) * J.ge_a)));
+        X[j] = ninf;
+    }
+    auto capture = [&](int i) {
+        for (int l = 0; l < W; ++l)
+            if (J.m[l] == i) J.best[l] = D[Ragged ? J.nb[l] : n][l];
+    };
+    if (!local) capture(0);
+    ivd vbest = z;
+
+    for (int i = 1; i <= M; ++i) {
+        ivd P[8];
+        ivl live;
+        cm.row(i, P, live);
+        ivd dd = D[0];                                           // D(i-1, 0)
+        const ivd x0 = local ? ninf : ivsplat<ivd>(-(J.go_b + static_cast<T>(i) * J.ge_b));
+        ivd dl = local ? z : x0;                                 // D(i, 0)
+        ivd ly = ninf;                                           // Y(i, 0)
+        D[0] = dl; X[0] = x0;
+        for (int j = 1; j <= n; ++j) {
+            const ivd s = cm.s(P, j);
+            const ivd du = D[j], xu = X[j];                      // row i-1, column j
+            ivd mv = dd + s;
+            if (local) mv = ivmax(mv, z);
+            const ivd x = ivmax((du - go_b) - ge_b, xu - ge_b);
+            const ivd y = ivmax((dl - go_a) - ge_a, ly - ge_a);
+            const ivd dn = ivmax(mv, ivmax(x, y));
+            D[j] = dn; X[j] = x;
+            dd = du; dl = dn; ly = y;
+            if (local) {
+                ivl keep = live;
+                if constexpr (Ragged) keep &= (z + static_cast<T>(j)) <= cm.nbv;
+                vbest = ivmax(vbest, ivsel(keep, MOnly ? mv : dn, z));
+            }
+        }
+        if (!local) capture(i);
+    }
+    if (local) for (int l = 0; l < W; ++l) J.best[l] = vbest[l];
+}
+
 template <class T>
 static void inter_score_t(InterJobT<T>& J) noexcept {
-    if (J.nb) { if (J.linear) inter_score_linear<T, true>(J);  else inter_score_affine<T, true>(J); }
-    else      { if (J.linear) inter_score_linear<T, false>(J); else inter_score_affine<T, false>(J); }
+    const bool rag = J.nb != nullptr;
+    if (J.linear) {
+        if (rag) inter_score_linear<T, true>(J); else inter_score_linear<T, false>(J);
+        return;
+    }
+    // NaN penalties compare false and take the general form.
+    const bool pos_open = J.go_a >= T(0) && J.go_b >= T(0);
+    const bool pos_ext = J.ge_a >= T(0) && J.ge_b >= T(0);
+    if (pos_open && pos_ext) {
+        if (rag) inter_score_affine_pos<T, true, true>(J);  else inter_score_affine_pos<T, false, true>(J);
+    } else if (pos_open) {
+        if (rag) inter_score_affine_pos<T, true, false>(J); else inter_score_affine_pos<T, false, false>(J);
+    } else {
+        if (rag) inter_score_affine<T, true>(J); else inter_score_affine<T, false>(J);
+    }
 }
 static void inter_score_entry(InterJob& J) noexcept { inter_score_t<double>(J); }
 static void inter_score_entry_f(InterJobT<float>& J) noexcept { inter_score_t<float>(J); }
