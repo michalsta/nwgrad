@@ -547,18 +547,25 @@ private:
         const Alphabet& alpha = params.matrix.alphabet();
         std::vector<uint8_t> a_enc, b_enc;
         const size_t N = problems.size();
-        for (size_t idx; (idx = work_idx.fetch_add(1, std::memory_order_relaxed)) < N; ) {
-            const auto& p = problems[idx];
-            stream_encode_(alpha, p.seq_a, a_enc, idx, 'a');
-            stream_encode_(alpha, p.seq_b, b_enc, idx, 'b');
-            al.set_problem(a_enc, b_enc, params, band, p.guide_j);
-            if (grad_mode_ == GradMode::Hard) {
-                al.compute_viterbi(buf); scores[idx] = al.score(); al.hard_grad(buf, local_grad);
-            } else if (grad_mode_ == GradMode::Soft) {
-                al.compute_forward_back(buf); scores[idx] = al.log_z(); al.soft_grad(buf, local_grad);
-            } else {
-                al.compute_viterbi(buf); scores[idx] = al.score();
-            }
+        for (size_t idx; (idx = work_idx.fetch_add(1, std::memory_order_relaxed)) < N; )
+            stream_one_(al, problems, idx, alpha, params, band, buf, a_enc, b_enc, scores, local_grad);
+    }
+    // One streaming problem on its own path: encode, set up, fill, score, gradient.
+    template<class Al>
+    void stream_one_(Al& al, const std::vector<ProblemInstance>& problems, size_t i,
+                     const Alphabet& alpha, const AlignParams& params, int band, DpBuffer& buf,
+                     std::vector<uint8_t>& a_enc, std::vector<uint8_t>& b_enc,
+                     std::vector<double>& scores, AlignParams& local_grad) const {
+        const auto& p = problems[i];
+        stream_encode_(alpha, p.seq_a, a_enc, i, 'a');
+        stream_encode_(alpha, p.seq_b, b_enc, i, 'b');
+        al.set_problem(a_enc, b_enc, params, band, p.guide_j);
+        if (grad_mode_ == GradMode::Hard) {
+            al.compute_viterbi(buf); scores[i] = al.score(); al.hard_grad(buf, local_grad);
+        } else if (grad_mode_ == GradMode::Soft) {
+            al.compute_forward_back(buf); scores[i] = al.log_z(); al.soft_grad(buf, local_grad);
+        } else {
+            al.compute_viterbi(buf); scores[i] = al.score();
         }
     }
     // The level a shared pass would run on, or -1 (every problem its own path): the
@@ -658,23 +665,9 @@ private:
         InterSoftJob sj{};
         const bool soft_ok = soft && inter_soft_weights(params, soft_temp_, lin, es, sj);
         const size_t nn = static_cast<size_t>(params.matrix.size()) * params.matrix.size();
-        if (!soft) {
-            blkT.resize(nn);
-            for (size_t k = 0; k < nn; ++k) blkT[k] = static_cast<T>(params.matrix.data()[k]);
-        }
-        auto own = [&](size_t i) {   // one problem on its own path: stream_loop_'s body
-            Al& x = al[0];
-            const auto& p = problems[i];
-            stream_encode_(alpha, p.seq_a, ae[0], i, 'a');
-            stream_encode_(alpha, p.seq_b, be[0], i, 'b');
-            x.set_problem(ae[0], be[0], params, band, p.guide_j);
-            if (grad_mode_ == GradMode::Hard) {
-                x.compute_viterbi(buf); scores[i] = x.score(); x.hard_grad(buf, local_grad);
-            } else if (grad_mode_ == GradMode::Soft) {
-                x.compute_forward_back(buf); scores[i] = x.log_z(); x.soft_grad(buf, local_grad);
-            } else {
-                x.compute_viterbi(buf); scores[i] = x.score();
-            }
+        if (!soft) cast_block_(params, blkT);   // params are fixed for the call: once per worker
+        auto own = [&](size_t i) {
+            stream_one_(al[0], problems, i, alpha, params, band, buf, ae[0], be[0], scores, local_grad);
         };
         const size_t G = groups.size(), tasks = G + other.size();
         for (size_t t; (t = idx.fetch_add(1, std::memory_order_relaxed)) < tasks; ) {
@@ -734,28 +727,19 @@ private:
                     al[l].banded_lane_rows(W, static_cast<int>(l), M, blo.data(), bhi.data(),
                                            ulo.data(), uhi.data(), bri[l], brj[l]);
             }
-            const size_t sz = static_cast<size_t>(M + 1) * (n + 1) * W;
             InterJobT<T> job{};
             job.a = a.data(); job.m = m.data(); job.b = b.data(); job.n = n; job.M = M;
             job.align_mode = (AM == AlignMode::Local) ? 1 : 0;
             if (ragged) job.nb = nb.data();
-            job.blk = blkT.data(); job.nalpha = params.matrix.size();
-            job.go_a = static_cast<T>(params.gap_open_a); job.ge_a = static_cast<T>(params.gap_extend_a);
-            job.go_b = static_cast<T>(params.gap_open_b); job.ge_b = static_cast<T>(params.gap_extend_b);
-            job.linear = lin ? 1 : 0;
-            if constexpr (lin) { if (buf.H.size() < sz) buf.H.resize(sz); job.VM = buf.H.data(); }
-            else {
-                for (auto* v : {&buf.VM, &buf.VX, &buf.VY}) if (v->size() < sz) v->resize(sz);
-                job.VM = buf.VM.data(); job.VX = buf.VX.data(); job.VY = buf.VY.data();
-            }
+            set_inter_params_(job, params, blkT);
+            wire_inter_tables_(job, buf, static_cast<size_t>(M + 1) * (n + 1) * W);
             job.best = best.data(); job.best_i = bi.data(); job.best_j = bj.data();
             if constexpr (AB == AlignBand::GuideBanded) {
                 job.blo = blo.data(); job.bhi = bhi.data();
                 job.ulo = ulo.data(); job.uhi = uhi.data();
                 job.bri = bri.data(); job.brj = brj.data();
             }
-            if constexpr (std::is_same_v<T, double>) K.inter_fill(job);
-            else                                     K.inter_fill_f(job);
+            run_inter_fill_(K, job);
             for (size_t l = 0; l < real; ++l) {
                 const size_t i = elig[s + l];
                 al[l].adopt_interleaved(buf, W, static_cast<int>(l), best[l], bi[l], bj[l], gstride);
@@ -1159,6 +1143,40 @@ private:
         if constexpr (std::is_same_v<T, double>) return K.inter_fill ? K.inter_w : 0;
         else                                     return K.inter_fill_f ? K.inter_w_f : 0;
     }
+
+    // The pieces of an InterJob every inter-pair fill shares (score_and_grad_inter_,
+    // banded_grad_inter_, stream_inter_loop_), so the three cannot drift apart: the
+    // kernels' inputs must be exactly what each pair's own fill would use.
+    //   cast_block_:        the substitution block in T, as the own fill rounds it (blkT_)
+    //   set_inter_params_:  block, alphabet size, the four penalties in T, gap model
+    //   wire_inter_tables_: size the shared tables (H for linear, VM/VX/VY for affine) to
+    //                       `sz` cells per table and point the job at them
+    //   run_inter_fill_:    the kernel of this precision
+    static void cast_block_(const AlignParams& P, std::vector<T>& blkT) {
+        const size_t nbk = static_cast<size_t>(P.matrix.size()) * P.matrix.size();
+        blkT.resize(nbk);
+        for (size_t k = 0; k < nbk; ++k) blkT[k] = static_cast<T>(P.matrix.data()[k]);
+    }
+    static void set_inter_params_(InterJobT<T>& job, const AlignParams& P, const std::vector<T>& blkT) {
+        job.blk = blkT.data(); job.nalpha = P.matrix.size();
+        job.go_a = static_cast<T>(P.gap_open_a); job.ge_a = static_cast<T>(P.gap_extend_a);
+        job.go_b = static_cast<T>(P.gap_open_b); job.ge_b = static_cast<T>(P.gap_extend_b);
+        job.linear = GM == GapModel::Linear ? 1 : 0;
+    }
+    static void wire_inter_tables_(InterJobT<T>& job, DpBuffer& buf, size_t sz) {
+        if constexpr (GM == GapModel::Linear) {
+            // Linear's one table rides in the H slot (adopt_interleaved reads buf.H).
+            if (buf.H.size() < sz) buf.H.resize(sz);
+            job.VM = buf.H.data();
+        } else {
+            for (auto* v : {&buf.VM, &buf.VX, &buf.VY}) if (v->size() < sz) v->resize(sz);
+            job.VM = buf.VM.data(); job.VX = buf.VX.data(); job.VY = buf.VY.data();
+        }
+    }
+    static void run_inter_fill_(const LevelKernels& K, InterJobT<T>& job) {
+        if constexpr (std::is_same_v<T, double>) K.inter_fill(job);
+        else                                     K.inter_fill_f(job);
+    }
     // Linear Global's own fill is cheap: the shared one loses below 4 lanes (DNA, W=2:
     // 0.76x on SSE2) and for alphabets over 8 (protein, the per-row gather: 1.10-1.22x
     // at 12 threads on AVX2).  Soft pairs still take the soft pass and skip the fill.
@@ -1304,23 +1322,11 @@ private:
                 if (ragged) job.nb = nb.data();
                 auto& buf = w.buf;
                 if (!skip_fill) {
-                    const size_t sz = static_cast<size_t>(M + 1) * (n + 1) * W;
-                    // Linear's one table rides in the H slot (adopt_interleaved reads buf.H).
-                    if constexpr (lin) { if (buf.H.size() < sz) buf.H.resize(sz); }
-                    else for (auto* v : {&buf.VM, &buf.VX, &buf.VY}) if (v->size() < sz) v->resize(sz);
-                    // In T, as the pair's own fill rounds them (blkT_, the cast penalties).
-                    const size_t nbk = static_cast<size_t>(P.matrix.size()) * P.matrix.size();
-                    blkT.resize(nbk);
-                    for (size_t k = 0; k < nbk; ++k) blkT[k] = static_cast<T>(P.matrix.data()[k]);
-                    job.blk = blkT.data(); job.nalpha = P.matrix.size();
-                    job.go_a = static_cast<T>(P.gap_open_a); job.ge_a = static_cast<T>(P.gap_extend_a);
-                    job.go_b = static_cast<T>(P.gap_open_b); job.ge_b = static_cast<T>(P.gap_extend_b);
-                    job.linear = lin ? 1 : 0;
-                    if constexpr (lin) job.VM = buf.H.data();
-                    else { job.VM = buf.VM.data(); job.VX = buf.VX.data(); job.VY = buf.VY.data(); }
+                    cast_block_(P, blkT);
+                    set_inter_params_(job, P, blkT);
+                    wire_inter_tables_(job, buf, static_cast<size_t>(M + 1) * (n + 1) * W);
                     job.best = best.data(); job.best_i = bi.data(); job.best_j = bj.data();
-                    if constexpr (std::is_same_v<T, double>) K.inter_fill(job);
-                    else                                     K.inter_fill_f(job);
+                    run_inter_fill_(K, job);
                 }
                 // Soft lanes share the forward-backward too (one soft_impl, not "log",
                 // one temperature — batch-wide here), when the weights fit.
@@ -1483,26 +1489,17 @@ private:
                                        ulo.data(), uhi.data(), bri[l], brj[l]);
                 }
                 const AlignParams& P = params(i0);
-                auto& buf = w.buf;
-                const size_t sz = static_cast<size_t>(M + 1) * (n + 1) * W;
-                for (auto* v : {&buf.VM, &buf.VX, &buf.VY}) if (v->size() < sz) v->resize(sz);
                 InterJobT<T> job{};
                 job.a = a.data(); job.m = m.data(); job.b = b.data(); job.n = n; job.M = M;
                 job.align_mode = (AM == AlignMode::Local) ? 1 : 0;
-                const size_t nbk = static_cast<size_t>(P.matrix.size()) * P.matrix.size();
-                blkT.resize(nbk);
-                for (size_t k = 0; k < nbk; ++k) blkT[k] = static_cast<T>(P.matrix.data()[k]);
-                job.blk = blkT.data(); job.nalpha = P.matrix.size();
-                job.go_a = static_cast<T>(P.gap_open_a); job.ge_a = static_cast<T>(P.gap_extend_a);
-                job.go_b = static_cast<T>(P.gap_open_b); job.ge_b = static_cast<T>(P.gap_extend_b);
-                job.linear = 0;
-                job.VM = buf.VM.data(); job.VX = buf.VX.data(); job.VY = buf.VY.data();
+                cast_block_(P, blkT);
+                set_inter_params_(job, P, blkT);   // affine: this path runs for affine only
+                wire_inter_tables_(job, w.buf, static_cast<size_t>(M + 1) * (n + 1) * W);
                 job.best = best.data(); job.best_i = bi.data(); job.best_j = bj.data();
                 job.blo = blo.data(); job.bhi = bhi.data();
                 job.ulo = ulo.data(); job.uhi = uhi.data();
                 job.bri = bri.data(); job.brj = brj.data();
-                if constexpr (std::is_same_v<T, double>) K.inter_fill(job);
-                else                                     K.inter_fill_f(job);
+                run_inter_fill_(K, job);
                 for (size_t l = 0; l < real; ++l)
                     banded_interleaved_(elig[s + l], w, bandwidth, W, static_cast<int>(l),
                                         best[l], bi[l], bj[l]);
