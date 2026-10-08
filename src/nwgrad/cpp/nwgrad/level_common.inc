@@ -38,6 +38,7 @@ namespace NWGRAD_LVL_NAME {
 #include "inter_kernel_impl.inl"  // inter-pair affine Full fill (uses KW)
 #include "inter_soft_impl.inl"    // inter-pair soft pass (uses the above's IW/ivd)
 #include "soft_kernel_impl.inl"   // per-pair scaled forward-backward
+#include "score_kernel_impl.inl"  // score only: rolling rows, no table
 }
 #undef NWGRAD_LEVEL_NS
 
@@ -72,6 +73,9 @@ struct NwgradLevelRegistrar {
                        &NWGRAD_LVL_NAME::inter_soft_entry,     // inter-pair soft pass, double
                        &NWGRAD_LVL_NAME::soft_pair_linear,     // per-pair soft, linear
                        &NWGRAD_LVL_NAME::soft_pair_affine);    // per-pair soft, affine
+        register_level_score(NWGRAD_LVL_ENUM,
+                             &NWGRAD_LVL_NAME::score_entry<double>,
+                             &NWGRAD_LVL_NAME::score_entry<float>);
     }
 };
 const NwgradLevelRegistrar nwgrad_level_registrar_instance;

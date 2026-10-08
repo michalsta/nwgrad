@@ -229,7 +229,7 @@ static void bind_convenience(nb::module_& m, const std::string& sfx) {
             auto gj = make_guide(aligned_a, aligned_b); EncodedPair enc(a, b, params); \
             WITH_ALIGNER_T(T, GM, AM, band, gj, { \
                 al.set_problem(enc.a, enc.b, params, band, gj); \
-                al.compute_viterbi(_buf); return al.score(); }); \
+                return al.compute_score(_buf); }); \
         }, NWG_CONV_ARGS, DOC)
 #define NWG_HARD(FN, GM, AM, DOC) \
     m.def((std::string(FN) + sfx).c_str(), \

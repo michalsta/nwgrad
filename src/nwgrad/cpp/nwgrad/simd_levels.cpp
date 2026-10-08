@@ -46,3 +46,8 @@ void register_level(SimdLevel l, viterbi_fn viterbi, viterbi_fn_f viterbi_f,
     k.soft_pair_affine  = soft_pair_affine;
     level_table()[(int)l] = k;
 }
+
+void register_level_score(SimdLevel l, score_fn score, score_fn_f score_f) {
+    level_table()[(int)l].score   = score;
+    level_table()[(int)l].score_f = score_f;
+}

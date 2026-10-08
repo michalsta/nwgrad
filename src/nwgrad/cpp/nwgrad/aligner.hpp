@@ -7,6 +7,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <cstdlib>
 #include <string_view>
 #include <type_traits>
 #include <utility>
@@ -449,6 +450,62 @@ struct Aligner {
         run_viterbi(buf);
         any_viterbi_done_ = true;
         fwdbwd_is_newest_ = false;
+    }
+
+    // ── Score only ────────────────────────────────────────────────────────────
+    //
+    // The optimal alignment score and nothing else: no table, no traceback, O(n) memory.
+    // Bit-identical to score() after compute_viterbi() under an EXACT traceback mode
+    // (Pointers / Scores — every cell is computed by the same expressions as the fill),
+    // at every backend; it does not touch the Viterbi state, so path, guide and gradient
+    // accessors are unaffected (and still need compute_viterbi()).  Note the float32
+    // `auto` default for affine Full is hirschberg_pmax, whose path-replayed score may sit
+    // a measured hair below this exact optimum (see AGENTS.md).
+    //
+    // Full: the leveled striped kernel (score_kernel_impl.inl) on a simd backend, a scalar
+    // rolling-row copy of the fill otherwise.  Linear gaps run through the affine kernel
+    // with zero opens, which reduces the recurrence to the linear one exactly (v - 0 is
+    // exact, and rounding is monotone, so max(a-g, b-g) == max(a,b) - g bit for bit;
+    // the borders -(0 + i*ge) are -i*ge).  GuideBanded runs the banded fill: its tables
+    // are band-sized already, and it is not what score-only callers use.
+    double compute_score(DpBuffer& buf) {
+        check_problem();
+        if constexpr (AB == AlignBand::GuideBanded) {
+            compute_viterbi(buf);
+            return viterbi_score_;
+        } else {
+            const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
+            if (backend != kBackendScalar) {
+                const LevelKernels& K = level_kernels(backend);
+                auto fn = [&] {
+                    if constexpr (std::is_same_v<T, double>) return K.score;
+                    else                                     return K.score_f;
+                }();
+                if (fn) {
+                    ScoreJob<T> job{};
+                    job.a = a_idx_.data(); job.m = m_;
+                    job.b = b_idx_.data(); job.n = n_;
+                    job.blk = blkT_; job.nalpha = nalpha_;
+                    const bool lin = GM == GapModel::Linear;
+                    job.go_a = lin ? T(0) : static_cast<T>(params_->gap_open_a);
+                    job.ge_a = static_cast<T>(params_->gap_extend_a);
+                    job.go_b = lin ? T(0) : static_cast<T>(params_->gap_open_b);
+                    job.ge_b = static_cast<T>(params_->gap_extend_b);
+                    job.local = AM == AlignMode::Local;
+                    job.twopass = score_twopass_env();
+                    job.buf = &buf;
+                    fn(job);
+                    return job.score;
+                }
+            }
+            if constexpr (GM == GapModel::Linear) return score_linear_scalar(buf);
+            else                                   return score_affine_scalar(buf);
+        }
+    }
+    double compute_score() {
+        check_problem();
+        check_own_buf_allocated();
+        return compute_score(own_buf_);
     }
 
     // soft_guide="posterior": the next forward-backward also records, per row of A, the
@@ -2580,6 +2637,84 @@ private:
         gj[static_cast<std::size_t>(m_)] = n_;
         fill_guide_gaps(gj);
         return gj;
+    }
+
+    // ── Score only, scalar: viterbi_affine / viterbi_linear on rolling rows ──
+    // The same expressions in the same order (Full band), so the value at every cell —
+    // and the score — is bit-identical to the fill's; only the tables are gone.
+    static bool score_twopass_env() {
+        static const bool v = [] {
+            const char* e = std::getenv("NWGRAD_SCORE_VARIANT");
+            return e && std::string_view(e) == "twopass";
+        }();
+        return v;
+    }
+
+    double score_affine_scalar(DpBuffer& buf) const {
+        const T go_a = static_cast<T>(params_->gap_open_a);
+        const T ge_a = static_cast<T>(params_->gap_extend_a);
+        const T go_b = static_cast<T>(params_->gap_open_b);
+        const T ge_b = static_cast<T>(params_->gap_extend_b);
+        const std::size_t w = static_cast<std::size_t>(n_) + 1;
+        for (auto* v : {&buf.rM, &buf.rX, &buf.rY, &buf.qM, &buf.qX, &buf.qY})
+            if (v->size() < w) v->resize(w);
+        T* pM = buf.qM.data(); T* pX = buf.qX.data(); T* pY = buf.qY.data();
+        T* cM = buf.rM.data(); T* cX = buf.rX.data(); T* cY = buf.rY.data();
+        constexpr bool local = AM == AlignMode::Local;
+        const T ninf = static_cast<T>(NEG_INF);
+        pM[0] = static_cast<T>(0); pX[0] = ninf; pY[0] = ninf;
+        for (int j = 1; j <= n_; ++j) {
+            pM[j] = local ? static_cast<T>(0) : ninf;
+            pX[j] = ninf;
+            pY[j] = local ? ninf : -(go_a + static_cast<T>(j) * ge_a);
+        }
+        T best = static_cast<T>(0);
+        for (int i = 1; i <= m_; ++i) {
+            cM[0] = local ? static_cast<T>(0) : ninf;
+            cX[0] = local ? ninf : -(go_b + static_cast<T>(i) * ge_b);
+            cY[0] = ninf;
+            const T* sub = blkT_ + static_cast<std::size_t>(a_idx_[i - 1]) * nalpha_;
+            for (int j = 1; j <= n_; ++j) {
+                T m_val = std::max({pM[j-1], pX[j-1], pY[j-1]}) + sub[b_idx_[j - 1]];
+                const T x_val = std::max({pM[j] - go_b - ge_b, pX[j] - ge_b, pY[j] - go_b - ge_b});
+                const T y_val = std::max({cM[j-1] - go_a - ge_a, cX[j-1] - go_a - ge_a, cY[j-1] - ge_a});
+                if constexpr (local) {
+                    m_val = std::max(m_val, static_cast<T>(0));
+                    best = std::max(best, std::max({m_val, x_val, y_val}));
+                }
+                cM[j] = m_val; cX[j] = x_val; cY[j] = y_val;
+            }
+            std::swap(pM, cM); std::swap(pX, cX); std::swap(pY, cY);
+        }
+        if constexpr (local) return static_cast<double>(best);
+        else return static_cast<double>(std::max({pM[n_], pX[n_], pY[n_]}));
+    }
+
+    double score_linear_scalar(DpBuffer& buf) const {
+        const T ge_a = static_cast<T>(params_->gap_extend_a);
+        const T ge_b = static_cast<T>(params_->gap_extend_b);
+        const std::size_t w = static_cast<std::size_t>(n_) + 1;
+        if (buf.rM.size() < w) buf.rM.resize(w);
+        if (buf.qM.size() < w) buf.qM.resize(w);
+        T* prev = buf.qM.data(); T* cur = buf.rM.data();
+        constexpr bool local = AM == AlignMode::Local;
+        prev[0] = static_cast<T>(0);
+        for (int j = 1; j <= n_; ++j) prev[j] = local ? static_cast<T>(0) : -static_cast<T>(j) * ge_a;
+        double best = 0.0;
+        for (int i = 1; i <= m_; ++i) {
+            cur[0] = local ? static_cast<T>(0) : -static_cast<T>(i) * ge_b;
+            const T* sub = blkT_ + static_cast<std::size_t>(a_idx_[i - 1]) * nalpha_;
+            for (int j = 1; j <= n_; ++j) {
+                T v = std::max({prev[j-1] + sub[b_idx_[j - 1]], prev[j] - ge_b, cur[j-1] - ge_a});
+                if constexpr (local) {
+                    v = std::max(v, static_cast<T>(0));
+                    if (v > best) best = v;
+                }
+                cur[j] = v;
+            }
+            std::swap(prev, cur);
+        }
+        return local ? best : static_cast<double>(prev[n_]);
     }
 
     void viterbi_affine(DpBuffer& buf) {

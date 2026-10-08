@@ -153,6 +153,28 @@ struct ViterbiJob {
 using viterbi_fn   = void (*)(ViterbiJob<double>&);
 using viterbi_fn_f = void (*)(ViterbiJob<float>&);
 
+// ── Score only: the optimal alignment score, no table, no traceback ───────────
+//
+// The affine Full recurrence of ViterbiJob, bit-identical in every cell it computes,
+// but keeping only rolling rows (O(n) memory) and reporting just the score: VM/VX/VY at
+// (m, n) for Global, the maximum over every cell for Local.  Linear gaps run through it
+// with go_a = go_b = 0, which reduces the affine recurrence to the linear one exactly
+// (v - 0 is exact and rounding is monotone, so max(a-g, b-g) == max(a,b) - g bit for
+// bit) — see Aligner::compute_score.  Scratch (profile, rolling rows) lives in buf.
+template <class T>
+struct ScoreJob {
+    const unsigned char* a; int m;
+    const unsigned char* b; int n;
+    const T* blk; int nalpha;
+    T go_a, ge_a, go_b, ge_b;
+    int local;                              // 0 = Global, 1 = Local
+    int twopass;                            // 1: the unfused two-pass carry (for measuring)
+    DpBufferT<T>* buf;
+    double score;                           // out
+};
+using score_fn   = void (*)(ScoreJob<double>&);
+using score_fn_f = void (*)(ScoreJob<float>&);
+
 // ── Hirschberg linear-space sweep ─────────────────────────────────────────────
 //
 // One half-sweep of a divide-and-conquer block: fill H rows keeping only rolling rows,
@@ -417,6 +439,8 @@ struct LevelKernels {
     inter_soft_fn inter_soft = nullptr;         // inter-pair soft pass, double (same W)
     soft_pair_fn  soft_pair_linear = nullptr;   // per-pair scaled forward-backward ↓
     soft_pair_fn  soft_pair_affine = nullptr;
+    score_fn      score = nullptr;              // score only (rolling rows), double
+    score_fn_f    score_f = nullptr;            // ditto, float32
 };
 
 // One slot per possible level; index by (int)SimdLevel.  Populated by the level TUs'
@@ -434,6 +458,10 @@ inline LevelKernels* level_table() {
 // GCC would zero-init its 56 bytes with an AVX512 GPR-broadcast (vpbroadcastd) and the
 // program would SIGILL at load on a non-AVX512 box.  Passing bare pointers keeps the
 // registrar to scalar `lea`s; the struct is assembled and stored here, in baseline code.
+// The score-only kernels, registered separately (same baseline-code rule) right after
+// register_level by the same registrar, so they cannot be overwritten by it.
+void register_level_score(SimdLevel l, score_fn score, score_fn_f score_f);
+
 void register_level(SimdLevel l, viterbi_fn viterbi, viterbi_fn_f viterbi_f,
                     viterbi_fn viterbi_ptr, viterbi_fn_f viterbi_ptr_f,
                     banded_row_fn banded_row_global, banded_row_fn banded_row_local,

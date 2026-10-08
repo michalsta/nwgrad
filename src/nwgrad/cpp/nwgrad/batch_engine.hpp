@@ -587,7 +587,7 @@ private:
         } else if (grad_mode_ == GradMode::Soft) {
             al.compute_forward_back(buf); scores[i] = al.log_z(); al.soft_grad(buf, local_grad);
         } else {
-            al.compute_viterbi(buf); scores[i] = al.score();
+            scores[i] = al.compute_score(buf);   // no table, no traceback (exact fill's score)
         }
     }
     // The level a shared pass would run on, or -1 (every problem its own path): the
