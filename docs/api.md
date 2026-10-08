@@ -119,6 +119,16 @@ the whole struct in the ascent direction:
 params = params + lr * grad    # element-wise over matrix and all four gap fields
 ```
 
+**Pairs and batches copy their params.** `SeqPair(...)`, `add_many()` and
+`set_params()` take a copy, so an `AlignParams` is never shared with the pairs built
+from it: updating it in place (`+=`, `*=`, the setters) changes nothing they compute,
+and their cached scores stay valid. Hand the new values over explicitly:
+
+```python
+params += lr * grad
+batch.set_params(params)       # the batch sees the update from here on
+```
+
 
 ### Gap penalty conventions
 
@@ -145,7 +155,9 @@ nwgrad.SeqPair(
 
 One sequence pair, aligned on the calling thread. Sequences and problem type are fixed
 at construction; the parameters can be swapped cheaply with `set_params()`. The pair
-keeps its `AlignParams` alive, so you don't need a separate reference to it.
+holds its own **copy** of the `AlignParams`: you don't need to keep a reference, and
+changing the object afterwards (`p *= 2`, `p.gap_open_a = …`) does not affect the pair
+until you pass it to `set_params()`.
 
 A `SeqPair` is also what `batch[i]` returns: a **view** of pair `i` of a
 [`SeqPairBatch`](#seqpairbatch), with the same methods and properties. A view's
@@ -214,16 +226,18 @@ per-thread buffers. Naming any of `gap_model` / `mode` / `grad_mode` fixes the t
 (the others take their defaults); naming none is the deprecated pre-0.6 form, where the
 first `add_many()` fixes it (see [Migrating from 0.5](#migrating-from-05)).
 
-`n_threads=0` (default) uses the number of *physical* cores (falling back to
-`hardware_concurrency` where that cannot be determined): the DP is stall-bound, so
-SMT siblings contend and the logical count measured up to 1.44× slower.
+`n_threads=0` (default) uses the number of *physical* cores among the CPUs the
+process may run on — its affinity mask, so `taskset` and container CPU pinning are
+respected (a cgroup CPU *quota* is not) — falling back to the allowed logical count
+where the topology cannot be read: the DP is stall-bound, so SMT siblings contend and
+the logical count measured up to 1.44× slower.
 
 **Methods:**
 
 | Method | Returns | Description |
 |---|---|---|
-| `add_many(seqs_a, seqs_b, params, kernel="auto")` | — | Append the pairs `(seqs_a[i], seqs_b[i])` under `params`: one **segment**. Params may differ between calls (one alphabet); `set_params()` replaces them all. Sequences are validated and encoded in parallel; a bad character raises and adds nothing. The batch keeps `params` alive. |
-| `set_params(params)` | — | Point every pair at `params` (same alphabet; a mismatch raises without changing anything). Clears cached scores, gradients and stored paths; keeps the guides, for `banded_grad()`. |
+| `add_many(seqs_a, seqs_b, params, kernel="auto")` | — | Append the pairs `(seqs_a[i], seqs_b[i])` under `params`: one **segment**. Params may differ between calls (one alphabet); `set_params()` replaces them all. Sequences are validated and encoded in parallel; a bad character raises and adds nothing. The batch keeps a **copy** of `params` (calls with equal params share one); later changes to the object do not reach the batch — use `set_params()`. |
+| `set_params(params)` | — | Give every pair a copy of `params` (same alphabet; a mismatch raises without changing anything). Clears cached scores, gradients and stored paths; keeps the guides, for `banded_grad()`. |
 | `score_and_grad(keep_paths=False)` | `float` (sum of scores) | Full DP on every pair: score, guide and (unless `grad_mode="none"`) gradient, cached per pair. `keep_paths=True` also stores each alignment path, so `batch[i].aligned()` / `.coordinates()` work (a few bytes per alignment column). |
 | `banded_grad(bandwidth, keep_paths=False)` | `float` (sum of scores) | Banded re-align + gradient around each pair's cached guide. Run `score_and_grad()` once to establish the guides, then `set_params()` + `banded_grad(bw)` after each update; no full DP is run. |
 | `align(seqs_a, seqs_b, params, band=0, aligned_a=[], aligned_b=[], kernel="auto")` | [`BatchResult`](#batchresult) | Align pairs **without adding them** (what `BatchAligner` was): scores plus the gradient summed over the pairs, nothing kept per pair, so memory stays O(threads). Uses the batch's type, grad mode, threads and settings. `band > 0` bands every pair (`aligned_a` / `aligned_b`, one gapped string per pair, give the guides; the diagonal otherwise); `band == 0` with guides bands at width 0, so all pairs or none must carry one. Soft: forward-backward only (no Viterbi). |
@@ -333,7 +347,7 @@ added in order, so results do not depend on `n_threads` (0 = the default thread 
 | Function | Returns | Description |
 |---|---|---|
 | `step(batch, labels, alpha0)` | `Step` | One optimisation iteration's logistic work after `batch.score_and_grad()`: the fitted `alpha` (as `fit_alpha`) and `grad = Σᵢ (labels[i] − expit(alpha + scoreᵢ)) gradᵢ` as an `AlignParams` (as `weighted_grad` returns it). Uses the batch's `n_threads`. `SeqPairBatch` and `SeqPairBatchDouble`. |
-| `fit_alpha(scores, labels, alpha0, n_threads=0, tol=1e-12, max_newton=8, maxiter=200)` | `float` | The intercept maximising the likelihood: the root of dL/dα = Σ(y − p), which is strictly decreasing in α. Plain Newton steps while \|step\| ≤ 1, otherwise a bracketed safeguarded Newton (Numerical Recipes' rtsafe). Exact to rounding from any start. |
+| `fit_alpha(scores, labels, alpha0, n_threads=0, tol=1e-12, max_newton=8, maxiter=200)` | `float` | The intercept maximising the likelihood: the root of dL/dα = Σ(y − p), which is strictly decreasing in α. Plain Newton steps while \|step\| ≤ 1, otherwise a bracketed safeguarded Newton (Numerical Recipes' rtsafe). Exact to rounding from any start. A NaN or infinite score (any non-finite derivative), a non-finite `alpha0` or a negative `tol` raises `ValueError`. |
 | `probabilities(scores, alpha, n_threads=0)` | `numpy.ndarray` | expit(α + scores), bit-identical to `scipy.special.expit`. |
 
 ## `BatchResult`
@@ -370,9 +384,10 @@ encoded against `params`'s alphabet on the way in.
 `aligned_b` must describe the input pair, not merely be well formed: it needs one
 entry per residue of `seq_a` plus one (i.e. the gapped `aligned_a` spells `seq_a`),
 every column in `[0, len(seq_b)]`, never decreasing. Anything else raises
-`ValueError` before the DP runs, as does a negative `band`. The last guide entry need
-not equal `len(seq_b)`: B residues after the last A residue (trailing gaps in A) do not
-add an entry.
+`ValueError` before the DP runs, as does a negative `band` or giving only one of
+`aligned_a` / `aligned_b`. A `band` of `len(seq_b)` or more covers whole rows, i.e. it
+is the full DP. The last guide entry need not equal `len(seq_b)`: B residues after the
+last A residue (trailing gaps in A) do not add an entry.
 
 **Score only** — return `float`:
 
@@ -429,6 +444,24 @@ in its own arrays (about 10× less memory per pair, faster batch-wide steps), an
 | `pair.alloc_dp()` | (nothing) | deprecated no-op |
 | `batch[i].set_params(p)`, `batch[i].hb_cutoff = …`, `.fill`, `.soft_impl`, `.soft_temperature` | set them on the batch | raises: a pair in a batch is a view, its settings are the batch's (`hb_cutoff` now applies to every pair) |
 | `batch[i] is batch[i]` | — | `batch[i]` returns a new view each time |
+
+Other behaviour changes since 0.5.2:
+
+- **Params are copied, not borrowed — check training loops.** `SeqPair`, `add_many()`
+  and `set_params()` keep a copy, so an in-place update of an `AlignParams` (`+=`, `*=`,
+  the gap / matrix setters) no longer reaches existing pairs. In 0.5 the pairs held a
+  reference, so a loop like `params += lr * g; batch.score_and_grad()` picked up the new
+  values (while results cached before the update stayed marked valid). In 0.6 **that loop
+  silently keeps scoring the original params** — nothing raises. Call
+  `batch.set_params(params)` after each update.
+- **Input checks that were missing.** A negative `band` raises everywhere (it silently
+  ran the full DP when no guide was given); giving only one of `aligned_a` /
+  `aligned_b` raises (it silently used the diagonal guide); `logistic.fit_alpha` raises
+  on non-finite scores (NaN used to "converge" to a plausible intercept).
+- **`n_threads=0` respects the CPU affinity mask** (`taskset`, cpusets): under
+  `taskset -c 0` it is now 1, not the host's core count.
+- `logistic.log_likelihood()` and `Step.loglik_at_alpha0` were removed (see
+  [`nwgrad.logistic`](#nwgradlogistic)).
 
 Results are unchanged: scores, alignments and hard gradients are bit-identical to
 0.5.2's, and soft per-pair results too. Two sums differ in the last bits for soft
