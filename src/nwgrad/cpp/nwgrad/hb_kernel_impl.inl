@@ -75,7 +75,7 @@ static void hb_sweep_striped(HbJob<T>& job) {
     // for this, and the H == 0 case leaves the correct answer in place by construction.
     T* r0M = oM; T* r0X = oX; T* r0Y = oY;
     r0M[0] = job.in_x ? NINF : T(0);
-    r0X[0] = job.in_x ? T(0) : NINF;
+    r0X[0] = NINF;   // in_x: only the first row's column-0 X continues the run (below)
     r0Y[0] = NINF;
     for (int c = 1; c <= NC; ++c) {
         r0M[c] = NINF;
@@ -136,7 +136,8 @@ static void hb_sweep_striped(HbJob<T>& job) {
         // Column 0 of this row.  M cannot happen there (no column to pair with) and Y
         // cannot either (Y consumes a column); only X, extending downward.
         const T nbM = NINF;
-        const T nbX = std::max(std::max((bM - go_b) - ge_b, bX - ge_b), (bY - go_b) - ge_b);
+        T nbX = std::max(std::max((bM - go_b) - ge_b, bX - ge_b), (bY - go_b) - ge_b);
+        if (job.in_x && t == 0) nbX = T(0) - ge_b;   // the inherited run continues
         const T nbY = NINF;
         const T nbOpen = (std::max(nbM, nbX) - go_a) - ge_a;
 
@@ -314,7 +315,7 @@ static void hb_sweep_striped_pmax(HbJob<T>& job) {
     // what keeps the family bit-identical.
     T* r0M = oM; T* r0X = oX; T* r0Y = oY;
     r0M[0] = job.in_x ? NINF : T(0);
-    r0X[0] = job.in_x ? T(0) : NINF;
+    r0X[0] = NINF;   // in_x: only the first row's column-0 X continues the run (below)
     r0Y[0] = NINF;
     for (int c = 1; c <= NC; ++c) {
         r0M[c] = NINF;
@@ -378,7 +379,8 @@ static void hb_sweep_striped_pmax(HbJob<T>& job) {
                        (std::size_t)a[job.a_start + t * job.a_step] * sw;
 
         const T nbM = NINF;
-        const T nbX = std::max(std::max((bM - go_b) - ge_b, bX - ge_b), (bY - go_b) - ge_b);
+        T nbX = std::max(std::max((bM - go_b) - ge_b, bX - ge_b), (bY - go_b) - ge_b);
+        if (job.in_x && t == 0) nbX = T(0) - ge_b;   // the inherited run continues
         const T nbY = NINF;
         const T nbOpen = (std::max(nbM, nbX) - go_a) - ge_a;
 
@@ -816,7 +818,7 @@ static void hb_base_striped(HbBaseJob<T>& job) {
 
     // ── row 0: origin seed (in_x), Y series rightward ────────────────────────
     pM[0] = job.in_x ? NINF : T(0);
-    pX[0] = job.in_x ? T(0) : NINF;
+    pX[0] = NINF;   // in_x: only the first row's column-0 X continues the run (below)
     pY[0] = NINF;
     D0[0] = 3; D1[0] = 3; D2[0] = 3;
     {
@@ -854,9 +856,10 @@ static void hb_base_striped(HbBaseJob<T>& job) {
         // column 0 of this row: carried X gap down the left edge
         const T ax0 = (bM - go_b) - ge_b, bx0 = bX - ge_b, cx0 = (bY - go_b) - ge_b;
         const T nbM = NINF;
-        const T nbX = std::max({ax0, bx0, cx0});
+        T nbX = std::max({ax0, bx0, cx0});
         const T nbY = NINF;
-        const unsigned char cx0code = (ax0 >= bx0 && ax0 >= cx0) ? 0 : ((bx0 >= cx0) ? 1 : 2);
+        unsigned char cx0code = (ax0 >= bx0 && ax0 >= cx0) ? 0 : ((bx0 >= cx0) ? 1 : 2);
+        if (job.in_x && r == 1) { nbX = T(0) - ge_b; cx0code = 1; }   // the inherited run continues
         cM[0] = nbM; cX[0] = nbX; cY[0] = nbY;
         D0[(std::size_t)r * rowsz] = 3;
         D1[(std::size_t)r * rowsz] = cx0code;

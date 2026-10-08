@@ -867,13 +867,14 @@ def test_negative_gap_penalties_auto_is_exact_explicit_raises(cls, gm, md):
                 e.score_and_grad()
 
 
-# ── float32 Hirschberg loses score with a SMALL hb_cutoff (found 2026-10-08, not fixed) ──
-# Exact and prefix-max, Global and Local, scalar and simd: the shared recursion at
-# T=float.  On this box, cutoff >= 32 is exact; 16 and 8 lose 0.5, 4 loses 4.5, 1 loses
-# 5.5 (153.6 optimum).  Double is exact at every cutoff, float32 with integer penalties
-# too: rounding of the non-representable 0.3 / 0.2 flips a split/join decision, and the
-# loss grows with recursion depth.  The default cutoff (512) measured safe (<= 0.002 on
-# 272 alignments of 600-12000 residues).  See TODO.md.
+# ── Boundary gap states are strict (fixed 2026-10-09) ─────────────────────────────────
+# When the join lets a vertical gap run straddle the cut, the upper half must END with a
+# vertical move into its corner (out_x) and the lower half LEAVE its origin by one (in_x).
+# The sweeps seeded the X state at the origin / corner, which also let the inherited state
+# feed a diagonal or horizontal move there: a half was promised more than its solver could
+# deliver (the base case ends strictly in X), and the shortfall compounded with depth.
+# Needs rounding to tip a near-tie into the straddling form, so it is rare — random pairs
+# at small hb_cutoff: up to 4.8 below the optimum at float32, 3.5-3.8 at double.
 _F32_A = ("GCAGAACCAATATGGAAAAAGAACGCACGGCGTTCACCAAGCGAAATGGGACTCCTAGAAGCCGCAACTGTACCAAATG"
           "GGAGGTGAAGCACCTCACAAGCTATGTCCTTACAGTCAACTCCCTTGAAAGACGGCATAGTTATGAACGATGTC")
 _F32_B = ("CAAAGAGACTATACTGCGGGAGTAGATTTATTTGGTGTGCTGACCTGCTCGTATCCGGCGGCGCACCTATTATTTAAA"
@@ -881,15 +882,39 @@ _F32_B = ("CAAAGAGACTATACTGCGGGAGTAGATTTATTTGGTGTGCTGACCTGCTCGTATCCGGCGGCGCACCTA
 _F32_M = [[2, 2, 0, 0], [3, -2, 2, -2], [3, 3, 1, 2], [-2, -1, 2, 0]]
 
 
-@pytest.mark.xfail(strict=True, reason="float32 Hirschberg with a small hb_cutoff (TODO.md)")
-@pytest.mark.parametrize("cutoff", [1, 8])
-def test_float32_small_cutoff_keeps_the_optimum(cutoff):
+@pytest.mark.parametrize("cls", ["SeqPair", "SeqPairDouble"])
+@pytest.mark.parametrize("tb", ["hirschberg", "hirschberg_pmax"])
+@pytest.mark.parametrize("md", ["global", "local"])
+@pytest.mark.parametrize("cutoff", [1, 2, 4, 8, 16])
+def test_inherited_gap_run_keeps_the_optimum(cls, tb, md, cutoff):
     import numpy as np
     p = nwgrad.AlignParams(nwgrad.SubstMatrix(np.array(_F32_M, float), alphabet="ACGT"),
                            3.0, 0.3, 2.0, 0.2)
-    ref = nwgrad.SeqPair(_F32_A, _F32_B, p, gap_model="affine", mode="global", traceback="pointers")
+    C = getattr(nwgrad, cls)
+    ref = C(_F32_A, _F32_B, p, gap_model="affine", mode=md, traceback="pointers")
     ref.score_and_grad()
-    hb = nwgrad.SeqPair(_F32_A, _F32_B, p, gap_model="affine", mode="global", traceback="hirschberg")
+    hb = C(_F32_A, _F32_B, p, gap_model="affine", mode=md, traceback=tb)
     hb.hb_cutoff = cutoff
     hb.score_and_grad()
-    assert hb.score >= ref.score - 1e-3
+    tol = 1e-3 if (cls == "SeqPair" or tb == "hirschberg_pmax") else 1e-9
+    assert hb.score >= ref.score - tol
+    assert hb.score <= ref.score + tol
+
+
+_DBL_A = "ATAAGCATGCCGCGACACCGTGTCCGACTCTGACCTCCGTGTATATGGAGAGCACAAACGGACGAAAAAGTTGCTTCACCGAGCCAGATGTGTAATGGCCGCACCTCCGAGATCCCCGGTTCGCTATCGGCTCGTATTCTAATTAGATTCAAGTGCGTTAACCGTGTCGGCGGGCCTGAGGTTGACAATAACCGCTATTGAGGGCCCGCCTCGTTGCATGGT"
+_DBL_B = "TTAGAGATTAGAAGCATGCCGCGACGGTAATACAGACCGTGTCTGACTCTGACCCGTGTATTGGTGACACAAACGGACGAAAAAGTTCTTCACCGCAACGTACTAATGACAGCAACCAATGTGTAATGGCCGCACTTGCTCCGAGATCCCCGGGTCGCTATAGGCTCGTATTCTAATATCGGTTAGATTCAAGTGCGTTAACCGAGCGGCGGGCCTGATGTTGACATAACCGCATTGAGGCCCGCCTCGGTGTGTCGTACTGTTGCATGGT"
+_DBL_M = [[1.0, 2.0, 0.0, -1.0], [-2.0, 3.0, -1.0, 0.0], [-2.0, -1.0, -2.0, 0.0], [3.0, -1.0, 3.0, 1.0]]
+
+
+@pytest.mark.parametrize("cutoff", [1, 2, 4, 8])
+@pytest.mark.parametrize("tb", ["hirschberg", "hirschberg_pmax"])
+def test_boundary_states_double_case(cutoff, tb):
+    """The double-precision face of the same defect: 173.7 at cutoff 1 for a 177.5 optimum."""
+    import numpy as np
+    p = nwgrad.AlignParams(nwgrad.SubstMatrix(np.array(_DBL_M), alphabet="ACGT"), 3.3, 0.3, 2.5, 0.2)
+    ref = nwgrad.SeqPairDouble(_DBL_A, _DBL_B, p, gap_model="affine", mode="global", traceback="pointers")
+    ref.score_and_grad()
+    hb = nwgrad.SeqPairDouble(_DBL_A, _DBL_B, p, gap_model="affine", mode="global", traceback=tb)
+    hb.hb_cutoff = cutoff
+    hb.score_and_grad()
+    assert abs(hb.score - ref.score) < 1e-9

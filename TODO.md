@@ -131,21 +131,19 @@ performance work, none of it measured yet; the cost notes are estimates.
   `NWGRAD_SCORE_FUZZ=20000 nwgrad_tests "[score]"` on spot/solace; (d) inter-pair
   eligibility for score only still uses the table-size cap (`inter_pair_fits`), which
   does not apply to one row — re-derive the crossover against the per-pair kernel.
-- **float32 Hirschberg loses score with a SMALL `hb_cutoff`** (characterized 2026-10-08;
-  first misread as a Local / prefix-max problem).  Exact `hirschberg` and
-  `hirschberg_pmax`, Global and Local, scalar and simd alike — the shared recursion at
-  T=float.  One 153 x 96 DNA box (integer matrix, gaps 3/0.3/2/0.2): cutoff 32+ exact,
-  16 and 8 lose 0.5, 4 loses 4.5, 1 loses 5.5; double exact at every cutoff, float32 with
-  INTEGER penalties exact even at cutoff 1.  So float32 rounding of non-representable
-  penalties flips some decision in the split/join, and the loss grows with recursion
-  depth — far beyond rounding.  At the DEFAULT cutoff (512) it does not show: 240
-  alignments of 600-3000 residues and 32 of 6000-12000, homologous and unrelated, DNA and
-  protein, Global and Local — float32 `auto` short of float32 Pointers by <= 0.002 (equal
-  to exact Hirschberg's), never above.  Root cause not found; next, compare float and
-  double forward / reverse rows and the join's (c*, span) choices at each split.  Repro:
-  `tests/Python/test_hirschberg.py::test_float32_small_cutoff_keeps_the_optimum` (strict
-  xfail — it starts failing when fixed).  Until then, consider a float32 floor on
-  hb_cutoff (e.g. 32).
+- **Hirschberg boundary states — FIXED 2026-10-09.**  Not float-specific: when the join
+  lets a vertical gap run straddle the cut, the halves must CONTINUE it (lower half leaves
+  its origin vertically, upper half enters its corner vertically), but the sweeps seeded
+  the X state at the origin / corner, which also let it feed a diagonal or horizontal move.
+  A half was promised more than its solver (base case: strictly ends in X) could deliver,
+  compounding with depth: random pairs at small hb_cutoff lost up to 4.8 (float32) / 3.5
+  (double); default cutoff 512 measured fine before and after.  Fix: origin / corner
+  unreachable, the first swept row's column 0 seeded 0 - ge_b (scalar hb_fwd / hb_rev /
+  hb_base, the vector exact and prefix-max sweeps and hb_base_striped, the test model).
+  After: 0 of 36k scalar and 2.4k vector random alignments beyond rounding.  Regression
+  tests: test_hirschberg.py::test_inherited_gap_run_keeps_the_optimum,
+  ::test_boundary_states_double_case.  (A first attempt that changed the seed VALUE only
+  moved the failures around — any constant seed is a uniform shift inside a block.)
 - **Hirschberg with negative gap penalties** is guarded (auto -> Pointers, explicit raises);
   a real fix would make the join and the Local endpoint scans handle gaps that gain score.
 - **O3 — release the GIL in long batch calls.** Same item as AGENTS.md's Open TODO.

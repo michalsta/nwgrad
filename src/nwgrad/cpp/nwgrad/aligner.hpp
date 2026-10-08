@@ -1878,7 +1878,9 @@ private:
 
         // Row i0: the block's origin, then Y moves rightward along it.
         pM[0] = in_x ? static_cast<T>(NEG_INF) : static_cast<T>(0);
-        pX[0] = in_x ? static_cast<T>(0)       : static_cast<T>(NEG_INF);
+        // An inherited X run (in_x) may only CONTINUE: the origin feeds nothing but the
+        // first row's column-0 X (below) — see hb_solve's note on boundary states.
+        pX[0] = static_cast<T>(NEG_INF);
         pY[0] = static_cast<T>(NEG_INF);
         for (int c = 1; c <= W; ++c) {
             pM[c] = static_cast<T>(NEG_INF);
@@ -1889,6 +1891,7 @@ private:
         for (int r = i0 + 1; r <= i1; ++r) {
             cM[0] = static_cast<T>(NEG_INF);
             cX[0] = std::max({pM[0] - go_b - ge_b, pX[0] - ge_b, pY[0] - go_b - ge_b});
+            if (in_x && r == i0 + 1) cX[0] = static_cast<T>(0) - ge_b;   // the run continues
             cY[0] = static_cast<T>(NEG_INF);
             // The running prefix max over Q[k] = g[k] + k*ge_a, seeded with the column-0
             // border folded in as k = -1.  Unused (and cold) when Pmax is false.
@@ -1929,7 +1932,9 @@ private:
 
         // Reversed column offset d = j1 - j, so d grows leftward from the block's end.
         pM[0] = out_x ? static_cast<T>(NEG_INF) : static_cast<T>(0);
-        pX[0] = out_x ? static_cast<T>(0)       : static_cast<T>(NEG_INF);
+        // A run continuing past the corner (out_x) must ENTER it vertically: the corner
+        // feeds nothing but the first reversed row's column-0 X (below).
+        pX[0] = static_cast<T>(NEG_INF);
         pY[0] = static_cast<T>(NEG_INF);
         for (int d = 1; d <= W; ++d) {
             pM[d] = static_cast<T>(NEG_INF);
@@ -1940,6 +1945,7 @@ private:
         for (int r = i1 - 1; r >= i0; --r) {
             cM[0] = static_cast<T>(NEG_INF);
             cX[0] = std::max({pM[0] - go_b - ge_b, pX[0] - ge_b, pY[0] - go_b - ge_b});
+            if (out_x && r == i1 - 1) cX[0] = static_cast<T>(0) - ge_b;   // enters the corner vertically
             cY[0] = static_cast<T>(NEG_INF);
             T P = cY[0] - ge_a;
             for (int d = 1; d <= W; ++d) {
@@ -2055,7 +2061,7 @@ private:
         };
 
         pM[0] = in_x ? static_cast<T>(NEG_INF) : static_cast<T>(0);
-        pX[0] = in_x ? static_cast<T>(0)       : static_cast<T>(NEG_INF);
+        pX[0] = static_cast<T>(NEG_INF);   // in_x: only the first row's column-0 X continues it
         pY[0] = static_cast<T>(NEG_INF);
         dM[0] = 3; dX[0] = 3; dY[0] = 3;
         for (int c = 1; c <= W; ++c) {
@@ -2073,6 +2079,7 @@ private:
             cX[0] = std::max({ux0, vx0, wx0});
             cY[0] = static_cast<T>(NEG_INF);
             dM[rb] = 3; dX[rb] = pick(ux0, vx0, wx0); dY[rb] = 3;
+            if (in_x && r == 1) { cX[0] = static_cast<T>(0) - ge_b; dX[rb] = 1; }   // continues the run
             for (int c = 1; c <= W; ++c) {
                 const T dgM = pM[c-1], dgX = pX[c-1], dgY = pY[c-1];
                 cM[c] = std::max({dgM, dgX, dgY}) + subT(i0 + r, j0 + c);
@@ -2185,6 +2192,16 @@ private:
         // run straddling the cut: both halves then charge the open, so one -go_b is
         // refunded.  That refund is strictly positive, so taking the max over both forms
         // picks it automatically wherever it applies.
+        //
+        // Boundary states are STRICT, and must be for the join's values to be achievable:
+        // in_x means the block's path LEAVES its origin by a vertical move continuing the
+        // inherited run, out_x that it ENTERS its far corner by one.  The sweeps used to seed
+        // the X state at the origin / corner instead, which also let the inherited state
+        // feed a diagonal or a horizontal move there — so a half promised more than its
+        // solver (whose base case ends strictly in X) could deliver, and the shortfall
+        // compounded up the recursion: up to 4.8 below the optimum at float32, 3.5 at
+        // double, on random pairs at small hb_cutoff (fixed 2026-10-09).  Now the origin /
+        // corner is unreachable and the first swept row's column 0 is seeded 0 - ge_b.
         const T go_b = static_cast<T>(params_->gap_open_b);
         T best = static_cast<T>(NEG_INF);
         int cstar = 0;

@@ -80,7 +80,7 @@ Row<T> ref_pmax_sweep(const std::vector<unsigned char>& a, const std::vector<uns
 
     // row 0 — exact, serial
     pM[0] = in_x ? NINF : T(0);
-    pX[0] = in_x ? T(0) : NINF;
+    pX[0] = NINF;   // in_x: the inherited run may only continue (first row's column 0 below)
     pY[0] = NINF;
     for (int c = 1; c <= NC; ++c) {
         pM[c] = NINF; pX[c] = NINF;
@@ -93,7 +93,8 @@ Row<T> ref_pmax_sweep(const std::vector<unsigned char>& a, const std::vector<uns
     for (int t = 0; t < H; ++t) {
         const unsigned char arow = a[t];
         const T nbM = NINF;
-        const T nbX = std::max(std::max((bM - go_b) - ge_b, bX - ge_b), (bY - go_b) - ge_b);
+        T nbX = std::max(std::max((bM - go_b) - ge_b, bX - ge_b), (bY - go_b) - ge_b);
+        if (in_x && t == 0) nbX = T(0) - ge_b;
         const T nbY = NINF;
 
         // carry-free half, and the open value g[c] each cell offers a new Y gap
