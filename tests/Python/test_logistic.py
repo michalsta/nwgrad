@@ -125,3 +125,11 @@ def test_step_needs_one_label_per_pair_and_cached_scores():
     batch.score_and_grad()
     with pytest.raises(ValueError, match="one label per pair"):
         L.step(batch, y[:-1], 0.0)
+
+
+def test_fit_alpha_rejects_nan_scores():
+    """NaN scores used to "converge" to a plausible intercept (scan B5)."""
+    import numpy as np
+    import nwgrad.logistic as L
+    with pytest.raises(ValueError, match="non-finite"):
+        L.fit_alpha(np.array([np.nan, 0.0]), np.array([0.0, 1.0]), 0.0, n_threads=1)

@@ -156,15 +156,24 @@ inline double fit_alpha(const double* s, const double* y, size_t n, double alpha
                         int n_threads, double tol = 1e-12, int max_newton = 8,
                         int maxiter = 200, const Sums* at_alpha0 = nullptr) {
     check_labels(y, n);
+    if (!std::isfinite(alpha0) || !std::isfinite(tol) || tol < 0)
+        throw std::invalid_argument("nwgrad.logistic.fit_alpha: alpha0 and tol must be finite, tol >= 0");
+    // A non-finite score makes g NaN or infinite, and both bracket tests are false for
+    // NaN: without this check the bisection "converges" on its step size alone.
+    auto finite = [](double g, double h) {
+        if (!std::isfinite(g) || !std::isfinite(h))
+            throw std::invalid_argument("nwgrad.logistic.fit_alpha: non-finite derivative (a score is NaN or infinite)");
+        return std::pair<double, double>(g, h);
+    };
     auto derivatives = [&](double alpha) {
         const Sums d = evaluate(s, y, n, alpha, false, n_threads);
-        return std::pair<double, double>(d.g, d.h);
+        return finite(d.g, d.h);
     };
 
     double alpha = alpha0;
     for (int k = 0; k < max_newton; ++k) {
         double g, h;
-        std::tie(g, h) = (k == 0 && at_alpha0) ? std::pair<double, double>(at_alpha0->g, at_alpha0->h)
+        std::tie(g, h) = (k == 0 && at_alpha0) ? finite(at_alpha0->g, at_alpha0->h)
                                                : derivatives(alpha);
         const double step = h > 0 ? g / h : std::numeric_limits<double>::infinity();
         if (!std::isfinite(step) || std::abs(step) > 1.0) break;

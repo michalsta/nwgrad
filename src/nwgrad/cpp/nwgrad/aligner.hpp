@@ -219,6 +219,15 @@ struct Aligner {
     // tables inside DpBufferT<T> are double regardless of T.
     using DpBuffer = DpBufferT<T>;
 
+    // Not copyable: a_idx_/b_idx_ and blkT_ may point into this aligner's own vectors
+    // (a_own_, b_own_, blkT_storage_), which a copy duplicates without re-aiming them.
+    // Moving keeps each vector's heap buffer, so the pointers stay valid.
+    Aligner() = default;
+    Aligner(const Aligner&) = delete;
+    Aligner& operator=(const Aligner&) = delete;
+    Aligner(Aligner&&) = default;
+    Aligner& operator=(Aligner&&) = default;
+
     // ── Public pipeline API — own internal buffer ─────────────────────────────
 
     // Convenience: take characters, validate and encode them against the params'
@@ -231,9 +240,12 @@ struct Aligner {
                      const AlignParams& params,
                      int band = 0,
                      std::vector<int> guide_j = {}) {
+        // Encode both before touching a_own_/b_own_: a bad character in B must not
+        // free A's codes under the previous problem's spans.
         const Alphabet& alpha = params.matrix.alphabet();
-        a_own_ = alpha.encode(a);
-        b_own_ = alpha.encode(b);
+        std::vector<uint8_t> ea = alpha.encode(a), eb = alpha.encode(b);
+        a_own_ = std::move(ea);
+        b_own_ = std::move(eb);
         set_problem(std::span<const uint8_t>(a_own_),
                     std::span<const uint8_t>(b_own_),
                     params, band, std::move(guide_j));
@@ -275,10 +287,15 @@ struct Aligner {
         n_      = static_cast<int>(b.size());
         stride_ = static_cast<size_t>(n_ + 1);
         sz_     = static_cast<size_t>(m_ + 1) * stride_;
+        // Checked for Full too: the entry points pick GuideBanded only for band > 0, so
+        // a negative band would otherwise slip through as a full DP.
+        if (band_ < 0)
+            throw std::invalid_argument(
+                "nwgrad: band must be >= 0, got " + std::to_string(band_));
+        // Every guide entry is in [0, n], so a band >= n already covers whole rows;
+        // clamping keeps guide_j_[i] + band_ (jhi/jhi0) from overflowing int.
+        if (band_ > n_) band_ = n_;
         if constexpr (AB == AlignBand::GuideBanded) {
-            if (band_ < 0)
-                throw std::invalid_argument(
-                    "nwgrad: band must be >= 0, got " + std::to_string(band_));
             if (guide_j.empty()) {
                 guide_j_.resize(static_cast<size_t>(m_ + 1));
                 if (m_ > 0)
