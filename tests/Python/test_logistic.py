@@ -48,10 +48,20 @@ def test_results_do_not_depend_on_threads():
     assert len({L.probabilities(s, 0.3, n_threads=t).tobytes() for t in (1, 3, 8)}) == 1
 
 
-@pytest.mark.parametrize("labels", [np.zeros(5), np.ones(5), np.array([0.0, 1.0, 0.5, 1.0, 0.0])])
-def test_invalid_labels_raise(labels):
-    with pytest.raises(ValueError):
-        L.fit_alpha(np.arange(5.0), labels, 0.0)
+def test_soft_labels_fit_the_root_of_the_cross_entropy_gradient():
+    """Labels are not checked, and soft labels in [0, 1] are supported as such:
+    alpha is the root of sum(y - p) for fractional y too."""
+    s, _ = data(8)
+    y = np.random.default_rng(8).random(s.size)
+    assert L.fit_alpha(s, y, 0.0) == pytest.approx(root(s, y), abs=1e-10)
+
+
+def test_labels_are_not_checked():
+    """Labels are the caller's responsibility: out-of-range or single-class labels
+    give a meaningless intercept, not an error."""
+    s = np.arange(5.0)
+    for y in (np.ones(5), np.array([0.0, 1.0, 2.0, 1.0, 0.0])):
+        assert np.isfinite(L.fit_alpha(s, y, 0.0))
 
 
 def test_length_mismatch_raises():
@@ -123,3 +133,18 @@ def test_fit_alpha_rejects_nan_scores():
     import nwgrad.logistic as L
     with pytest.raises(ValueError, match="non-finite"):
         L.fit_alpha(np.array([np.nan, 0.0]), np.array([0.0, 1.0]), 0.0, n_threads=1)
+
+
+def test_step_with_soft_labels_is_its_parts_composed():
+    a, b, _ = many_pairs(2 * 4096 + 5, seed=9)
+    y = np.random.default_rng(9).random(len(a))
+    batch = nwgrad.SeqPairBatchDouble(n_threads=4)
+    batch.add_many(a, b, dna_params(), gap_model="affine", mode="local")
+    batch.score_and_grad()
+    st = L.step(batch, y, -0.4)
+    s = batch.scores()
+    assert st.alpha == L.fit_alpha(s, y, -0.4, n_threads=4)
+    expected = batch.weighted_grad(y - L.probabilities(s, st.alpha)).to_dict()
+    got = st.grad.to_dict()
+    assert np.array_equal(got["matrix"], expected["matrix"])
+    assert all(got[f] == expected[f] for f in FIELDS)

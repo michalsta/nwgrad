@@ -74,13 +74,20 @@ TEST_CASE("logistic: sums and the fitted alpha do not depend on the thread count
     REQUIRE(std::abs(at.g) < 1e-8 * static_cast<double>(n));
 }
 
-TEST_CASE("logistic: invalid labels throw", "[logistic]") {
-    std::vector<double> s = {0.0, 1.0, 2.0};
-    for (std::vector<double> y : {std::vector<double>{0, 0, 0}, std::vector<double>{1, 1, 1},
-                                  std::vector<double>{0, 1, 2}}) {
-        REQUIRE_THROWS_AS(nwgrad::logistic::fit_alpha(s.data(), y.data(), 3, 0.0, 1),
-                          std::invalid_argument);
+TEST_CASE("logistic: labels are not checked; soft labels fit the root of sum(y - p)", "[logistic]") {
+    const size_t n = 2 * nwgrad::logistic::BLOCK + 7;
+    std::vector<double> s(n), y(n);
+    for (size_t i = 0; i < n; ++i) {
+        s[i] = std::sin(0.29 * static_cast<double>(i)) * 3.0;
+        y[i] = 0.5 + 0.5 * std::cos(0.13 * static_cast<double>(i));   // soft labels in [0, 1]
     }
+    const double alpha = nwgrad::logistic::fit_alpha(s.data(), y.data(), n, 0.0, 2);
+    const auto at = nwgrad::logistic::evaluate(s.data(), y.data(), n, alpha, 1);
+    REQUIRE(std::abs(at.g) < 1e-8 * static_cast<double>(n));
+    // Out-of-range or single-class labels are the caller's to reject: no throw.
+    std::vector<double> s3 = {0.0, 1.0, 2.0};
+    for (std::vector<double> y3 : {std::vector<double>{1, 1, 1}, std::vector<double>{0, 1, 2}})
+        REQUIRE_NOTHROW(nwgrad::logistic::fit_alpha(s3.data(), y3.data(), 3, 0.0, 1));
 }
 
 TEST_CASE("logistic: step is its parts composed", "[logistic]") {

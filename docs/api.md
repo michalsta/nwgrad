@@ -338,8 +338,11 @@ likelihood [DiscrimAlign](https://github.com/BioGeMT/DiscrimAlign) maximises. It
 its own module (`src/nwgrad/cpp/nwgrad/logistic/`) and uses only `SeqPairBatch`'s public
 interface. Every sum is taken over fixed blocks of 4096 elements and the block sums are
 added in order, so results do not depend on `n_threads` (0 = the default thread count).
-`labels` are float64 arrays of 0s and 1s with both classes present; anything else raises
-`ValueError`. The log-likelihood itself is not provided (`log_likelihood()` and
+`labels` are float64 arrays with each label in [0, 1]: 0/1 class labels, or soft labels
+(target probabilities, for which the likelihood is the Bernoulli cross-entropy). They must
+not be all 0 or all 1, or the likelihood has no finite maximum in α. **Labels are not
+checked**: they are the caller's responsibility, and labels that break these conditions
+give a meaningless `alpha` instead of an error. The log-likelihood itself is not provided (`log_likelihood()` and
 `Step.loglik_at_alpha0` were removed in 0.6.0: they clipped probabilities to
 [ε, 1 − ε]). Evaluate it from the logits z = α + score as Σ y·z − Σ log(1 + eᶻ), e.g.
 `np.dot(labels, z) - np.logaddexp(0, z).sum()`, which needs no clipping.
@@ -461,6 +464,10 @@ Other behaviour changes since 0.5.2:
 - **`n_threads=0` respects the CPU affinity mask** (`taskset`, cpusets): under
   `taskset -c 0` it is now 1, not the host's core count.
 - `logistic.log_likelihood()` and `Step.loglik_at_alpha0` were removed (see
+  [`nwgrad.logistic`](#nwgradlogistic)).
+- **`logistic` labels are no longer checked**, and soft labels in [0, 1] are accepted.
+  `step()` and `fit_alpha()` no longer raise `ValueError` for labels other than 0/1 or
+  of a single class; the caller must check them (see
   [`nwgrad.logistic`](#nwgradlogistic)).
 
 Results are unchanged: scores, alignments and hard gradients are bit-identical to

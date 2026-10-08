@@ -30,9 +30,10 @@ void bind_step(nb::module_& m) {
         "cached (call score_and_grad() first).  Returns a Step: the fitted\n"
         "intercept (alpha, as fit_alpha()), and\n"
         "grad = sum_i (labels[i] - expit(alpha + score_i)) * grad_i, as\n"
-        "weighted_grad() would return it.  labels: float64 array of 0s and 1s, one\n"
-        "per pair, both classes present.  Uses the batch's n_threads; the result\n"
-        "does not depend on it.");
+        "weighted_grad() would return it.  labels: float64 array, one per pair,\n"
+        "each in [0, 1] (0/1 class labels or soft labels), not all 0 and not all\n"
+        "1; not checked, see the nwgrad.logistic module doc.  Uses the batch's\n"
+        "n_threads; the result does not depend on it.");
 }
 
 }  // namespace
@@ -43,7 +44,12 @@ void bind_logistic(nb::module_& parent) {
         "A binary logistic link over per-pair alignment scores: P(y = 1) =\n"
         "expit(alpha + score).  The likelihood DiscrimAlign maximises.  Every sum\n"
         "is taken over fixed blocks of elements, so results do not depend on\n"
-        "n_threads (0 = nwgrad's default thread count).");
+        "n_threads (0 = nwgrad's default thread count).\n\n"
+        "Labels are not checked; the caller must ensure each is in [0, 1], a 0/1\n"
+        "class label or a soft label (a target probability: the likelihood is\n"
+        "then the Bernoulli cross-entropy), and that they are not all 0 and not\n"
+        "all 1.  Otherwise the likelihood has no finite maximum and fit_alpha()\n"
+        "and step() return a meaningless alpha instead of raising.");
 
     nb::class_<nwgrad::logistic::Step>(m, "Step")
         .def_ro("alpha", &nwgrad::logistic::Step::alpha, "The fitted intercept.")
@@ -78,8 +84,10 @@ void bind_logistic(nb::module_& parent) {
         nb::arg("tol") = 1e-12, nb::arg("max_newton") = 8, nb::arg("maxiter") = 200,
         "The intercept maximising the likelihood, from alpha0: plain Newton steps\n"
         "while |step| <= 1, otherwise a bracketed safeguarded Newton (rtsafe).\n"
-        "Exact to rounding from any start.  Raises ValueError unless labels are 0/1\n"
-        "with both classes present.");
+        "Exact to rounding from any start.  labels: each in [0, 1] (0/1 class\n"
+        "labels or soft labels), not all 0 and not all 1; not checked, see the\n"
+        "nwgrad.logistic module doc.  Raises ValueError on a non-finite score,\n"
+        "alpha0 or tol, or a negative tol.");
 
     bind_step<float>(m);
     bind_step<double>(m);

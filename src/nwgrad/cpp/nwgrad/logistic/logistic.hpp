@@ -2,8 +2,17 @@
 // nwgrad::logistic -- a binary logistic link over per-pair alignment scores.
 //
 // Model: P(y_i = 1) = p_i = expit(alpha + s_i), with s_i a pair's alignment
-// score, y_i in {0, 1} its label and alpha an intercept.  This is the
-// likelihood DiscrimAlign maximises.  Kept apart from the alignment code: it
+// score, y_i its label and alpha an intercept.  This is the likelihood
+// DiscrimAlign maximises.
+//
+// Labels are the caller's responsibility and are not checked here: each y_i
+// must lie in [0, 1], either a 0/1 class label or a soft label (a target
+// probability, giving the Bernoulli cross-entropy), and 0 < sum_i y_i < n,
+// i.e. not all 0 and not all 1.  Only then does the likelihood have a finite
+// maximum in alpha.  Otherwise fit_alpha() and step() return a meaningless
+// alpha instead of raising (with all labels 1, an alpha past which every
+// expit rounds to 1).  Nothing else here depends on the labels being 0 or 1:
+// they enter only through y_i - p_i.  Kept apart from the alignment code: it
 // only uses SeqPairBatchT's public interface (scores(), size(), weighted_grad()).
 //
 // Determinism: every sum is taken over fixed blocks of BLOCK elements, each in
@@ -38,23 +47,6 @@ inline double expit(double x) noexcept { return 1.0 / (1.0 + std::exp(-x)); }
 
 inline int resolve_threads(int n_threads) noexcept {
     return n_threads > 0 ? n_threads : default_thread_count();
-}
-
-// Labels must be 0 or 1, with both classes present: with one class the
-// likelihood has no finite maximum in alpha.
-inline void check_labels(const double* y, size_t n) {
-    size_t positives = 0;
-    for (size_t i = 0; i < n; ++i) {
-        if (y[i] != 0.0 && y[i] != 1.0)
-            throw std::invalid_argument(
-                "nwgrad.logistic: labels must be 0 or 1 (label " + std::to_string(i) +
-                " is " + std::to_string(y[i]) + ")");
-        positives += (y[i] == 1.0);
-    }
-    if (positives == 0 || positives == n)
-        throw std::invalid_argument(
-            "nwgrad.logistic: labels of both classes are needed: with one class the "
-            "likelihood has no finite maximum in alpha");
 }
 
 // Sums over all elements at one alpha.  The log-likelihood itself is not
@@ -135,10 +127,10 @@ inline void probabilities(const double* s, size_t n, double alpha, double* out, 
 // rtsafe (Newton inside the bracket, bisection when Newton would leave it or
 // converge too slowly).  The same algorithm and tolerances as DiscrimAlign's
 // logit_link.fit_alpha().  `at_alpha0`, if given, must be evaluate() at alpha0.
+// The labels are not checked: see the precondition at the top of this file.
 inline double fit_alpha(const double* s, const double* y, size_t n, double alpha0,
                         int n_threads, double tol = 1e-12, int max_newton = 8,
                         int maxiter = 200, const Sums* at_alpha0 = nullptr) {
-    check_labels(y, n);
     if (!std::isfinite(alpha0) || !std::isfinite(tol) || tol < 0)
         throw std::invalid_argument("nwgrad.logistic.fit_alpha: alpha0 and tol must be finite, tol >= 0");
     // A non-finite score makes g NaN or infinite, and both bracket tests are false for
@@ -194,7 +186,8 @@ inline double fit_alpha(const double* s, const double* y, size_t n, double alpha
 
 // One iteration's logistic work over a batch whose scores and gradients are
 // cached (after score_and_grad()): the fitted alpha, and
-// sum_i (y_i - p_i) grad_i at that alpha.
+// sum_i (y_i - p_i) grad_i at that alpha.  The labels are not checked: see the
+// precondition at the top of this file.
 struct Step {
     double alpha;
     AlignParams grad;
@@ -206,7 +199,6 @@ Step step(const SeqPairBatchT<T>& batch, const double* y, size_t n, double alpha
         throw std::invalid_argument("nwgrad.logistic.step: needs one label per pair (got " +
                                     std::to_string(n) + " labels for " +
                                     std::to_string(batch.size()) + " pairs)");
-    check_labels(y, n);
     const int threads = batch.n_threads();
     const std::vector<double> s = batch.scores();
     const Sums at0 = evaluate(s.data(), y, n, alpha0, threads);
