@@ -1399,6 +1399,19 @@ private:
                 throw std::logic_error(
                     "nwgrad: traceback=\"hirschberg\" is implemented for full DP only; a "
                     "guide band already bounds memory, which is the only thing Hirschberg buys");
+            else if (m_ > hb_cutoff_ && !hb_penalties_ok_()) {
+                // A NEGATIVE gap penalty breaks the recursion: its join and the Local
+                // endpoint scans assume a gap never gains score (measured 2026-10-08:
+                // 15-21 of 40 random pairs off by up to a residue's score, Global and
+                // Local, both carries — some ABOVE the optimum — and a heap corruption
+                // in the float32 Local case).  `auto` runs such a pair as Pointers
+                // (exact; only the memory differs); an explicit request raises rather
+                // than return a wrong answer or a silent substitute.
+                if (!tb_auto_)
+                    throw std::invalid_argument(
+                        "nwgrad: traceback=\"hirschberg\" / \"hirschberg_pmax\" needs non-negative "
+                        "gap penalties (got a negative one); use traceback=\"pointers\" or \"auto\"");
+            }
             else if (m_ > hb_cutoff_) {
                 // Linear: one exact sweep for both "hirschberg" and "hirschberg_pmax" —
                 // the prefix-max carry exists to remove affine's lazy-F fixpoint, and the
@@ -2642,6 +2655,13 @@ private:
     // ── Score only, scalar: viterbi_affine / viterbi_linear on rolling rows ──
     // The same expressions in the same order (Full band), so the value at every cell —
     // and the score — is bit-identical to the fill's; only the tables are gone.
+    // Hirschberg needs every gap penalty it uses >= 0 (NaN fails too); see run_viterbi.
+    bool hb_penalties_ok_() const noexcept {
+        const AlignParams& p = *params_;
+        const bool ext = p.gap_extend_a >= 0.0 && p.gap_extend_b >= 0.0;
+        if constexpr (GM == GapModel::Linear) return ext;
+        else return ext && p.gap_open_a >= 0.0 && p.gap_open_b >= 0.0;
+    }
     static bool score_twopass_env() {
         static const bool v = [] {
             const char* e = std::getenv("NWGRAD_SCORE_VARIANT");

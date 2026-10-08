@@ -835,3 +835,33 @@ def test_short_pairs_bit_exact_with_pointers_non_representable_gap():
 def test_short_pairs_bit_exact_with_pointers_representable_gap():
     bad = _identity_mismatches(1.0)
     assert not bad, f"{len(bad)} short pair(s) differ, first: {bad[0]}"
+
+
+# ── Negative gap penalties: Hirschberg's join and Local endpoint scans assume a gap never
+# gains score.  Measured 2026-10-08 before the guard: 15-21 of 40 random pairs off by up to
+# a residue's score (some ABOVE the optimum), Global and Local, both carries, and a heap
+# corruption in the float32 Local case.  `auto` now runs such pairs as Pointers; an
+# explicit Hirschberg request raises.
+@pytest.mark.parametrize("cls", ["SeqPair", "SeqPairDouble"])
+@pytest.mark.parametrize("gm", ["affine", "linear"])
+@pytest.mark.parametrize("md", ["global", "local"])
+def test_negative_gap_penalties_auto_is_exact_explicit_raises(cls, gm, md):
+    import numpy as np
+    rng = np.random.default_rng(11)
+    C = getattr(nwgrad, cls)
+    for gaps in ([-1.0, 0.3, 2.0, 1.0], [2.0, -0.5, 2.0, 0.2], [2.0, 0.3, -1.0, -0.5]):
+        m = rng.integers(-2, 4, (4, 4)).astype(float)
+        p = nwgrad.AlignParams(nwgrad.SubstMatrix(m, alphabet="ACGT"), *gaps)
+        a = "".join(rng.choice(list("ACGT"), 90)); b = "".join(rng.choice(list("ACGT"), 80))
+        ref = C(a, b, p, gap_model=gm, mode=md, traceback="pointers"); ref.score_and_grad()
+        auto = C(a, b, p, gap_model=gm, mode=md); auto.hb_cutoff = 8; auto.score_and_grad()
+        assert auto.score == ref.score
+        assert np.array_equal(auto.grad.matrix.to_matrix(), ref.grad.matrix.to_matrix())
+        hits_negative = (gm == "affine") or gaps[1] < 0 or gaps[3] < 0
+        for tb in ("hirschberg", "hirschberg_pmax"):
+            e = C(a, b, p, gap_model=gm, mode=md, traceback=tb); e.hb_cutoff = 8
+            if hits_negative:
+                with pytest.raises(ValueError, match="non-negative"):
+                    e.score_and_grad()
+            else:
+                e.score_and_grad()
