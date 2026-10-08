@@ -340,7 +340,7 @@ interface. Every sum is taken over fixed blocks of 4096 elements and the block s
 added in order, so results do not depend on `n_threads` (0 = the default thread count).
 `labels` are float64 arrays of 0s and 1s with both classes present; anything else raises
 `ValueError`. The log-likelihood itself is not provided (`log_likelihood()` and
-`Step.loglik_at_alpha0` were removed after 0.5.2: they clipped probabilities to
+`Step.loglik_at_alpha0` were removed in 0.6.0: they clipped probabilities to
 [ε, 1 − ε]). Evaluate it from the logits z = α + score as Σ y·z − Σ log(1 + eᶻ), e.g.
 `np.dot(labels, z) - np.logaddexp(0, z).sum()`, which needs no clipping.
 
