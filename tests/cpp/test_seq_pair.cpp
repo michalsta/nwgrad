@@ -427,16 +427,16 @@ TEST_CASE("SeqPair: set_params invalidates the retained traceback", "[seq_pair]"
 }
 
 TEST_CASE("SeqPairBatch: scheduling knobs set on the batch reach the engine", "[seq_pair_batch]") {
-    // sorted_schedule / profile are plain façade fields; score_and_grad() must push them
-    // (it once relied on the Python binding to, so C++ callers silently ran dynamic).
+    // sorted_schedule / profile set on the façade must reach the engine (they were once
+    // façade fields that only the Python binding copied over, so C++ ran dynamic).
     auto p = asym_params(4.0, 0.5, 1.5, 2.0);
     Corpus c;
     SeqPairBatch batch(GapModel::Affine, AlignMode::Global, GradMode::Hard, 2);
     batch.add_many(std::vector<std::string_view>(c.as.begin(), c.as.end()),
                    std::vector<std::string_view>(c.bs.begin(), c.bs.end()), p);
     batch.set_fill(false, false);          // the sorted scheduler runs the own-fill path
-    batch.sorted_schedule = true;
-    batch.profile = true;
+    batch.set_sorted_schedule(true);
+    batch.set_profile(true);
     batch.score_and_grad();
     REQUIRE_FALSE(batch.profile_out().empty());
 }

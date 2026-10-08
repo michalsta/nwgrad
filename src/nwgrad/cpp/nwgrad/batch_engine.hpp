@@ -55,6 +55,46 @@
 #include "parallel.hpp"
 #include "simd_levels.hpp"
 
+// Every setting of a batch, its default and its validation, in one place.  A typed batch's
+// engine owns the one copy; an untyped (deprecated) SeqPairBatchT holds one only until its
+// first add_many() builds the engine from it.  The setters here validate and normalize;
+// BatchEngine's setters add what the engine must do on a change (soft_temperature
+// invalidates soft results, n_threads resolves 0).
+struct BatchSettings {
+    int  n_threads = 0;                                  // 0: physical cores (resolved)
+    TracebackMode traceback = TracebackMode::Default;    // fixed at construction
+    int  hb_cutoff = 512;                                // Hirschberg base-case rows
+    bool rowwise_full = false;                           // fill "rowwise" (own fills)
+    bool inter_fill = true;                              // fill "interpair"
+    SoftImpl soft_impl = SoftImpl::Scaled;
+    double soft_temperature = 1.0;
+    bool soft_guide_lazy = false, soft_guide_posterior = false;   // at most one set
+    // Scheduling (own fills): see BatchEngine::run_sorted_phase_ / banded_grad_lpt_.
+    bool   sorted_schedule = false;
+    double reserve_frac = 0.0;
+    double long_cost_ratio = 1.0;
+    double weight_lo = 500.0;
+    double weight_hi = 1700.0;
+    bool   profile = false;
+
+    void set_hb_cutoff(int rows) {
+        if (rows < 1) throw std::invalid_argument("nwgrad: hb_cutoff must be >= 1");
+        hb_cutoff = rows;
+    }
+    void set_soft_temperature(double t) {
+        if (!(t > 0.0 && t <= std::numeric_limits<double>::max()))
+            throw std::invalid_argument("nwgrad: soft temperature must be finite and > 0, got " +
+                                        std::to_string(t));
+        soft_temperature = t;
+    }
+    void set_soft_guide(bool lazy, bool posterior) noexcept {
+        soft_guide_lazy = lazy && !posterior;
+        soft_guide_posterior = posterior;
+    }
+    void set_fill(bool rowwise, bool inter) noexcept { rowwise_full = rowwise; inter_fill = inter; }
+    void set_n_threads(int n) noexcept { n_threads = n > 0 ? n : default_thread_count(); }
+};
+
 template<class T, GapModel GM, AlignMode AM>
 class BatchEngine {
 public:
@@ -66,13 +106,14 @@ public:
 
     // ── Construction ─────────────────────────────────────────────────────────
 
-    BatchEngine(int n_threads, GradMode gd, TracebackMode tb = TracebackMode::Default)
-        : n_threads_(n_threads > 0 ? n_threads : default_thread_count()),
-          grad_mode_(gd), tb_(tb) {
+    BatchEngine(BatchSettings s, GradMode gd) : s_(std::move(s)), grad_mode_(gd) {
+        s_.set_n_threads(s_.n_threads);
         FullAl probe;   // what "auto" resolves to for this problem type
-        probe.set_traceback(tb_);
+        probe.set_traceback(s_.traceback);
         tb_resolved_ = probe.traceback();
     }
+    BatchEngine(int n_threads, GradMode gd, TracebackMode tb = TracebackMode::Default)
+        : BatchEngine(BatchSettings{n_threads, tb}, gd) {}
 
     BatchEngine(const BatchEngine&)            = delete;
     BatchEngine& operator=(const BatchEngine&) = delete;
@@ -80,67 +121,43 @@ public:
     BatchEngine& operator=(BatchEngine&&)      = default;
 
     // ── Settings ─────────────────────────────────────────────────────────────
-    // Batch-wide.  The ones that change a result invalidate the cached results they
-    // change; the rest are speed knobs (bit-identical results).
+    // Read through settings(); change through the setters below.  The ones that change a
+    // result invalidate what they change; the rest are speed knobs (bit-identical
+    // results).  hb_cutoff applies to every pair from the next alignment on.
 
-    int n_threads() const noexcept { return n_threads_; }
-    void set_n_threads(int n) { n_threads_ = n > 0 ? n : default_thread_count(); }
+    const BatchSettings& settings() const noexcept { return s_; }
     GradMode grad_mode() const noexcept { return grad_mode_; }
+    int n_threads() const noexcept { return s_.n_threads; }
     // The traceback as constructed ("auto" stays Default) and as this type resolves it.
-    TracebackMode traceback() const noexcept { return tb_; }
+    TracebackMode traceback() const noexcept { return s_.traceback; }
     TracebackMode traceback_resolved() const noexcept { return tb_resolved_; }
 
-    // Hirschberg base-case rows (see Aligner::set_hb_cutoff).  Speed/memory, and — above
-    // the cutoff — which of several optimal paths; it applies to every pair from the
-    // next alignment on.
-    int hb_cutoff() const noexcept { return hb_cutoff_; }
-    void set_hb_cutoff(int rows) {
-        if (rows < 1) throw std::invalid_argument("nwgrad: hb_cutoff must be >= 1");
-        hb_cutoff_ = rows;
-    }
-
-    // Full-band fill: striped / row-wise (Aligner::set_rowwise_full), and whether
-    // score_and_grad() / banded_grad() fill W pairs per vector (inter-pair).  Speed only.
-    bool rowwise_full = false;
-    bool inter_fill   = true;
-
-    // Soft path.  set_soft_impl changes results within tolerance only and invalidates
-    // nothing (as SeqPair::set_soft_impl); a new temperature changes the soft score, so
-    // it invalidates soft results.
-    SoftImpl soft_impl() const noexcept { return soft_impl_; }
-    void set_soft_impl(SoftImpl s) noexcept { soft_impl_ = s; }
-    double soft_temperature() const noexcept { return soft_temp_; }
+    void set_n_threads(int n) noexcept { s_.set_n_threads(n); }
+    void set_hb_cutoff(int rows) { s_.set_hb_cutoff(rows); }
+    void set_fill(bool rowwise, bool inter) noexcept { s_.set_fill(rowwise, inter); }
+    // soft_impl changes results within tolerance only and invalidates nothing (as
+    // SeqPair::set_soft_impl); a new temperature changes the soft score.
+    void set_soft_impl(SoftImpl v) noexcept { s_.soft_impl = v; }
     void set_soft_temperature(double t) {
-        if (!(t > 0.0 && t <= std::numeric_limits<double>::max()))
-            throw std::invalid_argument("nwgrad: soft temperature must be finite and > 0, got " +
-                                        std::to_string(t));
-        soft_temp_ = t;
+        s_.set_soft_temperature(t);
         if (grad_mode_ == GradMode::Soft)
             for (auto& f : flags_) f &= static_cast<uint8_t>(~(kScore | kGrad | kHeld));
     }
-    // Soft guide policy (see SeqPair::set_soft_guide_lazy / _posterior): at most one set.
-    bool soft_guide_lazy() const noexcept { return soft_lazy_; }
-    bool soft_guide_posterior() const noexcept { return soft_post_; }
-    void set_soft_guide(bool lazy, bool posterior) noexcept {
-        soft_lazy_ = lazy && !posterior;
-        soft_post_ = posterior;
-    }
+    void set_soft_guide(bool lazy, bool posterior) noexcept { s_.set_soft_guide(lazy, posterior); }
+    void set_sorted_schedule(bool v) noexcept { s_.sorted_schedule = v; }
+    void set_reserve_frac(double v) noexcept { s_.reserve_frac = v; }
+    void set_long_cost_ratio(double v) noexcept { s_.long_cost_ratio = v; }
+    void set_weight_lo(double v) noexcept { s_.weight_lo = v; }
+    void set_weight_hi(double v) noexcept { s_.weight_hi = v; }
+    void set_profile(bool v) noexcept { s_.profile = v; }
 
-    // Scheduling (score_and_grad / banded_grad): see run_sorted_phase_ and
-    // banded_grad_lpt_ for the measurements behind each.
-    bool   sorted_schedule = false;
-    double reserve_frac    = 0.0;
-    double long_cost_ratio = 1.0;
-    double weight_lo       = 500.0;
-    double weight_hi       = 1700.0;
     struct PhaseProfile {
         double chunk_s = 0.0, reserve_s = 0.0;
         double chunk_cells = 0.0, reserve_cells = 0.0;
         long   chunk_tasks = 0, reserve_tasks = 0;
         double finish_s = 0.0;
     };
-    bool profile = false;
-    std::vector<PhaseProfile> profile_out;
+    std::vector<PhaseProfile> profile_out;   // per worker, after a profiled sorted run
 
     // ── Adding pairs ─────────────────────────────────────────────────────────
 
@@ -324,8 +341,8 @@ public:
         if (N == 0) return 0.0;
         prepare_paths_(keep_paths);
         ++full_calls_;   // guides may have moved: the banded grouping is stale
-        if (inter_fill)           score_and_grad_inter_(keep_paths);
-        else if (sorted_schedule) score_and_grad_sorted_(keep_paths);
+        if (s_.inter_fill)           score_and_grad_inter_(keep_paths);
+        else if (s_.sorted_schedule) score_and_grad_sorted_(keep_paths);
         else                      score_and_grad_dynamic_(keep_paths);
         if (hold_grads) hold_all_();
         return sum_scores_();
@@ -346,8 +363,8 @@ public:
                     "nwgrad: banded_grad_with_dp() needs a guide path; run the full "
                     "score_and_grad_with_dp() (or align_full()) at least once first");
         prepare_paths_(keep_paths);
-        if (inter_fill && !keep_paths) banded_grad_inter_(bandwidth);
-        else if (sorted_schedule)      banded_grad_lpt_(bandwidth, keep_paths);
+        if (s_.inter_fill && !keep_paths) banded_grad_inter_(bandwidth);
+        else if (s_.sorted_schedule)      banded_grad_lpt_(bandwidth, keep_paths);
         else                           banded_grad_dynamic_(bandwidth, keep_paths);
         if (hold_grads) hold_all_();
         return sum_scores_();
@@ -482,7 +499,7 @@ public:
                     "problem gets an automatic diagonal guide instead.");
         }
         const bool banded = band > 0 || !problems[0].guide_j.empty();
-        if (inter_fill) {
+        if (s_.inter_fill) {
             const int be = stream_inter_backend_(params, kernel, banded);
             if (be >= 0) {
                 if (banded) stream_inter_<AlignBand::GuideBanded>(problems, params, band, kernel, result, be);
@@ -501,7 +518,7 @@ public:
                 result.grad += local_grad;
             }
         };
-        run_workers_guarded(std::min<int>(n_threads_, static_cast<int>(std::min<size_t>(N, 1u << 30))), worker);
+        run_workers_guarded(std::min<int>(s_.n_threads, static_cast<int>(std::min<size_t>(N, 1u << 30))), worker);
         return result;
     }
 
@@ -529,12 +546,12 @@ private:
     template<AlignBand AB>
     void configure_stream_(Aligner<GM, AM, AB, T>& al, int kernel) const {
         al.set_kernel(kernel);
-        al.set_soft_impl(soft_impl_);
-        al.set_soft_temperature(soft_temp_);
+        al.set_soft_impl(s_.soft_impl);
+        al.set_soft_temperature(s_.soft_temperature);
         if constexpr (AB == AlignBand::Full) {
-            al.set_traceback(tb_);
-            al.set_hb_cutoff(hb_cutoff_);
-            al.set_rowwise_full(rowwise_full);
+            al.set_traceback(s_.traceback);
+            al.set_hb_cutoff(s_.hb_cutoff);
+            al.set_rowwise_full(s_.rowwise_full);
         }
     }
     template<AlignBand AB>
@@ -579,7 +596,7 @@ private:
         if (backend < 0) return -1;
         const LevelKernels& K = level_kernels(backend);
         if (grad_mode_ == GradMode::Soft)
-            return (K.inter_soft && K.inter_w > 0 && soft_impl_ != SoftImpl::Log && !banded) ? backend : -1;
+            return (K.inter_soft && K.inter_w > 0 && s_.soft_impl != SoftImpl::Log && !banded) ? backend : -1;
         if (inter_w_(K) <= 0) return -1;
         if (GM == GapModel::Linear &&
             (banded || (AM == AlignMode::Global && (inter_w_(K) < 4 || params.matrix.size() > 8))))
@@ -602,7 +619,7 @@ private:
         size_t maxa = 0, maxb = 0;
         for (size_t i = 0; i < N; ++i) {
             const size_t la = problems[i].seq_a.size(), lb = problems[i].seq_b.size();
-            if (la == 0 || lb == 0 || (hb_case && la > static_cast<size_t>(hb_cutoff_)) ||
+            if (la == 0 || lb == 0 || (hb_case && la > static_cast<size_t>(s_.hb_cutoff)) ||
                 !inter_pair_fits(la, lb, GM == GapModel::Affine, soft, inter_w_(K), sizeof(T), K.inter_w)) {
                 other.push_back(i); continue;
             }
@@ -639,7 +656,7 @@ private:
             }
         };
         const size_t tasks = groups.size() + other.size();
-        run_workers_guarded(std::min<int>(n_threads_, static_cast<int>(std::max<size_t>(tasks, 1))), worker);
+        run_workers_guarded(std::min<int>(s_.n_threads, static_cast<int>(std::max<size_t>(tasks, 1))), worker);
     }
     template<AlignBand AB>
     void stream_inter_loop_(const std::vector<ProblemInstance>& problems, const AlignParams& params,
@@ -663,7 +680,7 @@ private:
         DVec sscr;
         std::vector<int> siscr, sok;
         InterSoftJob sj{};
-        const bool soft_ok = soft && inter_soft_weights(params, soft_temp_, lin, es, sj);
+        const bool soft_ok = soft && inter_soft_weights(params, s_.soft_temperature, lin, es, sj);
         const size_t nn = static_cast<size_t>(params.matrix.size()) * params.matrix.size();
         if (!soft) cast_block_(params, blkT);   // params are fixed for the call: once per worker
         auto own = [&](size_t i) {
@@ -707,7 +724,7 @@ private:
                 for (size_t l = 0; l < real; ++l) {
                     const size_t i = elig[s + l];
                     if (!sok[l]) { own(i); continue; }
-                    scores[i] = slogz[l] * soft_temp_;
+                    scores[i] = slogz[l] * s_.soft_temperature;
                     double* g = local_grad.matrix.data();
                     for (size_t k = 0; k < nn; ++k) g[k] += scnt[l * nn + k];
                     local_grad.gap_open_a += sgap[l * 4 + 0]; local_grad.gap_extend_a += sgap[l * 4 + 1];
@@ -763,13 +780,9 @@ private:
     };
     struct Segment { const AlignParams* params; int kernel; size_t begin; };
 
-    int n_threads_;
+    BatchSettings s_;
     GradMode grad_mode_;
-    TracebackMode tb_, tb_resolved_ = TracebackMode::Pointers;
-    int hb_cutoff_ = 512;
-    SoftImpl soft_impl_ = SoftImpl::Scaled;
-    double soft_temp_ = 1.0;
-    bool soft_lazy_ = false, soft_post_ = false;
+    TracebackMode tb_resolved_ = TracebackMode::Pointers;
 
     const Alphabet* alpha_ = nullptr;
     size_t nn_ = 0;
@@ -863,7 +876,7 @@ private:
             }
         };
         if (nblocks > 0)
-            run_workers_guarded(std::min<int>(n_threads_, static_cast<int>(nblocks)), worker);
+            run_workers_guarded(std::min<int>(s_.n_threads, static_cast<int>(nblocks)), worker);
         std::vector<double> tot(gs, 0.0);
         for (size_t b = 0; b < nblocks; ++b)
             for (size_t k = 0; k < gs; ++k) tot[k] += partial[b * gs + k];
@@ -884,16 +897,16 @@ private:
         explicit Work(const BatchEngine& e) : g(e.alphabet()) { configure(e); }
         // The batch's settings, (re)applied: a reused Work follows setting changes.
         void configure(const BatchEngine& e) {
-            full.set_traceback(e.tb_);
-            full.set_hb_cutoff(e.hb_cutoff_);
-            full.set_rowwise_full(e.rowwise_full);
-            full.set_soft_impl(e.soft_impl_);
-            full.set_soft_temperature(e.soft_temp_);
+            full.set_traceback(e.s_.traceback);
+            full.set_hb_cutoff(e.s_.hb_cutoff);
+            full.set_rowwise_full(e.s_.rowwise_full);
+            full.set_soft_impl(e.s_.soft_impl);
+            full.set_soft_temperature(e.s_.soft_temperature);
             // Only the Full aligner can use pointers; the banded one needs its score
             // tables and its footprint is O(m*band) already.
             band.set_traceback(TracebackMode::Scores);
-            band.set_soft_impl(e.soft_impl_);
-            band.set_soft_temperature(e.soft_temp_);
+            band.set_soft_impl(e.s_.soft_impl);
+            band.set_soft_temperature(e.s_.soft_temperature);
         }
     };
     // The calling thread's Work for single-pair operations (SeqPair's align_full() and
@@ -978,7 +991,7 @@ private:
         flags_[i] &= static_cast<uint8_t>(~kStored);
         auto& al = w.full;
         set_problem_(al, i);
-        const bool lazy = soft_lazy_ && !keep, post = soft_post_ && !keep;
+        const bool lazy = s_.soft_guide_lazy && !keep, post = s_.soft_guide_posterior && !keep;
         if (grad_mode_ == GradMode::Hard) {
             al.compute_viterbi(w.buf);
             score_[i] = al.score();
@@ -1043,11 +1056,11 @@ private:
     struct SoftLane { double logz; const double* counts; const double* gaps;
                       const int* gpost = nullptr; int gstride = 0; };
     void apply_soft_lane_(size_t i, const SoftLane& soft) {
-        score_[i] = soft.logz * soft_temp_;
+        score_[i] = soft.logz * s_.soft_temperature;
         double* d = grad_ptr_(i);
         for (size_t k = 0; k < nn_; ++k) d[k] = soft.counts[k];
         for (size_t k = 0; k < 4; ++k) d[nn_ + k] = soft.gaps[k];
-        if (soft_post_ && soft.gpost) {
+        if (s_.soft_guide_posterior && soft.gpost) {
             const int m = static_cast<int>(len_a(i)), n = static_cast<int>(len_b(i));
             std::vector<int> rows(static_cast<size_t>(m) + 1);
             for (int r = 0; r <= m; ++r) rows[static_cast<size_t>(r)] = soft.gpost[static_cast<size_t>(r) * soft.gstride];
@@ -1090,7 +1103,7 @@ private:
     void run_soft_lane_(size_t i, Work& w, const SoftLane* soft, bool keep) {
         if (!soft || grad_mode_ != GradMode::Soft) { run_full_(i, w, keep); return; }
         flags_[i] &= static_cast<uint8_t>(~kStored);
-        const bool lazy = soft_lazy_ && !keep, post = soft_post_ && !keep;
+        const bool lazy = s_.soft_guide_lazy && !keep, post = s_.soft_guide_posterior && !keep;
         bool pending = false;
         if (lazy) pending = true;
         else if (post && soft->gpost) pending = false;   // apply_soft_lane_ sets the guide
@@ -1196,7 +1209,7 @@ private:
             return -1;
         if (!linear_fill_ok_(K) && grad_mode_ != GradMode::Soft) return -1;
         // Hirschberg pairs past the cutoff split: no shared fill.
-        if (is_hirschberg(tb_resolved_) && len_a(i) > static_cast<size_t>(hb_cutoff_)) return -1;
+        if (is_hirschberg(tb_resolved_) && len_a(i) > static_cast<size_t>(s_.hb_cutoff)) return -1;
         return backend;
     }
 
@@ -1224,11 +1237,11 @@ private:
     void ensure_plan_() {
         const int def_backend = global_default_backend();
         if (plan_.generation == generation_ && plan_.default_backend == def_backend &&
-            plan_.hb_cutoff == hb_cutoff_)
+            plan_.hb_cutoff == s_.hb_cutoff)
             return;
         const size_t N = size();
         InterPlan P;
-        P.generation = generation_; P.default_backend = def_backend; P.hb_cutoff = hb_cutoff_;
+        P.generation = generation_; P.default_backend = def_backend; P.hb_cutoff = s_.hb_cutoff;
         P.backend.assign(N, -1);
         struct Key { int backend; size_t len_b, len_a, i; };
         std::vector<Key> keys;
@@ -1270,8 +1283,8 @@ private:
         const size_t G = groups.size(), tasks = G + other.size();
         const bool soft = grad_mode_ == GradMode::Soft;
         // A lazy-guide soft group needs no Viterbi at all, nor a posterior-guide one.
-        const bool no_viterbi = soft && (soft_lazy_ || soft_post_) && !keep;
-        const bool want_post = soft && soft_post_ && !keep;
+        const bool no_viterbi = soft && (s_.soft_guide_lazy || s_.soft_guide_posterior) && !keep;
+        const bool want_post = soft && s_.soft_guide_posterior && !keep;
         std::atomic<size_t> idx{0};
         auto worker = [&]() {
             Work w(*this);
@@ -1330,11 +1343,11 @@ private:
                 }
                 // Soft lanes share the forward-backward too (one soft_impl, not "log",
                 // one temperature — batch-wide here), when the weights fit.
-                bool soft_group = K.inter_soft != nullptr && soft && soft_impl_ != SoftImpl::Log;
+                bool soft_group = K.inter_soft != nullptr && soft && s_.soft_impl != SoftImpl::Log;
                 const size_t nnk = nn_;
                 if (soft_group) {
                     InterSoftJob sj{};
-                    const bool fin = inter_soft_weights(P, soft_temp_, lin, ses, sj);
+                    const bool fin = inter_soft_weights(P, s_.soft_temperature, lin, ses, sj);
                     soft_group = fin;
                     if (fin) {
                         // The soft pass is double, K.inter_w lanes: a float32 group runs
@@ -1523,16 +1536,16 @@ private:
     }
 
     double length_weight_(double cells) const noexcept {
-        if (long_cost_ratio <= 1.0 || weight_hi <= weight_lo) return 1.0;
+        if (s_.long_cost_ratio <= 1.0 || s_.weight_hi <= s_.weight_lo) return 1.0;
         const double eff = std::sqrt(cells);
-        const double t = std::clamp((eff - weight_lo) / (weight_hi - weight_lo), 0.0, 1.0);
-        return 1.0 + (long_cost_ratio - 1.0) * t;
+        const double t = std::clamp((eff - s_.weight_lo) / (s_.weight_hi - s_.weight_lo), 0.0, 1.0);
+        return 1.0 + (s_.long_cost_ratio - 1.0) * t;
     }
 
     // Length-sorted, equal-work chunks, one per thread, plus a reserve of the smallest
     // tasks: bounds the DP memory high-water mark at sum-over-chunks rather than
     // n_threads x the global maximum (human proteome, 16 threads: 4.9 vs 30.6 GB).  See
-    // the measurements recorded at SeqPairBatch's long_cost_ratio and reserve_frac.
+    // the measurements recorded at SeqPairBatch's s_.long_cost_ratio and s_.reserve_frac.
     template<typename Fn>
     void run_sorted_phase_(const std::vector<double>& cost, int nthr, Fn&& task) {
         const size_t N = cost.size();
@@ -1542,7 +1555,7 @@ private:
         const double total = std::accumulate(cost.begin(), cost.end(), 0.0);
         size_t r = 0;
         {
-            const double want = total * std::clamp(reserve_frac, 0.0, 0.5);
+            const double want = total * std::clamp(s_.reserve_frac, 0.0, 0.5);
             double acc = 0.0;
             while (r < N && acc < want && r + static_cast<size_t>(nthr) < N) acc += cost[order[r++]];
         }
@@ -1563,7 +1576,7 @@ private:
         std::atomic<int>    next_worker{0};
         std::atomic<size_t> reserve_idx{0};
         using clk = std::chrono::steady_clock;
-        const bool prof = profile;
+        const bool prof = s_.profile;
         if (prof) profile_out.assign(static_cast<size_t>(nthr), PhaseProfile{});
         const auto t_start = clk::now();
         auto since = [](clk::time_point a, clk::time_point b) {
@@ -1607,7 +1620,7 @@ private:
 
     void score_and_grad_sorted_(bool keep) {
         const size_t N = size();
-        const int nthr = std::min<int>(n_threads_, static_cast<int>(N));
+        const int nthr = std::min<int>(s_.n_threads, static_cast<int>(N));
         std::vector<double> cost(N);
         for (size_t i = 0; i < N; ++i) {
             const double cells = static_cast<double>(len_a(i) + 1) * static_cast<double>(len_b(i) + 1);
@@ -1659,6 +1672,6 @@ private:
     template<typename Worker>
     void run_workers_(size_t N, Worker& worker) {
         if (N == 0) return;
-        run_workers_guarded(std::min<int>(n_threads_, static_cast<int>(std::min<size_t>(N, 1u << 30))), worker);
+        run_workers_guarded(std::min<int>(s_.n_threads, static_cast<int>(std::min<size_t>(N, 1u << 30))), worker);
     }
 };

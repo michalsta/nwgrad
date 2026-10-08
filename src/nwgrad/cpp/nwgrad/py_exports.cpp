@@ -731,10 +731,10 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
              "Deprecated: drop_paths().")
         .def_prop_rw(
             "schedule",
-            [](const SPB& s) { return s.sorted_schedule ? "sorted" : "dynamic"; },
+            [](const SPB& s) { return s.sorted_schedule() ? "sorted" : "dynamic"; },
             [](SPB& s, const std::string& v) {
-                if      (v == "dynamic") s.sorted_schedule = false;
-                else if (v == "sorted")  s.sorted_schedule = true;
+                if      (v == "dynamic") s.set_sorted_schedule(false);
+                else if (v == "sorted")  s.set_sorted_schedule(true);
                 else throw nb::value_error(
                     ("nwgrad: unknown schedule \"" + v +
                      "\" (expected \"dynamic\" or \"sorted\")").c_str());
@@ -779,11 +779,7 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
         .def_prop_rw(
             "soft_temperature",
             [](const SPB& s) { return s.soft_temperature(); },
-            [](SPB& s, double v) {
-                if (!(v > 0.0 && v <= std::numeric_limits<double>::max()))
-                    throw nb::value_error("nwgrad: soft_temperature must be finite and > 0");
-                s.set_soft_temperature(v);
-            },
+            [](SPB& s, double v) { s.set_soft_temperature(v); },
             NWGRAD_SOFT_TEMP_DOC "\nApplies to every pair in the batch.")
         .def_prop_rw(
             "soft_guide",
@@ -816,10 +812,7 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
         .def_prop_rw(
             "hb_cutoff",
             [](const SPB& s) { return s.hb_cutoff(); },
-            [](SPB& s, int v) {
-                if (v < 1) throw nb::value_error("nwgrad: hb_cutoff must be >= 1");
-                s.set_hb_cutoff(v);
-            },
+            [](SPB& s, int v) { s.set_hb_cutoff(v); },
             "Rows per block at which Hirschberg stops splitting and solves the block\n"
             "outright with the (vectorized) pointers fill.  Applies to every pair; ignored\n"
             "unless the traceback resolves to Hirschberg.  Default 512.\n"
@@ -839,28 +832,33 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             "512 from a fleet sweep (sse2/avx2/avx512/neon, len 500-8000) with the base\n"
             "case vectorized: pairs <= 512 run at full pointer speed and bit-exact,\n"
             "longer pairs win 1.4-2.7x at high thread counts.")
-        .def_rw("reserve_frac", &SPB::reserve_frac,
+        .def_prop_rw("reserve_frac", [](const SPB& s) { return s.reserve_frac(); },
+                     [](SPB& s, double v) { s.set_reserve_frac(v); },
                 "Fraction of total work held back as filler for early-finishing\n"
                 "threads under schedule=\"sorted\".  Default 0.0 (no reserve): a\n"
                 "300-arm sweep over 4 machines found no reserve was fastest on\n"
                 "tailed length distributions and immaterial on flat ones.  Raise it\n"
                 "only if your workload behaves unlike either.")
-        .def_rw("long_cost_ratio", &SPB::long_cost_ratio,
+        .def_prop_rw("long_cost_ratio", [](const SPB& s) { return s.long_cost_ratio(); },
+                     [](SPB& s, double v) { s.set_long_cost_ratio(v); },
                 "schedule=\"sorted\" cost weight: how much more a cell costs once the DP\n"
                 "tables no longer fit cache.  DEFAULT 1.0 = OFF: correcting the\n"
                 "imbalance measured slower (it fixes balance but converts idle\n"
                 "threads into memory contention).  Raise it to move the straggler\n"
                 "toward the short-sequence chunks; expect to pay ~4-6%.")
-        .def_rw("weight_lo", &SPB::weight_lo,
+        .def_prop_rw("weight_lo", [](const SPB& s) { return s.weight_lo(); },
+                     [](SPB& s, double v) { s.set_weight_lo(v); },
                 "Effective length below which cells are unweighted (default 500).")
-        .def_rw("weight_hi", &SPB::weight_hi,
+        .def_prop_rw("weight_hi", [](const SPB& s) { return s.weight_hi(); },
+                     [](SPB& s, double v) { s.set_weight_hi(v); },
                 "Effective length at which the weight saturates (default 1700).")
         .def_prop_ro("traceback",
                      [](const SPB& s) { return traceback_name(s.traceback()); },
                      "The traceback mode the batch was constructed with — \"auto\" (the\n"
                      "default) is reported as-is (read batch[i].traceback for the mode it\n"
                      "resolves to).  See the constructor docstring for what each retains.")
-        .def_rw("profile", &SPB::profile,
+        .def_prop_rw("profile", [](const SPB& s) { return s.profile(); },
+                     [](SPB& s, bool v) { s.set_profile(v); },
                 "Record per-thread phase timings during schedule=\"sorted\" runs "
                 "(off by default).  Read them back with schedule_profile().")
         .def("schedule_profile",

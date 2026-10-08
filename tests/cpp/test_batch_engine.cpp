@@ -101,7 +101,7 @@ void run_case(unsigned seed, const Cfg& c) {
     if (N2) old.add_many(A2, B2, p1b, GM, AM, c.gd, k2);
 
     BatchEngine<T, GM, AM> eng(c.threads, c.gd, c.tb);
-    eng.inter_fill = c.inter; eng.rowwise_full = c.rowwise; eng.sorted_schedule = c.sorted;
+    eng.set_fill(c.rowwise, c.inter); eng.set_sorted_schedule(c.sorted);
     eng.set_soft_impl(c.soft_impl); eng.set_soft_temperature(c.temp);
     eng.set_soft_guide(c.soft_guide == 1, c.soft_guide == 2);
     eng.set_hb_cutoff(c.hb_cutoff);
@@ -288,7 +288,7 @@ void stream_sweep(int n) {
         const bool oracle_bug = gds[gi] == GradMode::Soft && band == 0 && guides && inter;
         ba.inter_fill = inter && !oracle_bug; ba.soft_temperature = temp;
         BatchEngine<T, GM, AM> eng(threads, gds[gi]);
-        eng.inter_fill = inter; eng.set_soft_temperature(temp);
+        eng.set_fill(false, inter); eng.set_soft_temperature(temp);
         const BatchResult ro = ba.align(probs);
         const BatchResult re = eng.align_stream(probs, p, band);
         REQUIRE(ro.scores.size() == re.scores.size());

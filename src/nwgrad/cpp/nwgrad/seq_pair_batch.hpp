@@ -50,13 +50,16 @@ public:
 
     // Typed: the batch's problem type is fixed here.
     SeqPairBatchT(GapModel gm, AlignMode am, GradMode gd, int n_threads = 0,
-                  TracebackMode tb = TracebackMode::Default)
-        : n_threads_(n_threads > 0 ? n_threads : default_thread_count()), tb_(tb) {
+                  TracebackMode tb = TracebackMode::Default) {
+        pending_.set_n_threads(n_threads);
+        pending_.traceback = tb;
         make_engine_(gm, am, gd);
     }
-    // Untyped (the pre-0.6 form): the first add_many() fixes the type.
-    explicit SeqPairBatchT(int n_threads = 0, TracebackMode tb = TracebackMode::Default)
-        : n_threads_(n_threads > 0 ? n_threads : default_thread_count()), tb_(tb) {}
+    // Untyped (the pre-0.6 form): the first add_many() that adds pairs fixes the type.
+    explicit SeqPairBatchT(int n_threads = 0, TracebackMode tb = TracebackMode::Default) {
+        pending_.set_n_threads(n_threads);
+        pending_.traceback = tb;
+    }
 
     SeqPairBatchT(const SeqPairBatchT&)            = delete;
     SeqPairBatchT& operator=(const SeqPairBatchT&) = delete;
@@ -110,7 +113,7 @@ public:
             try {
                 visit([&](auto& e) { e.add_many(seqs_a, seqs_b, params, kernel); });
             } catch (...) {
-                e_.template emplace<0>();
+                e_.template emplace<0>();   // pending_ still holds the settings
                 throw;
             }
             if (size() == 0) e_.template emplace<0>();
@@ -158,7 +161,6 @@ public:
     void set_params(const AlignParams& p) { if (typed()) visit([&](auto& e) { e.set_params(p); }); }
     double score_and_grad(bool keep_paths = false, bool hold_grads = false) {
         if (!typed()) return 0.0;
-        sync_schedule();
         return visit([&](auto& e) { return e.score_and_grad(keep_paths, hold_grads); });
     }
     double banded_grad(int bandwidth, bool keep_paths = false, bool hold_grads = false) {
@@ -168,7 +170,6 @@ public:
                                             std::to_string(bandwidth) + "); use score_and_grad() for full DP");
             return 0.0;
         }
-        sync_schedule();
         return visit([&](auto& e) { return e.banded_grad(bandwidth, keep_paths, hold_grads); });
     }
     void drop_paths() { if (typed()) visit([](auto& e) { e.drop_paths(); }); }
@@ -197,55 +198,64 @@ public:
         return visit([&](const auto& e) { return e.align_stream(problems, params, band, kernel); });
     }
 
-    // ── Settings (stored here; pushed to the engine) ─────────────────────────
+    // ── Settings ─────────────────────────────────────────────────────────────
+    // One copy of each: the engine's once the batch is typed, pending_ before (the engine
+    // is built from it).  Read through settings(); every setter goes to that one copy,
+    // through the same validating setters (BatchSettings / BatchEngine).
 
-    int n_threads() const noexcept { return n_threads_; }
-    void set_n_threads(int n) {
-        n_threads_ = n > 0 ? n : default_thread_count();
-        if (typed()) visit([&](auto& e) { e.set_n_threads(n_threads_); });
+    const BatchSettings& settings() const {
+        return typed() ? visit([](const auto& e) -> const BatchSettings& { return e.settings(); })
+                       : pending_;
     }
-    TracebackMode traceback() const noexcept { return tb_; }
+    int n_threads() const { return settings().n_threads; }
+    TracebackMode traceback() const { return settings().traceback; }
     TracebackMode traceback_resolved() const {
         return visit([](const auto& e) { return e.traceback_resolved(); });
     }
-    int hb_cutoff() const noexcept { return hb_cutoff_; }
-    void set_hb_cutoff(int v) {
-        if (v < 1) throw std::invalid_argument("nwgrad: hb_cutoff must be >= 1");
-        hb_cutoff_ = v;
-        if (typed()) visit([&](auto& e) { e.set_hb_cutoff(v); });
+    int hb_cutoff() const { return settings().hb_cutoff; }
+    bool rowwise_full() const { return settings().rowwise_full; }
+    bool inter_fill() const { return settings().inter_fill; }
+    SoftImpl soft_impl() const { return settings().soft_impl; }
+    double soft_temperature() const { return settings().soft_temperature; }
+    bool soft_guide_lazy() const { return settings().soft_guide_lazy; }
+    bool soft_guide_posterior() const { return settings().soft_guide_posterior; }
+    bool sorted_schedule() const { return settings().sorted_schedule; }
+    double reserve_frac() const { return settings().reserve_frac; }
+    double long_cost_ratio() const { return settings().long_cost_ratio; }
+    double weight_lo() const { return settings().weight_lo; }
+    double weight_hi() const { return settings().weight_hi; }
+    bool profile() const { return settings().profile; }
+
+#define NWGRAD_BATCH_SETTER(NAME, TYPE)                                               \
+    void NAME(TYPE v) {                                                               \
+        if (typed()) visit([&](auto& e) { e.NAME(v); }); else pending_.NAME(v);         \
     }
-    bool rowwise_full() const noexcept { return rowwise_; }
-    bool inter_fill() const noexcept { return inter_; }
+    NWGRAD_BATCH_SETTER(set_n_threads, int)
+    NWGRAD_BATCH_SETTER(set_hb_cutoff, int)
+    NWGRAD_BATCH_SETTER(set_soft_temperature, double)
+#undef NWGRAD_BATCH_SETTER
     void set_fill(bool rowwise, bool inter) {
-        rowwise_ = rowwise; inter_ = inter;
-        if (typed()) visit([&](auto& e) { e.rowwise_full = rowwise; e.inter_fill = inter; });
+        if (typed()) visit([&](auto& e) { e.set_fill(rowwise, inter); });
+        else pending_.set_fill(rowwise, inter);
     }
-    SoftImpl soft_impl() const noexcept { return soft_impl_; }
-    void set_soft_impl(SoftImpl s) {
-        soft_impl_ = s;
-        if (typed()) visit([&](auto& e) { e.set_soft_impl(s); });
-    }
-    double soft_temperature() const noexcept { return soft_temp_; }
-    void set_soft_temperature(double t) {
-        if (!(t > 0.0 && t <= std::numeric_limits<double>::max()))
-            throw std::invalid_argument("nwgrad: soft_temperature must be finite and > 0");
-        soft_temp_ = t;
-        if (typed()) visit([&](auto& e) { e.set_soft_temperature(t); });
-    }
-    bool soft_guide_lazy() const noexcept { return soft_lazy_; }
-    bool soft_guide_posterior() const noexcept { return soft_post_; }
     void set_soft_guide(bool lazy, bool posterior) {
-        soft_lazy_ = lazy && !posterior; soft_post_ = posterior;
         if (typed()) visit([&](auto& e) { e.set_soft_guide(lazy, posterior); });
+        else pending_.set_soft_guide(lazy, posterior);
     }
-    // Scheduling knobs: plain fields, pushed to the engine by score_and_grad() and
-    // banded_grad() (sync_schedule) — set them freely between calls.
-    bool   sorted_schedule = false;
-    double reserve_frac    = 0.0;
-    double long_cost_ratio = 1.0;
-    double weight_lo       = 500.0;
-    double weight_hi       = 1700.0;
-    bool   profile         = false;
+    // Plain fields, no validation, no side effects.
+#define NWGRAD_BATCH_FIELD(NAME, FIELD, TYPE)                                         \
+    void NAME(TYPE v) {                                                               \
+        if (typed()) visit([&](auto& e) { e.NAME(v); }); else pending_.FIELD = v;       \
+    }
+    NWGRAD_BATCH_FIELD(set_soft_impl, soft_impl, SoftImpl)
+    NWGRAD_BATCH_FIELD(set_sorted_schedule, sorted_schedule, bool)
+    NWGRAD_BATCH_FIELD(set_reserve_frac, reserve_frac, double)
+    NWGRAD_BATCH_FIELD(set_long_cost_ratio, long_cost_ratio, double)
+    NWGRAD_BATCH_FIELD(set_weight_lo, weight_lo, double)
+    NWGRAD_BATCH_FIELD(set_weight_hi, weight_hi, double)
+    NWGRAD_BATCH_FIELD(set_profile, profile, bool)
+#undef NWGRAD_BATCH_FIELD
+
     using PhaseProfile = typename Engine<GapModel::Affine, AlignMode::Global>::PhaseProfile;
     std::vector<PhaseProfile> profile_out() const {
         if (!typed()) return {};
@@ -257,28 +267,13 @@ public:
             return v;
         });
     }
-    // Push the plain-field knobs (call before an operation that schedules).
-    void sync_schedule() {
-        if (!typed()) return;
-        visit([&](auto& e) {
-            e.sorted_schedule = sorted_schedule; e.reserve_frac = reserve_frac;
-            e.long_cost_ratio = long_cost_ratio; e.weight_lo = weight_lo; e.weight_hi = weight_hi;
-            e.profile = profile;
-        });
-    }
 
 private:
     Var e_;
     GapModel gm_ = GapModel::Affine;
     AlignMode am_ = AlignMode::Global;
     GradMode gd_ = GradMode::Hard;
-    int n_threads_;
-    TracebackMode tb_;
-    int hb_cutoff_ = 512;
-    bool rowwise_ = false, inter_ = true;
-    SoftImpl soft_impl_ = SoftImpl::Scaled;
-    double soft_temp_ = 1.0;
-    bool soft_lazy_ = false, soft_post_ = false;
+    BatchSettings pending_;   // the settings until an engine exists (then it holds them)
 
     void require_typed_() const {
         if (!typed())
@@ -288,18 +283,10 @@ private:
     }
     void make_engine_(GapModel gm, AlignMode am, GradMode gd) {
         gm_ = gm; am_ = am; gd_ = gd;
-        if      (gm == GapModel::Linear && am == AlignMode::Global) e_.template emplace<1>(n_threads_, gd, tb_);
-        else if (gm == GapModel::Linear && am == AlignMode::Local)  e_.template emplace<2>(n_threads_, gd, tb_);
-        else if (gm == GapModel::Affine && am == AlignMode::Global) e_.template emplace<3>(n_threads_, gd, tb_);
-        else                                                        e_.template emplace<4>(n_threads_, gd, tb_);
-        visit([&](auto& e) {
-            e.set_hb_cutoff(hb_cutoff_);
-            e.rowwise_full = rowwise_; e.inter_fill = inter_;
-            e.set_soft_impl(soft_impl_);
-            e.set_soft_temperature(soft_temp_);
-            e.set_soft_guide(soft_lazy_, soft_post_);
-        });
-        sync_schedule();
+        if      (gm == GapModel::Linear && am == AlignMode::Global) e_.template emplace<1>(pending_, gd);
+        else if (gm == GapModel::Linear && am == AlignMode::Local)  e_.template emplace<2>(pending_, gd);
+        else if (gm == GapModel::Affine && am == AlignMode::Global) e_.template emplace<3>(pending_, gd);
+        else                                                        e_.template emplace<4>(pending_, gd);
     }
 };
 
