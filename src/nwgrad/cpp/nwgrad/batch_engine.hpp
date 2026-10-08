@@ -346,7 +346,8 @@ public:
         if (N == 0) return 0.0;
         prepare_paths_(keep_paths);
         ++full_calls_;   // guides may have moved: the banded grouping is stale
-        if (s_.inter_fill)           score_and_grad_inter_(keep_paths);
+        if (grad_mode_ == GradMode::None && !keep_paths) score_only_();
+        else if (s_.inter_fill)      score_and_grad_inter_(keep_paths);
         else if (s_.sorted_schedule) score_and_grad_sorted_(keep_paths);
         else                      score_and_grad_dynamic_(keep_paths);
         if (hold_grads) hold_all_();
@@ -737,6 +738,21 @@ private:
                 }
                 continue;
             }
+            if constexpr (AB == AlignBand::Full) {
+                if (grad_mode_ == GradMode::None && has_inter_score_(K)) {
+                    // Score only: one row per table, no adopt / traceback.
+                    InterJobT<T> job{};
+                    job.a = a.data(); job.m = m.data(); job.b = b.data(); job.n = n; job.M = M;
+                    job.align_mode = (AM == AlignMode::Local) ? 1 : 0;
+                    if (ragged) job.nb = nb.data();
+                    set_inter_params_(job, params, blkT);
+                    wire_inter_tables_(job, buf, static_cast<size_t>(n + 1) * W);
+                    job.best = best.data();
+                    run_inter_score_(K, job);
+                    for (size_t l = 0; l < real; ++l) scores[elig[s + l]] = static_cast<double>(best[l]);
+                    continue;
+                }
+            }
             if constexpr (AB == AlignBand::GuideBanded) {
                 blo.assign(static_cast<size_t>(M + 1) * W, 1);
                 bhi.assign(static_cast<size_t>(M + 1) * W, 0);
@@ -783,7 +799,11 @@ private:
         kStored = 32,      // path_ holds the current alignment
         kHeld = 64,        // grad_ holds a gradient compute_grad() has not released yet
     };
-    struct Segment { const AlignParams* params; int kernel; size_t begin; };
+    // gparams: the params the segment's PENDING guides belong to.  Null for the lazy soft
+    // guide ("under the params current then"); set by score_only_() to the params it
+    // scored, so a deferred guide is the one the eager path would have stored.
+    struct Segment { const AlignParams* params; int kernel; size_t begin;
+                     const AlignParams* gparams = nullptr; };
 
     // The batch's own copies of its params, one per distinct VALUE: add_many() calls
     // with equal params share one copy, so the inter-pair plan (which groups pairs by
@@ -828,7 +848,7 @@ private:
     void drop_unused_params_() {
         std::vector<const AlignParams*> used;
         used.reserve(segs_.size());
-        for (const auto& s : segs_) used.push_back(s.params);
+        for (const auto& s : segs_) { used.push_back(s.params); if (s.gparams) used.push_back(s.gparams); }
         std::sort(used.begin(), used.end());
         auto in_use = [&](const AlignParams* q) { return std::binary_search(used.begin(), used.end(), q); };
         for (auto it = params_idx_.begin(); it != params_idx_.end();)
@@ -1077,7 +1097,9 @@ private:
     // SeqPair::resolve_guide: the pending lazy guide, under the params current now.
     void resolve_guide_(size_t i, Work& w) {
         if (!guide_pending(i)) return;
-        set_problem_(w.full, i);
+        const AlignParams* gp = segs_[seg_[i]].gparams;
+        w.full.set_kernel(kernel(i));
+        w.full.set_problem(codes_a(i), codes_b(i), gp ? *gp : params(i));
         w.full.compute_viterbi(w.buf);
         store_guide_(i, w.full.guide_j_from_viterbi(w.buf));
         flags_[i] &= static_cast<uint8_t>(~(kPending | kStored));
@@ -1245,6 +1267,16 @@ private:
     static void run_inter_fill_(const LevelKernels& K, InterJobT<T>& job) {
         if constexpr (std::is_same_v<T, double>) K.inter_fill(job);
         else                                     K.inter_fill_f(job);
+    }
+    // Score only (grad_mode None, Full): the same lanes on ONE row per table, each lane's
+    // score out in job.best; false when the level has no such kernel.
+    static bool has_inter_score_(const LevelKernels& K) {
+        if constexpr (std::is_same_v<T, double>) return K.inter_score != nullptr;
+        else                                     return K.inter_score_f != nullptr;
+    }
+    static void run_inter_score_(const LevelKernels& K, InterJobT<T>& job) {
+        if constexpr (std::is_same_v<T, double>) K.inter_score(job);
+        else                                     K.inter_score_f(job);
     }
     // Linear Global's own fill is cheap: the shared one loses below 4 lanes (DNA, W=2:
     // 0.76x on SSE2) and for alphabets over 8 (protein, the per-row gather: 1.10-1.22x
@@ -1579,6 +1611,80 @@ private:
     }
 
     // ── Own-fill schedulers (SeqPairBatch's, unchanged in substance) ─────────
+
+    // grad_mode None without stored paths: scores only — compute_score per pair, the
+    // inter-pair score kernel for the plan's groups — and no Viterbi table or traceback.
+    // The guides banded_grad() bands around become PENDING, resolved on first use under
+    // the params scored here (Segment::gparams), so they are exactly the guides the eager
+    // path would have stored.  Scores are the exact optimum (the Pointers fill's score):
+    // under float32 `auto` the traceback-bearing modes report hirschberg_pmax's instead.
+    void score_only_() {
+        for (auto& sg : segs_) sg.gparams = sg.params;
+        drop_unused_params_();
+        const size_t N = size();
+        const bool inter = s_.inter_fill;
+        if (inter) ensure_plan_();
+        const size_t G = inter ? plan_.groups.size() : 0;
+        const size_t tasks = inter ? G + plan_.other.size() : N;
+        std::atomic<size_t> idx{0};
+        auto worker = [&]() {
+            Work w(*this);
+            std::vector<const unsigned char*> a, b;
+            std::vector<int> m, nb;
+            std::vector<T> best, blkT;
+            auto own = [&](size_t i) {
+                flags_[i] &= static_cast<uint8_t>(~kStored);
+                set_problem_(w.full, i);
+                score_[i] = w.full.compute_score(w.buf);
+                finish_(i, false, true);
+            };
+            for (size_t t; (t = idx.fetch_add(1, std::memory_order_relaxed)) < tasks; ) {
+                if (!inter) { own(t); continue; }
+                if (t >= G) { own(plan_.other[t - G]); continue; }
+                const auto [s, e] = plan_.groups[t];
+                const size_t real = e - s;
+                const size_t i0 = plan_.elig[s];
+                bool same_params = true;
+                for (size_t l = 1; l < real; ++l)
+                    same_params &= &params(plan_.elig[s + l]) == &params(i0);
+                const LevelKernels& K = level_kernels(plan_.backend[i0]);
+                if (!same_params || !has_inter_score_(K) || !linear_fill_ok_(K)) {
+                    for (size_t l = 0; l < real; ++l) own(plan_.elig[s + l]);
+                    continue;
+                }
+                const int W = inter_w_(K);
+                a.assign(W, nullptr); b.assign(W, nullptr); m.assign(W, 0); nb.assign(W, 0);
+                best.assign(W, T(0));
+                int M = 0, n = 0;
+                bool ragged = false;
+                for (int l = 0; l < W; ++l) {
+                    const size_t i = plan_.elig[s + std::min<size_t>(l, real - 1)];
+                    a[l] = codes_a(i).data(); b[l] = codes_b(i).data();
+                    m[l] = static_cast<int>(len_a(i));
+                    nb[l] = static_cast<int>(len_b(i));
+                    M = std::max(M, m[l]);
+                    n = std::max(n, nb[l]);
+                    ragged |= nb[l] != nb[0];
+                }
+                InterJobT<T> job{};
+                job.a = a.data(); job.m = m.data(); job.b = b.data(); job.n = n; job.M = M;
+                job.align_mode = (AM == AlignMode::Local) ? 1 : 0;
+                if (ragged) job.nb = nb.data();
+                cast_block_(params(i0), blkT);
+                set_inter_params_(job, params(i0), blkT);
+                wire_inter_tables_(job, w.buf, static_cast<size_t>(n + 1) * W);
+                job.best = best.data();
+                run_inter_score_(K, job);
+                for (size_t l = 0; l < real; ++l) {
+                    const size_t i = plan_.elig[s + l];
+                    flags_[i] &= static_cast<uint8_t>(~kStored);
+                    score_[i] = static_cast<double>(best[l]);
+                    finish_(i, false, true);
+                }
+            }
+        };
+        run_workers_(tasks, worker);
+    }
 
     void score_and_grad_dynamic_(bool keep) {
         const size_t N = size();

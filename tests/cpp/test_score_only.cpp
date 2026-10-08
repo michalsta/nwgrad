@@ -161,3 +161,89 @@ TEST_CASE("compute_score leaves the Viterbi state alone", "[score]") {
     al.compute_viterbi();
     REQUIRE(al.score() == s);
 }
+
+// ── Inter-pair score only: every lane bit-identical to its pair's compute_score ──
+namespace {
+
+template <class T, GapModel GM, AlignMode AM>
+void inter_check(const LevelKernels& K, int W, std::mt19937_64& rng, const Alphabet& A,
+                 const AlignParams& p, bool ragged, long& n_checked) {
+    auto ri = [&](int lo, int hi) { return std::uniform_int_distribution<int>(lo, hi)(rng); };
+    const int na = A.size();
+    const int n = ri(0, 70);
+    std::vector<std::vector<unsigned char>> as(W), bs(W);
+    std::vector<int> ms(W), nbs(W);
+    for (int l = 0; l < W; ++l) {
+        ms[l] = ri(0, 40);
+        nbs[l] = ragged ? ri(std::max(0, n - 12), n) : n;
+        for (int k = 0; k < ms[l]; ++k) as[l].push_back(static_cast<unsigned char>(ri(0, na - 1)));
+        for (int k = 0; k < nbs[l]; ++k) bs[l].push_back(static_cast<unsigned char>(ri(0, na - 1)));
+        if (ri(0, 2) == 0)   // a homologous lane: B starts with A
+            for (int k = 0; k < std::min(ms[l], nbs[l]); ++k) bs[l][k] = as[l][k];
+    }
+    std::vector<const unsigned char*> ap(W), bp(W);
+    for (int l = 0; l < W; ++l) { ap[l] = as[l].data(); bp[l] = bs[l].data(); }
+    std::vector<T> blk(static_cast<size_t>(na) * na);
+    for (int x = 0; x < na; ++x)
+        for (int y = 0; y < na; ++y) blk[x * na + y] = static_cast<T>(p.matrix.at(x, y));
+    const bool lin = GM == GapModel::Linear;
+    InterJobT<T> J{};
+    J.a = ap.data(); J.m = ms.data(); J.b = bp.data(); J.n = n;
+    J.M = *std::max_element(ms.begin(), ms.end());
+    J.blk = blk.data(); J.nalpha = na;
+    J.go_a = lin ? T(0) : static_cast<T>(p.gap_open_a); J.ge_a = static_cast<T>(p.gap_extend_a);
+    J.go_b = lin ? T(0) : static_cast<T>(p.gap_open_b); J.ge_b = static_cast<T>(p.gap_extend_b);
+    J.align_mode = AM == AlignMode::Local; J.linear = lin;
+    std::vector<T> vm(static_cast<size_t>(n + 1) * W), vx(vm.size()), vy(vm.size()), best(W);
+    J.VM = vm.data(); J.VX = vx.data(); J.VY = vy.data(); J.best = best.data();
+    if (ragged) J.nb = nbs.data();
+    if constexpr (std::is_same_v<T, double>) K.inter_score(J); else K.inter_score_f(J);
+    for (int l = 0; l < W; ++l) {
+        Aligner<GM, AM, AlignBand::Full, T> al;
+        al.set_kernel(kBackendScalar);
+        DpBufferT<T> buf;
+        al.set_problem(std::span<const uint8_t>(as[l]), std::span<const uint8_t>(bs[l]), p);
+        const double want = al.compute_score(buf);
+        INFO("lane " << l << " m=" << ms[l] << " nb=" << nbs[l] << " n=" << n << " T=" << sizeof(T)
+             << " GM=" << (int)GM << " AM=" << (int)AM << " ragged=" << ragged
+             << " want=" << want << " got=" << static_cast<double>(best[l]));
+        REQUIRE(same_bits(static_cast<double>(best[l]), want));
+        ++n_checked;
+    }
+}
+
+}  // namespace
+
+TEST_CASE("inter-pair score: every lane equals its pair's compute_score", "[score][interpair]") {
+    std::mt19937_64 rng(77);
+    auto ri = [&](int lo, int hi) { return std::uniform_int_distribution<int>(lo, hi)(rng); };
+    const long iters = fuzz_iters(300);
+    long n_checked = 0, n_levels = 0;
+    for (SimdLevel lv : detect_available_levels()) {
+        const LevelKernels& K = level_kernels(static_cast<int>(lv));
+        if (!K.inter_score || !K.inter_score_f) continue;
+        ++n_levels;
+        for (long it = 0; it < iters; ++it) {
+            const Alphabet& A = ri(0, 2) == 0 ? Alphabet::protein() : Alphabet::dna();
+            AlignParams p(A);
+            const bool real = ri(0, 1);
+            for (int x = 0; x < A.size(); ++x)
+                for (int y = 0; y < A.size(); ++y)
+                    p.matrix.at(x, y) = real ? std::uniform_real_distribution<double>(-2, 3)(rng)
+                                             : static_cast<double>(x == y ? ri(1, 3) : ri(-2, 1));
+            p.gap_open_a = real ? 2.7 : ri(0, 4); p.gap_extend_a = real ? 0.1 * ri(1, 9) : ri(0, 2);
+            p.gap_open_b = real ? 1.9 : ri(0, 4); p.gap_extend_b = real ? 0.3 : ri(0, 2);
+            const bool rag = ri(0, 2) == 0;
+            inter_check<double, GapModel::Affine, AlignMode::Global>(K, K.inter_w, rng, A, p, rag, n_checked);
+            inter_check<double, GapModel::Affine, AlignMode::Local >(K, K.inter_w, rng, A, p, rag, n_checked);
+            inter_check<double, GapModel::Linear, AlignMode::Global>(K, K.inter_w, rng, A, p, rag, n_checked);
+            inter_check<double, GapModel::Linear, AlignMode::Local >(K, K.inter_w, rng, A, p, rag, n_checked);
+            inter_check<float,  GapModel::Affine, AlignMode::Global>(K, K.inter_w_f, rng, A, p, rag, n_checked);
+            inter_check<float,  GapModel::Affine, AlignMode::Local >(K, K.inter_w_f, rng, A, p, rag, n_checked);
+            inter_check<float,  GapModel::Linear, AlignMode::Global>(K, K.inter_w_f, rng, A, p, rag, n_checked);
+            inter_check<float,  GapModel::Linear, AlignMode::Local >(K, K.inter_w_f, rng, A, p, rag, n_checked);
+        }
+    }
+    INFO(n_levels << " levels, " << n_checked << " lanes");
+    REQUIRE(n_levels > 0);
+}

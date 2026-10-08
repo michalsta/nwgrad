@@ -441,6 +441,10 @@ struct LevelKernels {
     soft_pair_fn  soft_pair_affine = nullptr;
     score_fn      score = nullptr;              // score only (rolling rows), double
     score_fn_f    score_f = nullptr;            // ditto, float32
+    // Inter-pair score only (Full): InterJobT with ONE-row VM/VX/VY ((n+1)*W each), the
+    // lanes' scores out in best[] (Global and Local).  Same lane counts as inter_fill.
+    inter_fn      inter_score = nullptr;
+    inter_fn_f    inter_score_f = nullptr;
 };
 
 // One slot per possible level; index by (int)SimdLevel.  Populated by the level TUs'
@@ -460,7 +464,8 @@ inline LevelKernels* level_table() {
 // registrar to scalar `lea`s; the struct is assembled and stored here, in baseline code.
 // The score-only kernels, registered separately (same baseline-code rule) right after
 // register_level by the same registrar, so they cannot be overwritten by it.
-void register_level_score(SimdLevel l, score_fn score, score_fn_f score_f);
+void register_level_score(SimdLevel l, score_fn score, score_fn_f score_f,
+                          inter_fn inter_score, inter_fn_f inter_score_f);
 
 void register_level(SimdLevel l, viterbi_fn viterbi, viterbi_fn_f viterbi_f,
                     viterbi_fn viterbi_ptr, viterbi_fn_f viterbi_ptr_f,

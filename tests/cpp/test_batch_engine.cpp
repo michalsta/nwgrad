@@ -112,7 +112,21 @@ void run_case(unsigned seed, const Cfg& c) {
     REQUIRE(eng.size() == N);
     AlignParams go(alpha), ge(alpha);
 
-    auto compare = [&](const char* stage) {
+    // grad_mode None: score_and_grad() runs score only (0.6, after the oracle froze).  The
+    // score is the exact optimum — the Pointers fill's, which a traceback mode's replayed
+    // score can miss by an ULP (Hirschberg) or more (hirschberg_pmax) — and the guide is
+    // deferred, resolved on first use under the params scored: it must then equal the
+    // oracle's eager guide.
+    auto exact_score = [&](size_t i) {
+        Aligner<GM, AM, AlignBand::Full, T> al;
+        al.set_kernel(i < static_cast<size_t>(N1) ? kBackendAuto : k2);
+        al.set_traceback(TracebackMode::Pointers);
+        DpBufferT<T> buf;
+        al.set_problem(A[i], B[i], i < static_cast<size_t>(N1) ? p1 : p1b);
+        al.compute_viterbi(buf);
+        return al.score();
+    };
+    auto compare = [&](const char* stage, bool score_only = false) {
         INFO("stage " << stage);
         for (size_t i = 0; i < N; ++i) {
             INFO("pair " << i << " m=" << A[i].size() << " n=" << B[i].size());
@@ -120,6 +134,13 @@ void run_case(unsigned seed, const Cfg& c) {
             REQUIRE(op.path_valid()  == eng.path_valid(i));
             REQUIRE(op.score_valid() == eng.score_valid(i));
             REQUIRE(op.grad_valid()  == eng.grad_valid(i));
+            if (score_only) {
+                REQUIRE(eng.guide_pending(i));
+                CHECK(same(eng.score(i), exact_score(i)));
+                CHECK(op.guide_j_raw() == eng.guide_j(i));   // resolves the deferred guide
+                REQUIRE(!eng.guide_pending(i));
+                continue;
+            }
             REQUIRE(op.guide_pending() == eng.guide_pending(i));
             if (op.score_valid()) CHECK(same(op.score(), eng.score(i)));
             if (op.grad_valid()) {
@@ -137,8 +158,8 @@ void run_case(unsigned seed, const Cfg& c) {
 
     // 1. Full DP.
     const double so = old.score_and_grad(), se = eng.score_and_grad();
-    CHECK(same(so, se));
-    compare("score_and_grad");
+    if (c.gd != GradMode::None) CHECK(same(so, se));
+    compare("score_and_grad", c.gd == GradMode::None);
 
     // 2. weighted_grad with arbitrary weights: same blocked arithmetic.
     if (c.gd != GradMode::None && N) {

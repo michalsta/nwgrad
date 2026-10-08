@@ -39,6 +39,13 @@ template <> struct IVT<float>  { using v = ivf; using l = ivi; static constexpr 
 // scalar and row-wise kernels.
 template <class V> static inline V ivmax(V a, V b) noexcept { return a < b ? b : a; }
 template <class L, class V> static inline V ivsel(L m, V a, V b) noexcept { return m ? a : b; }
+// Every lane = x.  Not `ivd{} + x`: +0 + -0 is +0, so that idiom loses the sign of a
+// zero border (-0 when a gap extend is 0), which the scalar fill keeps.
+template <class V, class S> static inline V ivsplat(S x) noexcept {
+    V v;
+    for (unsigned l = 0; l < sizeof(V) / sizeof(S); ++l) v[l] = x;
+    return v;
+}
 
 
 // Per lane, the score of this row's A residue against the column's B residue: a blend
@@ -171,11 +178,11 @@ static void inter_fill_linear(InterJobT<T>& J) noexcept {
     } else {
         H[0] = z;
         for (int i = 1; i <= M; ++i) {
-            const ivd v = z + (-static_cast<T>(i) * J.ge_b);
+            const ivd v = ivsplat<ivd>(-static_cast<T>(i) * J.ge_b);
             H[static_cast<size_t>(i) * st] = Banded ? cm.border_mask(v, i, J.bri) : v;
         }
         for (int j = 1; j <= n; ++j) {
-            const ivd v = z + (-static_cast<T>(j) * J.ge_a);
+            const ivd v = ivsplat<ivd>(-static_cast<T>(j) * J.ge_a);
             H[j] = Banded ? cm.border_mask(v, j, J.brj) : v;
         }
     }
@@ -247,11 +254,11 @@ static void inter_fill_affine(InterJobT<T>& J) noexcept {
     } else {
         VM[0] = z;
         for (int i = 1; i <= M; ++i) {
-            const ivd v = z + (-(J.go_b + static_cast<T>(i) * J.ge_b));
+            const ivd v = ivsplat<ivd>(-(J.go_b + static_cast<T>(i) * J.ge_b));
             VX[static_cast<size_t>(i) * st] = Banded ? cm.border_mask(v, i, J.bri) : v;
         }
         for (int j = 1; j <= n; ++j) {
-            const ivd v = z + (-(J.go_a + static_cast<T>(j) * J.ge_a));
+            const ivd v = ivsplat<ivd>(-(J.go_a + static_cast<T>(j) * J.ge_a));
             VY[j] = Banded ? cm.border_mask(v, j, J.brj) : v;
         }
     }
@@ -324,3 +331,135 @@ static void inter_fill_t(InterJobT<T>& J) noexcept {
 
 static void inter_fill_entry(InterJob& J) noexcept { inter_fill_t<double>(J); }
 static void inter_fill_entry_f(InterJobT<float>& J) noexcept { inter_fill_t<float>(J); }
+
+// ── Inter-pair SCORE ONLY (Full): the fills above on one row, updated in place ──
+//
+// Per lane exactly inter_fill_affine / inter_fill_linear (the same operands in the same
+// order, so each lane's cells are bit-identical to its pair's own fill), but row i
+// overwrites row i-1 left to right in J.VM/VX/VY ((n+1)*W each: one row, not a table).
+// The diagonal operand of column j — row i-1, column j-1 — is overwritten one step
+// earlier, so it is carried in registers.  Output, per lane, in J.best: Global the
+// cell (m_l, n_l) — captured when the row loop passes that lane's last row — and Local
+// the maximum over the lane's own cells (rows <= m_l, columns <= n_l), which is the
+// fill's best value (max is exact in any order; the strict-first rule only places it).
+template <class T, bool Ragged>
+static void inter_score_affine(InterJobT<T>& J) noexcept {
+    using C = InterCommon<T>;
+    using ivd = typename C::ivd; using ivl = typename C::ivl;
+    constexpr int W = C::IW;
+    const C cm(J);
+    const int n = J.n, M = J.M;
+    const bool local = J.align_mode == 1;
+    ivd* VM = reinterpret_cast<ivd*>(J.VM);
+    ivd* VX = reinterpret_cast<ivd*>(J.VX);
+    ivd* VY = reinterpret_cast<ivd*>(J.VY);
+    const ivd z = {}, ninf = z + (-std::numeric_limits<T>::infinity());
+    const ivd go_a = z + J.go_a, ge_a = z + J.ge_a, go_b = z + J.go_b, ge_b = z + J.ge_b;
+
+    // row 0, as inter_fill_affine leaves it
+    for (int j = 0; j <= n; ++j) {
+        VM[j] = local ? z : (j == 0 ? z : ninf);
+        VX[j] = ninf;
+        VY[j] = (local || j == 0) ? ninf : ivsplat<ivd>(-(J.go_a + static_cast<T>(j) * J.ge_a));
+    }
+    auto capture = [&](int i) {        // Global: lanes whose A ends at row i
+        for (int l = 0; l < W; ++l)
+            if (J.m[l] == i) {
+                const int nl = Ragged ? J.nb[l] : n;
+                J.best[l] = std::max({VM[nl][l], VX[nl][l], VY[nl][l]});
+            }
+    };
+    if (!local) capture(0);
+    ivd vbest = z;
+
+    for (int i = 1; i <= M; ++i) {
+        ivd P[8];
+        ivl live;
+        cm.row(i, P, live);
+        ivd dm = VM[0], dx = VX[0], dy = VY[0];   // row i-1, column 0
+        ivd lm = local ? z : ninf;
+        ivd lx = local ? ninf : ivsplat<ivd>(-(J.go_b + static_cast<T>(i) * J.ge_b));
+        ivd ly = ninf;
+        VM[0] = lm; VX[0] = lx; VY[0] = ly;
+        for (int j = 1; j <= n; ++j) {
+            const ivd s = cm.s(P, j);
+            const ivd um = VM[j], ux = VX[j], uy = VY[j];   // row i-1, column j
+            ivd d = dm;
+            d = ivmax(d, dx);
+            d = ivmax(d, dy);
+            ivd mv = d + s;
+            if (local) mv = ivmax(mv, z);
+            ivd x = (um - go_b) - ge_b;
+            x = ivmax(x, ux - ge_b);
+            x = ivmax(x, (uy - go_b) - ge_b);
+            const ivd open = (ivmax(lm, lx) - go_a) - ge_a;
+            const ivd y = ivmax(open, ly - ge_a);
+            VM[j] = mv; VX[j] = x; VY[j] = y;
+            dm = um; dx = ux; dy = uy;
+            lm = mv; lx = x; ly = y;
+            if (local) {
+                ivl keep = live;
+                if constexpr (Ragged) keep &= (z + static_cast<T>(j)) <= cm.nbv;
+                vbest = ivmax(vbest, ivsel(keep, ivmax(mv, ivmax(x, y)), z));
+            }
+        }
+        if (!local) capture(i);
+    }
+    if (local) for (int l = 0; l < W; ++l) J.best[l] = vbest[l];
+}
+
+template <class T, bool Ragged>
+static void inter_score_linear(InterJobT<T>& J) noexcept {
+    using C = InterCommon<T>;
+    using ivd = typename C::ivd; using ivl = typename C::ivl;
+    constexpr int W = C::IW;
+    const C cm(J);
+    const int n = J.n, M = J.M;
+    const bool local = J.align_mode == 1;
+    ivd* H = reinterpret_cast<ivd*>(J.VM);
+    const ivd z = {};
+    const ivd ge_a = z + J.ge_a, ge_b = z + J.ge_b;
+
+    for (int j = 0; j <= n; ++j)
+        H[j] = (local || j == 0) ? z : ivsplat<ivd>(-static_cast<T>(j) * J.ge_a);
+    auto capture = [&](int i) {
+        for (int l = 0; l < W; ++l)
+            if (J.m[l] == i) J.best[l] = H[Ragged ? J.nb[l] : n][l];
+    };
+    if (!local) capture(0);
+    ivd vbest = z;
+
+    for (int i = 1; i <= M; ++i) {
+        ivd P[8];
+        ivl live;
+        cm.row(i, P, live);
+        ivd d = H[0];                                  // row i-1, column 0
+        ivd lh = local ? z : ivsplat<ivd>(-static_cast<T>(i) * J.ge_b);
+        H[0] = lh;
+        for (int j = 1; j <= n; ++j) {
+            const ivd up = H[j];
+            ivd v = d + cm.s(P, j);
+            v = ivmax(v, up - ge_b);
+            v = ivmax(v, lh - ge_a);
+            if (local) v = ivmax(v, z);
+            H[j] = v;
+            d = up;
+            lh = v;
+            if (local) {
+                ivl keep = live;
+                if constexpr (Ragged) keep &= (z + static_cast<T>(j)) <= cm.nbv;
+                vbest = ivmax(vbest, ivsel(keep, v, z));
+            }
+        }
+        if (!local) capture(i);
+    }
+    if (local) for (int l = 0; l < W; ++l) J.best[l] = vbest[l];
+}
+
+template <class T>
+static void inter_score_t(InterJobT<T>& J) noexcept {
+    if (J.nb) { if (J.linear) inter_score_linear<T, true>(J);  else inter_score_affine<T, true>(J); }
+    else      { if (J.linear) inter_score_linear<T, false>(J); else inter_score_affine<T, false>(J); }
+}
+static void inter_score_entry(InterJob& J) noexcept { inter_score_t<double>(J); }
+static void inter_score_entry_f(InterJobT<float>& J) noexcept { inter_score_t<float>(J); }

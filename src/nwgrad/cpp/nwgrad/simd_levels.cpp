@@ -47,7 +47,10 @@ void register_level(SimdLevel l, viterbi_fn viterbi, viterbi_fn_f viterbi_f,
     level_table()[(int)l] = k;
 }
 
-void register_level_score(SimdLevel l, score_fn score, score_fn_f score_f) {
-    level_table()[(int)l].score   = score;
-    level_table()[(int)l].score_f = score_f;
+void register_level_score(SimdLevel l, score_fn score, score_fn_f score_f,
+                          inter_fn inter_score, inter_fn_f inter_score_f) {
+    level_table()[(int)l].score         = score;
+    level_table()[(int)l].score_f       = score_f;
+    level_table()[(int)l].inter_score   = inter_score;
+    level_table()[(int)l].inter_score_f = inter_score_f;
 }

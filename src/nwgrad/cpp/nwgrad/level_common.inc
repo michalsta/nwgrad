@@ -75,7 +75,9 @@ struct NwgradLevelRegistrar {
                        &NWGRAD_LVL_NAME::soft_pair_affine);    // per-pair soft, affine
         register_level_score(NWGRAD_LVL_ENUM,
                              &NWGRAD_LVL_NAME::score_entry<double>,
-                             &NWGRAD_LVL_NAME::score_entry<float>);
+                             &NWGRAD_LVL_NAME::score_entry<float>,
+                             &NWGRAD_LVL_NAME::inter_score_entry,
+                             &NWGRAD_LVL_NAME::inter_score_entry_f);
     }
 };
 const NwgradLevelRegistrar nwgrad_level_registrar_instance;
