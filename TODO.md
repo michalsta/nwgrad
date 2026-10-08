@@ -120,13 +120,23 @@ The scan's correctness and maintenance findings (B1–B8, S1–S4) are closed: f
 branch `scan-fixes` or already gone with the 0.6 restructure. What remains is
 performance work, none of it measured yet; the cost notes are estimates.
 
-- **O1 — a score-only fill.** `nw_score*` / `sw_score*` and `grad_mode="none"` batches
-  run the full traceback machinery to return one number: Hirschberg recursion past
-  `hb_cutoff`, direction bytes (Pointers) below it, then a path replay. A rolling-row
-  forward pass (O(n) memory, no traceback) would do strictly less work. Decide first
-  whether it must reproduce today's results: at float32 `auto` is `hirschberg_pmax`,
-  whose score may sit (≤ the measured shortfall) below the exact optimum a plain forward
-  pass returns. Benchmark short/long × Global/Local; keep the bit-identity contracts.
+- **O1 — score-only: DONE 2026-10-08** (`compute_score`, `score_kernel_impl.inl`, inter-pair
+  `inter_score_*`; see AGENTS.md "Score only").  Left: (a) the per-pair striped kernel's
+  two-row form (D = max(M,X,Y) and X instead of M/X/Y, as `inter_score_affine_pos` — exact
+  for non-negative opens; fewer loads and maxes per cell; est. 15-25 %); (b) float32 on
+  AVX-512 (W=16): lazy-F rounds make long Global pairs 0.89x `hirschberg_pmax` — consider a
+  W=8 (256-bit) float kernel there, or an opt-in prefix-max score; (c) the score kernels on
+  NEON/AVX-512 were verified before negative penalties entered the tests — rerun
+  `NWGRAD_SCORE_FUZZ=20000 nwgrad_tests "[score]"` on spot/solace; (d) inter-pair
+  eligibility for score only still uses the table-size cap (`inter_pair_fits`), which
+  does not apply to one row — re-derive the crossover against the per-pair kernel.
+- **float32 Local `hirschberg_pmax` short of the optimum by 0.5** on a random DNA pair
+  (penalties 3/0.3/2/0.2, integer matrix; 153.1 vs Pointers 153.6) — beyond the
+  measured <= 4.9e-4 (those were Global fixtures).  The Local endpoint scans took the
+  prefix-max carry on 2026-10-05; characterize (tools/char_hb_pmax.py on Local) before
+  trusting the float32 Local `auto` default.
+- **Hirschberg with negative gap penalties** is guarded (auto -> Pointers, explicit raises);
+  a real fix would make the join and the Local endpoint scans handle gaps that gain score.
 - **O3 — release the GIL in long batch calls.** Same item as AGENTS.md's Open TODO.
   ~0.1 µs per call: release around batch calls only, not the µs-scale single-pair
   functions. Blocked on a stated contract against two Python threads mutating one batch.
