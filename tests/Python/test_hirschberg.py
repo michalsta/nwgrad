@@ -865,3 +865,31 @@ def test_negative_gap_penalties_auto_is_exact_explicit_raises(cls, gm, md):
                     e.score_and_grad()
             else:
                 e.score_and_grad()
+
+
+# ── float32 Hirschberg loses score with a SMALL hb_cutoff (found 2026-10-08, not fixed) ──
+# Exact and prefix-max, Global and Local, scalar and simd: the shared recursion at
+# T=float.  On this box, cutoff >= 32 is exact; 16 and 8 lose 0.5, 4 loses 4.5, 1 loses
+# 5.5 (153.6 optimum).  Double is exact at every cutoff, float32 with integer penalties
+# too: rounding of the non-representable 0.3 / 0.2 flips a split/join decision, and the
+# loss grows with recursion depth.  The default cutoff (512) measured safe (<= 0.002 on
+# 272 alignments of 600-12000 residues).  See TODO.md.
+_F32_A = ("GCAGAACCAATATGGAAAAAGAACGCACGGCGTTCACCAAGCGAAATGGGACTCCTAGAAGCCGCAACTGTACCAAATG"
+          "GGAGGTGAAGCACCTCACAAGCTATGTCCTTACAGTCAACTCCCTTGAAAGACGGCATAGTTATGAACGATGTC")
+_F32_B = ("CAAAGAGACTATACTGCGGGAGTAGATTTATTTGGTGTGCTGACCTGCTCGTATCCGGCGGCGCACCTATTATTTAAA"
+          "ACCAATATCATGTCGATG")
+_F32_M = [[2, 2, 0, 0], [3, -2, 2, -2], [3, 3, 1, 2], [-2, -1, 2, 0]]
+
+
+@pytest.mark.xfail(strict=True, reason="float32 Hirschberg with a small hb_cutoff (TODO.md)")
+@pytest.mark.parametrize("cutoff", [1, 8])
+def test_float32_small_cutoff_keeps_the_optimum(cutoff):
+    import numpy as np
+    p = nwgrad.AlignParams(nwgrad.SubstMatrix(np.array(_F32_M, float), alphabet="ACGT"),
+                           3.0, 0.3, 2.0, 0.2)
+    ref = nwgrad.SeqPair(_F32_A, _F32_B, p, gap_model="affine", mode="global", traceback="pointers")
+    ref.score_and_grad()
+    hb = nwgrad.SeqPair(_F32_A, _F32_B, p, gap_model="affine", mode="global", traceback="hirschberg")
+    hb.hb_cutoff = cutoff
+    hb.score_and_grad()
+    assert hb.score >= ref.score - 1e-3

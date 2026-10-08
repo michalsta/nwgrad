@@ -131,11 +131,21 @@ performance work, none of it measured yet; the cost notes are estimates.
   `NWGRAD_SCORE_FUZZ=20000 nwgrad_tests "[score]"` on spot/solace; (d) inter-pair
   eligibility for score only still uses the table-size cap (`inter_pair_fits`), which
   does not apply to one row — re-derive the crossover against the per-pair kernel.
-- **float32 Local `hirschberg_pmax` short of the optimum by 0.5** on a random DNA pair
-  (penalties 3/0.3/2/0.2, integer matrix; 153.1 vs Pointers 153.6) — beyond the
-  measured <= 4.9e-4 (those were Global fixtures).  The Local endpoint scans took the
-  prefix-max carry on 2026-10-05; characterize (tools/char_hb_pmax.py on Local) before
-  trusting the float32 Local `auto` default.
+- **float32 Hirschberg loses score with a SMALL `hb_cutoff`** (characterized 2026-10-08;
+  first misread as a Local / prefix-max problem).  Exact `hirschberg` and
+  `hirschberg_pmax`, Global and Local, scalar and simd alike — the shared recursion at
+  T=float.  One 153 x 96 DNA box (integer matrix, gaps 3/0.3/2/0.2): cutoff 32+ exact,
+  16 and 8 lose 0.5, 4 loses 4.5, 1 loses 5.5; double exact at every cutoff, float32 with
+  INTEGER penalties exact even at cutoff 1.  So float32 rounding of non-representable
+  penalties flips some decision in the split/join, and the loss grows with recursion
+  depth — far beyond rounding.  At the DEFAULT cutoff (512) it does not show: 240
+  alignments of 600-3000 residues and 32 of 6000-12000, homologous and unrelated, DNA and
+  protein, Global and Local — float32 `auto` short of float32 Pointers by <= 0.002 (equal
+  to exact Hirschberg's), never above.  Root cause not found; next, compare float and
+  double forward / reverse rows and the join's (c*, span) choices at each split.  Repro:
+  `tests/Python/test_hirschberg.py::test_float32_small_cutoff_keeps_the_optimum` (strict
+  xfail — it starts failing when fixed).  Until then, consider a float32 floor on
+  hb_cutoff (e.g. 32).
 - **Hirschberg with negative gap penalties** is guarded (auto -> Pointers, explicit raises);
   a real fix would make the join and the Local endpoint scans handle gaps that gain score.
 - **O3 — release the GIL in long batch calls.** Same item as AGENTS.md's Open TODO.
