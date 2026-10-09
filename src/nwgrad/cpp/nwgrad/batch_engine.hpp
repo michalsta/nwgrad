@@ -1060,7 +1060,9 @@ private:
 
     // SeqPair::score_and_grad_with_dp.
     void run_full_(size_t i, Work& w, bool keep) {
-        flags_[i] &= static_cast<uint8_t>(~kStored);
+        // Publish score/gradient validity only after the whole fill succeeds. A
+        // soft fill can throw after its Viterbi has already stored a new path.
+        flags_[i] &= static_cast<uint8_t>(~(kScore | kGrad | kStored));
         auto& al = w.full;
         set_problem_(al, i);
         const bool lazy = s_.soft_guide_lazy && !keep, post = s_.soft_guide_posterior && !keep;
@@ -1104,7 +1106,7 @@ private:
     // SeqPair::banded_grad_with_dp.
     void run_banded_(size_t i, Work& w, int bandwidth, bool keep) {
         resolve_guide_(i, w);
-        flags_[i] &= static_cast<uint8_t>(~kStored);
+        flags_[i] &= static_cast<uint8_t>(~(kScore | kGrad | kStored));
         auto& al = w.band;
         al.set_kernel(kernel(i));
         const int* g = guide_ptr_(i);

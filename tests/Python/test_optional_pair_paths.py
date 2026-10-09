@@ -77,3 +77,27 @@ def test_gradient_free_pair_rejects_fused_gradient(keep_paths):
     pair = nwgrad.SeqPairDouble("ACGT", "ACGT", p, grad_mode="none")
     with pytest.raises(RuntimeError, match="grad_mode"):
         pair.score_and_grad(keep_paths=keep_paths)
+
+
+@pytest.mark.parametrize("suffix", ["", "Double"])
+@pytest.mark.parametrize("operation", ["align_full", "realign_banded"])
+@pytest.mark.parametrize("before", ["unreleased", "released", "dropped"])
+def test_failed_fill_cannot_publish_an_old_gradient(suffix, operation, before):
+    p = nwgrad.AlignParams(np.eye(4) * 800, alphabet="ACGT")
+    pair = getattr(nwgrad, "SeqPair" + suffix)("ACGT", "ACGT", p, grad_mode="soft")
+    pair.soft_impl = "log"
+    pair.align_full()
+    if before == "released":
+        pair.compute_grad()
+    elif before == "dropped":
+        pair.drop_dp()
+    # Viterbi can finish and store a path before the scaled soft pass rejects exp(800).
+    pair.soft_impl = "scaled"
+    with pytest.raises(ValueError, match="scaled_or_log"):
+        getattr(pair, operation)(4) if operation == "realign_banded" else pair.align_full()
+    assert not pair.score_valid and not pair.grad_valid
+    with pytest.raises(RuntimeError):
+        pair.compute_grad()
+    pair.soft_impl = "log"
+    pair.score_and_grad(keep_paths=False)
+    assert pair.score_valid and pair.grad_valid

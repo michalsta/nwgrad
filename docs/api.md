@@ -179,6 +179,8 @@ soft options, `hb_cutoff` — belong to the batch: setting them on a view raises
 | `set_params(params)` | (Standalone pairs.) Swap alignment parameters. Clears `score`, `grad` and the stored path; preserves `guide_j`, so `realign_banded()` works straight after. |
 | `drop_dp()` | Free the stored path. `score`, a released `grad` and `guide_j` survive. |
 
+A failed pair computation invalidates its cached score and gradient.
+
 **Properties:**
 
 | Property | Type | Description |
