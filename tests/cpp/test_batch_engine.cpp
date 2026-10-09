@@ -1,33 +1,15 @@
-// ── BatchEngine against the classes it replaces ─────────────────────────────
-//
-// BatchEngine<T, GM, AM> keeps every pair's state in flat arrays and runs each pair
-// through a per-worker Aligner; the pre-0.6 SeqPairBatchT<T> (frozen in legacy/) held one SeqPair object (two Aligners)
-// per pair.  The engine's per-pair operations are ports of SeqPair's, so every result
-// must be BIT-identical: scores, gradients, guides and validity flags after
-// score_and_grad(), after set_params() + banded_grad(), the stored paths against
-// align_full() + aligned() / coordinates(), and weighted_grad().  Hard compute_grad()
-// is integer counts, so exact too; the soft one is compared with a tolerance, because
-// the old one merged per-thread sums in completion order (not reproducible), while the
-// engine sums in fixed blocks.
-//
-// Random configurations cover both precisions, the four problem types, the three grad
-// modes, every fill and scheduler, every traceback, soft impl / temperature / guide,
-// small Hirschberg cutoffs (so short pairs split), two parameter segments, and empty
-// and one-residue sequences.
-
+// Randomized batch regressions against direct public Aligner calls. The reference
+// does not use BatchEngine, SeqPair, inter-pair scheduling or stored-path compression.
+// Covers 192 stored-batch and 240 streaming configurations across precisions, types,
+// parameter segments, schedules, fills, traceback modes, soft options and guide bands.
 #include "catch.hpp"
-
+#include "batch_engine.hpp"
 #include <cmath>
 #include <random>
 #include <string>
 #include <vector>
 
-#include "batch_engine.hpp"
-#include "legacy/legacy_batch.hpp"
-#include "legacy/legacy_seq_pair_batch.hpp"
-
 namespace {
-
 struct Cfg {
     GradMode gd;
     TracebackMode tb;
@@ -70,7 +52,92 @@ AlignParams rparams(std::mt19937& rng, const Alphabet& alpha, GapModel gm, int k
     return AlignParams(SubstMatrix(m.data(), alpha), go, ge, go * 1.3, ge * 0.8);
 }
 
+
 bool same(double x, double y) { return x == y || (std::isnan(x) && std::isnan(y)); }
+
+struct Expected {
+    double score = 0;
+    AlignParams grad;
+    std::vector<int> guide;
+    std::pair<std::string, std::string> aligned;
+    std::pair<std::vector<int64_t>, std::vector<int64_t>> coordinates;
+    explicit Expected(const Alphabet& a) : grad(a) {}
+};
+
+// Independent of batch storage, scheduling and path compression. Drive the public
+// Aligner directly, then derive coordinates from its gapped strings and end cell.
+template<class Al, class Buffer>
+void capture_path(const Al& al, const Buffer& buf, Expected& out) {
+    out.aligned = al.aligned(buf);
+    const auto end = al.alignment_end();
+    int64_t x = end.first, y = end.second;
+    for (char c : out.aligned.first) x -= c != '-';
+    for (char c : out.aligned.second) y -= c != '-';
+    auto& [ci, cj] = out.coordinates;
+    ci = {x}; cj = {y};
+    int previous = -1;
+    for (size_t k = 0; k < out.aligned.first.size(); ++k) {
+        const int step = out.aligned.first[k] == '-' ? 2 : out.aligned.second[k] == '-' ? 1 : 0;
+        if (previous != -1 && previous != step) { ci.push_back(x); cj.push_back(y); }
+        x += step != 2; y += step != 1;
+        previous = step;
+    }
+    ci.push_back(x); cj.push_back(y);
+}
+
+template<class T, GapModel GM, AlignMode AM, AlignBand AB>
+Expected reference(std::string_view a, std::string_view b, const AlignParams& p,
+                   const Cfg& c, int kernel, bool keep, int band = 0,
+                   std::vector<int> guide = {}, bool streaming = false) {
+    Aligner<GM, AM, AB, T> al;
+    DpBufferT<T> buf;
+    al.set_kernel(kernel);
+    al.set_soft_impl(c.soft_impl); al.set_soft_temperature(c.temp);
+    if constexpr (AB == AlignBand::Full) {
+        al.set_traceback(c.tb); al.set_hb_cutoff(c.hb_cutoff); al.set_rowwise_full(c.rowwise);
+    } else {
+        al.set_traceback(TracebackMode::Scores);
+    }
+    al.set_problem(a, b, p, band, std::move(guide));
+    Expected r(p.alphabet());
+    const bool soft = c.gd == GradMode::Soft;
+    const bool skip_viterbi = soft && (streaming || (!keep && AB == AlignBand::Full && c.soft_guide));
+    if (c.gd == GradMode::None && !keep) {
+        r.score = al.compute_score(buf);
+        if (streaming) return r;
+        al.compute_viterbi(buf);  // deferred guide, using the scoring parameters
+        r.guide = al.guide_j_from_viterbi(buf);
+        return r;
+    }
+    if (!skip_viterbi) {
+        al.compute_viterbi(buf);
+        r.score = al.score();
+        r.guide = al.guide_j_from_viterbi(buf);
+        if (keep) capture_path(al, buf, r);
+        if (c.gd == GradMode::Hard) al.hard_grad(buf, r.grad);
+    }
+    if (soft) {
+        al.set_posterior_guide(!streaming && !keep && AB == AlignBand::Full && c.soft_guide == 2);
+        al.compute_forward_back(buf);
+        r.score = al.log_z(); al.soft_grad(buf, r.grad);
+        if (!streaming && !keep && AB == AlignBand::Full && c.soft_guide == 2)
+            r.guide = al.posterior_guide();
+    }
+    return r;
+}
+
+void check_number(double expected, double actual, bool soft, double tolerance = 1e-10) {
+    if (soft) CHECK(std::abs(expected - actual) <= tolerance * (1.0 + std::abs(expected)));
+    else CHECK(same(expected, actual));
+}
+void check_grad(const AlignParams& expected, const AlignParams& actual, bool soft) {
+    for (size_t k = 0; k < static_cast<size_t>(expected.matrix.size()) * expected.matrix.size(); ++k)
+        check_number(expected.matrix.data()[k], actual.matrix.data()[k], soft, 1e-9);
+    check_number(expected.gap_open_a, actual.gap_open_a, soft, 1e-9);
+    check_number(expected.gap_extend_a, actual.gap_extend_a, soft, 1e-9);
+    check_number(expected.gap_open_b, actual.gap_open_b, soft, 1e-9);
+    check_number(expected.gap_extend_b, actual.gap_extend_b, soft, 1e-9);
+}
 
 template <class T, GapModel GM, AlignMode AM>
 void run_case(unsigned seed, const Cfg& c) {
@@ -80,7 +147,6 @@ void run_case(unsigned seed, const Cfg& c) {
     const AlignParams p1 = rparams(rng, alpha, GM, kind);
     const AlignParams p1b = rparams(rng, alpha, GM, (kind + 1) % 3);
     const AlignParams p2 = rparams(rng, alpha, GM, (kind + 2) % 3);
-
     const int N1 = 1 + static_cast<int>(rng() % 30), N2 = c.two_segments ? 1 + static_cast<int>(rng() % 20) : 0;
     std::vector<std::string> A, B;
     const int lb = rlen(rng);
@@ -91,128 +157,86 @@ void run_case(unsigned seed, const Cfg& c) {
     std::vector<std::string_view> A1(A.begin(), A.begin() + N1), B1(B.begin(), B.begin() + N1);
     std::vector<std::string_view> A2(A.begin() + N1, A.end()), B2(B.begin() + N1, B.end());
     const int k2 = c.scalar_second ? kBackendScalar : kBackendAuto;
-
-    legacy::SeqPairBatchT<T> old(c.threads, c.tb);
-    old.inter_fill = c.inter; old.rowwise_full = c.rowwise; old.sorted_schedule = c.sorted;
-    old.soft_impl = c.soft_impl; old.soft_temperature = c.temp;
-    old.soft_guide_lazy = c.soft_guide == 1; old.soft_guide_posterior = c.soft_guide == 2;
-    old.hb_cutoff = c.hb_cutoff;
-    old.add_many(A1, B1, p1, GM, AM, c.gd);
-    if (N2) old.add_many(A2, B2, p1b, GM, AM, c.gd, k2);
-
     BatchEngine<T, GM, AM> eng(c.threads, c.gd, c.tb);
     eng.set_fill(c.rowwise, c.inter); eng.set_sorted_schedule(c.sorted);
     eng.set_soft_impl(c.soft_impl); eng.set_soft_temperature(c.temp);
-    eng.set_soft_guide(c.soft_guide == 1, c.soft_guide == 2);
-    eng.set_hb_cutoff(c.hb_cutoff);
+    eng.set_soft_guide(c.soft_guide == 1, c.soft_guide == 2); eng.set_hb_cutoff(c.hb_cutoff);
     eng.add_many(A1, B1, p1);
     if (N2) eng.add_many(A2, B2, p1b, k2);
-
-    const size_t N = old.size();
+    const size_t N = A.size();
     REQUIRE(eng.size() == N);
-    AlignParams go(alpha), ge(alpha);
-
-    // grad_mode None: score_and_grad() runs score only (0.6, after the oracle froze).  The
-    // score is the exact optimum — the Pointers fill's, which a traceback mode's replayed
-    // score can miss by an ULP (Hirschberg) or more (hirschberg_pmax) — and the guide is
-    // deferred, resolved on first use under the params scored: it must then equal the
-    // oracle's eager guide.
-    auto exact_score = [&](size_t i) {
-        Aligner<GM, AM, AlignBand::Full, T> al;
-        al.set_kernel(i < static_cast<size_t>(N1) ? kBackendAuto : k2);
-        al.set_traceback(TracebackMode::Pointers);
-        DpBufferT<T> buf;
-        al.set_problem(A[i], B[i], i < static_cast<size_t>(N1) ? p1 : p1b);
-        al.compute_viterbi(buf);
-        return al.score();
-    };
-    auto compare = [&](const char* stage, bool score_only = false) {
-        INFO("stage " << stage);
+    const bool soft = c.gd == GradMode::Soft;
+    std::vector<Expected> expected;
+    auto kernel = [&](size_t i) { return i < static_cast<size_t>(N1) ? kBackendAuto : k2; };
+    double sum = 0;
+    for (size_t i = 0; i < N; ++i) {
+        expected.push_back(reference<T, GM, AM, AlignBand::Full>(A[i], B[i],
+            i < static_cast<size_t>(N1) ? p1 : p1b, c, kernel(i), false));
+        sum += expected.back().score;
+    }
+    check_number(sum, eng.score_and_grad(), soft);
+    AlignParams plain(alpha), weighted(alpha);
+    std::vector<double> weights(N);
+    for (auto& w : weights) w = std::uniform_real_distribution<double>(-2, 2)(rng);
+    for (size_t i = 0; i < N; ++i) {
+        INFO("full pair " << i);
+        REQUIRE(eng.score_valid(i)); REQUIRE(eng.path_valid(i)); REQUIRE_FALSE(eng.path_stored(i));
+        REQUIRE(eng.grad_valid(i) == (c.gd != GradMode::None));
+        check_number(expected[i].score, eng.score(i), soft);
+        const bool pending = c.gd == GradMode::None || (soft && c.soft_guide == 1);
+        REQUIRE(eng.guide_pending(i) == pending);
+        if (!(soft && c.soft_guide == 1)) CHECK(expected[i].guide == eng.guide_j(i));
+        if (c.gd != GradMode::None) {
+            check_grad(expected[i].grad, eng.grad(i), soft);
+            plain += expected[i].grad; weighted += weights[i] * expected[i].grad;
+        }
+    }
+    if (c.gd != GradMode::None) {
+        check_grad(plain, eng.compute_grad(), soft);
+        check_grad(weighted, eng.weighted_grad(weights.data(), N), soft);
+    }
+    eng.set_params(p2);
+    sum = 0;
+    for (size_t i = 0; i < N; ++i) {
+        REQUIRE_FALSE(eng.score_valid(i)); REQUIRE_FALSE(eng.grad_valid(i)); REQUIRE_FALSE(eng.path_stored(i));
+        if (soft && c.soft_guide == 1)
+            expected[i].guide = reference<T, GM, AM, AlignBand::Full>(A[i], B[i], p2, c, kernel(i), true).guide;
+        expected[i] = reference<T, GM, AM, AlignBand::GuideBanded>(A[i], B[i], p2, c,
+                            kernel(i), false, c.bw, expected[i].guide);
+        sum += expected[i].score;
+    }
+    check_number(sum, eng.banded_grad(c.bw), soft);
+    for (size_t i = 0; i < N; ++i) {
+        INFO("banded pair " << i);
+        check_number(expected[i].score, eng.score(i), soft);
+        CHECK(expected[i].guide == eng.guide_raw(i));
+        if (c.gd != GradMode::None) check_grad(expected[i].grad, eng.grad(i), soft);
+    }
+    for (bool banded : {false, true}) {
+        sum = 0;
         for (size_t i = 0; i < N; ++i) {
-            INFO("pair " << i << " m=" << A[i].size() << " n=" << B[i].size());
-            const auto& op = old[i];
-            REQUIRE(op.path_valid()  == eng.path_valid(i));
-            REQUIRE(op.score_valid() == eng.score_valid(i));
-            REQUIRE(op.grad_valid()  == eng.grad_valid(i));
-            if (score_only) {
-                REQUIRE(eng.guide_pending(i));
-                CHECK(same(eng.score(i), exact_score(i)));
-                CHECK(op.guide_j_raw() == eng.guide_j(i));   // resolves the deferred guide
-                REQUIRE(!eng.guide_pending(i));
-                continue;
-            }
-            REQUIRE(op.guide_pending() == eng.guide_pending(i));
-            if (op.score_valid()) CHECK(same(op.score(), eng.score(i)));
-            if (op.grad_valid()) {
-                go = op.grad(); eng.grad(i, ge);
-                bool eq = same(go.gap_open_a, ge.gap_open_a) && same(go.gap_extend_a, ge.gap_extend_a) &&
-                          same(go.gap_open_b, ge.gap_open_b) && same(go.gap_extend_b, ge.gap_extend_b);
-                for (int k = 0; k < alpha.size() * alpha.size(); ++k)
-                    eq = eq && same(go.matrix.data()[k], ge.matrix.data()[k]);
-                CHECK(eq);
-            }
-            if (op.path_valid() && !op.guide_pending())
-                CHECK(op.guide_j_raw() == eng.guide_raw(i));
+            expected[i] = banded
+                ? reference<T, GM, AM, AlignBand::GuideBanded>(A[i], B[i], p2, c, kernel(i), true, c.bw, expected[i].guide)
+                : reference<T, GM, AM, AlignBand::Full>(A[i], B[i], p2, c, kernel(i), true);
+            sum += expected[i].score;
         }
-    };
-
-    // 1. Full DP.
-    const double so = old.score_and_grad(), se = eng.score_and_grad();
-    if (c.gd != GradMode::None) CHECK(same(so, se));
-    compare("score_and_grad", c.gd == GradMode::None);
-
-    // 2. weighted_grad with arbitrary weights: same blocked arithmetic.
-    if (c.gd != GradMode::None && N) {
-        std::vector<double> w(N);
-        for (auto& x : w) x = std::uniform_real_distribution<double>(-2, 2)(rng);
-        const AlignParams wo = old.weighted_grad(w.data(), N), we = eng.weighted_grad(w.data(), N);
-        bool eq = same(wo.gap_open_a, we.gap_open_a) && same(wo.gap_extend_b, we.gap_extend_b);
-        for (int k = 0; k < alpha.size() * alpha.size(); ++k)
-            eq = eq && same(wo.matrix.data()[k], we.matrix.data()[k]);
-        CHECK(eq);
-        const AlignParams co = old.compute_grad(), ce = eng.compute_grad();
-        for (int k = 0; k < alpha.size() * alpha.size(); ++k) {
-            if (c.gd == GradMode::Hard) CHECK(same(co.matrix.data()[k], ce.matrix.data()[k]));
-            else CHECK(std::abs(co.matrix.data()[k] - ce.matrix.data()[k]) <=
-                       1e-9 * (1.0 + std::abs(co.matrix.data()[k])));
+        check_number(sum, banded ? eng.banded_grad(c.bw, true) : eng.score_and_grad(true), soft);
+        for (size_t i = 0; i < N; ++i) {
+            INFO("stored paths pair " << i << " banded " << banded);
+            REQUIRE(eng.path_stored(i));
+            check_number(expected[i].score, eng.score(i), soft);
+            CHECK(expected[i].aligned == eng.aligned(i));
+            CHECK(expected[i].coordinates == eng.coordinates(i));
+            CHECK(expected[i].guide == eng.guide_raw(i));
+            if (c.gd != GradMode::None) check_grad(expected[i].grad, eng.grad(i), soft);
         }
     }
-
-    // 3. New params, banded step around the cached guides.
-    old.set_params(p2); eng.set_params(p2);
-    compare("set_params");
-    const double bo = old.banded_grad(c.bw), be = eng.banded_grad(c.bw);
-    CHECK(same(bo, be));
-    compare("banded_grad");
-
-    // 4. Stored paths against the old pair-owned tables.  align_full() ran every pair's
-    // own fill; score_and_grad(keep_paths) honours fill="interpair", whose shared soft
-    // pass agrees with the per-pair forward-backward within tolerance only (the soft
-    // path's contract) — so soft scores here are compared with it.  Paths are Viterbi:
-    // exact.
-    auto close = [&](double x, double y) {
-        if (c.gd != GradMode::Soft) return same(x, y);
-        return std::abs(x - y) <= 1e-11 * (1.0 + std::abs(x));
-    };
-    old.alloc_dp();
-    const double ao = old.align_full(), ae = eng.score_and_grad(/*keep_paths=*/true);
-    CHECK(close(ao, ae));
+    eng.drop_paths();
     for (size_t i = 0; i < N; ++i) {
-        INFO("aligned, pair " << i);
-        CHECK(close(old[i].score(), eng.score(i)));
-        CHECK(old[i].aligned() == eng.aligned(i));
-        CHECK(old[i].coordinates() == eng.coordinates(i));
-    }
-    // ... and the banded realignment's.
-    const double ro = old.realign_banded(c.bw), re = eng.banded_grad(c.bw, /*keep_paths=*/true);
-    CHECK(same(ro, re));
-    for (size_t i = 0; i < N; ++i) {
-        INFO("realigned, pair " << i);
-        CHECK(same(old[i].score(), eng.score(i)));
-        CHECK(old[i].aligned() == eng.aligned(i));
+        REQUIRE_FALSE(eng.path_stored(i)); REQUIRE(eng.score_valid(i)); REQUIRE(eng.path_valid(i));
+        REQUIRE(eng.grad_valid(i) == (c.gd != GradMode::None));
     }
 }
-
 template <class T, GapModel GM, AlignMode AM>
 void sweep(int n) {
     std::mt19937 rng(1000u + static_cast<unsigned>(GM) * 10u + static_cast<unsigned>(AM) +
@@ -264,17 +288,14 @@ TEST_CASE("BatchEngine == SeqPairBatch, float32", "[batch_engine]") {
     sweep<float, GapModel::Linear, AlignMode::Local>(24);
 }
 
-// ── align_stream against BatchAligner ───────────────────────────────────────
-
+// Streaming regressions against direct Aligners, including guided band zero.
 namespace {
 
 template <class T, GapModel GM, AlignMode AM>
 void stream_sweep(int n) {
     std::mt19937 rng(77u + static_cast<unsigned>(GM) * 10u + static_cast<unsigned>(AM) +
                      (std::is_same_v<T, float> ? 100u : 0u));
-    using BA = legacy::BatchAlignerT<T>;
     const GradMode gds[] = {GradMode::Hard, GradMode::Soft, GradMode::None};
-    const typename BA::GradMode bgds[] = {BA::GradMode::Hard, BA::GradMode::Soft, BA::GradMode::None};
     for (int k = 0; k < n; ++k) {
         const int gi = k % 3;
         const bool protein = rng() % 4 == 0, inter = rng() % 3 != 0;
@@ -302,15 +323,20 @@ void stream_sweep(int n) {
         }
         INFO("stream case " << k << " gd " << gi << " band " << band << " guides " << guides
              << " inter " << inter << " threads " << threads << " protein " << protein);
-        BA ba(p, band, GM, AM, bgds[gi], threads);
-        // The one known-wrong oracle path: a soft guided band-0 call under interpair ran
-        // the Full-only shared soft pass and ignored the guides (fixed in align_stream).
-        // There the oracle's own-path answer, the correct one, is the reference.
-        const bool oracle_bug = gds[gi] == GradMode::Soft && band == 0 && guides && inter;
-        ba.inter_fill = inter && !oracle_bug; ba.soft_temperature = temp;
         BatchEngine<T, GM, AM> eng(threads, gds[gi]);
         eng.set_fill(false, inter); eng.set_soft_temperature(temp);
-        const BatchResult ro = ba.align(probs);
+        BatchResult ro(alpha);
+        Cfg c{}; c.gd = gds[gi]; c.temp = temp; c.soft_impl = SoftImpl::Scaled;
+        c.tb = TracebackMode::Default; c.hb_cutoff = 512;
+        for (const auto& problem : probs) {
+            auto r = band > 0 || guides
+                ? reference<T, GM, AM, AlignBand::GuideBanded>(problem.seq_a, problem.seq_b,
+                      p, c, kBackendAuto, false, band, problem.guide_j, true)
+                : reference<T, GM, AM, AlignBand::Full>(problem.seq_a, problem.seq_b,
+                      p, c, kBackendAuto, false, 0, {}, true);
+            ro.scores.push_back(r.score);
+            ro.grad += r.grad;
+        }
         const BatchResult re = eng.align_stream(probs, p, band);
         REQUIRE(ro.scores.size() == re.scores.size());
         for (int i = 0; i < N; ++i) {
@@ -330,7 +356,7 @@ void stream_sweep(int n) {
 
 } // namespace
 
-TEST_CASE("BatchEngine::align_stream == BatchAligner::align", "[batch_engine]") {
+TEST_CASE("BatchEngine::align_stream matches direct Aligners", "[batch_engine]") {
     stream_sweep<double, GapModel::Affine, AlignMode::Global>(30);
     stream_sweep<double, GapModel::Affine, AlignMode::Local>(30);
     stream_sweep<double, GapModel::Linear, AlignMode::Global>(30);
