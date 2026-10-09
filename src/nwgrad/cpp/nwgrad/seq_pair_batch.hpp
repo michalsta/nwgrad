@@ -208,8 +208,10 @@ public:
     void align_full() { e([&](auto& x) { x.score_and_grad_one(i_, true, true); }); }
     void realign_banded(int bandwidth) { e([&](auto& x) { x.banded_one(i_, bandwidth, true, true); }); }
     void compute_grad() { e([&](auto& x) { x.compute_grad_one(i_); }); }
-    std::pair<double, AlignParams> score_and_grad() {
-        e([&](auto& x) { x.score_and_grad_one(i_, true); });
+    std::pair<double, AlignParams> score_and_grad(bool keep_paths = true) {
+        e([&](auto& x) { x.score_and_grad_one(i_, keep_paths); });
+        if (grad_mode() == GradMode::None)
+            throw std::logic_error("nwgrad: grad_mode is None; construct with Hard or Soft to enable gradients");
         return {score(), grad()};
     }
     void drop_dp() { e([&](auto& x) { x.drop_path(i_); }); }

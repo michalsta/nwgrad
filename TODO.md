@@ -18,7 +18,8 @@ Removed the untyped batch state, per-add problem-type arguments, batch
 Batches now own one settings store in an engine selected at construction. Batch
 computations publish gradients immediately, with no batch-wide holding pass.
 The supported `SeqPair.align_full()` / `realign_banded()` still hold their gradients
-until `compute_grad()`, so their per-pair holding state remains. DiscrimAlign's
+until `compute_grad()`. That visibility is now derived from current scores and
+stored paths; the separate `kHeld` flag is removed. DiscrimAlign's
 ported API is tested from PR #16, rather than modifying the old consumer checkout.
 
 ## Default thread count (`n_threads=0`): physical cores are wrong for short pairs

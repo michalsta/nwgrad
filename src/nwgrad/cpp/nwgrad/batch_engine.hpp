@@ -141,7 +141,7 @@ public:
     void set_soft_temperature(double t) {
         s_.set_soft_temperature(t);
         if (grad_mode_ == GradMode::Soft)
-            for (auto& f : flags_) f &= static_cast<uint8_t>(~(kScore | kGrad | kHeld));
+            for (auto& f : flags_) f &= static_cast<uint8_t>(~(kScore | kGrad));
     }
     void set_soft_guide(bool lazy, bool posterior) noexcept { s_.set_soft_guide(lazy, posterior); }
     void set_sorted_schedule(bool v) noexcept { s_.sorted_schedule = v; }
@@ -317,7 +317,7 @@ public:
         const AlignParams* own = own_params_(params);
         for (auto& s : segs_) s.params = own;
         drop_unused_params_();
-        for (auto& f : flags_) f &= static_cast<uint8_t>(~(kScore | kGrad | kStored | kHeld));
+        for (auto& f : flags_) f &= static_cast<uint8_t>(~(kScore | kGrad | kStored));
     }
     // set_params for one pair's segment only (a single-pair batch: SeqPair).
     void set_params_segment(size_t seg, const AlignParams& params) {
@@ -329,7 +329,7 @@ public:
         drop_unused_params_();
         const size_t end = seg + 1 < segs_.size() ? segs_[seg + 1].begin : size();
         for (size_t i = segs_[seg].begin; i < end; ++i)
-            flags_[i] &= static_cast<uint8_t>(~(kScore | kGrad | kStored | kHeld));
+            flags_[i] &= static_cast<uint8_t>(~(kScore | kGrad | kStored));
     }
 
     // Full DP on every pair: score, guide and (unless grad_mode None) gradient, cached
@@ -376,27 +376,29 @@ public:
     void drop_paths() noexcept {
         std::vector<std::vector<uint32_t>>().swap(path_);
         std::vector<std::array<int, 2>>().swap(path_end_);
-        for (auto& f : flags_) f &= static_cast<uint8_t>(~(kStored | kHeld));
+        for (auto& f : flags_) f &= static_cast<uint8_t>(~kStored);
         solo_.reset();
     }
     void drop_path(size_t i) noexcept {
         if (i < path_.size()) { std::vector<uint32_t>().swap(path_[i]); }
-        flags_[i] &= static_cast<uint8_t>(~(kStored | kHeld));
+        flags_[i] &= static_cast<uint8_t>(~kStored);
         solo_.reset();
     }
 
     // One pair, on the calling thread (SeqPair's own operations).
     void score_and_grad_one(size_t i, bool keep_path, bool hold_grad = false) {
+        keep_path = keep_path || hold_grad;
         prepare_paths_(keep_path, /*all=*/false);
         run_full_(i, solo_work_(), keep_path);
-        if (hold_grad) hold_(i);
+        if (hold_grad) defer_grad_(i);
     }
     void banded_one(size_t i, int bandwidth, bool keep_path, bool hold_grad = false) {
+        keep_path = keep_path || hold_grad;
         if (!path_valid(i))
             throw std::logic_error("nwgrad: call align_full() before realign_banded()");
         prepare_paths_(keep_path, /*all=*/false);
         run_banded_(i, solo_work_(), bandwidth, keep_path);
-        if (hold_grad) hold_(i);
+        if (hold_grad) defer_grad_(i);
     }
     // SeqPair::compute_grad: release pair i's held gradient, with the old preconditions
     // and messages, in the old order.
@@ -404,13 +406,13 @@ public:
         if (grad_valid(i)) return;
         if (!score_valid(i))
             throw std::logic_error("nwgrad: call align_full() or realign_banded() first");
-        if (!(flags_[i] & kHeld) && !(grad_mode_ == GradMode::None && path_stored(i)))
+        if (!path_stored(i))
             throw std::logic_error(
                 "nwgrad: DP tables have been dropped; call align_full() or realign_banded() first");
         if (grad_mode_ == GradMode::None)
             throw std::logic_error(
                 "nwgrad: grad_mode is None; construct with Hard or Soft to enable gradients");
-        flags_[i] = static_cast<uint8_t>((flags_[i] & ~kHeld) | kGrad);
+        flags_[i] |= kGrad;
     }
 
     // The cached scores, in pair order.  Throws if any pair has none.
@@ -790,7 +792,6 @@ private:
         kPending = 8,      // lazy soft guide not computed yet
         kLastBanded = 16,  // the cached results came from a banded DP
         kStored = 32,      // path_ holds the current alignment
-        kHeld = 64,        // grad_ holds a gradient compute_grad() has not released yet
     };
     // gparams: the params the segment's PENDING guides belong to.  Null for the lazy soft
     // guide ("under the params current then"); set by score_only_() to the params it
@@ -1044,9 +1045,10 @@ private:
             score_[i] = al.score();
         }
     }
-    void hold_(size_t i) noexcept {
-        if (flags_[i] & kGrad) flags_[i] = static_cast<uint8_t>((flags_[i] & ~kGrad) | kHeld);
-    }
+    // An unpublished gradient needs no extra flag: a current score and stored path
+    // prove it was computed. Dropping the path or invalidating the score removes that
+    // evidence, so compute_grad_one() retains the supported pair lifecycle.
+    void defer_grad_(size_t i) noexcept { flags_[i] &= static_cast<uint8_t>(~kGrad); }
     void finish_(size_t i, bool banded, bool pending) {
         uint8_t f = flags_[i] & kStored;
         f |= kPath | kScore;

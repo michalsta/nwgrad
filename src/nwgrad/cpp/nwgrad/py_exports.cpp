@@ -326,9 +326,10 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
              "Banded DP centred on the current guide path, under the current params.")
         .def("compute_grad", &SP::compute_grad,
              "Release the gradient of the last align_full() / realign_banded().")
-        .def("score_and_grad", &SP::score_and_grad,
-             "align_full() then compute_grad().  Returns (score, AlignParams grad).\n"
-             "Raises if grad_mode is \"none\".")
+        .def("score_and_grad", &SP::score_and_grad, nb::arg("keep_paths") = true,
+             "Full DP with immediate gradient. Returns (score, AlignParams grad).\n"
+             "keep_paths=True preserves aligned()/coordinates() availability; False\n"
+             "skips storing the path. Raises if grad_mode is \"none\".")
         .def("drop_dp", &SP::drop_dp,
              "Free the stored path (aligned() raises until the next align).  Score,\n"
              "released gradient and guide_j remain valid.")
