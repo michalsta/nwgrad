@@ -38,7 +38,7 @@ def test_type_is_fixed_before_successful_add(suffix):
     gradients = batch.grads()
     total = batch.compute_grad().to_dict()
     batch.drop_paths()
-    assert batch[0].grad_valid and not batch[0].dp_valid
+    assert batch[0].grad_valid and not batch[0].stored_path_valid
     for before, after in zip(gradients, batch.grads()):
         np.testing.assert_array_equal(before, after)
     np.testing.assert_array_equal(total["matrix"], batch.compute_grad().to_dict()["matrix"])

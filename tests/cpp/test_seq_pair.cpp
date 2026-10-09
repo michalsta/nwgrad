@@ -58,7 +58,7 @@ TEST_CASE("SeqPair: linear/global score matches Aligner", "[seq_pair]") {
     auto p = asym_params(0.0, 1.5, 0.0, 0.5);   // asymmetric extend
     SeqPair sp(A, B, p, GapModel::Linear, AlignMode::Global, GradMode::None);
 
-    sp.align_full();
+    sp.align();
     REQUIRE(sp.score() ==
             Approx(aligner_score<GapModel::Linear, AlignMode::Global>(p, A, B)));
 }
@@ -67,7 +67,7 @@ TEST_CASE("SeqPair: linear/local score matches Aligner", "[seq_pair]") {
     auto p = asym_params(0.0, 1.5, 0.0, 0.5);
     SeqPair sp(A, B, p, GapModel::Linear, AlignMode::Local, GradMode::None);
 
-    sp.align_full();
+    sp.align();
     REQUIRE(sp.score() ==
             Approx(aligner_score<GapModel::Linear, AlignMode::Local>(p, A, B)));
 }
@@ -76,7 +76,7 @@ TEST_CASE("SeqPair: affine/global score matches Aligner", "[seq_pair]") {
     auto p = asym_params(4.0, 0.5, 1.5, 2.0);   // asymmetric open and extend
     SeqPair sp(A, B, p, GapModel::Affine, AlignMode::Global, GradMode::None);
 
-    sp.align_full();
+    sp.align();
     REQUIRE(sp.score() ==
             Approx(aligner_score<GapModel::Affine, AlignMode::Global>(p, A, B)));
 }
@@ -85,7 +85,7 @@ TEST_CASE("SeqPair: affine/local score matches Aligner", "[seq_pair]") {
     auto p = asym_params(4.0, 0.5, 1.5, 2.0);
     SeqPair sp(A, B, p, GapModel::Affine, AlignMode::Local, GradMode::None);
 
-    sp.align_full();
+    sp.align();
     REQUIRE(sp.score() ==
             Approx(aligner_score<GapModel::Affine, AlignMode::Local>(p, A, B)));
 }
@@ -99,7 +99,7 @@ TEST_CASE("SeqPair: accessors throw before anything is computed", "[seq_pair]") 
     REQUIRE_FALSE(sp.score_valid());
     REQUIRE_FALSE(sp.grad_valid());
     REQUIRE_FALSE(sp.path_valid());
-    REQUIRE_FALSE(sp.dp_valid());
+    REQUIRE_FALSE(sp.stored_path_valid());
 
     REQUIRE_THROWS_AS(sp.score(), std::logic_error);
     REQUIRE_THROWS_AS(sp.grad(),  std::logic_error);
@@ -110,7 +110,7 @@ TEST_CASE("SeqPair: align_full needs no alloc_dp", "[seq_pair]") {
     // alloc_dp() is kept only as a no-op for old callers.
     auto p = asym_params(4.0, 0.5, 1.5, 2.0);
     SeqPair sp(A, B, p, GapModel::Affine, AlignMode::Global, GradMode::Hard);
-    sp.align_full();
+    sp.align();
     REQUIRE(sp.score() == Approx(aligner_score<GapModel::Affine, AlignMode::Global>(p, A, B)));
 }
 
@@ -137,8 +137,8 @@ TEST_CASE("SeqPair: set_params invalidates the cached results", "[seq_pair]") {
     auto p = asym_params(4.0, 0.5, 1.5, 2.0);
     SeqPair sp(A, B, p, GapModel::Affine, AlignMode::Global, GradMode::Hard);
 
-    sp.align_full();
-    sp.compute_grad();
+    sp.align();
+
     const double first = sp.score();
 
     auto p2 = asym_params(1.0, 0.25, 1.0, 0.25);   // cheaper gaps
@@ -146,7 +146,7 @@ TEST_CASE("SeqPair: set_params invalidates the cached results", "[seq_pair]") {
     REQUIRE_FALSE(sp.score_valid());
     REQUIRE_FALSE(sp.grad_valid());
 
-    sp.align_full();
+    sp.align();
     REQUIRE(sp.score() ==
             Approx(aligner_score<GapModel::Affine, AlignMode::Global>(p2, A, B)));
     REQUIRE(sp.score() != Approx(first));           // the new params actually bit
@@ -177,7 +177,7 @@ TEST_CASE("SeqPair: aligned() strings reconstruct the sequences", "[seq_pair]") 
     auto p = asym_params(4.0, 0.5, 1.5, 2.0);
     SeqPair sp(A, B, p, GapModel::Affine, AlignMode::Global, GradMode::None);
 
-    sp.align_full();
+    sp.align();
 
     auto [ga, gb] = sp.aligned();
     REQUIRE(ga.size() == gb.size());
@@ -194,14 +194,13 @@ TEST_CASE("SeqPair: GradMode::Soft scores the log-partition function", "[seq_pai
 
     SeqPair soft(A, B, p, GapModel::Affine, AlignMode::Global, GradMode::Soft);
 
-    soft.align_full();
+    soft.align();
 
     // log Z sums over every alignment, so it is >= the single best score.
     const double viterbi =
         aligner_score<GapModel::Affine, AlignMode::Global>(p, A, B);
     REQUIRE(soft.score() >= Approx(viterbi));
 
-    soft.compute_grad();
     REQUIRE(soft.grad_valid());
     // Gap derivatives are negated expected counts: raising a penalty lowers the
     // score, so d(log Z)/d(gap penalty) can never be positive.
@@ -213,7 +212,7 @@ TEST_CASE("SeqPair: GradMode::None still scores but refuses a gradient", "[seq_p
     auto p = asym_params(4.0, 0.5, 1.5, 2.0);
     SeqPair sp(A, B, p, GapModel::Affine, AlignMode::Global, GradMode::None);
 
-    sp.align_full();
+    sp.align();
 
     REQUIRE(sp.score() ==
             Approx(aligner_score<GapModel::Affine, AlignMode::Global>(p, A, B)));
@@ -224,12 +223,12 @@ TEST_CASE("SeqPair: a wide band reproduces the full-DP score", "[seq_pair][bande
     auto p = asym_params(4.0, 0.5, 1.5, 2.0);
     SeqPair sp(A, B, p, GapModel::Affine, AlignMode::Global, GradMode::Hard);
 
-    sp.align_full();
+    sp.align();
     const double full = sp.score();
 
     // A band wider than both sequences cannot exclude any cell, so the banded
     // re-alignment must recover exactly the full-DP optimum.
-    sp.realign_banded(static_cast<int>(A.size() + B.size()));
+    sp.banded_align(static_cast<int>(A.size() + B.size()));
     REQUIRE(sp.score() == Approx(full));
 }
 
@@ -237,11 +236,11 @@ TEST_CASE("SeqPair: realign_banded picks up new params", "[seq_pair][banded]") {
     auto p = asym_params(4.0, 0.5, 1.5, 2.0);
     SeqPair sp(A, B, p, GapModel::Affine, AlignMode::Global, GradMode::Hard);
 
-    sp.align_full();
+    sp.align();
 
     auto p2 = asym_params(0.5, 0.25, 0.5, 0.25);
     sp.set_params(p2);
-    sp.realign_banded(static_cast<int>(A.size() + B.size()));
+    sp.banded_align(static_cast<int>(A.size() + B.size()));
 
     REQUIRE(sp.score() ==
             Approx(aligner_score<GapModel::Affine, AlignMode::Global>(p2, A, B)));
@@ -284,7 +283,7 @@ TEST_CASE("SeqPairBatch: full DP with stored paths matches per-pair alignment", 
     REQUIRE(total == Approx(expected));
     for (size_t i = 0; i < batch.size(); ++i) {
         REQUIRE(batch[i].score_valid());
-        REQUIRE(batch[i].dp_valid());
+        REQUIRE(batch[i].stored_path_valid());
         REQUIRE(batch[i].grad_valid());   // batch fills publish gradients immediately
     }
 }
@@ -350,7 +349,7 @@ TEST_CASE("SeqPairBatch: set_params then banded_grad", "[seq_pair_batch][banded]
     REQUIRE(total == Approx(expected));
 
     batch.drop_paths();
-    for (size_t i = 0; i < batch.size(); ++i) REQUIRE_FALSE(batch[i].dp_valid());
+    for (size_t i = 0; i < batch.size(); ++i) REQUIRE_FALSE(batch[i].stored_path_valid());
 }
 
 TEST_CASE("SeqPairBatch: an empty batch has no gradient", "[seq_pair_batch]") {
