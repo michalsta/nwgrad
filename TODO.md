@@ -126,9 +126,10 @@ performance work, none of it measured yet; the cost notes are estimates.
   three-state fused form 1.0-1.5x at 1 thread, 1.0-1.6x at 12; float32 Global ~neutral
   (0.95-1.16, lazy-F also updates D).  Left: (b) float32 on
   AVX-512 (W=16): lazy-F rounds make long Global pairs 0.89x `hirschberg_pmax` — consider a
-  W=8 (256-bit) float kernel there, or an opt-in prefix-max score; (c) the score kernels on
-  NEON/AVX-512 were verified before negative penalties entered the tests — rerun
-  `NWGRAD_SCORE_FUZZ=20000 nwgrad_tests "[score]"` on spot/solace; (d) inter-pair
+  W=8 (256-bit) float kernel there, or an opt-in prefix-max score; (c) rerun
+  `NWGRAD_SCORE_FUZZ=20000 nwgrad_tests "[score]"` on solace (AVX-512) with negative
+  penalties. NEON is verified on spot, 2026-10-09, candidate `e0e434b`: 800,392
+  assertions passed; see [release validation](docs/release-validation.md). (d) inter-pair
   eligibility for score only still uses the table-size cap (`inter_pair_fits`), which
   does not apply to one row — re-derive the crossover against the per-pair kernel.
 - **Hirschberg boundary states — FIXED 2026-10-09.**  Not float-specific: when the join
@@ -165,12 +166,14 @@ performance work, none of it measured yet; the cost notes are estimates.
   per process; mind cgroup v1 vs v2.
 
 Also open from the same work:
-- **Verify the unified affine walk (`walk_affine`, S3) on AVX-512 and NEON.** It was
-  differentially checked against the six old walkers on scalar/sse2/avx2 only (solace
-  and spot were off). The harness compiles the old `aligner.hpp` (from `5d97c38`) inside
+- **Verify the unified affine walk (`walk_affine`, S3) on AVX-512.** NEON is done:
+  spot, 2026-10-09, candidate `e0e434b`, 1.6M scalar/NEON comparison cases against
+  the six old walkers, zero differences. Solace is still unreachable. The harness
+  compiles the old `aligner.hpp` (from `5d97c38`) inside
   a namespace next to the new one — copy `aligner_simd.hpp` alongside it under another
   name with different content, or GCC's `#pragma once` (content + mtime) skips it.
-- **Release notes: B3 changes behaviour.** Batches and pairs own a copy of their params:
+- **Release notes: B3 changes behaviour — DOCUMENTED in `docs/api.md`.** Batches and
+  pairs own a copy of their params:
   an in-place change (`*=`, the gap/matrix setters) no longer reaches them — call
   `set_params()` — and the Python side no longer keeps the params object alive.
   DiscrimAlign is unaffected (it builds fresh params and calls `set_params()`).
