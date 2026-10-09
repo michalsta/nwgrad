@@ -24,12 +24,12 @@
 //
 // Every per-pair operation below is a port of the SeqPair method of the same name, in
 // the same order of Aligner calls: the per-pair results are bit-identical to the old
-// classes, which tests/cpp/test_batch_engine.cpp checks against them directly.
+// classes; tests/cpp/test_batch_engine.cpp checks them against raw Aligners.
 //
 // Params are per add_many() call: a SEGMENT of consecutive pairs shares one
 // AlignParams (and one Viterbi backend).  set_params() points every segment at the new
-// params.  Params are held by pointer; the caller keeps them alive (the Python binding
-// pins them).
+// params.  Params are owned copies, deduplicated by value, so callers can update or
+// release their originals without changing cached results.
 
 #include <algorithm>
 #include <array>
@@ -54,6 +54,7 @@
 #include "batch_result.hpp"
 #include "grad_mode.hpp"
 #include "parallel.hpp"
+#include "pair_api_compat.hpp"
 #include "simd_levels.hpp"
 
 // Every setting of a batch, its default and its validation, in one place. The engine
@@ -97,6 +98,7 @@ struct BatchSettings {
 
 template<class T, GapModel GM, AlignMode AM>
 class BatchEngine {
+    friend struct PairApiCompat;
 public:
     using DpBuffer = DpBufferT<T>;
     using FullAl   = Aligner<GM, AM, AlignBand::Full, T>;
@@ -241,13 +243,13 @@ public:
     double score(size_t i) const {
         if (!score_valid(i))
             throw std::logic_error(
-                "nwgrad: score not valid; call align_full() or realign_banded() first");
+                "nwgrad: score not valid; compute an alignment first");
         return score_[i];
     }
     // Pair i's gradient into `out` (same alphabet).
     void grad(size_t i, AlignParams& out) const {
         if (!grad_valid(i))
-            throw std::logic_error("nwgrad: gradient not computed; call score_and_grad() or banded_grad() first (a SeqPair.align_full() gradient needs compute_grad())");
+            throw std::logic_error("nwgrad: gradient not computed; call score_and_grad() or banded_grad() first");
         const double* g = grad_.data() + i * gstride();
         std::memcpy(out.matrix.data(), g, nn_ * sizeof(double));
         out.gap_open_a = g[nn_]; out.gap_extend_a = g[nn_ + 1];
@@ -258,7 +260,7 @@ public:
     // The cached guide (column after each row of A), resolving a pending lazy guide.
     std::vector<int> guide_j(size_t i) {
         if (!path_valid(i))
-            throw std::logic_error("nwgrad: alignment not computed; call align_full() first");
+            throw std::logic_error("nwgrad: alignment not computed; call align() first");
         if (guide_pending(i)) resolve_guide_(i, solo_work_());
         const int* g = guide_ptr_(i);
         return {g, g + len_a(i) + 1};
@@ -369,10 +371,8 @@ public:
         return sum_scores_();
     }
 
-    // Free the stored paths.  Scores, released gradients and guides stay; a held
-    // gradient goes with the path (as the old drop_dp() made compute_grad() throw).
-    // Both also free the single-pair DP buffer (solo_): it is only a cache, and drop_dp()
-    // promised to release DP memory.
+    // Free the stored paths.  Scores, published gradients and guides stay.
+    // Both also free the single-pair DP buffer (solo_), which is only a cache.
     void drop_paths() noexcept {
         std::vector<std::vector<uint32_t>>().swap(path_);
         std::vector<std::array<int, 2>>().swap(path_end_);
@@ -386,41 +386,22 @@ public:
     }
 
     // One pair, on the calling thread (SeqPair's own operations).
-    void score_and_grad_one(size_t i, bool keep_path, bool hold_grad = false) {
-        keep_path = keep_path || hold_grad;
+    void score_and_grad_one(size_t i, bool keep_path) {
         prepare_paths_(keep_path, /*all=*/false);
         run_full_(i, solo_work_(), keep_path);
-        if (hold_grad) defer_grad_(i);
     }
-    void banded_one(size_t i, int bandwidth, bool keep_path, bool hold_grad = false) {
-        keep_path = keep_path || hold_grad;
+    void banded_one(size_t i, int bandwidth, bool keep_path) {
         if (!path_valid(i))
-            throw std::logic_error("nwgrad: call align_full() before realign_banded()");
+            throw std::logic_error("nwgrad: call align() or score_and_grad() before banded_align()");
         prepare_paths_(keep_path, /*all=*/false);
         run_banded_(i, solo_work_(), bandwidth, keep_path);
-        if (hold_grad) defer_grad_(i);
     }
-    // SeqPair::compute_grad: release pair i's held gradient, with the old preconditions
-    // and messages, in the old order.
-    void compute_grad_one(size_t i) {
-        if (grad_valid(i)) return;
-        if (!score_valid(i))
-            throw std::logic_error("nwgrad: call align_full() or realign_banded() first");
-        if (!path_stored(i))
-            throw std::logic_error(
-                "nwgrad: DP tables have been dropped; call align_full() or realign_banded() first");
-        if (grad_mode_ == GradMode::None)
-            throw std::logic_error(
-                "nwgrad: grad_mode is None; construct with Hard or Soft to enable gradients");
-        flags_[i] |= kGrad;
-    }
-
     // The cached scores, in pair order.  Throws if any pair has none.
     std::vector<double> scores() const {
         for (size_t i = 0; i < size(); ++i)
             if (!score_valid(i))
                 throw std::logic_error(
-                    "nwgrad: score not valid; call align_full() or realign_banded() first");
+                    "nwgrad: score not valid; compute an alignment first");
         return score_;
     }
 
@@ -443,9 +424,9 @@ public:
     // sum).  Unlike the old per-thread completion-order merge, reproducible bit for bit.
     AlignParams compute_grad() {
         const Alphabet& alpha = alphabet();
-        // Pair views can still call the supported align_full()/compute_grad() API.
-        // Only those per-pair calls hold gradients; batch fills publish them directly.
-        for (size_t i = 0; i < size(); ++i) compute_grad_one(i);
+        // Temporary compatibility bridge for deferred results from old calls on views.
+        // Remove in 0.8; modern pair and batch fills publish gradients directly.
+        PairApiCompat::release_for_sum(*this);  // remove the 0.7 view bridge in 0.8
         return blocked_sum_(alpha, nullptr);
     }
     // The cached gradients as arrays: matrices[i*n*n ..] (row-major, alphabet order) and
@@ -885,10 +866,10 @@ private:
 
     void check_stored_(size_t i) const {
         if (!path_valid(i))
-            throw std::logic_error("nwgrad: alignment not computed; call align_full() first");
+            throw std::logic_error("nwgrad: alignment not computed; call align() first");
         if (!path_stored(i))
             throw std::logic_error(
-                "nwgrad: DP tables have been dropped; call align_full() or realign_banded() first");
+                "nwgrad: stored path unavailable; use align(keep_paths=True) or banded_align(keep_paths=True)");
     }
     std::pair<int, int> path_start_(size_t i) const {
         int x = path_end_[i][0], y = path_end_[i][1];
@@ -904,7 +885,7 @@ private:
             throw std::logic_error("nwgrad: grad_mode is None; construct with Hard or Soft to enable gradients");
         for (size_t i = 0; i < size(); ++i)
             if (!grad_valid(i))
-                throw std::logic_error("nwgrad: gradient not computed; call score_and_grad() or banded_grad() first (a SeqPair.align_full() gradient needs compute_grad())");
+                throw std::logic_error("nwgrad: gradient not computed; call score_and_grad() or banded_grad() first");
     }
     void prepare_paths_(bool keep, bool all = true) {
         if (!keep) {
@@ -981,7 +962,7 @@ private:
             band.set_soft_temperature(e.s_.soft_temperature);
         }
     };
-    // The calling thread's Work for single-pair operations (SeqPair's align_full() and
+    // The calling thread's Work for single-pair operations (SeqPair's align() and
     // friends), kept between calls: a fresh one per call re-allocated the DP tables
     // every time, which the pre-0.6 SeqPair (pair-owned tables) did not — measured
     // 4-10 % per repeated call.  Same thread-safety as SeqPair had: one caller at a time.
@@ -1045,10 +1026,7 @@ private:
             score_[i] = al.score();
         }
     }
-    // An unpublished gradient needs no extra flag: a current score and stored path
-    // prove it was computed. Dropping the path or invalidating the score removes that
-    // evidence, so compute_grad_one() retains the supported pair lifecycle.
-    void defer_grad_(size_t i) noexcept { flags_[i] &= static_cast<uint8_t>(~kGrad); }
+    // Modern fills publish all computed results together.
     void finish_(size_t i, bool banded, bool pending) {
         uint8_t f = flags_[i] & kStored;
         f |= kPath | kScore;

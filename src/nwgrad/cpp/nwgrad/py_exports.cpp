@@ -18,6 +18,14 @@
 
 namespace nb = nanobind;
 
+// Temporary 0.7 deprecations. Warn before mutation so warnings-as-errors is safe.
+static void warn_pair_api(const char* old_name, const char* replacement) {
+    const std::string message = std::string("SeqPair.") + old_name +
+        " is deprecated in nwgrad 0.7.0 and will be removed in 0.8.0; use " + replacement;
+    if (PyErr_WarnEx(PyExc_DeprecationWarning, message.c_str(), 1) < 0)
+        throw nb::python_error();
+}
+
 void bind_logistic(nb::module_& parent);   // logistic/py_logistic.cpp
 using nb_arr_f64    = nb::ndarray<double, nb::ndim<2>, nb::c_contig, nb::device::cpu>;
 using nb_arr_f64_1d = nb::ndarray<nb::numpy, double, nb::ndim<1>>;
@@ -318,21 +326,36 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
             nb::arg("params"),
             "Swap alignment parameters (a standalone pair; a batch's pair takes the\n"
             "batch's set_params).  Invalidates the score, gradient and stored path\n"
-            "(aligned() raises until the next align); guide_j is kept for realign_banded().")
-        .def("align_full", &SP::align_full,
-             "Full DP: score, guide and stored path.  The gradient is computed but held:\n"
-             "compute_grad() releases it.")
-        .def("realign_banded", &SP::realign_banded, nb::arg("bandwidth"),
-             "Banded DP centred on the current guide path, under the current params.")
-        .def("compute_grad", &SP::compute_grad,
-             "Release the gradient of the last align_full() / realign_banded().")
+            "(aligned() raises until the next align); guide_j is kept for banded_align().")
+        .def("align", &SP::align, nb::arg("keep_paths") = true,
+             "Full computation. Returns the score and publishes the configured gradient\n"
+             "immediately (grad is None in none mode). Stores the path by default.")
+        .def("banded_align", &SP::banded_align, nb::arg("bandwidth"),
+             nb::arg("keep_paths") = true,
+             "Compute around the cached guide. Returns the score and publishes the\n"
+             "configured gradient immediately. Requires an established guide.")
         .def("score_and_grad", &SP::score_and_grad, nb::arg("keep_paths") = true,
              "Full DP with immediate gradient. Returns (score, AlignParams grad).\n"
              "keep_paths=True preserves aligned()/coordinates() availability; False\n"
              "skips storing the path. Raises if grad_mode is \"none\".")
-        .def("drop_dp", &SP::drop_dp,
-             "Free the stored path (aligned() raises until the next align).  Score,\n"
-             "released gradient and guide_j remain valid.")
+        .def("drop_paths", &SP::drop_paths,
+             "Free the stored path and reusable scratch memory; scores, gradients and guides survive.")
+        .def("align_full", [](SP& s) {
+            warn_pair_api("align_full()", "align() or score_and_grad()");
+            PairApiCompat::full(s);
+        }, "Deprecated in 0.7; removed in 0.8. Stores paths and defers gradient visibility.")
+        .def("realign_banded", [](SP& s, int bandwidth) {
+            warn_pair_api("realign_banded()", "banded_align()");
+            PairApiCompat::banded(s, bandwidth);
+        }, nb::arg("bandwidth"), "Deprecated in 0.7; removed in 0.8. Defers gradient visibility.")
+        .def("compute_grad", [](SP& s) {
+            warn_pair_api("compute_grad()", "grad after align() or banded_align()");
+            PairApiCompat::publish(s);
+        }, "Deprecated in 0.7; removed in 0.8. Releases a deferred cached gradient.")
+        .def("drop_dp", [](SP& s) {
+            warn_pair_api("drop_dp()", "drop_paths()");
+            s.drop_paths();
+        }, "Deprecated in 0.7; removed in 0.8. Use drop_paths().")
         .def("aligned", &SP::aligned,
              "Return the alignment as a pair of gapped strings (seq_a, seq_b).")
         .def(
@@ -388,8 +411,12 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
         .def_prop_ro("path_valid",  &SP::path_valid)
         .def_prop_ro("score_valid", &SP::score_valid)
         .def_prop_ro("grad_valid",  &SP::grad_valid)
-        .def_prop_ro("dp_valid",    &SP::dp_valid,
+        .def_prop_ro("stored_path_valid", &SP::stored_path_valid,
                      "Whether a stored path is available (aligned(), coordinates()).")
+        .def_prop_ro("dp_valid", [](const SP& s) {
+            warn_pair_api("dp_valid", "stored_path_valid");
+            return s.stored_path_valid();
+        }, "Deprecated in 0.7; removed in 0.8. Use stored_path_valid.")
         .def_prop_rw(
             "hb_cutoff",
             [](const SP& s) { return s.hb_cutoff(); },

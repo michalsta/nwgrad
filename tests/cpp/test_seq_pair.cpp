@@ -1,3 +1,4 @@
+// Contains deprecated pair lifecycle regressions; remove compatibility cases in 0.8.
 // SeqPair and SeqPairBatch.
 //
 // These two headers were never instantiated by the C++ test binary — they were
@@ -438,4 +439,40 @@ TEST_CASE("SeqPairBatch: scheduling knobs set on the batch reach the engine", "[
     batch.set_profile(true);
     batch.score_and_grad();
     REQUIRE_FALSE(batch.profile_out().empty());
+}
+
+// Modern API regressions remain when compatibility tests above are removed.
+template<class T>
+static void modern_pair_api() {
+    const auto p = asym_params(4.0, 0.5, 1.5, 2.0);
+    for (auto gd : {GradMode::Hard, GradMode::Soft, GradMode::None}) {
+        SeqPairT<T> sp(A, B, p, GapModel::Affine, AlignMode::Global, gd);
+        const double computed_score = sp.align(false);
+        REQUIRE(computed_score == sp.score());
+        REQUIRE(sp.score_valid());
+        REQUIRE(sp.path_valid());
+        REQUIRE_FALSE(sp.stored_path_valid());
+        REQUIRE(sp.grad_valid() == (gd != GradMode::None));
+        const auto initial = sp.score();
+        sp.drop_paths();
+        REQUIRE(sp.score_valid());
+        REQUIRE(sp.grad_valid() == (gd != GradMode::None));
+        sp.set_params(p);
+        REQUIRE_FALSE(sp.score_valid());
+        REQUIRE_FALSE(sp.grad_valid());
+        REQUIRE(sp.banded_align(100) == Approx(initial));
+        REQUIRE(sp.stored_path_valid());
+        REQUIRE(sp.grad_valid() == (gd != GradMode::None));
+        SeqPairBatchT<T> batch(GapModel::Affine, AlignMode::Global, gd, 1);
+        batch.add_many({A, B}, {B, A}, p);
+        auto first = batch[0];
+        REQUIRE(first.align(false) == Approx(initial));
+        REQUIRE_FALSE(batch[1].score_valid());
+        REQUIRE(first.grad_valid() == (gd != GradMode::None));
+    }
+}
+
+TEST_CASE("SeqPair: final API publishes results and stores paths independently", "[seq_pair][modern_api]") {
+    modern_pair_api<float>();
+    modern_pair_api<double>();
 }

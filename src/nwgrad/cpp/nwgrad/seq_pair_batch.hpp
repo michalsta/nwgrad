@@ -203,18 +203,30 @@ public:
     size_t index() const noexcept { return i_; }
 
     // ── Alignment (on the calling thread) ────────────────────────────────────
-    // align_full(): full DP, score and stored path; the gradient is held until
-    // compute_grad() (as the pre-0.6 SeqPair, which derived it from retained tables).
-    void align_full() { e([&](auto& x) { x.score_and_grad_one(i_, true, true); }); }
-    void realign_banded(int bandwidth) { e([&](auto& x) { x.banded_one(i_, bandwidth, true, true); }); }
-    void compute_grad() { e([&](auto& x) { x.compute_grad_one(i_); }); }
-    std::pair<double, AlignParams> score_and_grad(bool keep_paths = true) {
+    double align(bool keep_paths = true) {
         e([&](auto& x) { x.score_and_grad_one(i_, keep_paths); });
+        return score();
+    }
+    double banded_align(int bandwidth, bool keep_paths = true) {
+        e([&](auto& x) { x.banded_one(i_, bandwidth, keep_paths); });
+        return score();
+    }
+    std::pair<double, AlignParams> score_and_grad(bool keep_paths = true) {
+        align(keep_paths);
         if (grad_mode() == GradMode::None)
             throw std::logic_error("nwgrad: grad_mode is None; construct with Hard or Soft to enable gradients");
         return {score(), grad()};
     }
-    void drop_dp() { e([&](auto& x) { x.drop_path(i_); }); }
+    void drop_paths() { e([&](auto& x) { x.drop_path(i_); }); }
+
+    [[deprecated("use align(); removed in nwgrad 0.8.0")]]
+    void align_full() { PairApiCompat::full(*this); }
+    [[deprecated("use banded_align(); removed in nwgrad 0.8.0")]]
+    void realign_banded(int bandwidth) { PairApiCompat::banded(*this, bandwidth); }
+    [[deprecated("read grad after align(); removed in nwgrad 0.8.0")]]
+    void compute_grad() { PairApiCompat::publish(*this); }
+    [[deprecated("use drop_paths(); removed in nwgrad 0.8.0")]]
+    void drop_dp() { drop_paths(); }
 
     // ── Results ──────────────────────────────────────────────────────────────
     double score() const { return ce([&](const auto& x) { return x.score(i_); }); }
@@ -229,7 +241,9 @@ public:
     bool path_valid()  const { return ce([&](const auto& x) { return x.path_valid(i_); }); }
     bool score_valid() const { return ce([&](const auto& x) { return x.score_valid(i_); }); }
     bool grad_valid()  const { return ce([&](const auto& x) { return x.grad_valid(i_); }); }
-    bool dp_valid()    const { return ce([&](const auto& x) { return x.path_stored(i_); }); }
+    bool stored_path_valid() const { return ce([&](const auto& x) { return x.path_stored(i_); }); }
+    [[deprecated("use stored_path_valid(); removed in nwgrad 0.8.0")]]
+    bool dp_valid() const { return stored_path_valid(); }
     std::string seq_a() const { return ce([&](const auto& x) { return x.seq_a(i_); }); }
     std::string seq_b() const { return ce([&](const auto& x) { return x.seq_b(i_); }); }
     size_t len_a() const { return ce([&](const auto& x) { return x.len_a(i_); }); }
