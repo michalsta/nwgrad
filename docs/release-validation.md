@@ -44,6 +44,43 @@ empty sequences, ties and non-representable gap costs. Scores, aligned strings,
 index paths, guides and both gradient consumers matched, as did 29,408 rejected
 cases. The harness and logs remain under the isolated directory above.
 
+## Removal of the API deprecated in 0.6.0
+
+Checked on the local x86 host on 2026-10-09 against `389a5ac`, GCC 16.2.1,
+Python 3.14.7, SSE2 runtime dispatch. The untyped batch state and deprecated
+wrappers are removed; supported pair methods still preserve their gradient
+lifecycle. In this build, `sizeof(SeqPairBatch)` fell from 832 to 752 bytes;
+`sizeof(SeqPair)` remains 24 bytes. This measures object size, not throughput.
+
+| Check | Result |
+|---|---|
+| C++ Debug suite | 10/10 CTest groups passed |
+| Python suite, default backend | 2,692 passed, 9 skipped |
+| Python suite, forced scalar fallback | 2,692 passed, 9 skipped |
+| Full C++ suite and header-only consumer, ASan/UBSan | Both passed |
+| DiscrimAlign PR #16 fast tests | 1,145 passed, 31 deselected, 1 expected failure |
+| DiscrimAlign PR #16 before/after acceptance fits | 16/16 result fingerprints and final log likelihoods identical |
+
+The consumer checkout was a detached worktree of
+[DiscrimAlign PR #16](https://github.com/BioGeMT/DiscrimAlign/pull/16), commit
+`778c7a74c6b1b75272c5e7c3b9b9a829d08c1452`, at
+`/tmp/discrimalign-pr16-api`; its source was not modified. Its fast test command
+was `pytest tests -q -m 'not slow' --ignore=tests/test_mirbench.py`.
+
+The acceptance matrix used 3,000 Manakov pairs (sample seed 7), four problem
+types (local/affine/general, global/affine/symmetric, local/linear/simple,
+global/linear/general), striped/interpair fills, and returned alignments on/off.
+Each fit ran six iterations, eight threads, and constant step size 5e-4. The
+same PR source and fixtures ran before and after the API removal. The PR predates
+the optimizer-portfolio branch, so the old optimizer-specific acceptance harness
+was adapted to these 16 configurations supported by the PR. Exact fingerprints
+covered all returned fields, including learned parameters, scores and paths.
+
+Logs and comparison results remain under `/tmp/nwgrad-api-*`,
+`/tmp/discrimalign-pr16-tests.log`, and `/tmp/nwgrad-pr16-{before,after}.json`.
+The preceding NEON results describe their explicitly named earlier candidate;
+this API-removal validation is local.
+
 ## Remaining release checks
 
 - Run the corresponding extended score fuzz and old-walker comparison on AVX-512.
