@@ -81,6 +81,64 @@ Logs and comparison results remain under `/tmp/nwgrad-api-*`,
 The preceding NEON results describe their explicitly named earlier candidate;
 this API-removal validation is local.
 
+## Follow-up cleanup and optional pair paths
+
+Checked locally on 2026-10-09 with GCC 16.2.1, Python 3.14.7 and SSE2 runtime
+dispatch. Changes are recorded in `579462e`, `0559df0`, `ac3fd56`, `cc10315`
+and `01a32eb`.
+
+Setter plumbing now shares one macro and Python parameter setters take typed
+references. The 2,441 lines of frozen legacy batch headers were replaced by
+references computed directly through `Aligner`, retaining 192 stored-batch and
+240 streaming configurations. The focused batch regressions passed 1,464,239
+assertions.
+
+`SeqPair.score_and_grad(keep_paths=False)` skips stored alignment paths; the
+default remains `True`. The separate held-gradient flag is removed. Deferred
+gradient visibility is derived from existing score, path and gradient validity
+flags, preserving the supported pair lifecycle. A failed scoring fill now
+invalidates cached results before it can leave a partial path behind. Twelve
+regressions cover recovery after failed full/banded soft fills.
+
+| Check | Result |
+|---|---|
+| C++ Debug suite | 10/10 CTest groups passed |
+| Python suite, default backend | 2,756 passed, 9 skipped |
+| Python suite, forced scalar fallback | 2,756 passed, 9 skipped |
+| Full C++ suite and header-only consumer, ASan/UBSan | Both passed |
+| DiscrimAlign PR #16 acceptance fits against the pre-removal baseline | 16/16 result fingerprints and final log likelihoods identical |
+
+The same unmodified PR #16 checkout and acceptance fixtures described above
+were used. Final results are in `/tmp/nwgrad-pr16-followup-final.json`; test
+logs are `/tmp/nwgrad-followup-{ctest,python,python-scalar,san-tests}-final.log`.
+These follow-up checks were local; the earlier NEON validation is unchanged.
+
+Path-storage timing used one installed binary, CPU affinity, seven alternating
+trials and two identical path-enabled control arms. Ratios below are elapsed
+time without paths divided by time with paths; the control compares the two
+path-enabled arms. A control away from 1 indicates timing drift.
+
+| Gradient | Length | Operation | Without/with paths | Control |
+|---|---|---|---|---|
+| Hard | 50 | Reuse pair | 0.962 | 1.008 |
+| Hard | 50 | Construct and align | 0.947 | 0.939 |
+| Hard | 200 | Reuse pair | 0.967 | 1.025 |
+| Hard | 200 | Construct and align | 0.866 | 0.860 |
+| Soft | 50 | Reuse pair | 0.970 | 1.038 |
+| Soft | 50 | Construct and align | 0.976 | 1.035 |
+| Soft | 200 | Reuse pair | 0.962 | 0.995 |
+| Soft | 200 | Construct and align | 0.978 | 0.981 |
+
+The hard length-50 and soft length-200 reuse fixtures show about 4% less time
+with stable controls. Other measurements do not establish a gain above noise;
+these results do not support a general throughput claim. Raw measurements are
+in `/tmp/nwgrad-followup-path-bench-pinned.jsonl`. The committed benchmark
+provides the same three-arm comparison with calibrated repeat counts:
+
+```bash
+python tools/bench_pair_paths.py --seq-len 50 200 --cpu 0
+```
+
 ## Remaining release checks
 
 - Run the corresponding extended score fuzz and old-walker comparison on AVX-512.
