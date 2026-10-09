@@ -125,7 +125,7 @@ TEST_CASE("add_many: owned pairs support the full SeqPair lifecycle", "[add_many
     batch.score_and_grad(/*keep_paths=*/true);
     for (size_t i = 0; i < batch.size(); ++i) {
         REQUIRE(batch[i].path_valid());
-        REQUIRE(batch[i].dp_valid());
+        REQUIRE(batch[i].stored_path_valid());
         auto [aa, bb] = batch[i].aligned();
         REQUIRE(aa.size() == bb.size());
     }
@@ -133,7 +133,7 @@ TEST_CASE("add_many: owned pairs support the full SeqPair lifecycle", "[add_many
     batch.banded_grad(8, /*keep_paths=*/true);
     batch.drop_paths();
     for (size_t i = 0; i < batch.size(); ++i)
-        REQUIRE_FALSE(batch[i].dp_valid());
+        REQUIRE_FALSE(batch[i].stored_path_valid());
 }
 
 TEST_CASE("add_many: a batch holds one problem type", "[add_many]") {

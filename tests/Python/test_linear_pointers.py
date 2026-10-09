@@ -37,8 +37,7 @@ def _seqs(n, lo, hi, seed):
 
 def _pair(cls, a, b, p, mode, tb):
     sp = cls(a, b, p, gap_model="linear", mode=mode, grad_mode="hard", traceback=tb)
-    sp.align_full()
-    sp.compute_grad()
+    sp.align()
     g = sp.grad
     return (sp.score, sp.aligned(), list(sp.guide_j), np.asarray(g.matrix.to_matrix()),
             (g.gap_extend_a, g.gap_extend_b))
@@ -88,6 +87,6 @@ def test_auto_switches_fill_by_size_same_path(mode):
         out = []
         for tb in ("auto", "pointers", "scores"):
             sp = nwgrad.SeqPairDouble(a, b, p, gap_model="linear", mode=mode, traceback=tb)
-            sp.align_full()
+            sp.align()
             out.append((sp.score, sp.aligned(), list(sp.guide_j)))
         assert out[0] == out[1] == out[2]

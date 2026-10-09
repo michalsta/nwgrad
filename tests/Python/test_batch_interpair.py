@@ -94,7 +94,7 @@ def test_guided_matches(prec):
     sp = [nwgrad.SeqPairDouble(a, b, p, gap_model="affine", mode="global") for a, b in zip(A, B)]
     al = []
     for s in sp:
-        s.align_full(); al.append(s.aligned())
+        s.align(); al.append(s.aligned())
     aligned = ([x[0] for x in al], [x[1] for x in al])
     for band in (0, 3):
         r0 = _align(prec, p, "affine", "global", "hard", A, B, "striped", band=band, aligned=aligned)
@@ -164,7 +164,7 @@ def test_global_banded_guide_ending_short_of_n(prec, fill, band):
     sp = [nwgrad.SeqPairDouble(x, b, p, gap_model="affine", mode="global") for x in A]
     al = []
     for s in sp:
-        s.align_full(); al.append(s.aligned())
+        s.align(); al.append(s.aligned())
     al[-1] = ("ACGTACGTAC-------", b)
     ba = CLS[prec](p, band=band, gap_model="affine", mode="global", n_threads=1)
     ba.fill = fill

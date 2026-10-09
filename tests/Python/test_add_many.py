@@ -77,9 +77,7 @@ class HandBatch:
     def score_and_grad(self):
         total = 0.0
         for sp in self.pairs:
-            sp.align_full()
-            if self.gd != "none":
-                sp.compute_grad()
+            sp.align()
             total += sp.score
         return total
 
@@ -172,7 +170,7 @@ def test_full_seqpair_lifecycle_on_owned_pairs():
     assert total == pytest.approx(sum(batch[i].score for i in range(len(batch))))
 
     for i in range(len(batch)):
-        assert batch[i].path_valid and batch[i].score_valid and batch[i].dp_valid
+        assert batch[i].path_valid and batch[i].score_valid and batch[i].stored_path_valid
         a_al, b_al = batch[i].aligned()
         assert len(a_al) == len(b_al)
 
@@ -182,7 +180,7 @@ def test_full_seqpair_lifecycle_on_owned_pairs():
     batch.banded_grad(8, keep_paths=True)
     batch.drop_paths()
     for i in range(len(batch)):
-        assert not batch[i].dp_valid
+        assert not batch[i].stored_path_valid
 
 
 def test_set_params_after_add_many():

@@ -135,7 +135,7 @@ def test_a_penalties_suppress_gaps_in_a(matrix):
     a, b = "AC", "ACGTGT"  # b is longer, so alignment needs gaps in a
     cheap = nwgrad.SeqPair(a, b, params(matrix, 0.5, 0.5, 20.0, 20.0),
                            gap_model="affine", mode="global", grad_mode="none")
-    cheap.align_full()
+    cheap.align()
     aligned_a, _ = cheap.aligned()
     assert "-" in aligned_a  # gaps land in a, which is where they are cheap
 
@@ -144,7 +144,7 @@ def test_b_penalties_suppress_gaps_in_b(matrix):
     a, b = "ACGTGT", "AC"  # mirror image: now a is longer
     cheap = nwgrad.SeqPair(a, b, params(matrix, 20.0, 20.0, 0.5, 0.5),
                            gap_model="affine", mode="global", grad_mode="none")
-    cheap.align_full()
+    cheap.align()
     _, aligned_b = cheap.aligned()
     assert "-" in aligned_b
 
@@ -289,7 +289,7 @@ def test_seq_pair_agrees_with_single_pair_functions(matrix, mode, gap_model, gra
     p = params(matrix, 4.0, 0.5, 1.5, 2.0)  # deliberately lopsided
 
     sp = nwgrad.SeqPair(a, b, p, gap_model=gap_model, mode=mode, grad_mode=grad_mode)
-    sp.align_full()
+    sp.align()
 
     fn = {
         ("global", "linear"): nwgrad.nw_score, ("local", "linear"): nwgrad.sw_score,

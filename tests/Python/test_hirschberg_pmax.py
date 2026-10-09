@@ -86,8 +86,7 @@ def _pair(a, b, p, tb, cutoff=None, kernel="auto", dtype="double", mode="global"
              traceback=tb, kernel=kernel)
     if cutoff is not None and tb.startswith("hirschberg"):
         sp.hb_cutoff = cutoff
-    sp.align_full()
-    sp.compute_grad()
+    sp.align()
     return sp
 
 
@@ -203,7 +202,7 @@ def test_linear_gap_model_runs_the_exact_sweep(params):
             sp = nwgrad.SeqPairDouble(a, b, params, gap_model="linear", mode="global",
                                       grad_mode="hard", traceback=tb)
             sp.hb_cutoff = 8
-            sp.align_full()
+            sp.align()
             out[tb] = (sp.score, sp.aligned())
         assert out["hirschberg_pmax"] == out["hirschberg"]
         assert out["hirschberg"][0] == pytest.approx(out["pointers"][0], rel=1e-12, abs=1e-9)

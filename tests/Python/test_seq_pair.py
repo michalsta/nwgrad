@@ -1,3 +1,4 @@
+# This file includes compatibility lifecycle regressions for removal in 0.8.
 """Tests for SeqPair and SeqPairBatch, comparing against single-pair and
 streaming (SeqPairBatch.align, formerly BatchAligner) APIs.
 
@@ -112,7 +113,7 @@ class TestPairAllocation:
 
     def test_align_full_without_alloc_works(self, blosum):
         sp = nwgrad.SeqPair("ACDE", "ACDE", blosum)
-        sp.align_full()
+        sp.align()
         assert sp.score_valid
 
     def test_realign_banded_after_drop_dp_reallocates(self, blosum):
@@ -124,7 +125,7 @@ class TestPairAllocation:
 
     def test_align_full_allocates_on_demand(self, blosum):
         sp = nwgrad.SeqPair("ACDE", "ACDE", blosum)
-        sp.align_full()
+        sp.align()
         assert sp.score_valid
 
 # ── SeqPair: align_full score ─────────────────────────────────────────────────
@@ -135,7 +136,7 @@ class TestSeqPairScore:
     def test_align_full_score_matches_ref(self, a, b, gap_model, mode, gap_open, gap_extend):
         p = make_params(gap_extend, gap_open)
         sp = nwgrad.SeqPair(a, b, p, gap_model=gap_model, mode=mode, grad_mode="none")
-        sp.align_full()
+        sp.align()
         expected = ref_score(a, b, gap_model, mode, gap_open, gap_extend)
         assert sp.score == pytest.approx(expected), (
             f"{gap_model}/{mode} pair ({a!r},{b!r}): got {sp.score}, expected {expected}"
@@ -148,7 +149,7 @@ class TestSeqPairScore:
     def test_score_valid_after_align(self, blosum):
         sp = nwgrad.SeqPair("ACDE", "ACDE", blosum)
         assert not sp.score_valid
-        sp.align_full()
+        sp.align()
         assert sp.score_valid
 
 
@@ -160,8 +161,7 @@ class TestSeqPairHardGrad:
     def test_hard_grad_matches_ref(self, a, b, gap_model, mode, gap_open, gap_extend):
         p = make_params(gap_extend, gap_open)
         sp = nwgrad.SeqPair(a, b, p, gap_model=gap_model, mode=mode, grad_mode="hard")
-        sp.align_full()
-        sp.compute_grad()
+        sp.align()
 
         exp_score, exp_g = ref_hard_grad(a, b, gap_model, mode, gap_open, gap_extend)
 
@@ -185,8 +185,7 @@ class TestSeqPairHardGrad:
 
     def test_grad_shape(self, blosum):
         sp = nwgrad.SeqPair("ACDE", "ACDE", blosum)
-        sp.align_full()
-        sp.compute_grad()
+        sp.align()
         assert grad_matrix(sp.grad).shape == (20, 20)
 
 
@@ -198,8 +197,7 @@ class TestSeqPairSoftGrad:
     def test_soft_score_and_grad_match_ref(self, a, b, gap_model, mode, gap_open, gap_extend):
         p = make_params(gap_extend, gap_open)
         sp = nwgrad.SeqPair(a, b, p, gap_model=gap_model, mode=mode, grad_mode="soft")
-        sp.align_full()
-        sp.compute_grad()
+        sp.align()
 
         exp_score, exp_g = ref_soft_grad(a, b, gap_model, mode, gap_open, gap_extend)
 
@@ -222,11 +220,11 @@ class TestSeqPairBanded:
             self, a, b, gap_model, mode, gap_open, gap_extend):
         p = make_params(gap_extend, gap_open)
         sp = nwgrad.SeqPair(a, b, p, gap_model=gap_model, mode=mode, grad_mode="hard")
-        sp.align_full()
+        sp.align()
         full_score = sp.score
 
         bw = max(len(a), len(b)) + 5
-        sp.realign_banded(bw)
+        sp.banded_align(bw)
         assert sp.score == pytest.approx(full_score, rel=1e-10), (
             f"realign_banded(wide) score mismatch for {gap_model}/{mode} ({a!r},{b!r})"
         )
@@ -237,13 +235,11 @@ class TestSeqPairBanded:
             self, a, b, gap_model, mode, gap_open, gap_extend):
         p = make_params(gap_extend, gap_open)
         sp = nwgrad.SeqPair(a, b, p, gap_model=gap_model, mode=mode, grad_mode="hard")
-        sp.align_full()
-        sp.compute_grad()
+        sp.align()
         full_grad = grad_matrix(sp.grad).copy()
 
         bw = max(len(a), len(b)) + 5
-        sp.realign_banded(bw)
-        sp.compute_grad()
+        sp.banded_align(bw)
         np.testing.assert_allclose(
             grad_matrix(sp.grad), full_grad, atol=1e-12,
             err_msg=f"realign_banded grad mismatch for {gap_model}/{mode} ({a!r},{b!r})"
@@ -251,8 +247,8 @@ class TestSeqPairBanded:
 
     def test_realign_banded_requires_path(self, blosum):
         sp = nwgrad.SeqPair("ACDE", "ACDE", blosum)
-        with pytest.raises(Exception, match="align_full"):
-            sp.realign_banded(5)
+        with pytest.raises(Exception, match="align.*banded_align"):
+            sp.banded_align(5)
 
     def test_realign_banded_clears_grad_valid(self, blosum):
         sp = nwgrad.SeqPair("ACDE", "ACDE", blosum)
@@ -264,8 +260,8 @@ class TestSeqPairBanded:
 
     def test_realign_banded_sets_score_valid(self, blosum):
         sp = nwgrad.SeqPair("ACDE", "ACDE", blosum)
-        sp.align_full()
-        sp.realign_banded(10)
+        sp.align()
+        sp.banded_align(10)
         assert sp.score_valid
 
 
@@ -293,8 +289,7 @@ class TestSeqPairStateMachine:
 
     def test_set_params_preserves_path_clears_score_and_grad(self, blosum, blosum2):
         sp = nwgrad.SeqPair("ACDE", "ACDE", blosum)
-        sp.align_full()
-        sp.compute_grad()
+        sp.align()
         sp.set_params(blosum2)
         assert sp.path_valid
         assert not sp.score_valid
@@ -302,17 +297,17 @@ class TestSeqPairStateMachine:
 
     def test_set_params_allows_realign_banded(self, blosum, blosum2):
         sp = nwgrad.SeqPair("ACDE", "ACDE", blosum)
-        sp.align_full()
+        sp.align()
         sp.set_params(blosum2)
-        sp.realign_banded(10)
+        sp.banded_align(10)
         assert sp.score_valid
 
     def test_set_params_score_updates_after_realign(self, blosum, blosum2):
         sp = nwgrad.SeqPair("ACDE", "ACDE", blosum)
-        sp.align_full()
+        sp.align()
         score1 = sp.score
         sp.set_params(blosum2)
-        sp.realign_banded(50)
+        sp.banded_align(50)
         score2 = sp.score
         assert score2 != pytest.approx(score1)
 
@@ -333,14 +328,14 @@ class TestSeqPairStateMachine:
 
     def test_guide_j_set_after_align(self, blosum):
         sp = nwgrad.SeqPair("ACDE", "ACDE", blosum)
-        sp.align_full()
+        sp.align()
         gj = sp.guide_j
         assert gj is not None
         assert len(gj) == len("ACDE") + 1
 
     def test_guide_j_preserved_after_set_params(self, blosum, blosum2):
         sp = nwgrad.SeqPair("ACDE", "ACDE", blosum)
-        sp.align_full()
+        sp.align()
         gj_before = list(sp.guide_j)
         sp.set_params(blosum2)
         assert list(sp.guide_j) == gj_before
@@ -456,16 +451,6 @@ class TestSeqPairBatchThreading:
         totalm = bm.score_and_grad(keep_paths=True)
 
         assert totalm == pytest.approx(total1, rel=1e-10)
-
-    @pytest.mark.parametrize("n_threads", [2, 4])
-    def test_compute_grad_multithread_matches_single(self, n_threads):
-        def make_batch(nt):
-            p = make_params(1.0, 11.0)
-            b = nwgrad.SeqPairBatch(n_threads=nt, gap_model="affine", mode="global",
-                                      grad_mode="hard")
-            b.add_many([x for x, _ in PAIRS * 3], [y for _, y in PAIRS * 3], p)
-            return b
-
         b1 = make_batch(1)
         bm = make_batch(n_threads)
         b1.score_and_grad(keep_paths=True)
@@ -521,7 +506,7 @@ class TestScoreAndGrad:
         p = make_params(gap_extend, gap_open)
         ref_total = 0.0
         for sp in standalone(PAIRS, p, gap_model=gap_model, mode=mode, grad_mode="hard"):
-            sp.align_full()
+            sp.align()
             ref_total += sp.score
         new_total = typed_batch(PAIRS, p, gap_model, mode).score_and_grad()
         assert new_total == pytest.approx(ref_total, rel=1e-10)
@@ -531,8 +516,8 @@ class TestScoreAndGrad:
         p = make_params(1.0, 11.0)
         ref_total = 0.0
         for sp in standalone(PAIRS, p, gap_model="affine", mode="global", grad_mode="hard"):
-            sp.align_full()
-            sp.realign_banded(bw)
+            sp.align()
+            sp.banded_align(bw)
             ref_total += sp.score
         # Two calls, not one: banding around the full DP's OWN optimal path can never
         # change the answer, so score_and_grad() establishes the guide and banded_grad()
@@ -564,8 +549,7 @@ class TestScoreAndGrad:
 
         ref_grad = np.zeros((20, 20))
         for sp in standalone(PAIRS, p, gap_model="affine", mode="global", grad_mode="hard"):
-            sp.align_full()
-            sp.compute_grad()
+            sp.align()
             ref_grad += grad_matrix(sp.grad)
 
         batch_new = typed_batch(PAIRS, p)
@@ -596,12 +580,12 @@ class TestScoreAndGrad:
     def test_dp_valid_stays_false(self):
         batch, pairs_obj = self._make_batch()
         batch.score_and_grad()
-        assert not any(sp.dp_valid for sp in pairs_obj)
+        assert not any(sp.stored_path_valid for sp in pairs_obj)
 
     def test_keep_paths_stores_paths(self):
         batch, pairs_obj = self._make_batch()
         batch.score_and_grad(keep_paths=True)
-        assert all(sp.dp_valid for sp in pairs_obj)
+        assert all(sp.stored_path_valid for sp in pairs_obj)
         assert all(len(sp.aligned()[0]) == len(sp.aligned()[1]) for sp in pairs_obj)
 
     def test_score_valid_set(self):
@@ -640,7 +624,6 @@ class TestScoreAndGrad:
             return typed_batch(PAIRS * 3, make_params(1.0, 11.0), n_threads=nt)
 
         assert make(1).score_and_grad() == make(n_threads).score_and_grad()
-
     @pytest.mark.parametrize("n_threads", [2, 4])
     def test_multithread_grad_matches_single(self, n_threads):
         def make_and_run(nt):
@@ -649,9 +632,6 @@ class TestScoreAndGrad:
             return grad_matrix(b.compute_grad())
 
         np.testing.assert_array_equal(make_and_run(n_threads), make_and_run(1))
-
-    # ── guide_j is set from full DP even when banded ──────────────────────────
-
     def test_guide_j_set_after_score_and_grad(self):
         batch, pairs_obj = self._make_batch()
         batch.score_and_grad()
@@ -667,7 +647,7 @@ class TestScoreAndGrad:
                                 gap_model="affine", mode="global", grad_mode="hard")
         batch = typed_batch([("PLEASANTLY", "MEANLY")], p)
         batch.score_and_grad()
-        sp_ref.align_full()
+        sp_ref.align()
 
         assert list(batch[0].guide_j) == list(sp_ref.guide_j)
 
@@ -677,18 +657,18 @@ class TestScoreAndGrad:
 class TestDropDp:
     def test_dp_invalid_initially(self, blosum):
         sp = nwgrad.SeqPair("ACDE", "ACDE", blosum)
-        assert not sp.dp_valid
+        assert not sp.stored_path_valid
 
     def test_dp_valid_after_align_full(self, blosum):
         sp = nwgrad.SeqPair("ACDE", "ACDE", blosum)
-        sp.align_full()
-        assert sp.dp_valid
+        sp.align()
+        assert sp.stored_path_valid
 
     def test_dp_valid_after_realign_banded(self, blosum):
         sp = nwgrad.SeqPair("ACDE", "ACDE", blosum)
-        sp.align_full()
-        sp.realign_banded(10)
-        assert sp.dp_valid
+        sp.align()
+        sp.banded_align(10)
+        assert sp.stored_path_valid
 
     def test_drop_dp_clears_dp_valid(self, blosum):
         sp = nwgrad.SeqPair("ACDE", "ACDE", blosum)
@@ -798,9 +778,9 @@ class TestDropPathsBatch:
     def test_batch_drop_paths_clears_dp_valid_on_all(self):
         batch, pairs_obj = self._make_batch()
         batch.score_and_grad(keep_paths=True)
-        assert all(sp.dp_valid for sp in pairs_obj)
+        assert all(sp.stored_path_valid for sp in pairs_obj)
         batch.drop_paths()
-        assert not any(sp.dp_valid for sp in pairs_obj)
+        assert not any(sp.stored_path_valid for sp in pairs_obj)
 
     def test_batch_drop_paths_preserves_scores(self):
         batch, pairs_obj = self._make_batch()
@@ -830,7 +810,7 @@ class TestDropPathsBatch:
         batch.score_and_grad(keep_paths=True)
         batch.drop_paths()
         batch.banded_grad(30, keep_paths=True)
-        assert all(sp.dp_valid for sp in pairs_obj)
+        assert all(sp.stored_path_valid for sp in pairs_obj)
         grad = grad_matrix(batch.compute_grad())
         assert grad.shape == (20, 20)
         assert grad.sum() > 0
@@ -839,7 +819,7 @@ class TestDropPathsBatch:
         batch, pairs_obj = self._make_batch(n_threads=4)
         batch.score_and_grad(keep_paths=True)
         batch.drop_paths()
-        assert not any(sp.dp_valid for sp in pairs_obj)
+        assert not any(sp.stored_path_valid for sp in pairs_obj)
 
 
 # ── SeqPairBatch: API surface ─────────────────────────────────────────────────

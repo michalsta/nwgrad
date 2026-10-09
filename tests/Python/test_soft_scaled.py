@@ -79,9 +79,8 @@ def test_scaled_matches_log_banded(gm, mode, bw):
         for impl in ("scaled", "log"):
             sp = nwgrad.SeqPairDouble(a, b, params, gap_model=gm, mode=mode, grad_mode="soft")
             sp.soft_impl = impl
-            sp.align_full()
-            sp.realign_banded(bw)
-            sp.compute_grad()
+            sp.align()
+            sp.banded_align(bw)
             g = sp.grad
             out.append((sp.score, g.matrix.to_matrix(), [g.gap_open_a, g.gap_extend_a,
                                                        g.gap_open_b, g.gap_extend_b]))
@@ -252,11 +251,11 @@ def test_temperature_invalidates_and_validates():
     rng = np.random.default_rng(51)
     params = dna_params(rng)
     sp = nwgrad.SeqPairDouble("ACGTAC", "ACTTAC", params, grad_mode="soft")
-    sp.align_full()
+    sp.align()
     s1 = sp.score
     sp.soft_temperature = 0.5
     assert not sp.score_valid
-    sp.align_full()
+    sp.align()
     assert sp.score != s1
     for bad in (0.0, -1.0, float("inf"), float("nan")):
         with pytest.raises(ValueError):
@@ -379,10 +378,9 @@ def test_lazy_rescale_both_directions(gm, mode, bw):
         for impl in ("scaled", "log"):
             sp = nwgrad.SeqPairDouble(a, b, params, gap_model=gm, mode=mode, grad_mode="soft")
             sp.soft_impl = impl
-            sp.align_full()
+            sp.align()
             if bw:
-                sp.realign_banded(bw)
-            sp.compute_grad()
+                sp.banded_align(bw)
             g = sp.grad
             out.append((sp.score, g.matrix.to_matrix(),
                         [g.gap_open_a, g.gap_extend_a, g.gap_open_b, g.gap_extend_b]))
@@ -456,7 +454,7 @@ def test_soft_guide_posterior_tracks_viterbi_when_cold(mode):
             # the path actually crosses.
             sp = nwgrad.SeqPairDouble(A[i], B[i], params, gap_model="affine", mode="local",
                                       traceback="pointers")
-            sp.align_full()
+            sp.align()
             core = sp.aligned()[0].replace("-", "")
             lo = A[i].find(core); hi = lo + len(core)
             if not core:

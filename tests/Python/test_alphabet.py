@@ -206,10 +206,10 @@ def test_same_alphabet_set_params_still_works():
     p1 = dna_params(gap_extend_a=1.0, gap_extend_b=1.0)
     p2 = dna_params(gap_extend_a=2.0, gap_extend_b=2.0)
     sp = nwgrad.SeqPair("ACGTACGT", "ACGTACGT", p1, gap_model="linear", mode="local")
-    sp.align_full()
+    sp.align()
     first = sp.score
     sp.set_params(p2)
-    sp.align_full()
+    sp.align()
     assert sp.score == pytest.approx(first)   # identical seqs: no gaps either way
 
 

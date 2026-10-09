@@ -42,8 +42,7 @@ assert np.isfinite(grad.matrix.to_matrix()).all()
 assert sp.aligned() == ("ACGT", "ACGT"), sp.aligned()
 assert sp.formatted(0) == "ACGT\\n||||\\nACGT"
 # Exercise reuse, including the Full -> GuideBanded transition.
-sp.realign_banded(4)
-sp.compute_grad()
+sp.banded_align(4)
 assert sp.aligned() == ("ACGT", "ACGT"), sp.aligned()
 """)
     assert proc.returncode == 0, describe(proc)
@@ -69,14 +68,13 @@ assert list(sp.guide_j) == guide
 gc.collect()
 trash = [params(99, "TGCA") for _ in range(500)]
 if {realign!r}:
-    sp.realign_banded(4)
-    sp.compute_grad()
+    sp.banded_align(4)
     assert sp.score == 16
     assert sp.aligned() == expected
 else:
     # set_params() invalidates the retained tables: they and the traceback
     # belong to the replaced params, which may already be freed.
-    assert not sp.dp_valid
+    assert not sp.stored_path_valid
     for call in (sp.aligned, lambda: sp.formatted(0)):
         try:
             call()
@@ -105,7 +103,7 @@ b.set_params(params(5))
 gc.collect()
 trash = [params(99, "TGCA") for _ in range(500)]
 for i in range(len(b)):
-    assert not b[i].dp_valid
+    assert not b[i].stored_path_valid
     try:
         b[i].aligned()
     except RuntimeError:

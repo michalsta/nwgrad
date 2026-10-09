@@ -29,7 +29,7 @@ def _params(seed, go, ge):
 
 def _pair(a, b, p, gap_model, mode, traceback="pointers"):
     sp = nwgrad.SeqPairDouble(a, b, p, gap_model=gap_model, mode=mode, traceback=traceback)
-    sp.align_full()
+    sp.align()
     return sp
 
 
@@ -57,7 +57,7 @@ def test_round_trip_after_banded_realignment():
     for a, b in zip(_seqs(40, 5, 40, 6), _seqs(40, 5, 50, 7)):
         sp = _pair(a, b, p1, "affine", "local")
         sp.set_params(p2)
-        sp.realign_banded(3)
+        sp.banded_align(3)
         aln = Alignment([a, b], sp.coordinates())
         assert (aln[0], aln[1]) == sp.aligned()
 

@@ -69,7 +69,7 @@ def test_aligned_strings_are_consistent(gap_model, mode):
     p = _affine_params(BLOSUM62)
     sp = nwgrad.SeqPair("PLEASANTLY", "MEANLY", p, gap_model=gap_model,
                         mode=mode, grad_mode="hard")
-    sp.align_full()
+    sp.align()
     a, b = sp.aligned()
 
     assert len(a) == len(b)                          # equal-length columns
@@ -89,7 +89,7 @@ def test_global_affine_aligned_exact():
     p = _affine_params(BLOSUM62)
     sp = nwgrad.SeqPair("PLEASANTLY", "MEANLY", p, gap_model="affine",
                         mode="global", grad_mode="hard")
-    sp.align_full()
+    sp.align()
     assert sp.aligned() == ("PLEASANTLY", "-MEAN---LY")
 
 
@@ -97,7 +97,7 @@ def test_formatted_three_lines_and_match_markers():
     p = _affine_params(BLOSUM62)
     sp = nwgrad.SeqPair("PLEASANTLY", "MEANLY", p, gap_model="affine",
                         mode="global", grad_mode="hard")
-    sp.align_full()
+    sp.align()
     a, mid, b = sp.formatted(width=0).split("\n")
     assert (a, b) == ("PLEASANTLY", "-MEAN---LY")
     for ca, m, cb in zip(a, mid, b):
@@ -113,7 +113,7 @@ def test_formatted_wraps_at_width():
     p = _affine_params(BLOSUM62)
     sp = nwgrad.SeqPair("ACDEFGHIKLMNPQRSTVWY", "ACDEFGHIKLMNPQRSTVWY", p,
                         gap_model="affine", mode="global", grad_mode="hard")
-    sp.align_full()
+    sp.align()
     blocks = sp.formatted(width=8).split("\n\n")
     assert len(blocks) == 3            # 20 columns / 8 -> 3 blocks
     assert all(len(line) <= 8 for blk in blocks for line in blk.split("\n"))
@@ -123,8 +123,8 @@ def test_aligned_requires_dp_tables():
     p = _affine_params(BLOSUM62)
     sp = nwgrad.SeqPair("ACDE", "ACDF", p, gap_model="affine",
                         mode="global", grad_mode="hard")
-    sp.align_full()
-    sp.drop_dp()
+    sp.align()
+    sp.drop_paths()
     with pytest.raises(Exception):
         sp.aligned()
 
@@ -139,8 +139,7 @@ def test_score_and_grad_matches_separate_calls():
 
     sp2 = nwgrad.SeqPair("PLEASANTLY", "MEANLY", p, gap_model="affine",
                          mode="global", grad_mode="hard")
-    sp2.align_full()
-    sp2.compute_grad()
+    sp2.align()
     assert score == pytest.approx(sp2.score)
     np.testing.assert_array_equal(grad.matrix.to_matrix(),
                                   sp2.grad.matrix.to_matrix())

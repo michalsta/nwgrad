@@ -183,7 +183,7 @@ class TestUsableWithAlignParams:
         )
         sp = nwgrad.SeqPair("PLEASANTLY", "MEANLY", params,
                             gap_model="affine", mode="global", grad_mode="hard")
-        sp.align_full()
+        sp.align()
         assert sp.score == pytest.approx(-3.0)
 
     def test_nuc44_alignment(self):
@@ -194,5 +194,5 @@ class TestUsableWithAlignParams:
         )
         sp = nwgrad.SeqPair("ACGT", "ACGT", params,
                             gap_model="linear", mode="global", grad_mode="none")
-        sp.align_full()
+        sp.align()
         assert sp.score == pytest.approx(20.0)  # 4 × 5.0

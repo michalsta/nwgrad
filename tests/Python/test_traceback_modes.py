@@ -163,6 +163,6 @@ def test_seq_pair_traceback_argument(params):
         sp = nwgrad.SeqPair(a, b, params, gap_model="affine", mode="global",
                             grad_mode="hard", traceback=tb)
         assert sp.traceback == tb
-        sp.align_full()
+        sp.align()
         got[tb] = (sp.score, sp.aligned())
     assert got["scores"] == got["pointers"]

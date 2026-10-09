@@ -120,10 +120,10 @@ def test_local_no_longer_throws(params):
     sp = nwgrad.SeqPair("ACDEFGHIK", "WWACDEFGHIKWW", params, gap_model="affine",
                         mode="local", grad_mode="hard", traceback="hirschberg")
     sp.hb_cutoff = 1                      # 9 rows: any larger cutoff runs it as Pointers
-    sp.align_full()                       # no throw
+    sp.align()                       # no throw
     ref = nwgrad.SeqPair("ACDEFGHIK", "WWACDEFGHIKWW", params, gap_model="affine",
                          mode="local", grad_mode="hard", traceback="pointers")
-    ref.align_full()
+    ref.align()
     assert sp.score == pytest.approx(ref.score, rel=1e-5, abs=1e-3)
 
 
@@ -136,8 +136,7 @@ def test_local_no_longer_throws(params):
 def _lin(a, b, p, tb, mode, cls=nwgrad.SeqPairDouble, cutoff=HB_CUTOFF):
     sp = cls(a, b, p, gap_model="linear", mode=mode, grad_mode="hard", traceback=tb)
     sp.hb_cutoff = cutoff
-    sp.align_full()
-    sp.compute_grad()
+    sp.align()
     return sp
 
 
@@ -198,8 +197,8 @@ def test_banded_realign_unaffected(params):
     b = nwgrad.SeqPairBatchDouble(n_threads=1, traceback="hirschberg")
     sp = nwgrad.SeqPairDouble("ACDEFGHIK", "ACDWFGHIK", params, gap_model="linear",
                               mode="global", grad_mode="hard", traceback="hirschberg")
-    sp.align_full()
-    sp.realign_banded(2)   # the banded aligner keeps tables; Hirschberg is Full only
+    sp.align()
+    sp.banded_align(2)   # the banded aligner keeps tables; Hirschberg is Full only
     assert sp.score is not None
 
 
@@ -259,7 +258,7 @@ def test_score_matches_pointers_exactly_at_double(request, fixture):
                                   grad_mode="hard", traceback="hirschberg")
         hb.hb_cutoff = HB_CUTOFF
         for sp in (ref, hb):
-            sp.align_full()
+            sp.align()
         assert hb.score == pytest.approx(ref.score, abs=1e-9), (a, b)
 
 
@@ -279,7 +278,7 @@ def test_score_matches_pointers_at_float32(params):
                             grad_mode="hard", traceback="hirschberg")
         hb.hb_cutoff = HB_CUTOFF
         for sp in (ref, hb):
-            sp.align_full()
+            sp.align()
         assert hb.score == pytest.approx(ref.score, rel=1e-5, abs=1e-3), (a, b)
 
 
@@ -297,7 +296,7 @@ def test_recursion_actually_runs(params):
                               grad_mode="hard", traceback="hirschberg")
     hb.hb_cutoff = HB_CUTOFF
     for sp in (ref, hb):
-        sp.align_full()
+        sp.align()
     assert hb.score == pytest.approx(ref.score, abs=1e-9)
 
 
@@ -312,7 +311,7 @@ def test_alignment_reconstructs_inputs(request, fixture):
         sp = nwgrad.SeqPairDouble(a, b, p, gap_model="affine", mode="global",
                                   grad_mode="hard", traceback="hirschberg")
         sp.hb_cutoff = HB_CUTOFF
-        sp.align_full()
+        sp.align()
         x, y = sp.aligned()
         assert len(x) == len(y)
         assert x.replace("-", "") == a
@@ -343,7 +342,7 @@ def test_path_scores_what_it_claims(request, fixture):
         sp = nwgrad.SeqPairDouble(a, b, p, gap_model="affine", mode="global",
                                   grad_mode="hard", traceback="hirschberg")
         sp.hb_cutoff = HB_CUTOFF
-        sp.align_full()
+        sp.align()
         x, y = sp.aligned()
         assert _rescore(x, y, p) == pytest.approx(sp.score, abs=1e-9), (a, b)
 
@@ -359,8 +358,7 @@ def test_gradient_is_the_gradient_of_that_path(asym_params):
         sp = nwgrad.SeqPairDouble(a, b, asym_params, gap_model="affine", mode="global",
                                   grad_mode="hard", traceback="hirschberg")
         sp.hb_cutoff = HB_CUTOFF
-        sp.align_full()
-        sp.compute_grad()
+        sp.align()
         g = sp.grad.to_dict()
         x, y = sp.aligned()
         want = np.zeros((20, 20))
@@ -404,7 +402,7 @@ def test_degenerate_shapes(params):
                                       grad_mode="hard", traceback="hirschberg")
             hb.hb_cutoff = 1    # split to single rows: these inputs are <= 9 long
             for sp in (ref, hb):
-                sp.align_full()
+                sp.align()
             assert hb.score == pytest.approx(ref.score, abs=1e-9), (a, b)
             x, y = hb.aligned()
             assert x.replace("-", "") == a
@@ -460,7 +458,7 @@ def _local(a, b, p, tb, cutoff=HB_CUTOFF, dtype="double"):
     sp = cls(a, b, p, gap_model="affine", mode="local", grad_mode="hard", traceback=tb)
     if cutoff is not None and tb == "hirschberg":
         sp.hb_cutoff = cutoff
-    sp.align_full()
+    sp.align()
     return sp
 
 
@@ -511,7 +509,6 @@ def test_local_gradient_is_the_gradient_of_that_path(asym_params):
     idx = {c: i for i, c in enumerate(AA)}
     for a, b in zip(A, B):
         sp = _local(a, b, asym_params, "hirschberg", cutoff=64)
-        sp.compute_grad()
         g = sp.grad.to_dict()
         x, y = sp.aligned()
         want = np.zeros((20, 20))
@@ -613,8 +610,7 @@ def _pair(a, b, p, tb, cutoff=HB_CUTOFF):
                               grad_mode="hard", traceback=tb)
     if cutoff is not None and tb == "hirschberg":
         sp.hb_cutoff = cutoff
-    sp.align_full()
-    sp.compute_grad()
+    sp.align()
     return sp
 
 

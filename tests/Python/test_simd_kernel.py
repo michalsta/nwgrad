@@ -114,12 +114,12 @@ def test_seq_pair_kernels_agree_including_banded_realign():
     for kern in ("scalar_fallback", "auto"):
         sp = nwgrad.SeqPair(a, b, p, gap_model="affine", mode="global",
                             grad_mode="hard", kernel=kern)
-        sp.align_full()
+        sp.align()
         full = sp.score
         # realign_banded takes the per-row gather path inside the simd kernel rather
         # than the query profile, so it is genuinely different code — not just the
         # same kernel over fewer columns.
-        sp.realign_banded(12)
+        sp.banded_align(12)
         out[kern] = (full, sp.score, sp.aligned())
 
     assert out["scalar_fallback"] == out["auto"]

@@ -17,9 +17,12 @@ Removed the untyped batch state, per-add problem-type arguments, batch
 `alloc_dp` / `align_full` / `realign_banded` / `drop_dp`, and `SeqPair.alloc_dp`.
 Batches now own one settings store in an engine selected at construction. Batch
 computations publish gradients immediately, with no batch-wide holding pass.
-The supported `SeqPair.align_full()` / `realign_banded()` still hold their gradients
-until `compute_grad()`. That visibility is now derived from current scores and
-stored paths; the separate `kHeld` flag is removed. DiscrimAlign's
+The remaining old pair lifecycle is deprecated in 0.7.0 and removed in 0.8.0.
+Use `align()`, `banded_align()`, `drop_paths()` and `stored_path_valid`; configured
+gradients are immediately available. Deferred visibility remains only in the
+compatibility helper and batch-view reduction bridge, with no separate `kHeld`
+flag. Delete `pair_api_compat.hpp`, the deprecated facade methods/bindings and
+reduction bridge in 0.8, keeping modern lifecycle regressions. DiscrimAlign's
 ported API is tested from PR #16, rather than modifying the old consumer checkout.
 
 ## Default thread count (`n_threads=0`): physical cores are wrong for short pairs

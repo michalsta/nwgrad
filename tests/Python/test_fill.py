@@ -55,7 +55,7 @@ def _run(seqs_a, seqs_b, params, mode, traceback, fill, kernel="auto", prec="dou
         sp = pcls(seqs_a[i], seqs_b[i], params, gap_model="affine", mode=mode,
                   grad_mode="hard", kernel=kernel, traceback=traceback)
         sp.fill = fill if fill != "interpair" else "striped"
-        sp.align_full()
+        sp.align()
         aligned.append((sp.score, sp.aligned()))
     return b.scores(), mats, gaps, aligned
 
@@ -425,7 +425,7 @@ def test_banded_interpair_paths_and_soft_lanes():
     for i in range(0, 80, 9):
         sp = nwgrad.SeqPairDouble(A[i], B[i], p, gap_model="affine", mode="local",
                                   grad_mode="hard", traceback="pointers")
-        sp.align_full(); sp.realign_banded(3)
+        sp.align(); sp.banded_align(3)
         assert list(sp.guide_j) == list(res[1][i])
 
 
@@ -457,8 +457,8 @@ def test_banded_grad_guides_match_realign_banded(prec, gm, mode, fill):
     for i in range(90):
         sp = pcls(A[i], B[i], p, gap_model=gm, mode=mode, grad_mode="hard",
                   traceback="pointers")
-        sp.align_full()
-        sp.realign_banded(2)
+        sp.align()
+        sp.banded_align(2)
         assert list(sp.guide_j) == list(b[i].guide_j)
         assert sp.score == b[i].score
 

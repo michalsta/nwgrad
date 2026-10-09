@@ -169,15 +169,14 @@ soft options, `hb_cutoff` — belong to the batch: setting them on a view raises
 
 | Method | Description |
 |---|---|
-| `align_full()` | Full DP: sets `score`, `guide_j` and the stored alignment path. The gradient is computed too but **held**: `grad` stays `None` until `compute_grad()`. |
-| `realign_banded(bandwidth)` | Banded DP around the current path, under the current params. Requires a prior `align_full()` (or a batch `score_and_grad()`). Same holding of the gradient. |
-| `compute_grad()` | Return the cached gradient, or release the one held by `align_full()` / `realign_banded()`. Raises if there is none (no alignment yet, `set_params()` since, `drop_dp()` before release, or `grad_mode="none"`). |
+| `align(keep_paths=True)` | Full computation: returns the score and immediately publishes the configured hard/soft gradient. With `grad_mode="none"`, `grad` stays `None`. Stores the path by default. |
+| `banded_align(bandwidth, keep_paths=True)` | Compute around the cached guide under current params; returns the score and immediately publishes the configured gradient. Requires an established guide; supports score-only mode. |
 | `score_and_grad(keep_paths=True)` | Full DP with immediately available gradient. By default stores the path; `keep_paths=False` skips path storage while retaining the guide for banded alignment. Returns `(score, grad)`; raises if `grad_mode` is `"none"`. |
-| `aligned()` | The alignment as a pair of gapped strings `(seq_a, seq_b)`. Needs a stored path: raises after `drop_dp()` or `set_params()` until the next align. With `grad_mode="soft"` it is the Viterbi alignment. |
+| `aligned()` | The alignment as a pair of gapped strings `(seq_a, seq_b)`. Needs a stored path: raises after `drop_paths()` or `set_params()` until the next align. With `grad_mode="soft"` it is the Viterbi alignment. |
 | `coordinates()` | The alignment as Biopython-style coordinates: an `int64` array of shape `(2, k)`, row 0 positions in `seq_a`, row 1 in `seq_b`, with a column at the start, at each change between aligned and gap columns, and at the end. `Bio.Align.Alignment([seq_a, seq_b], coordinates)` rebuilds it. A local alignment starts where its path starts. Same availability as `aligned()`. |
 | `formatted(width=60)` | Pretty-printed alignment block (seq A / match line / seq B), wrapped at `width` columns (`0` = no wrap). Same availability as `aligned()`. |
-| `set_params(params)` | (Standalone pairs.) Swap alignment parameters. Clears `score`, `grad` and the stored path; preserves `guide_j`, so `realign_banded()` works straight after. |
-| `drop_dp()` | Free the stored path. `score`, a released `grad` and `guide_j` survive. |
+| `set_params(params)` | (Standalone pairs.) Swap alignment parameters. Clears `score`, `grad` and the stored path; preserves `guide_j`, so `banded_align()` works straight after. |
+| `drop_paths()` | Free the stored path and reusable scratch memory. `score`, `grad` and `guide_j` survive. |
 
 A failed pair computation invalidates its cached score and gradient.
 
@@ -193,7 +192,7 @@ A failed pair computation invalidates its cached score and gradient.
 | `path_valid` | `bool` | `guide_j` is usable as a banding guide |
 | `score_valid` | `bool` | `score` matches the current params |
 | `grad_valid` | `bool` | `grad` is populated |
-| `dp_valid` | `bool` | A stored path is available (`aligned()`, `coordinates()`) |
+| `stored_path_valid` | `bool` | A stored path is available (`aligned()`, `coordinates()`). Independent of `path_valid`, which reports guide availability. |
 | `traceback` | `str` | The traceback mode the pair *resolved* to (never `"auto"`) |
 | `hb_cutoff` | `int` | Hirschberg base-case size in rows (settable on a standalone pair; default 512) |
 | `fill` | `str` | Full-DP simd fill at double precision: `"striped"` (default) or `"rowwise"` (settable on a standalone pair; see `SeqPairBatch.fill`) |
@@ -205,7 +204,7 @@ A failed pair computation invalidates its cached score and gradient.
 |---|---|---|
 | `"hard"` | Viterbi alignment score | Substitution-pair counts (integer-valued subgradient) |
 | `"soft"` | Log-partition function `log Z` | Expected substitution counts (true gradient of `log Z`) |
-| `"none"` | Optimal alignment score, **score only** (see below) | `compute_grad()` raises |
+| `"none"` | Optimal alignment score, **score only** (see below) | `None`; use `align()` / `banded_align()` |
 
 <a id="score-only"></a>**`grad_mode="none"` is score only.** No DP table is kept and no
 traceback runs: rolling rows (O(n) memory) through a SIMD kernel per pair, and the
@@ -222,6 +221,35 @@ path on single pairs (AVX2, 1 thread): 1.2–3.1× affine Global, 3–6.5× affi
 1.5–14.5× linear; it keeps that lead with threads, having no table to stream.
 
 ---
+
+### Pair compatibility: deprecated in 0.7.0, removed in 0.8.0
+
+Python calls emit `DeprecationWarning`; C++ methods are marked `[[deprecated]]`.
+During 0.7, old methods retain their deferred-gradient behavior. New computations
+publish gradients immediately, on standalone pairs and batch views alike.
+
+| Deprecated pair API | Replacement |
+|---|---|
+| `align_full()` | `align()` or `score_and_grad()` |
+| `realign_banded(bw)` | `banded_align(bw)` |
+| `compute_grad()` | Read `grad` after a modern computation |
+| `drop_dp()` | `drop_paths()` |
+| `dp_valid` | `stored_path_valid` |
+
+The old full/banded calls store paths and hide their cached gradients until
+`compute_grad()`. Dropping paths before release prevents release; dropping them
+after release preserves the gradient. Batch `compute_grad()` also releases
+results deferred by old calls on views. This bridge disappears in 0.8; batch
+`compute_grad()` itself remains supported as the cached-gradient reduction.
+
+```python
+pair.align()                         # score and configured gradient are current
+score, grad = pair.score_and_grad(keep_paths=False)
+pair.set_params(updated_params)      # clears results, preserves the guide
+score = pair.banded_align(8, keep_paths=False)
+grad = pair.grad
+pair.drop_paths()                    # score, gradient and guide survive
+```
 
 ## `SeqPairBatch`
 

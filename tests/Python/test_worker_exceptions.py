@@ -82,7 +82,7 @@ def test_set_params_keeps_the_current_params_alive():
     sp.set_params(_fresh_params(2.0))     # no local reference kept
     import gc
     gc.collect()
-    sp.align_full()                       # must not use-after-free
+    sp.align()                       # must not use-after-free
     _score, grad = sp.score_and_grad()
 
     ref = nwgrad.SeqPair("ACDEFGHIK", "ACDEFGHIK", _fresh_params(2.0),
