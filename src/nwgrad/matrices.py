@@ -10,6 +10,12 @@ Protein matrices use the 23-character NCBI alphabet ``ARNDCQEGHILKMFPSTWYVBZX``
 
 ``NUC44`` uses the 15-character IUPAC DNA ambiguity alphabet ``ATGCSWRYKMBVHDN``.
 
+These are the published matrix-file variants, including their ambiguity scores
+and original scaling (BLOSUM80 uses 1/3-bit units). NCBI's newer C++ toolkit
+tables use different ambiguity conventions and a 1/2-bit BLOSUM80 variant.
+All retained entries were checked against the online source files on 2026-10-09;
+the full-table reference hashes are pinned in tests/Python/test_matrices.py.
+
 Usage::
 
     import nwgrad

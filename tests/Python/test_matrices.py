@@ -4,6 +4,8 @@ Values cross-checked against:
   - BLOSUM/PAM/NUC44: NCBI BLAST FTP ftp.ncbi.nlm.nih.gov/blast/matrices/
   - VTML: wrpearson/fasta36 GitHub repository (data/ directory)
 """
+import hashlib
+
 import numpy as np
 import pytest
 import nwgrad
@@ -22,6 +24,37 @@ from nwgrad.matrices import (
 _AA_MAT_NAMES = ["BLOSUM45", "BLOSUM50", "BLOSUM62", "BLOSUM80", "BLOSUM90",
                  "PAM30", "PAM70", "PAM250", "VTML40", "VTML80", "VTML160", "VTML200"]
 _AA_ALPHABET = "ARNDCQEGHILKMFPSTWYVBZX"
+
+# Full-table references downloaded and compared cell-for-cell on 2026-10-09:
+# BLOSUM*, PAM*, NUC44: https://ftp.ncbi.nlm.nih.gov/blast/matrices/
+#   (NUC44's filename is NUC.4.4; protein stop-codon rows/columns are omitted).
+# VTML*: https://github.com/wrpearson/fasta36/tree/6d6718aaf949483197dd48ea9baecfb7d0f73a41/data
+#   (filenames VTML_40.mat, VTML_80.mat, VTML_160.mat, VTML_200.mat).
+# Hash alphabet ASCII + NUL + the source table reordered to that alphabet as
+# row-major little-endian float64. No network access is needed during pytest.
+_REFERENCE_SHA256 = {
+    "BLOSUM45": "c436c9eee6277f3a9d02a8bee9224f79085d6ff5075110d873dbb0680fd11a27",
+    "BLOSUM50": "59ab3a456e612b25877254624c367f2302f575e96dc63b4540242d37c08e153b",
+    "BLOSUM62": "da22fab0e8bb547e456f03dd6e89d7e5d79bdcf1ea73c33f8c1047d6c7a106af",
+    "BLOSUM80": "fe3e3b28eb02271c87287c39cfb63ea9f062d46625f7a5dba8d4cebd36ae7c7e",
+    "BLOSUM90": "d8133d90063e1472cbbdd8a88b1a9e917015872e1bd6fb5b39e7775215555e43",
+    "PAM30": "21a882f410c09af56aeff91e06294c2046e27769fc01bdb83329b8185d35b97f",
+    "PAM70": "e0452ee87becc4e993acbff67bebfb00ca8d9000f386dc5f9eeeebcbd6b2a978",
+    "PAM250": "43afb2f706eba85581925444ad93efcc740a20dc1aa0a6f4e30acbe09e647809",
+    "VTML40": "543d7e25add26121744147aaeb46b56242cbf576e7914b91310b296d76cc421f",
+    "VTML80": "b640e42989fd4f5f8e4376019bbc2f1d893efcca79c8098e8d474cee7e9a332d",
+    "VTML160": "9338b20ff87403b298ffa31eedf7e121af410a004aa93e7f4a415434b06659d8",
+    "VTML200": "18df50c1567697f62fa4e13f9e3800f471f724d6650ee1db5d6857fe07aabc05",
+    "NUC44": "069c6bd85045b38bf9666da88a60742b6089a551bb1fba8461bad4d02d2d7386",
+}
+
+
+@pytest.mark.parametrize("name", list(_REFERENCE_SHA256))
+def test_every_cell_matches_online_reference(name):
+    matrix = getattr(matrices, name)
+    values = np.ascontiguousarray(matrix.to_matrix(), dtype="<f8")
+    digest = hashlib.sha256(matrix.alphabet.encode("ascii") + b"\0" + values.tobytes())
+    assert digest.hexdigest() == _REFERENCE_SHA256[name]
 
 
 class TestShapesAndAlphabets:
