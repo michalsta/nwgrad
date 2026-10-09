@@ -40,6 +40,13 @@ AVX2 host (homologous or unrelated pairs, 1–12 threads); local float64 keeps
 `traceback="hirschberg"` explicitly for very long local pairs (e.g. >10k residues),
 where the pointer tables would not fit.
 
+Recursive Hirschberg (pairs with `len(seq_a) > hb_cutoff`) requires non-negative
+gap penalties; linear gaps ignore the gap-open fields. An explicit
+`"hirschberg"` or `"hirschberg_pmax"` request raises `ValueError` otherwise.
+`"auto"` falls back to `"pointers"`, preserving the optimum but increasing DP
+memory from O(m+n) to O(m×n). This can matter in training loops whose updates
+move a gap cost below zero. Pairs at or below the cutoff still use pointers.
+
 For linear gaps `"auto"` resolves to `"pointers"`, but a pair whose score table would
 be at most 2 MiB keeps the table instead of direction bytes: the table fill is ~1.35×
 faster per thread, while past L2 the table's memory traffic costs up to 3.5× at 12
@@ -68,4 +75,6 @@ with.
 - With `traceback="pointers"`, a hard-gradient alignment keeps 3 bytes per DP cell; `"scores"` keeps 12. The default for affine global alignment is Hirschberg, which keeps O(m+n) — so the per-thread buffer described below applies to the pointer modes and to the Hirschberg base case (≤ `hb_cutoff` rows).
 - `SeqPairBatch.score_and_grad()` allocates one `DpBuffer` per thread (sized to the largest sequence pair in the batch) and reuses it across all assigned pairs. Pair-owned DP tables are never allocated, keeping peak memory at `n_threads × max(m×n)` rather than `N × max(m×n)`.
 - Work is distributed via a shared `std::atomic` counter — no per-task mutex, no work-stealing queue.
-- Gradient accumulation is per-thread; a single mutex is taken once at join to merge partial gradients.
+- Stored-batch gradients are summed in fixed blocks of 4096 pairs, with each block
+  accumulated in pair order and the block sums merged in order. Results are
+  reproducible across thread counts. Streaming `align()` uses per-thread sums.

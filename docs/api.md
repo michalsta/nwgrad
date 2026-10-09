@@ -171,7 +171,7 @@ soft options, `hb_cutoff` — belong to the batch: setting them on a view raises
 |---|---|
 | `align_full()` | Full DP: sets `score`, `guide_j` and the stored alignment path. The gradient is computed too but **held**: `grad` stays `None` until `compute_grad()`. |
 | `realign_banded(bandwidth)` | Banded DP around the current path, under the current params. Requires a prior `align_full()` (or a batch `score_and_grad()`). Same holding of the gradient. |
-| `compute_grad()` | Release the gradient of the last `align_full()` / `realign_banded()`. Raises if there is none (no alignment yet, `set_params()` or `drop_dp()` since, or `grad_mode="none"`). |
+| `compute_grad()` | Return the cached gradient, or release the one held by `align_full()` / `realign_banded()`. Raises if there is none (no alignment yet, `set_params()` since, `drop_dp()` before release, or `grad_mode="none"`). |
 | `score_and_grad()` | `align_full()` + `compute_grad()`. Returns `(score, grad)`; raises if `grad_mode` is `"none"`. |
 | `aligned()` | The alignment as a pair of gapped strings `(seq_a, seq_b)`. Needs a stored path: raises after `drop_dp()` or `set_params()` until the next align. With `grad_mode="soft"` it is the Viterbi alignment. |
 | `coordinates()` | The alignment as Biopython-style coordinates: an `int64` array of shape `(2, k)`, row 0 positions in `seq_a`, row 1 in `seq_b`, with a column at the start, at each change between aligned and gap columns, and at the end. `Bio.Align.Alignment([seq_a, seq_b], coordinates)` rebuilds it. A local alignment starts where its path starts. Same availability as `aligned()`. |
@@ -485,6 +485,15 @@ Other behaviour changes since 0.5.2:
   score (replayed along the `hirschberg_pmax` path) could sit a hair below it, so such a
   score may now come out slightly higher. A none-mode `score_and_grad()` defers the guides
   (same guides, computed on first use).
+- **Hirschberg correctness.** Inherited vertical gaps at recursion boundaries now
+  continue strictly within the gap state. Previously, small `hb_cutoff` values
+  could yield suboptimal paths in both precisions; affected scores, paths and
+  gradients can change. Default-cutoff measurements did not reproduce the defect.
+- **Negative gap costs and Hirschberg.** For pairs longer than `hb_cutoff`, an
+  explicit Hirschberg request now raises on negative gap penalties; `"auto"`
+  uses pointers instead. Linear gaps ignore open costs. This fixes incorrect
+  scores and a float32 local memory error, but the automatic fallback needs
+  O(m×n) DP memory rather than O(m+n).
 - `logistic.log_likelihood()` and `Step.loglik_at_alpha0` were removed (see
   [`nwgrad.logistic`](#nwgradlogistic)).
 - **`logistic` labels are no longer checked**, and soft labels in [0, 1] are accepted.
@@ -492,9 +501,10 @@ Other behaviour changes since 0.5.2:
   of a single class; the caller must check them (see
   [`nwgrad.logistic`](#nwgradlogistic)).
 
-Results are unchanged: scores, alignments and hard gradients are bit-identical to
-0.5.2's, and soft per-pair results too. Two sums differ in the last bits for soft
-pairs only, because they are now reproducible: `compute_grad()` (0.5 merged per-thread
+Outside the correctness fixes and score-only change above, the batch restructure
+preserves 0.5.2's per-pair results: scores, alignments and hard gradients are
+bit-identical, and soft per-pair results too. Two soft sums can differ in the last
+bits: `compute_grad()` now merges fixed blocks reproducibly (0.5 merged per-thread
 sums in completion order) and the scores of a deprecated `align_full()` under
 `fill="interpair"` (0.5 ran each pair's own forward-backward; the shared soft pass
 agrees within the soft path's usual tolerance).

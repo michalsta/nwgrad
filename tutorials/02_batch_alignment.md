@@ -45,7 +45,8 @@ batch.add_many(seqs_a, seqs_b, params)              # encoded once, in parallel
 print(len(batch))                                   # 4
 ```
 
-The batch keeps `params` alive. `add_many()` may be called again to append more pairs,
+The batch copies `params`; later changes require `batch.set_params(params)`.
+`add_many()` may be called again to append more pairs,
 with the same or other parameters (over the same alphabet).
 
 ## `score_and_grad()`

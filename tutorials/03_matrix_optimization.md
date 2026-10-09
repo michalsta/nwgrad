@@ -107,8 +107,8 @@ for step in range(50):
 
 `batch.set_params()` invalidates cached scores and gradients on all pairs but
 preserves the alignment paths, so the next `banded_grad(bw)` re-aligns around them
-instead of running the full DP. The batch keeps `params` alive
-automatically.
+instead of running the full DP. The batch copies `params`; later changes require
+another `set_params()` call.
 
 ## Learning the gap penalties too
 

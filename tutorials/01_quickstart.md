@@ -134,8 +134,8 @@ sp = nwgrad.SeqPair(
 )
 ```
 
-The pair keeps its `AlignParams` alive automatically — you don't need to hold a
-separate reference to `params`.
+The pair copies its `AlignParams`, so you don't need to hold a separate reference.
+Later changes to `params` reach the pair only after `sp.set_params(params)`.
 
 ### Computing the score
 
@@ -257,7 +257,7 @@ sp.compute_grad()
 print(sp.score, sp.grad.matrix.to_matrix().sum())
 ```
 
-`set_params()` keeps `new_params` alive automatically.
+`set_params()` copies `new_params`.
 
 The `bandwidth` parameter is the half-width of the band in cells. If the true
 optimal path lies outside the band, the result is silently sub-optimal.
@@ -268,12 +268,14 @@ optimal path lies outside the band, the result is silently sub-optimal.
 sp.path_valid   # guide_j is usable (realign_banded is callable)
 sp.score_valid  # score matches current matrix and path
 sp.grad_valid   # grad is populated
-sp.dp_valid     # DP tables are still in memory (compute_grad is callable)
+sp.dp_valid     # an alignment path is stored (aligned()/coordinates() are callable)
 ```
 
-`compute_grad()` requires both `score_valid` and `dp_valid`. After
-`score_and_grad()` via `SeqPairBatch` (see Tutorial 2), `dp_valid` is `False`
-but `grad_valid` is already `True`.
+`compute_grad()` returns the cached gradient, or releases the gradient held by
+`align_full()` / `realign_banded()`. It needs a current gradient, not DP tables or
+a stored path. `drop_dp()` discards a held gradient, but a released gradient survives.
+After a batch `score_and_grad()` (see Tutorial 2), `grad_valid` is
+`True`; `dp_valid` is `True` only if `keep_paths=True` was requested.
 
 ## Summary
 
