@@ -47,3 +47,12 @@ instead (a separate build: TSan cannot be combined with ASan). Every build of th
 tests also enables libstdc++'s `_GLIBCXX_ASSERTIONS` bounds checks, and everything is
 compiled with `-ffp-contract=off`, so no SIMD level can fuse an FMA the scalar path
 does not.
+
+`nwgrad_header_tests` links no ISA kernel translation units. It checks that the
+dispatch table is empty, then exercises alignment and DP-buffer reuse through
+the header-only fallback. CI runs this target with ASan and UBSan:
+
+```bash
+cmake --build build-san --target nwgrad_header_tests
+ctest --test-dir build-san --output-on-failure -R '^cpp_header_tests$'
+```

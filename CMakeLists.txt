@@ -221,25 +221,43 @@ if (NWGRAD_BUILD_TESTS)
     endif()
     target_link_libraries(nwgrad_tests PRIVATE Threads::Threads)
 
+    # Real header-only consumer: no ISA-level TUs or registrars are linked, so
+    # every dispatch slot stays empty and alignment exercises the header fallback.
+    add_executable(nwgrad_header_tests
+        tests/cpp/main.cpp
+        tests/cpp/test_header_only.cpp
+        tests/cpp/test_buffer_reuse.cpp)
+    target_include_directories(nwgrad_header_tests PRIVATE src/nwgrad/cpp/nwgrad tests/cpp)
+    target_compile_features(nwgrad_header_tests PRIVATE cxx_std_20)
+    target_link_libraries(nwgrad_header_tests PRIVATE Threads::Threads)
+    if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(nwgrad_header_tests PRIVATE -Wall -Wextra)
+    endif()
+    # A build of the usual test target must provide every executable ctest runs.
+    add_dependencies(nwgrad_tests nwgrad_header_tests)
+
     # Hardened standard library for the test binary in EVERY build, not only the
     # sanitizer ones: the plain gcc/clang and NEON CI jobs, and any local
     # `cmake -B build`, otherwise ran the tests with unchecked operator[].  Neither
     # macro changes the ABI.  Deliberately not -fhardened: its
     # -ftrivial-auto-var-init=zero would zero exactly the uninitialized reads a test
     # build exists to expose, and _FORTIFY_SOURCE needs optimization.
-    target_compile_definitions(nwgrad_tests PRIVATE
-        _GLIBCXX_ASSERTIONS
-        $<$<CXX_COMPILER_ID:Clang,AppleClang>:_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_DEBUG>)
+    foreach(test_target nwgrad_tests nwgrad_header_tests)
+        target_compile_definitions(${test_target} PRIVATE
+            _GLIBCXX_ASSERTIONS
+            $<$<CXX_COMPILER_ID:Clang,AppleClang>:_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_DEBUG>)
 
-    # Sanitizers must be passed to both the compile and the link step.
-    if (NWGRAD_SANITIZE)
-        target_compile_options(nwgrad_tests PRIVATE ${NWGRAD_SANITIZE_FLAGS})
-        target_link_options(nwgrad_tests PRIVATE ${NWGRAD_SANITIZE_FLAGS})
-        target_compile_definitions(nwgrad_tests PRIVATE ${NWGRAD_SANITIZE_DEFS})
-    endif()
+        # Sanitizers must be passed to both the compile and the link step.
+        if (NWGRAD_SANITIZE)
+            target_compile_options(${test_target} PRIVATE ${NWGRAD_SANITIZE_FLAGS})
+            target_link_options(${test_target} PRIVATE ${NWGRAD_SANITIZE_FLAGS})
+            target_compile_definitions(${test_target} PRIVATE ${NWGRAD_SANITIZE_DEFS})
+        endif()
+    endforeach()
 
     enable_testing()
     add_test(NAME cpp_tests COMMAND nwgrad_tests)
+    add_test(NAME cpp_header_tests COMMAND nwgrad_header_tests)
 
     # ── The simd kernel, once per instruction set ────────────────────────────────
     #

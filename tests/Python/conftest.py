@@ -15,11 +15,13 @@ gradient, alignment and biopython test into a simd test.
 (sse2/avx2/avx512 on x86, neon on ARM) — the whole suite runs once per level, so the
 baseline (sse2) kernel is tested from Python too, not just the strongest.  It mirrors the
 C++ ctest cpp_tests_isa_* loop.  The backend is passed per-call via kernel= (the unified
-vocabulary in simd_levels.hpp), so no global state is mutated; scalar_fallback is left out
-of the =simd sweep since that is the default (unforced) run.
+vocabulary in simd_levels.hpp), including batch add_many() and align(). Explicit
+kernel arguments are preserved. The unforced run uses auto (best available SIMD);
+run =scalar_fallback separately to exercise the scalar backend.
 """
 
 import os
+import re
 
 import pytest
 
@@ -73,8 +75,8 @@ _current_backend = None  # the backend string injected into kernel=, updated per
 def _sweep_backends():
     """Backend value(s) to force, or None for a normal (unforced) run.
 
-    "simd"       -> every simd level the CPU runs (scalar_fallback excluded — it is the
-                    default run); the suite runs once per level.
+    "simd"       -> every simd level the CPU runs (scalar_fallback excluded);
+                    the suite runs once per level.
     <backend>    -> force exactly that backend (scalar_fallback / auto / sse2 / avx2 / ...).
     """
     if not _KERNEL:
@@ -106,11 +108,12 @@ def pytest_report_header(config):
     return f"nwgrad: FORCING kernel={(_SWEEP or [_KERNEL])[0]!r} for every aligner call"
 
 
-def _inject_kernel(fn):
+def _inject_kernel(fn, kernel_position):
     """Wrap a callable so it passes kernel=<current backend> unless the caller set one."""
 
     def wrapper(*args, **kwargs):
-        kwargs.setdefault("kernel", _current_backend)
+        if len(args) <= kernel_position:
+            kwargs.setdefault("kernel", _current_backend)
         return fn(*args, **kwargs)
 
     wrapper.__name__ = getattr(fn, "__name__", "wrapped")
@@ -119,9 +122,7 @@ def _inject_kernel(fn):
 
 
 def _patch_entry_points(nwgrad):
-    # Every entry point that accepts kernel=: the 12 convenience functions, plus the
-    # classes.  Discovered from the signature rather than a hand-kept list, so a new entry
-    # point cannot quietly escape the sweep.
+    # Discover functions, constructors and class methods that accept kernel=.
     #
     # inspect.signature() is no use here: nanobind callables report (*args, **kwargs).  The
     # real signature is the first line of __doc__, and for a bound class it is __init__'s.
@@ -129,13 +130,29 @@ def _patch_entry_points(nwgrad):
         doc = obj.__init__.__doc__ if isinstance(obj, type) else obj.__doc__
         return (doc or "").splitlines()[0] if doc else ""
 
+    def kernel_position(signature, constructor=False):
+        # nanobind's first docstring line includes self for __init__, but callers
+        # of the class pass no self. Method wrappers receive it in args normally.
+        params = re.findall(r"(?:^|,\s*)(\w+):", signature.split("(", 1)[1])
+        return params.index("kernel") - int(constructor)
+
     patched = []
     for name in dir(nwgrad):
         if name.startswith("_"):
             continue
         obj = getattr(nwgrad, name)
-        if callable(obj) and "kernel:" in signature_line(obj):
-            setattr(nwgrad, name, _inject_kernel(obj))
+        if isinstance(obj, type):
+            for method_name in dir(obj):
+                method = getattr(obj, method_name)
+                signature = (getattr(method, "__doc__", None) or "").splitlines()
+                if method_name != "__init__" and signature and "kernel:" in signature[0]:
+                    setattr(obj, method_name, _inject_kernel(
+                        method, kernel_position(signature[0])))
+                    patched.append(f"{name}.{method_name}")
+        signature = signature_line(obj)
+        if callable(obj) and "kernel:" in signature:
+            setattr(nwgrad, name, _inject_kernel(
+                obj, kernel_position(signature, constructor=isinstance(obj, type))))
             patched.append(name)
 
     assert patched, "NWGRAD_FORCE_KERNEL set, but no kernel-taking entry point was patched"

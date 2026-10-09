@@ -142,16 +142,12 @@ jobs:
           # tolerance being loosened.
           NWGRAD_FORCE_KERNEL=simd pytest tests/Python/ -q
 
-  no-multiversion:
-    # The MSVC / AArch64 fallback path, compiled on x86 where it can actually be run
-    # under a sanitizer.  The Windows and ARM jobs above exercise this code, but on
-    # platforms where an out-of-bounds read in the row kernels would go unnoticed —
-    # neither has ASan here.  This job closes that gap cheaply: same single-entry
-    # table, same kernels, but with the sanitizers pointed at them.
-    name: C++ tests (single-ISA fallback path, ASan+UBSan)
+  header-only-sanitizers:
+    # Link no ISA kernel TUs: the test asserts empty dispatch slots and exercises
+    # alignment and buffer reuse through the actual header-only fallback.
+    name: C++ tests (header-only fallback, ASan+UBSan)
     runs-on: ubuntu-latest
     env:
-      CXXFLAGS: -DNWGRAD_NO_MULTIVERSION=1
       UBSAN_OPTIONS: print_stacktrace=1
     steps:
       - uses: actions/checkout@v7
@@ -165,15 +161,15 @@ jobs:
 
       - name: Configure
         run: >
-          cmake -S . -B build-nomv -DCMAKE_BUILD_TYPE=Debug
+          cmake -S . -B build-header -DCMAKE_BUILD_TYPE=Debug
           -DNWGRAD_SANITIZE=ON
           -Dnanobind_DIR="$(python -m nanobind --cmake_dir)"
 
       - name: Build
-        run: cmake --build build-nomv --target nwgrad_tests -j"$(nproc)"
+        run: cmake --build build-header --target nwgrad_header_tests -j"$(nproc)"
 
       - name: Test
-        run: ctest --test-dir build-nomv --output-on-failure
+        run: ctest --test-dir build-header --output-on-failure -R '^cpp_header_tests$'
 
   sanitizers:
     name: C++ tests (${{ matrix.compiler }}, ASan+UBSan)
