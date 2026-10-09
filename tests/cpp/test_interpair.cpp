@@ -63,11 +63,11 @@ void batch_case(const std::string& alpha, GapModel gm, AlignMode am, GradMode gd
     std::vector<std::string> A, B;
     make_seqs(alpha, 61, 1, 30, 30, 38, seed, A, B);   // B lengths mixed within the cap
     const AlignParams p = params_for(alpha, gm == GapModel::Linear, seed);
-    SeqPairBatchT<T> own(3, TracebackMode::Pointers), inter(3, TracebackMode::Pointers);
+    SeqPairBatchT<T> own(gm, am, gd, 3, TracebackMode::Pointers), inter(gm, am, gd, 3, TracebackMode::Pointers);
     own.set_fill(false, false);
     inter.set_fill(false, true);
-    own.add_many(views(A), views(B), p, gm, am, gd);
-    inter.add_many(views(A), views(B), p, gm, am, gd);
+    own.add_many(views(A), views(B), p);
+    inter.add_many(views(A), views(B), p);
     own.score_and_grad();
     inter.score_and_grad();
     if (band > 0) { own.banded_grad(band); inter.banded_grad(band); }

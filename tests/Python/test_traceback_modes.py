@@ -43,9 +43,8 @@ def _seqs(n, lo, hi, seed):
 
 
 def _batch(seqs_a, seqs_b, params, mode, traceback, grad_mode="hard", threads=4):
-    b = nwgrad.SeqPairBatch(n_threads=threads, traceback=traceback)
-    b.add_many(seqs_a, seqs_b, params, gap_model="affine", mode=mode,
-               grad_mode=grad_mode, kernel="auto")
+    b = nwgrad.SeqPairBatch(n_threads=threads, traceback=traceback, gap_model="affine", mode=mode, grad_mode=grad_mode)
+    b.add_many(seqs_a, seqs_b, params, kernel="auto")
     return b
 
 
@@ -101,7 +100,7 @@ def test_aligned_strings_identical(params, mode):
     out = {}
     for tb in MODES:
         batch = _batch(a_seqs, b_seqs, params, mode, tb, threads=1)
-        out[tb] = (batch.align_full(),
+        out[tb] = (batch.score_and_grad(keep_paths=True),
                    [batch[i].aligned() for i in range(len(a_seqs))],
                    [list(batch[i].guide_j) for i in range(len(a_seqs))])
     assert out["scores"] == out["pointers"]

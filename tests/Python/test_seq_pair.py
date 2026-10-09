@@ -3,7 +3,7 @@ streaming (SeqPairBatch.align, formerly BatchAligner) APIs.
 
 Coverage:
   - SeqPairBatch.score_and_grad() vs ref API; dp_valid stays False; compute_grad() after
-  - SeqPair.drop_dp() / SeqPairBatch.drop_dp() lifecycle and memory release
+  - SeqPair.drop_dp() / SeqPairBatch.drop_paths() lifecycle and memory release
   - SeqPair.align_full() score vs nw_score / sw_score / nw_score_affine / sw_score_affine
   - SeqPair hard grad vs nw_grad / sw_grad / nw_affine_grad / sw_affine_grad
   - SeqPair soft score (log Z) and grad vs nw_soft_grad / sw_soft_grad / ...
@@ -13,7 +13,7 @@ Coverage:
   - SeqPairBatch sums match individual SeqPair results
   - SeqPairBatch matches BatchAligner (hard grad mode)
   - SeqPairBatch multi-thread matches single-thread
-  - Error handling: premature calls raise; alloc_dp is a deprecated no-op
+  - Error handling: premature calls raise; paths are stored on request
 """
 
 import numpy as np
@@ -107,43 +107,25 @@ ALL_CONFIGS = [
 
 # ── SeqPair: allocation lifecycle ─────────────────────────────────────────────
 
-class TestExplicitAlloc:
-    """alloc_dp() was required before align_full(); since 0.6 there are no pair-owned
-    tables, and it is a deprecated no-op."""
+class TestPairAllocation:
+    """Alignment allocates its worker buffer on demand."""
 
     def test_align_full_without_alloc_works(self, blosum):
         sp = nwgrad.SeqPair("ACDE", "ACDE", blosum)
         sp.align_full()
         assert sp.score_valid
 
-    def test_alloc_dp_is_deprecated(self, blosum):
-        sp = nwgrad.SeqPair("ACDE", "ACDE", blosum)
-        with pytest.warns(DeprecationWarning):
-            sp.alloc_dp()
-
-    def test_realign_banded_after_drop_dp_requires_alloc(self, blosum):
+    def test_realign_banded_after_drop_dp_reallocates(self, blosum):
         sp = nwgrad.SeqPair("ACDE", "ACDE", blosum)
         sp.align_full()
         sp.drop_dp()
         sp.realign_banded(10)
         assert sp.score_valid
 
-    def test_align_full_after_alloc_succeeds(self, blosum):
+    def test_align_full_allocates_on_demand(self, blosum):
         sp = nwgrad.SeqPair("ACDE", "ACDE", blosum)
         sp.align_full()
         assert sp.score_valid
-
-    def test_batch_deprecated_alloc_and_align_full_still_work(self, blosum):
-        batch = nwgrad.SeqPairBatch(n_threads=1, gap_model="linear")
-        batch.add_many(["ACDE"], ["ACDE"], blosum)
-        with pytest.warns(DeprecationWarning):
-            batch.alloc_dp()
-        with pytest.warns(DeprecationWarning):
-            batch.align_full()
-        assert batch[0].dp_valid and not batch[0].grad_valid   # held, as before
-        batch.compute_grad()
-        assert batch[0].grad_valid
-
 
 # ── SeqPair: align_full score ─────────────────────────────────────────────────
 
@@ -375,7 +357,7 @@ class TestSeqPairBatchSums:
         batch.add_many([x for x, _ in PAIRS], [y for _, y in PAIRS], p)
         pairs_obj = list(batch)
 
-        total = batch.align_full()
+        total = batch.score_and_grad(keep_paths=True)
         expected = sum(sp.score for sp in pairs_obj)
         assert total == pytest.approx(expected, rel=1e-10)
 
@@ -387,7 +369,7 @@ class TestSeqPairBatchSums:
         batch.add_many([x for x, _ in PAIRS], [y for _, y in PAIRS], p)
         pairs_obj = list(batch)
 
-        batch.align_full()
+        batch.score_and_grad(keep_paths=True)
         batch_grad = grad_matrix(batch.compute_grad())
 
         expected = np.zeros((20, 20))
@@ -403,9 +385,9 @@ class TestSeqPairBatchSums:
         batch.add_many([x for x, _ in PAIRS], [y for _, y in PAIRS], p)
         pairs_obj = list(batch)
 
-        batch.align_full()
+        batch.score_and_grad(keep_paths=True)
         bw = 20
-        total = batch.realign_banded(bw)
+        total = batch.banded_grad(bw, keep_paths=True)
         expected = sum(sp.score for sp in pairs_obj)
         assert total == pytest.approx(expected, rel=1e-10)
 
@@ -429,7 +411,7 @@ class TestSeqPairBatchVsBatchAligner:
                                   grad_mode="hard")
         batch.add_many([x for x, _ in PAIRS], [y for _, y in PAIRS], p)
         pairs_obj = list(batch)
-        batch.align_full()
+        batch.score_and_grad(keep_paths=True)
 
         new_scores = np.array([sp.score for sp in pairs_obj])
         np.testing.assert_allclose(new_scores, ref_scores, atol=1e-10)
@@ -449,7 +431,7 @@ class TestSeqPairBatchVsBatchAligner:
         batch = nwgrad.SeqPairBatch(n_threads=1, gap_model=gap_model, mode=mode,
                                   grad_mode="hard")
         batch.add_many([x for x, _ in PAIRS], [y for _, y in PAIRS], p)
-        batch.align_full()
+        batch.score_and_grad(keep_paths=True)
         new_grad = grad_matrix(batch.compute_grad())
 
         np.testing.assert_allclose(new_grad, ref_grad, atol=1e-10)
@@ -470,8 +452,8 @@ class TestSeqPairBatchThreading:
         b1 = make_batch(1)
         bm = make_batch(n_threads)
 
-        total1 = b1.align_full()
-        totalm = bm.align_full()
+        total1 = b1.score_and_grad(keep_paths=True)
+        totalm = bm.score_and_grad(keep_paths=True)
 
         assert totalm == pytest.approx(total1, rel=1e-10)
 
@@ -486,8 +468,8 @@ class TestSeqPairBatchThreading:
 
         b1 = make_batch(1)
         bm = make_batch(n_threads)
-        b1.align_full()
-        bm.align_full()
+        b1.score_and_grad(keep_paths=True)
+        bm.score_and_grad(keep_paths=True)
 
         g1 = grad_matrix(b1.compute_grad())
         gm = grad_matrix(bm.compute_grad())
@@ -500,9 +482,9 @@ class TestSeqPairBatchThreading:
                                   grad_mode="hard")
         batch.add_many([x for x, _ in PAIRS], [y for _, y in PAIRS], p)
 
-        batch.align_full()
+        batch.score_and_grad(keep_paths=True)
         batch.set_params(blosum2)
-        total = batch.realign_banded(30)
+        total = batch.banded_grad(30, keep_paths=True)
         assert isinstance(total, float)
 
         grad = grad_matrix(batch.compute_grad())
@@ -803,10 +785,8 @@ class TestDropDp:
 
 # ── drop_dp: SeqPairBatch ─────────────────────────────────────────────────────
 
-@pytest.mark.filterwarnings("ignore::DeprecationWarning")
-class TestDropDpBatch:
-    """The deprecated pair-table batch API (alloc_dp / align_full / realign_banded /
-    drop_dp), kept for DiscrimAlign: same observable lifecycle, over stored paths."""
+class TestDropPathsBatch:
+    """Dropping batch paths preserves cached scores, gradients and guides."""
     def _make_batch(self, n_threads=1):
         p = make_params(1.0, 11.0)
         batch = nwgrad.SeqPairBatch(n_threads=n_threads, gap_model="affine", mode="global",
@@ -815,51 +795,50 @@ class TestDropDpBatch:
         pairs_obj = list(batch)
         return batch, pairs_obj
 
-    def test_batch_drop_dp_clears_dp_valid_on_all(self):
+    def test_batch_drop_paths_clears_dp_valid_on_all(self):
         batch, pairs_obj = self._make_batch()
-        batch.align_full()
+        batch.score_and_grad(keep_paths=True)
         assert all(sp.dp_valid for sp in pairs_obj)
-        batch.drop_dp()
+        batch.drop_paths()
         assert not any(sp.dp_valid for sp in pairs_obj)
 
-    def test_batch_drop_dp_preserves_scores(self):
+    def test_batch_drop_paths_preserves_scores(self):
         batch, pairs_obj = self._make_batch()
-        batch.align_full()
+        batch.score_and_grad(keep_paths=True)
         scores_before = [sp.score for sp in pairs_obj]
-        batch.drop_dp()
+        batch.drop_paths()
         for sp, s in zip(pairs_obj, scores_before):
             assert sp.score == pytest.approx(s)
 
-    def test_batch_drop_dp_preserves_grads(self):
+    def test_batch_drop_paths_preserves_grads(self):
         batch, pairs_obj = self._make_batch()
-        batch.align_full()
+        batch.score_and_grad(keep_paths=True)
         batch.compute_grad()
         grads_before = [grad_matrix(sp.grad).copy() for sp in pairs_obj]
-        batch.drop_dp()
+        batch.drop_paths()
         for sp, g in zip(pairs_obj, grads_before):
             np.testing.assert_array_equal(grad_matrix(sp.grad), g)
 
-    def test_batch_drop_dp_blocks_compute_grad(self):
+    def test_batch_drop_paths_preserves_compute_grad(self):
         batch, pairs_obj = self._make_batch()
-        batch.align_full()
-        batch.drop_dp()
-        with pytest.raises(Exception, match="dropped"):
-            batch.compute_grad()
+        batch.score_and_grad(keep_paths=True)
+        batch.drop_paths()
+        assert batch.compute_grad() is not None
 
-    def test_batch_drop_dp_then_realign_restores(self):
+    def test_batch_drop_paths_then_realign_restores(self):
         batch, pairs_obj = self._make_batch()
-        batch.align_full()
-        batch.drop_dp()
-        batch.realign_banded(30)
+        batch.score_and_grad(keep_paths=True)
+        batch.drop_paths()
+        batch.banded_grad(30, keep_paths=True)
         assert all(sp.dp_valid for sp in pairs_obj)
         grad = grad_matrix(batch.compute_grad())
         assert grad.shape == (20, 20)
         assert grad.sum() > 0
 
-    def test_batch_drop_dp_multithreaded(self):
+    def test_batch_drop_paths_multithreaded(self):
         batch, pairs_obj = self._make_batch(n_threads=4)
-        batch.align_full()
-        batch.drop_dp()
+        batch.score_and_grad(keep_paths=True)
+        batch.drop_paths()
         assert not any(sp.dp_valid for sp in pairs_obj)
 
 

@@ -82,11 +82,10 @@ expected = np.array([c @ diag for c in counts], dtype=float)
 
 
 def build(tb, threads):
-    b = nwgrad.SeqPairBatch(n_threads=threads, traceback=tb)
+    b = nwgrad.SeqPairBatch(n_threads=threads, traceback=tb, gap_model="affine", mode="local", grad_mode="hard")
     if tb == "hirschberg":
         b.hb_cutoff = args.cutoff
-    b.add_many(seqs, seqs, params, gap_model="affine", mode="local",
-               grad_mode="hard", kernel="auto")
+    b.add_many(seqs, seqs, params, kernel="auto")
     return b
 
 

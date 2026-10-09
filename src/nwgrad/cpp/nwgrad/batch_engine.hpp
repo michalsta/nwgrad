@@ -56,9 +56,8 @@
 #include "parallel.hpp"
 #include "simd_levels.hpp"
 
-// Every setting of a batch, its default and its validation, in one place.  A typed batch's
-// engine owns the one copy; an untyped (deprecated) SeqPairBatchT holds one only until its
-// first add_many() builds the engine from it.  The setters here validate and normalize;
+// Every setting of a batch, its default and its validation, in one place. The engine
+// owns the only copy. The setters here validate and normalize;
 // BatchEngine's setters add what the engine must do on a change (soft_temperature
 // invalidates soft results, n_threads resolves 0).
 struct BatchSettings {
@@ -248,7 +247,7 @@ public:
     // Pair i's gradient into `out` (same alphabet).
     void grad(size_t i, AlignParams& out) const {
         if (!grad_valid(i))
-            throw std::logic_error("nwgrad: gradient not computed; call compute_grad() first");
+            throw std::logic_error("nwgrad: gradient not computed; call score_and_grad() or banded_grad() first (a SeqPair.align_full() gradient needs compute_grad())");
         const double* g = grad_.data() + i * gstride();
         std::memcpy(out.matrix.data(), g, nn_ * sizeof(double));
         out.gap_open_a = g[nn_]; out.gap_extend_a = g[nn_ + 1];
@@ -338,10 +337,7 @@ public:
     // coordinates()); it forces the Viterbi a lazy or posterior soft guide would skip.
     // Returns the sum of scores, in pair order (bit-reproducible whatever the schedule).
     //
-    // hold_grads: leave each gradient computed but NOT valid until compute_grad() — the
-    // state the old align_full() / realign_banded() left (they computed no gradient;
-    // compute_grad() derived it from the retained tables).  The deprecated wrappers use it.
-    double score_and_grad(bool keep_paths = false, bool hold_grads = false) {
+    double score_and_grad(bool keep_paths = false) {
         const size_t N = size();
         if (N == 0) return 0.0;
         prepare_paths_(keep_paths);
@@ -350,13 +346,12 @@ public:
         else if (s_.inter_fill)      score_and_grad_inter_(keep_paths);
         else if (s_.sorted_schedule) score_and_grad_sorted_(keep_paths);
         else                      score_and_grad_dynamic_(keep_paths);
-        if (hold_grads) hold_all_();
         return sum_scores_();
     }
 
     // Banded re-align + gradient around every pair's cached guide (the training-loop
     // step after set_params()).  Throws if any pair has no guide yet.
-    double banded_grad(int bandwidth, bool keep_paths = false, bool hold_grads = false) {
+    double banded_grad(int bandwidth, bool keep_paths = false) {
         const size_t N = size();
         if (N == 0) return 0.0;
         if (bandwidth <= 0)
@@ -366,13 +361,11 @@ public:
         for (size_t i = 0; i < N; ++i)
             if (!path_valid(i))
                 throw std::logic_error(
-                    "nwgrad: banded_grad_with_dp() needs a guide path; run the full "
-                    "score_and_grad_with_dp() (or align_full()) at least once first");
+                    "nwgrad: banded_grad() needs a guide path; run score_and_grad() first");
         prepare_paths_(keep_paths);
         if (s_.inter_fill && !keep_paths) banded_grad_inter_(bandwidth);
         else if (s_.sorted_schedule)      banded_grad_lpt_(bandwidth, keep_paths);
         else                           banded_grad_dynamic_(bandwidth, keep_paths);
-        if (hold_grads) hold_all_();
         return sum_scores_();
     }
 
@@ -446,10 +439,10 @@ public:
     }
     // The summed gradient (weights all 1: w*g == g exactly, so this is the plain blocked
     // sum).  Unlike the old per-thread completion-order merge, reproducible bit for bit.
-    // Releases held gradients first (compute_grad_one, in pair order: the first pair
-    // that cannot raises its own message).
     AlignParams compute_grad() {
         const Alphabet& alpha = alphabet();
+        // Pair views can still call the supported align_full()/compute_grad() API.
+        // Only those per-pair calls hold gradients; batch fills publish them directly.
         for (size_t i = 0; i < size(); ++i) compute_grad_one(i);
         return blocked_sum_(alpha, nullptr);
     }
@@ -906,9 +899,11 @@ private:
         return {x, y};
     }
     void check_all_grads_() const {
+        if (grad_mode_ == GradMode::None)
+            throw std::logic_error("nwgrad: grad_mode is None; construct with Hard or Soft to enable gradients");
         for (size_t i = 0; i < size(); ++i)
             if (!grad_valid(i))
-                throw std::logic_error("nwgrad: gradient not computed; call compute_grad() first");
+                throw std::logic_error("nwgrad: gradient not computed; call score_and_grad() or banded_grad() first (a SeqPair.align_full() gradient needs compute_grad())");
     }
     void prepare_paths_(bool keep, bool all = true) {
         if (!keep) {
@@ -1052,7 +1047,6 @@ private:
     void hold_(size_t i) noexcept {
         if (flags_[i] & kGrad) flags_[i] = static_cast<uint8_t>((flags_[i] & ~kGrad) | kHeld);
     }
-    void hold_all_() noexcept { for (size_t i = 0; i < size(); ++i) hold_(i); }
     void finish_(size_t i, bool banded, bool pending) {
         uint8_t f = flags_[i] & kStored;
         f |= kPath | kScore;

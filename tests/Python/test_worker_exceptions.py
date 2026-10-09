@@ -43,26 +43,24 @@ def test_compute_grad_with_grad_mode_none_raises():
     """grad_mode=None makes SeqPair::compute_grad() throw, again from a worker."""
     params = make_params()
     batch, _pairs = make_batch(params, grad_mode="none")
-    batch.align_full()
+    batch.score_and_grad(keep_paths=True)
     with pytest.raises(RuntimeError, match="grad_mode"):
         batch.compute_grad()
 
 
-@pytest.mark.filterwarnings("ignore::DeprecationWarning")
-def test_align_full_without_alloc_dp_works():
-    """There are no pair-owned tables any more: alloc_dp() is a deprecated no-op and
-    align_full() needs nothing allocated first."""
+def test_batch_stores_paths_without_explicit_allocation():
+    """Stored paths need no explicit allocation."""
     params = make_params()
     batch, _pairs = make_batch(params)
-    assert batch.align_full() == pytest.approx(N_PAIRS * batch[0].score)
+    assert batch.score_and_grad(keep_paths=True) == pytest.approx(N_PAIRS * batch[0].score)
 
 
 def test_realign_banded_without_path_raises():
-    """realign_banded() requires a prior align_full(); throws from a worker."""
+    """banded_grad() requires a guide from score_and_grad()."""
     params = make_params()
     batch, _pairs = make_batch(params)
-    with pytest.raises(RuntimeError, match="align_full"):
-        batch.realign_banded(3)
+    with pytest.raises(RuntimeError, match="score_and_grad"):
+        batch.banded_grad(3, keep_paths=True)
 
 
 # (Two add() tests stood here: that add() kept its borrowed SeqPairs alive, and that it
@@ -168,7 +166,7 @@ def test_batch_still_usable_after_a_caught_worker_exception():
     with pytest.raises(RuntimeError):
         batch.compute_grad()          # too early
 
-    batch.align_full()                # now in the right order
+    batch.score_and_grad(keep_paths=True)                # now in the right order
     grad = batch.compute_grad()
 
     single = nwgrad.SeqPair("ACDEFGHIK", "ACDEFGHIK", params,

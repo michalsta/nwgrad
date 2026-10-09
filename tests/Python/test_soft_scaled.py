@@ -33,9 +33,9 @@ def rand_seq(rng, alpha, n):
 
 
 def batch_results(A, B, params, gm, mode, impl, threads=2):
-    b = nwgrad.SeqPairBatchDouble(n_threads=threads)
+    b = nwgrad.SeqPairBatchDouble(n_threads=threads, gap_model=gm, mode=mode, grad_mode="soft")
     b.soft_impl = impl
-    b.add_many(A, B, params, gap_model=gm, mode=mode, grad_mode="soft")
+    b.add_many(A, B, params)
     b.score_and_grad()
     mats, gaps = b.grads()
     return b.scores(), mats, gaps
@@ -139,8 +139,8 @@ def test_scaled_long_local_protein_in_range():
 
 def test_scaled_raises_out_of_range():
     s, params = out_of_range_case()
-    b = nwgrad.SeqPairBatchDouble(n_threads=1)
-    b.add_many([s], [s], params, gap_model="affine", mode="local", grad_mode="soft")
+    b = nwgrad.SeqPairBatchDouble(n_threads=1, gap_model="affine", mode="local", grad_mode="soft")
+    b.add_many([s], [s], params)
     assert b.soft_impl == "scaled"
     with pytest.raises(ValueError, match="scaled_or_log"):
         b.score_and_grad()
@@ -184,9 +184,9 @@ def test_soft_interpair_identical(mode, cls):
     B = [rand_seq(rng, "ACGT", b) for _, b in lens]
     out = []
     for fill in ("striped", "interpair"):
-        b = cls(n_threads=3, traceback="pointers")
+        b = cls(n_threads=3, traceback="pointers", gap_model="affine", mode=mode, grad_mode="soft")
         b.fill = fill
-        b.add_many(A, B, params, gap_model="affine", mode=mode, grad_mode="soft")
+        b.add_many(A, B, params)
         b.score_and_grad()
         mats, gaps = b.grads()
         guides = [list(b[i].guide_j) for i in range(len(b))]
@@ -215,11 +215,11 @@ def test_temperature_is_scaled_params(gm, mode, impl):
     A = [rand_seq(rng, "ACGT", int(rng.integers(1, 30))) for _ in range(12)]
     B = [rand_seq(rng, "ACGT", int(rng.integers(1, 40))) for _ in range(12)]
     for T in (0.3, 2.5):
-        b = nwgrad.SeqPairBatchDouble(n_threads=2)
+        b = nwgrad.SeqPairBatchDouble(n_threads=2, gap_model=gm, mode=mode, grad_mode="soft")
         b.soft_impl = impl
         b.soft_temperature = T
         assert b.soft_temperature == T
-        b.add_many(A, B, params, gap_model=gm, mode=mode, grad_mode="soft")
+        b.add_many(A, B, params)
         b.score_and_grad()
         m1, g1 = b.grads()
         s2, m2, g2 = batch_results(A, B, scaled_params(params, 1.0 / T), gm, mode, impl)
@@ -302,10 +302,10 @@ def test_soft_interpair_linear(mode, T, cls):
     B = [rand_seq(rng, "ACGT", b) for _, b in lens]
     out = []
     for fill in ("striped", "interpair"):
-        b = cls(n_threads=3)
+        b = cls(n_threads=3, gap_model="linear", mode=mode, grad_mode="soft")
         b.fill = fill
         b.soft_temperature = T
-        b.add_many(A, B, params, gap_model="linear", mode=mode, grad_mode="soft")
+        b.add_many(A, B, params)
         b.score_and_grad()
         mats, gaps = b.grads()
         out.append((b.scores(), mats, gaps, [list(b[i].guide_j) for i in range(len(b))]))
@@ -330,10 +330,10 @@ def test_soft_guide_lazy(gm, fill):
     B = [rand_seq(rng, "ACGT", 40) for _ in range(30)]
 
     def batch(policy):
-        b = nwgrad.SeqPairBatchDouble(n_threads=2, traceback="pointers")
+        b = nwgrad.SeqPairBatchDouble(n_threads=2, traceback="pointers", gap_model=gm, mode="local", grad_mode="soft")
         b.fill = fill
         b.soft_guide = policy
-        b.add_many(A, B, params, gap_model=gm, mode="local", grad_mode="soft")
+        b.add_many(A, B, params)
         b.score_and_grad()
         return b
 
@@ -349,8 +349,8 @@ def test_soft_guide_lazy(gm, fill):
     # After set_params, a pending lazy guide follows the NEW params.
     l3 = batch("lazy")
     l3.set_params(p2)
-    e2 = nwgrad.SeqPairBatchDouble(n_threads=2, traceback="pointers")
-    e2.add_many(A, B, p2, gap_model=gm, mode="local", grad_mode="soft")
+    e2 = nwgrad.SeqPairBatchDouble(n_threads=2, traceback="pointers", gap_model=gm, mode="local", grad_mode="soft")
+    e2.add_many(A, B, p2)
     e2.score_and_grad()
     assert [list(l3[i].guide_j) for i in range(30)] == [list(e2[i].guide_j) for i in range(30)]
 
@@ -396,12 +396,12 @@ def test_lazy_rescale_both_directions(gm, mode, bw):
 
 def _post_batch(A, B, params, gm, mode, fill, impl="scaled", T=1.0, guide="posterior",
                 cls=nwgrad.SeqPairBatchDouble):
-    b = cls(n_threads=2, traceback="pointers")
+    b = cls(n_threads=2, traceback="pointers", gap_model=gm, mode=mode, grad_mode="soft")
     b.fill = fill
     b.soft_impl = impl
     b.soft_temperature = T
     b.soft_guide = guide
-    b.add_many(A, B, params, gap_model=gm, mode=mode, grad_mode="soft")
+    b.add_many(A, B, params)
     b.score_and_grad()
     return b
 

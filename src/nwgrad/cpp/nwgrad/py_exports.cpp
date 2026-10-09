@@ -6,11 +6,9 @@
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/string_view.h>
 #include <nanobind/stl/vector.h>
-#include <nanobind/stl/optional.h>
 
 #include <algorithm>
 #include <cstdint>
-#include <optional>
 #include <string>
 #include <vector>
 
@@ -276,11 +274,6 @@ static void bind_convenience(nb::module_& m, const std::string& sfx) {
 #undef NWG_CONV_ARGS
 }
 
-// A DeprecationWarning at the Python caller (stacklevel 1 = the frame calling us).
-static void deprecated(const char* msg) {
-    if (PyErr_WarnEx(PyExc_DeprecationWarning, msg, 1) != 0) throw nb::python_error();
-}
-
 static nb::object numpy_1d(const std::vector<double>& v) {
     double* buf = new double[v.size() ? v.size() : 1];
     std::copy(v.begin(), v.end(), buf);
@@ -319,10 +312,6 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
             "A pair taken from a batch (batch[i]) is a view of that batch's pair i: its\n"
             "results are the batch's, and its settings (params, fill, soft options,\n"
             "hb_cutoff) are the batch's too — set them on the batch.")
-        .def("alloc_dp",
-             [](SP&) { deprecated("SeqPair.alloc_dp() does nothing and is deprecated: the DP "
-                                  "runs on a worker buffer, there are no pair tables to allocate"); },
-             "Deprecated no-op (there are no per-pair DP tables to allocate).")
         .def(
             "set_params",
             [](nb::object self_obj, nb::object params_obj) {
@@ -430,48 +419,29 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
         .def_prop_ro("seq_b", [](const SP& s) { return s.seq_b(); });
 }
 
-template<class Opt, class Parse>
-static Opt parse_opt(const std::optional<std::string>& v, Parse parse) {
-    if (!v) return std::nullopt;
-    return parse(*v);
-}
-
 // ── SeqPairBatch ─────────────────────────────────────────────────────────────
 template<class T>
 static void bind_seq_pair_batch(nb::module_& m, const char* name) {
     using SPB = SeqPairBatchT<T>;
     using SP  = SeqPairT<T>;
-    using OS  = std::optional<std::string>;
     nb::class_<SPB>(m, name, nb::dynamic_attr())
         .def(
             "__init__",
-            [](SPB* self, int n_threads, const std::string& traceback, const OS& gap_model,
-               const OS& mode, const OS& grad_mode) {
-                const TracebackMode tb = parse_traceback(traceback);
-                if (!gap_model && !mode && !grad_mode) {
-                    deprecated(
-                        "SeqPairBatch() without gap_model, mode and grad_mode is deprecated: "
-                        "a batch holds one problem type, now fixed by the first add_many(); "
-                        "pass them here, e.g. SeqPairBatch(gap_model=\"affine\", mode=\"local\", "
-                        "grad_mode=\"hard\")");
-                    new (self) SPB(n_threads, tb);
-                    return;
-                }
-                new (self) SPB(parse_gap_model(gap_model.value_or("affine")),
-                               parse_align_mode(mode.value_or("global")),
-                               parse_grad_mode<GradMode>(grad_mode.value_or("hard")),
-                               n_threads, tb);
+            [](SPB* self, int n_threads, const std::string& traceback,
+               const std::string& gap_model, const std::string& mode,
+               const std::string& grad_mode) {
+                new (self) SPB(parse_gap_model(gap_model), parse_align_mode(mode),
+                               parse_grad_mode<GradMode>(grad_mode), n_threads,
+                               parse_traceback(traceback));
             },
             nb::arg("n_threads") = 0, nb::arg("traceback") = "auto", nb::kw_only(),
-            nb::arg("gap_model") = nb::none(), nb::arg("mode") = nb::none(),
-            nb::arg("grad_mode") = nb::none(),
+            nb::arg("gap_model") = "affine", nb::arg("mode") = "global",
+            nb::arg("grad_mode") = "hard",
             "A batch of sequence pairs of ONE problem type, aligned in parallel.\n"
             "  gap_model : \"affine\" (default) | \"linear\"\n"
             "  mode      : \"global\" (default) | \"local\"\n"
             "  grad_mode : \"hard\" (default) | \"soft\" | \"none\"\n"
-            "     — every pair in the batch; naming any of the three fixes the type (the\n"
-            "     others take their defaults).  Naming none is the deprecated form: the\n"
-            "     first add_many() then fixes the type.\n"
+            "     — fixed at construction, including on an empty batch.\n"
             "  n_threads=0 (default) uses the PHYSICAL core count among the CPUs this\n"
             "  process may run on (its affinity mask; falling back to the allowed\n"
             "  logical count): this DP is stall-bound, so SMT siblings\n"
@@ -507,38 +477,15 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             "hundred bytes per pair) and are aligned on per-thread buffers.")
         .def(
             "add_many",
-            [](nb::object self_obj,
-               const std::vector<std::string_view>& seqs_a,
-               const std::vector<std::string_view>& seqs_b,
-               nb::object params_obj, const OS& gap_model, const OS& mode,
-               const OS& grad_mode, const std::string& kernel) {
-                SPB& self = nb::cast<SPB&>(self_obj);
-                const AlignParams& params = nb::cast<const AlignParams&>(params_obj);
-                // Parse first: a bad name is reported as such, whatever the batch's state.
-                auto gm = parse_opt<std::optional<GapModel>>(gap_model, parse_gap_model);
-                auto am = parse_opt<std::optional<AlignMode>>(mode, parse_align_mode);
-                auto gd = parse_opt<std::optional<GradMode>>(grad_mode, parse_grad_mode<GradMode>);
-                const int kn = parse_backend(kernel);
-                if (gap_model || mode || grad_mode)
-                    deprecated(
-                        "add_many(gap_model=..., mode=..., grad_mode=...) is deprecated: a batch "
-                        "holds one problem type; pass them to the SeqPairBatch constructor");
-                if (!self.typed()) {
-                    // The pre-0.6 add_many() defaults, for an untyped (deprecated) batch.
-                    if (!gm) gm = GapModel::Affine;
-                    if (!am) am = AlignMode::Global;
-                    if (!gd) gd = GradMode::Hard;
-                }
-                self.add_many(seqs_a, seqs_b, params, gm, am, gd, kn);
+            [](SPB& self, const std::vector<std::string_view>& seqs_a,
+               const std::vector<std::string_view>& seqs_b, const AlignParams& params,
+               const std::string& kernel) {
+                self.add_many(seqs_a, seqs_b, params, parse_backend(kernel));
             },
-            nb::arg("seqs_a"), nb::arg("seqs_b"), nb::arg("params"),
-            nb::arg("gap_model") = nb::none(), nb::arg("mode") = nb::none(),
-            nb::arg("grad_mode") = nb::none(), nb::arg("kernel") = "auto",
-            "Append the pairs (seqs_a[i], seqs_b[i]) under `params` (one segment: params\n"
-            "may differ between add_many() calls; set_params() replaces them all).\n"
-            "Sequences are validated and encoded in parallel; a bad character raises and\n"
-            "adds nothing.  gap_model / mode / grad_mode: deprecated (the type is the\n"
-            "batch's); if given they must match it.")
+            nb::arg("seqs_a"), nb::arg("seqs_b"), nb::arg("params"), nb::arg("kernel") = "auto",
+            "Append pairs under an owned copy of params (one segment). Sequences are\n"
+            "validated and encoded in parallel; a bad character raises and adds nothing.\n"
+            "The problem type is fixed by the constructor.")
         .def("__len__", &SPB::size)
         .def(
             "__getitem__",
@@ -656,44 +603,9 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             [](const SPB& self) { return self.alphabet().symbols(); },
             "The symbols of the alphabet every pair in the batch shares.  Raises on an\n"
             "empty batch.")
-        .def_prop_ro("gap_model",
-                     [](const SPB& s) -> nb::object {
-                         return s.typed() ? nb::cast(gap_model_name(s.gap_model())) : nb::none(); },
-                     "The batch's gap model (None until a deprecated untyped batch gets pairs).")
-        .def_prop_ro("mode",
-                     [](const SPB& s) -> nb::object {
-                         return s.typed() ? nb::cast(align_mode_name(s.align_mode())) : nb::none(); },
-                     "The batch's alignment mode (None while untyped).")
-        .def_prop_ro("grad_mode",
-                     [](const SPB& s) -> nb::object {
-                         return s.typed() ? nb::cast(grad_mode_name(s.grad_mode())) : nb::none(); },
-                     "The batch's grad mode (None while untyped).")
-        // ── Deprecated: the pair-owned-table API (kept for DiscrimAlign; see TODO.md) ──
-        .def("alloc_dp",
-             [](SPB&) { deprecated("SeqPairBatch.alloc_dp() does nothing and is deprecated"); },
-             "Deprecated no-op.")
-        .def("align_full",
-             [](SPB& self) {
-                 deprecated("SeqPairBatch.align_full() is deprecated: use "
-                            "score_and_grad(keep_paths=True)");
-                 return self.score_and_grad(/*keep_paths=*/true, /*hold_grads=*/true);
-             },
-             "Deprecated: score_and_grad(keep_paths=True), with each gradient held until\n"
-             "compute_grad() (as before).  Returns the sum of scores.")
-        .def("realign_banded",
-             [](SPB& self, int bandwidth) {
-                 deprecated("SeqPairBatch.realign_banded() is deprecated: use "
-                            "banded_grad(bandwidth, keep_paths=True)");
-                 return self.banded_grad(bandwidth, /*keep_paths=*/true, /*hold_grads=*/true);
-             },
-             nb::arg("bandwidth"),
-             "Deprecated: banded_grad(bandwidth, keep_paths=True), gradients held.")
-        .def("drop_dp",
-             [](SPB& self) {
-                 deprecated("SeqPairBatch.drop_dp() is deprecated: use drop_paths()");
-                 self.drop_paths();
-             },
-             "Deprecated: drop_paths().")
+        .def_prop_ro("gap_model", [](const SPB& s) { return gap_model_name(s.gap_model()); })
+        .def_prop_ro("mode", [](const SPB& s) { return align_mode_name(s.align_mode()); })
+        .def_prop_ro("grad_mode", [](const SPB& s) { return grad_mode_name(s.grad_mode()); })
         .def_prop_rw(
             "schedule",
             [](const SPB& s) { return s.sorted_schedule() ? "sorted" : "dynamic"; },

@@ -51,11 +51,10 @@ ENVELOPE_F64 = 1.6e-12
 
 
 def score_arm(pairs, p, tb, Batch, threads, cutoff):
-    b = Batch(n_threads=threads, traceback=tb)
+    b = Batch(n_threads=threads, traceback=tb, gap_model="affine", mode="global", grad_mode="hard")
     if tb.startswith("hirschberg"):
         b.hb_cutoff = cutoff
-    b.add_many([x for x, _ in pairs], [y for _, y in pairs], p,
-               gap_model="affine", mode="global", grad_mode="hard", kernel="auto")
+    b.add_many([x for x, _ in pairs], [y for _, y in pairs], p, kernel="auto")
     b.score_and_grad()
     return np.array([b[i].score for i in range(len(pairs))], dtype=float)
 

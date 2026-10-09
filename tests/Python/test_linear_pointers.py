@@ -69,8 +69,8 @@ def test_batch_pointers_equal_scores(prec, mode):
     p = _params("ties")
     out = []
     for tb in ("scores", "pointers"):
-        b = CLS[prec][1](n_threads=3, traceback=tb)
-        b.add_many(A, B, p, gap_model="linear", mode=mode, grad_mode="hard")
+        b = CLS[prec][1](n_threads=3, traceback=tb, gap_model="linear", mode=mode, grad_mode="hard")
+        b.add_many(A, B, p)
         b.score_and_grad()
         out.append((b.scores(), *b.grads(), [list(b[i].guide_j) for i in range(len(b))]))
     for x, y in zip(out[0][:3], out[1][:3]):

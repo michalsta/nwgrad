@@ -99,7 +99,7 @@ def test_batch_set_params_invalidates_owned_pair_traceback(precision, traceback,
 b = n.SeqPairBatch{precision}(n_threads=1, traceback={traceback!r})
 b.add_many(["ACGT", "ACGTT"], ["ACGT", "ACGT"], params(), kernel="scalar_fallback")
 b.set_params(params(4))
-b.align_full()
+b.score_and_grad(keep_paths=True)
 expected = [b[i].aligned() for i in range(len(b))]
 b.set_params(params(5))
 gc.collect()
@@ -113,7 +113,7 @@ for i in range(len(b)):
     else:
         raise AssertionError("stale traceback was readable after batch.set_params()")
 if {realign!r}:
-    b.realign_banded(4)
+    b.banded_grad(4, keep_paths=True)
     assert [b[i].aligned() for i in range(len(b))] == expected
 """)
     assert proc.returncode == 0, describe(proc)

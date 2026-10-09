@@ -11,7 +11,7 @@ Coverage:
     across every gap_model x mode x grad_mode combination
   - per-pair gradients survive: batch[i].grad is the whole point of the API
   - len / indexing / negative indexing / out-of-range
-  - the pairs are usable through the full SeqPair lifecycle (alloc_dp,
+  - the pairs are usable through the full SeqPair lifecycle (
     align_full, compute_grad, realign_banded, aligned, drop_dp)
   - several add_many() segments in one batch (one problem type, params per segment)
   - single-thread == multi-thread (construction is parallel)
@@ -254,11 +254,11 @@ def test_dropping_params_after_two_add_many_calls():
     "heap-use-after-free ... READ of size 8 ... thread T3" from a worker thread.
     A sanitizer finds no bug it is not walked into; this walks it in.
     """
-    batch = nwgrad.SeqPairBatch(n_threads=2)
+    batch = nwgrad.SeqPairBatch(n_threads=2, gap_model="affine", mode="local", grad_mode="hard")
     p1 = prot_params(gap_extend=1.0)
     p2 = prot_params(gap_extend=9.0)
-    batch.add_many(PROT_A, PROT_B, p1, gap_model="affine", mode="local", grad_mode="hard")
-    batch.add_many(PROT_A, PROT_B, p2, gap_model="affine", mode="local", grad_mode="hard")
+    batch.add_many(PROT_A, PROT_B, p1)
+    batch.add_many(PROT_A, PROT_B, p2)
     del p1, p2
     gc.collect()
 
@@ -302,9 +302,9 @@ def test_two_add_many_calls_keep_their_own_params():
     """A second add_many() must not replace the first call's params."""
     p1 = prot_params(gap_extend=1.0)
     p2 = prot_params(gap_extend=9.0)
-    batch = nwgrad.SeqPairBatch(n_threads=2)
-    batch.add_many(PROT_A, PROT_B, p1, gap_model="affine", mode="local", grad_mode="hard")
-    batch.add_many(PROT_A, PROT_B, p2, gap_model="affine", mode="local", grad_mode="hard")
+    batch = nwgrad.SeqPairBatch(n_threads=2, gap_model="affine", mode="local", grad_mode="hard")
+    batch.add_many(PROT_A, PROT_B, p1)
+    batch.add_many(PROT_A, PROT_B, p2)
 
     # And the values are intact and distinct, so the halves really did use
     # different params -- guarding against both being pinned but one ignored.
@@ -335,16 +335,14 @@ def test_bad_character_raises_and_leaves_batch_unchanged():
     """The throw happens on a worker thread, mid-construction.  The batch must
     not be left half-filled behind it."""
     params = dna_params()
-    batch = nwgrad.SeqPairBatch(n_threads=4)
-    batch.add_many(DNA_A, DNA_B, params, gap_model="affine", mode="local",
-                   grad_mode="hard")
+    batch = nwgrad.SeqPairBatch(n_threads=4, gap_model="affine", mode="local", grad_mode="hard")
+    batch.add_many(DNA_A, DNA_B, params)
     assert len(batch) == len(DNA_A)
 
     bad_a = list(DNA_A) + ["ACGT"] * 50 + ["ACGZ"]     # 'Z' is not in ACGT
     bad_b = list(DNA_B) + ["ACGT"] * 50 + ["ACGT"]
     with pytest.raises(Exception, match="not in alphabet"):
-        batch.add_many(bad_a, bad_b, params, gap_model="affine", mode="local",
-                       grad_mode="hard")
+        batch.add_many(bad_a, bad_b, params)
 
     assert len(batch) == len(DNA_A)          # nothing from the failed call stuck
     batch.score_and_grad()                   # and the survivors still work
@@ -352,12 +350,10 @@ def test_bad_character_raises_and_leaves_batch_unchanged():
 
 
 def test_alphabet_mismatch_raises_and_leaves_batch_unchanged():
-    batch = nwgrad.SeqPairBatch(n_threads=2)
-    batch.add_many(PROT_A, PROT_B, prot_params(),
-                   gap_model="affine", mode="local", grad_mode="hard")
+    batch = nwgrad.SeqPairBatch(n_threads=2, gap_model="affine", mode="local", grad_mode="hard")
+    batch.add_many(PROT_A, PROT_B, prot_params())
     with pytest.raises(Exception, match="cannot join a batch over alphabet"):
-        batch.add_many(DNA_A, DNA_B, dna_params(),
-                       gap_model="affine", mode="local", grad_mode="hard")
+        batch.add_many(DNA_A, DNA_B, dna_params())
     assert len(batch) == len(PROT_A)
     batch.score_and_grad()
 
@@ -379,18 +375,3 @@ def test_grad_mode_none_still_scores():
     assert not batch[0].grad_valid
     # The binding reports an uncomputed gradient as None rather than raising.
     assert batch[0].grad is None
-
-
-@pytest.mark.filterwarnings("ignore::DeprecationWarning")
-def test_untyped_batch_takes_its_type_from_the_first_add_many_that_adds_pairs():
-    """An empty or failing first add_many() on a deprecated untyped batch must not fix its
-    type: before 0.6 an empty add_many() was a no-op."""
-    batch = nwgrad.SeqPairBatch(n_threads=2)
-    batch.add_many([], [], dna_params())                      # adds nothing
-    assert batch.gap_model is None
-    with pytest.raises(ValueError):
-        batch.add_many(["ACGZ"], ["ACGT"], dna_params())      # throws: adds nothing
-    assert batch.gap_model is None and len(batch) == 0
-    batch.add_many(DNA_A, DNA_B, dna_params(), gap_model="linear", mode="local",
-                   grad_mode="soft")                          # this one types it
-    assert (batch.gap_model, batch.mode, batch.grad_mode) == ("linear", "local", "soft")

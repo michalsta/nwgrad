@@ -10,18 +10,14 @@
 //     SeqPairBatchT<double> b(GapModel::Affine, AlignMode::Local, GradMode::Hard);
 //     b.add_many(seqs_a, seqs_b, params);              // params per call (a segment)
 //
-// or, for code written against the pre-0.6 API, by the FIRST add_many() of a batch
-// built without a type (later calls must agree; the Python binding warns).  Underneath
-// is one BatchEngine of that type, selected once: a dispatch per batch call, never per
-// pair.  Settings live here, so they can be set before the type is known, and are
-// pushed into the engine when it exists.
+// One BatchEngine is selected at construction: one dispatch per batch call, never
+// per pair. Settings live in that engine.
 //
 // SeqPairT<T> is a handle: either a standalone single pair (it owns a one-pair batch)
 // or a view of pair i of a batch (b[i]).  Its operations are the engine's per-pair
 // ones, on the calling thread.
 
 #include <memory>
-#include <optional>
 #include <string>
 #include <string_view>
 #include <variant>
@@ -41,171 +37,78 @@ template<class T = double>
 class SeqPairBatchT {
 public:
     template<GapModel G, AlignMode A> using Engine = BatchEngine<T, G, A>;
-    using Var = std::variant<std::monostate,
-                             Engine<GapModel::Linear, AlignMode::Global>,
+    using Var = std::variant<Engine<GapModel::Linear, AlignMode::Global>,
                              Engine<GapModel::Linear, AlignMode::Local>,
                              Engine<GapModel::Affine, AlignMode::Global>,
                              Engine<GapModel::Affine, AlignMode::Local>>;
     using SeqPair = SeqPairT<T>;
 
-    // Typed: the batch's problem type is fixed here.
     SeqPairBatchT(GapModel gm, AlignMode am, GradMode gd, int n_threads = 0,
-                  TracebackMode tb = TracebackMode::Default) {
-        pending_.set_n_threads(n_threads);
-        pending_.traceback = tb;
-        make_engine_(gm, am, gd);
-    }
-    // Untyped (the pre-0.6 form): the first add_many() that adds pairs fixes the type.
-    explicit SeqPairBatchT(int n_threads = 0, TracebackMode tb = TracebackMode::Default) {
-        pending_.set_n_threads(n_threads);
-        pending_.traceback = tb;
-    }
+                  TracebackMode tb = TracebackMode::Default)
+        : e_(make_engine_(gm, am, gd, n_threads, tb)), gm_(gm), am_(am), gd_(gd) {}
 
     SeqPairBatchT(const SeqPairBatchT&)            = delete;
     SeqPairBatchT& operator=(const SeqPairBatchT&) = delete;
     SeqPairBatchT(SeqPairBatchT&&)                 = default;
     SeqPairBatchT& operator=(SeqPairBatchT&&)      = default;
 
-    bool typed() const noexcept { return !std::holds_alternative<std::monostate>(e_); }
-    GapModel  gap_model()  const { require_typed_(); return gm_; }
-    AlignMode align_mode() const { require_typed_(); return am_; }
-    GradMode  grad_mode()  const { require_typed_(); return gd_; }
+    GapModel gap_model() const noexcept { return gm_; }
+    AlignMode align_mode() const noexcept { return am_; }
+    GradMode grad_mode() const noexcept { return gd_; }
 
-    // Visit the engine (throws on an untyped batch).  One switch per batch call.
+    // One switch per batch call; every batch has an engine, including an empty one.
     template<class F> decltype(auto) visit(F&& f) {
-        require_typed_();
-        switch (e_.index()) {
-            case 1:  return f(std::get<1>(e_));
-            case 2:  return f(std::get<2>(e_));
-            case 3:  return f(std::get<3>(e_));
-            default: return f(std::get<4>(e_));
-        }
+        return std::visit(std::forward<F>(f), e_);
     }
     template<class F> decltype(auto) visit(F&& f) const {
-        require_typed_();
-        switch (e_.index()) {
-            case 1:  return f(std::get<1>(e_));
-            case 2:  return f(std::get<2>(e_));
-            case 3:  return f(std::get<3>(e_));
-            default: return f(std::get<4>(e_));
-        }
+        return std::visit(std::forward<F>(f), e_);
     }
 
     // ── Adding pairs ─────────────────────────────────────────────────────────
 
-    // Append a segment of pairs under a copy of `params` (the batch owns it; a later
-    // in-place change to the caller's object does not reach the batch).  gm/am/gd: fix the type of an untyped batch; on a typed one,
-    // they must agree with it (one batch, one problem type).
-    void add_many(const std::vector<std::string_view>& seqs_a,
-                  const std::vector<std::string_view>& seqs_b,
-                  const AlignParams& params,
-                  std::optional<GapModel> gm, std::optional<AlignMode> am,
-                  std::optional<GradMode> gd, int kernel = kBackendAuto) {
-        if (!typed()) {
-            if (!gm || !am || !gd)
-                throw std::invalid_argument(
-                    "nwgrad: this batch has no problem type yet; construct it with gap_model, "
-                    "mode and grad_mode (or pass all three to its first add_many())");
-            // Provisional: an untyped batch takes its type from the first add_many() that
-            // ADDS pairs.  One that adds nothing, or throws, leaves it untyped (as before
-            // 0.6, when an empty add_many() was a no-op).
-            make_engine_(*gm, *am, *gd);
-            try {
-                visit([&](auto& e) { e.add_many(seqs_a, seqs_b, params, kernel); });
-            } catch (...) {
-                e_.template emplace<0>();   // pending_ still holds the settings
-                throw;
-            }
-            if (size() == 0) e_.template emplace<0>();
-            return;
-        } else {
-            auto clash = [&](const char* what, const char* have, const char* want) {
-                throw std::invalid_argument(
-                    std::string("nwgrad: this batch holds ") + gap_model_name(gm_) + " " +
-                    align_mode_name(am_) + " " + grad_mode_name(gd_) + " pairs; add_many(" + what +
-                    "=\"" + want + "\") cannot add " + want + " ones to it (have \"" + have +
-                    "\").  One batch holds one problem type: use a separate batch.");
-            };
-            if (gm && *gm != gm_) clash("gap_model", gap_model_name(gm_), gap_model_name(*gm));
-            if (am && *am != am_) clash("mode", align_mode_name(am_), align_mode_name(*am));
-            if (gd && *gd != gd_) clash("grad_mode", grad_mode_name(gd_), grad_mode_name(*gd));
-        }
-        visit([&](auto& e) { e.add_many(seqs_a, seqs_b, params, kernel); });
-    }
-    // Typed form (C++ convenience): the batch must already have its type.
+    // Append a segment under an owned copy of params.
     void add_many(const std::vector<std::string_view>& seqs_a,
                   const std::vector<std::string_view>& seqs_b,
                   const AlignParams& params, int kernel = kBackendAuto) {
-        add_many(seqs_a, seqs_b, params, std::nullopt, std::nullopt, std::nullopt, kernel);
-    }
-    // The pre-0.6 C++ signature.
-    void add_many(const std::vector<std::string_view>& seqs_a,
-                  const std::vector<std::string_view>& seqs_b,
-                  const AlignParams& params, GapModel gm, AlignMode am, GradMode gd,
-                  int kernel = kBackendAuto) {
-        add_many(seqs_a, seqs_b, params, std::optional<GapModel>(gm), std::optional<AlignMode>(am),
-                 std::optional<GradMode>(gd), kernel);
+        visit([&](auto& e) { e.add_many(seqs_a, seqs_b, params, kernel); });
     }
 
-    size_t size() const noexcept {
-        return typed() ? visit([](const auto& e) { return e.size(); }) : 0;
-    }
+    size_t size() const noexcept { return visit([](const auto& e) { return e.size(); }); }
     const Alphabet& alphabet() const {
-        if (!typed()) throw std::logic_error("nwgrad: empty batch has no alphabet");
         return visit([](const auto& e) -> const Alphabet& { return e.alphabet(); });
     }
     SeqPair operator[](size_t i);
 
-    // ── Batch operations (an untyped batch is an empty one) ──────────────────
+    // ── Batch operations  ──────────────────
 
-    void set_params(const AlignParams& p) { if (typed()) visit([&](auto& e) { e.set_params(p); }); }
-    double score_and_grad(bool keep_paths = false, bool hold_grads = false) {
-        if (!typed()) return 0.0;
-        return visit([&](auto& e) { return e.score_and_grad(keep_paths, hold_grads); });
+    void set_params(const AlignParams& p) { visit([&](auto& e) { e.set_params(p); }); }
+    double score_and_grad(bool keep_paths = false) {
+        return visit([&](auto& e) { return e.score_and_grad(keep_paths); });
     }
-    double banded_grad(int bandwidth, bool keep_paths = false, bool hold_grads = false) {
-        if (!typed()) {
-            if (bandwidth <= 0)
-                throw std::invalid_argument("nwgrad: banded_grad() needs bandwidth > 0 (got " +
-                                            std::to_string(bandwidth) + "); use score_and_grad() for full DP");
-            return 0.0;
-        }
-        return visit([&](auto& e) { return e.banded_grad(bandwidth, keep_paths, hold_grads); });
+    double banded_grad(int bandwidth, bool keep_paths = false) {
+        return visit([&](auto& e) { return e.banded_grad(bandwidth, keep_paths); });
     }
-    void drop_paths() { if (typed()) visit([](auto& e) { e.drop_paths(); }); }
+    void drop_paths() { visit([](auto& e) { e.drop_paths(); }); }
     AlignParams compute_grad() {
-        if (!typed()) throw std::logic_error("nwgrad: empty batch has no alphabet");
         return visit([](auto& e) { return e.compute_grad(); });
     }
     std::vector<double> scores() const {
-        if (!typed()) return {};
         return visit([](const auto& e) { return e.scores(); });
     }
     AlignParams weighted_grad(const double* w, size_t n) const {
-        if (!typed()) throw std::logic_error("nwgrad: empty batch has no alphabet");
         return visit([&](const auto& e) { return e.weighted_grad(w, n); });
     }
     void grads_into(double* matrices, double* gaps) const {
-        if (!typed()) throw std::logic_error("nwgrad: empty batch has no alphabet");
         visit([&](const auto& e) { e.grads_into(matrices, gaps); });
     }
     BatchResult align(const std::vector<ProblemInstance>& problems, const AlignParams& params,
                       int band = 0, int kernel = kBackendAuto) const {
-        if (!typed())
-            throw std::logic_error(
-                "nwgrad: align() needs the batch's problem type; construct the batch with "
-                "gap_model, mode and grad_mode");
         return visit([&](const auto& e) { return e.align_stream(problems, params, band, kernel); });
     }
 
     // ── Settings ─────────────────────────────────────────────────────────────
-    // One copy of each: the engine's once the batch is typed, pending_ before (the engine
-    // is built from it).  Read through settings(); every setter goes to that one copy,
-    // through the same validating setters (BatchSettings / BatchEngine).
-
     const BatchSettings& settings() const {
-        return typed() ? visit([](const auto& e) -> const BatchSettings& { return e.settings(); })
-                       : pending_;
+        return visit([](const auto& e) -> const BatchSettings& { return e.settings(); });
     }
     int n_threads() const { return settings().n_threads; }
     TracebackMode traceback() const { return settings().traceback; }
@@ -228,24 +131,22 @@ public:
 
 #define NWGRAD_BATCH_SETTER(NAME, TYPE)                                               \
     void NAME(TYPE v) {                                                               \
-        if (typed()) visit([&](auto& e) { e.NAME(v); }); else pending_.NAME(v);         \
+        visit([&](auto& e) { e.NAME(v); });         \
     }
     NWGRAD_BATCH_SETTER(set_n_threads, int)
     NWGRAD_BATCH_SETTER(set_hb_cutoff, int)
     NWGRAD_BATCH_SETTER(set_soft_temperature, double)
 #undef NWGRAD_BATCH_SETTER
     void set_fill(bool rowwise, bool inter) {
-        if (typed()) visit([&](auto& e) { e.set_fill(rowwise, inter); });
-        else pending_.set_fill(rowwise, inter);
+        visit([&](auto& e) { e.set_fill(rowwise, inter); });
     }
     void set_soft_guide(bool lazy, bool posterior) {
-        if (typed()) visit([&](auto& e) { e.set_soft_guide(lazy, posterior); });
-        else pending_.set_soft_guide(lazy, posterior);
+        visit([&](auto& e) { e.set_soft_guide(lazy, posterior); });
     }
     // Plain fields, no validation, no side effects.
 #define NWGRAD_BATCH_FIELD(NAME, FIELD, TYPE)                                         \
     void NAME(TYPE v) {                                                               \
-        if (typed()) visit([&](auto& e) { e.NAME(v); }); else pending_.FIELD = v;       \
+        visit([&](auto& e) { e.NAME(v); });       \
     }
     NWGRAD_BATCH_FIELD(set_soft_impl, soft_impl, SoftImpl)
     NWGRAD_BATCH_FIELD(set_sorted_schedule, sorted_schedule, bool)
@@ -258,7 +159,6 @@ public:
 
     using PhaseProfile = typename Engine<GapModel::Affine, AlignMode::Global>::PhaseProfile;
     std::vector<PhaseProfile> profile_out() const {
-        if (!typed()) return {};
         return visit([](const auto& e) {
             std::vector<PhaseProfile> v;
             for (const auto& p : e.profile_out) v.push_back({p.chunk_s, p.reserve_s, p.chunk_cells,
@@ -273,21 +173,19 @@ private:
     GapModel gm_ = GapModel::Affine;
     AlignMode am_ = AlignMode::Global;
     GradMode gd_ = GradMode::Hard;
-    BatchSettings pending_;   // the settings until an engine exists (then it holds them)
+    static Var make_engine_(GapModel gm, AlignMode am, GradMode gd,
+                            int n_threads, TracebackMode tb) {
+        BatchSettings settings;
+        settings.set_n_threads(n_threads);
+        settings.traceback = tb;
+        if (gm == GapModel::Linear) {
+            if (am == AlignMode::Global) return Var(std::in_place_index<0>, settings, gd);
+            return Var(std::in_place_index<1>, settings, gd);
+        }
+        if (am == AlignMode::Global) return Var(std::in_place_index<2>, settings, gd);
+        return Var(std::in_place_index<3>, settings, gd);
+    }
 
-    void require_typed_() const {
-        if (!typed())
-            throw std::logic_error(
-                "nwgrad: this batch has no problem type yet (no pairs); construct it with "
-                "gap_model, mode and grad_mode");
-    }
-    void make_engine_(GapModel gm, AlignMode am, GradMode gd) {
-        gm_ = gm; am_ = am; gd_ = gd;
-        if      (gm == GapModel::Linear && am == AlignMode::Global) e_.template emplace<1>(pending_, gd);
-        else if (gm == GapModel::Linear && am == AlignMode::Local)  e_.template emplace<2>(pending_, gd);
-        else if (gm == GapModel::Affine && am == AlignMode::Global) e_.template emplace<3>(pending_, gd);
-        else                                                        e_.template emplace<4>(pending_, gd);
-    }
 };
 
 // ── SeqPairT: one pair — standalone, or a view of pair i of a batch ──────────
@@ -319,11 +217,9 @@ public:
     void realign_banded(int bandwidth) { e([&](auto& x) { x.banded_one(i_, bandwidth, true, true); }); }
     void compute_grad() { e([&](auto& x) { x.compute_grad_one(i_); }); }
     std::pair<double, AlignParams> score_and_grad() {
-        align_full();
-        compute_grad();
+        e([&](auto& x) { x.score_and_grad_one(i_, true); });
         return {score(), grad()};
     }
-    void alloc_dp() noexcept {}   // nothing to allocate: the DP runs on a worker buffer
     void drop_dp() { e([&](auto& x) { x.drop_path(i_); }); }
 
     // ── Results ──────────────────────────────────────────────────────────────

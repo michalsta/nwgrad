@@ -56,7 +56,7 @@ static const std::string B = "WWKLLMMFFAACGG";
 TEST_CASE("SeqPair: linear/global score matches Aligner", "[seq_pair]") {
     auto p = asym_params(0.0, 1.5, 0.0, 0.5);   // asymmetric extend
     SeqPair sp(A, B, p, GapModel::Linear, AlignMode::Global, GradMode::None);
-    sp.alloc_dp();
+
     sp.align_full();
     REQUIRE(sp.score() ==
             Approx(aligner_score<GapModel::Linear, AlignMode::Global>(p, A, B)));
@@ -65,7 +65,7 @@ TEST_CASE("SeqPair: linear/global score matches Aligner", "[seq_pair]") {
 TEST_CASE("SeqPair: linear/local score matches Aligner", "[seq_pair]") {
     auto p = asym_params(0.0, 1.5, 0.0, 0.5);
     SeqPair sp(A, B, p, GapModel::Linear, AlignMode::Local, GradMode::None);
-    sp.alloc_dp();
+
     sp.align_full();
     REQUIRE(sp.score() ==
             Approx(aligner_score<GapModel::Linear, AlignMode::Local>(p, A, B)));
@@ -74,7 +74,7 @@ TEST_CASE("SeqPair: linear/local score matches Aligner", "[seq_pair]") {
 TEST_CASE("SeqPair: affine/global score matches Aligner", "[seq_pair]") {
     auto p = asym_params(4.0, 0.5, 1.5, 2.0);   // asymmetric open and extend
     SeqPair sp(A, B, p, GapModel::Affine, AlignMode::Global, GradMode::None);
-    sp.alloc_dp();
+
     sp.align_full();
     REQUIRE(sp.score() ==
             Approx(aligner_score<GapModel::Affine, AlignMode::Global>(p, A, B)));
@@ -83,7 +83,7 @@ TEST_CASE("SeqPair: affine/global score matches Aligner", "[seq_pair]") {
 TEST_CASE("SeqPair: affine/local score matches Aligner", "[seq_pair]") {
     auto p = asym_params(4.0, 0.5, 1.5, 2.0);
     SeqPair sp(A, B, p, GapModel::Affine, AlignMode::Local, GradMode::None);
-    sp.alloc_dp();
+
     sp.align_full();
     REQUIRE(sp.score() ==
             Approx(aligner_score<GapModel::Affine, AlignMode::Local>(p, A, B)));
@@ -117,7 +117,6 @@ TEST_CASE("SeqPair: validity flags follow the lifecycle", "[seq_pair]") {
     auto p = asym_params(4.0, 0.5, 1.5, 2.0);
     SeqPair sp(A, B, p, GapModel::Affine, AlignMode::Global, GradMode::Hard);
 
-    sp.alloc_dp();
     sp.align_full();
     REQUIRE(sp.score_valid());
     REQUIRE(sp.path_valid());
@@ -136,7 +135,7 @@ TEST_CASE("SeqPair: validity flags follow the lifecycle", "[seq_pair]") {
 TEST_CASE("SeqPair: set_params invalidates the cached results", "[seq_pair]") {
     auto p = asym_params(4.0, 0.5, 1.5, 2.0);
     SeqPair sp(A, B, p, GapModel::Affine, AlignMode::Global, GradMode::Hard);
-    sp.alloc_dp();
+
     sp.align_full();
     sp.compute_grad();
     const double first = sp.score();
@@ -156,7 +155,7 @@ TEST_CASE("SeqPair: score_and_grad matches align_full + compute_grad", "[seq_pai
     auto p = asym_params(4.0, 0.5, 1.5, 2.0);
 
     SeqPair a(A, B, p, GapModel::Affine, AlignMode::Global, GradMode::Hard);
-    a.alloc_dp();
+
     a.align_full();
     a.compute_grad();
 
@@ -176,7 +175,7 @@ TEST_CASE("SeqPair: score_and_grad matches align_full + compute_grad", "[seq_pai
 TEST_CASE("SeqPair: aligned() strings reconstruct the sequences", "[seq_pair]") {
     auto p = asym_params(4.0, 0.5, 1.5, 2.0);
     SeqPair sp(A, B, p, GapModel::Affine, AlignMode::Global, GradMode::None);
-    sp.alloc_dp();
+
     sp.align_full();
 
     auto [ga, gb] = sp.aligned();
@@ -193,7 +192,7 @@ TEST_CASE("SeqPair: GradMode::Soft scores the log-partition function", "[seq_pai
     auto p = asym_params(4.0, 0.5, 1.5, 2.0);
 
     SeqPair soft(A, B, p, GapModel::Affine, AlignMode::Global, GradMode::Soft);
-    soft.alloc_dp();
+
     soft.align_full();
 
     // log Z sums over every alignment, so it is >= the single best score.
@@ -212,7 +211,7 @@ TEST_CASE("SeqPair: GradMode::Soft scores the log-partition function", "[seq_pai
 TEST_CASE("SeqPair: GradMode::None still scores but refuses a gradient", "[seq_pair]") {
     auto p = asym_params(4.0, 0.5, 1.5, 2.0);
     SeqPair sp(A, B, p, GapModel::Affine, AlignMode::Global, GradMode::None);
-    sp.alloc_dp();
+
     sp.align_full();
 
     REQUIRE(sp.score() ==
@@ -223,7 +222,7 @@ TEST_CASE("SeqPair: GradMode::None still scores but refuses a gradient", "[seq_p
 TEST_CASE("SeqPair: a wide band reproduces the full-DP score", "[seq_pair][banded]") {
     auto p = asym_params(4.0, 0.5, 1.5, 2.0);
     SeqPair sp(A, B, p, GapModel::Affine, AlignMode::Global, GradMode::Hard);
-    sp.alloc_dp();
+
     sp.align_full();
     const double full = sp.score();
 
@@ -236,7 +235,7 @@ TEST_CASE("SeqPair: a wide band reproduces the full-DP score", "[seq_pair][bande
 TEST_CASE("SeqPair: realign_banded picks up new params", "[seq_pair][banded]") {
     auto p = asym_params(4.0, 0.5, 1.5, 2.0);
     SeqPair sp(A, B, p, GapModel::Affine, AlignMode::Global, GradMode::Hard);
-    sp.alloc_dp();
+
     sp.align_full();
 
     auto p2 = asym_params(0.5, 0.25, 0.5, 0.25);
@@ -274,7 +273,7 @@ TEST_CASE("SeqPairBatch: full DP with stored paths matches per-pair alignment", 
     SeqPairBatch batch = corpus_batch(c, p, 2);
     REQUIRE(batch.size() == c.as.size());
 
-    const double total = batch.score_and_grad(/*keep_paths=*/true, /*hold_grads=*/true);
+    const double total = batch.score_and_grad(/*keep_paths=*/true);
 
     double expected = 0.0;
     for (size_t i = 0; i < c.as.size(); ++i)
@@ -285,7 +284,7 @@ TEST_CASE("SeqPairBatch: full DP with stored paths matches per-pair alignment", 
     for (size_t i = 0; i < batch.size(); ++i) {
         REQUIRE(batch[i].score_valid());
         REQUIRE(batch[i].dp_valid());
-        REQUIRE_FALSE(batch[i].grad_valid());   // held until compute_grad()
+        REQUIRE(batch[i].grad_valid());   // batch fills publish gradients immediately
     }
 }
 
@@ -294,7 +293,7 @@ TEST_CASE("SeqPairBatch: compute_grad sums the per-pair gradients",
     auto p = asym_params(4.0, 0.5, 1.5, 2.0);
     Corpus c;
     SeqPairBatch batch = corpus_batch(c, p, 3);
-    batch.score_and_grad(true, true);
+    batch.score_and_grad(true);
     const AlignParams total = batch.compute_grad();
 
     AlignParams expected(Alphabet::protein());
@@ -313,12 +312,12 @@ TEST_CASE("SeqPairBatch: compute_grad sums the per-pair gradients",
             REQUIRE(total.matrix.at(i, j) == Approx(expected.matrix.at(i, j)));
 }
 
-TEST_CASE("SeqPairBatch: held and immediate gradients agree",
+TEST_CASE("SeqPairBatch: stored paths preserve gradients",
           "[seq_pair_batch]") {
     auto p = asym_params(4.0, 0.5, 1.5, 2.0);
     Corpus c;
     SeqPairBatch b1 = corpus_batch(c, p, 2);
-    const double total_stepwise = b1.score_and_grad(true, true);
+    const double total_stepwise = b1.score_and_grad(true);
     const AlignParams grad_stepwise = b1.compute_grad();
 
     SeqPairBatch b2 = corpus_batch(c, p, 2);
@@ -337,7 +336,7 @@ TEST_CASE("SeqPairBatch: set_params then banded_grad", "[seq_pair_batch][banded]
     auto p = asym_params(4.0, 0.5, 1.5, 2.0);
     Corpus c;
     SeqPairBatch batch = corpus_batch(c, p, 2);
-    batch.score_and_grad(true, true);
+    batch.score_and_grad(true);
 
     auto p2 = asym_params(0.5, 0.25, 0.5, 0.25);
     batch.set_params(p2);
@@ -354,7 +353,7 @@ TEST_CASE("SeqPairBatch: set_params then banded_grad", "[seq_pair_batch][banded]
 }
 
 TEST_CASE("SeqPairBatch: an empty batch has no gradient", "[seq_pair_batch]") {
-    SeqPairBatch batch(2);
+    SeqPairBatch batch(GapModel::Affine, AlignMode::Global, GradMode::Hard, 2);
     REQUIRE(batch.size() == 0);
 
     // Scoring an empty batch is still a no-op summing to zero.
@@ -404,7 +403,7 @@ TEST_CASE("SeqPair: set_params invalidates the retained traceback", "[seq_pair]"
         auto* p1 = new AlignParams(asym_params(4.0, 0.5, 1.5, 2.0));
         SeqPair sp(A, B, *p1, GapModel::Affine, AlignMode::Global, GradMode::Hard,
                    kBackendAuto, tb);
-        sp.alloc_dp();
+
         sp.align_full();
         const auto expected = sp.aligned();
         const auto guide    = sp.guide_j();

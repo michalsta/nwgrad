@@ -48,8 +48,8 @@ def test_grads_protein_alphabet():
                                 gap_open_a=3.0, gap_extend_a=0.5,
                                 gap_open_b=2.0, gap_extend_b=1.0)
     seqs = ["".join(rng.choice(list(alphabet), size=n)) for n in (30, 25, 40, 1, 33)]
-    batch = nwgrad.SeqPairBatchDouble(n_threads=2)
-    batch.add_many(seqs, seqs[::-1], params, gap_model="affine", mode="global")
+    batch = nwgrad.SeqPairBatchDouble(n_threads=2, gap_model="affine", mode="global")
+    batch.add_many(seqs, seqs[::-1], params)
     batch.score_and_grad()
     assert batch.alphabet == alphabet
     matrices, gaps = batch.grads()

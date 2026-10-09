@@ -84,7 +84,7 @@ def test_thread_launch_failure_does_not_abort(entry):
                 b.add_many(A, B, p)
                 got = None
             elif "{entry}" == "align_full":
-                got = b.align_full()
+                got = b.score_and_grad(keep_paths=True)
             else:
                 got = b.score_and_grad()
         except Exception as e:

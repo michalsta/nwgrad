@@ -176,11 +176,10 @@ def test_float32_default_costs_nothing_beyond_float32(params):
     pairs = list(zip(s[:6], s[6:]))
 
     def sc(tb, cls):
-        bt = cls(n_threads=2, traceback=tb)
+        bt = cls(n_threads=2, traceback=tb, gap_model="affine", mode="global", grad_mode="hard")
         if tb.startswith("hirschberg"):
             bt.hb_cutoff = 512
-        bt.add_many([x for x, _ in pairs], [y for _, y in pairs], params,
-                    gap_model="affine", mode="global", grad_mode="hard", kernel="auto")
+        bt.add_many([x for x, _ in pairs], [y for _, y in pairs], params, kernel="auto")
         bt.score_and_grad()
         return np.array([bt[i].score for i in range(len(pairs))], dtype=float)
 
@@ -329,10 +328,9 @@ def test_short_pairs_add_nothing_over_exact_hirschberg(lossy_params):
 
 def test_batch_agrees_with_single_pair(lossy_params):
     a_s, b_s = _seqs(8, 700, 1100, 19), _seqs(8, 700, 1100, 20)
-    b = nwgrad.SeqPairBatchDouble(n_threads=2, traceback="hirschberg_pmax")
+    b = nwgrad.SeqPairBatchDouble(n_threads=2, traceback="hirschberg_pmax", gap_model="affine", mode="global", grad_mode="hard")
     b.hb_cutoff = 64
-    b.add_many(a_s, b_s, lossy_params, gap_model="affine", mode="global",
-               grad_mode="hard", kernel="auto")
+    b.add_many(a_s, b_s, lossy_params, kernel="auto")
     b.score_and_grad()
     for i, (a, bb) in enumerate(zip(a_s, b_s)):
         assert b[i].score == _pair(a, bb, lossy_params, "hirschberg_pmax", cutoff=64).score

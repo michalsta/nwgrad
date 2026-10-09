@@ -93,8 +93,8 @@ TEST_CASE("logistic: labels are not checked; soft labels fit the root of sum(y -
 TEST_CASE("logistic: step is its parts composed", "[logistic]") {
     Fixture f(2 * nwgrad::logistic::BLOCK + 5);
     auto p = params_over("ACGT", 2.0);
-    SeqPairBatchT<double> batch(4);
-    batch.add_many(f.va(), f.vb(), p, GapModel::Affine, AlignMode::Local, GradMode::Hard);
+    SeqPairBatchT<double> batch(GapModel::Affine, AlignMode::Local, GradMode::Hard, 4);
+    batch.add_many(f.va(), f.vb(), p);
     batch.score_and_grad();
     const auto st = nwgrad::logistic::step(batch, f.y.data(), f.y.size(), -0.4);
     const auto s = batch.scores();
@@ -109,8 +109,8 @@ TEST_CASE("SeqPairBatch: parallel set_params and scores match the pairs", "[logi
     Fixture f(2 * 4096 + 9);   // more than one of the old 4096-pair scores() blocks
     auto p1 = params_over("ACGT", 2.0);
     auto p2 = params_over("ACGT", 3.0);
-    SeqPairBatchT<double> batch(5);
-    batch.add_many(f.va(), f.vb(), p1, GapModel::Affine, AlignMode::Global, GradMode::Hard);
+    SeqPairBatchT<double> batch(GapModel::Affine, AlignMode::Global, GradMode::Hard, 5);
+    batch.add_many(f.va(), f.vb(), p1);
     batch.score_and_grad();
     batch.set_params(p2);
     for (size_t i = 0; i < batch.size(); ++i) REQUIRE_FALSE(batch[i].score_valid());

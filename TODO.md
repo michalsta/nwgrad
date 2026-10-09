@@ -11,16 +11,15 @@ nighthaven, 12 threads): a whole hard training step (set_params + score_and_grad
 scores + weighted_grad) 0.76x the old time, a banded step 0.62x, resident memory
 385 -> 34 MB. See AGENTS.md "batch_engine.hpp".
 
-## Drop the deprecated 0.5 batch API once DiscrimAlign is ported
+## Remove the 0.6.0-deprecated API — DONE
 
-Kept at the maintainer's request (2026-10-07) so DiscrimAlign runs unchanged: untyped
-`SeqPairBatch(...)` + `add_many(gap_model=, mode=, grad_mode=)`, and the batch's
-`alloc_dp` / `align_full` / `realign_banded` / `drop_dp` (plus `SeqPair.alloc_dp`).
-DiscrimAlign's call sites: `src/nwgrad_engine.py` 121-126 and 156-169, `src/adaptive.py`
-143-159. Port them to `SeqPairBatch(n, traceback, gap_model=, mode=, grad_mode=)`,
-`add_many(A, B, params)` and `score_and_grad(keep_paths=True)` + `batch[i].coordinates()`,
-check its acceptance fits stay bit-identical, then delete the wrappers, the `kHeld` /
-`hold_grads` machinery that exists only for them, and their tests.
+Removed the untyped batch state, per-add problem-type arguments, batch
+`alloc_dp` / `align_full` / `realign_banded` / `drop_dp`, and `SeqPair.alloc_dp`.
+Batches now own one settings store in an engine selected at construction. Batch
+computations publish gradients immediately, with no batch-wide holding pass.
+The supported `SeqPair.align_full()` / `realign_banded()` still hold their gradients
+until `compute_grad()`, so their per-pair holding state remains. DiscrimAlign's
+ported API is tested from PR #16, rather than modifying the old consumer checkout.
 
 ## Default thread count (`n_threads=0`): physical cores are wrong for short pairs
 

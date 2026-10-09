@@ -47,9 +47,8 @@ static std::vector<double> flat(const AlignParams& g) {
 
 TEST_CASE("scores / weighted_grad: match the per-pair values", "[weighted_grad]") {
     auto p = dna_params();
-    SeqPairBatchT<double> batch(3);
-    batch.add_many(views(SEQS_A), views(SEQS_B), p, GapModel::Affine,
-                   AlignMode::Local, GradMode::Hard);
+    SeqPairBatchT<double> batch(GapModel::Affine, AlignMode::Local, GradMode::Hard, 3);
+    batch.add_many(views(SEQS_A), views(SEQS_B), p);
     batch.score_and_grad();
 
     std::vector<double> s = batch.scores();
@@ -67,9 +66,8 @@ TEST_CASE("weighted_grad: bit-identical across thread counts", "[weighted_grad]"
     auto p = dna_params();
     std::vector<std::vector<double>> results;
     for (int threads : {1, 2, 7}) {
-        SeqPairBatchT<double> batch(threads);
-        batch.add_many(views(SEQS_A), views(SEQS_B), p, GapModel::Linear,
-                       AlignMode::Global, GradMode::Hard);
+        SeqPairBatchT<double> batch(GapModel::Linear, AlignMode::Global, GradMode::Hard, threads);
+        batch.add_many(views(SEQS_A), views(SEQS_B), p);
         batch.score_and_grad();
         results.push_back(flat(batch.weighted_grad(WEIGHTS.data(), WEIGHTS.size())));
     }
@@ -79,13 +77,12 @@ TEST_CASE("weighted_grad: bit-identical across thread counts", "[weighted_grad]"
 
 TEST_CASE("weighted_grad: preconditions throw", "[weighted_grad]") {
     auto p = dna_params();
-    SeqPairBatchT<double> empty(1);
+    SeqPairBatchT<double> empty(GapModel::Affine, AlignMode::Global, GradMode::Hard, 1);
     REQUIRE_THROWS_AS(empty.weighted_grad(nullptr, 0), std::logic_error);
     REQUIRE(empty.scores().empty());
 
-    SeqPairBatchT<double> batch(2);
-    batch.add_many(views(SEQS_A), views(SEQS_B), p, GapModel::Affine,
-                   AlignMode::Global, GradMode::Hard);
+    SeqPairBatchT<double> batch(GapModel::Affine, AlignMode::Global, GradMode::Hard, 2);
+    batch.add_many(views(SEQS_A), views(SEQS_B), p);
     REQUIRE_THROWS_AS(batch.weighted_grad(WEIGHTS.data(), WEIGHTS.size()), std::logic_error);
     REQUIRE_THROWS_AS(batch.scores(), std::logic_error);
 
@@ -99,9 +96,8 @@ TEST_CASE("weighted_grad: preconditions throw", "[weighted_grad]") {
 // contracted sum in weighted_grad() would miss this bit-exact equality.
 TEST_CASE("weighted_grad: products are rounded before they are summed", "[weighted_grad]") {
     auto p = dna_params();
-    SeqPairBatchT<double> batch(2);
-    batch.add_many(views(SEQS_A), views(SEQS_B), p, GapModel::Affine,
-                   AlignMode::Local, GradMode::Hard);
+    SeqPairBatchT<double> batch(GapModel::Affine, AlignMode::Local, GradMode::Hard, 2);
+    batch.add_many(views(SEQS_A), views(SEQS_B), p);
     batch.score_and_grad();
     // Weights with long mantissas, so a fused multiply-add would round differently.
     const std::vector<double> w = {0.1, -1.0 / 3.0, 2.0 / 7.0, 1e-3 / 9.0, -0.7};
@@ -119,9 +115,8 @@ TEST_CASE("weighted_grad: products are rounded before they are summed", "[weight
 
 TEST_CASE("grads_into: copies every pair's cached gradient", "[weighted_grad]") {
     auto p = dna_params();
-    SeqPairBatchT<double> batch(3);
-    batch.add_many(views(SEQS_A), views(SEQS_B), p, GapModel::Affine,
-                   AlignMode::Local, GradMode::Hard);
+    SeqPairBatchT<double> batch(GapModel::Affine, AlignMode::Local, GradMode::Hard, 3);
+    batch.add_many(views(SEQS_A), views(SEQS_B), p);
     batch.score_and_grad();
     const size_t N = batch.size();
     std::vector<double> mats(N * 16, -1.0), gaps(N * 4, -1.0);
@@ -135,12 +130,11 @@ TEST_CASE("grads_into: copies every pair's cached gradient", "[weighted_grad]") 
 
 TEST_CASE("grads_into: preconditions throw", "[weighted_grad]") {
     auto p = dna_params();
-    SeqPairBatchT<double> empty(1);
+    SeqPairBatchT<double> empty(GapModel::Affine, AlignMode::Global, GradMode::Hard, 1);
     REQUIRE_THROWS_AS(empty.grads_into(nullptr, nullptr), std::logic_error);
 
-    SeqPairBatchT<double> batch(2);
-    batch.add_many(views(SEQS_A), views(SEQS_B), p, GapModel::Affine,
-                   AlignMode::Global, GradMode::Hard);
+    SeqPairBatchT<double> batch(GapModel::Affine, AlignMode::Global, GradMode::Hard, 2);
+    batch.add_many(views(SEQS_A), views(SEQS_B), p);
     std::vector<double> mats(batch.size() * 16), gaps(batch.size() * 4);
     REQUIRE_THROWS_AS(batch.grads_into(mats.data(), gaps.data()), std::logic_error);
 }
@@ -166,8 +160,8 @@ TEST_CASE("weighted_grad: block order, bit-identical across thread counts", "[we
     std::vector<std::vector<double>> results;
     std::vector<double> expected(20, 0.0);
     for (int threads : {1, 2, 7}) {
-        SeqPairBatchT<double> batch(threads);
-        batch.add_many(views(a), views(b), p, GapModel::Affine, AlignMode::Local, GradMode::Hard);
+        SeqPairBatchT<double> batch(GapModel::Affine, AlignMode::Local, GradMode::Hard, threads);
+        batch.add_many(views(a), views(b), p);
         batch.score_and_grad();
         results.push_back(flat(batch.weighted_grad(w.data(), N)));
         if (threads == 1) {

@@ -44,15 +44,14 @@ lin = nwgrad.AlignParams(nwgrad.SubstMatrix(np.array(M), "ACGT"), 0.0, 1.2147, 0
 
 def run(threads, mode, gap, grad_mode, tb="auto", fill=None, impl=None):
     cls = nwgrad.SeqPairBatch if args.prec == "float32" else nwgrad.SeqPairBatchDouble
-    b = cls(n_threads=threads, traceback=tb)
+    b = cls(n_threads=threads, traceback=tb, gap_model=gap, mode=mode, grad_mode=grad_mode)
     if fill:
         b.fill = fill
     if impl is not None:
         b.soft_impl = impl
     if grad_mode == "soft":
         b.soft_guide = args.soft_guide
-    b.add_many(A, B, params if gap == "affine" else lin, gap_model=gap, mode=mode,
-               grad_mode=grad_mode)
+    b.add_many(A, B, params if gap == "affine" else lin)
     b.score_and_grad()  # warm: allocation, plan
     best = 1e30
     for _ in range(args.reps):

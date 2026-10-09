@@ -289,12 +289,11 @@ def test_narrow_band_does_not_crash():
     a, b = "A" * 22, "C" * 87                      # |m - n| = 65
 
     for mode in ("global", "local"):
-        batch = nwgrad.SeqPairBatch(n_threads=1)
-        batch.add_many([a], [b], params, gap_model="affine", mode=mode,
-                       grad_mode="hard", kernel="auto")
-        full = batch.align_full()
+        batch = nwgrad.SeqPairBatch(n_threads=1, gap_model="affine", mode=mode, grad_mode="hard")
+        batch.add_many([a], [b], params, kernel="auto")
+        full = batch.score_and_grad(keep_paths=True)
         for band in (1, 2, 4, 8, 16, 32, 64, 128):
-            got = batch.realign_banded(band)
+            got = batch.banded_grad(band, keep_paths=True)
             assert np.isfinite(got), f"{mode} band={band} -> {got}"
             assert got <= full + 1e-9, f"{mode} band={band}: {got} beats unbanded {full}"
 
@@ -317,8 +316,8 @@ def test_banded_grad_global_is_independent_of_buffer_history():
     p1, p2 = P(7, 0.1, 0.0, 1e-4), P(8, 1.0, 2.5, 0.7)
 
     def run(seqs_a, seqs_b, threads):
-        batch = nwgrad.SeqPairBatchDouble(n_threads=threads, traceback="pointers")
-        batch.add_many(seqs_a, seqs_b, p1, gap_model="affine", mode="global")
+        batch = nwgrad.SeqPairBatchDouble(n_threads=threads, traceback="pointers", gap_model="affine", mode="global")
+        batch.add_many(seqs_a, seqs_b, p1)
         batch.score_and_grad()
         batch.set_params(p2)
         batch.banded_grad(2)
