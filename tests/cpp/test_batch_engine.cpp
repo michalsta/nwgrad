@@ -4,7 +4,9 @@
 // parameter segments, schedules, fills, traceback modes, soft options and guide bands.
 #include "catch.hpp"
 #include "batch_engine.hpp"
+#include <algorithm>
 #include <cmath>
+#include <limits>
 #include <random>
 #include <string>
 #include <vector>
@@ -139,6 +141,59 @@ void check_grad(const AlignParams& expected, const AlignParams& actual, bool sof
     check_number(expected.gap_extend_b, actual.gap_extend_b, soft, 1e-9);
 }
 
+// SIMD and per-pair soft passes may choose different posterior argmax columns
+// on numerical ties. Validate the actual guide independently in log space before
+// using that guide as the input to the banded reference (bands are different problems).
+template<class T, GapModel GM, AlignMode AM>
+void check_posterior_guide(std::string_view a, std::string_view b,
+                           const AlignParams& p, const Cfg& c,
+                           const std::vector<int>& guide) {
+    Aligner<GM, AM, AlignBand::Full, T> al;
+    DpBufferT<T> buf;
+    al.set_soft_impl(SoftImpl::Log);
+    al.set_soft_temperature(c.temp);
+    al.set_problem(a, b, p);
+    al.compute_forward_back(buf);
+    const int m = static_cast<int>(a.size()), n = static_cast<int>(b.size());
+    REQUIRE(guide.size() == static_cast<size_t>(m + 1));
+    auto at = [n](const auto& table, int i, int j) {
+        return table[static_cast<size_t>(i) * (n + 1) + j];
+    };
+    const double neg_inf = -std::numeric_limits<double>::infinity();
+    auto logsum = [neg_inf](double x, double y, double z) {
+        const double top = std::max({x, y, z});
+        return top == neg_inf ? top : top + std::log(std::exp(x-top) + std::exp(y-top) + std::exp(z-top));
+    };
+    int previous = 0;
+    for (int i = 0; i <= m; ++i) {
+        REQUIRE(guide[i] >= previous);
+        REQUIRE(guide[i] <= n);
+        std::vector<double> cell(n+1), next_y(n+1, neg_inf), exit(n+1);
+        for (int j = 0; j <= n; ++j) {
+            if constexpr (GM == GapModel::Linear) {
+                cell[j] = at(buf.F, i, j) + at(buf.B, i, j);
+                if (j < n) next_y[j] = at(buf.F, i, j) - p.gap_extend_a/c.temp + at(buf.B, i, j+1);
+            } else {
+                cell[j] = logsum(at(buf.FM, i, j)+at(buf.BM, i, j),
+                                 at(buf.FX, i, j)+at(buf.BX, i, j),
+                                 at(buf.FY, i, j)+at(buf.BY, i, j));
+                if (j < n) next_y[j] = at(buf.FY, i, j+1)+at(buf.BY, i, j+1);
+            }
+        }
+        const double scale = *std::max_element(cell.begin(), cell.end());
+        for (int j = 0; j <= n; ++j)
+            exit[j] = std::exp(cell[j]-scale) - std::exp(next_y[j]-scale);
+        const double best = *std::max_element(exit.begin(), exit.end());
+        // If monotonicization kept the previous column, a row argmax at any
+        // earlier column is sufficient. Otherwise this exact column must maximize.
+        const double chosen = guide[i] == previous
+            ? *std::max_element(exit.begin(), exit.begin()+previous+1) : exit[guide[i]];
+        INFO("posterior row " << i << " chosen " << guide[i] << " mass " << chosen << " best " << best);
+        CHECK(best - chosen <= 1e-10 * (1.0 + std::abs(best)));
+        previous = guide[i];
+    }
+}
+
 template <class T, GapModel GM, AlignMode AM>
 void run_case(unsigned seed, const Cfg& c) {
     std::mt19937 rng(seed);
@@ -185,7 +240,14 @@ void run_case(unsigned seed, const Cfg& c) {
         check_number(expected[i].score, eng.score(i), soft);
         const bool pending = c.gd == GradMode::None || (soft && c.soft_guide == 1);
         REQUIRE(eng.guide_pending(i) == pending);
-        if (!(soft && c.soft_guide == 1)) CHECK(expected[i].guide == eng.guide_j(i));
+        if (!(soft && c.soft_guide == 1)) {
+            const auto actual_guide = eng.guide_j(i);
+            if (soft && c.soft_guide == 2) {
+                check_posterior_guide<T, GM, AM>(A[i], B[i],
+                    i < static_cast<size_t>(N1) ? p1 : p1b, c, actual_guide);
+                expected[i].guide = actual_guide;
+            } else CHECK(expected[i].guide == actual_guide);
+        }
         if (c.gd != GradMode::None) {
             check_grad(expected[i].grad, eng.grad(i), soft);
             plain += expected[i].grad; weighted += weights[i] * expected[i].grad;
