@@ -129,13 +129,18 @@ public:
     double weight_hi() const { return settings().weight_hi; }
     bool profile() const { return settings().profile; }
 
-#define NWGRAD_BATCH_SETTER(NAME, TYPE)                                               \
-    void NAME(TYPE v) {                                                               \
-        visit([&](auto& e) { e.NAME(v); });         \
-    }
+#define NWGRAD_BATCH_SETTER(NAME, TYPE) \
+    void NAME(TYPE v) { visit([&](auto& e) { e.NAME(v); }); }
     NWGRAD_BATCH_SETTER(set_n_threads, int)
     NWGRAD_BATCH_SETTER(set_hb_cutoff, int)
     NWGRAD_BATCH_SETTER(set_soft_temperature, double)
+    NWGRAD_BATCH_SETTER(set_soft_impl, SoftImpl)
+    NWGRAD_BATCH_SETTER(set_sorted_schedule, bool)
+    NWGRAD_BATCH_SETTER(set_reserve_frac, double)
+    NWGRAD_BATCH_SETTER(set_long_cost_ratio, double)
+    NWGRAD_BATCH_SETTER(set_weight_lo, double)
+    NWGRAD_BATCH_SETTER(set_weight_hi, double)
+    NWGRAD_BATCH_SETTER(set_profile, bool)
 #undef NWGRAD_BATCH_SETTER
     void set_fill(bool rowwise, bool inter) {
         visit([&](auto& e) { e.set_fill(rowwise, inter); });
@@ -143,19 +148,6 @@ public:
     void set_soft_guide(bool lazy, bool posterior) {
         visit([&](auto& e) { e.set_soft_guide(lazy, posterior); });
     }
-    // Plain fields, no validation, no side effects.
-#define NWGRAD_BATCH_FIELD(NAME, FIELD, TYPE)                                         \
-    void NAME(TYPE v) {                                                               \
-        visit([&](auto& e) { e.NAME(v); });       \
-    }
-    NWGRAD_BATCH_FIELD(set_soft_impl, soft_impl, SoftImpl)
-    NWGRAD_BATCH_FIELD(set_sorted_schedule, sorted_schedule, bool)
-    NWGRAD_BATCH_FIELD(set_reserve_frac, reserve_frac, double)
-    NWGRAD_BATCH_FIELD(set_long_cost_ratio, long_cost_ratio, double)
-    NWGRAD_BATCH_FIELD(set_weight_lo, weight_lo, double)
-    NWGRAD_BATCH_FIELD(set_weight_hi, weight_hi, double)
-    NWGRAD_BATCH_FIELD(set_profile, profile, bool)
-#undef NWGRAD_BATCH_FIELD
 
     using PhaseProfile = typename Engine<GapModel::Affine, AlignMode::Global>::PhaseProfile;
     std::vector<PhaseProfile> profile_out() const {

@@ -314,10 +314,7 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
             "hb_cutoff) are the batch's too — set them on the batch.")
         .def(
             "set_params",
-            [](nb::object self_obj, nb::object params_obj) {
-                SP& self = nb::cast<SP&>(self_obj);
-                self.set_params(nb::cast<const AlignParams&>(params_obj));
-            },
+            [](SP& self, const AlignParams& params) { self.set_params(params); },
             nb::arg("params"),
             "Swap alignment parameters (a standalone pair; a batch's pair takes the\n"
             "batch's set_params).  Invalidates the score, gradient and stored path\n"
@@ -502,9 +499,7 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             "Pair i as a SeqPair view (score, grad, guide_j, aligned(), ...).")
         .def(
             "set_params",
-            [](nb::object self_obj, nb::object params_obj) {
-                nb::cast<SPB&>(self_obj).set_params(nb::cast<const AlignParams&>(params_obj));
-            },
+            [](SPB& self, const AlignParams& params) { self.set_params(params); },
             nb::arg("params"),
             "Set the params of every pair (one alphabet).  Clears the cached scores,\n"
             "gradients and stored paths; guides stay, for banded_grad().")
