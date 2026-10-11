@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -240,7 +241,9 @@ struct Aligner {
     void set_problem(std::string_view a, std::string_view b,
                      const AlignParams& params,
                      int band = 0,
-                     std::vector<int> guide_j = {}) {
+                     std::vector<int> guide_j = {},
+                     std::span<const uint16_t> track = {},
+                     std::span<const uint16_t> gap_track = {}) {
         // Encode both before touching a_own_/b_own_: a bad character in B must not
         // free A's codes under the previous problem's spans.
         const Alphabet& alpha = params.matrix.alphabet();
@@ -249,16 +252,29 @@ struct Aligner {
         b_own_ = std::move(eb);
         set_problem(std::span<const uint8_t>(a_own_),
                     std::span<const uint8_t>(b_own_),
-                    params, band, std::move(guide_j));
+                    params, band, std::move(guide_j), track, gap_track);
     }
 
     // Sequences arrive already encoded to alphabet indices — the DP never sees a
     // char.  Encoding (and validation) happens once, at the boundary, in SeqPair
     // / BatchAligner.  The spans must outlive the DP calls that follow.
+    //
+    // Tracks (see "Tracks" below): `track` gives the parameter set of each residue of A
+    // (m entries, each < params.num_sets()), `gap_track` the set of each DP row 0..m for
+    // gaps in A (m+1 entries).  Either may be empty: the track then defaults to all
+    // zeros, the gap track to row 0 -> track[0], row i -> track[i-1].  A problem is
+    // TRACKED when params has more than one set or either track is given; an untracked
+    // problem runs exactly the code it always ran.  The spans must outlive the DP calls,
+    // like the sequences'.  `blkT`, when given, is params' whole matrix stack already in
+    // precision T (the batch prepares it once per params); otherwise a float32 tracked
+    // problem converts the stack here.
     void set_problem(std::span<const uint8_t> a, std::span<const uint8_t> b,
                      const AlignParams& params,
                      int band = 0,
-                     std::vector<int> guide_j = {}) {
+                     std::vector<int> guide_j = {},
+                     std::span<const uint16_t> track = {},
+                     std::span<const uint16_t> gap_track = {},
+                     const T* blkT = nullptr) {
         // Invalidate first: a guide rejected below must not leave the previous
         // problem's results readable against this problem's sequences.
         problem_set_      = false;
@@ -272,16 +288,24 @@ struct Aligner {
         params_ = &params;
         blk_    = params.matrix.data();
         nalpha_ = params.matrix.size();
-        // The Viterbi-precision copy of the substitution block.  T=double aliases the
-        // master (no copy); float32 converts once per problem into blkT_storage_.
+        tr_     = params.num_sets() > 1 || !track.empty() || !gap_track.empty();
+        // The Viterbi-precision copy of the substitution block (the whole stack when
+        // tracked).  T=double aliases the master (no copy); float32 converts once per
+        // problem into blkT_storage_, unless the caller prepared it.
         if constexpr (std::is_same_v<T, double>) {
+            (void)blkT;
             blkT_ = blk_;
         } else {
-            const std::size_t nn = static_cast<std::size_t>(nalpha_) * nalpha_;
-            blkT_storage_.resize(nn);
-            for (std::size_t k = 0; k < nn; ++k)
-                blkT_storage_[k] = static_cast<T>(blk_[k]);
-            blkT_ = blkT_storage_.data();
+            if (tr_ && blkT) {
+                blkT_ = blkT;
+            } else {
+                const std::size_t nn = static_cast<std::size_t>(nalpha_) * nalpha_ *
+                                       static_cast<std::size_t>(tr_ ? params.num_sets() : 1);
+                blkT_storage_.resize(nn);
+                for (std::size_t k = 0; k < nn; ++k)
+                    blkT_storage_[k] = static_cast<T>(blk_[k]);
+                blkT_ = blkT_storage_.data();
+            }
         }
         band_   = band;
         m_      = static_cast<int>(a.size());
@@ -314,8 +338,12 @@ struct Aligner {
                 guide_j_ = std::move(guide_j);
             }
         }
+        if (tr_) setup_tracks_(track, gap_track);
         problem_set_      = true;
     }
+
+    // Whether the current problem is tracked (see set_problem).
+    bool tracked() const noexcept { return tr_; }
 
     // Allocate an empty buffer shell. Must be called once before compute_viterbi()
     // / compute_forward_back() with own buffer. Buffers grow implicitly as needed.
@@ -475,7 +503,7 @@ struct Aligner {
             return viterbi_score_;
         } else {
             const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
-            if (backend != kBackendScalar) {
+            if (backend != kBackendScalar && !tr_) {   // INTERIM(tracks)
                 const LevelKernels& K = level_kernels(backend);
                 auto fn = [&] {
                     if constexpr (std::is_same_v<T, double>) return K.score;
@@ -705,6 +733,125 @@ private:
     int                 m_ = 0, n_ = 0;
     size_t              stride_ = 0, sz_ = 0;
     std::vector<int>    guide_j_;  // used only when AB == GuideBanded
+
+    // ── Tracks ────────────────────────────────────────────────────────────────
+    //
+    // A tracked problem scores each DP row with the parameter set its track selects
+    // (params_ holds K sets: matrix block k, gap fields gap(k, .)).  Row i (1..m)
+    // consumes a[i-1]; with s = track[i-1]:
+    //   * a match (i-1, j-1) -> (i, j) scores matrix s at (a[i-1], b[j-1]);
+    //   * a gap in B INTO row i (vertical, the X state, consuming a[i-1]) costs set s's
+    //     gap_extend_b, plus its gap_open_b when the move opens the run — so a vertical
+    //     run is charged the open of the row it STARTS in and each row's own extend;
+    //   * a gap in A WITHIN row i (horizontal, the Y state, consuming b) costs set
+    //     gap_track[i]'s gap_open_a / gap_extend_a; row 0 (before a[0]) and row m (after
+    //     a[m-1]) included.  A horizontal run lies in one row, so it has one set.
+    // Nothing else changes: the recurrences are the untracked ones with each penalty
+    // read from its row.  Every DP below reads its row's penalties from the arrays here
+    // (in precision T, cast exactly as the untracked fill casts params_'s fields), and
+    // the substitution row from the STACKED block: row rs_[i-1] = s*nalpha + a[i-1] of
+    // blkT_, the K matrices back to back (params_->matrix is that stack).  The gradient
+    // is K sets too, each count landing in the set its row selects.
+    //
+    // The Global column-0 border is a vertical run from the origin: row i holds
+    // -(go_b(1) + C_i), C_i the sum of ge_b over rows 1..i.  The untracked fill writes
+    // the closed form -(go_b + i*ge_b), not a running sum, so C_i is accumulated by RUNS
+    // of bitwise-equal extends: C_i = i*ge when rows 1..i share one value, and
+    // C_{s-1} + (i-s+1)*ge from a run's start s on.  A track whose sets all hold the same
+    // values is therefore bit-identical to the untracked problem — every penalty, every
+    // border, every substitution score is the same number — which the tests assert.
+    bool                       tr_ = false;
+    std::span<const uint16_t>  trk_, gtrk_;         // m: set per residue of A; m+1: per row
+    std::vector<uint16_t>      trk_own_, gtrk_own_;  // defaults, when a span was empty
+    std::vector<uint32_t>      rs_;                  // m: stacked substitution row of row i at [i-1]
+    // Per DP row 0..m, precision T: gaps in A within row i (open, extend); gaps in B into
+    // row i (open, extend; [0] unused); the Global column-0 border of row i ([0] unused).
+    std::vector<T>             tgoa_, tgea_, tgob_, tgeb_, tbx0_;
+
+    // The set of DP row i (1..m) for matches and gaps in B, and of row i (0..m) for gaps in A.
+    int tset(int i) const noexcept { return trk_[static_cast<size_t>(i) - 1]; }
+    int gset(int i) const noexcept { return gtrk_[static_cast<size_t>(i)]; }
+    // Row i's penalties in precision T, tracked or not (for the walkers and the
+    // non-hot paths; the fills read the arrays directly).
+    T row_go_a(int i) const noexcept { return tr_ ? tgoa_[static_cast<size_t>(i)] : static_cast<T>(params_->gap_open_a); }
+    T row_ge_a(int i) const noexcept { return tr_ ? tgea_[static_cast<size_t>(i)] : static_cast<T>(params_->gap_extend_a); }
+    T row_go_b(int i) const noexcept { return tr_ ? tgob_[static_cast<size_t>(i)] : static_cast<T>(params_->gap_open_b); }
+    T row_ge_b(int i) const noexcept { return tr_ ? tgeb_[static_cast<size_t>(i)] : static_cast<T>(params_->gap_extend_b); }
+    // The same in double, from params_ (the soft path's precision).
+    double drow_go_a(int i) const noexcept { return tr_ ? params_->gap(gset(i), AlignParams::kOpenA)   : params_->gap_open_a; }
+    double drow_ge_a(int i) const noexcept { return tr_ ? params_->gap(gset(i), AlignParams::kExtendA) : params_->gap_extend_a; }
+    double drow_go_b(int i) const noexcept { return tr_ ? params_->gap(tset(i), AlignParams::kOpenB)   : params_->gap_open_b; }
+    double drow_ge_b(int i) const noexcept { return tr_ ? params_->gap(tset(i), AlignParams::kExtendB) : params_->gap_extend_b; }
+
+    void setup_tracks_(std::span<const uint16_t> track, std::span<const uint16_t> gap_track) {
+        const int K = params_->num_sets();
+        const size_t m = static_cast<size_t>(m_);
+        if (!track.empty() && track.size() != m)
+            throw std::invalid_argument(
+                "nwgrad: track has " + std::to_string(track.size()) + " entries, but sequence A has " +
+                std::to_string(m) + " residues (one set per residue)");
+        if (!gap_track.empty() && gap_track.size() != m + 1)
+            throw std::invalid_argument(
+                "nwgrad: gap_track has " + std::to_string(gap_track.size()) + " entries, but sequence A of " +
+                "length " + std::to_string(m) + " needs " + std::to_string(m + 1) + " (one per DP row 0..m)");
+        for (size_t k = 0; k < track.size(); ++k)
+            if (track[k] >= K)
+                throw std::invalid_argument(
+                    "nwgrad: track[" + std::to_string(k) + "] = " + std::to_string(track[k]) +
+                    " is not a parameter set (params has " + std::to_string(K) + ")");
+        for (size_t k = 0; k < gap_track.size(); ++k)
+            if (gap_track[k] >= K)
+                throw std::invalid_argument(
+                    "nwgrad: gap_track[" + std::to_string(k) + "] = " + std::to_string(gap_track[k]) +
+                    " is not a parameter set (params has " + std::to_string(K) + ")");
+        if (track.empty()) { trk_own_.assign(m, 0); trk_ = trk_own_; }
+        else                 trk_ = track;
+        if (gap_track.empty()) {
+            gtrk_own_.resize(m + 1);
+            gtrk_own_[0] = m ? trk_[0] : 0;
+            for (size_t i = 1; i <= m; ++i) gtrk_own_[i] = trk_[i - 1];
+            gtrk_ = gtrk_own_;
+        } else {
+            gtrk_ = gap_track;
+        }
+        rs_.resize(m);
+        for (size_t i = 0; i < m; ++i)
+            rs_[i] = static_cast<uint32_t>(trk_[i]) * static_cast<uint32_t>(nalpha_) + a_idx_[i];
+        tgoa_.resize(m + 1); tgea_.resize(m + 1); tgob_.resize(m + 1); tgeb_.resize(m + 1);
+        tbx0_.resize(m + 1);
+        for (size_t i = 0; i <= m; ++i) {
+            const int g = gtrk_[i];
+            tgoa_[i] = static_cast<T>(params_->gap(g, AlignParams::kOpenA));
+            tgea_[i] = static_cast<T>(params_->gap(g, AlignParams::kExtendA));
+        }
+        tgob_[0] = tgeb_[0] = tbx0_[0] = static_cast<T>(0);
+        for (size_t i = 1; i <= m; ++i) {
+            const int t = trk_[i - 1];
+            tgob_[i] = static_cast<T>(params_->gap(t, AlignParams::kOpenB));
+            tgeb_[i] = static_cast<T>(params_->gap(t, AlignParams::kExtendB));
+        }
+        // The column-0 border, by runs of bitwise-equal extends (see above).
+        T csum = static_cast<T>(0);     // C_{s-1}: the sum over rows before the current run
+        size_t s = 1;                   // the current run's first row
+        for (size_t i = 1; i <= m; ++i) {
+            if (i > 1 && std::bit_cast<std::conditional_t<sizeof(T) == 8, uint64_t, uint32_t>>(tgeb_[i]) !=
+                         std::bit_cast<std::conditional_t<sizeof(T) == 8, uint64_t, uint32_t>>(tgeb_[i - 1])) {
+                // close the run [s, i-1]
+                csum = (s == 1) ? static_cast<T>(i - 1) * tgeb_[i - 1]
+                                : csum + static_cast<T>(i - s) * tgeb_[i - 1];
+                s = i;
+            }
+            const T ge = tgeb_[i];
+            if constexpr (GM == GapModel::Linear) {
+                tbx0_[i] = (s == 1) ? -static_cast<T>(i) * ge
+                                    : -(csum + static_cast<T>(i - s + 1) * ge);
+            } else {
+                const T go = tgob_[1];
+                tbx0_[i] = (s == 1) ? -(go + static_cast<T>(i) * ge)
+                                    : -(go + (csum + static_cast<T>(i - s + 1) * ge));
+            }
+        }
+    }
 
     // ── Striped table layout ──────────────────────────────────────────────────
     // The leveled simd Viterbi (affine Full) writes VM/VX/VY in Farrar striped layout
@@ -979,9 +1126,19 @@ private:
     // ── Substitution lookup (the DP hot path) ─────────────────────────────────
     // Offset of the (a[i-1], b[j-1]) cell in an n_alpha × n_alpha block.  DP
     // coordinates are 1-based, so i-1 / j-1 index the sequences.
-    size_t sub_off(int i, int j) const noexcept {
+    // The untracked offset, for the untracked fills' hot loops (no branch on tr_ there).
+    size_t sub_off_u(int i, int j) const noexcept {
         return static_cast<size_t>(a_idx_[static_cast<size_t>(i) - 1]) *
                    static_cast<size_t>(nalpha_) +
+               static_cast<size_t>(b_idx_[static_cast<size_t>(j) - 1]);
+    }
+    T subTu(int i, int j) const noexcept { return blkT_[sub_off_u(i, j)]; }
+    // Tracked: the row is row i's stacked row (its set's block, then a[i-1]), which is
+    // also the gradient's index, since a K-set gradient's matrix is the same stack.
+    size_t sub_off(int i, int j) const noexcept {
+        const size_t r = tr_ ? static_cast<size_t>(rs_[static_cast<size_t>(i) - 1])
+                             : static_cast<size_t>(a_idx_[static_cast<size_t>(i) - 1]);
+        return r * static_cast<size_t>(nalpha_) +
                static_cast<size_t>(b_idx_[static_cast<size_t>(j) - 1]);
     }
 
@@ -1012,7 +1169,17 @@ private:
                 "nwgrad: gradient alphabet \"" + grad.matrix.alphabet().symbols() +
                 "\" does not match params alphabet \"" +
                 params_->matrix.alphabet().symbols() + "\"");
+        if (grad.num_sets() != params_->num_sets())
+            throw std::invalid_argument(
+                "nwgrad: gradient has " + std::to_string(grad.num_sets()) +
+                " parameter sets, params have " + std::to_string(params_->num_sets()));
         return grad.matrix.data();
+    }
+    // The gradient's gap field f of the set row i charges: a gap in A (f = kOpenA /
+    // kExtendA) its gap-track set, a gap in B (kOpenB / kExtendB) its track set.
+    double& grad_gap(AlignParams& grad, int i, int f) const noexcept {
+        if (!tr_) return grad.gap_ref(0, f);
+        return grad.gap_ref((f == AlignParams::kOpenA || f == AlignParams::kExtendA) ? gset(i) : tset(i), f);
     }
 
     // ── Band helpers ──────────────────────────────────────────────────────────
@@ -1177,6 +1344,13 @@ private:
     // fill's max chose it, so both give the same walk, ties included.
     template <class Emit>
     void walk_linear(const DpBuffer& buf, Emit&& emit) const {
+        if (tr_) walk_linear_impl<true>(buf, emit);
+        else     walk_linear_impl<false>(buf, emit);
+    }
+    // Tr: read each row's extend (row_ge_b) rather than one hoisted value — a template
+    // parameter, so the untracked walk is the code it always was.
+    template <bool Tr, class Emit>
+    void walk_linear_impl(const DpBuffer& buf, Emit& emit) const {
         int i = (AM == AlignMode::Global) ? m_ : best_i_;
         int j = (AM == AlignMode::Global) ? n_ : best_j_;
         while (true) {
@@ -1192,7 +1366,8 @@ private:
                     rat(buf.H, i, j) == rat(buf.H, i-1, j-1) + subT(i, j))
                     k = 0;
                 else if (i > 0 && (j == 0 || rat(buf.H, i, j) == rat(buf.H, i-1, j) -
-                                                 static_cast<T>(params_->gap_extend_b)))
+                                                 (Tr ? tgeb_[static_cast<size_t>(i)]
+                                                     : static_cast<T>(params_->gap_extend_b))))
                     k = 1;
                 else
                     k = 2;
@@ -1245,11 +1420,18 @@ private:
     // what a well-formed DP would have chosen anyway.
     template <class Emit>
     void walk_affine(const DpBuffer& buf, Emit&& emit) const {
-        if (pointers_) walk_affine_impl<true>(buf, emit);
-        else           walk_affine_impl<false>(buf, emit);
+        if (tr_) {
+            if (pointers_) walk_affine_impl<true, true>(buf, emit);
+            else           walk_affine_impl<false, true>(buf, emit);
+        } else {
+            if (pointers_) walk_affine_impl<true, false>(buf, emit);
+            else           walk_affine_impl<false, false>(buf, emit);
+        }
     }
 
-    template <bool Ptr, class Emit>
+    // Tr: each move reads the penalties of its own row (a gap in B the row it enters, a
+    // gap in A the row it lies in); otherwise the four are hoisted, as they always were.
+    template <bool Ptr, bool Tr, class Emit>
     void walk_affine_impl(const DpBuffer& buf, Emit& emit) const {
         auto from_code = [](unsigned char c) {
             return c == 1 ? TBTable::X : (c == 2 ? TBTable::Y : TBTable::M);
@@ -1258,10 +1440,10 @@ private:
             if (vm >= vx && vm >= vy) return TBTable::M;
             return vx >= vy ? TBTable::X : TBTable::Y;
         };
-        const T go_a = static_cast<T>(params_->gap_open_a);
-        const T ge_a = static_cast<T>(params_->gap_extend_a);
-        const T go_b = static_cast<T>(params_->gap_open_b);
-        const T ge_b = static_cast<T>(params_->gap_extend_b);
+        T go_a = static_cast<T>(params_->gap_open_a);
+        T ge_a = static_cast<T>(params_->gap_extend_a);
+        T go_b = static_cast<T>(params_->gap_open_b);
+        T ge_b = static_cast<T>(params_->gap_extend_b);
 
         int i = best_i_, j = best_j_;
         TBTable tbl = best_tbl_;
@@ -1287,6 +1469,7 @@ private:
                 emit(TBTable::M, i, j, false);
                 --i; --j;
             } else if (tbl == TBTable::X) {   // gap in B: advance i, gap_b penalties
+                if constexpr (Tr) { go_b = tgob_[static_cast<size_t>(i)]; ge_b = tgeb_[static_cast<size_t>(i)]; }
                 if constexpr (Ptr) prev = from_code(dcode(buf.DX, i, j));
                 else { const size_t k = cell_index(i-1, j);
                        prev = argmax(buf.VM[k] - go_b - ge_b,
@@ -1295,6 +1478,7 @@ private:
                 emit(TBTable::X, i, j, prev != TBTable::X);
                 --i;
             } else {                          // gap in A: advance j, gap_a penalties
+                if constexpr (Tr) { go_a = tgoa_[static_cast<size_t>(i)]; ge_a = tgea_[static_cast<size_t>(i)]; }
                 if constexpr (Ptr) prev = from_code(dcode(buf.DY, i, j));
                 else { const size_t k = cell_index(i, j-1);
                        prev = argmax(buf.VM[k] - go_a - ge_a,
@@ -1340,12 +1524,12 @@ private:
                 gblk[sub_off(i, j)] += 1.0;
                 if (gj) (*gj)[static_cast<size_t>(i - 1)] = j - 1;
             } else if (s == TBTable::X) {
-                grad.gap_extend_b -= 1.0;
-                if (open) grad.gap_open_b -= 1.0;
+                grad_gap(grad, i, AlignParams::kExtendB) -= 1.0;
+                if (open) grad_gap(grad, i, AlignParams::kOpenB) -= 1.0;
                 if (gj) (*gj)[static_cast<size_t>(i - 1)] = j;
             } else {
-                grad.gap_extend_a -= 1.0;
-                if (open) grad.gap_open_a -= 1.0;
+                grad_gap(grad, i, AlignParams::kExtendA) -= 1.0;
+                if (open) grad_gap(grad, i, AlignParams::kOpenA) -= 1.0;
             }
         });
         if (gj) fill_guide_gaps(*gj);
@@ -1394,7 +1578,7 @@ private:
         // same one, so an unsupported combination throws instead of falling back — a
         // silent substitution would make a benchmark of it meaningless and a gradient
         // from it unattributable.
-        if (is_hirschberg(tb_)) {
+        if (is_hirschberg(tb_) && !tr_) {   // INTERIM(tracks): tracked Hirschberg not yet implemented
             if constexpr (AB != AlignBand::Full)
                 throw std::logic_error(
                     "nwgrad: traceback=\"hirschberg\" is implemented for full DP only; a "
@@ -1455,7 +1639,7 @@ private:
         // (a Hirschberg mode reaches here only for a short pair — see above)
         const bool use_ptr = (tb_ == TracebackMode::Pointers || is_hirschberg(tb_)) &&
                              (AB == AlignBand::Full);
-        if (backend == kBackendScalar) {
+        if (backend == kBackendScalar || tr_) {   // INTERIM(tracks): no tracked simd kernel yet
             if (use_ptr) viterbi_affine_ptr(buf); else viterbi_affine(buf);
             return;
         }
@@ -1547,13 +1731,25 @@ private:
     // to "gap in A", and the returned path was not the one scored (-18.7 vs -7.9).
     // At T=double every cast here is the identity: results are unchanged bit for bit.
     void viterbi_linear(DpBuffer& buf) {
+        if (tr_) viterbi_linear_impl<true>(buf);
+        else     viterbi_linear_impl<false>(buf);
+    }
+    // Tr: each row's penalties and substitution row from the track arrays (the same
+    // expressions with the row's values, so equal sets reproduce the untracked fill).
+    template <bool Tr>
+    void viterbi_linear_impl(DpBuffer& buf) {
         banded_fill(buf.H);
 
         if constexpr (AM == AlignMode::Global) {
             at(buf.H, 0, 0) = 0.0;
             const int bi = border_rows(), bj = border_cols();
-            for (int i = 1; i <= bi; ++i) at(buf.H, i, 0) = -static_cast<T>(i) * static_cast<T>(params_->gap_extend_b);
-            for (int j = 1; j <= bj; ++j) at(buf.H, 0, j) = -static_cast<T>(j) * static_cast<T>(params_->gap_extend_a);
+            if constexpr (Tr) {
+                for (int i = 1; i <= bi; ++i) at(buf.H, i, 0) = tbx0_[static_cast<size_t>(i)];
+                for (int j = 1; j <= bj; ++j) at(buf.H, 0, j) = -static_cast<T>(j) * tgea_[0];
+            } else {
+                for (int i = 1; i <= bi; ++i) at(buf.H, i, 0) = -static_cast<T>(i) * static_cast<T>(params_->gap_extend_b);
+                for (int j = 1; j <= bj; ++j) at(buf.H, 0, j) = -static_cast<T>(j) * static_cast<T>(params_->gap_extend_a);
+            }
         } else {
             for (int i = 0; i <= m_; ++i) at(buf.H, i, 0) = 0.0;
             for (int j = 0; j <= n_; ++j) at(buf.H, 0, j) = 0.0;
@@ -1562,12 +1758,30 @@ private:
         best_i_ = 0; best_j_ = 0;
         double best_local = 0.0;
         for (int i = 1; i <= m_; ++i) {
+            T ge_b_r, ge_a_r;
+            const T* srow = nullptr;
+            if constexpr (Tr) {
+                ge_b_r = tgeb_[static_cast<size_t>(i)]; ge_a_r = tgea_[static_cast<size_t>(i)];
+                srow = blkT_ + static_cast<size_t>(rs_[static_cast<size_t>(i) - 1]) * static_cast<size_t>(nalpha_);
+            } else {
+                ge_b_r = static_cast<T>(params_->gap_extend_b); ge_a_r = static_cast<T>(params_->gap_extend_a);
+            }
             for (int j = jlo(i); j <= jhi(i); ++j) {
-                T v = std::max({
-                    rat(buf.H, i-1, j-1) + subT(i, j),
-                    rat(buf.H, i-1, j)   - static_cast<T>(params_->gap_extend_b),  // gap in B (advance i)
-                    rat(buf.H, i,   j-1) - static_cast<T>(params_->gap_extend_a),  // gap in A (advance j)
-                });
+                T v;
+                if constexpr (Tr) {
+                    v = std::max({
+                        rat(buf.H, i-1, j-1) + srow[b_idx_[static_cast<size_t>(j) - 1]],
+                        rat(buf.H, i-1, j)   - ge_b_r,
+                        rat(buf.H, i,   j-1) - ge_a_r,
+                    });
+                } else {
+                    (void)srow; (void)ge_b_r; (void)ge_a_r;
+                    v = std::max({
+                        rat(buf.H, i-1, j-1) + subTu(i, j),
+                        rat(buf.H, i-1, j)   - static_cast<T>(params_->gap_extend_b),  // gap in B (advance i)
+                        rat(buf.H, i,   j-1) - static_cast<T>(params_->gap_extend_a),  // gap in A (advance j)
+                    });
+                }
                 if constexpr (AM == AlignMode::Local) {
                     v = std::max(v, static_cast<T>(0));
                     if (v > best_local) { best_local = v; best_i_ = i; best_j_ = j; }
@@ -1589,14 +1803,20 @@ private:
     // equality — so both pick the first largest.  Local: stop where the clamped value is
     // <= 0 (the H walk's stop test); borders stop (Local), go up / left (Global).
     void viterbi_linear_ptr(DpBuffer& buf) {
+        if (tr_) viterbi_linear_ptr_impl<true>(buf);
+        else     viterbi_linear_ptr_impl<false>(buf);
+    }
+    template <bool Tr>
+    void viterbi_linear_ptr_impl(DpBuffer& buf) {
         const size_t st = stride_;
         const size_t dsz = static_cast<size_t>(m_ + 1) * st;
         if (buf.DM.size() < dsz) buf.DM.resize(dsz);
         if (buf.rM.size() < st) { buf.rM.resize(st); buf.qM.resize(st); }
         T* prev = buf.qM.data(); T* cur = buf.rM.data();
         unsigned char* D = buf.DM.data();
-        const T ge_a = static_cast<T>(params_->gap_extend_a);
-        const T ge_b = static_cast<T>(params_->gap_extend_b);
+        T ge_a = static_cast<T>(params_->gap_extend_a);
+        T ge_b = static_cast<T>(params_->gap_extend_b);
+        if constexpr (Tr) ge_a = tgea_[0];
         constexpr bool local = AM == AlignMode::Local;
         prev[0] = static_cast<T>(0); D[0] = 3;
         for (int j = 1; j <= n_; ++j) {
@@ -1611,10 +1831,17 @@ private:
             unsigned char* __restrict d = D + static_cast<size_t>(i) * st;
             // Locals, not members: the byte stores below may alias anything, so a member
             // read in the loop (subT's blkT_/a_idx_/b_idx_) would be reloaded every cell.
-            const T* __restrict prow = blkT_ + static_cast<size_t>(a_idx_[static_cast<size_t>(i) - 1]) * nalpha_;
+            const T* __restrict prow;
+            if constexpr (Tr) {
+                prow = blkT_ + static_cast<size_t>(rs_[static_cast<size_t>(i) - 1]) * nalpha_;
+                ge_a = tgea_[static_cast<size_t>(i)]; ge_b = tgeb_[static_cast<size_t>(i)];
+            } else {
+                prow = blkT_ + static_cast<size_t>(a_idx_[static_cast<size_t>(i) - 1]) * nalpha_;
+            }
             const T* __restrict pv = prev;
             T* __restrict cv = cur;
-            cv[0] = local ? static_cast<T>(0) : -static_cast<T>(i) * ge_b;
+            if constexpr (Tr) cv[0] = local ? static_cast<T>(0) : tbx0_[static_cast<size_t>(i)];
+            else              cv[0] = local ? static_cast<T>(0) : -static_cast<T>(i) * ge_b;
             d[0] = local ? 3 : 1;
             // Two passes, as gcc -O3 splits viterbi_linear's own loop: the carry-free
             // max(diag+s, up-ge_b) and its code vectorize across the row; only
@@ -1670,8 +1897,8 @@ private:
         double* gblk = grad_block(grad);
         walk_linear(buf, [&](int k, int i, int j) {
             if (k == 0)      gblk[sub_off(i, j)] += 1.0;
-            else if (k == 1) grad.gap_extend_b -= 1.0;   // the score subtracts this penalty
-            else             grad.gap_extend_a -= 1.0;
+            else if (k == 1) grad_gap(grad, i, AlignParams::kExtendB) -= 1.0;   // the score subtracts this penalty
+            else             grad_gap(grad, i, AlignParams::kExtendA) -= 1.0;
         });
     }
 
@@ -1699,10 +1926,16 @@ private:
     // walks column 0 and row 0 (X at (1,0) resolves to M, at (i>1,0) to X), and
     // those cells are border-initialised, never visited by the main loop.
     void viterbi_affine_ptr(DpBuffer& buf) {
-        const T go_a = static_cast<T>(params_->gap_open_a);
-        const T ge_a = static_cast<T>(params_->gap_extend_a);
-        const T go_b = static_cast<T>(params_->gap_open_b);
-        const T ge_b = static_cast<T>(params_->gap_extend_b);
+        if (tr_) viterbi_affine_ptr_impl<true>(buf);
+        else     viterbi_affine_ptr_impl<false>(buf);
+    }
+    template <bool Tr>
+    void viterbi_affine_ptr_impl(DpBuffer& buf) {
+        T go_a = static_cast<T>(params_->gap_open_a);
+        T ge_a = static_cast<T>(params_->gap_extend_a);
+        T go_b = static_cast<T>(params_->gap_open_b);
+        T ge_b = static_cast<T>(params_->gap_extend_b);
+        if constexpr (Tr) { go_a = tgoa_[0]; ge_a = tgea_[0]; }
 
         const std::size_t stride = stride_;   // row-major, matches cell_index()
         const std::size_t dsz    = static_cast<std::size_t>(m_ + 1) * stride;
@@ -1742,8 +1975,15 @@ private:
 
         for (int i = 1; i <= m_; ++i) {
             const std::size_t rb = static_cast<std::size_t>(i) * stride;
+            const T* srow = nullptr;
+            if constexpr (Tr) {
+                go_a = tgoa_[static_cast<size_t>(i)]; ge_a = tgea_[static_cast<size_t>(i)];
+                go_b = tgob_[static_cast<size_t>(i)]; ge_b = tgeb_[static_cast<size_t>(i)];
+                srow = blkT_ + static_cast<size_t>(rs_[static_cast<size_t>(i) - 1]) * static_cast<size_t>(nalpha_);
+            }
             // column 0 of this row
             if constexpr (AM == AlignMode::Local) { cM[0] = 0; cX[0] = NEG_INF; }
+            else if constexpr (Tr) { cM[0] = NEG_INF; cX[0] = tbx0_[static_cast<size_t>(i)]; }
             else { cM[0] = NEG_INF; cX[0] = -(go_b + static_cast<T>(i) * ge_b); }
             cY[0] = NEG_INF;
             dM[rb] = 3;
@@ -1753,7 +1993,9 @@ private:
             for (int j = 1; j <= n_; ++j) {
                 const std::size_t k = static_cast<std::size_t>(j);
                 const T dgM = pM[k-1], dgX = pX[k-1], dgY = pY[k-1];
-                T m_val = std::max({dgM, dgX, dgY}) + subT(i, j);
+                T m_val;
+                if constexpr (Tr) m_val = std::max({dgM, dgX, dgY}) + srow[b_idx_[k - 1]];
+                else              m_val = std::max({dgM, dgX, dgY}) + subTu(i, j);
                 unsigned char km = pick(dgM, dgX, dgY);
 
                 const T ux = pM[k] - go_b - ge_b, vx = pX[k] - ge_b, wx = pY[k] - go_b - ge_b;
@@ -1906,7 +2148,7 @@ private:
             T P = cY[0] - ge_a;
             for (int c = 1; c <= W; ++c) {
                 // subT is 1-based over the full sequences; row r consumes a[r-1].
-                cM[c] = std::max({pM[c-1], pX[c-1], pY[c-1]}) + subT(r, j0 + c);
+                cM[c] = std::max({pM[c-1], pX[c-1], pY[c-1]}) + subTu(r, j0 + c);
                 cX[c] = std::max({pM[c] - go_b - ge_b, pX[c] - ge_b, pY[c] - go_b - ge_b});
                 if constexpr (Pmax) {
                     // g[k] for k = c-1.  Max-then-subtract mirrors the kernel's `ov`
@@ -1958,7 +2200,7 @@ private:
             T P = cY[0] - ge_a;
             for (int d = 1; d <= W; ++d) {
                 // Mirrored diagonal: this step pairs a[r] with b[j1-d], i.e. subT(r+1, j1-d+1).
-                cM[d] = std::max({pM[d-1], pX[d-1], pY[d-1]}) + subT(r + 1, j1 - d + 1);
+                cM[d] = std::max({pM[d-1], pX[d-1], pY[d-1]}) + subTu(r + 1, j1 - d + 1);
                 cX[d] = std::max({pM[d] - go_b - ge_b, pX[d] - ge_b, pY[d] - go_b - ge_b});
                 if constexpr (Pmax) {
                     const T g = (std::max(cM[d-1], cX[d-1]) - go_a) - ge_a;
@@ -2090,7 +2332,7 @@ private:
             if (in_x && r == 1) { cX[0] = static_cast<T>(0) - ge_b; dX[rb] = 1; }   // continues the run
             for (int c = 1; c <= W; ++c) {
                 const T dgM = pM[c-1], dgX = pX[c-1], dgY = pY[c-1];
-                cM[c] = std::max({dgM, dgX, dgY}) + subT(i0 + r, j0 + c);
+                cM[c] = std::max({dgM, dgX, dgY}) + subTu(i0 + r, j0 + c);
                 const T ux = pM[c] - go_b - ge_b, vx = pX[c] - ge_b, wx = pY[c] - go_b - ge_b;
                 cX[c] = std::max({ux, vx, wx});
                 const T uy = cM[c-1] - go_a - ge_a, vy = cX[c-1] - go_a - ge_a, wy = cY[c-1] - ge_a;
@@ -2365,7 +2607,7 @@ private:
             T P = cY[0] - ge_a;   // Pmax: the running prefix max, the border as its seed
             for (int c = 1; c <= NC; ++c) {
                 const int bcol = b_start + (c - 1) * b_step;       // 0-based sequence col
-                T m = std::max({pM[c-1], pX[c-1], pY[c-1]}) + subT(arow + 1, bcol + 1);
+                T m = std::max({pM[c-1], pX[c-1], pY[c-1]}) + subTu(arow + 1, bcol + 1);
                 if (local) m = std::max(m, static_cast<T>(0));
                 const T x = std::max(std::max((pM[c] - go_b) - ge_b, pX[c] - ge_b), (pY[c] - go_b) - ge_b);
                 T y;
@@ -2467,7 +2709,7 @@ private:
             row[0] = row[0] - ge_b;
             for (int c = 1; c <= W; ++c) {
                 const int j = rev ? j1 - c + 1 : j0 + c;
-                T v = diag + subT(i, j);
+                T v = diag + subTu(i, j);
                 const T u = row[c] - ge_b, l = row[c - 1] - ge_a;
                 if (v < u) v = u;
                 if (v < l) v = l;
@@ -2496,7 +2738,7 @@ private:
             unsigned char* d = D + static_cast<std::size_t>(r) * st;
             cur[0] = prev[0] - ge_b; d[0] = 1;
             for (int c = 1; c <= W; ++c) {
-                T v = prev[c - 1] + subT(i0 + r, j0 + c);
+                T v = prev[c - 1] + subTu(i0 + r, j0 + c);
                 unsigned char k = 0;
                 const T u = prev[c] - ge_b, l = cur[c - 1] - ge_a;
                 if (v < u) { v = u; k = 1; }
@@ -2550,7 +2792,7 @@ private:
             for (int i = 1; i <= m_; ++i) {
                 T diag = row[0];
                 for (int j = 1; j <= n_; ++j) {
-                    T v = diag + subT(i, j);
+                    T v = diag + subTu(i, j);
                     const T u = row[j] - ge_b, l = row[j - 1] - ge_a;
                     if (v < u) v = u;
                     if (v < l) v = l;
@@ -2576,7 +2818,7 @@ private:
                 g[je] = g[je] - ge_b;
                 if (g[je] > sbest) { sbest = g[je]; is = pi; js = je; }
                 for (int q = je - 1; q >= 0; --q) {
-                    T v = diag + subT(pi + 1, q + 1);
+                    T v = diag + subTu(pi + 1, q + 1);
                     const T u = g[q] - ge_b, l = g[q + 1] - ge_a;
                     if (v < u) v = u;
                     if (v < l) v = l;
@@ -2699,10 +2941,15 @@ private:
     }
 
     double score_affine_scalar(DpBuffer& buf) const {
-        const T go_a = static_cast<T>(params_->gap_open_a);
-        const T ge_a = static_cast<T>(params_->gap_extend_a);
-        const T go_b = static_cast<T>(params_->gap_open_b);
-        const T ge_b = static_cast<T>(params_->gap_extend_b);
+        return tr_ ? score_affine_scalar_impl<true>(buf) : score_affine_scalar_impl<false>(buf);
+    }
+    template <bool Tr>
+    double score_affine_scalar_impl(DpBuffer& buf) const {
+        T go_a = static_cast<T>(params_->gap_open_a);
+        T ge_a = static_cast<T>(params_->gap_extend_a);
+        T go_b = static_cast<T>(params_->gap_open_b);
+        T ge_b = static_cast<T>(params_->gap_extend_b);
+        if constexpr (Tr) { go_a = tgoa_[0]; ge_a = tgea_[0]; }
         const std::size_t w = static_cast<std::size_t>(n_) + 1;
         for (auto* v : {&buf.rM, &buf.rX, &buf.rY, &buf.qM, &buf.qX, &buf.qY})
             if (v->size() < w) v->resize(w);
@@ -2718,10 +2965,18 @@ private:
         }
         T best = static_cast<T>(0);
         for (int i = 1; i <= m_; ++i) {
+            const T* sub;
+            if constexpr (Tr) {
+                go_a = tgoa_[static_cast<size_t>(i)]; ge_a = tgea_[static_cast<size_t>(i)];
+                go_b = tgob_[static_cast<size_t>(i)]; ge_b = tgeb_[static_cast<size_t>(i)];
+                cX[0] = local ? ninf : tbx0_[static_cast<size_t>(i)];
+                sub = blkT_ + static_cast<std::size_t>(rs_[static_cast<size_t>(i) - 1]) * nalpha_;
+            } else {
+                cX[0] = local ? ninf : -(go_b + static_cast<T>(i) * ge_b);
+                sub = blkT_ + static_cast<std::size_t>(a_idx_[i - 1]) * nalpha_;
+            }
             cM[0] = local ? static_cast<T>(0) : ninf;
-            cX[0] = local ? ninf : -(go_b + static_cast<T>(i) * ge_b);
             cY[0] = ninf;
-            const T* sub = blkT_ + static_cast<std::size_t>(a_idx_[i - 1]) * nalpha_;
             for (int j = 1; j <= n_; ++j) {
                 T m_val = std::max({pM[j-1], pX[j-1], pY[j-1]}) + sub[b_idx_[j - 1]];
                 const T x_val = std::max({pM[j] - go_b - ge_b, pX[j] - ge_b, pY[j] - go_b - ge_b});
@@ -2739,8 +2994,13 @@ private:
     }
 
     double score_linear_scalar(DpBuffer& buf) const {
-        const T ge_a = static_cast<T>(params_->gap_extend_a);
-        const T ge_b = static_cast<T>(params_->gap_extend_b);
+        return tr_ ? score_linear_scalar_impl<true>(buf) : score_linear_scalar_impl<false>(buf);
+    }
+    template <bool Tr>
+    double score_linear_scalar_impl(DpBuffer& buf) const {
+        T ge_a = static_cast<T>(params_->gap_extend_a);
+        T ge_b = static_cast<T>(params_->gap_extend_b);
+        if constexpr (Tr) ge_a = tgea_[0];
         const std::size_t w = static_cast<std::size_t>(n_) + 1;
         if (buf.rM.size() < w) buf.rM.resize(w);
         if (buf.qM.size() < w) buf.qM.resize(w);
@@ -2750,8 +3010,15 @@ private:
         for (int j = 1; j <= n_; ++j) prev[j] = local ? static_cast<T>(0) : -static_cast<T>(j) * ge_a;
         double best = 0.0;
         for (int i = 1; i <= m_; ++i) {
-            cur[0] = local ? static_cast<T>(0) : -static_cast<T>(i) * ge_b;
-            const T* sub = blkT_ + static_cast<std::size_t>(a_idx_[i - 1]) * nalpha_;
+            const T* sub;
+            if constexpr (Tr) {
+                ge_a = tgea_[static_cast<size_t>(i)]; ge_b = tgeb_[static_cast<size_t>(i)];
+                cur[0] = local ? static_cast<T>(0) : tbx0_[static_cast<size_t>(i)];
+                sub = blkT_ + static_cast<std::size_t>(rs_[static_cast<size_t>(i) - 1]) * nalpha_;
+            } else {
+                cur[0] = local ? static_cast<T>(0) : -static_cast<T>(i) * ge_b;
+                sub = blkT_ + static_cast<std::size_t>(a_idx_[i - 1]) * nalpha_;
+            }
             for (int j = 1; j <= n_; ++j) {
                 T v = std::max({prev[j-1] + sub[b_idx_[j - 1]], prev[j] - ge_b, cur[j-1] - ge_a});
                 if constexpr (local) {
@@ -2766,6 +3033,11 @@ private:
     }
 
     void viterbi_affine(DpBuffer& buf) {
+        if (tr_) viterbi_affine_impl<true>(buf);
+        else     viterbi_affine_impl<false>(buf);
+    }
+    template <bool Tr>
+    void viterbi_affine_impl(DpBuffer& buf) {
         band_fill(buf.VM, NEG_INF);
         band_fill(buf.VX, NEG_INF);
         band_fill(buf.VY, NEG_INF);
@@ -2774,20 +3046,26 @@ private:
         // makes this scalar fill bit-exact with the T-typed simd kernel: both then do
         // (v - go) - ge in T with the same left association, so their VM/VX/VY tables
         // agree to the last bit (which the argmax tracebacks below depend on).
-        const T go_a = static_cast<T>(params_->gap_open_a);
-        const T ge_a = static_cast<T>(params_->gap_extend_a);
-        const T go_b = static_cast<T>(params_->gap_open_b);
-        const T ge_b = static_cast<T>(params_->gap_extend_b);
+        // Tracked: the same, per row (the arrays hold the same casts).
+        T go_a = static_cast<T>(params_->gap_open_a);
+        T ge_a = static_cast<T>(params_->gap_extend_a);
+        T go_b = static_cast<T>(params_->gap_open_b);
+        T ge_b = static_cast<T>(params_->gap_extend_b);
 
         if constexpr (AM == AlignMode::Global) {
             at(buf.VM, 0, 0) = static_cast<T>(0);
             const int bi = border_rows(), bj = border_cols();
+            if constexpr (Tr) {
+                for (int i = 1; i <= bi; ++i) at(buf.VX, i, 0) = tbx0_[static_cast<size_t>(i)];
+                for (int j = 1; j <= bj; ++j) at(buf.VY, 0, j) = -(tgoa_[0] + static_cast<T>(j) * tgea_[0]);
+            } else {
             // VX along column 0: all gaps in B (consuming A), uses gap_b params
             for (int i = 1; i <= bi; ++i)
                 at(buf.VX, i, 0) = -(go_b + static_cast<T>(i) * ge_b);
             // VY along row 0: all gaps in A (consuming B), uses gap_a params
             for (int j = 1; j <= bj; ++j)
                 at(buf.VY, 0, j) = -(go_a + static_cast<T>(j) * ge_a);
+            }
         } else {
             for (int i = 0; i <= m_; ++i) at(buf.VM, i, 0) = static_cast<T>(0);
             for (int j = 0; j <= n_; ++j) at(buf.VM, 0, j) = static_cast<T>(0);
@@ -2797,9 +3075,17 @@ private:
         T best_local = static_cast<T>(0);
 
         for (int i = 1; i <= m_; ++i) {
+            const T* srow = nullptr;
+            if constexpr (Tr) {
+                go_a = tgoa_[static_cast<size_t>(i)]; ge_a = tgea_[static_cast<size_t>(i)];
+                go_b = tgob_[static_cast<size_t>(i)]; ge_b = tgeb_[static_cast<size_t>(i)];
+                srow = blkT_ + static_cast<size_t>(rs_[static_cast<size_t>(i) - 1]) * static_cast<size_t>(nalpha_);
+            }
             for (int j = jlo(i); j <= jhi(i); ++j) {
                 T diag  = std::max({rat(buf.VM,i-1,j-1), rat(buf.VX,i-1,j-1), rat(buf.VY,i-1,j-1)});
-                T m_val = diag + subT(i, j);
+                T m_val;
+                if constexpr (Tr) m_val = diag + srow[b_idx_[static_cast<size_t>(j) - 1]];
+                else              m_val = diag + subTu(i, j);
                 // X state: gap in B (advance i), uses gap_b params
                 T x_val = std::max({
                     rat(buf.VM,i-1,j) - go_b - ge_b,
@@ -3125,6 +3411,7 @@ private:
 
     void run_fwdbwd(DpBuffer& buf) {
         soft_counts_ready_ = false;
+        if (tr_) throw std::logic_error("nwgrad: INTERIM(tracks): tracked soft path not implemented yet");
         if (soft_impl_ != SoftImpl::Log) {
             bool ok;
             ok = fwdbwd_scaled(buf);

@@ -796,18 +796,23 @@ private:
         const double g[4] = {p.gap_open_a, p.gap_extend_a, p.gap_open_b, p.gap_extend_b};
         mix(g, sizeof g);
         const size_t na = p.matrix.alphabet().size();
-        mix(p.matrix.data(), na * na * sizeof(double));
+        mix(p.matrix.data(), na * na * static_cast<size_t>(p.num_sets()) * sizeof(double));
+        mix(p.more_gaps().data(), p.more_gaps().size() * sizeof(double));
         return h;
     }
     // Bitwise, so equal copies are interchangeable bit for bit (0.0 vs -0.0 and NaNs
     // simply do not share).
     static bool params_same_(const AlignParams& x, const AlignParams& y) noexcept {
         if (&x.matrix.alphabet() != &y.matrix.alphabet()) return false;
+        if (x.num_sets() != y.num_sets()) return false;
         const double gx[4] = {x.gap_open_a, x.gap_extend_a, x.gap_open_b, x.gap_extend_b};
         const double gy[4] = {y.gap_open_a, y.gap_extend_a, y.gap_open_b, y.gap_extend_b};
         const size_t na = x.matrix.alphabet().size();
+        const size_t K = static_cast<size_t>(x.num_sets());
         return std::memcmp(gx, gy, sizeof gx) == 0 &&
-               std::memcmp(x.matrix.data(), y.matrix.data(), na * na * sizeof(double)) == 0;
+               std::memcmp(x.matrix.data(), y.matrix.data(), na * na * K * sizeof(double)) == 0 &&
+               (K == 1 || std::memcmp(x.more_gaps().data(), y.more_gaps().data(),
+                                      x.more_gaps().size() * sizeof(double)) == 0);
     }
     const AlignParams* own_params_(const AlignParams& p) {
         const size_t h = params_hash_(p);

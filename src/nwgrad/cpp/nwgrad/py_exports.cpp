@@ -28,7 +28,18 @@ static void warn_pair_api(const char* old_name, const char* replacement) {
 
 void bind_logistic(nb::module_& parent);   // logistic/py_logistic.cpp
 using nb_arr_f64    = nb::ndarray<double, nb::ndim<2>, nb::c_contig, nb::device::cpu>;
+using nb_arr_f64_3d = nb::ndarray<double, nb::ndim<3>, nb::c_contig, nb::device::cpu>;
 using nb_arr_f64_1d = nb::ndarray<nb::numpy, double, nb::ndim<1>>;
+
+// A new numpy float64 array of `shape` owning a copy of `n` doubles from `src`.
+// Returned as an object, so a property getter's reference_internal policy never applies.
+static nb::object numpy_copy(const double* src, size_t n, std::initializer_list<size_t> shape) {
+    double* buf = new double[n ? n : 1];
+    std::copy(src, src + n, buf);
+    nb::capsule owner(buf, [](void* p) noexcept { delete[] static_cast<double*>(p); });
+    std::vector<size_t> sh(shape);
+    return nb::cast(nb::ndarray<nb::numpy, double>(buf, sh.size(), sh.data(), owner));
+}
 
 // The compiler that built this extension, captured at compile time.  Exposed as
 // nwgrad.compiled_with() — a reliable way to tell which toolchain produced the loaded
@@ -90,6 +101,28 @@ struct EncodedPair {
     EncodedPair(std::string_view sa, std::string_view sb, const AlignParams& p)
         : a(p.matrix.alphabet().encode(sa)), b(p.matrix.alphabet().encode(sb)) {}
 };
+
+// A track argument (None, or a sequence of set indices) as uint16 set indices.  Range
+// against the params' set count is checked by the Aligner / the batch, which know K.
+static std::vector<uint16_t> to_track(const nb::handle& obj, const char* what) {
+    std::vector<uint16_t> out;
+    if (!obj.is_valid() || obj.is_none()) return out;
+    std::vector<int64_t> v;
+    try {
+        v = nb::cast<std::vector<int64_t>>(obj);
+    } catch (const nb::cast_error&) {
+        throw nb::type_error((std::string("nwgrad: ") + what +
+                              " must be a sequence of integers (parameter set indices) or None").c_str());
+    }
+    out.resize(v.size());
+    for (size_t k = 0; k < v.size(); ++k) {
+        if (v[k] < 0 || v[k] >= SubstMatrix::kMaxSets)
+            throw nb::value_error((std::string("nwgrad: ") + what + "[" + std::to_string(k) + "] = " +
+                                   std::to_string(v[k]) + " is not a parameter set index").c_str());
+        out[k] = static_cast<uint16_t>(v[k]);
+    }
+    return out;
+}
 
 static GapModel parse_gap_model(const std::string& name) {
     if (name == "linear") return GapModel::Linear;
@@ -225,44 +258,58 @@ static std::string format_alignment(const std::string& a, const std::string& b,
 // numerically identical to the plain ones — bound for naming symmetry only.
 template<class T>
 static void bind_convenience(nb::module_& m, const std::string& sfx) {
-#define NWG_CONV_ARGS \
+#define NWG_BASE_ARGS \
         nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("params"), nb::arg("band") = 0, \
         nb::arg("aligned_a") = "", nb::arg("aligned_b") = "", nb::arg("kernel") = "auto"
+#define NWG_TRACK_ARGS \
+        nb::kw_only(), nb::arg("track").none() = nb::none(), nb::arg("gap_track").none() = nb::none()
+#define NWG_CONV_ARGS NWG_BASE_ARGS, NWG_TRACK_ARGS
+#define NWG_TRACK_DOC \
+    "\n\ntrack / gap_track (keyword, optional): the parameter set of each residue of seq_a\n" \
+    "(len(seq_a) entries) and of each DP row 0..len(seq_a) for gaps in seq_a\n" \
+    "(len(seq_a)+1 entries; default: row 0 -> track[0], row i -> track[i-1]).  See\n" \
+    "SeqPairBatch.add_many.  With several sets the gradient has as many."
 #define NWG_SCORE(FN, GM, AM, DOC) \
     m.def((std::string(FN) + sfx).c_str(), \
         [](const std::string& a, const std::string& b, const AlignParams& params, int band, \
-           const std::string& aligned_a, const std::string& aligned_b, const std::string& kernel) { \
+           const std::string& aligned_a, const std::string& aligned_b, const std::string& kernel, \
+           nb::handle track, nb::handle gap_track) { \
             auto gj = make_guide(aligned_a, aligned_b); EncodedPair enc(a, b, params); \
+            const auto tk = to_track(track, "track"), gt = to_track(gap_track, "gap_track"); \
             WITH_ALIGNER_T(T, GM, AM, band, gj, { \
-                al.set_problem(enc.a, enc.b, params, band, gj); \
+                al.set_problem(enc.a, enc.b, params, band, gj, tk, gt); \
                 return al.compute_score(_buf); }); \
-        }, NWG_CONV_ARGS, DOC)
+        }, NWG_CONV_ARGS, DOC NWG_TRACK_DOC)
 #define NWG_HARD(FN, GM, AM, DOC) \
     m.def((std::string(FN) + sfx).c_str(), \
         [](const std::string& a, const std::string& b, const AlignParams& params, int band, \
-           const std::string& aligned_a, const std::string& aligned_b, const std::string& kernel) { \
+           const std::string& aligned_a, const std::string& aligned_b, const std::string& kernel, \
+           nb::handle track, nb::handle gap_track) { \
             auto gj = make_guide(aligned_a, aligned_b); EncodedPair enc(a, b, params); \
+            const auto tk = to_track(track, "track"), gt = to_track(gap_track, "gap_track"); \
             WITH_ALIGNER_T(T, GM, AM, band, gj, { \
-                al.set_problem(enc.a, enc.b, params, band, gj); al.compute_viterbi(_buf); \
+                al.set_problem(enc.a, enc.b, params, band, gj, tk, gt); al.compute_viterbi(_buf); \
                 AlignParams grad = AlignParams::zeros_like(params); al.hard_grad(_buf, grad); \
                 return nb::make_tuple(al.score(), grad); }); \
-        }, NWG_CONV_ARGS, DOC)
+        }, NWG_CONV_ARGS, DOC NWG_TRACK_DOC)
 #define NWG_SOFT(FN, GM, AM, DOC) \
     m.def((std::string(FN) + sfx).c_str(), \
         [](const std::string& a, const std::string& b, const AlignParams& params, int band, \
            const std::string& aligned_a, const std::string& aligned_b, const std::string& kernel, \
-           const std::string& soft_impl, double temperature) { \
+           const std::string& soft_impl, double temperature, \
+           nb::handle track, nb::handle gap_track) { \
             auto gj = make_guide(aligned_a, aligned_b); EncodedPair enc(a, b, params); \
+            const auto tk = to_track(track, "track"), gt = to_track(gap_track, "gap_track"); \
             const SoftImpl si = parse_soft_impl(soft_impl); \
             WITH_ALIGNER_T(T, GM, AM, band, gj, { \
                 al.set_soft_impl(si); al.set_soft_temperature(temperature); \
-                al.set_problem(enc.a, enc.b, params, band, gj); al.compute_forward_back(_buf); \
+                al.set_problem(enc.a, enc.b, params, band, gj, tk, gt); al.compute_forward_back(_buf); \
                 AlignParams grad = AlignParams::zeros_like(params); al.soft_grad(_buf, grad); \
                 return nb::make_tuple(al.log_z(), grad); }); \
-        }, NWG_CONV_ARGS, nb::arg("soft_impl") = "scaled", nb::arg("temperature") = 1.0, \
+        }, NWG_BASE_ARGS, nb::arg("soft_impl") = "scaled", nb::arg("temperature") = 1.0, NWG_TRACK_ARGS, \
         DOC "\n\nsoft_impl: \"scaled\" (default) | \"scaled_or_log\" | \"log\" -- " \
         "see SeqPairBatch.soft_impl.\ntemperature: T > 0; returns (T*log Z(params/T), " \
-        "expected counts under params/T) -- see SeqPairBatch.soft_temperature.")
+        "expected counts under params/T) -- see SeqPairBatch.soft_temperature." NWG_TRACK_DOC)
 
     NWG_SCORE("nw_score", Linear, Global, "Needleman-Wunsch global alignment score (linear gap penalty).");
     NWG_SCORE("sw_score", Linear, Local,  "Smith-Waterman local alignment score (linear gap penalty).");
@@ -280,6 +327,9 @@ static void bind_convenience(nb::module_& m, const std::string& sfx) {
 #undef NWG_HARD
 #undef NWG_SOFT
 #undef NWG_CONV_ARGS
+#undef NWG_BASE_ARGS
+#undef NWG_TRACK_ARGS
+#undef NWG_TRACK_DOC
 }
 
 static nb::object numpy_1d(const std::vector<double>& v) {
@@ -923,36 +973,123 @@ NB_MODULE(nwgrad_ext, m) {
             nb::arg("gap_extend_b") = 0.0,
             "Construct from a SubstMatrix (which carries its own alphabet) plus gap costs.\n"
             "Preferred over the (array, alphabet) form — no risk of an alphabet mismatch.")
+        .def_static(
+            "from_arrays",
+            [](nb_arr_f64_3d mats, nb_arr_f64 gaps, const std::string& alphabet) {
+                const size_t K = mats.shape(0), n = mats.shape(1);
+                if (mats.shape(2) != n)
+                    throw std::invalid_argument("nwgrad: matrices must have shape (K, N, N)");
+                if (static_cast<size_t>(alphabet.size()) != n)
+                    throw std::invalid_argument("nwgrad: alphabet length must match matrix size");
+                if (gaps.shape(0) != K || gaps.shape(1) != 4)
+                    throw std::invalid_argument(
+                        "nwgrad: gaps must have shape (K, 4) — gap_open_a, gap_extend_a, "
+                        "gap_open_b, gap_extend_b per set — for K = " + std::to_string(K) + " matrices");
+                if (K == 0 || K > static_cast<size_t>(SubstMatrix::kMaxSets))
+                    throw std::invalid_argument("nwgrad: the number of parameter sets must be in [1, " +
+                                                std::to_string(SubstMatrix::kMaxSets) + "]");
+                return AlignParams(SubstMatrix(mats.data(), Alphabet::get(alphabet), static_cast<int>(K)),
+                                   gaps.data());
+            },
+            nb::arg("matrices"), nb::arg("gaps"), nb::arg("alphabet") = std::string(AA_ORDER),
+            "K parameter sets from arrays: matrices (K, N, N) and gaps (K, 4), the gap\n"
+            "columns being gap_open_a, gap_extend_a, gap_open_b, gap_extend_b.  Set k is\n"
+            "what a track entry k selects (SeqPairBatch.add_many(tracks=...)).")
+        .def_static(
+            "stack", [](const std::vector<AlignParams>& parts) { return AlignParams::stack(parts); },
+            nb::arg("sets"),
+            "Stack params over one alphabet into one params with their sets in order\n"
+            "(each part may hold several sets).")
+        .def_prop_ro("num_sets", &AlignParams::num_sets,
+                     "K, the number of parameter sets.  The plain fields (matrix, gap_open_a,\n"
+                     "...) are set 0.")
+        .def_prop_rw(
+            "matrices",
+            [](const AlignParams& self) {
+                const size_t n = static_cast<size_t>(self.matrix.size()), K = static_cast<size_t>(self.num_sets());
+                return numpy_copy(self.matrix.data(), K * n * n, {K, n, n});
+            },
+            [](AlignParams& self, nb_arr_f64_3d mats) {
+                const size_t n = static_cast<size_t>(self.matrix.size()), K = static_cast<size_t>(self.num_sets());
+                if (mats.shape(0) != K || mats.shape(1) != n || mats.shape(2) != n)
+                    throw std::invalid_argument("nwgrad: matrices must have shape (K, N, N) = (" +
+                                                std::to_string(K) + ", " + std::to_string(n) + ", " +
+                                                std::to_string(n) + ")");
+                std::copy(mats.data(), mats.data() + K * n * n, self.matrix.data());
+            },
+            "Every set's matrix as a (K, N, N) float64 array (a copy).  Assigning an array\n"
+            "of the same shape replaces them.")
+        .def_prop_rw(
+            "gaps",
+            [](const AlignParams& self) {
+                const std::vector<double> g = self.all_gaps();
+                const size_t K = static_cast<size_t>(self.num_sets());
+                return numpy_copy(g.data(), g.size(), {K, 4});
+            },
+            [](AlignParams& self, nb_arr_f64 gaps) {
+                const size_t K = static_cast<size_t>(self.num_sets());
+                if (gaps.shape(0) != K || gaps.shape(1) != 4)
+                    throw std::invalid_argument("nwgrad: gaps must have shape (K, 4) = (" +
+                                                std::to_string(K) + ", 4)");
+                for (size_t k = 0; k < K; ++k)
+                    for (int f = 0; f < 4; ++f)
+                        self.gap_ref(static_cast<int>(k), f) = gaps.data()[k * 4 + static_cast<size_t>(f)];
+            },
+            "Every set's gap fields as a (K, 4) float64 array (a copy): columns\n"
+            "gap_open_a, gap_extend_a, gap_open_b, gap_extend_b.  Assignable.")
+        .def(
+            "__getitem__",
+            [](const AlignParams& self, long k) {
+                const long K = self.num_sets();
+                if (k < 0) k += K;
+                if (k < 0 || k >= K) throw nb::index_error("nwgrad: parameter set index out of range");
+                return self.set(static_cast<int>(k));
+            },
+            nb::arg("k"), "Set k as a one-set AlignParams (a copy).")
+        .def(
+            "__setitem__",
+            [](AlignParams& self, long k, const AlignParams& p) {
+                const long K = self.num_sets();
+                if (k < 0) k += K;
+                if (k < 0 || k >= K) throw nb::index_error("nwgrad: parameter set index out of range");
+                self.assign_set(static_cast<int>(k), p);
+            },
+            nb::arg("k"), nb::arg("params"), "Replace set k with a one-set AlignParams.")
         .def(
             "to_dict",
             [](const AlignParams& self) {
-                int n = self.matrix.size();
-                double* buf = new double[n * n];
-                self.matrix.to_array(buf);
-                nb::capsule owner(buf, [](void* p) noexcept { delete[] static_cast<double*>(p); });
-                size_t shape[2] = {static_cast<size_t>(n), static_cast<size_t>(n)};
+                const size_t n = static_cast<size_t>(self.matrix.size()), K = static_cast<size_t>(self.num_sets());
                 nb::dict d;
-                d["matrix"]       = nb::ndarray<nb::numpy, double>(buf, 2, shape, owner);
+                d["matrix"]       = numpy_copy(self.matrix.data(), n * n, {n, n});
                 d["alphabet"]     = self.matrix.order();
                 d["gap_open_a"]   = self.gap_open_a;
                 d["gap_extend_a"] = self.gap_extend_a;
                 d["gap_open_b"]   = self.gap_open_b;
                 d["gap_extend_b"] = self.gap_extend_b;
+                if (K > 1) {
+                    d["num_sets"] = K;
+                    d["matrices"] = numpy_copy(self.matrix.data(), K * n * n, {K, n, n});
+                    const std::vector<double> g = self.all_gaps();
+                    d["gaps"]     = numpy_copy(g.data(), g.size(), {K, 4});
+                }
                 return d;
             },
             "Return the parameters as a dict: 'matrix' (N×N array), 'alphabet', and the\n"
-            "four gap fields. Convenient for inspecting a gradient.")
+            "four gap fields — all of set 0 — and, when there are K > 1 sets, also\n"
+            "'num_sets', 'matrices' (K×N×N) and 'gaps' (K×4) for every set.  Convenient\n"
+            "for inspecting a gradient.")
         .def_prop_rw(
             "matrix",
-            [](const AlignParams& self) { return self.matrix; },
+            [](const AlignParams& self) { return self.matrix.slice(0); },
             [](AlignParams& self, const SubstMatrix& mat) {
                 if (&mat.alphabet() != &self.matrix.alphabet())
                     throw std::invalid_argument(
                         "nwgrad: cannot assign a matrix over alphabet \"" +
                         mat.alphabet().symbols() + "\" to params over \"" +
                         self.matrix.alphabet().symbols() + "\"");
-                self.matrix = mat;
-            })
+                self.matrix.assign_set(0, mat);
+            },
+            "The substitution matrix of set 0 (a copy; assign to replace it).")
         .def_rw("gap_open_a",   &AlignParams::gap_open_a)
         .def_rw("gap_extend_a", &AlignParams::gap_extend_a)
         .def_rw("gap_open_b",   &AlignParams::gap_open_b)
