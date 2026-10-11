@@ -199,5 +199,11 @@ Tracks landed on branch `tracks` (2026-10-11; see AGENTS.md, "Tracks").  Deferre
 - **Tracked soft batches store a per-row record per pair**: `len(A) * n + 4 * (len(A)+1)`
   doubles (≈ 1.4 KB per Manakov pair, ≈ 3.6 GB for 2.5 M).  Inherent when every row has
   its own set; `align()` (streaming) stores nothing.  Hard gradients are paths (≈ 30 B).
+- **Tracked affine global is 1.2-1.4x untracked, soft 1.2-1.5x** (100k Manakov pairs,
+  K = 25; AGENTS.md, "Tracks", Performance).  Not profiled; linear and affine local are
+  within ~1.1x.
+- **Untracked guide-banded iterations at 1 thread are 3-5% slower than on `main`** (+1%
+  instructions, kernels identical; spread over lane setup and `set_problem`, layout
+  sensitive).  12 threads: 1.01.
 - **Tracked Hirschberg builds each row's profile as it sweeps** (no shared profile): one
   gather per cell.  A compact profile per block would help when rows share sets.

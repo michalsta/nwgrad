@@ -282,6 +282,19 @@ score-only, streaming, Hirschberg splitting, validation), `test_tracks_soft.py`.
 checks (row penalties in the striped/pointer/score kernels, the inter-pair soft weights)
 were each caught.
 
+**Performance** (nighthaven, i5-12500, 2026-10-10/11). Untracked code, `tracks` vs `main`
+A/B (`tools/bench_ab.py`, control arm ~1.00): at 12 threads every workload 1.00-1.01; at
+1 thread 1.00-1.02 except guide-banded iterations, 1.03-1.05. perf stat over 40 banded
+iterations: +1.0% instructions, +3.3% cycles, +6% branch misses, startup equal;
+callgrind shows the DP kernels, walk, `validate_guide` and `fill_guide_gaps`
+instruction-identical to `main`, the excess spread over lane setup and `set_problem`
+bookkeeping, and the ratio moves 1.02-1.06 between builds (layout). Accepted.
+Tracked cost (`tools/bench_tracks.py`, 100k Manakov pairs, K = 25 sets, one per miRNA
+position, one training step, tracked / untracked): double linear 0.99-1.09; double affine
+local 1.06-1.08, global 1.22-1.23; float linear 1.00-1.09; float affine local 1.15-1.23,
+global 1.35-1.42; soft 1.19-1.47 (causes not profiled). Memory for 100k pairs: 31 MB tracked vs 24 MB untracked (hard paths);
+soft records 168 MB (TODO.md).
+
 ### Vectorization: the faster hard-gradient kernels (prototyped, measured on 3 machines)
 
 This is the record of a long investigation into speeding up the **hard-gradient** DP past the shipped `viterbi_affine_simd`. Every number below was measured on an AMD Opteron 6380 (SSE2, 60 threads), an Intel i5-12500 (AVX2, 12 threads), and an Apple M1 (NEON, 8 threads). Prototypes live in the scratchpad, not the tree — this section is the map so the next person does not re-derive it.
