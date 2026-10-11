@@ -1031,6 +1031,13 @@ private:
         params_own_.push_back(std::make_unique<const AlignParams>(p));
         const AlignParams* q = params_own_.back().get();
         params_idx_.emplace(h, q);
+        if (tracked_ || q->num_sets() > 1) add_prep_(q);
+        return q;
+    }
+    // Prepared data for owned params `q` (tracked batches only: an untracked batch, and
+    // a standalone SeqPair, must not pay an allocation per params copy).
+    void add_prep_(const AlignParams* q) {
+        if (prep_find_(q)) return;
         Prep pr;
         pr.p = q;
         const std::vector<double> all = q->all_gaps();
@@ -1044,7 +1051,6 @@ private:
             }
         }
         prep_.push_back(std::move(pr));
-        return q;
     }
     // A batch owns one or two params copies: a linear scan, cheaper per pair than a hash.
     const Prep* prep_find_(const AlignParams* p) const {
@@ -1173,6 +1179,7 @@ private:
     // Their cached gradients were stored densely; they are dropped with their scores.
     void make_tracked_(size_t N0) {
         tracked_ = true;
+        for (const auto& u : params_own_) add_prep_(u.get());
         tk_.assign(oa_[N0], 0);
         gk_.assign(oa_[N0] + N0, 0);
         std::vector<double>().swap(grad_);
