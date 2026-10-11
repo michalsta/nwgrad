@@ -842,12 +842,12 @@ private:
     // Per DP row 0..m, precision T: gaps in A within row i (open, extend); gaps in B into
     // row i (open, extend; [0] unused); the Global column-0 border of row i ([0] unused).
     std::vector<T>             tgoa_, tgea_, tgob_, tgeb_, tbx0_;
-    std::vector<T>             tzero_;                  // m+1 zeros: linear's opens, for the affine kernels
-    std::vector<T>             trgob_, trgeb_;          // Hirschberg's reverse gaps in B (hb_reverse_rows_)
-    bool                       rev_ready_ = false;
+    mutable std::vector<T>     tzero_;                  // m+1 zeros: linear's opens, for the affine kernels
+    mutable std::vector<T>     trgob_, trgeb_;          // Hirschberg's reverse gaps in B (hb_reverse_rows_)
+    mutable bool               rev_ready_ = false;
     // The shared query profile's rows (TrackJob::ra/crow): each distinct stacked row once.
-    std::vector<uint32_t>      ra_, crow_;
-    bool                       compact_ready_ = false;  // ra_/crow_ describe this problem
+    mutable std::vector<uint32_t> ra_, crow_;
+    mutable bool               compact_ready_ = false;  // ra_/crow_ describe this problem
 
     // ── Hirschberg's reverse sweeps with tracks ──────────────────────────────
     // A reverse sweep runs the recurrence MIRRORED (hb_rev, hb_kernel_impl.inl's a_step
@@ -866,7 +866,7 @@ private:
     // stay bit-identical to the untracked sweep.  (Exact in real arithmetic; in floating
     // point the mirror's sums round differently from the forward fill's, as the untracked
     // reverse sweep's always have — Hirschberg's score is replayed from its path.)
-    void hb_reverse_rows_() {
+    void hb_reverse_rows_() const {
         if (rev_ready_) return;
         const size_t m = static_cast<size_t>(m_);
         trgob_.assign(m + 1, static_cast<T>(0));
@@ -894,7 +894,7 @@ private:
     // The per-row parameters a leveled kernel reads (TrackJob), `profile`: whether it
     // builds a query profile (rows `row_len` elements long), so whether to offer one.
     // `linear_opens_zero`: a linear problem run through an affine kernel (score only).
-    void fill_track_job_(TrackJob<T>& tj, bool profile, size_t row_len, bool linear_opens_zero = false) {
+    void fill_track_job_(TrackJob<T>& tj, bool profile, size_t row_len, bool linear_opens_zero = false) const {
         tj.rs = rs_.data();
         tj.go_a = tgoa_.data(); tj.ge_a = tgea_.data();
         tj.go_b = tgob_.data(); tj.ge_b = tgeb_.data();
@@ -2879,17 +2879,20 @@ private:
         const int W = j1 - j0;
         hb_fit(buf.hfa, static_cast<std::size_t>(W) + 1);
         T* row = buf.hfa.data();
-        const T ge_a = static_cast<T>(params_->gap_extend_a);
-        const T ge_b = static_cast<T>(params_->gap_extend_b);
+        // Tracked: no opens in linear, so the mirror needs no rewritten rows — only the
+        // row of each gap in A: forward DP row i, reverse (the suffix from row i-1) row i-1.
+        T ge_a = hb_ge_a(rev ? i1 : i0);
+        T ge_b = static_cast<T>(params_->gap_extend_b);
         row[0] = static_cast<T>(0);
         for (int c = 1; c <= W; ++c) row[c] = row[c - 1] - ge_a;
         for (int r = 1; r <= i1 - i0; ++r) {
             const int i = rev ? i1 - r + 1 : i0 + r;   // 1-based DP row of A[i-1]
+            if (tr_) { ge_b = tgeb_[static_cast<size_t>(i)]; ge_a = hb_ge_a(rev ? i - 1 : i); }
             T diag = row[0];
             row[0] = row[0] - ge_b;
             for (int c = 1; c <= W; ++c) {
                 const int j = rev ? j1 - c + 1 : j0 + c;
-                T v = diag + subTu(i, j);
+                T v = diag + (tr_ ? subT(i, j) : subTu(i, j));
                 const T u = row[c] - ge_b, l = row[c - 1] - ge_a;
                 if (v < u) v = u;
                 if (v < l) v = l;
@@ -2910,15 +2913,16 @@ private:
         hb_fit(buf.hfa, st); hb_fit(buf.hfb, st);
         T* prev = buf.hfa.data(); T* cur = buf.hfb.data();
         unsigned char* D = buf.DM.data();
-        const T ge_a = static_cast<T>(params_->gap_extend_a);
-        const T ge_b = static_cast<T>(params_->gap_extend_b);
+        T ge_a = hb_ge_a(i0);
+        T ge_b = static_cast<T>(params_->gap_extend_b);
         prev[0] = static_cast<T>(0);
         for (int c = 1; c <= W; ++c) { prev[c] = prev[c - 1] - ge_a; D[c] = 2; }
         for (int r = 1; r <= H; ++r) {
             unsigned char* d = D + static_cast<std::size_t>(r) * st;
+            if (tr_) { ge_a = tgea_[static_cast<size_t>(i0 + r)]; ge_b = tgeb_[static_cast<size_t>(i0 + r)]; }
             cur[0] = prev[0] - ge_b; d[0] = 1;
             for (int c = 1; c <= W; ++c) {
-                T v = prev[c - 1] + subTu(i0 + r, j0 + c);
+                T v = prev[c - 1] + (tr_ ? subT(i0 + r, j0 + c) : subTu(i0 + r, j0 + c));
                 unsigned char k = 0;
                 const T u = prev[c] - ge_b, l = cur[c - 1] - ge_a;
                 if (v < u) { v = u; k = 1; }
@@ -2960,8 +2964,11 @@ private:
         hops_.clear();
         hb_start_i_ = 0; hb_start_j_ = 0;
         int i_end = m_, j_end = n_;
-        const T ge_a = static_cast<T>(params_->gap_extend_a);
-        const T ge_b = static_cast<T>(params_->gap_extend_b);
+        // Tracked: row i's own extends (ga(i): gaps in A within DP row i; gb(i): into it).
+        const T ge_a0 = static_cast<T>(params_->gap_extend_a);
+        const T ge_b0 = static_cast<T>(params_->gap_extend_b);
+        auto ga = [&](int i) { return tr_ ? tgea_[static_cast<size_t>(i)] : ge_a0; };
+        auto gb = [&](int i) { return tr_ ? tgeb_[static_cast<size_t>(i)] : ge_b0; };
         if constexpr (AM == AlignMode::Local) {
             // Forward clamped scan: the best cell, first row then first column (strict >,
             // as viterbi_linear chooses it).
@@ -2971,8 +2978,9 @@ private:
             T best = static_cast<T>(0); int ie = 0, je = 0;
             for (int i = 1; i <= m_; ++i) {
                 T diag = row[0];
+                const T ge_a = ga(i), ge_b = gb(i);
                 for (int j = 1; j <= n_; ++j) {
-                    T v = diag + subTu(i, j);
+                    T v = diag + (tr_ ? subT(i, j) : subTu(i, j));
                     const T u = row[j] - ge_b, l = row[j - 1] - ge_a;
                     if (v < u) v = u;
                     if (v < l) v = l;
@@ -2990,15 +2998,18 @@ private:
             hb_fit(buf.hfb, static_cast<std::size_t>(je) + 1);
             T* g = buf.hfb.data();                       // g[q] = score from (p, q) to (ie, je)
             g[je] = static_cast<T>(0);
-            for (int q = je - 1; q >= 0; --q) g[q] = g[q + 1] - ge_a;
+            for (int q = je - 1; q >= 0; --q) g[q] = g[q + 1] - ga(ie);
             T sbest = g[0]; int is = ie, js = 0;
             for (int q = 0; q <= je; ++q) if (g[q] > sbest) { sbest = g[q]; js = q; }
             for (int pi = ie - 1; pi >= 0; --pi) {
+                // the suffix from DP row pi: its first move down is into row pi+1, its
+                // gaps in A lie in row pi
+                const T ge_a = ga(pi), ge_b = gb(pi + 1);
                 T diag = g[je];
                 g[je] = g[je] - ge_b;
                 if (g[je] > sbest) { sbest = g[je]; is = pi; js = je; }
                 for (int q = je - 1; q >= 0; --q) {
-                    T v = diag + subTu(pi + 1, q + 1);
+                    T v = diag + (tr_ ? subT(pi + 1, q + 1) : subTu(pi + 1, q + 1));
                     const T u = g[q] - ge_b, l = g[q + 1] - ge_a;
                     if (v < u) v = u;
                     if (v < l) v = l;
@@ -3018,8 +3029,8 @@ private:
         int i = hb_start_i_, j = hb_start_j_;
         for (unsigned char op : hops_) {
             if (op == 0)      { ++i; ++j; sc += subT(i, j); }
-            else if (op == 1) { ++i; sc -= ge_b; }
-            else              { ++j; sc -= ge_a; }
+            else if (op == 1) { ++i; sc -= gb(i); }
+            else              { sc -= ga(i); ++j; }
         }
         viterbi_score_ = static_cast<double>(sc);
         best_i_ = i_end; best_j_ = j_end;

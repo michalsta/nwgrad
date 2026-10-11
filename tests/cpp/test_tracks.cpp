@@ -15,6 +15,7 @@
 #include "aligner.hpp"
 
 #include <bit>
+#include <cmath>
 #include <cstdint>
 #include <random>
 #include <span>
@@ -282,4 +283,126 @@ TEST_CASE("track validation", "[tracks]") {
     al.alloc_buf();
     al.compute_viterbi();
     REQUIRE_THROWS_AS(al.hard_grad(g1), std::invalid_argument);
+}
+
+// ── Hirschberg with tracks ─────────────────────────────────────────────────────
+//
+// The reverse sweeps run on rewritten rows (Aligner::hb_reverse_rows_), the join refunds
+// the open of the first row below the cut.  Checked with a small hb_cutoff so the
+// recursion really splits: the path's score is the optimum (Pointers'), up to the
+// floating-point slack Hirschberg has always had; the gradient dotted with the params is
+// that score; scalar and simd are bit-identical; equal sets are the untracked run.
+namespace {
+
+template <GapModel GM, AlignMode AM, class T>
+Run<T> run_hb(const AlignParams& p, const std::string& a, const std::string& b,
+              std::span<const uint16_t> track, std::span<const uint16_t> gtrack, int backend,
+              TracebackMode tb, int cutoff) {
+    Aligner<GM, AM, AlignBand::Full, T> al;
+    al.set_kernel(backend);
+    al.set_traceback(tb);
+    al.set_hb_cutoff(cutoff);
+    al.set_problem(a, b, p, 0, {}, track, gtrack);
+    DpBufferT<T> buf;
+    al.compute_viterbi(buf);
+    Run<T> r;
+    r.score = al.score();
+    AlignParams g = AlignParams::zeros_like(p);
+    al.hard_grad(buf, g);
+    r.grad = flatten(g);
+    std::tie(r.aa, r.bb) = al.aligned(buf);
+    return r;
+}
+
+double dot(const std::vector<double>& g, const AlignParams& p) {
+    const auto f = flatten(p);
+    double s = 0;
+    for (size_t k = 0; k < g.size(); ++k) s += g[k] * f[k];
+    return s;
+}
+
+template <GapModel GM, AlignMode AM, class T>
+void check_hb(const AlignParams& p, const std::string& a, const std::string& b,
+              std::span<const uint16_t> track, std::span<const uint16_t> gtrack) {
+    const double tol = std::is_same_v<T, double> ? 1e-9 : 2e-3;
+    const auto ptr = run_hb<GM, AM, T>(p, a, b, track, gtrack, kBackendScalar, TracebackMode::Pointers, 1);
+    for (TracebackMode tb : {TracebackMode::Hirschberg, TracebackMode::HirschbergPmax}) {
+        for (int cutoff : {1, 3}) {
+            const auto sc = run_hb<GM, AM, T>(p, a, b, track, gtrack, kBackendScalar, tb, cutoff);
+            const auto sv = run_hb<GM, AM, T>(p, a, b, track, gtrack, kBackendAuto, tb, cutoff);
+            INFO("tb " << int(tb) << " cutoff " << cutoff << " a " << a << " b " << b);
+            REQUIRE(same_bits_d(sc.score, sv.score));
+            REQUIRE(same_bits(sc.grad, sv.grad));
+            REQUIRE(sc.aa == sv.aa);
+            REQUIRE(sc.bb == sv.bb);
+            // optimal: never above the optimum, the exact sweep within rounding of it
+            REQUIRE(sc.score <= ptr.score + tol);
+            if (tb == TracebackMode::Hirschberg || GM == GapModel::Linear)
+                REQUIRE(sc.score >= ptr.score - tol);
+            else
+                REQUIRE(sc.score >= ptr.score - 100 * tol);
+            REQUIRE(std::abs(dot(sc.grad, p) - sc.score) <= tol * (1 + std::abs(sc.score)));
+        }
+    }
+}
+
+template <class T>
+void hb_sweep_tracks(uint64_t seed, const Alphabet& alpha, int count, int maxlen) {
+    std::mt19937_64 rng(seed);
+    std::uniform_int_distribution<int> dl(0, maxlen), dk(1, 5), dc(0, 1);
+    for (int it = 0; it < count; ++it) {
+        const int m = dl(rng), n = dl(rng), K = dk(rng);
+        const std::string a = random_seq(rng, alpha, m), b = random_seq(rng, alpha, n);
+        const AlignParams p = random_sets(rng, alpha, K, dc(rng), false);   // gaps >= 0
+        const auto track = random_track(rng, static_cast<size_t>(m), K);
+        const auto gtrack = random_track(rng, static_cast<size_t>(m) + 1, K);
+        INFO("seed " << seed << " it " << it << " K " << K);
+        check_hb<GapModel::Affine, AlignMode::Global, T>(p, a, b, track, gtrack);
+        check_hb<GapModel::Affine, AlignMode::Local, T>(p, a, b, track, gtrack);
+        check_hb<GapModel::Linear, AlignMode::Global, T>(p, a, b, track, gtrack);
+        check_hb<GapModel::Linear, AlignMode::Local, T>(p, a, b, track, gtrack);
+    }
+}
+
+template <class T>
+void hb_equal_sets(uint64_t seed, const Alphabet& alpha, int count, int maxlen) {
+    std::mt19937_64 rng(seed);
+    std::uniform_int_distribution<int> dl(0, maxlen), dk(1, 5), dc(0, 1);
+    for (int it = 0; it < count; ++it) {
+        const int m = dl(rng), n = dl(rng), K = dk(rng);
+        const std::string a = random_seq(rng, alpha, m), b = random_seq(rng, alpha, n);
+        const AlignParams pk = random_sets(rng, alpha, K, dc(rng), true);
+        const AlignParams p1 = pk.set(0);
+        const auto track = random_track(rng, static_cast<size_t>(m), K);
+        const auto gtrack = random_track(rng, static_cast<size_t>(m) + 1, K);
+        for (int be : {kBackendScalar, kBackendAuto})
+            for (TracebackMode tb : {TracebackMode::Hirschberg, TracebackMode::HirschbergPmax}) {
+                const auto u = run_hb<GapModel::Affine, AlignMode::Global, T>(p1, a, b, {}, {}, be, tb, 2);
+                const auto t = run_hb<GapModel::Affine, AlignMode::Global, T>(pk, a, b, track, gtrack, be, tb, 2);
+                REQUIRE(same_bits_d(u.score, t.score));
+                REQUIRE(u.aa == t.aa);
+                const auto ul = run_hb<GapModel::Affine, AlignMode::Local, T>(p1, a, b, {}, {}, be, tb, 2);
+                const auto tl = run_hb<GapModel::Affine, AlignMode::Local, T>(pk, a, b, track, gtrack, be, tb, 2);
+                REQUIRE(same_bits_d(ul.score, tl.score));
+                REQUIRE(ul.aa == tl.aa);
+                const auto un = run_hb<GapModel::Linear, AlignMode::Global, T>(p1, a, b, {}, {}, be, tb, 2);
+                const auto tn = run_hb<GapModel::Linear, AlignMode::Global, T>(pk, a, b, track, gtrack, be, tb, 2);
+                REQUIRE(same_bits_d(un.score, tn.score));
+                REQUIRE(un.aa == tn.aa);
+            }
+    }
+}
+
+}  // namespace
+
+TEST_CASE("tracked Hirschberg: optimal, scalar == simd, gradient is the path's", "[tracks]") {
+    hb_sweep_tracks<double>(21, Alphabet::get("ACGT"), 40, 30);
+    hb_sweep_tracks<float>(22, Alphabet::get("ACGT"), 40, 30);
+    hb_sweep_tracks<double>(23, Alphabet::get(AA_ORDER), 15, 40);
+    hb_sweep_tracks<float>(24, Alphabet::get(AA_ORDER), 15, 40);
+}
+
+TEST_CASE("tracked Hirschberg: equal sets are the untracked recursion", "[tracks]") {
+    hb_equal_sets<double>(31, Alphabet::get("ACGT"), 40, 30);
+    hb_equal_sets<float>(32, Alphabet::get("ACGT"), 40, 30);
 }

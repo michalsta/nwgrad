@@ -306,3 +306,26 @@ def test_one_set_tracked_weighted_grad_is_untracked_bit_for_bit(case, prec):
     Ct, Cu = bt.compute_grad(), bu.compute_grad()
     np.testing.assert_array_equal(Ct.matrices, Cu.matrices)
     np.testing.assert_array_equal(Ct.gaps, Cu.gaps)
+
+
+@pytest.mark.parametrize("case", CASES)
+@pytest.mark.parametrize("prec", ["_double", ""])
+@pytest.mark.parametrize("traceback", ["hirschberg", "hirschberg_pmax"])
+def test_tracked_hirschberg_splits_and_stays_optimal(case, prec, traceback):
+    """hb_cutoff 2: the recursion really splits (with tracks the reverse sweeps run on
+    rewritten rows).  The path's score is the optimum, and the gradient is that path's."""
+    rng = np.random.default_rng(19)
+    A, B, mats, gaps, tracks, gtracks = random_problem(rng, 120, 4, maxlen=40)
+    P = to_params(mats, gaps)
+    ref = make_batch(case, prec, A, B, P, tracks, gtracks, fill="striped", traceback="pointers")
+    hb = make_batch(case, prec, A, B, P, tracks, gtracks, fill="striped", traceback=traceback)
+    hb.hb_cutoff = 2
+    ref.score_and_grad()
+    hb.score_and_grad()
+    tol = 1e-9 if prec == "_double" else 2e-3
+    exact = traceback == "hirschberg" or case[0] == "linear"
+    np.testing.assert_array_less(hb.scores(), ref.scores() + tol)
+    np.testing.assert_array_less(ref.scores() - (tol if exact else 100 * tol), hb.scores() + 1e-12)
+    gm, gg = hb.grads()
+    dots = (gm * mats).sum(axis=(1, 2, 3)) + (gg * gaps).sum(axis=(1, 2))
+    np.testing.assert_allclose(dots, hb.scores(), atol=tol * 50)
