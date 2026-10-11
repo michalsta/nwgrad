@@ -863,22 +863,7 @@ private:
     // values is therefore bit-identical to the untracked problem — every penalty, every
     // border, every substitution score is the same number — which the tests assert.
     bool                       tr_ = false;
-    std::span<const uint16_t>  trk_, gtrk_;         // m: set per residue of A; m+1: per row
-    std::vector<uint16_t>      trk_own_, gtrk_own_;  // defaults, when a span was empty
-    std::vector<uint32_t>      rs_;                  // m: stacked substitution row of row i at [i-1]
-    // Per DP row 0..m, precision T: gaps in A within row i (open, extend); gaps in B into
-    // row i (open, extend; [0] unused); the Global column-0 border of row i ([0] unused).
-    std::vector<T>             tgoa_, tgea_, tgob_, tgeb_, tbx0_;
-    mutable std::vector<T>     tzero_;                  // m+1 zeros: linear's opens, for the affine kernels
-    mutable std::vector<T>     trgob_, trgeb_;          // Hirschberg's reverse gaps in B (hb_reverse_rows_)
-    // Tracked soft: the per-row record (soft_record_counts / _gaps), and the scaled
-    // kernel's per-row weights (4 per row) and exp'd profile rows.
-    std::vector<double>        srec_cnt_, srec_gap_, srw_;
-    std::vector<double>        dbx0_;                   // the log path's column-0 border, double
-    mutable bool               rev_ready_ = false;
-    // The shared query profile's rows (TrackJob::ra/crow): each distinct stacked row once.
-    mutable std::vector<uint32_t> ra_, crow_;
-    mutable bool               compact_ready_ = false;  // ra_/crow_ describe this problem
+    // (The tracked state proper lives at the end of the class, away from the hot members.)
 
     // ── Hirschberg's reverse sweeps with tracks ──────────────────────────────
     // A reverse sweep runs the recurrence MIRRORED (hb_rev, hb_kernel_impl.inl's a_step
@@ -1156,6 +1141,25 @@ private:
 
     // ── Own DP buffer (used by the no-arg public API) ─────────────────────────
     DpBuffer own_buf_;
+
+    // ── Tracked state (see "Tracks"): declared last, so the untracked hot members keep
+    // their places and cache lines.
+    std::span<const uint16_t>  trk_, gtrk_;         // m: set per residue of A; m+1: per row
+    std::vector<uint16_t>      trk_own_, gtrk_own_;  // defaults, when a span was empty
+    std::vector<uint32_t>      rs_;                  // m: stacked substitution row of row i at [i-1]
+    // Per DP row 0..m, precision T: gaps in A within row i (open, extend); gaps in B into
+    // row i (open, extend; [0] unused); the Global column-0 border of row i ([0] unused).
+    std::vector<T>             tgoa_, tgea_, tgob_, tgeb_, tbx0_;
+    mutable std::vector<T>     tzero_;                  // m+1 zeros: linear's opens, for the affine kernels
+    mutable std::vector<T>     trgob_, trgeb_;          // Hirschberg's reverse gaps in B (hb_reverse_rows_)
+    // Tracked soft: the per-row record (soft_record_counts / _gaps), and the scaled
+    // kernel's per-row weights (4 per row) and exp'd profile rows.
+    std::vector<double>        srec_cnt_, srec_gap_, srw_;
+    std::vector<double>        dbx0_;                   // the log path's column-0 border, double
+    mutable bool               rev_ready_ = false;
+    // The shared query profile's rows (TrackJob::ra/crow): each distinct stacked row once.
+    mutable std::vector<uint32_t> ra_, crow_;
+    mutable bool               compact_ready_ = false;  // ra_/crow_ describe this problem
 
     // ── Precondition checks ───────────────────────────────────────────────────
     void check_problem() const {
