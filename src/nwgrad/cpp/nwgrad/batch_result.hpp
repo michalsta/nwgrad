@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <string_view>
 #include <vector>
 
@@ -11,6 +12,9 @@ struct ProblemInstance {
     std::string_view seq_a;
     std::string_view seq_b;
     std::vector<int> guide_j;  // empty → trivial diagonal guide (band around main diagonal)
+    // Tracks (aligner.hpp, "Tracks"); empty → the defaults (all set 0 / derived).
+    std::vector<uint16_t> track;
+    std::vector<uint16_t> gap_track;
 };
 
 // What a streaming align() returns: one score per problem, and the gradient summed over

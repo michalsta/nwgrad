@@ -650,9 +650,11 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             [](const SPB& self, const std::vector<std::string_view>& seqs_a,
                const std::vector<std::string_view>& seqs_b, const AlignParams& params, int band,
                const std::vector<std::string>& aligned_a, const std::vector<std::string>& aligned_b,
-               const std::string& kernel) {
+               const std::string& kernel, nb::handle tracks, nb::handle gap_tracks) {
                 if (seqs_a.size() != seqs_b.size())
                     throw nb::value_error("nwgrad: align() needs seqs_a and seqs_b of equal length");
+                auto tk = to_tracks(tracks, seqs_a.size(), "tracks");
+                auto gk = to_tracks(gap_tracks, seqs_a.size(), "gap_tracks");
                 const bool guides = !aligned_a.empty() || !aligned_b.empty();
                 if (guides && (aligned_a.size() != seqs_a.size() || aligned_b.size() != seqs_a.size()))
                     throw nb::value_error("nwgrad: aligned_a / aligned_b need one entry per pair");
@@ -664,18 +666,22 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
                     // strings (as BatchAligner.align did); make_guide would read an empty
                     // string as "no guide" and silently band around the diagonal.
                     if (guides) problems[i].guide_j = guide_j_from_aligned(aligned_a[i], aligned_b[i]);
+                    if (!tk.empty()) problems[i].track = std::move(tk[i]);
+                    if (!gk.empty()) problems[i].gap_track = std::move(gk[i]);
                 }
                 return self.align(problems, params, band, parse_backend(kernel));
             },
             nb::arg("seqs_a"), nb::arg("seqs_b"), nb::arg("params"), nb::arg("band") = 0,
             nb::arg("aligned_a") = std::vector<std::string>{},
             nb::arg("aligned_b") = std::vector<std::string>{}, nb::arg("kernel") = "auto",
+            nb::kw_only(), nb::arg("tracks").none() = nb::none(), nb::arg("gap_tracks").none() = nb::none(),
             "Align (seqs_a[i], seqs_b[i]) under `params` WITHOUT adding them to the batch\n"
             "(what BatchAligner was): returns a BatchResult (scores, gradient summed over\n"
             "the pairs), storing nothing per pair, so memory stays O(threads).  Uses the\n"
             "batch's problem type, grad mode, threads and settings.  band > 0 bands every\n"
             "pair (aligned_a / aligned_b, one gapped string per pair, give the guides; the\n"
-            "diagonal otherwise).  Soft: forward-backward only.")
+            "diagonal otherwise).  Soft: forward-backward only.  tracks / gap_tracks: as\n"
+            "add_many's; the summed gradient then has params' K sets.")
         .def("compute_grad", [](SPB& self) { return self.compute_grad(); },
              nb::rv_policy::move,
              "The gradient summed over all pairs (cached; no DP).  Summed in fixed blocks\n"

@@ -566,6 +566,13 @@ public:
                     "problem gets an automatic diagonal guide instead.");
         }
         const bool banded = band > 0 || !problems[0].guide_j.empty();
+        // Tracks: checked here, on the caller's thread, naming the problem.
+        const int K = params.num_sets();
+        for (size_t i = 0; i < N; ++i) {
+            const auto& p = problems[i];
+            if (!p.track.empty()) check_track_(p.track, p.seq_a.size(), K, i, "track");
+            if (!p.gap_track.empty()) check_track_(p.gap_track, p.seq_a.size() + 1, K, i, "gap_track");
+        }
         if (s_.inter_fill) {
             const int be = stream_inter_backend_(params, kernel, banded);
             if (be >= 0) {
@@ -634,6 +641,62 @@ private:
         for (size_t idx; (idx = work_idx.fetch_add(1, std::memory_order_relaxed)) < N; )
             stream_one_(al, problems, idx, alpha, params, band, buf, a_enc, b_enc, scores, local_grad);
     }
+    // A problem's effective tracks: as given, or the defaults (all zeros; derived).
+    static void effective_tracks_(const ProblemInstance& p, size_t m, std::vector<uint16_t>& t,
+                                  std::vector<uint16_t>& g) {
+        if (p.track.empty()) t.assign(m, 0); else t = p.track;
+        if (p.gap_track.empty()) {
+            g.resize(m + 1);
+            g[0] = m ? t[0] : 0;
+            for (size_t r = 1; r <= m; ++r) g[r] = t[r - 1];
+        } else {
+            g = p.gap_track;
+        }
+    }
+    // Tracked soft lane rows (InterSoftJob::rs / rw) of one problem: its stacked rows and
+    // the exp'd penalties of each row at temperature T.  False when a weight overflows.
+    static bool soft_rows_of_(std::span<const uint8_t> ca, std::span<const uint16_t> tk,
+                              std::span<const uint16_t> gk, const AlignParams& P, double temp,
+                              std::vector<uint32_t>& rs, std::vector<double>& rw) {
+        constexpr bool lin = GM == GapModel::Linear;
+        const double it = 1.0 / temp, big = std::numeric_limits<double>::max();
+        const uint32_t na = static_cast<uint32_t>(P.matrix.size());
+        const size_t m = ca.size();
+        rs.resize(m);
+        for (size_t r = 0; r < m; ++r) rs[r] = static_cast<uint32_t>(tk[r]) * na + ca[r];
+        rw.assign(4 * (m + 1), 0.0);
+        bool ok = true;
+        for (size_t r = 0; r <= m; ++r) {
+            const int g = gk[r];
+            rw[4 * r + 1] = std::exp(-P.gap(g, AlignParams::kExtendA) * it);
+            if (!lin) rw[4 * r] = std::exp(-(P.gap(g, AlignParams::kOpenA) + P.gap(g, AlignParams::kExtendA)) * it);
+            if (r > 0) {
+                const int t = tk[r - 1];
+                rw[4 * r + 3] = std::exp(-P.gap(t, AlignParams::kExtendB) * it);
+                if (!lin) rw[4 * r + 2] = std::exp(-(P.gap(t, AlignParams::kOpenB) + P.gap(t, AlignParams::kExtendB)) * it);
+            }
+            for (int f = 0; f < 4; ++f) ok &= rw[4 * r + static_cast<size_t>(f)] <= big;
+        }
+        return ok;
+    }
+    // A per-row soft record (counts m x n, gaps 4 x (m+1)) added into a K-set gradient.
+    static void add_rows_(AlignParams& g, std::span<const uint8_t> ca, std::span<const uint16_t> tk,
+                          std::span<const uint16_t> gk, const double* cnt, const double* gaps) {
+        const size_t na = static_cast<size_t>(g.matrix.size()), m = ca.size();
+        double* blk = g.matrix.data();
+        for (size_t r = 0; r < m; ++r) {
+            double* d = blk + (static_cast<size_t>(tk[r]) * na + ca[r]) * na;
+            for (size_t c = 0; c < na; ++c) d[c] += cnt[r * na + c];
+        }
+        for (size_t r = 0; r <= m; ++r) {
+            g.gap_ref(gk[r], AlignParams::kOpenA) += gaps[4 * r];
+            g.gap_ref(gk[r], AlignParams::kExtendA) += gaps[4 * r + 1];
+            if (r > 0) {
+                g.gap_ref(tk[r - 1], AlignParams::kOpenB) += gaps[4 * r + 2];
+                g.gap_ref(tk[r - 1], AlignParams::kExtendB) += gaps[4 * r + 3];
+            }
+        }
+    }
     // One streaming problem on its own path: encode, set up, fill, score, gradient.
     template<class Al>
     void stream_one_(Al& al, const std::vector<ProblemInstance>& problems, size_t i,
@@ -643,7 +706,7 @@ private:
         const auto& p = problems[i];
         stream_encode_(alpha, p.seq_a, a_enc, i, 'a');
         stream_encode_(alpha, p.seq_b, b_enc, i, 'b');
-        al.set_problem(a_enc, b_enc, params, band, p.guide_j);
+        al.set_problem(a_enc, b_enc, params, band, p.guide_j, p.track, p.gap_track);
         if (grad_mode_ == GradMode::Hard) {
             al.compute_viterbi(buf); scores[i] = al.score(); al.hard_grad(buf, local_grad);
         } else if (grad_mode_ == GradMode::Soft) {
@@ -711,12 +774,15 @@ private:
             groups.emplace_back(s, e);
             s = e;
         }
+        // Tracked lanes (per-lane rows into the kernels): params with sets, or any track.
+        bool trk = params.num_sets() > 1;
+        for (size_t i = 0; i < N && !trk; ++i) trk = !problems[i].track.empty() || !problems[i].gap_track.empty();
         std::atomic<size_t> idx{0};
         std::mutex grad_mutex;
         auto worker = [&]() {
             AlignParams local_grad = AlignParams::zeros_like(params);
             stream_inter_loop_<AB>(problems, params, band, kernel, elig, groups, other, idx,
-                                   result.scores, local_grad, K, W);
+                                   result.scores, local_grad, K, W, trk);
             if (grad_mode_ != GradMode::None) {
                 std::lock_guard<std::mutex> lock(grad_mutex);
                 result.grad += local_grad;
@@ -731,7 +797,7 @@ private:
                             const std::vector<std::pair<size_t, size_t>>& groups,
                             const std::vector<size_t>& other, std::atomic<size_t>& idx,
                             std::vector<double>& scores, AlignParams& local_grad,
-                            const LevelKernels& K, int W) const {
+                            const LevelKernels& K, int W, bool trk) const {
         using Al = Aligner<GM, AM, AB, T>;
         std::vector<Al> al(W);
         for (Al& x : al) configure_stream_<AB>(x, kernel);
@@ -749,7 +815,15 @@ private:
         InterSoftJob sj{};
         const bool soft_ok = soft && inter_soft_weights(params, s_.soft_temperature, lin, es, sj);
         const size_t nn = static_cast<size_t>(params.matrix.size()) * params.matrix.size();
+        const size_t na = static_cast<size_t>(params.matrix.size());
         if (!soft) cast_block_(params, blkT);   // params are fixed for the call: once per worker
+        // Tracked lanes: each lane's effective tracks, its TrackJob (hard / none) or soft rows.
+        std::vector<std::vector<uint16_t>> lt(W), lg(W);
+        std::vector<TrackJob<T>> tj(W);
+        std::vector<std::vector<uint32_t>> lrs(W);
+        std::vector<std::vector<double>> lrw(W);
+        std::vector<const uint32_t*> lrsp(W);
+        std::vector<const double*> lrwp(W);
         auto own = [&](size_t i) {
             stream_one_(al[0], problems, i, alpha, params, band, buf, ae[0], be[0], scores, local_grad);
         };
@@ -767,6 +841,7 @@ private:
                     const size_t i = elig[s + lr];
                     stream_encode_(alpha, problems[i].seq_a, ae[l], i, 'a');
                     stream_encode_(alpha, problems[i].seq_b, be[l], i, 'b');
+                    if (trk) effective_tracks_(problems[i], ae[l].size(), lt[l], lg[l]);
                 }
                 a[l] = ae[lr].data(); b[l] = be[lr].data();
                 m[l] = static_cast<int>(ae[lr].size());
@@ -777,10 +852,23 @@ private:
             }
             const size_t gstride = ragged ? static_cast<size_t>(n) + 1 : 0;
             if (soft) {
+                if (trk) {
+                    bool fin = true;
+                    for (int l = 0; l < W; ++l) {
+                        const size_t lr = std::min<size_t>(l, real - 1);
+                        if (static_cast<size_t>(l) == lr)
+                            fin &= soft_rows_of_(ae[l], lt[l], lg[l], params, s_.soft_temperature, lrs[l], lrw[l]);
+                        lrsp[l] = lrs[lr].data(); lrwp[l] = lrw[lr].data();
+                    }
+                    if (!fin) { for (size_t k = s; k < e; ++k) own(elig[k]); continue; }
+                    sj.rs = lrsp.data(); sj.rw = lrwp.data();
+                }
+                const size_t ccnt = trk ? static_cast<size_t>(M) * na : nn;
+                const size_t cgap = trk ? 4 * (static_cast<size_t>(M) + 1) : 4;
                 const size_t need = inter_soft_scratch(n, M, W);
                 if (sscr.size() < need) sscr.resize(need);
                 siscr.resize(static_cast<size_t>(M + 1) * W);
-                slogz.resize(W); scnt.resize(W * nn); sgap.resize(W * 4); sok.resize(W);
+                slogz.resize(W); scnt.resize(W * ccnt); sgap.resize(W * cgap); sok.resize(W);
                 sj.a = a.data(); sj.m = m.data(); sj.b = b.data(); sj.n = n; sj.M = M;
                 sj.nb = ragged ? nb.data() : nullptr;
                 sj.align_mode = (AM == AlignMode::Local) ? 1 : 0;
@@ -792,6 +880,10 @@ private:
                     const size_t i = elig[s + l];
                     if (!sok[l]) { own(i); continue; }
                     scores[i] = slogz[l] * s_.soft_temperature;
+                    if (trk) {
+                        add_rows_(local_grad, ae[l], lt[l], lg[l], scnt.data() + l * ccnt, sgap.data() + l * cgap);
+                        continue;
+                    }
                     double* g = local_grad.matrix.data();
                     for (size_t k = 0; k < nn; ++k) g[k] += scnt[l * nn + k];
                     local_grad.gap_open_a += sgap[l * 4 + 0]; local_grad.gap_extend_a += sgap[l * 4 + 1];
@@ -807,6 +899,18 @@ private:
                     job.align_mode = (AM == AlignMode::Local) ? 1 : 0;
                     if (ragged) job.nb = nb.data();
                     set_inter_params_(job, params, blkT);
+                    if (trk) {
+                        for (int l = 0; l < W; ++l) {
+                            const size_t lr = std::min<size_t>(l, real - 1);
+                            if (static_cast<size_t>(l) == lr) {
+                                al[l].set_problem(ae[l], be[l], params, band, {}, lt[l], lg[l]);
+                                al[l].track_job(tj[l]);
+                            } else {
+                                tj[l] = tj[lr];
+                            }
+                        }
+                        job.tr = tj.data();
+                    }
                     wire_inter_tables_(job, buf, static_cast<size_t>(n + 1) * W);
                     job.best = best.data();
                     run_inter_score_(K, job);
@@ -821,7 +925,12 @@ private:
                 std::fill(bri.begin(), bri.end(), 0); std::fill(brj.begin(), brj.end(), 0);
             }
             for (size_t l = 0; l < real; ++l) {
-                al[l].set_problem(ae[l], be[l], params, band, problems[elig[s + l]].guide_j);
+                if (trk) {
+                    al[l].set_problem(ae[l], be[l], params, band, problems[elig[s + l]].guide_j, lt[l], lg[l]);
+                    al[l].track_job(tj[l]);
+                } else {
+                    al[l].set_problem(ae[l], be[l], params, band, problems[elig[s + l]].guide_j);
+                }
                 if constexpr (AB == AlignBand::GuideBanded)
                     al[l].banded_lane_rows(W, static_cast<int>(l), M, blo.data(), bhi.data(),
                                            ulo.data(), uhi.data(), bri[l], brj[l]);
@@ -830,6 +939,10 @@ private:
             job.a = a.data(); job.m = m.data(); job.b = b.data(); job.n = n; job.M = M;
             job.align_mode = (AM == AlignMode::Local) ? 1 : 0;
             if (ragged) job.nb = nb.data();
+            if (trk) {
+                for (size_t l = real; l < static_cast<size_t>(W); ++l) tj[l] = tj[real - 1];
+                job.tr = tj.data();
+            }
             set_inter_params_(job, params, blkT);
             wire_inter_tables_(job, buf, static_cast<size_t>(M + 1) * (n + 1) * W);
             job.best = best.data(); job.best_i = bi.data(); job.best_j = bj.data();

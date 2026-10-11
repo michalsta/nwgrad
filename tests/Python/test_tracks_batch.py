@@ -279,9 +279,6 @@ def test_untracked_batch_becomes_tracked():
     assert b.grads()[0].shape == (3, 1, N, N)
 
 
-def test_tracked_soft_raises_until_supported():
-    pytest.skip("tracked soft lands with the soft-path phase")
-
 
 @pytest.mark.parametrize("case", CASES)
 @pytest.mark.parametrize("prec", ["_double", ""])
@@ -329,3 +326,48 @@ def test_tracked_hirschberg_splits_and_stays_optimal(case, prec, traceback):
     gm, gg = hb.grads()
     dots = (gm * mats).sum(axis=(1, 2, 3)) + (gg * gaps).sum(axis=(1, 2))
     np.testing.assert_allclose(dots, hb.scores(), atol=tol * 50)
+
+
+@pytest.mark.parametrize("case", CASES)
+@pytest.mark.parametrize("prec", ["_double", ""])
+@pytest.mark.parametrize("fill", ["interpair", "striped"])
+@pytest.mark.parametrize("grad_mode", ["hard", "soft", "none"])
+def test_streaming_align_with_tracks(case, prec, fill, grad_mode):
+    """align() (nothing stored per pair) agrees with the batch's own pairs: the same
+    scores, and the gradient summed over the problems."""
+    rng = np.random.default_rng(23)
+    A, B, mats, gaps, tracks, gtracks = random_problem(rng, 150, 4, maxlen=30)
+    P = to_params(mats, gaps)
+    gtracks = [g if k % 3 else None for k, g in enumerate(gtracks)]
+    stored = make_batch(case, prec, A, B, P, tracks, gtracks, fill=fill, grad_mode=grad_mode)
+    stored.score_and_grad()
+    streamer = BATCH[prec](4, gap_model=case[0], mode=case[1], grad_mode=grad_mode)
+    streamer.fill = fill
+    res = streamer.align(A, B, P, tracks=tracks, gap_tracks=gtracks)
+    if grad_mode == "soft":
+        np.testing.assert_allclose(res.scores, stored.scores(), rtol=1e-11, atol=1e-11)
+    else:
+        np.testing.assert_array_equal(res.scores, stored.scores())
+    if grad_mode == "none":
+        return
+    C = stored.compute_grad()
+    assert res.grad.num_sets == 4
+    if grad_mode == "hard":
+        np.testing.assert_array_equal(res.grad.matrices, C.matrices)
+        np.testing.assert_array_equal(res.grad.gaps, C.gaps)
+    else:
+        np.testing.assert_allclose(res.grad.matrices, C.matrices, rtol=1e-10, atol=1e-10)
+        np.testing.assert_allclose(res.grad.gaps, C.gaps, rtol=1e-10, atol=1e-10)
+    # banded streaming: a band past every B is the full DP
+    resb = streamer.align(A, B, P, band=64, tracks=tracks, gap_tracks=gtracks)
+    if grad_mode == "hard":
+        np.testing.assert_array_equal(resb.scores, stored.scores())
+
+
+def test_streaming_track_validation():
+    P3 = to_params(np.zeros((3, N, N)), np.ones((3, 4)))
+    s = nwgrad.SeqPairBatchDouble(2, gap_model="affine", mode="global")
+    with pytest.raises(ValueError, match="pair 1: track has 1 entries"):
+        s.align(["AC", "AC"], ["AC", "AC"], P3, tracks=[[0, 1], [0]])
+    with pytest.raises(ValueError, match="is not a parameter set"):
+        s.align(["AC"], ["AC"], P3, gap_tracks=[[0, 0, 7]])
