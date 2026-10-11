@@ -511,11 +511,12 @@ public:
                 double* gi = gaps + i * K * 4;
                 std::fill(mi, mi + K * nn_, 0.0);
                 std::fill(gi, gi + K * 4, 0.0);
-                std::vector<double> scratch(kstride_(), 0.0);
-                Touched touched;
-                pair_grad_emit_(i, scratch, touched, [&](size_t k, double v) {
-                    if (k < K * nn_) mi[k] = v; else gi[k - K * nn_] = v;
-                });
+                Touched t;
+                pair_grad_(i, t);
+                for (size_t q = 0; q < t.keys.size(); ++q) {
+                    const size_t k = t.keys[q];
+                    if (k < K * nn_) mi[k] = t.vals[q]; else gi[k - K * nn_] = t.vals[q];
+                }
             });
             return;
         }
@@ -1194,49 +1195,56 @@ private:
             d[k >> 2] = static_cast<uint8_t>(d[k >> 2] | (moves[k] << ((k & 3) * 2)));
         tps_[i] = {i0, j0, static_cast<int32_t>(moves.size())};
     }
-    // A pair's touched fields (tpath_grad_ / srec_grad_ scratch): their indices, and
-    // (soft records, where several rows may land on one field) a seen-flag per field.
-    struct Touched { std::vector<uint32_t> keys; std::vector<uint8_t> seen; };
-    // Pair i's hard gradient from its stored path: emit(index, count) for each field of a
-    // K-set gradient it touches, the matrix stack first (index set*n*n + a*n + b) then the
-    // gaps (K*n*n + 4*set + field) — counts as the walk's gradient holds them (gap fields
-    // negative).  `scratch` (K*(n*n+4) doubles, zero) accumulates and is left zero.
-    template <class Emit>
-    void tpath_grad_(size_t i, std::vector<double>& scratch, Touched& tch, Emit&& emit) const {
-        std::vector<uint32_t>& touched = tch.keys;
+    // One pair's gradient, sparse: the fields it touches (keys, in first-touch order) and
+    // their values; `slot` (one per field of the flat K-set layout, 0 = untouched, else
+    // position + 1) finds a field's entry, and is left all-zero again after each pair.
+    struct Touched {
+        std::vector<uint32_t> keys, slot;
+        std::vector<double> vals;
+        void begin(size_t nfields) {
+            keys.clear(); vals.clear();
+            if (slot.size() < nfields) slot.assign(nfields, 0);
+        }
+        void add(size_t k, double v) {
+            uint32_t& sl = slot[k];
+            if (sl) { vals[sl - 1] += v; return; }
+            keys.push_back(static_cast<uint32_t>(k)); vals.push_back(v);
+            sl = static_cast<uint32_t>(keys.size());
+        }
+        void end() { for (uint32_t k : keys) slot[k] = 0; }
+    };
+    // Pair i's hard gradient from its stored path, sparse into `t`: every field of the
+    // flat K-set layout it touches — the matrix stack first (set*n*n + a*n + b), then the
+    // gaps (K*n*n + 4*set + field) — with the walk gradient's counts (gap fields negative).
+    void tpath_grad_(size_t i, Touched& t) const {
         const auto ca = codes_a(i), cb = codes_b(i);
         const auto tk = track(i), gk = gap_track(i);
         const size_t na = static_cast<size_t>(alpha_->size());
         const size_t gbase = static_cast<size_t>(nsets_) * nn_;
-        auto add = [&](size_t k, double v) {
-            if (scratch[k] == 0.0) touched.push_back(static_cast<uint32_t>(k));
-            scratch[k] += v;
-        };
+        t.begin(kstride_());
         const uint8_t* d = tp_.data() + tpo_[i];
-        int r = tps_[i][0], c = tps_[i][1];
+        size_t r = static_cast<size_t>(tps_[i][0]), c = static_cast<size_t>(tps_[i][1]);
         const int steps = tps_[i][2];
         int prev = 3;
-        touched.clear();
         for (int k = 0; k < steps; ++k) {
             const int mv = (d[k >> 2] >> ((k & 3) * 2)) & 3;
             if (mv == 0) {
-                add(static_cast<size_t>(tk[static_cast<size_t>(r)]) * nn_ + ca[static_cast<size_t>(r)] * na +
-                    cb[static_cast<size_t>(c)], 1.0);
+                t.add(static_cast<size_t>(tk[r]) * nn_ + ca[r] * na + cb[c], 1.0);
                 ++r; ++c;
             } else if (mv == 1) {   // gap in B into row r+1: the set of residue a[r]
-                const size_t g = gbase + 4 * static_cast<size_t>(tk[static_cast<size_t>(r)]);
-                if (GM == GapModel::Affine && prev != 1) add(g + AlignParams::kOpenB, -1.0);
-                add(g + AlignParams::kExtendB, -1.0);
+                const size_t g = gbase + 4 * static_cast<size_t>(tk[r]);
+                if (GM == GapModel::Affine && prev != 1) t.add(g + AlignParams::kOpenB, -1.0);
+                t.add(g + AlignParams::kExtendB, -1.0);
                 ++r;
             } else {                // gap in A within row r: its gap-track set
-                const size_t g = gbase + 4 * static_cast<size_t>(gk[static_cast<size_t>(r)]);
-                if (GM == GapModel::Affine && prev != 2) add(g + AlignParams::kOpenA, -1.0);
-                add(g + AlignParams::kExtendA, -1.0);
+                const size_t g = gbase + 4 * static_cast<size_t>(gk[r]);
+                if (GM == GapModel::Affine && prev != 2) t.add(g + AlignParams::kOpenA, -1.0);
+                t.add(g + AlignParams::kExtendA, -1.0);
                 ++c;
             }
             prev = mv;
         }
-        for (uint32_t k : touched) { emit(k, scratch[k]); scratch[k] = 0.0; }
+        t.end();
     }
     // The flat K-set gradient layout tpath_grad_ emits into, to and from an AlignParams.
     size_t kstride_() const noexcept { return static_cast<size_t>(nsets_) * (nn_ + 4); }
@@ -1312,23 +1320,20 @@ private:
         std::vector<double> partial(nblocks * gs, 0.0);
         std::atomic<size_t> next{0};
         auto worker = [&]() {
-            std::vector<double> scratch(gs, 0.0), vals, scaled;
-            std::vector<uint32_t> keys;
-            Touched touched;
+            std::vector<double> scaled;
+            Touched t;
             for (size_t b; (b = next.fetch_add(1, std::memory_order_relaxed)) < nblocks; ) {
                 double* acc = partial.data() + b * gs;
                 const size_t end = std::min(n, (b + 1) * WEIGHTED_GRAD_BLOCK);
                 for (size_t i = b * WEIGHTED_GRAD_BLOCK; i < end; ++i) {
-                    keys.clear(); vals.clear();
-                    pair_grad_emit_(i, scratch, touched, [&](size_t k, double v) {
-                        keys.push_back(static_cast<uint32_t>(k)); vals.push_back(v);
-                    });
+                    pair_grad_(i, t);
+                    const size_t nk = t.keys.size();
                     if (weights) {
-                        scaled.resize(vals.size());
-                        scale_into_(scaled.data(), vals.data(), vals.size(), weights[i]);
-                        for (size_t q = 0; q < keys.size(); ++q) acc[keys[q]] += scaled[q];
+                        if (scaled.size() < nk) scaled.resize(nk);
+                        scale_into_(scaled.data(), t.vals.data(), nk, weights[i]);
+                        for (size_t q = 0; q < nk; ++q) acc[t.keys[q]] += scaled[q];
                     } else {
-                        for (size_t q = 0; q < keys.size(); ++q) acc[keys[q]] += vals[q];
+                        for (size_t q = 0; q < nk; ++q) acc[t.keys[q]] += t.vals[q];
                     }
                 }
             }
@@ -1344,50 +1349,40 @@ private:
     }
     // Pair i's stored tracked gradient, field by field (emit(index, value) into the flat
     // K-set layout of tpath_grad_).
-    template <class Emit>
-    void pair_grad_emit_(size_t i, std::vector<double>& scratch, Touched& touched,
-                         Emit&& emit) const {
-        if (grad_mode_ == GradMode::Soft) srec_grad_(i, scratch, touched, emit);
-        else                              tpath_grad_(i, scratch, touched, emit);
-    }
     // Pair i's stored soft record, scattered into the flat K-set layout (tpath_grad_'s):
     // row r's counts to its set's block, its gap fields to its sets — summed in row order,
     // each touched field emitted once.
-    template <class Emit>
-    void srec_grad_(size_t i, std::vector<double>& scratch, Touched& tch, Emit& emit) const {
+    void srec_grad_(size_t i, Touched& t) const {
         const auto ca = codes_a(i);
         const auto tk = track(i), gk = gap_track(i);
         const size_t na = static_cast<size_t>(alpha_->size()), m = len_a(i);
         const size_t gbase = static_cast<size_t>(nsets_) * nn_;
-        std::vector<uint8_t>& seen = tch.seen;
-        std::vector<uint32_t>& touched = tch.keys;
-        if (seen.size() < scratch.size()) seen.assign(scratch.size(), 0);
-        touched.clear();
-        auto add = [&](size_t k, double v) {
-            if (!seen[k]) { seen[k] = 1; touched.push_back(static_cast<uint32_t>(k)); }
-            scratch[k] += v;
-        };
+        t.begin(kstride_());
         const double* rec = sr_.data() + sro_[i];
         for (size_t r = 0; r < m; ++r) {
             const size_t base = (static_cast<size_t>(tk[r]) * na + ca[r]) * na;
-            for (size_t c = 0; c < na; ++c) add(base + c, rec[r * na + c]);
+            for (size_t c = 0; c < na; ++c) t.add(base + c, rec[r * na + c]);
         }
         const double* g = rec + m * na;
         for (size_t r = 0; r <= m; ++r) {
-            add(gbase + 4 * static_cast<size_t>(gk[r]) + AlignParams::kOpenA, g[4 * r]);
-            add(gbase + 4 * static_cast<size_t>(gk[r]) + AlignParams::kExtendA, g[4 * r + 1]);
+            t.add(gbase + 4 * static_cast<size_t>(gk[r]) + AlignParams::kOpenA, g[4 * r]);
+            t.add(gbase + 4 * static_cast<size_t>(gk[r]) + AlignParams::kExtendA, g[4 * r + 1]);
             if (r > 0) {
-                add(gbase + 4 * static_cast<size_t>(tk[r - 1]) + AlignParams::kOpenB, g[4 * r + 2]);
-                add(gbase + 4 * static_cast<size_t>(tk[r - 1]) + AlignParams::kExtendB, g[4 * r + 3]);
+                t.add(gbase + 4 * static_cast<size_t>(tk[r - 1]) + AlignParams::kOpenB, g[4 * r + 2]);
+                t.add(gbase + 4 * static_cast<size_t>(tk[r - 1]) + AlignParams::kExtendB, g[4 * r + 3]);
             }
         }
-        for (uint32_t k : touched) { emit(k, scratch[k]); scratch[k] = 0.0; seen[k] = 0; }
+        t.end();
     }
-
+    // Pair i's stored tracked gradient, sparse into `t` (keys / vals).
+    void pair_grad_(size_t i, Touched& t) const {
+        if (grad_mode_ == GradMode::Soft) srec_grad_(i, t);
+        else                              tpath_grad_(i, t);
+    }
     void pair_flat_grad_(size_t i, double* flat) const {
-        std::vector<double> scratch(kstride_(), 0.0);
-        Touched touched;
-        pair_grad_emit_(i, scratch, touched, [&](size_t k, double v) { flat[k] = v; });
+        Touched t;
+        pair_grad_(i, t);
+        for (size_t q = 0; q < t.keys.size(); ++q) flat[t.keys[q]] = t.vals[q];
     }
 
     // ── A worker's state: one buffer, one Aligner per band, gradient scratch ─────
