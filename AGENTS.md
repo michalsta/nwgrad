@@ -290,10 +290,35 @@ callgrind shows the DP kernels, walk, `validate_guide` and `fill_guide_gaps`
 instruction-identical to `main`, the excess spread over lane setup and `set_problem`
 bookkeeping, and the ratio moves 1.02-1.06 between builds (layout). Accepted.
 Tracked cost (`tools/bench_tracks.py`, 100k Manakov pairs, K = 25 sets, one per miRNA
-position, one training step, tracked / untracked): double linear 0.99-1.09; double affine
-local 1.06-1.08, global 1.22-1.23; float linear 1.00-1.09; float affine local 1.15-1.23,
-global 1.35-1.42; soft 1.19-1.47 (causes not profiled). Memory for 100k pairs: 31 MB tracked vs 24 MB untracked (hard paths);
-soft records 168 MB (TODO.md).
+position, one training step, tracked / untracked, 1 and 12 threads; `696db0c`): double
+linear 0.97-1.07; double affine local 1.09-1.12, global 1.19-1.23; float linear
+0.99-1.10; float affine local 1.11-1.15, global 1.28-1.34; soft (double) 1.19-1.38.
+Memory for 100k pairs: 31 MB tracked vs 24 MB untracked (hard paths); soft records 168 MB.
+
+Where it goes (perf, 1 thread, per step on those 100k pairs; `score_and_grad` = sg,
+`weighted_grad` = wg):
+- **wg replays every pair** (the untracked one sums stored dense gradients: 1 ms). Hard:
+  the stored path, by runs of one move (a run of gaps in A is one key; diagonals and
+  gaps in B take a key per row): affine global 15 ms (paths ~50 steps), local 4 ms (~9),
+  linear global 24 ms (its ~28 gap steps scattered in runs of 1-2). Soft: the per-row
+  record, by row blocks, 23 ms. Parallel over the blocks of 4096 pairs. Before
+  `41b3ea1`/`696db0c`: 18.8 / 4.0 / 25 / 28.8 ms.
+- **sg, linear: tracked is faster** (112 vs 138 ms double global; not profiled — the
+  tracked walk stores the path where the untracked one accumulates a dense gradient).
+- **sg, affine: +6-15%.** Symbol deltas (double affine local): the tracked inter-pair
+  `row()` (each lane's stacked row through its track, then its letters) 1.9x the
+  untracked one, about +7% of sg; the fill kernel +6% of its own time, ~4% of sg
+  (per-row penalty vectors per lane); `setup_tracks_` per pair ~+4% of sg; recording the path (walk + moves +
+  packing) a little more than the untracked gradient walk.
+- **sg, soft: +17%** (was +27%: the lanes' row weights were exp'd per pair and row; now
+  each set's four once per params, `41b3ea1`): the inter-pair soft kernel +10% (per-lane
+  weights per row), the lanes' row setup.
+
+Tried and dropped (measured on nighthaven): all rows' penalty vectors built once per
+inter-pair group before the fill (double unchanged, float 2-6% slower); a branch-free row
+index in the tracked `row()` (rs padded with a 0, the index clamped: within +-3%, either
+sign); a branch-free per-step path replay (selects and conditional counts: slower than
+the branchy one, 24 vs 18.8 ms — the counts chain through memory).
 
 ### Vectorization: the faster hard-gradient kernels (prototyped, measured on 3 machines)
 
