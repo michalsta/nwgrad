@@ -148,8 +148,21 @@ performance work, none of it measured yet; the cost notes are estimates.
   tests: test_hirschberg.py::test_inherited_gap_run_keeps_the_optimum,
   ::test_boundary_states_double_case.  (A first attempt that changed the seed VALUE only
   moved the failures around — any constant seed is a uniform shift inside a block.)
-- **Hirschberg with negative gap penalties** is guarded (auto -> Pointers, explicit raises);
-  a real fix would make the join and the Local endpoint scans handle gaps that gain score.
+- **Hirschberg with negative gap penalties** is guarded (auto -> Pointers, explicit raises).
+  Characterized 2026-10-11 (guard disabled, scalar + sse2, random pairs): Global with
+  negative EXTENDS and opens >= 0 is correct (0 / 12000) — the guard could be relaxed
+  there, little gain.  Real fixes, if ever wanted:
+  (a) negative OPENS: the join's plain form combines a prefix ending in X (Y) with a
+  suffix starting in X (Y) — one run, two opens — overvalued when go < 0; the halves need
+  "must not end / start in X (Y)" boundary states (sweeps + base cases + the plain form
+  restricted to the other pairs), and Y runs on the shared cut row likewise;
+  (b) Local with negative EXTENDS: decide the model first — the Local fill forbids a gap
+  run on row 0 / column 0 (border X/Y = -inf) while an interior fresh start may open one,
+  and the box's global solve allows one at its corner, so with gaps that GAIN score they
+  disagree (Hirschberg up to ~0.1-3 above Pointers); and hb_scan_impl needs a padding
+  mask (a gap run growing through padding lanes wins the endpoint -> the box overruns B,
+  heap-buffer-overflow) — the same flaw the score kernel had (spad).
+
 - **O3 — release the GIL in long batch calls.** Same item as AGENTS.md's Open TODO.
   ~0.1 µs per call: release around batch calls only, not the µs-scale single-pair
   functions. Blocked on a stated contract against two Python threads mutating one batch.

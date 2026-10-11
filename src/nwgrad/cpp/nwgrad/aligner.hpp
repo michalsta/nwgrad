@@ -1400,13 +1400,21 @@ private:
                     "nwgrad: traceback=\"hirschberg\" is implemented for full DP only; a "
                     "guide band already bounds memory, which is the only thing Hirschberg buys");
             else if (m_ > hb_cutoff_ && !hb_penalties_ok_()) {
-                // A NEGATIVE gap penalty breaks the recursion: its join and the Local
-                // endpoint scans assume a gap never gains score (measured 2026-10-08:
-                // 15-21 of 40 random pairs off by up to a residue's score, Global and
-                // Local, both carries — some ABOVE the optimum — and a heap corruption
-                // in the float32 Local case).  `auto` runs such a pair as Pointers
-                // (exact; only the memory differs); an explicit request raises rather
-                // than return a wrong answer or a silent substitute.
+                // A NEGATIVE gap penalty breaks the recursion (characterized 2026-10-11,
+                // after the boundary-state fix):
+                //  * a negative OPEN (either sequence): the join's plain form adds a prefix
+                //    ending in a gap to a suffix starting in the same gap — one run, two
+                //    opens — which with go < 0 OVERvalues it, and nothing stops the halves
+                //    from realizing it (36 % of random Global pairs below the optimum);
+                //  * Local with a negative EXTEND: a gap run that gains score makes Local
+                //    degenerate, and the fill (no gap on row 0 / column 0) and the box's
+                //    global solve (may open one at its corner) resolve it differently —
+                //    Hirschberg scores up to ~0.1-3 ABOVE Pointers — and the simd endpoint
+                //    scan lets a gap run growing through the padding lanes win, so the box
+                //    overruns B (heap-buffer-overflow in hb_scan_impl).
+                // Global with negative extends and opens >= 0 is correct (0 / 12000).
+                // `auto` runs such a pair as Pointers (exact; only the memory differs); an
+                // explicit request raises rather than return a wrong answer.
                 if (!tb_auto_)
                     throw std::invalid_argument(
                         "nwgrad: traceback=\"hirschberg\" / \"hirschberg_pmax\" needs non-negative "
