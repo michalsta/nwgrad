@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -1104,7 +1105,8 @@ private:
     std::vector<uint16_t> gk_;              // tracked: pair i's gap track at oa_[i] + i
     // Tracked hard gradients, as paths: pair i's moves, 2 bits each (0 diagonal, 1 gap in
     // B, 2 gap in A), in tp_[tpo_[i] ..], at most len_a + len_b of them (a path has no
-    // more steps); tps_[i] = {i0, j0, steps}: the start cell and the move count.
+    // more steps); tps_[i] = {i0, j0, steps}: the start cell and the move count.  8 bytes
+    // of padding at the end (tpath_grad_'s window).
     std::vector<uint8_t>  tp_;
     std::vector<size_t>   tpo_{0};
     std::vector<std::array<int32_t, 3>> tps_;
@@ -1203,7 +1205,7 @@ private:
         for (size_t i = tpo_.size() - 1; i < size(); ++i)
             tpo_.push_back(tpo_.back() + (len_a(i) + len_b(i) + 3) / 4);
         (void)from;
-        tp_.resize(tpo_.back());
+        tp_.resize(tpo_.back() + 8);   // + 8: tpath_grad_ reads the moves 8 bytes at a time
         tps_.resize(size(), {0, 0, 0});
     }
     void store_srec_(size_t i, const std::vector<double>& cnt, const std::vector<double>& gaps) {
@@ -1233,14 +1235,14 @@ private:
             if (keys.size() < maxkeys) { keys.resize(maxkeys); vals.resize(maxkeys); }
             n = 0;
         }
-        // One step on field k: its key is kept on the first (no branch).
-        void count(uint32_t k) { keys[n] = k; n += slot[k]++ == 0; }
-        // The counts as values, negative from field `neg` on (the gap fields).
+        // The counts as values, negative from field `neg` on (the gap fields: the sign
+        // bit set, no branch — the two kinds interleave unpredictably).
         void end_counts(uint32_t neg) {
             for (size_t q = 0; q < n; ++q) {
                 const uint32_t k = keys[q];
                 const double c = static_cast<double>(slot[k]);
-                vals[q] = k >= neg ? -c : c;
+                vals[q] = std::bit_cast<double>(std::bit_cast<uint64_t>(c) |
+                                                (static_cast<uint64_t>(k >= neg) << 63));
                 slot[k] = 0;
             }
         }
@@ -1271,25 +1273,44 @@ private:
         size_t r = static_cast<size_t>(tps_[i][0]), c = static_cast<size_t>(tps_[i][1]);
         const int steps = tps_[i][2];
         t.begin(kstride_(), 2 * static_cast<size_t>(steps) + 1);
+        uint32_t* keys = t.keys.data();
+        uint32_t* slot = t.slot.data();
+        size_t n = 0;
+        auto one = [&](uint32_t key, uint32_t cnt) { keys[n] = key; n += slot[key] == 0; slot[key] += cnt; };
+        // By runs of one move (up to 28, from a 64-bit window): a diagonal or B-gap run
+        // walks its rows (each row its own set), a run of gaps in A stays in row r (one
+        // key).  A gap run's first step also opens (the open field is extend - 1); a run
+        // split at 28 continues with prev == mv, so it does not open twice.
         int prev = 3;
-        for (int k = 0; k < steps; ++k) {
-            const int mv = (d[k >> 2] >> ((k & 3) * 2)) & 3;
+        static_assert(std::endian::native == std::endian::little, "the window reads move k at bit 2k");
+        for (int k = 0; k < steps; ) {
+            uint64_t wd;
+            std::memcpy(&wd, d + (k >> 2), sizeof wd);
+            wd >>= 2 * (k & 3);
+            const int mv = static_cast<int>(wd & 3);
+            const uint64_t x = (wd ^ (0x5555555555555555ull * static_cast<uint64_t>(mv))) & ((1ull << 56) - 1);
+            const int run = std::min(x ? std::countr_zero(x) >> 1 : 28, steps - k);
             if (mv == 0) {
-                t.count(static_cast<uint32_t>(static_cast<size_t>(tk[r]) * nn_ + ca[r] * na + cb[c]));
-                ++r; ++c;
-            } else if (mv == 1) {   // gap in B into row r+1: the set of residue a[r]
-                const uint32_t g = static_cast<uint32_t>(gbase + 4 * static_cast<size_t>(tk[r]));
-                if (GM == GapModel::Affine && prev != 1) t.count(g + AlignParams::kOpenB);
-                t.count(g + AlignParams::kExtendB);
-                ++r;
-            } else {                // gap in A within row r: its gap-track set
-                const uint32_t g = static_cast<uint32_t>(gbase + 4 * static_cast<size_t>(gk[r]));
-                if (GM == GapModel::Affine && prev != 2) t.count(g + AlignParams::kOpenA);
-                t.count(g + AlignParams::kExtendA);
-                ++c;
+                for (int q = 0; q < run; ++q)
+                    one(static_cast<uint32_t>(static_cast<size_t>(tk[r + q]) * nn_ + ca[r + q] * na + cb[c + q]), 1);
+                r += run; c += run;
+            } else if (mv == 1) {
+                const auto eb = [&](size_t row) {
+                    return static_cast<uint32_t>(gbase + 4 * static_cast<size_t>(tk[row]) + AlignParams::kExtendB);
+                };
+                if (GM == GapModel::Affine && prev != 1) one(eb(r) - 1, 1);
+                for (int q = 0; q < run; ++q) one(eb(r + q), 1);
+                r += run;
+            } else {
+                const uint32_t ea = static_cast<uint32_t>(gbase + 4 * static_cast<size_t>(gk[r]) + AlignParams::kExtendA);
+                if (GM == GapModel::Affine && prev != 2) one(ea - 1, 1);
+                one(ea, static_cast<uint32_t>(run));
+                c += run;
             }
             prev = mv;
+            k += run;
         }
+        t.n = n;
         t.end_counts(static_cast<uint32_t>(gbase));
     }
     // The flat K-set gradient layout tpath_grad_ emits into, to and from an AlignParams.

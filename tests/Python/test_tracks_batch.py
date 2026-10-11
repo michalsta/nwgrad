@@ -281,6 +281,42 @@ def test_untracked_batch_becomes_tracked():
 
 
 @pytest.mark.parametrize("case", CASES)
+@pytest.mark.parametrize("traceback", ["pointers", "hirschberg"])
+def test_long_gap_runs_replay(case, traceback):
+    """Stored paths are replayed by runs of one move, read 28 at a time: very unequal
+    lengths force runs far longer than that (gaps in A along a row, gaps in B down many
+    rows), which must give the pair's own gradient."""
+    rng = np.random.default_rng(23)
+    K = 4
+    A, B = [], []
+    for _ in range(40):
+        short, long_ = int(rng.integers(0, 6)), int(rng.integers(29, 160))
+        la, lb = (short, long_) if rng.integers(0, 2) else (long_, short)
+        A.append("".join(rng.choice(list(ALPHA), size=la)))
+        B.append("".join(rng.choice(list(ALPHA), size=lb)))
+    mats = rng.normal(0, 1.5, size=(K, N, N))
+    gaps = rng.uniform(0.2, 2.0, size=(K, 4))
+    tracks = [list(rng.integers(0, K, size=len(a))) for a in A]
+    gtracks = [list(rng.integers(0, K, size=len(a) + 1)) for a in A]
+    P = to_params(mats, gaps)
+    batch = make_batch(case, "_double", A, B, P, tracks, gtracks, traceback=traceback)
+    batch.score_and_grad()
+    gm, gg = batch.grads()
+    for k, (s, m_, g_) in enumerate(per_pair(case, "_double", A, B, P, tracks, gtracks)):
+        assert batch.scores()[k] == s
+        np.testing.assert_array_equal(gm[k], m_)
+        np.testing.assert_array_equal(gg[k], g_)
+    w = rng.normal(size=len(A))
+    G = batch.weighted_grad(w)
+    acc_m, acc_g = np.zeros(gm.shape[1:]), np.zeros(gg.shape[1:])
+    for k in range(len(A)):
+        acc_m += w[k] * gm[k]
+        acc_g += w[k] * gg[k]
+    np.testing.assert_array_equal(G.matrices, acc_m)
+    np.testing.assert_array_equal(G.gaps, acc_g)
+
+
+@pytest.mark.parametrize("case", CASES)
 @pytest.mark.parametrize("prec", ["_double", ""])
 def test_one_set_tracked_weighted_grad_is_untracked_bit_for_bit(case, prec):
     """With one set, the tracked sum (each pair's touched fields, weight * count, in pair

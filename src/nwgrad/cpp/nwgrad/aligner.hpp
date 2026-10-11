@@ -965,16 +965,23 @@ private:
             throw std::invalid_argument(
                 "nwgrad: gap_track has " + std::to_string(gap_track.size()) + " entries, but sequence A of " +
                 "length " + std::to_string(m) + " needs " + std::to_string(m + 1) + " (one per DP row 0..m)");
-        for (size_t k = 0; k < track.size(); ++k)
-            if (track[k] >= K)
-                throw std::invalid_argument(
-                    "nwgrad: track[" + std::to_string(k) + "] = " + std::to_string(track[k]) +
-                    " is not a parameter set (params has " + std::to_string(K) + ")");
-        for (size_t k = 0; k < gap_track.size(); ++k)
-            if (gap_track[k] >= K)
-                throw std::invalid_argument(
-                    "nwgrad: gap_track[" + std::to_string(k) + "] = " + std::to_string(gap_track[k]) +
-                    " is not a parameter set (params has " + std::to_string(K) + ")");
+        // (the max first: a batch re-checks every pair on every fill, so keep it a
+        // vectorizable pass; the loops below only find the index to report)
+        uint16_t mx = 0;
+        for (const uint16_t v : track) mx = std::max(mx, v);
+        for (const uint16_t v : gap_track) mx = std::max(mx, v);
+        if (mx >= K) {
+            for (size_t k = 0; k < track.size(); ++k)
+                if (track[k] >= K)
+                    throw std::invalid_argument(
+                        "nwgrad: track[" + std::to_string(k) + "] = " + std::to_string(track[k]) +
+                        " is not a parameter set (params has " + std::to_string(K) + ")");
+            for (size_t k = 0; k < gap_track.size(); ++k)
+                if (gap_track[k] >= K)
+                    throw std::invalid_argument(
+                        "nwgrad: gap_track[" + std::to_string(k) + "] = " + std::to_string(gap_track[k]) +
+                        " is not a parameter set (params has " + std::to_string(K) + ")");
+        }
         if (track.empty()) { trk_own_.assign(m, 0); trk_ = trk_own_; }
         else                 trk_ = track;
         if (gap_track.empty()) {
