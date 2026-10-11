@@ -1530,7 +1530,7 @@ private:
                 if constexpr (AM == AlignMode::Local)
                     if (rat(buf.H, i, j) <= 0.0) break;
                 if (i > 0 && j > 0 &&
-                    rat(buf.H, i, j) == rat(buf.H, i-1, j-1) + subT(i, j))
+                    rat(buf.H, i, j) == rat(buf.H, i-1, j-1) + (Tr ? subT(i, j) : subTu(i, j)))
                     k = 0;
                 else if (i > 0 && (j == 0 || rat(buf.H, i, j) == rat(buf.H, i-1, j) -
                                                  (Tr ? tgeb_[static_cast<size_t>(i)]
@@ -1684,19 +1684,36 @@ private:
     // the gap fields count down (see the sign convention).
     void hard_grad_affine(const DpBuffer& buf, AlignParams& grad,
                           std::vector<int>* gj = nullptr) const {
+        if (tr_) hard_grad_affine_impl<true>(buf, grad, gj);
+        else     hard_grad_affine_impl<false>(buf, grad, gj);
+    }
+    // Tr: each count lands in its row's set (sub_off / grad_gap); otherwise the walk
+    // the untracked gradient always took, with no per-step branch on tr_.
+    template <bool Tr>
+    void hard_grad_affine_impl(const DpBuffer& buf, AlignParams& grad, std::vector<int>* gj) const {
         double* gblk = grad_block(grad);
         if (gj) guide_affine_init(*gj);
         walk_affine(buf, [&](TBTable s, int i, int j, bool open) {
             if (s == TBTable::M) {
-                gblk[sub_off(i, j)] += 1.0;
+                gblk[Tr ? sub_off(i, j) : sub_off_u(i, j)] += 1.0;
                 if (gj) (*gj)[static_cast<size_t>(i - 1)] = j - 1;
             } else if (s == TBTable::X) {
-                grad_gap(grad, i, AlignParams::kExtendB) -= 1.0;
-                if (open) grad_gap(grad, i, AlignParams::kOpenB) -= 1.0;
+                if constexpr (Tr) {
+                    grad_gap(grad, i, AlignParams::kExtendB) -= 1.0;
+                    if (open) grad_gap(grad, i, AlignParams::kOpenB) -= 1.0;
+                } else {
+                    grad.gap_extend_b -= 1.0;
+                    if (open) grad.gap_open_b -= 1.0;
+                }
                 if (gj) (*gj)[static_cast<size_t>(i - 1)] = j;
             } else {
-                grad_gap(grad, i, AlignParams::kExtendA) -= 1.0;
-                if (open) grad_gap(grad, i, AlignParams::kOpenA) -= 1.0;
+                if constexpr (Tr) {
+                    grad_gap(grad, i, AlignParams::kExtendA) -= 1.0;
+                    if (open) grad_gap(grad, i, AlignParams::kOpenA) -= 1.0;
+                } else {
+                    grad.gap_extend_a -= 1.0;
+                    if (open) grad.gap_open_a -= 1.0;
+                }
             }
         });
         if (gj) fill_guide_gaps(*gj);
@@ -2064,10 +2081,18 @@ private:
 
     void hard_grad_linear(const DpBuffer& buf, AlignParams& grad) const {
         double* gblk = grad_block(grad);
+        if (tr_) {
+            walk_linear(buf, [&](int k, int i, int j) {
+                if (k == 0)      gblk[sub_off(i, j)] += 1.0;
+                else if (k == 1) grad_gap(grad, i, AlignParams::kExtendB) -= 1.0;
+                else             grad_gap(grad, i, AlignParams::kExtendA) -= 1.0;
+            });
+            return;
+        }
         walk_linear(buf, [&](int k, int i, int j) {
-            if (k == 0)      gblk[sub_off(i, j)] += 1.0;
-            else if (k == 1) grad_gap(grad, i, AlignParams::kExtendB) -= 1.0;   // the score subtracts this penalty
-            else             grad_gap(grad, i, AlignParams::kExtendA) -= 1.0;
+            if (k == 0)      gblk[sub_off_u(i, j)] += 1.0;
+            else if (k == 1) grad.gap_extend_b -= 1.0;   // the score subtracts this penalty
+            else             grad.gap_extend_a -= 1.0;
         });
     }
 

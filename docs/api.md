@@ -8,7 +8,8 @@ building from source, see [cpp.md](cpp.md).
 ## Contents
 
 - [`Alphabet`](#alphabet) · [`SubstMatrix`](#substmatrix) · [`AlignParams`](#alignparams)
-  (with [gap penalty conventions](#gap-penalty-conventions))
+  (with [gap penalty conventions](#gap-penalty-conventions) and
+  [parameter sets and tracks](#parameter-sets-and-tracks))
 - [`SeqPair`](#seqpair) · [`SeqPairBatch`](#seqpairbatch) · [`nwgrad.logistic`](#nwgradlogistic)
   · [`BatchResult`](#batchresult)
 - [Migrating from 0.5](#migrating-from-05)
@@ -137,6 +138,53 @@ For **linear** gap model, a gap of length `k` costs `gap_extend * k`.
 For **affine** gap model, a gap of length `k` costs `gap_open + gap_extend * k`.
 
 This matches BioPython's convention where `open` is charged once per gap regardless of length.
+
+### Parameter sets and tracks
+
+An `AlignParams` may hold **K parameter sets**, each a full substitution matrix plus the
+four gap fields, and a problem may then score each row of sequence A with its own set.
+
+```python
+P = nwgrad.AlignParams.from_arrays(matrices, gaps, alphabet="ACGT")  # (K,N,N), (K,4)
+P = nwgrad.AlignParams.stack([p0, p1, p2])     # one-set params, in order
+P.num_sets; P.matrices; P.gaps                 # K, (K,N,N) copy, (K,4) copy (assignable)
+P[k]; P[k] = p                                 # set k as a one-set AlignParams
+```
+
+The plain fields (`matrix`, `gap_open_a`, ...) are set 0, so one-set code is unchanged.
+`to_dict()` adds `num_sets`, `matrices` and `gaps` when K > 1. Arithmetic needs the same
+alphabet **and** the same K; a gradient of a K-set problem has K sets.
+
+A **track** gives each residue of A its set: `track[i]` in `[0, K)`, `len(A)` entries.
+A **gap track** gives each DP row `0..len(A)` its set for gaps in A: `len(A) + 1`
+entries. If omitted, the track is all 0 and the gap track takes row 0 from `track[0]`
+and row i from `track[i-1]`. In DP row i (after residue `i-1` of A, 1-based):
+
+| Move | Charged by |
+|---|---|
+| match `a[i-1]`–`b[j-1]` | matrix of set `track[i-1]` |
+| gap in B into row i (`a[i-1]` against `-`) | `gap_extend_b` of `track[i-1]`, plus its `gap_open_b` when the run starts in row i — a vertical run pays the open of the row it **starts** in |
+| gap in A within row i (`-` against `b[j-1]`) | `gap_open_a` / `gap_extend_a` of `gap_track[i]`, rows 0 and `len(A)` included |
+
+Tracks are accepted by the single-pair functions (`track=`, `gap_track=` keywords),
+`SeqPair(..., track=, gap_track=)`, `SeqPairBatch.add_many(..., tracks=, gap_tracks=)`
+and `SeqPairBatch.align(..., tracks=, gap_tracks=)` (one sequence per pair; `None`, or a
+`None` entry, for the default). Every path supports them: hard, soft and score-only,
+linear and affine, global and local, full and banded, every fill and traceback
+(Hirschberg too), at both precisions.
+
+Contracts:
+- The hard path stays **bit-exact across ISA levels** (every SIMD kernel against the
+  scalar tracked fill).
+- **Equal sets are the untracked problem**: K copies of one set, under any track, give
+  bit for bit the untracked tables, score and path (the column-0 border is summed by
+  runs of equal extends, which reproduces the untracked closed form).
+- A tracked batch stores a **hard gradient as the pair's path** (2 bits per step) and a
+  **soft gradient as a per-row record** (`len(A)` match-count rows plus four gap
+  fields per DP row), so memory does not grow with K; `weighted_grad()` and
+  `compute_grad()` replay them. With one set, `weighted_grad()` is bit-identical to
+  the untracked batch's. `grads()` returns `(N, K, n, n)` and `(N, K, 4)` for a tracked
+  batch — that one is dense, so prefer `weighted_grad()` for many pairs.
 
 ---
 
@@ -279,15 +327,15 @@ the logical count measured up to 1.44× slower.
 
 | Method | Returns | Description |
 |---|---|---|
-| `add_many(seqs_a, seqs_b, params, kernel="auto")` | — | Append the pairs `(seqs_a[i], seqs_b[i])` under `params`: one **segment**. Params may differ between calls (one alphabet); `set_params()` replaces them all. Sequences are validated and encoded in parallel; a bad character raises and adds nothing. The batch keeps a **copy** of `params` (calls with equal params share one); later changes to the object do not reach the batch — use `set_params()`. |
+| `add_many(seqs_a, seqs_b, params, kernel="auto", *, tracks=None, gap_tracks=None)` | — | Append the pairs `(seqs_a[i], seqs_b[i])` under `params`: one **segment**. With [tracks](#parameter-sets-and-tracks) (or K > 1 sets) the batch is **tracked**: every pair carries tracks and every segment's params must have the same K. Params may differ between calls (one alphabet); `set_params()` replaces them all. Sequences are validated and encoded in parallel; a bad character raises and adds nothing. The batch keeps a **copy** of `params` (calls with equal params share one); later changes to the object do not reach the batch — use `set_params()`. |
 | `set_params(params)` | — | Give every pair a copy of `params` (same alphabet; a mismatch raises without changing anything). Clears cached scores, gradients and stored paths; keeps the guides, for `banded_grad()`. |
 | `score_and_grad(keep_paths=False)` | `float` (sum of scores) | Full DP on every pair: score, guide and (unless `grad_mode="none"`) gradient, cached per pair. With `grad_mode="none"` and no `keep_paths`: [score only](#score-only), guides deferred. `keep_paths=True` also stores each alignment path, so `batch[i].aligned()` / `.coordinates()` work (a few bytes per alignment column). |
 | `banded_grad(bandwidth, keep_paths=False)` | `float` (sum of scores) | Banded re-align + gradient around each pair's cached guide. Run `score_and_grad()` once to establish the guides, then `set_params()` + `banded_grad(bw)` after each update; no full DP is run. |
-| `align(seqs_a, seqs_b, params, band=0, aligned_a=[], aligned_b=[], kernel="auto")` | [`BatchResult`](#batchresult) | Align pairs **without adding them** (what `BatchAligner` was): scores plus the gradient summed over the pairs, nothing kept per pair, so memory stays O(threads). Uses the batch's type, grad mode, threads and settings. `band > 0` bands every pair (`aligned_a` / `aligned_b`, one gapped string per pair, give the guides; the diagonal otherwise); `band == 0` with guides bands at width 0, so all pairs or none must carry one. Soft: forward-backward only (no Viterbi). None, unbanded: [score only](#score-only). |
+| `align(seqs_a, seqs_b, params, band=0, aligned_a=[], aligned_b=[], kernel="auto", *, tracks=None, gap_tracks=None)` | [`BatchResult`](#batchresult) | Align pairs **without adding them** (what `BatchAligner` was): scores plus the gradient summed over the pairs, nothing kept per pair, so memory stays O(threads). Uses the batch's type, grad mode, threads and settings. `band > 0` bands every pair (`aligned_a` / `aligned_b`, one gapped string per pair, give the guides; the diagonal otherwise); `band == 0` with guides bands at width 0, so all pairs or none must carry one. Soft: forward-backward only (no Viterbi). None, unbanded: [score only](#score-only). |
 | `compute_grad()` | `AlignParams` | The cached gradients summed over all pairs. Summed in fixed blocks, so bit-reproducible whatever `n_threads`. Raises on an empty batch. |
 | `scores()` | `numpy.ndarray` (float64) | The cached per-pair scores, in pair order. Runs no DP; raises if any pair has no valid score. |
 | `weighted_grad(weights)` | `AlignParams` | `sum_i weights[i] * grad_i` over the cached per-pair gradients. `weights` is a 1-D numeric array with one entry per pair. Runs no DP; raises if any pair has no valid gradient. Summed in fixed blocks of 4096 pairs (each in pair order, the blocks in parallel), then over the blocks in order, so the result is bit-reproducible and does not depend on `n_threads`. |
-| `grads()` | `(numpy.ndarray, numpy.ndarray)` (float64) | The cached per-pair gradients as two arrays, in pair order: `matrices` of shape `(N, n, n)`, rows and columns in the order of `alphabet`, and `gaps` of shape `(N, 4)` with columns `gap_open_a`, `gap_extend_a`, `gap_open_b`, `gap_extend_b`. Runs no DP; raises on an empty batch and if any pair has no valid gradient. |
+| `grads()` | `(numpy.ndarray, numpy.ndarray)` (float64) | The cached per-pair gradients as two arrays, in pair order: `matrices` of shape `(N, n, n)`, rows and columns in the order of `alphabet`, and `gaps` of shape `(N, 4)` with columns `gap_open_a`, `gap_extend_a`, `gap_open_b`, `gap_extend_b` — a tracked batch: `(N, K, n, n)` and `(N, K, 4)`. Runs no DP; raises on an empty batch and if any pair has no valid gradient. |
 | `drop_paths()` | — | Free the stored alignment paths. |
 
 The batch is also a sequence: `len(batch)` is the number of pairs and `batch[i]`

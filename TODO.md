@@ -178,3 +178,28 @@ Also open from the same work:
   an in-place change (`*=`, the gap/matrix setters) no longer reaches them — call
   `set_params()` — and the Python side no longer keeps the params object alive.
   DiscrimAlign is unaffected (it builds fresh params and calls `set_params()`).
+
+## Tracks (parameter sets per row of A): what is left
+
+Tracks landed on branch `tracks` (2026-10-11; see AGENTS.md, "Tracks").  Deferred:
+
+- **Glocal mode** (global in A, local in B: free leading and trailing gaps along B) —
+  PosimiR's second DP mode.  A third `AlignMode`, or row-0 / row-m horizontal costs of
+  0 via the gap track (that needs a "free" set whose counts reach no gradient).  Not
+  started; the gap track already prices rows 0 and m on their own, so the hooks exist.
+- **Fleet runs not yet done: spot (neon) and solace (avx512).**  Correctness
+  (`ctest`, `NWGRAD_FORCE_KERNEL=simd pytest tests/Python`) and `tools/bench_tracks.py`.
+  Everything on the branch was verified on sse2 (skynet, wloczykij) and avx2 (nighthaven).
+- **Python track conversion** (`to_tracks` in py_exports.cpp) casts each pair's list
+  separately: ~1-2 µs per pair, seconds for millions.  Accepting one flat int array plus
+  offsets would remove it.
+- **Track storage is per pair** (2 B per residue, both tracks).  PosimiR's tracks are a
+  function of the miRNA's length (0, 1, 2, ...): interning identical tracks would make
+  them free.  Not needed yet (≈ 90 B per Manakov pair).
+- **Tracked soft batches store a per-row record per pair**: `len(A) * n + 4 * (len(A)+1)`
+  doubles (≈ 1.4 KB per Manakov pair, ≈ 3.6 GB for 2.5 M).  Inherent when every row has
+  its own set; `align()` (streaming) stores nothing.  Hard gradients are paths (≈ 30 B).
+- **Tracked Hirschberg builds each row's profile as it sweeps** (no shared profile): one
+  gather per cell.  A compact profile per block would help when rows share sets.
+- **float32 tracked inter-pair groups cast the whole matrix stack per group**
+  (`cast_block_`, K * n^2 per group); the batch's prepared stack (`prep_`) could serve.

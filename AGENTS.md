@@ -199,35 +199,88 @@ ISA selection is a **function-pointer table**, one entry per level, resolved onc
 
 The gains are where the flat arrays put them: the batch-wide walks (`set_params`, `scores`, `weighted_grad`) stream instead of chasing pointers, which is why they grow with threads (the old walks were memory-bound, `TODO.md`). The DP kernels are unchanged, so DP-dominated work (the soft step) moves least. DiscrimAlign's 16 acceptance fits (`da_accept`, unchanged DiscrimAlign through the deprecated API) are bit-identical to the oracle. Not measured: AVX-512 (solace went offline mid-session; its correctness runs passed).
 
-### The matrix track: a different substitution matrix per position of sequence A — NOT ON MAIN
+### Tracks: K parameter sets, one chosen per row of sequence A (branch `tracks`, 2026-10-11)
 
-> **Status: unmerged.** Everything in this section lives only on branch `multipos_old`
-> (commit `9885e13`, one commit ahead of `763634d`). It is **not on `main` and not in
-> 0.5.0**: `matrix_count()`, `add_matrix()`, `build_row_alphabet()`, the `track`
-> arguments and `tests/Python/test_matrix_track.py` do not exist on `main`. The section
-> is kept as the design and measurement record for when that branch is merged.
+For PosimiR (position-specific miRNA scoring), built from scratch; it replaces the
+`multipos_old` matrix-track attempt, whose design notes stood here.
 
-`AlignParams` holds **K ≥ 1 matrix SLOTS** over one alphabet (slot 0 is `matrix`; `matrix_count()` / `matrix_at(k)` / `add_matrix()`). A problem may carry a **TRACK** — one slot index per residue of sequence A — and position `i` of A is then scored by slot `track[i]`. Sequence B has no track: the column axis is always the plain alphabet. `set_problem(a, b, params, band, guide_j, track)`; `SeqPair(..., track)` fixes it at construction (it belongs to *that* A, so `set_params()` may swap the matrices under it but may not change the slot count); `ProblemInstance::track`; `SeqPairBatch::add_many(..., tracks)`.
+**Model.** `AlignParams` holds K >= 1 SETS (matrix + four gap fields). Set 0 is the plain
+members (`matrix` block 0, `gap_open_a` ...), sets 1..K-1 the rest of the matrix STACK
+(`SubstMatrix` now holds K blocks back to back: `sets()`, `set_data(k)`) and `more_gaps_`;
+arithmetic needs equal K. A problem carries a TRACK (`len(A)` set indices) and a GAP TRACK
+(`len(A)+1`, one per DP row; default row 0 -> track[0], row i -> track[i-1]). DP row i
+(1..m, after a[i-1]): a match uses matrix `track[i-1]`; a gap in B INTO row i costs that
+set's `ge_b`, plus its `go_b` when the run starts there (a vertical run pays the open of
+its FIRST row); a gap in A WITHIN row i costs `gap_track[i]`'s `go_a`/`ge_a` (rows 0 and m
+included). A problem is tracked when K > 1 or a track is given; untracked problems run
+exactly the code they always ran (every tracked change is a `Tr` template instantiation
+or an `if (tr_)` in non-hot code; `subTu`/`sub_off_u` keep the untracked hot loops
+branch-free).
 
-**The gradient comes back as K matrices**, and that is the whole reason the API is slots-plus-track rather than one matrix literally per position: the gradient has to be a point in the *same* parameter space, so every position sharing a slot ties into the same K·N·N learnable parameters. The literal per-position reading is not lost — it is the case `K == len(A)`, `track = 0..m-1`, supported, and simply the one where nothing is tied. Arithmetic requires equal K as well as equal alphabets (`zeros_like` copies the slot count); `add()` rejects a pair whose slot count disagrees with the batch, though pairs may of course carry *different tracks*.
+**Representation in the Aligner** (`setup_tracks_`): `rs_[i-1]` = the STACKED substitution
+row of DP row i (`set*nalpha + a[i-1]` — a row of the stack, which is also the gradient's
+index), and per-row penalty arrays in precision T (`tgoa_/tgea_` rows 0..m, `tgob_/tgeb_`
+rows 1..m), cast exactly as the untracked fill casts the fields. The Global column-0
+border is a vertical run from the origin: `-(go_b(1) + C_i)`. The untracked fill writes
+the CLOSED form `-(go_b + i*ge_b)`, so C_i is summed by runs of bitwise-equal extends
+(`i*ge` while rows 1..i share one; `C_{s-1} + (i-s+1)*ge` from a run's start s): K copies
+of one set give the untracked border bit for bit. That is the contract the tests pin:
+**equal sets are the untracked problem**, tables included, under any track and backend.
 
-**Internally it is one idea: the DP's ROW ALPHABET widens from "residue" to "(slot, residue)".** `Aligner::build_row_alphabet()` collects the distinct such pairs occurring along A, compacts them to dense ids in `arow_`, and builds the `nrow_ × nalpha_` block they index; `rowsrc_` inverts the map so `grad_rows()` can resolve a row symbol back to a slot **once per gradient call**, not once per cell. Every kernel here already builds `prof[row symbol][columns]` and takes one slice per row (the query-profile law below), so **nothing downstream changed shape and nothing changed per cell** — `job.nalpha` merely split into `nrow`/`ncol`, and `job.a` became `uint32_t` row symbols. This is why the feature did not touch the striped kernels, the tracebacks, or the Hirschberg sweeps at all.
+**Kernels.** Every job struct carries a `TrackJob<T>` (simd_levels.hpp; `tr.on()`). Each
+kernel's tracked instantiation loads the row's penalties (and re-broadcasts them) once
+per row — inside a row nothing changes, so the inner loops keep their shape. Query
+profiles (striped, score-only, row-wise Full): the problem's distinct stacked rows are
+compacted (`ra_/crow_`, sorted unique) into one profile row each while that fits
+`track_profile_bytes()` (1 MiB; `NWGRAD_TRACK_PROFILE_BYTES`, the tests set 0); past it
+each DP row's profile row is built as the fill reaches it (O(n) memory, one gather per
+cell — the same work as the profile when no two rows share a stacked row). Inter-pair
+fills/scores: per-lane `TrackJob`s (`InterJobT::tr`), each lane's row vectors built per
+row as `z + v` exactly like the untracked broadcasts; lanes past their A clamp to their
+last row (computed, ignored). The tracked inter-pair lanes are set up BEFORE the fill on
+per-lane aligners (`Work::lanes/blanes`), which then adopt their tables without a second
+`set_problem()`.
 
-**COMPACTED, not stacked, and the untracked path skips it entirely.** Stacking the K slots would make every profile build O(K·N·n), which at `K == m` is `O(m·N·n)` — N times the DP. Compaction bounds the row count by `min(m, K·N)`, so the per-position case costs O(m·n) of profile (inherent: that *is* position-specific scoring) and never more than stacking. When there is no track, `build_row_alphabet` takes a fast path that does not compact or copy at all — `blk_` aliases the params' own block exactly as before — because the compaction is cheap but not free and the untracked case must cost what it always cost.
+**Hirschberg.** The reverse sweep runs the recurrence MIRRORED, which meets a vertical run
+at its LAST row and charges the open there; with per-row opens that is wrong. The mirror
+gets rewritten rows (`hb_reverse_rows_`): `go'(r) = go(r+1)`, `ge'(r) = ge(r) + (go(r) -
+go(r+1))`, `go(m+1) := go(m)`, so a complete run pays `go(s) + sum ge` by telescoping; a
+run continuing past the block's corner (out_x) pays a constant offset the join's argmax
+cannot see; the join refunds `go(p+1)` (the first row below the cut). Equal rows give
+`ge' = ge + 0` exactly. `HbRows` (hb_kernel_impl.inl) maps sweep row t to its DP rows
+(forward: cells row r+1; reverse: row r, vertical move r+1 with the rewritten arrays).
+Tracked sweeps build each row's profile row (no shared profile), and the pmax ramp is
+rebuilt when a row's `ge_a` differs from the last. Verified: scalar == every level bit for
+bit, score within rounding of Pointers' at hb_cutoff 1 and 3, gradient . params == the
+replayed score, equal sets == untracked; two planted bugs (no rewrite; refund at row p)
+each fail the suite.
 
-**Measured (skynet, sse2, 1 thread, float32, affine/global/hard, one process per arm — arms sharing a process contaminate each other badly at len ≥ 1000; an early shared-process run reported 0.42× where the isolated one reports 1.00×):**
+**Soft.** One representation: a per-row RECORD — `len(A)` rows of match counts by B letter
+and four gap fields per DP row — produced by the log path (`soft_record_log_`), the
+scaled per-pair kernel (`SoftPairJob::rw/grow`, a profile row per DP row with `nalpha`
+exps per row) and the inter-pair soft pass (`InterSoftJob::rs/rw`, outputs per lane and
+row), then scattered into the K sets (`add_soft_record_`). Tolerance-tested like the rest
+of the soft path.
 
-| len | no track | 3 slots | 20 slots | one slot per position |
-|---|---|---|---|---|
-| 30 | 101.4 Mcell/s | 80.7 (0.80×) | — | 75.9 (0.75×) |
-| 200 | 214.8 | 191.1 (0.89×) | 148.5 (0.69×) | 138.1 (0.64×) |
-| 1000 | 47.8–49.7 | 49.5 (**1.00×**) | 44 (0.90×) | — |
+**Batch storage** (`BatchEngine`). Tracks per pair at `oa_[i]` / `oa_[i]+i` (uint16, K <=
+65536). A HARD gradient is stored as the pair's PATH, 2 bits per step (`tp_`, slots of
+`(len_a+len_b+3)/4` bytes) plus its start cell, and replayed on demand (`tpath_grad_`):
+memory does not grow with K (≈ 30 B per Manakov pair; K dense sets would be 4 KB at
+K = 25). A SOFT gradient is the per-row record (`sr_`). `weighted_grad()` /
+`compute_grad()` sum each pair's touched fields, weight * count formed out of line,
+added once, in the same fixed blocks — with one set bit-identical to the untracked dense
+sum (an untouched field would get w*0, which leaves a +0 sum unchanged). float32 batches
+cast each owned params' whole stack once (`prep_`). An untracked batch that gets tracks
+later converts (zero tracks) and drops its cached results.
 
-The shape is exactly what the profile-build cost predicts: a track costs O(nrow·n) more profile against an O(m·n) DP, so it is **free once the DP dominates** (len 1000, K=3) and most visible on short pairs where per-problem setup is a large share. The untracked path is unchanged within the noise floor: a cross-binary before/after showed ~2–4% at len=30 and ~2% at len=200, but the `scalar_fallback` **control arm moved by the same ratio** at len=30 and by the *opposite* sign at len=1000, which is the signature of separately-compiled code layout — a confound this repo has already documented as larger than the effects it measures.
-
-**Verification.** `tests/cpp/test_simd_bitexact.cpp` runs tracks through the *same* scalar-vs-simd harness at every ISA level (`[track]`, 423,830 assertions): a track changes the number of profile rows, which row a DP row selects, and the order those rows sit in, and none of it may move a single bit of any table. It also pins that **an all-zeros track is bit-identical to no track at all** — the reduction must be pure re-indexing, so the fast path and the compacted path are asserted to agree bit-for-bit. `tests/Python/test_matrix_track.py` (36 tests) checks the score and both gradients against an exhaustive enumeration of every alignment path, against an independent Python affine DP, and against finite differences per slot; plus all four traceback modes, the banded path, and the batch paths. Under `NWGRAD_FORCE_KERNEL=simd` every one of those becomes a per-level bit-identity check.
-
-**Not done:** the docs (`docs/api.md`) still describe the single-matrix API only. No fleet sweep — every number above is skynet/sse2.
+**Tests.** `tests/cpp/test_tracks.cpp` (`[tracks]`, ctest once per ISA): every kernel vs
+the scalar tracked fill, both profile modes, Hirschberg, equal sets. Python:
+`test_tracks.py` (exhaustive path oracle `track_oracle.py`: score and per-set gradient;
+finite differences; equal sets; semantics pinned by hand), `test_tracks_batch.py` (batch
+vs single-pair functions under every fill and traceback, weighted sums, banded,
+score-only, streaming, Hirschberg splitting, validation), `test_tracks_soft.py`. Mutation
+checks (row penalties in the striped/pointer/score kernels, the inter-pair soft weights)
+were each caught.
 
 ### Vectorization: the faster hard-gradient kernels (prototyped, measured on 3 machines)
 

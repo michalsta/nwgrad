@@ -97,9 +97,11 @@ struct InterCommon {
     static std::vector<ivd>& srow_buf() { static thread_local std::vector<ivd> b; return b; }
     // The row of `blk` lane l reads at DP row i: its residue's (tracked: its stacked row),
     // row 0 past the lane's own A (those cells are computed and ignored).
+    template <bool Tr>
     size_t brow(int l, int i) const {
         if (i > J.m[l]) return 0;
-        return J.tr ? static_cast<size_t>(J.tr[l].rs[i - 1]) : static_cast<size_t>(J.a[l][i - 1]);
+        if constexpr (Tr) return static_cast<size_t>(J.tr[l].rs[i - 1]);
+        else              return static_cast<size_t>(J.a[l][i - 1]);
     }
     // Tracked: lane l's value of a per-row array at DP row i, clamped to its own rows (the
     // rows past its A are computed and ignored, so any finite value serves there).
@@ -134,13 +136,14 @@ struct InterCommon {
     }
     // Row i's profile (P[c] = per lane, score of the lane's A residue i vs letter c) and
     // the lanes still inside their own A.
+    template <bool Tr = false>
     void row(int i, ivd* P, ivl& live) const {
         const int na = J.nalpha;
         for (int l = 0; l < IW; ++l) live[l] = (i <= J.m[l]) ? -1 : 0;
         if (levels < 0) {
             const int n = J.n;
             for (int l = 0; l < IW; ++l) {
-                const T* pr = J.blk + brow(l, i) * na;
+                const T* pr = J.blk + brow<Tr>(l, i) * na;
                 const unsigned char* bl = J.b[l];
                 const int nl = J.nb ? J.nb[l] : n;
                 for (int j = 1; j <= nl; ++j) srow[j][l] = pr[bl[j - 1]];
@@ -151,7 +154,7 @@ struct InterCommon {
         for (int c = 0; c < 8; ++c) {
             const int cc = c < na ? c : 0;
             for (int l = 0; l < IW; ++l)
-                P[c][l] = J.blk[brow(l, i) * na + cc];
+                P[c][l] = J.blk[brow<Tr>(l, i) * na + cc];
         }
     }
     ivd s(const ivd* P, int j) const {
@@ -233,7 +236,7 @@ static void inter_fill_linear(InterJobT<T>& J) noexcept {
     for (int i = 1; i <= M; ++i) {
         ivd P[8];
         ivl live;
-        cm.row(i, P, live);
+        cm.template row<Tr>(i, P, live);
         if constexpr (Tr) { ivd ga, gb; cm.row_gaps(i, ga, ge_a, gb, ge_b); }
         int j0 = 1, j1 = n;
         ivd lo = z, hi = z, jv = z;
@@ -314,7 +317,7 @@ static void inter_fill_affine(InterJobT<T>& J) noexcept {
     for (int i = 1; i <= M; ++i) {
         ivd P[8];
         ivl live;
-        cm.row(i, P, live);
+        cm.template row<Tr>(i, P, live);
         if constexpr (Tr) cm.row_gaps(i, go_a, ge_a, go_b, ge_b);
         int j0 = 1, j1 = n;
         ivd lo = z, hi = z, jv = z;
@@ -427,7 +430,7 @@ static void inter_score_affine(InterJobT<T>& J) noexcept {
     for (int i = 1; i <= M; ++i) {
         ivd P[8];
         ivl live;
-        cm.row(i, P, live);
+        cm.template row<Tr>(i, P, live);
         if constexpr (Tr) cm.row_gaps(i, go_a, ge_a, go_b, ge_b);
         ivd dm = VM[0], dx = VX[0], dy = VY[0];   // row i-1, column 0
         ivd lm = local ? z : ninf;
@@ -489,7 +492,7 @@ static void inter_score_linear(InterJobT<T>& J) noexcept {
     for (int i = 1; i <= M; ++i) {
         ivd P[8];
         ivl live;
-        cm.row(i, P, live);
+        cm.template row<Tr>(i, P, live);
         if constexpr (Tr) { ivd ga, gb; cm.row_gaps(i, ga, ge_a, gb, ge_b); }
         ivd d = H[0];                                  // row i-1, column 0
         ivd lh;
@@ -560,7 +563,7 @@ static void inter_score_affine_pos(InterJobT<T>& J) noexcept {
     for (int i = 1; i <= M; ++i) {
         ivd P[8];
         ivl live;
-        cm.row(i, P, live);
+        cm.template row<Tr>(i, P, live);
         if constexpr (Tr) cm.row_gaps(i, go_a, ge_a, go_b, ge_b);
         ivd dd = D[0];                                           // D(i-1, 0)
         ivd x0;
