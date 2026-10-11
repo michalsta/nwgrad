@@ -1456,6 +1456,18 @@ private:
                                      track(i), gap_track(i), prep_of_(&p), prep_gaps_(&p));
         else          al.set_problem(codes_a(i), codes_b(i), p, band, std::move(guide));
     }
+    // The hard gradient and guide of the DP `al` just ran, into pair i, in one walk —
+    // the untracked sequence spelled out at each site (the code it always was).
+#define NWGRAD_HARD_GRAD_GUIDE(i, al, w)                                   \
+    do {                                                                    \
+        if (tracked_) { hard_grad_guide_(i, al, w); }                       \
+        else {                                                              \
+            (w).g.zero();                                                   \
+            (al).hard_grad_and_guide((w).buf, (w).g, (w).gj);               \
+            store_grad_(i, (w).g);                                          \
+            store_guide_(i, (w).gj);                                        \
+        }                                                                   \
+    } while (0)
     void store_grad_(size_t i, const AlignParams& g) {
         double* d = grad_ptr_(i);
         std::memcpy(d, g.matrix.data(), nn_ * sizeof(double));
@@ -1486,16 +1498,10 @@ private:
     // The hard gradient and the guide of the DP `al` just ran, into pair i, in one walk:
     // tracked, the path itself (store_tpath_); otherwise the dense gradient.
     template<class Al>
-    void hard_grad_guide_(size_t i, Al& al, Work& w) {
-        if (tracked_) {
-            int i0 = 0, j0 = 0;
-            al.hard_path_and_guide(w.buf, w.moves, i0, j0, &w.gj);
-            store_tpath_(i, w.moves, i0, j0);
-        } else {
-            w.g.zero();
-            al.hard_grad_and_guide(w.buf, w.g, w.gj);
-            store_grad_(i, w.g);
-        }
+    void hard_grad_guide_(size_t i, Al& al, Work& w) {   // tracked: the path itself
+        int i0 = 0, j0 = 0;
+        al.hard_path_and_guide(w.buf, w.moves, i0, j0, &w.gj);
+        store_tpath_(i, w.moves, i0, j0);
         store_guide_(i, w.gj);
     }
     // Hard or soft gradient of the DP `al` just ran, into pair i.
@@ -1550,7 +1556,7 @@ private:
         if (grad_mode_ == GradMode::Hard) {
             al.compute_viterbi(w.buf);
             score_[i] = al.score();
-            hard_grad_guide_(i, al, w);
+            NWGRAD_HARD_GRAD_GUIDE(i, al, w);
             if (keep) store_path_(i, al, w.buf);
             finish_(i, false, false);
             return;
@@ -1592,7 +1598,7 @@ private:
         if (grad_mode_ == GradMode::Hard) {   // one traceback walk for guide and gradient
             al.compute_viterbi(w.buf);
             score_[i] = al.score();
-            hard_grad_guide_(i, al, w);
+            NWGRAD_HARD_GRAD_GUIDE(i, al, w);
             if (keep) store_path_(i, al, w.buf);
             finish_(i, true, false);
             return;
@@ -1635,7 +1641,7 @@ private:
         al.adopt_interleaved(w.buf, W, lane, best, bi, bj, stride);
         score_[i] = al.score();
         if (grad_mode_ == GradMode::Hard) {
-            hard_grad_guide_(i, al, w);   // one walk for both
+            NWGRAD_HARD_GRAD_GUIDE(i, al, w);   // one walk for both
         } else {
             store_guide_(i, al.guide_j_from_viterbi(w.buf));
             if (grad_mode_ == GradMode::Soft && soft) {
@@ -1696,7 +1702,7 @@ private:
         al.adopt_interleaved(w.buf, W, lane, best, bi, bj);
         score_[i] = al.score();
         if (grad_mode_ == GradMode::Hard) {
-            hard_grad_guide_(i, al, w);
+            NWGRAD_HARD_GRAD_GUIDE(i, al, w);
         } else {
             store_guide_(i, al.guide_j_from_viterbi(w.buf));
         }
@@ -2442,3 +2448,4 @@ private:
         run_workers_guarded(std::min<int>(s_.n_threads, static_cast<int>(std::min<size_t>(N, 1u << 30))), worker);
     }
 };
+#undef NWGRAD_HARD_GRAD_GUIDE

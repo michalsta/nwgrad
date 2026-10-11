@@ -287,76 +287,22 @@ struct Aligner {
     // like the sequences'.  `blkT`, when given, is params' whole matrix stack already in
     // precision T (the batch prepares it once per params); otherwise a float32 tracked
     // problem converts the stack here.
+    // The untracked entry (no tracks): what it always was, except that params with more
+    // than one set make the problem tracked with the default tracks.
     void set_problem(std::span<const uint8_t> a, std::span<const uint8_t> b,
                      const AlignParams& params,
                      int band = 0,
-                     std::vector<int> guide_j = {},
-                     std::span<const uint16_t> track = {},
-                     std::span<const uint16_t> gap_track = {},
+                     std::vector<int> guide_j = {}) {
+        problem_common_(a, b, params, band, std::move(guide_j), params.num_sets() > 1, nullptr);
+        if (tr_) setup_tracks_({}, {}, nullptr);
+        problem_set_      = true;
+    }
+    void set_problem(std::span<const uint8_t> a, std::span<const uint8_t> b,
+                     const AlignParams& params, int band, std::vector<int> guide_j,
+                     std::span<const uint16_t> track, std::span<const uint16_t> gap_track,
                      const T* blkT = nullptr, const T* gapsT = nullptr) {
-        // Invalidate first: a guide rejected below must not leave the previous
-        // problem's results readable against this problem's sequences.
-        problem_set_      = false;
-        viterbi_done_     = false;
-        fwdbwd_done_      = false;
-        any_viterbi_done_ = false;
-        any_fwdbwd_done_  = false;
-        fwdbwd_is_newest_ = false;
-        a_idx_  = a;
-        b_idx_  = b;
-        params_ = &params;
-        blk_    = params.matrix.data();
-        nalpha_ = params.matrix.size();
-        tr_     = params.num_sets() > 1 || !track.empty() || !gap_track.empty();
-        // The Viterbi-precision copy of the substitution block (the whole stack when
-        // tracked).  T=double aliases the master (no copy); float32 converts once per
-        // problem into blkT_storage_, unless the caller prepared it.
-        if constexpr (std::is_same_v<T, double>) {
-            (void)blkT;
-            blkT_ = blk_;
-        } else {
-            if (tr_ && blkT) {
-                blkT_ = blkT;
-            } else {
-                const std::size_t nn = static_cast<std::size_t>(nalpha_) * nalpha_ *
-                                       static_cast<std::size_t>(tr_ ? params.num_sets() : 1);
-                blkT_storage_.resize(nn);
-                for (std::size_t k = 0; k < nn; ++k)
-                    blkT_storage_[k] = static_cast<T>(blk_[k]);
-                blkT_ = blkT_storage_.data();
-            }
-        }
-        band_   = band;
-        m_      = static_cast<int>(a.size());
-        n_      = static_cast<int>(b.size());
-        stride_ = static_cast<size_t>(n_ + 1);
-        sz_     = static_cast<size_t>(m_ + 1) * stride_;
-        // Checked for Full too: the entry points pick GuideBanded only for band > 0, so
-        // a negative band would otherwise slip through as a full DP.
-        if (band_ < 0)
-            throw std::invalid_argument(
-                "nwgrad: band must be >= 0, got " + std::to_string(band_));
-        // Every guide entry is in [0, n], so a band >= n already covers whole rows;
-        // clamping keeps guide_j_[i] + band_ (jhi/jhi0) from overflowing int.
-        if (band_ > n_) band_ = n_;
-        if constexpr (AB == AlignBand::GuideBanded) {
-            if (guide_j.empty()) {
-                guide_j_.resize(static_cast<size_t>(m_ + 1));
-                if (m_ > 0)
-                    for (int i = 0; i <= m_; ++i)
-                        guide_j_[i] = static_cast<int>(
-                            std::llround(static_cast<double>(i) * n_ / m_));
-                else
-                    guide_j_[0] = 0;
-            } else {
-                // The band helpers index guide_j_[0..m] unchecked, so a supplied guide
-                // must describe THIS problem: one entry per row, each a column of B,
-                // never moving left.  guide_j_from_aligned() checks only the aligned
-                // strings' own syntax, not that they spell this a and b.
-                validate_guide(guide_j);
-                guide_j_ = std::move(guide_j);
-            }
-        }
+        problem_common_(a, b, params, band, std::move(guide_j),
+                        params.num_sets() > 1 || !track.empty() || !gap_track.empty(), blkT);
         if (tr_) setup_tracks_(track, gap_track, gapsT);
         problem_set_      = true;
     }
@@ -817,6 +763,78 @@ private:
     int                 m_ = 0, n_ = 0;
     size_t              stride_ = 0, sz_ = 0;
     std::vector<int>    guide_j_;  // used only when AB == GuideBanded
+
+    // The body both set_problem overloads share (inlined into each: the untracked one
+    // must cost what it always cost).  Leaves problem_set_ to the caller.
+    [[gnu::always_inline]] inline void problem_common_(std::span<const uint8_t> a, std::span<const uint8_t> b,
+                                                       const AlignParams& params, int band,
+                                                       std::vector<int>&& guide_j, bool tracked,
+                                                       const T* blkT) {
+        // Invalidate first: a guide rejected below must not leave the previous
+        // problem's results readable against this problem's sequences.
+        problem_set_      = false;
+        viterbi_done_     = false;
+        fwdbwd_done_      = false;
+        any_viterbi_done_ = false;
+        any_fwdbwd_done_  = false;
+        fwdbwd_is_newest_ = false;
+        a_idx_  = a;
+        b_idx_  = b;
+        params_ = &params;
+        blk_    = params.matrix.data();
+        nalpha_ = params.matrix.size();
+        tr_     = tracked;
+        // The Viterbi-precision copy of the substitution block (the whole stack when
+        // tracked).  T=double aliases the master (no copy); float32 converts once per
+        // problem into blkT_storage_, unless the caller prepared it.
+        if constexpr (std::is_same_v<T, double>) {
+            (void)blkT;
+            blkT_ = blk_;
+        } else {
+            if (tr_ && blkT) {
+                blkT_ = blkT;
+            } else {
+                const std::size_t nn = static_cast<std::size_t>(nalpha_) * nalpha_ *
+                                       static_cast<std::size_t>(tr_ ? params.num_sets() : 1);
+                blkT_storage_.resize(nn);
+                for (std::size_t k = 0; k < nn; ++k)
+                    blkT_storage_[k] = static_cast<T>(blk_[k]);
+                blkT_ = blkT_storage_.data();
+            }
+        }
+        band_   = band;
+        m_      = static_cast<int>(a.size());
+        n_      = static_cast<int>(b.size());
+        stride_ = static_cast<size_t>(n_ + 1);
+        sz_     = static_cast<size_t>(m_ + 1) * stride_;
+        // Checked for Full too: the entry points pick GuideBanded only for band > 0, so
+        // a negative band would otherwise slip through as a full DP.
+        if (band_ < 0)
+            throw std::invalid_argument(
+                "nwgrad: band must be >= 0, got " + std::to_string(band_));
+        // Every guide entry is in [0, n], so a band >= n already covers whole rows;
+        // clamping keeps guide_j_[i] + band_ (jhi/jhi0) from overflowing int.
+        if (band_ > n_) band_ = n_;
+        if constexpr (AB == AlignBand::GuideBanded) {
+            if (guide_j.empty()) {
+                guide_j_.resize(static_cast<size_t>(m_ + 1));
+                if (m_ > 0)
+                    for (int i = 0; i <= m_; ++i)
+                        guide_j_[i] = static_cast<int>(
+                            std::llround(static_cast<double>(i) * n_ / m_));
+                else
+                    guide_j_[0] = 0;
+            } else {
+                // The band helpers index guide_j_[0..m] unchecked, so a supplied guide
+                // must describe THIS problem: one entry per row, each a column of B,
+                // never moving left.  guide_j_from_aligned() checks only the aligned
+                // strings' own syntax, not that they spell this a and b.
+                validate_guide(guide_j);
+                guide_j_ = std::move(guide_j);
+            }
+        }
+    }
+
 
     // ── Tracks ────────────────────────────────────────────────────────────────
     //
@@ -1698,8 +1716,23 @@ private:
     // the gap fields count down (see the sign convention).
     void hard_grad_affine(const DpBuffer& buf, AlignParams& grad,
                           std::vector<int>* gj = nullptr) const {
-        if (tr_) hard_grad_affine_impl<true>(buf, grad, gj);
-        else     hard_grad_affine_impl<false>(buf, grad, gj);
+        if (tr_) { hard_grad_affine_impl<true>(buf, grad, gj); return; }
+        double* gblk = grad_block(grad);
+        if (gj) guide_affine_init(*gj);
+        walk_affine(buf, [&](TBTable s, int i, int j, bool open) {
+            if (s == TBTable::M) {
+                gblk[sub_off_u(i, j)] += 1.0;
+                if (gj) (*gj)[static_cast<size_t>(i - 1)] = j - 1;
+            } else if (s == TBTable::X) {
+                grad.gap_extend_b -= 1.0;
+                if (open) grad.gap_open_b -= 1.0;
+                if (gj) (*gj)[static_cast<size_t>(i - 1)] = j;
+            } else {
+                grad.gap_extend_a -= 1.0;
+                if (open) grad.gap_open_a -= 1.0;
+            }
+        });
+        if (gj) fill_guide_gaps(*gj);
     }
     // Tr: each count lands in its row's set (sub_off / grad_gap); otherwise the walk
     // the untracked gradient always took, with no per-step branch on tr_.
