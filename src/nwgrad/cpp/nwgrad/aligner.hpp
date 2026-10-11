@@ -3977,7 +3977,9 @@ inline bool inter_soft_weights(const AlignParams& P, double T, bool lin,
                                std::vector<double>& es, InterSoftJob& sj) {
     constexpr double big = std::numeric_limits<double>::max();
     const double it = 1.0 / T;
-    const size_t nn = static_cast<size_t>(P.matrix.size()) * P.matrix.size();
+    // (The whole matrix stack: a tracked lane reads its stacked row; K = 1 otherwise.)
+    const size_t nn = static_cast<size_t>(P.matrix.size()) * P.matrix.size() *
+                      static_cast<size_t>(P.num_sets());
     es.resize(nn);
     bool fin = true;
     for (size_t k = 0; k < nn; ++k) { es[k] = std::exp(P.matrix.data()[k] * it); fin &= es[k] <= big; }
