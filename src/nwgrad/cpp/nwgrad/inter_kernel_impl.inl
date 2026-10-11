@@ -143,7 +143,9 @@ struct InterCommon {
         if (levels < 0) {
             const int n = J.n;
             for (int l = 0; l < IW; ++l) {
-                const T* pr = J.blk + brow<Tr>(l, i) * na;
+                const T* pr;
+                if constexpr (Tr) pr = J.blk + brow<Tr>(l, i) * na;
+                else pr = J.blk + static_cast<size_t>((i <= J.m[l]) ? J.a[l][i - 1] : 0) * na;
                 const unsigned char* bl = J.b[l];
                 const int nl = J.nb ? J.nb[l] : n;
                 for (int j = 1; j <= nl; ++j) srow[j][l] = pr[bl[j - 1]];
@@ -160,10 +162,14 @@ struct InterCommon {
             }
             return;
         }
+        // (untracked: the expression the kernel always had — a select, not a branch:
+        // written as brow()'s early return it measured +3 branch misses a pair)
         for (int c = 0; c < 8; ++c) {
             const int cc = c < na ? c : 0;
-            for (int l = 0; l < IW; ++l)
-                P[c][l] = J.blk[brow<Tr>(l, i) * na + cc];
+            for (int l = 0; l < IW; ++l) {
+                const int a = (i <= J.m[l]) ? J.a[l][i - 1] : 0;
+                P[c][l] = J.blk[a * na + cc];
+            }
         }
     }
     ivd s(const ivd* P, int j) const {
