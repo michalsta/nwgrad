@@ -540,7 +540,7 @@ public:
     // last bits may vary between runs).
     BatchResult align_stream(const std::vector<ProblemInstance>& problems,
                              const AlignParams& params, int band = 0,
-                             int kernel = kBackendAuto) const {
+                             int kernel = kBackendAuto, const StreamTracks& st = {}) const {
         const size_t N = problems.size();
         BatchResult result(params);
         result.scores.resize(N, 0.0);
@@ -568,16 +568,23 @@ public:
         const bool banded = band > 0 || !problems[0].guide_j.empty();
         // Tracks: checked here, on the caller's thread, naming the problem.
         const int K = params.num_sets();
-        for (size_t i = 0; i < N; ++i) {
-            const auto& p = problems[i];
-            if (!p.track.empty()) check_track_(p.track, p.seq_a.size(), K, i, "track");
-            if (!p.gap_track.empty()) check_track_(p.gap_track, p.seq_a.size() + 1, K, i, "gap_track");
-        }
+        if (st.tracks && st.tracks->size() != N)
+            throw std::invalid_argument("nwgrad: align() needs one track per problem");
+        if (st.gap_tracks && st.gap_tracks->size() != N)
+            throw std::invalid_argument("nwgrad: align() needs one gap_track per problem");
+        if (st.any())
+            for (size_t i = 0; i < N; ++i) {
+                const auto& p = problems[i];
+                if (st.tracks && !(*st.tracks)[i].empty())
+                    check_track_((*st.tracks)[i], p.seq_a.size(), K, i, "track");
+                if (st.gap_tracks && !(*st.gap_tracks)[i].empty())
+                    check_track_((*st.gap_tracks)[i], p.seq_a.size() + 1, K, i, "gap_track");
+            }
         if (s_.inter_fill) {
             const int be = stream_inter_backend_(params, kernel, banded);
             if (be >= 0) {
-                if (banded) stream_inter_<AlignBand::GuideBanded>(problems, params, band, kernel, result, be);
-                else        stream_inter_<AlignBand::Full>(problems, params, band, kernel, result, be);
+                if (banded) stream_inter_<AlignBand::GuideBanded>(problems, params, band, kernel, result, be, st);
+                else        stream_inter_<AlignBand::Full>(problems, params, band, kernel, result, be, st);
                 return result;
             }
         }
@@ -585,8 +592,8 @@ public:
         std::mutex grad_mutex;
         auto worker = [&]() {
             AlignParams local_grad = AlignParams::zeros_like(params);
-            if (banded) stream_loop_<AlignBand::GuideBanded>(problems, params, band, kernel, work_idx, result.scores, local_grad);
-            else        stream_loop_<AlignBand::Full>(problems, params, band, kernel, work_idx, result.scores, local_grad);
+            if (banded) stream_loop_<AlignBand::GuideBanded>(problems, params, band, kernel, work_idx, result.scores, local_grad, st);
+            else        stream_loop_<AlignBand::Full>(problems, params, band, kernel, work_idx, result.scores, local_grad, st);
             if (grad_mode_ != GradMode::None) {
                 std::lock_guard<std::mutex> lock(grad_mutex);
                 result.grad += local_grad;
@@ -631,7 +638,7 @@ private:
     template<AlignBand AB>
     void stream_loop_(const std::vector<ProblemInstance>& problems, const AlignParams& params,
                       int band, int kernel, std::atomic<size_t>& work_idx,
-                      std::vector<double>& scores, AlignParams& local_grad) const {
+                      std::vector<double>& scores, AlignParams& local_grad, const StreamTracks& st) const {
         Aligner<GM, AM, AB, T> al;
         configure_stream_<AB>(al, kernel);
         DpBuffer buf;
@@ -639,18 +646,18 @@ private:
         std::vector<uint8_t> a_enc, b_enc;
         const size_t N = problems.size();
         for (size_t idx; (idx = work_idx.fetch_add(1, std::memory_order_relaxed)) < N; )
-            stream_one_(al, problems, idx, alpha, params, band, buf, a_enc, b_enc, scores, local_grad);
+            stream_one_(al, problems, idx, alpha, params, band, buf, a_enc, b_enc, scores, local_grad, st);
     }
     // A problem's effective tracks: as given, or the defaults (all zeros; derived).
-    static void effective_tracks_(const ProblemInstance& p, size_t m, std::vector<uint16_t>& t,
-                                  std::vector<uint16_t>& g) {
-        if (p.track.empty()) t.assign(m, 0); else t = p.track;
-        if (p.gap_track.empty()) {
+    static void effective_tracks_(std::span<const uint16_t> tk, std::span<const uint16_t> gk, size_t m,
+                                  std::vector<uint16_t>& t, std::vector<uint16_t>& g) {
+        if (tk.empty()) t.assign(m, 0); else t.assign(tk.begin(), tk.end());
+        if (gk.empty()) {
             g.resize(m + 1);
             g[0] = m ? t[0] : 0;
             for (size_t r = 1; r <= m; ++r) g[r] = t[r - 1];
         } else {
-            g = p.gap_track;
+            g.assign(gk.begin(), gk.end());
         }
     }
     // Tracked soft lane rows (InterSoftJob::rs / rw) of one problem: its stacked rows and
@@ -702,11 +709,11 @@ private:
     void stream_one_(Al& al, const std::vector<ProblemInstance>& problems, size_t i,
                      const Alphabet& alpha, const AlignParams& params, int band, DpBuffer& buf,
                      std::vector<uint8_t>& a_enc, std::vector<uint8_t>& b_enc,
-                     std::vector<double>& scores, AlignParams& local_grad) const {
+                     std::vector<double>& scores, AlignParams& local_grad, const StreamTracks& st) const {
         const auto& p = problems[i];
         stream_encode_(alpha, p.seq_a, a_enc, i, 'a');
         stream_encode_(alpha, p.seq_b, b_enc, i, 'b');
-        al.set_problem(a_enc, b_enc, params, band, p.guide_j, p.track, p.gap_track);
+        al.set_problem(a_enc, b_enc, params, band, p.guide_j, st.track(i), st.gap_track(i));
         if (grad_mode_ == GradMode::Hard) {
             al.compute_viterbi(buf); scores[i] = al.score(); al.hard_grad(buf, local_grad);
         } else if (grad_mode_ == GradMode::Soft) {
@@ -739,7 +746,7 @@ private:
     // the cutoff).  A guided band-0 call is GuideBanded and stays so.
     template<AlignBand AB>
     void stream_inter_(const std::vector<ProblemInstance>& problems, const AlignParams& params,
-                       int band, int kernel, BatchResult& result, int backend) const {
+                       int band, int kernel, BatchResult& result, int backend, const StreamTracks& st) const {
         const size_t N = problems.size();
         const LevelKernels& K = level_kernels(backend);
         const bool soft = grad_mode_ == GradMode::Soft;
@@ -775,14 +782,13 @@ private:
             s = e;
         }
         // Tracked lanes (per-lane rows into the kernels): params with sets, or any track.
-        bool trk = params.num_sets() > 1;
-        for (size_t i = 0; i < N && !trk; ++i) trk = !problems[i].track.empty() || !problems[i].gap_track.empty();
+        const bool trk = params.num_sets() > 1 || st.any();
         std::atomic<size_t> idx{0};
         std::mutex grad_mutex;
         auto worker = [&]() {
             AlignParams local_grad = AlignParams::zeros_like(params);
             stream_inter_loop_<AB>(problems, params, band, kernel, elig, groups, other, idx,
-                                   result.scores, local_grad, K, W, trk);
+                                   result.scores, local_grad, K, W, trk, st);
             if (grad_mode_ != GradMode::None) {
                 std::lock_guard<std::mutex> lock(grad_mutex);
                 result.grad += local_grad;
@@ -797,7 +803,7 @@ private:
                             const std::vector<std::pair<size_t, size_t>>& groups,
                             const std::vector<size_t>& other, std::atomic<size_t>& idx,
                             std::vector<double>& scores, AlignParams& local_grad,
-                            const LevelKernels& K, int W, bool trk) const {
+                            const LevelKernels& K, int W, bool trk, const StreamTracks& st) const {
         using Al = Aligner<GM, AM, AB, T>;
         std::vector<Al> al(W);
         for (Al& x : al) configure_stream_<AB>(x, kernel);
@@ -825,7 +831,7 @@ private:
         std::vector<const uint32_t*> lrsp(W);
         std::vector<const double*> lrwp(W);
         auto own = [&](size_t i) {
-            stream_one_(al[0], problems, i, alpha, params, band, buf, ae[0], be[0], scores, local_grad);
+            stream_one_(al[0], problems, i, alpha, params, band, buf, ae[0], be[0], scores, local_grad, st);
         };
         const size_t G = groups.size(), tasks = G + other.size();
         for (size_t t; (t = idx.fetch_add(1, std::memory_order_relaxed)) < tasks; ) {
@@ -841,7 +847,7 @@ private:
                     const size_t i = elig[s + lr];
                     stream_encode_(alpha, problems[i].seq_a, ae[l], i, 'a');
                     stream_encode_(alpha, problems[i].seq_b, be[l], i, 'b');
-                    if (trk) effective_tracks_(problems[i], ae[l].size(), lt[l], lg[l]);
+                    if (trk) effective_tracks_(st.track(i), st.gap_track(i), ae[l].size(), lt[l], lg[l]);
                 }
                 a[l] = ae[lr].data(); b[l] = be[lr].data();
                 m[l] = static_cast<int>(ae[lr].size());
@@ -1785,6 +1791,14 @@ private:
         job.go_b = static_cast<T>(P.gap_open_b); job.ge_b = static_cast<T>(P.gap_extend_b);
         job.linear = GM == GapModel::Linear ? 1 : 0;
     }
+    // cast_block_ + set_inter_params_, except that a float32 tracked group reads the
+    // batch's own once-cast stack of P (prep_) instead of casting K matrices again.
+    void block_for_(InterJobT<T>& job, const AlignParams& P, std::vector<T>& blkT) const {
+        const T* pp = prep_of_(&P);
+        if (!pp) cast_block_(P, blkT);
+        set_inter_params_(job, P, blkT);
+        if (pp) job.blk = pp;
+    }
     static void wire_inter_tables_(InterJobT<T>& job, DpBuffer& buf, size_t sz) {
         if constexpr (GM == GapModel::Linear) {
             // Linear's one table rides in the H slot (adopt_interleaved reads buf.H).
@@ -1960,8 +1974,7 @@ private:
                     job.tr = w.tjobs.data();
                 }
                 if (!skip_fill) {
-                    cast_block_(P, blkT);
-                    set_inter_params_(job, P, blkT);
+                    block_for_(job, P, blkT);
                     wire_inter_tables_(job, buf, static_cast<size_t>(M + 1) * (n + 1) * W);
                     job.best = best.data(); job.best_i = bi.data(); job.best_j = bj.data();
                     run_inter_fill_(K, job);
@@ -2161,8 +2174,7 @@ private:
                 job.a = a.data(); job.m = m.data(); job.b = b.data(); job.n = n; job.M = M;
                 job.align_mode = (AM == AlignMode::Local) ? 1 : 0;
                 if (tracked_) job.tr = w.tjobs.data();
-                cast_block_(P, blkT);
-                set_inter_params_(job, P, blkT);   // affine: this path runs for affine only
+                block_for_(job, P, blkT);   // affine: this path runs for affine only
                 wire_inter_tables_(job, w.buf, static_cast<size_t>(M + 1) * (n + 1) * W);
                 job.best = best.data(); job.best_i = bi.data(); job.best_j = bj.data();
                 job.blo = blo.data(); job.bhi = bhi.data();
@@ -2242,8 +2254,7 @@ private:
                     tracked_lanes_(w, w.lanes, W, real, plan_.elig, s);
                     job.tr = w.tjobs.data();
                 }
-                cast_block_(params(i0), blkT);
-                set_inter_params_(job, params(i0), blkT);
+                block_for_(job, params(i0), blkT);
                 wire_inter_tables_(job, w.buf, static_cast<size_t>(n + 1) * W);
                 job.best = best.data();
                 run_inter_score_(K, job);

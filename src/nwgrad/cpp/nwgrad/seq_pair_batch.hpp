@@ -106,8 +106,8 @@ public:
         visit([&](const auto& e) { e.grads_into(matrices, gaps); });
     }
     BatchResult align(const std::vector<ProblemInstance>& problems, const AlignParams& params,
-                      int band = 0, int kernel = kBackendAuto) const {
-        return visit([&](const auto& e) { return e.align_stream(problems, params, band, kernel); });
+                      int band = 0, int kernel = kBackendAuto, const StreamTracks& st = {}) const {
+        return visit([&](const auto& e) { return e.align_stream(problems, params, band, kernel, st); });
     }
 
     // ── Settings ─────────────────────────────────────────────────────────────

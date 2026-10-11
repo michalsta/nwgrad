@@ -666,10 +666,11 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
                     // strings (as BatchAligner.align did); make_guide would read an empty
                     // string as "no guide" and silently band around the diagonal.
                     if (guides) problems[i].guide_j = guide_j_from_aligned(aligned_a[i], aligned_b[i]);
-                    if (!tk.empty()) problems[i].track = std::move(tk[i]);
-                    if (!gk.empty()) problems[i].gap_track = std::move(gk[i]);
                 }
-                return self.align(problems, params, band, parse_backend(kernel));
+                StreamTracks st;
+                if (!tracks.is_none()) st.tracks = &tk;
+                if (!gap_tracks.is_none()) st.gap_tracks = &gk;
+                return self.align(problems, params, band, parse_backend(kernel), st);
             },
             nb::arg("seqs_a"), nb::arg("seqs_b"), nb::arg("params"), nb::arg("band") = 0,
             nb::arg("aligned_a") = std::vector<std::string>{},

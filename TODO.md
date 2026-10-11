@@ -201,5 +201,3 @@ Tracks landed on branch `tracks` (2026-10-11; see AGENTS.md, "Tracks").  Deferre
   its own set; `align()` (streaming) stores nothing.  Hard gradients are paths (≈ 30 B).
 - **Tracked Hirschberg builds each row's profile as it sweeps** (no shared profile): one
   gather per cell.  A compact profile per block would help when rows share sets.
-- **float32 tracked inter-pair groups cast the whole matrix stack per group**
-  (`cast_block_`, K * n^2 per group); the batch's prepared stack (`prep_`) could serve.
