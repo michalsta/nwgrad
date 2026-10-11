@@ -89,9 +89,12 @@ Build dependencies: `scikit-build-core`, `nanobind>=3.0` (the bindings call its 
   Viterbi/traceback code over dropping it — bit-exactness across levels is the contract.
 - **Release the GIL during batch computation** (from the 2026-10-01 release review). The
   bindings hold it throughout, so a long `score_and_grad()` blocks every other Python
-  thread. Only safe now that pair/params lifetimes are pinned (commits `0413212`,
-  `92f45e0`); still needs a stated contract against concurrent mutation of a batch from
-  two Python threads. Nothing implemented or measured.
+  thread. Lifetimes are now safe for it: a view pins its batch (`_owner`), and the batch
+  OWNS copies of its params (scan fix B3, 2026-10-08), so a Python thread updating an
+  `AlignParams` in place cannot race the workers. Still needs a stated contract against
+  concurrent mutation of one batch from two Python threads. Release around batch calls
+  only (~0.1 µs per release/reacquire; not the µs-scale single-pair functions). Nothing
+  implemented or measured.
 - **Drop the deprecated 0.5 batch API once DiscrimAlign is ported** (kept 2026-10-07 at
   the maintainer's request): untyped `SeqPairBatch(...)`, `add_many(gap_model=, mode=,
   grad_mode=)`, and the batch's `alloc_dp` / `align_full` / `realign_banded` /
@@ -152,6 +155,8 @@ Sequences are validated and encoded to `uint8` indices **once, at the boundary**
 
 Usage pipeline: `set_problem()` → `compute_viterbi()` or `compute_forward_back()` → `score()` / `hard_grad()` / `soft_grad()`.
 
+**`Aligner` is move-only** (scan fix B2, 2026-10-08): `a_idx_`/`b_idx_` and `blkT_` may point into its own vectors (`a_own_`, `b_own_`, `blkT_storage_`), which a copy would duplicate without re-aiming; a move keeps each vector's heap buffer. **The string `set_problem()` encodes both sequences before replacing anything** (B1): a bad character in B used to free A's codes under the previous problem's spans (heap-use-after-free); now a failed encode leaves the previous problem fully intact. Both, and B5–B7 below, are pinned in `tests/cpp/test_scan_fixes.cpp` (`[scan]`).
+
 `DpBuffer` holds all DP tables and grows on demand. Can be owned by the `Aligner` or passed externally (required for thread-safe batch processing).
 
 **The Viterbi backend is *not* a fourth template parameter** — it is a runtime field (`set_kernel()`), and deliberately so. The branch is taken once per `compute_viterbi()`, amortized over m·n cells, so making it compile-time would buy nothing and would double the batch façade's engine variant (4 arms → 8). Being runtime is also what lets the linear model *decline* the simd kernel (below) rather than ship a slower one or fail to compile.
@@ -162,6 +167,8 @@ Usage pipeline: `set_problem()` → `compute_viterbi()` or `compute_forward_back
 
 Bit-exactness is **load-bearing, not a nicety**: the tracebacks store no direction pointers and re-derive the path by exact float equality (`rat(H,i,j) == rat(H,i-1,j-1) + sub(i,j)`). A kernel one ULP off would match no branch, fall through to the final `else`, and emit a gap where a match belongs — right score, quietly wrong alignment and gradient. `(v - go) - ge` is therefore kept left-associated, never folded to `v - (go+ge)`.
 
+**The affine tracebacks are ONE walk** (`walk_affine`, scan fix S3, 2026-10-08). Guide, gradient, aligned strings and index path — over score tables or Pointers codes — are thin consumers of `emit(state, i, j, open)`; the storage mode is a template parameter (no per-step branch). It replaced six hand-written copies whose border fixes had to land in each (one missing pointers branch had segfaulted). Two behaviours to know: on a **Global** border it emits the leading gap run without reading the tables (it once read uninitialised banded cells there; the old gradient walker already did this, the other five stepped through the border to the same positions); and a move indexes its predecessor cell ONCE for VM/VX/VY (`cell_index` divides in the striped layout). Verified against the six old walkers compiled side by side (old header in a namespace): 0 mismatches in ~6.5M random problems (scalar/sse2/avx2, both precisions, both modes, Full and narrow-banded, empty sequences, ties, `ge` = 0.1), and three planted mutants all caught; `tools/fuzz_ab.py` old vs new build 0/300 (a mutant build: 9/40 differ). Speed (nighthaven, `bench_ab.py`, control 0.99–1.02): 0.99–1.00× every walker section, and −1.2 % instructions on the training step; walk alone 0.83× (scores) and 0.71× (Pointers, whose guide + gradient is now one walk, not two).
+
 **The striped kernel keeps its tables striped, and the traceback reads them striped.** Column `j` (1-based) lives at lane `(j-1)/seg`, segment `(j-1)%seg`; a row is `(seg+1)·W` doubles — slot 0 is column 0, the striped columns start at offset `W` (aligned; see the 64-byte-allocator note below), slots 1..W-1 pad. Every table access in the DP, the tracebacks and the gradient goes through `rat`/`at` → `cell_index`, which switches on a per-`Aligner` `tables_striped_` flag (set from the kernel's `ViterbiJob.table_layout`/`seg`/`width`, cleared by every row-major fill), so the intricate float-equality traceback code is **untouched** — only the index changes, and the stored values are identical, so exact equality still holds. This replaced an earlier per-row **de-stripe** copy into row-major tables: an O(m·n) compiler-insensitive pass that roughly halved throughput. Removing it is **+43 % forward-only on AVX2** (415→594 Mcell/s, matching the isolated-kernel prototype) and eases the memory-bound regime. The row-wise banded kernel still writes row-major (`table_layout == 0`).
 
 **There is no ROW-WISE linear simd kernel, on purpose.** One was written, measured at 0.90×, and deleted: the linear recurrence collapses to a single carry that is a pure ~6-cycle latency chain, and the scalar loop already runs at ~9 cycles/cell against that floor. Affine escapes this only because it has ~4× more work per cell to hide behind the same chain — two of its three tables (`VM`, `VX`) read only row i-1 and are entirely carry-free. The objection is to vectorizing ALONG A ROW of one pair: the inter-pair layout (one pair per lane, see `fill="interpair"`) sidesteps it, since each lane's carry is its own scalar chain and W of them run side by side — linear interpair (2026-10-05) is 3.23× the scalar fill for Local on AVX2.
@@ -170,9 +177,9 @@ The **row-wise (banded) kernel** processes each row in **interleaved blocks**, n
 
 ISA selection is a **function-pointer table**, one entry per level, resolved once at load. Each level is compiled in **its own TU with that level's real `-march`** (`level_baseline/avx2/avx512.cpp` on x86, `level_neon.cpp` on AArch64), because a `#pragma` cannot widen `std::simd` — its register ABI is fixed at instantiation by `__AVX2__` etc., so a genuine compile flag is required. `register_level` (the one place the kernel struct is assembled) lives in `simd_levels.cpp`, compiled at **baseline** so its static-init store emits no wide instruction on a CPU that lacks the level. Controls: `nwgrad.set_isa_level(...)` forces a level (for testing); `NWGRAD_ISA=scalar_fallback|auto|sse2|avx2|avx512|neon` overrides the probe; `simd_isa()`/`get_isa_level()` report the active level and `compiled_with()` the build compiler. Deliberately *not* `target_clones`, which needs GNU ifunc — musl and macOS lack it, and it would break the musllinux/macOS wheels cibuildwheel already builds. There is **no plain-AVX level**: it is a *measured* regression on Bulldozer/Piledriver (whose FP unit cracks every 256-bit op into two 128-bit halves), so AVX-only CPUs run the sse2 (SSE2 baseline) level.
 
-**`parallel.hpp`** — `run_workers_guarded()`: runs a worker on N threads and **captures the first exception to an `exception_ptr`, rethrowing it on the caller's thread after join**. Without this, a throw escaping a `std::thread`'s callable calls `std::terminate` — the batch workers *can* throw (unmet preconditions, alphabet mismatches), so calling `compute_grad()` before `align_full()` used to abort the interpreter with no traceback. Any new throw site inside a worker is safe only because of this.
+**`parallel.hpp`** — `run_workers_guarded()`: runs a worker on N threads and **captures the first exception to an `exception_ptr`, rethrowing it on the caller's thread after join**. Without this, a throw escaping a `std::thread`'s callable calls `std::terminate` — the batch workers *can* throw (unmet preconditions, alphabet mismatches), so calling `compute_grad()` before `align_full()` used to abort the interpreter with no traceback. Any new throw site inside a worker is safe only because of this. `default_thread_count()` (what `n_threads=0` means) counts physical cores **among the CPUs in the affinity mask** (`allowed_cpus()`, Linux `sched_getaffinity`; scan fix O2, 2026-10-08), falling back to the allowed logical count: under `taskset -c 0` it is 1, where it used to be the host's 60. Not read: cgroup CPU quotas (`cpu.max`) — see `TODO.md`.
 
-**`batch_engine.hpp`** — `BatchEngine<T, GapModel, AlignMode>`: the batch layer (0.6 restructure, branch `restructure`, 2026-10-07). A batch holds pairs of **one problem type**, and every pair's state lives in flat arrays the engine owns: codes (`ca_`/`cb_` + offsets), guides (`m+1` ints at `oa_[i] + i`), scores, a flags byte, a segment index, and gradients (`n²+4` doubles, only when `grad_mode != None`). About 350 B per Manakov pair where a `SeqPair` object was 3,768 B inline (two whole `Aligner`s) and ~4.1 KB resident. The `Aligner`s exist once per **worker** (`Work`: one Full, one GuideBanded, one `DpBuffer`, gradient scratch), reused across pairs — `set_problem()` resets every per-problem field, and the old `BatchAligner` already ran one `Aligner` per thread this way. Params are per `add_many()` call: a **segment** of consecutive pairs shares one `AlignParams` pointer and one backend; `set_params()` repoints every segment. Every per-pair operation (`run_full_`, `run_banded_`, `run_interleaved_`, `run_soft_lane_`, `resolve_guide_`, ...) is a port of the `SeqPair` method it replaced, the same `Aligner` calls in the same order; the schedulers (dynamic, sorted with reserve, banded LPT) and both interpair paths (plan cached by generation / default ISA / `hb_cutoff`, band groups by guide midpoint) are `SeqPairBatch`'s, minus the per-pair gap-model/mode keys. `align_stream()` is the old `BatchAligner::align` (O(threads) memory, sequences encoded per worker, soft = forward-backward only, per-thread gradient merge), ported verbatim minus its 4-way `DISPATCH`.
+**`batch_engine.hpp`** — `BatchEngine<T, GapModel, AlignMode>`: the batch layer (0.6 restructure, branch `restructure`, 2026-10-07). A batch holds pairs of **one problem type**, and every pair's state lives in flat arrays the engine owns: codes (`ca_`/`cb_` + offsets), guides (`m+1` ints at `oa_[i] + i`), scores, a flags byte, a segment index, and gradients (`n²+4` doubles, only when `grad_mode != None`). About 350 B per Manakov pair where a `SeqPair` object was 3,768 B inline (two whole `Aligner`s) and ~4.1 KB resident. The `Aligner`s exist once per **worker** (`Work`: one Full, one GuideBanded, one `DpBuffer`, gradient scratch), reused across pairs — `set_problem()` resets every per-problem field, and the old `BatchAligner` already ran one `Aligner` per thread this way. Params are per `add_many()` call: a **segment** of consecutive pairs shares one `AlignParams` and one backend; `set_params()` repoints every segment. **The batch owns COPIES of its params** (`params_own_`, scan fix B3, 2026-10-08): an in-place change to the caller's object (`__iadd__`, the gap or matrix setters) does not reach a batch or a `SeqPair` — `set_params()` does. (Borrowing had let cached results stay "valid" under params that had changed.) Copies are **deduplicated by value** (bitwise, hashed): the inter-pair plan groups pairs by params ADDRESS, so a copy per `add_many()` would have silently split groups that used to share a fill. Superseded copies are freed by `set_params()`; the Python side pins nothing. Every per-pair operation (`run_full_`, `run_banded_`, `run_interleaved_`, `run_soft_lane_`, `resolve_guide_`, ...) is a port of the `SeqPair` method it replaced, the same `Aligner` calls in the same order; the schedulers (dynamic, sorted with reserve, banded LPT) and both interpair paths (plan cached by generation / default ISA / `hb_cutoff`, band groups by guide midpoint) are `SeqPairBatch`'s, minus the per-pair gap-model/mode keys. `align_stream()` is the old `BatchAligner::align` (O(threads) memory, sequences encoded per worker, soft = forward-backward only, per-thread gradient merge), ported verbatim minus its 4-way `DISPATCH`.
 - **Stored paths** (`keep_paths`): run-length ops `(type << 30) | len` plus the end cell, per pair, kept only on request; `aligned()` / `coordinates()` read them. They replace the per-pair DP tables the old `align_full()` retained. **Held gradients** (`kHeld`): the deprecated `align_full()` / `realign_banded()` compute the gradient in the same pass but leave `grad_valid` false until `compute_grad()`, which reproduces the old state machine and its messages in order (`compute_grad_one`).
 - **`compute_grad()` sums in fixed blocks** (as `weighted_grad()`), so it is bit-reproducible; the old one merged per-thread sums in completion order. Hard: identical (integer counts). Soft: last bits may differ from 0.5.
 - **`solo_`**: the calling thread's `Work`, kept between single-pair calls (SeqPair). A fresh one per call re-allocated the DP tables each time: measured +3.6–12 % per repeated `align_full()` + `compute_grad()` (nighthaven, len 50–1500); with it +0.3–5 % (the rest is storing the path eagerly instead of keeping the tables).
@@ -470,6 +477,82 @@ skynet (Piledriver, W=2, 1 thread, 200k pairs): rowwise 12.4 µs/pair, interpair
   buffers (`InterCommon`) work on macOS. Test on spot before trusting new
   `thread_local` state in a kernel.
 
+### Score only: `compute_score` and the inter-pair score kernel (2026-10-08)
+
+`Aligner::compute_score()` returns the optimal score with no table and no traceback:
+the convenience `nw_score*` / `sw_score*`, `align()` in `grad_mode="none"` and a none-mode
+batch `score_and_grad()` (without `keep_paths`) all use it. **Contract: bit-identical to
+`score()` after an exact fill (Pointers / Scores) at every backend, except possibly the
+sign of a zero score** (+0/-0 come out of equal-valued expression trees when a gap
+extend is ±0; `tests/cpp/test_score_only.cpp` compares every other bit). It does NOT
+follow the traceback mode: float32 `auto` (`hirschberg_pmax`) replays a path's score,
+which can sit below this exact optimum.
+- **Per pair, `score_kernel_impl.inl`** (leveled, `LevelKernels::score/score_f`): the
+  striped Full recurrence of `striped_affine_full` on six rolling rows. Fused (default):
+  VY in the same pass as VM/VX, lanes 1.. seeded -inf, lazy-F round 0 also carries the
+  OPEN across lane boundaries; `NWGRAD_SCORE_VARIANT=twopass` is the unfused form (both
+  tested; fused measured faster everywhere). With both opens >= 0 the fused pass runs
+  the D/X form (`score_affine_striped_pos`): previous row D = max(M,X,Y) and X only (an
+  open is dominated by the same cell's extension), lazy-F raising D with each corrected
+  Y, Y's own open still from max(M,X) (off the carry); Local over M alone when the extends
+  are >= 0 too. 1.0-1.5x the three-state form (AVX2), float32 Global ~neutral.
+  `NWGRAD_SCORE_VARIANT=twopass|fused3` force the older forms (all three tested). Local: a per-lane vector max, padding slots
+  masked by adding 0/-inf (`buf.spad`) — a NEGATIVE gap extend makes a run GAIN score
+  along the padding (found by the tests; the fill's argmax scans real columns only).
+  Linear runs through it with zero opens (`max(a-g,b-g) == max(a,b)-g` bit for bit).
+  Scalar backend: `score_affine_scalar` / `score_linear_scalar`, rolling copies of the
+  fills. GuideBanded runs the banded fill.
+- **Inter-pair, `inter_kernel_impl.inl`** (`inter_score_*`, `LevelKernels::inter_score/
+  inter_score_f`): the inter-pair fills on ONE row updated in place (diagonal carried in
+  registers), each lane's score in `best[]` (Global captured when the row loop passes
+  that lane's m). With non-negative opens the two-row form (`inter_score_affine_pos`):
+  rows D = max(M,X,Y) and X only — an open is dominated by the extension from the same
+  cell, so offering it every state adds nothing that can win; with non-negative extends
+  too, the Local max is over M alone. Negative opens take the three-row form.
+  `ivsplat` (not `ivd{} + x`, which turns -0 into +0) for every border value — the
+  inter-pair FILL had the same idiom (fixed).
+- **Batch** (`score_only_`): plan groups through the inter-pair kernel, the rest per
+  pair; guides become PENDING, resolved on first use under the params SCORED
+  (`Segment::gparams`, kept alive by `drop_unused_params_`), so they equal the eager
+  guides — the frozen oracle checks exactly that.
+
+**Measured.** Per pair (`tests/cpp/bench_score.cpp`, one process, 30 %-mutated
+homologues; new / old `auto` fill): nighthaven AVX2 1 thread affine Global 1.16–3.09×,
+affine Local 2.9–6.5×, linear 1.14–14.5×; 6 / 12 threads it keeps or extends the lead (no
+table to stream: e.g. dna affine Local f32 L3000 4.7× / 5.4×). solace AVX-512 1 thread
+similar, EXCEPT float32 Global long pairs: 0.89× at L3000 — `hirschberg_pmax` has no
+lazy-F and W=16 makes lazy-F's rounds expensive (still 1.46× over the exact fill).
+skynet SSE2: 1.7–5.0×. End to end (`tools/bench_score_ab.py`, vs 0.6.0, nighthaven,
+control 0.99–1.00), B/A at 1 / 12 threads: Manakov `align()` 0.72 / 0.76, Manakov batch
+step (set_params + score_and_grad) 0.61 / 0.61, Manakov `align()` float32 0.76 / 0.83,
+protein `align()` 300–1000 aa float32 0.76 / 0.59, double 0.39 / 0.38, a loop of single
+`nw_score_affine` calls 0.59.  (The two-row inter-pair form first took the Y open from D,
+which holds Y: the loop-carried chain grew to max-of-three + two subtractions and the
+Manakov step measured 1.03x the OLD path — keep opens off the carry.)
+
+**Also found and FIXED (2026-10-09): Hirschberg boundary states were not strict.** The
+join's straddling form promises the halves CONTINUE the X run (lower half leaves its origin
+vertically, upper half enters its corner vertically); the sweeps seeded the X state at the
+origin / corner, which also fed diagonal and horizontal moves, so a half was promised more
+than its solver could deliver and the loss compounded with recursion depth (up to 4.8 /
+3.5 below optimum at small hb_cutoff, float32 / double). Now the origin / corner is
+unreachable and the first swept row's column 0 is seeded `0 - ge_b`, in every sweep and base
+case (scalar and leveled) — see the comment at `hb_solve`'s join.
+
+**Hirschberg does not support NEGATIVE gap penalties — by design (decided 2026-10-11).**
+A gap that pays to open, or (Local) a run that gains score, is not a meaningful alignment
+model, so the recursion is not made to handle it. The guard in `run_viterbi`
+(`hb_penalties_ok_`, applied where the recursion would run: Full, m > `hb_cutoff`) is
+the final solution: `auto` runs such a pair as Pointers (exact; only the memory differs),
+an explicit `hirschberg` / `hirschberg_pmax` raises `ValueError`. Why it is needed
+(characterized with the guard disabled; details at the guard): a negative OPEN makes the
+join's plain form overvalue a run split at the cut (one run, two opens); Local with a
+negative EXTEND is degenerate — the fill and the box's global solve disagree about a
+leading gap run — and the simd endpoint scan can pick a padding column, overrunning B.
+Global with negative extends and opens >= 0 happens to be correct, but stays guarded:
+one rule, nothing gained by carving out the case. (The 0.5 float32 Local shortfall once
+listed here was the boundary-state bug fixed above.)
+
 ### Linear gaps: Pointers and Hirschberg (2026-10-05)
 
 - **`traceback="pointers"` for linear** (`viterbi_linear_ptr`): one direction byte per
@@ -532,8 +615,8 @@ functions:
 - `SeqPairBatch.soft_guide` (`SeqPair::set_soft_guide_lazy`): `"eager"` (default) — a soft
   `score_and_grad()` runs the guide Viterbi as always; `"lazy"` — it does not, and the guide
   is computed on first use (`guide_j`, `realign_banded`, `banded_grad`) under the params
-  CURRENT THEN. Deliberately opt-in: `score_and_grad(); params += lr*g; banded_grad()` is a
-  plausible loop (in-place updates exist: `__iadd__`, the gap setters), and a lazy default
+  CURRENT THEN. Deliberately opt-in: `score_and_grad(); set_params(params + lr*g); banded_grad()`
+  is the ordinary training step, and a lazy default
   would silently band around θ₁'s path instead of θ₀'s. Lazy is for loops that rescore in
   full every step (continuation); a lazy soft interpair group skips the Viterbi fill.
   `"posterior"` (2026-10-05, opt-in): no Viterbi either — the soft pass reports, per row
@@ -648,7 +731,7 @@ nanobind module `nwgrad_ext`, re-exported from `src/nwgrad/__init__.py`. Exposes
 - 12 single-pair convenience functions, all with the signature `f(seq_a, seq_b, params, band=0, aligned_a="", aligned_b="", kernel="auto")` (the four `*soft_grad` ones add `soft_impl="scaled"` and `temperature=1.0`) — they take plain `str` and encode internally, and the gap penalties ride in `params`, not the argument list. The affine naming is irregular and worth checking before use: `nw_score_affine` / `sw_score_affine` (suffix), but `nw_affine_grad` / `sw_affine_grad` / `nw_affine_soft_grad` / `sw_affine_soft_grad` (infix).
 - Classes: `Alphabet`, `SubstMatrix`, `AlignParams`, `BatchResult`, `SeqPair`, `SeqPairBatch` (and the `*Double` twins). `SeqPairBatch(n_threads, traceback, *, gap_model, mode, grad_mode)`; naming none of the three is deprecated (`DeprecationWarning`, first `add_many()` fixes the type). Deprecated, kept for DiscrimAlign (see Open TODOs): untyped batches, `add_many(gap_model=, mode=, grad_mode=)`, and the batch's `alloc_dp` / `align_full` / `realign_banded` / `drop_dp` (over stored paths and held gradients). `SeqPair.alloc_dp()` is a deprecated no-op.
 - Alphabet constants: `nwgrad.DNA`, `DNA_N`, `RNA`, `RNA_N`, `PROTEIN`, `PROTEIN_X`, `PROTEIN_UO`, `PROTEIN_UOX`, plus `NCBI_PROTEIN` and `IUPAC_DNA` for the packaged matrices
-- Zero-copy numpy integration via nanobind buffer protocol
+- numpy integration via nanobind (matrices and gradients are copied in and out, not views)
 - `kernel="auto"` (default) on the 12 functions, `SeqPair`, `SeqPairBatch.add_many()` and `.align()` — the **one unified backend vocabulary** `scalar_fallback | auto | sse2 | avx2 | avx512 | neon`, the same words `set_isa_level()`/`NWGRAD_ISA` take (`auto` = the strongest simd level the CPU runs; `sse2` was formerly called `baseline`). Every simd level is **bit-exact** with `scalar_fallback` — identical tables, alignments and gradients — so it is a speed knob and never a correctness one. It is per-aligner (the level is no longer a global), and affects the **Viterbi/hard-gradient path only**: forward-backward and `soft_grad` are the same shared code either way, and the linear gap model has no simd kernel, so any simd backend is a legal no-op there. An unrecognised name — or a simd level this CPU cannot run — **throws** (a typo that silently gave you the wrong path would be undetectable).
 - `traceback="auto"` (default) on `SeqPair` and `SeqPairBatch` — **fixed at construction**, deliberately not settable afterwards, because it decides what the DP *retains* rather than how it computes. `auto` resolves per problem: affine Full Global → **`hirschberg_pmax` at float32, `hirschberg` at double**; affine Full Local → `hirschberg_pmax` at float32, `pointers` at double; linear → `pointers` (H table kept up to 2 MiB); banded → score tables. `pointers` records a 1-byte predecessor per cell per state during the fill (3 B/cell); `scores` keeps VM/VX/VY and re-derives the argmax (12 B/cell, and the only mode that leaves tables for `to_row_major()` to inspect); `hirschberg` keeps no table at all above its `hb_cutoff` base case. `hirschberg_pmax` is Hirschberg with the closed-form prefix-max gap carry — 1.5–3.9× faster on related sequences, the float32 default, and the one mode that can return a *suboptimal* path (see its section above; at float32 its error is measurably dominated by float32's own, which is what justifies the default). Pointers and Scores are **bit-identical**; Hirschberg is bit-exact with them only for pairs ≤ `hb_cutoff` (it degrades to the Pointers fill there), and a valid-but-different subgradient above. **Fixed 2026-10-01 (was a caveat measured 2026-07-28):** "bit-exact below the cutoff" used to hold for neither the score nor the path. A pair that never split ran the Hirschberg *base case*, whose borders are seeded and carried differently from the Pointers fill, so with a non-representable `gap_extend` (0.1) it settled float ties on a path one ULP worse (−4.3 vs −4.299999999999999) and replayed the score from that path: 27/41 short pairs differed. Such pairs are now run *as* Pointers in `run_viterbi` (same fill, table, traceback), so the promise holds by construction, at unchanged memory and speed. Consequence for tests: a Hirschberg test on short pairs at the default cutoff tests Pointers — `test_hirschberg.py` pins `HB_CUTOFF = 16` (1 for tiny inputs) so the recursion stays under test. An unknown name **throws**; explicit `hirschberg`/`hirschberg_pmax` on banded **throws** (the `auto` default never picks them there); linear supports both (Full; `hirschberg_pmax` is the exact linear sweep); on **Local** affine both are supported, and `auto` resolves Local to `hirschberg_pmax` at float32 and `pointers` at double (see the Local note). Note this is a different axis from `kernel=`: that one is bit-exact by contract, this one is not.
 - `simd_isa()` reports which instruction set the kernel selected.
@@ -672,7 +755,7 @@ nanobind module `nwgrad_ext`, re-exported from `src/nwgrad/__init__.py`. Exposes
 
 `guide_j[i]` encodes the reference column after consuming i characters of sequence A, extracted from aligned strings containing `-` gap markers via `guide_j_from_aligned()`. Constrains the DP band around a cached path, enabling fast re-alignment when only the matrix changes.
 
-**A supplied guide is validated in `set_problem()`** (`validate_guide`, commit `20edcab`): exactly `m+1` entries, each in `[0, n]`, non-decreasing; a negative band is rejected too. All throw `std::invalid_argument` (Python `ValueError`) before any DP access, and `set_problem()` invalidates the aligner's previous results *first*, so a rejected problem cannot leave the old one readable. The band helpers (`jlo`/`jhi0`/`border_rows`) index `guide_j_[0..m]` unchecked, and `guide_j_from_aligned()` checks only the strings' own syntax — aligned strings `"A"`/`"A"` against a 4-residue A read past the vector. The empty guide stays the "make a diagonal guide" sentinel. **Do not require `guide_j.back() == n`**: trailing gaps in A consume B residues without appending an entry. **For Global the last row's band always reaches n** (`jhi`/`jhi0`, 2026-10-05): every global path ends at (m, n), and a band that missed it left the score and the traceback's start reading a cell no fill had written — `BatchAligner(band=0)` (now `SeqPairBatch.align`) with aligned strings `"ACGTACGTAC-------"` returned 0.0 for an optimal path scoring 10.0, whatever preceded it in the batch (`test_batch_interpair.py::test_global_banded_guide_ending_short_of_n`). Found because interpair, reading a fresh buffer, disagreed with the per-pair path reading a reused one.
+**A supplied guide is validated in `set_problem()`** (`validate_guide`, commit `20edcab`): exactly `m+1` entries, each in `[0, n]`, non-decreasing; a negative band is rejected too — **on the Full path as well** (scan fix B6, 2026-10-08: every entry point picks GuideBanded only for `band > 0`, so a negative band without a guide used to run a full DP unchecked). A band above `n` is **clamped to `n`** (B7): every guide entry is in `[0, n]`, so it already covered whole rows, and `guide_j_[i] + band_` overflowed `int` for `INT_MAX`. The convenience functions raise when only one of `aligned_a`/`aligned_b` is given (B8: it used to mean "no guide", never validating the string that was given). All throw `std::invalid_argument` (Python `ValueError`) before any DP access, and `set_problem()` invalidates the aligner's previous results *first*, so a rejected problem cannot leave the old one readable. The band helpers (`jlo`/`jhi0`/`border_rows`) index `guide_j_[0..m]` unchecked, and `guide_j_from_aligned()` checks only the strings' own syntax — aligned strings `"A"`/`"A"` against a 4-residue A read past the vector. The empty guide stays the "make a diagonal guide" sentinel. **Do not require `guide_j.back() == n`**: trailing gaps in A consume B residues without appending an entry. **For Global the last row's band always reaches n** (`jhi`/`jhi0`, 2026-10-05): every global path ends at (m, n), and a band that missed it left the score and the traceback's start reading a cell no fill had written — `BatchAligner(band=0)` (now `SeqPairBatch.align`) with aligned strings `"ACGTACGTAC-------"` returned 0.0 for an optimal path scoring 10.0, whatever preceded it in the batch (`test_batch_interpair.py::test_global_banded_guide_ending_short_of_n`). Found because interpair, reading a fresh buffer, disagreed with the per-pair path reading a reused one.
 
 # Persona: The Lovecraftian Cosmic Horror Narrator
 
