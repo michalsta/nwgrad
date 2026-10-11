@@ -843,9 +843,53 @@ private:
     // row i (open, extend; [0] unused); the Global column-0 border of row i ([0] unused).
     std::vector<T>             tgoa_, tgea_, tgob_, tgeb_, tbx0_;
     std::vector<T>             tzero_;                  // m+1 zeros: linear's opens, for the affine kernels
+    std::vector<T>             trgob_, trgeb_;          // Hirschberg's reverse gaps in B (hb_reverse_rows_)
+    bool                       rev_ready_ = false;
     // The shared query profile's rows (TrackJob::ra/crow): each distinct stacked row once.
     std::vector<uint32_t>      ra_, crow_;
     bool                       compact_ready_ = false;  // ra_/crow_ describe this problem
+
+    // ── Hirschberg's reverse sweeps with tracks ──────────────────────────────
+    // A reverse sweep runs the recurrence MIRRORED (hb_rev, hb_kernel_impl.inl's a_step
+    // < 0): it meets a vertical run at the run's LAST row first, and charges the open
+    // there.  With one open for every row that was the same number; with a track it is
+    // not — the run must pay the open of its FIRST row.  So the mirror is given rewritten
+    // rows: open'(r) = open(r+1) and extend'(r) = extend(r) + (open(r) - open(r+1)), with
+    // open(m+1) := open(m).  A run over rows s..e then pays open(e+1) + sum extend'(r)
+    // = open(s) + sum extend(r) — its true cost — by telescoping, whatever it straddles
+    // inside the sweep.  A run the sweep enters already open (out_x, continuing past the
+    // block's corner) pays sum extend' over its rows, its true cost minus open(i1+1) for
+    // the block's last row i1: one constant for every path of that sweep, which the join's
+    // argmax cannot see.  The join itself refunds open(p+1), the open of the first row
+    // below the cut, where the plain sum charges a straddling run twice (hb_solve).
+    // Equal rows give open' = open and extend' = extend + 0 = extend exactly, so equal sets
+    // stay bit-identical to the untracked sweep.  (Exact in real arithmetic; in floating
+    // point the mirror's sums round differently from the forward fill's, as the untracked
+    // reverse sweep's always have — Hirschberg's score is replayed from its path.)
+    void hb_reverse_rows_() {
+        if (rev_ready_) return;
+        const size_t m = static_cast<size_t>(m_);
+        trgob_.assign(m + 1, static_cast<T>(0));
+        trgeb_.assign(m + 1, static_cast<T>(0));
+        for (size_t r = 1; r <= m; ++r) {
+            const T go_next = (r < m) ? tgob_[r + 1] : tgob_[r];
+            trgob_[r] = go_next;
+            trgeb_[r] = tgeb_[r] + (tgob_[r] - go_next);
+        }
+        rev_ready_ = true;
+    }
+    // The penalties a scalar Hirschberg sweep row reads: gaps in A of DP row `hr`, the
+    // vertical move into DP row `vr` (reverse: the rewritten rows).
+    T hb_go_a(int hr) const noexcept { return tr_ ? tgoa_[static_cast<size_t>(hr)] : static_cast<T>(params_->gap_open_a); }
+    T hb_ge_a(int hr) const noexcept { return tr_ ? tgea_[static_cast<size_t>(hr)] : static_cast<T>(params_->gap_extend_a); }
+    T hb_go_b(int vr, bool rev) const noexcept {
+        if (!tr_) return static_cast<T>(params_->gap_open_b);
+        return (rev ? trgob_ : tgob_)[static_cast<size_t>(vr)];
+    }
+    T hb_ge_b(int vr, bool rev) const noexcept {
+        if (!tr_) return static_cast<T>(params_->gap_extend_b);
+        return (rev ? trgeb_ : tgeb_)[static_cast<size_t>(vr)];
+    }
 
     // The per-row parameters a leveled kernel reads (TrackJob), `profile`: whether it
     // builds a query profile (rows `row_len` elements long), so whether to offer one.
@@ -855,6 +899,7 @@ private:
         tj.go_a = tgoa_.data(); tj.ge_a = tgea_.data();
         tj.go_b = tgob_.data(); tj.ge_b = tgeb_.data();
         tj.bx0 = tbx0_.data();
+        if (rev_ready_) { tj.rgo_b = trgob_.data(); tj.rge_b = trgeb_.data(); }
         if (linear_opens_zero) {
             tzero_.assign(static_cast<size_t>(m_) + 1, static_cast<T>(0));
             tj.go_a = tj.go_b = tzero_.data();
@@ -925,6 +970,7 @@ private:
         for (size_t i = 0; i < m; ++i)
             rs_[i] = static_cast<uint32_t>(trk_[i]) * static_cast<uint32_t>(nalpha_) + a_idx_[i];
         compact_ready_ = false;
+        rev_ready_ = false;
         tgoa_.resize(m + 1); tgea_.resize(m + 1); tgob_.resize(m + 1); tgeb_.resize(m + 1);
         tbx0_.resize(m + 1);
         for (size_t i = 0; i <= m; ++i) {
@@ -1686,7 +1732,7 @@ private:
         // same one, so an unsupported combination throws instead of falling back — a
         // silent substitution would make a benchmark of it meaningless and a gradient
         // from it unattributable.
-        if (is_hirschberg(tb_) && !tr_) {   // INTERIM(tracks): tracked Hirschberg not yet implemented
+        if (is_hirschberg(tb_)) {
             if constexpr (AB != AlignBand::Full)
                 throw std::logic_error(
                     "nwgrad: traceback=\"hirschberg\" is implemented for full DP only; a "
@@ -2209,6 +2255,7 @@ private:
         job.H = H; job.ncols = ncols; job.in_x = in_x ? 1 : 0;
         job.buf = &buf;
         job.outM = oM; job.outX = oX; job.outY = oY;
+        if (tr_) { hb_reverse_rows_(); fill_track_job_(job.tr, false, 0); }
         if constexpr (std::is_same_v<T, double>) {
             if (hb_pmax()) K.hb_sweep_pmax(job); else K.hb_sweep(job);
         } else {
@@ -2226,14 +2273,15 @@ private:
     // adjacent multiply would let the compiler contract `g + k*ge_a` into an FMA, which
     // rounds once instead of twice and would make this reference disagree with the simd
     // kernel on any -mfma level.  Row 0 stays exact in both variants.
+    // Tracked: row r reads its own penalties (hb_go_a etc.) and substitution row, and the
+    // pmax ramp is that row's (`rmp` then a scratch of W+1 the sweep refills per row).
     template <bool Pmax = false>
     void hb_fwd(int i0, int i1, int j0, int j1, bool in_x,
                 T* pM, T* pX, T* pY, T* cM, T* cX, T* cY,
                 T*& oM, T*& oX, T*& oY, const T* rmp = nullptr) const {
-        const T go_a = static_cast<T>(params_->gap_open_a);
-        const T ge_a = static_cast<T>(params_->gap_extend_a);
-        const T go_b = static_cast<T>(params_->gap_open_b);
-        const T ge_b = static_cast<T>(params_->gap_extend_b);
+        T go_a = hb_go_a(i0), ge_a = hb_ge_a(i0);
+        T go_b = static_cast<T>(params_->gap_open_b);
+        T ge_b = static_cast<T>(params_->gap_extend_b);
         const int W = j1 - j0;
 
         // Row i0: the block's origin, then Y moves rightward along it.
@@ -2248,7 +2296,12 @@ private:
             pY[c] = std::max({pM[c-1] - go_a - ge_a, pX[c-1] - go_a - ge_a, pY[c-1] - ge_a});
         }
 
+        T* rr = const_cast<T*>(rmp);
         for (int r = i0 + 1; r <= i1; ++r) {
+            if (tr_) {
+                go_a = hb_go_a(r); ge_a = hb_ge_a(r); go_b = hb_go_b(r, false); ge_b = hb_ge_b(r, false);
+                if constexpr (Pmax) for (int k = 0; k <= W; ++k) rr[k] = static_cast<T>(k) * ge_a;
+            }
             cM[0] = static_cast<T>(NEG_INF);
             cX[0] = std::max({pM[0] - go_b - ge_b, pX[0] - ge_b, pY[0] - go_b - ge_b});
             if (in_x && r == i0 + 1) cX[0] = static_cast<T>(0) - ge_b;   // the run continues
@@ -2258,7 +2311,7 @@ private:
             T P = cY[0] - ge_a;
             for (int c = 1; c <= W; ++c) {
                 // subT is 1-based over the full sequences; row r consumes a[r-1].
-                cM[c] = std::max({pM[c-1], pX[c-1], pY[c-1]}) + subTu(r, j0 + c);
+                cM[c] = std::max({pM[c-1], pX[c-1], pY[c-1]}) + (tr_ ? subT(r, j0 + c) : subTu(r, j0 + c));
                 cX[c] = std::max({pM[c] - go_b - ge_b, pX[c] - ge_b, pY[c] - go_b - ge_b});
                 if constexpr (Pmax) {
                     // g[k] for k = c-1.  Max-then-subtract mirrors the kernel's `ov`
@@ -2280,14 +2333,15 @@ private:
     // a[r..i1) with b[.. j1), so on return oS[c] is the best score of aligning
     // a[i0..i1) with b[(j0+c)..j1) given the block's FIRST forward move has type S.
     // out_x seeds the far end exactly as in_x seeds the near one.
+    // Tracked: the mirror's rows (see hb_reverse_rows_) — reversed row r (consuming a[r])
+    // holds DP row r's gaps in A and DP row r+1's rewritten vertical move.
     template <bool Pmax = false>
     void hb_rev(int i0, int i1, int j0, int j1, bool out_x,
                 T* pM, T* pX, T* pY, T* cM, T* cX, T* cY,
                 T*& oM, T*& oX, T*& oY, const T* rmp = nullptr) const {
-        const T go_a = static_cast<T>(params_->gap_open_a);
-        const T ge_a = static_cast<T>(params_->gap_extend_a);
-        const T go_b = static_cast<T>(params_->gap_open_b);
-        const T ge_b = static_cast<T>(params_->gap_extend_b);
+        T go_a = hb_go_a(i1), ge_a = hb_ge_a(i1);
+        T go_b = static_cast<T>(params_->gap_open_b);
+        T ge_b = static_cast<T>(params_->gap_extend_b);
         const int W = j1 - j0;
 
         // Reversed column offset d = j1 - j, so d grows leftward from the block's end.
@@ -2302,7 +2356,12 @@ private:
             pY[d] = std::max({pM[d-1] - go_a - ge_a, pX[d-1] - go_a - ge_a, pY[d-1] - ge_a});
         }
 
+        T* rr = const_cast<T*>(rmp);
         for (int r = i1 - 1; r >= i0; --r) {
+            if (tr_) {
+                go_a = hb_go_a(r); ge_a = hb_ge_a(r); go_b = hb_go_b(r + 1, true); ge_b = hb_ge_b(r + 1, true);
+                if constexpr (Pmax) for (int k = 0; k <= W; ++k) rr[k] = static_cast<T>(k) * ge_a;
+            }
             cM[0] = static_cast<T>(NEG_INF);
             cX[0] = std::max({pM[0] - go_b - ge_b, pX[0] - ge_b, pY[0] - go_b - ge_b});
             if (out_x && r == i1 - 1) cX[0] = static_cast<T>(0) - ge_b;   // enters the corner vertically
@@ -2310,7 +2369,7 @@ private:
             T P = cY[0] - ge_a;
             for (int d = 1; d <= W; ++d) {
                 // Mirrored diagonal: this step pairs a[r] with b[j1-d], i.e. subT(r+1, j1-d+1).
-                cM[d] = std::max({pM[d-1], pX[d-1], pY[d-1]}) + subTu(r + 1, j1 - d + 1);
+                cM[d] = std::max({pM[d-1], pX[d-1], pY[d-1]}) + (tr_ ? subT(r + 1, j1 - d + 1) : subTu(r + 1, j1 - d + 1));
                 cX[d] = std::max({pM[d] - go_b - ge_b, pX[d] - ge_b, pY[d] - go_b - ge_b});
                 if constexpr (Pmax) {
                     const T g = (std::max(cM[d-1], cX[d-1]) - go_a) - ge_a;
@@ -2357,6 +2416,7 @@ private:
         job.a_start = i0; job.a_step = 1;      // row r=1..H consumes a[i0 + (r-1)]
         job.b_start = j0; job.b_step = 1;      // col c=1..NC pairs   b[j0 + (c-1)]
         job.H = H; job.ncols = NC; job.in_x = in_x ? 1 : 0; job.buf = &buf;
+        if (tr_) fill_track_job_(job.tr, false, 0);
         if constexpr (std::is_same_v<T, double>) K.hb_base(job);
         else                                     K.hb_base_f(job);
 
@@ -2390,10 +2450,9 @@ private:
 
     void hb_base(DpBuffer& buf, int i0, int i1, int j0, int j1,
                  bool in_x, bool out_x) {
-        const T go_a = static_cast<T>(params_->gap_open_a);
-        const T ge_a = static_cast<T>(params_->gap_extend_a);
-        const T go_b = static_cast<T>(params_->gap_open_b);
-        const T ge_b = static_cast<T>(params_->gap_extend_b);
+        T go_a = hb_go_a(i0), ge_a = hb_ge_a(i0);
+        T go_b = static_cast<T>(params_->gap_open_b);
+        T ge_b = static_cast<T>(params_->gap_extend_b);
         const int H = i1 - i0, W = j1 - j0;
         if (H == 0 && W == 0) return;
         if (const LevelKernels* K = hb_base_level()) {
@@ -2434,6 +2493,10 @@ private:
 
         for (int r = 1; r <= H; ++r) {
             const std::size_t rb = static_cast<std::size_t>(r) * stride;
+            if (tr_) {
+                go_a = hb_go_a(i0 + r); ge_a = hb_ge_a(i0 + r);
+                go_b = hb_go_b(i0 + r, false); ge_b = hb_ge_b(i0 + r, false);
+            }
             const T ux0 = pM[0] - go_b - ge_b, vx0 = pX[0] - ge_b, wx0 = pY[0] - go_b - ge_b;
             cM[0] = static_cast<T>(NEG_INF);
             cX[0] = std::max({ux0, vx0, wx0});
@@ -2442,7 +2505,7 @@ private:
             if (in_x && r == 1) { cX[0] = static_cast<T>(0) - ge_b; dX[rb] = 1; }   // continues the run
             for (int c = 1; c <= W; ++c) {
                 const T dgM = pM[c-1], dgX = pX[c-1], dgY = pY[c-1];
-                cM[c] = std::max({dgM, dgX, dgY}) + subTu(i0 + r, j0 + c);
+                cM[c] = std::max({dgM, dgX, dgY}) + (tr_ ? subT(i0 + r, j0 + c) : subTu(i0 + r, j0 + c));
                 const T ux = pM[c] - go_b - ge_b, vx = pX[c] - ge_b, wx = pY[c] - go_b - ge_b;
                 cX[c] = std::max({ux, vx, wx});
                 const T uy = cM[c-1] - go_a - ge_a, vy = cX[c-1] - go_a - ge_a, wy = cY[c-1] - ge_a;
@@ -2491,11 +2554,13 @@ private:
             return;
         }
         T *sM, *sX, *sY;
+        if (tr_) hb_reverse_rows_();
         if (hb_pmax()) {
             // The ramp, contiguous: rmp[k] = k*ge_a.  Same scalar multiply of the same
             // exactly-representable integer the striped kernel uses for the same absolute
             // column k, so the two agree to the bit — and built here, outside the row
             // loop, so the carry loop below contains no multiply to contract into an FMA.
+            // (Tracked: hb_fwd / hb_rev rebuild it per row, before the row's loop.)
             const T ge_a = static_cast<T>(params_->gap_extend_a);
             hb_fit(buf.hramp, static_cast<std::size_t>(NC) + 1);
             T* rmp = buf.hramp.data();
@@ -2562,7 +2627,9 @@ private:
         // compounded up the recursion: up to 4.8 below the optimum at float32, 3.5 at
         // double, on random pairs at small hb_cutoff (fixed 2026-10-09).  Now the origin /
         // corner is unreachable and the first swept row's column 0 is seeded 0 - ge_b.
-        const T go_b = static_cast<T>(params_->gap_open_b);
+        // Tracked: the open refunded is that of the first row below the cut, DP row p+1
+        // (see hb_reverse_rows_).
+        const T go_b = tr_ ? tgob_[static_cast<size_t>(p) + 1] : static_cast<T>(params_->gap_open_b);
         T best = static_cast<T>(NEG_INF);
         int cstar = 0;
         bool span = false;
@@ -2601,21 +2668,18 @@ private:
         // pointers" untestable by exact comparison, which is the one question worth asking
         // of it.  Same precision, same order, same operations: identical paths now give
         // identical scores to the bit, so any difference that remains is a real one.
-        const T go_a = static_cast<T>(params_->gap_open_a);
-        const T ge_a = static_cast<T>(params_->gap_extend_a);
-        const T go_b = static_cast<T>(params_->gap_open_b);
-        const T ge_b = static_cast<T>(params_->gap_extend_b);
         T s = static_cast<T>(0);
         int i = 0, j = 0;
         unsigned char prev = 3;                     // 3 = no previous move
         for (unsigned char op : hops_) {
             if (op == 0) { ++i; ++j; s += subT(i, j); }
             else if (op == 1) {
-                if (prev != 1) s -= go_b;
-                s -= ge_b; ++i;
+                ++i;   // a gap in B is charged by the row it enters
+                if (prev != 1) s -= row_go_b(i);
+                s -= row_ge_b(i);
             } else {
-                if (prev != 2) s -= go_a;
-                s -= ge_a; ++j;
+                if (prev != 2) s -= row_go_a(i);
+                s -= row_ge_a(i); ++j;
             }
             prev = op;
         }
@@ -2662,6 +2726,7 @@ private:
             job.H = H; job.ncols = NC; job.local = local ? 1 : 0;
             job.pmax = hb_pmax() ? 1 : 0;
             job.buf = &buf;
+            if (tr_) { hb_reverse_rows_(); fill_track_job_(job.tr, false, 0); }
             if constexpr (std::is_same_v<T, double>) K->hb_scan(job);
             else                                     K->hb_scan_f(job);
             best = job.best; bi = job.best_i; bj = job.best_j;
@@ -2679,10 +2744,13 @@ private:
         const int H = i1 - i0, NC = j1 - j0;
         best = static_cast<T>(0); bi = 0; bj = 0;
         if (H == 0 || NC == 0) return;
-        const T go_a = static_cast<T>(params_->gap_open_a);
-        const T ge_a = static_cast<T>(params_->gap_extend_a);
-        const T go_b = static_cast<T>(params_->gap_open_b);
-        const T ge_b = static_cast<T>(params_->gap_extend_b);
+        if (tr_) hb_reverse_rows_();
+        // Tracked: the rows as the leveled scan reads them (HbRows): forward, row t's
+        // cells are DP row a[t]+1; reverse (the mirror), DP row a[t], with the rewritten
+        // vertical moves; the block's row 0 is DP row i0 forward, i1 reverse.
+        T go_a = hb_go_a(reverse ? i1 : i0), ge_a = hb_ge_a(reverse ? i1 : i0);
+        T go_b = static_cast<T>(params_->gap_open_b);
+        T ge_b = static_cast<T>(params_->gap_extend_b);
         const int a_start = reverse ? i1 - 1 : i0, a_step = reverse ? -1 : +1;
         const int b_start = reverse ? j1 - 1 : j0, b_step = reverse ? -1 : +1;
 
@@ -2711,13 +2779,19 @@ private:
         T gbest = static_cast<T>(0); int gi = 0, gj = 0;
         for (int t = 0; t < H; ++t) {
             const int arow = a_start + t * a_step;                 // 0-based sequence row
+            if (tr_) {
+                const int hr = reverse ? arow : arow + 1;
+                go_a = hb_go_a(hr); ge_a = hb_ge_a(hr);
+                go_b = hb_go_b(arow + 1, reverse); ge_b = hb_ge_b(arow + 1, reverse);
+                if (pmax) for (int k = 0; k < NC; ++k) rmp[k] = static_cast<T>(k) * ge_a;
+            }
             cM[0] = local ? static_cast<T>(0) : static_cast<T>(NEG_INF);
             cX[0] = std::max(std::max((pM[0] - go_b) - ge_b, pX[0] - ge_b), (pY[0] - go_b) - ge_b);
             cY[0] = static_cast<T>(NEG_INF);
             T P = cY[0] - ge_a;   // Pmax: the running prefix max, the border as its seed
             for (int c = 1; c <= NC; ++c) {
                 const int bcol = b_start + (c - 1) * b_step;       // 0-based sequence col
-                T m = std::max({pM[c-1], pX[c-1], pY[c-1]}) + subTu(arow + 1, bcol + 1);
+                T m = std::max({pM[c-1], pX[c-1], pY[c-1]}) + (tr_ ? subT(arow + 1, bcol + 1) : subTu(arow + 1, bcol + 1));
                 if (local) m = std::max(m, static_cast<T>(0));
                 const T x = std::max(std::max((pM[c] - go_b) - ge_b, pX[c] - ge_b), (pY[c] - go_b) - ge_b);
                 T y;
@@ -2768,17 +2842,13 @@ private:
         // Replay for the score, seeded at the local start (subT is 1-based).  Same order
         // and precision as the DP, so the path's score is exact — the value the tests pin
         // against SW Pointers.
-        const T go_a = static_cast<T>(params_->gap_open_a);
-        const T ge_a = static_cast<T>(params_->gap_extend_a);
-        const T go_b = static_cast<T>(params_->gap_open_b);
-        const T ge_b = static_cast<T>(params_->gap_extend_b);
         T s = static_cast<T>(0);
         int i = is, j = js;
         unsigned char prev = 3;
         for (unsigned char op : hops_) {
             if (op == 0) { ++i; ++j; s += subT(i, j); }
-            else if (op == 1) { if (prev != 1) s -= go_b; s -= ge_b; ++i; }
-            else              { if (prev != 2) s -= go_a; s -= ge_a; ++j; }
+            else if (op == 1) { ++i; if (prev != 1) s -= row_go_b(i); s -= row_ge_b(i); }
+            else              { if (prev != 2) s -= row_go_a(i); s -= row_ge_a(i); ++j; }
             prev = op;
         }
         viterbi_score_ = static_cast<double>(s);
@@ -2961,8 +3031,8 @@ private:
         int i = hb_start_i_, j = hb_start_j_;
         for (unsigned char op : hops_) {
             if (op == 0)      { ++i; ++j; gblk[sub_off(i, j)] += 1.0; }
-            else if (op == 1) { ++i; grad.gap_extend_b -= 1.0; }
-            else              { ++j; grad.gap_extend_a -= 1.0; }
+            else if (op == 1) { ++i; grad_gap(grad, i, AlignParams::kExtendB) -= 1.0; }
+            else              { ++j; grad_gap(grad, i, AlignParams::kExtendA) -= 1.0; }
         }
     }
 
@@ -2977,11 +3047,12 @@ private:
         for (unsigned char op : hops_) {
             if (op == 0) { ++i; ++j; gblk[sub_off(i, j)] += 1.0; }
             else if (op == 1) {
-                if (prev != 1) grad.gap_open_b -= 1.0;
-                grad.gap_extend_b -= 1.0; ++i;
+                ++i;   // charged by the row it enters
+                if (prev != 1) grad_gap(grad, i, AlignParams::kOpenB) -= 1.0;
+                grad_gap(grad, i, AlignParams::kExtendB) -= 1.0;
             } else {
-                if (prev != 2) grad.gap_open_a -= 1.0;
-                grad.gap_extend_a -= 1.0; ++j;
+                if (prev != 2) grad_gap(grad, i, AlignParams::kOpenA) -= 1.0;
+                grad_gap(grad, i, AlignParams::kExtendA) -= 1.0; ++j;
             }
             prev = op;
         }
@@ -3034,6 +3105,18 @@ private:
     // and the score — is bit-identical to the fill's; only the tables are gone.
     // Hirschberg needs every gap penalty it uses >= 0 (NaN fails too); see run_viterbi.
     bool hb_penalties_ok_() const noexcept {
+        if (tr_) {   // every row's (the rows this problem uses)
+            bool ok = true;
+            for (size_t r = 0; r <= static_cast<size_t>(m_); ++r) {
+                ok &= tgea_[r] >= static_cast<T>(0);
+                if constexpr (GM == GapModel::Affine) ok &= tgoa_[r] >= static_cast<T>(0);
+                if (r > 0) {
+                    ok &= tgeb_[r] >= static_cast<T>(0);
+                    if constexpr (GM == GapModel::Affine) ok &= tgob_[r] >= static_cast<T>(0);
+                }
+            }
+            return ok;
+        }
         const AlignParams& p = *params_;
         const bool ext = p.gap_extend_a >= 0.0 && p.gap_extend_b >= 0.0;
         if constexpr (GM == GapModel::Linear) return ext;

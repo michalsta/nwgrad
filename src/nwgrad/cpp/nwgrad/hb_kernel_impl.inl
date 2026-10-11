@@ -45,17 +45,66 @@
 // the note there. Every masked `stdx::where(cond, dest) = value` site in this file
 // goes through it for T=double; T=float is unaffected and keeps the std::simd form.
 
+// ── Tracked rows of a Hirschberg block (see aligner.hpp, "Tracks" and Hirschberg) ──
+// Row t of a sweep consumes residue a[r], r = a_start + t*a_step.  Forward, its cells
+// are DP row r+1, its gaps in A that row's, and the block's row 0 is DP row a_start.
+// Reverse (a_step < 0), the sweep runs the recurrence MIRRORED: its row t holds the
+// suffixes from DP row r, so its gaps in A are DP row r's, and the block's row 0 is DP
+// row a_start + 1.  The vertical move of row t is DP row r+1's in both — with the
+// reverse arrays (rgo_b/rge_b) when mirrored, which charge a run's open at the row the
+// mirror reaches first (Aligner::hb_reverse_rows_ explains the rewrite).
+template <class T>
+struct HbRows {
+    const TrackJob<T>& tr;
+    int a_start, a_step;
+    int res(int t) const noexcept { return a_start + t * a_step; }
+    int hrow(int t) const noexcept { return a_step > 0 ? res(t) + 1 : res(t); }
+    int hrow0() const noexcept { return a_step > 0 ? a_start : a_start + 1; }
+    T go_a(int t) const noexcept { return tr.go_a[hrow(t)]; }
+    T ge_a(int t) const noexcept { return tr.ge_a[hrow(t)]; }
+    T go_b(int t) const noexcept { return (a_step > 0 ? tr.go_b : tr.rgo_b)[res(t) + 1]; }
+    T ge_b(int t) const noexcept { return (a_step > 0 ? tr.ge_b : tr.rge_b)[res(t) + 1]; }
+    // Row t's striped profile row (built here: a tracked block keeps no shared profile).
+    const T* profile(T* dst, const T* blk, int nalpha, const unsigned char* b, int b_start,
+                     int b_step, int NC, int seg, int W, int t) const {
+        const T ninf = -std::numeric_limits<T>::infinity();
+        const T* row = blk + (std::size_t)tr.rs[res(t)] * nalpha;
+        for (int l = 0; l < W; ++l)
+            for (int s = 0; s < seg; ++s) {
+                const int c = l * seg + s + 1;
+                dst[(std::size_t)s * W + l] = (c <= NC) ? row[b[b_start + (c - 1) * b_step]] : ninf;
+            }
+        return dst;
+    }
+};
+// The pmax ramp k*ge_a, striped, for the row's ge_a — rebuilt only when it changes (a
+// tracked sweep's rows may differ), a scalar loop either way: loaded, never multiplied
+// in the hot loop (no FMA), so bit-identical with the scalar reference's per-row ramp.
+template <class T>
+static inline void hb_ramp(T* rmp, T ge_a, int seg, int W) {
+    for (int l = 0; l < W; ++l)
+        for (int s = 0; s < seg; ++s)
+            rmp[(std::size_t)s * W + l] = static_cast<T>(l * seg + s) * ge_a;
+}
+template <class T>
+static inline bool same_bits(T x, T y) noexcept {
+    if constexpr (sizeof(T) == 8) return std::bit_cast<uint64_t>(x) == std::bit_cast<uint64_t>(y);
+    else                          return std::bit_cast<uint32_t>(x) == std::bit_cast<uint32_t>(y);
+}
+
 // One half-sweep of a Hirschberg block.  Rows are walked by (a_start, a_step) and
 // columns by (b_start, b_step), so the forward and reverse halves are the same code
 // with the steps negated — there is one carry implementation, not two.
-template <class T>
+template <class T, bool Tr = false>
 static void hb_sweep_striped(HbJob<T>& job) {
     using vd = stdx::native_simd<T>;
     const int W = (int)vd::size();
     const T NINF = -std::numeric_limits<T>::infinity();
 
     const int H = job.H, NC = job.ncols;
-    const T go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;
+    T go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;
+    const HbRows<T> tr{job.tr, job.a_start, job.a_step};
+    if constexpr (Tr) { go_a = tr.tr.go_a[tr.hrow0()]; ge_a = tr.tr.ge_a[tr.hrow0()]; }
     const unsigned char* a = job.a;
     const unsigned char* b = job.b;
     const T* blk = job.blk;
@@ -94,7 +143,7 @@ static void hb_sweep_striped(HbJob<T>& job) {
     fit(buf.hfa, sw); fit(buf.hfb, sw); fit(buf.hfc, sw);
     fit(buf.hfd, sw); fit(buf.hfe, sw); fit(buf.hff, sw);
     fit(buf.hov, sw);
-    fit(buf.hprof, (std::size_t)nalpha * sw);
+    fit(buf.hprof, (std::size_t)(Tr ? 1 : nalpha) * sw);
 
     T* pM = buf.hfa.data(); T* pX = buf.hfb.data(); T* pY = buf.hfc.data();
     T* cM = buf.hfd.data(); T* cX = buf.hfe.data(); T* cY = buf.hff.data();
@@ -104,8 +153,8 @@ static void hb_sweep_striped(HbJob<T>& job) {
     // score of `sym` against the residue in column l*seg+s+1.  Built per block because
     // the striping geometry depends on the block's own width — but it serves this
     // block's forward AND reverse sweeps, so it amortizes over H rows.  Padding columns
-    // get -inf so they can never win a max.
-    for (int sym = 0; sym < nalpha; ++sym) {
+    // get -inf so they can never win a max.  (Tracked: each row's, as the row comes.)
+    if constexpr (!Tr) for (int sym = 0; sym < nalpha; ++sym) {
         const T* row = blk + (std::size_t)sym * nalpha;
         T* dst = buf.hprof.data() + (std::size_t)sym * sw;
         for (int l = 0; l < W; ++l)
@@ -127,11 +176,17 @@ static void hb_sweep_striped(HbJob<T>& job) {
         }
     T bM = r0M[0], bX = r0X[0], bY = r0Y[0];
 
-    const vd vgo_a(go_a), vge_a(ge_a), vgo_b(go_b), vge_b(ge_b);
+    vd vgo_a(go_a), vge_a(ge_a), vgo_b(go_b), vge_b(ge_b);
 
     for (int t = 0; t < H; ++t) {
-        const T* sub = buf.hprof.data() +
-                       (std::size_t)a[job.a_start + t * job.a_step] * sw;
+        const T* sub;
+        if constexpr (Tr) {
+            go_a = tr.go_a(t); ge_a = tr.ge_a(t); go_b = tr.go_b(t); ge_b = tr.ge_b(t);
+            vgo_a = vd(go_a); vge_a = vd(ge_a); vgo_b = vd(go_b); vge_b = vd(ge_b);
+            sub = tr.profile(buf.hprof.data(), blk, nalpha, b, job.b_start, job.b_step, NC, seg, W, t);
+        } else {
+            sub = buf.hprof.data() + (std::size_t)a[job.a_start + t * job.a_step] * sw;
+        }
 
         // Column 0 of this row.  M cannot happen there (no column to pair with) and Y
         // cannot either (Y consumes a column); only X, extending downward.
@@ -248,8 +303,12 @@ static void hb_sweep_striped(HbJob<T>& job) {
         }
 }
 
-static void hb_sweep_entry_d(HbJob<double>& j) { hb_sweep_striped<double>(j); }
-static void hb_sweep_entry_f(HbJob<float>&  j) { hb_sweep_striped<float>(j); }
+static void hb_sweep_entry_d(HbJob<double>& j) {
+    if (j.tr.on()) hb_sweep_striped<double, true>(j); else hb_sweep_striped<double>(j);
+}
+static void hb_sweep_entry_f(HbJob<float>&  j) {
+    if (j.tr.on()) hb_sweep_striped<float, true>(j); else hb_sweep_striped<float>(j);
+}
 
 // ── OPT-IN SIBLING: the same sweep with a CLOSED-FORM prefix-max carry ────────────
 //
@@ -292,14 +351,16 @@ static void hb_sweep_entry_f(HbJob<float>&  j) { hb_sweep_striped<float>(j); }
 // add in the hot loop is exactly what a compiler contracts into an FMA — which would
 // round differently in the -mfma level TUs than in the baseline one and shatter the
 // bit-identity above.  Loading a precomputed ramp leaves nothing to contract.
-template <class T>
+template <class T, bool Tr = false>
 static void hb_sweep_striped_pmax(HbJob<T>& job) {
     using vd = stdx::native_simd<T>;
     const int W = (int)vd::size();
     const T NINF = -std::numeric_limits<T>::infinity();
 
     const int H = job.H, NC = job.ncols;
-    const T go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;
+    T go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;
+    const HbRows<T> tr{job.tr, job.a_start, job.a_step};
+    if constexpr (Tr) { go_a = tr.tr.go_a[tr.hrow0()]; ge_a = tr.tr.ge_a[tr.hrow0()]; }
     const unsigned char* a = job.a;
     const unsigned char* b = job.b;
     const T* blk = job.blk;
@@ -333,7 +394,7 @@ static void hb_sweep_striped_pmax(HbJob<T>& job) {
     fit(buf.hfa, sw); fit(buf.hfb, sw); fit(buf.hfc, sw);
     fit(buf.hfd, sw); fit(buf.hfe, sw); fit(buf.hff, sw);
     fit(buf.hov, sw); fit(buf.hramp, sw);
-    fit(buf.hprof, (std::size_t)nalpha * sw);
+    fit(buf.hprof, (std::size_t)(Tr ? 1 : nalpha) * sw);
 
     T* pM = buf.hfa.data(); T* pX = buf.hfb.data(); T* pY = buf.hfc.data();
     T* cM = buf.hfd.data(); T* cX = buf.hfe.data(); T* cY = buf.hff.data();
@@ -345,13 +406,13 @@ static void hb_sweep_striped_pmax(HbJob<T>& job) {
     // `static_cast<T>(k) * ge_a` by construction, and outside the row loop so it costs
     // O(ncols) per sweep rather than per row.  k is an exact integer well below 2^24
     // (float32's exact-integer bound) for any sequence this library can hold, so the
-    // multiply is the only rounding here.
-    for (int l = 0; l < W; ++l)
-        for (int s = 0; s < seg; ++s)
-            rmp[(std::size_t)s * W + l] = static_cast<T>(l * seg + s) * ge_a;
+    // multiply is the only rounding here.  (Tracked: per row, rebuilt when ge_a changes.)
+    T ramp_ge = ge_a;
+    bool ramp_ok = false;
+    if constexpr (!Tr) { hb_ramp(rmp, ge_a, seg, W); ramp_ok = true; }
 
     // Striped query profile over the block's column slice — identical to the exact sweep.
-    for (int sym = 0; sym < nalpha; ++sym) {
+    if constexpr (!Tr) for (int sym = 0; sym < nalpha; ++sym) {
         const T* row = blk + (std::size_t)sym * nalpha;
         T* dst = buf.hprof.data() + (std::size_t)sym * sw;
         for (int l = 0; l < W; ++l)
@@ -372,11 +433,18 @@ static void hb_sweep_striped_pmax(HbJob<T>& job) {
         }
     T bM = r0M[0], bX = r0X[0], bY = r0Y[0];
 
-    const vd vgo_a(go_a), vge_a(ge_a), vgo_b(go_b), vge_b(ge_b);
+    vd vgo_a(go_a), vge_a(ge_a), vgo_b(go_b), vge_b(ge_b);
 
     for (int t = 0; t < H; ++t) {
-        const T* sub = buf.hprof.data() +
-                       (std::size_t)a[job.a_start + t * job.a_step] * sw;
+        const T* sub;
+        if constexpr (Tr) {
+            go_a = tr.go_a(t); ge_a = tr.ge_a(t); go_b = tr.go_b(t); ge_b = tr.ge_b(t);
+            vgo_a = vd(go_a); vge_a = vd(ge_a); vgo_b = vd(go_b); vge_b = vd(ge_b);
+            sub = tr.profile(buf.hprof.data(), blk, nalpha, b, job.b_start, job.b_step, NC, seg, W, t);
+            if (!ramp_ok || !same_bits(ramp_ge, ge_a)) { hb_ramp(rmp, ge_a, seg, W); ramp_ge = ge_a; ramp_ok = true; }
+        } else {
+            sub = buf.hprof.data() + (std::size_t)a[job.a_start + t * job.a_step] * sw;
+        }
 
         const T nbM = NINF;
         T nbX = std::max(std::max((bM - go_b) - ge_b, bX - ge_b), (bY - go_b) - ge_b);
@@ -468,8 +536,12 @@ static void hb_sweep_striped_pmax(HbJob<T>& job) {
         }
 }
 
-static void hb_sweep_pmax_entry_d(HbJob<double>& j) { hb_sweep_striped_pmax<double>(j); }
-static void hb_sweep_pmax_entry_f(HbJob<float>&  j) { hb_sweep_striped_pmax<float>(j); }
+static void hb_sweep_pmax_entry_d(HbJob<double>& j) {
+    if (j.tr.on()) hb_sweep_striped_pmax<double, true>(j); else hb_sweep_striped_pmax<double>(j);
+}
+static void hb_sweep_pmax_entry_f(HbJob<float>&  j) {
+    if (j.tr.on()) hb_sweep_striped_pmax<float, true>(j); else hb_sweep_striped_pmax<float>(j);
+}
 
 // ── Hirschberg LOCAL endpoint scan: striped affine sweep that reports its argmax ──
 //
@@ -499,14 +571,16 @@ static void hb_sweep_pmax_entry_f(HbJob<float>&  j) { hb_sweep_striped_pmax<floa
 // takes its carry in the endpoint scans too, which dominate Local Hirschberg.  Like the
 // sweep it is bit-identical across levels and with the scalar reference
 // (Aligner::hb_scan_scalar<..., true>), and not bit-exact with the exact scan.
-template <class T, bool Local, bool Pmax>
+template <class T, bool Local, bool Pmax, bool Tr = false>
 static void hb_scan_impl(HbScanJob<T>& job) {
     using vd = stdx::native_simd<T>;
     constexpr int W = (int)vd::size();
     const T NINF = -std::numeric_limits<T>::infinity();
 
     const int H = job.H, NC = job.ncols;
-    const T go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;
+    T go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;
+    const HbRows<T> tr{job.tr, job.a_start, job.a_step};
+    if constexpr (Tr) { go_a = tr.tr.go_a[tr.hrow0()]; ge_a = tr.tr.ge_a[tr.hrow0()]; }
     const unsigned char* a = job.a;
     const unsigned char* b = job.b;
     const T* blk = job.blk;
@@ -525,21 +599,20 @@ static void hb_scan_impl(HbScanJob<T>& job) {
     fit(buf.hfa, sw); fit(buf.hfb, sw); fit(buf.hfc, sw);
     fit(buf.hfd, sw); fit(buf.hfe, sw); fit(buf.hff, sw);
     fit(buf.hov, sw);
-    fit(buf.hprof, (std::size_t)nalpha * sw);
+    fit(buf.hprof, (std::size_t)(Tr ? 1 : nalpha) * sw);
     if constexpr (Pmax) fit(buf.hramp, sw);
 
     T* pM = buf.hfa.data(); T* pX = buf.hfb.data(); T* pY = buf.hfc.data();
     T* cM = buf.hfd.data(); T* cX = buf.hfe.data(); T* cY = buf.hff.data();
     T* ov = buf.hov.data();
     T* rmp = buf.hramp.data();
-    if constexpr (Pmax)   // the ramp k*ge_a, striped, loaded never multiplied (no FMA)
-        for (int l = 0; l < W; ++l)
-            for (int s = 0; s < seg; ++s)
-                rmp[(std::size_t)s * W + l] = static_cast<T>(l * seg + s) * ge_a;
+    T ramp_ge = ge_a;
+    bool ramp_ok = false;
+    if constexpr (Pmax && !Tr) { hb_ramp(rmp, ge_a, seg, W); ramp_ok = true; }   // loaded never multiplied (no FMA)
 
     // Striped query profile over the block's column slice (padding -> -inf).  Serves this
-    // block's sweep exactly as in hb_sweep_striped.
-    for (int sym = 0; sym < nalpha; ++sym) {
+    // block's sweep exactly as in hb_sweep_striped.  (Tracked: each row's, as it comes.)
+    if constexpr (!Tr) for (int sym = 0; sym < nalpha; ++sym) {
         const T* row = blk + (std::size_t)sym * nalpha;
         T* dst = buf.hprof.data() + (std::size_t)sym * sw;
         for (int l = 0; l < W; ++l)
@@ -588,15 +661,23 @@ static void hb_scan_impl(HbScanJob<T>& job) {
     // column-0 border of the previous row: M = 0 fresh start in both modes, X = Y = -inf.
     T bM = 0, bX = NINF, bY = NINF;
 
-    const vd vgo_a(go_a), vge_a(ge_a), vgo_b(go_b), vge_b(ge_b);
+    vd vgo_a(go_a), vge_a(ge_a), vgo_b(go_b), vge_b(ge_b);
     const vd vzero(T(0));
     const vd vlane([](int q) { return T(q); });   // [0,1,...,W-1] for per-lane column ids
 
     T gbest = T(0); int gi = 0, gj = 0;
 
     for (int t = 0; t < H; ++t) {
-        const T* sub = buf.hprof.data() +
-                       (std::size_t)a[job.a_start + t * job.a_step] * sw;
+        const T* sub;
+        if constexpr (Tr) {
+            go_a = tr.go_a(t); ge_a = tr.ge_a(t); go_b = tr.go_b(t); ge_b = tr.ge_b(t);
+            vgo_a = vd(go_a); vge_a = vd(ge_a); vgo_b = vd(go_b); vge_b = vd(ge_b);
+            sub = tr.profile(buf.hprof.data(), blk, nalpha, b, job.b_start, job.b_step, NC, seg, W, t);
+            if constexpr (Pmax)
+                if (!ramp_ok || !same_bits(ramp_ge, ge_a)) { hb_ramp(rmp, ge_a, seg, W); ramp_ge = ge_a; ramp_ok = true; }
+        } else {
+            sub = buf.hprof.data() + (std::size_t)a[job.a_start + t * job.a_step] * sw;
+        }
 
         // Column 0 of this row.  Local: M = 0 (fresh start).  Global: M = -inf.  X extends
         // downward from the previous row's column 0 in both modes; Y cannot occur (no
@@ -740,10 +821,15 @@ static void hb_scan_impl(HbScanJob<T>& job) {
     job.best = gbest; job.best_i = gi; job.best_j = gj;
 }
 
+template <class T, bool Tr>
+static void hb_scan_dispatch_tr(HbScanJob<T>& j) {
+    if (j.pmax) { if (j.local) hb_scan_impl<T, true, true, Tr>(j);  else hb_scan_impl<T, false, true, Tr>(j); }
+    else        { if (j.local) hb_scan_impl<T, true, false, Tr>(j); else hb_scan_impl<T, false, false, Tr>(j); }
+}
 template <class T>
 static void hb_scan_dispatch(HbScanJob<T>& j) {
-    if (j.pmax) { if (j.local) hb_scan_impl<T, true, true>(j);  else hb_scan_impl<T, false, true>(j); }
-    else        { if (j.local) hb_scan_impl<T, true, false>(j); else hb_scan_impl<T, false, false>(j); }
+    if (j.tr.on()) hb_scan_dispatch_tr<T, true>(j);
+    else           hb_scan_dispatch_tr<T, false>(j);
 }
 static void hb_scan_entry_d(HbScanJob<double>& j) { hb_scan_dispatch(j); }
 static void hb_scan_entry_f(HbScanJob<float>& j)  { hb_scan_dispatch(j); }
@@ -761,14 +847,16 @@ static void hb_scan_entry_f(HbScanJob<float>& j)  { hb_scan_dispatch(j); }
 //   * column 0 is CARRIED, not a closed form — the border scalars bM/bX/bY roll down,
 //     because a sub-block's left edge is wherever the parent split it, not the origin;
 //   * the origin is seeded by in_x (M=0 for a fresh arrival, X=0 to continue a run).
-template <class T>
+template <class T, bool Tr = false>
 static void hb_base_striped(HbBaseJob<T>& job) {
     using vd = stdx::native_simd<T>;
     const int W = (int)vd::size();
     const T NINF = -std::numeric_limits<T>::infinity();
 
     const int H = job.H, NC = job.ncols;
-    const T go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;
+    T go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;
+    const HbRows<T> tr{job.tr, job.a_start, job.a_step};   // forward only (a_step == 1)
+    if constexpr (Tr) { go_a = tr.tr.go_a[tr.hrow0()]; ge_a = tr.tr.ge_a[tr.hrow0()]; }
     const unsigned char* a = job.a;
     const unsigned char* b = job.b;
     const T* blk = job.blk;
@@ -785,7 +873,7 @@ static void hb_base_striped(HbBaseJob<T>& job) {
 
     auto fit = [](typename DpBufferT<T>::TVec& v, std::size_t k) { if (v.size() < k) v.resize(k); };
     if (buf.hbD.size() < 3 * plane) buf.hbD.resize(3 * plane);
-    fit(buf.hprof, (std::size_t)nalpha * sw);
+    fit(buf.hprof, (std::size_t)(Tr ? 1 : nalpha) * sw);
     fit(buf.hfa, rowsz); fit(buf.hfb, rowsz); fit(buf.hfc, rowsz);
     fit(buf.hfd, rowsz); fit(buf.hfe, rowsz); fit(buf.hff, rowsz);
     fit(buf.hov, 2 * sw);
@@ -795,8 +883,8 @@ static void hb_base_striped(HbBaseJob<T>& job) {
         return (std::size_t)((c - 1) % seg) * W + (c - 1) / seg;
     };
 
-    // Striped query profile over the block's column slice.
-    for (int sym = 0; sym < nalpha; ++sym) {
+    // Striped query profile over the block's column slice.  (Tracked: each row's.)
+    if constexpr (!Tr) for (int sym = 0; sym < nalpha; ++sym) {
         const T* row = blk + (std::size_t)sym * nalpha;
         T* dst = buf.hprof.data() + (std::size_t)sym * sw;
         for (int l = 0; l < W; ++l)
@@ -843,12 +931,19 @@ static void hb_base_striped(HbBaseJob<T>& job) {
             if (c > NC) { const std::size_t k = (std::size_t)s * W + l; pM[off + k] = NINF; pX[off + k] = NINF; pY[off + k] = NINF; }
         }
 
-    const vd vgo_a(go_a), vge_a(ge_a), vgo_b(go_b), vge_b(ge_b);
+    vd vgo_a(go_a), vge_a(ge_a), vgo_b(go_b), vge_b(ge_b);
     const vd vzero(T(0)), vone(T(1)), vtwo(T(2)), vthree(T(3));
     T bM = pM[0], bX = pX[0], bY = pY[0];
 
     for (int r = 1; r <= H; ++r) {
-        const T* sub = buf.hprof.data() + (std::size_t)a[job.a_start + (r - 1) * job.a_step] * sw;
+        const T* sub;
+        if constexpr (Tr) {
+            go_a = tr.go_a(r - 1); ge_a = tr.ge_a(r - 1); go_b = tr.go_b(r - 1); ge_b = tr.ge_b(r - 1);
+            vgo_a = vd(go_a); vge_a = vd(ge_a); vgo_b = vd(go_b); vge_b = vd(ge_b);
+            sub = tr.profile(buf.hprof.data(), blk, nalpha, b, job.b_start, job.b_step, NC, seg, W, r - 1);
+        } else {
+            sub = buf.hprof.data() + (std::size_t)a[job.a_start + (r - 1) * job.a_step] * sw;
+        }
         unsigned char* dM = D0 + (std::size_t)r * rowsz + off;
         unsigned char* dX = D1 + (std::size_t)r * rowsz + off;
         unsigned char* dY = D2 + (std::size_t)r * rowsz + off;
@@ -1018,5 +1113,9 @@ static void hb_base_striped(HbBaseJob<T>& job) {
     }
 }
 
-static void hb_base_entry_d(HbBaseJob<double>& j) { hb_base_striped<double>(j); }
-static void hb_base_entry_f(HbBaseJob<float>&  j) { hb_base_striped<float>(j); }
+static void hb_base_entry_d(HbBaseJob<double>& j) {
+    if (j.tr.on()) hb_base_striped<double, true>(j); else hb_base_striped<double>(j);
+}
+static void hb_base_entry_f(HbBaseJob<float>&  j) {
+    if (j.tr.on()) hb_base_striped<float, true>(j); else hb_base_striped<float>(j);
+}
