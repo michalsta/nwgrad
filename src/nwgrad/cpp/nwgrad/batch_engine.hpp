@@ -1450,7 +1450,8 @@ private:
     }
     // Pair i on `al` under params `p` (band, guide), with its tracks when tracked.
     template<class Al>
-    void problem_(Al& al, size_t i, const AlignParams& p, int band, std::vector<int> guide) const {
+    [[gnu::always_inline]] inline void problem_(Al& al, size_t i, const AlignParams& p, int band,
+                                                std::vector<int>&& guide) const {
         if (tracked_) al.set_problem(codes_a(i), codes_b(i), p, band, std::move(guide),
                                      track(i), gap_track(i), prep_of_(&p), prep_gaps_(&p));
         else          al.set_problem(codes_a(i), codes_b(i), p, band, std::move(guide));
