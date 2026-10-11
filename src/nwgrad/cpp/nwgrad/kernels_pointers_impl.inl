@@ -31,7 +31,8 @@ static inline void store_codes(const stdx::native_simd<T>& code, unsigned char* 
     stdx::static_simd_cast<bvec>(code).copy_to(dst, stdx::element_aligned);
 }
 
-template <class T, bool Local>
+// Tr: a tracked problem (job.tr), as striped_affine_full.
+template <class T, bool Local, bool Tr = false>
 static void striped_affine_full_ptr(ViterbiJob<T>& job) {
     using vd = stdx::native_simd<T>;
     constexpr int W = (int)stdx::native_simd<T>::size();
@@ -39,7 +40,9 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
 
     const int m = job.m, n = job.n;
     const int nalpha = job.nalpha;
-    const T go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;
+    T go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;
+    const TrackJob<T>& tr = job.tr;
+    if constexpr (Tr) { go_a = tr.go_a[0]; ge_a = tr.ge_a[0]; }   // row 0's gaps in A
     const T* blk = job.blk;
     const unsigned char* a = job.a;
     const unsigned char* b = job.b;
@@ -51,7 +54,6 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
     const std::size_t off   = (std::size_t)W;
 
     if (buf.sopenv.size() < 2 * sw) buf.sopenv.resize(2 * sw);   // ov | openk
-    if (buf.sprof.size()  < (std::size_t)nalpha * sw) buf.sprof.resize((std::size_t)nalpha * sw);
     const std::size_t dsz = (std::size_t)(m + 1) * rowsz;
     // Each vector is checked on its own: a linear pointer fill sharing this buffer grows
     // DM, rM and qM alone, so one size no longer speaks for the group.
@@ -65,15 +67,7 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
         return (std::size_t)((j - 1) % seg) * W + (j - 1) / seg;
     };
 
-    for (int c = 0; c < nalpha; ++c) {
-        const T* row = blk + (std::size_t)c * nalpha;
-        T* dst = buf.sprof.data() + (std::size_t)c * sw;
-        for (int l = 0; l < W; ++l)
-            for (int s = 0; s < seg; ++s) {
-                const int j = l * seg + s + 1;
-                dst[(std::size_t)s * W + l] = (j <= n) ? row[b[j - 1]] : K_NINF;
-            }
-    }
+    striped_profile_build<T, Tr>(buf.sprof, blk, nalpha, b, n, seg, W, tr);
 
     T* ov = buf.sopenv.data();
     T* ok = buf.sopenv.data() + sw;
@@ -107,18 +101,24 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
             }
     }
 
-    const vd vgo_a(go_a), vge_a(ge_a), vgo_b(go_b), vge_b(ge_b);
+    vd vgo_a(go_a), vge_a(ge_a), vgo_b(go_b), vge_b(ge_b);
     const vd vzero(static_cast<T>(0)), vone(static_cast<T>(1)), vtwo(static_cast<T>(2));
     const vd vthree(static_cast<T>(3));
     T bM = 0, bX = K_NINF, bY = K_NINF;
     T best_local = 0; int best_i = 0, best_j = 0, best_tbl = 0;
 
     for (int i = 1; i <= m; ++i) {
+        if constexpr (Tr) {
+            go_a = tr.go_a[i]; ge_a = tr.ge_a[i]; go_b = tr.go_b[i]; ge_b = tr.ge_b[i];
+            vgo_a = vd(go_a); vge_a = vd(ge_a); vgo_b = vd(go_b); vge_b = vd(ge_b);
+        }
         const T nbM = Local ? T(0) : K_NINF;
-        const T nbX = Local ? K_NINF : -(go_b + i * ge_b);
+        T nbX;
+        if constexpr (Tr) nbX = Local ? K_NINF : tr.bx0[i];
+        else              nbX = Local ? K_NINF : -(go_b + i * ge_b);
         const T nbOpen = (std::max(nbM, nbX) - go_a) - ge_a;
         const T nbOpenK = (nbM >= nbX) ? T(0) : T(1);
-        const T* sub = buf.sprof.data() + (std::size_t)a[i - 1] * sw;
+        const T* sub = striped_row_profile<T, Tr>(buf.sprof.data(), blk, nalpha, a, b, n, seg, W, i, tr);
 
         unsigned char* dM = buf.DM.data() + (std::size_t)i * rowsz + off;
         unsigned char* dX = buf.DX.data() + (std::size_t)i * rowsz + off;
@@ -324,6 +324,11 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
 
 template <class T>
 static void striped_full_ptr_entry(ViterbiJob<T>& job) {
+    if (job.tr.on()) {
+        if (job.align_mode) striped_affine_full_ptr<T, true, true>(job);
+        else                striped_affine_full_ptr<T, false, true>(job);
+        return;
+    }
     if (job.align_mode) striped_affine_full_ptr<T, true>(job);
     else                striped_affine_full_ptr<T, false>(job);
 }

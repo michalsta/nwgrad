@@ -209,6 +209,7 @@ if (NWGRAD_BUILD_TESTS)
         tests/cpp/test_score_only.cpp
         tests/cpp/test_simd_bitexact.cpp
         tests/cpp/test_simd_bitexact_f32.cpp
+        tests/cpp/test_tracks.cpp
         ${NWGRAD_LEVEL_SOURCES}   # per-ISA kernel TUs, so kernel="simd" exercises the dispatched striped path
     )
     target_include_directories(nwgrad_tests PRIVATE
@@ -286,6 +287,15 @@ if (NWGRAD_BUILD_TESTS)
     foreach(isa sse2 avx2 avx512 neon)
         add_test(NAME cpp_tests_traceback_${isa} COMMAND nwgrad_tests "[traceback]")
         set_tests_properties(cpp_tests_traceback_${isa}
+            PROPERTIES ENVIRONMENT "NWGRAD_ISA=${isa}")
+    endforeach()
+
+    # ── tracks, once per instruction set ─────────────────────────────────────────
+    #
+    # Every tracked leveled kernel against the scalar tracked fill (test_tracks.cpp).
+    foreach(isa sse2 avx2 avx512 neon)
+        add_test(NAME cpp_tests_tracks_${isa} COMMAND nwgrad_tests "[tracks]")
+        set_tests_properties(cpp_tests_tracks_${isa}
             PROPERTIES ENVIRONMENT "NWGRAD_ISA=${isa}")
     endforeach()
 

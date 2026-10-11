@@ -30,14 +30,18 @@
 #  error "score_kernel_impl.inl must be included inside a level namespace by a level TU"
 #endif
 
-template <class T, bool Local, bool Fused>
+// Tr: a tracked problem (job.tr; see striped_affine_full) — each row's penalties,
+// border and profile row from the track arrays.
+template <class T, bool Local, bool Fused, bool Tr = false>
 static void score_affine_striped(ScoreJob<T>& job) {
     using vd = stdx::native_simd<T>;
     const int W = (int)vd::size();
     const T NINF = -std::numeric_limits<T>::infinity();
 
     const int m = job.m, n = job.n, nalpha = job.nalpha;
-    const T go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;
+    T go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;
+    const TrackJob<T>& tr = job.tr;
+    if constexpr (Tr) { go_a = tr.go_a[0]; ge_a = tr.ge_a[0]; }
     const unsigned char* a = job.a;
     const unsigned char* b = job.b;
     DpBufferT<T>& buf = *job.buf;
@@ -46,13 +50,13 @@ static void score_affine_striped(ScoreJob<T>& job) {
         // No columns: Global ends in one gap run down column 0 (or is empty); Local is 0.
         // The fill's (m, 0) cell: VM = -inf (0 at m == 0), VX = -(go_b + m*ge_b), VY = -inf.
         if constexpr (Local) job.score = 0.0;
+        else if constexpr (Tr) job.score = (m == 0) ? 0.0 : static_cast<double>(tr.bx0[m]);
         else job.score = (m == 0) ? 0.0 : static_cast<double>(-(go_b + static_cast<T>(m) * ge_b));
         return;
     }
 
     const int seg = (n + W - 1) / W;
     const std::size_t sw = (std::size_t)seg * W;
-    if (buf.sprof.size() < (std::size_t)nalpha * sw) buf.sprof.resize((std::size_t)nalpha * sw);
     for (auto* v : {&buf.rM, &buf.rX, &buf.rY, &buf.qM, &buf.qX, &buf.qY})
         if (v->size() < sw) v->resize(sw);
     if constexpr (!Fused) if (buf.sopenv.size() < sw) buf.sopenv.resize(sw);
@@ -74,15 +78,7 @@ static void score_affine_striped(ScoreJob<T>& job) {
     };
 
     // striped query profile, padding columns -inf (as striped_affine_full)
-    for (int c = 0; c < nalpha; ++c) {
-        const T* row = job.blk + (std::size_t)c * nalpha;
-        T* dst = buf.sprof.data() + (std::size_t)c * sw;
-        for (int l = 0; l < W; ++l)
-            for (int s = 0; s < seg; ++s) {
-                const int j = l * seg + s + 1;
-                dst[(std::size_t)s * W + l] = (j <= n) ? row[b[j - 1]] : NINF;
-            }
-    }
+    striped_profile_build<T, Tr>(buf.sprof, job.blk, nalpha, b, n, seg, W, tr);
 
     T* pM = buf.qM.data(); T* pX = buf.qX.data(); T* pY = buf.qY.data();   // row i-1
     T* cM = buf.rM.data(); T* cX = buf.rX.data(); T* cY = buf.rY.data();   // row i
@@ -99,7 +95,7 @@ static void score_affine_striped(ScoreJob<T>& job) {
             }
         }
 
-    const vd vgo_a(go_a), vge_a(ge_a), vgo_b(go_b), vge_b(ge_b);
+    vd vgo_a(go_a), vge_a(ge_a), vgo_b(go_b), vge_b(ge_b);
     const vd vzero(static_cast<T>(0)), vninf(NINF);
     vd vbest = vzero;                       // Local: running per-lane max (best starts at 0)
     T bM = 0, bX = NINF, bY = NINF;         // column 0 of the previous row
@@ -115,10 +111,16 @@ static void score_affine_striped(ScoreJob<T>& job) {
     };
 
     for (int i = 1; i <= m; ++i) {
+        if constexpr (Tr) {
+            go_a = tr.go_a[i]; ge_a = tr.ge_a[i]; go_b = tr.go_b[i]; ge_b = tr.ge_b[i];
+            vgo_a = vd(go_a); vge_a = vd(ge_a); vgo_b = vd(go_b); vge_b = vd(ge_b);
+        }
         const T nbM = Local ? T(0) : NINF;
-        const T nbX = Local ? NINF : -(go_b + i * ge_b);
+        T nbX;
+        if constexpr (Tr) nbX = Local ? NINF : tr.bx0[i];
+        else              nbX = Local ? NINF : -(go_b + i * ge_b);
         const T nbOpen = (std::max(nbM, nbX) - go_a) - ge_a;
-        const T* sub = buf.sprof.data() + (std::size_t)a[i - 1] * sw;
+        const T* sub = striped_row_profile<T, Tr>(buf.sprof.data(), job.blk, nalpha, a, b, n, seg, W, i, tr);
 
         vd Olast = vninf;                   // Fused: O of the last segment, for lazy-F
         if constexpr (Fused) {
@@ -258,27 +260,29 @@ static void score_affine_striped(ScoreJob<T>& job) {
 // slower than the fill (1.03x) before it was moved back.  MOnly (extends >= 0 too): no
 // gap cell exceeds the cell it extends from, so the Local maximum is over M alone — and
 // M's padding slots are clamped to exactly 0, so they need no mask.
-template <class T, bool Local, bool MOnly>
+template <class T, bool Local, bool MOnly, bool Tr = false>
 static void score_affine_striped_pos(ScoreJob<T>& job) {
     using vd = stdx::native_simd<T>;
     const int W = (int)vd::size();
     const T NINF = -std::numeric_limits<T>::infinity();
 
     const int m = job.m, n = job.n, nalpha = job.nalpha;
-    const T go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;
+    T go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;
+    const TrackJob<T>& tr = job.tr;
+    if constexpr (Tr) { go_a = tr.go_a[0]; ge_a = tr.ge_a[0]; }
     const unsigned char* a = job.a;
     const unsigned char* b = job.b;
     DpBufferT<T>& buf = *job.buf;
 
     if (n == 0) {
         if constexpr (Local) job.score = 0.0;
+        else if constexpr (Tr) job.score = (m == 0) ? 0.0 : static_cast<double>(tr.bx0[m]);
         else job.score = (m == 0) ? 0.0 : static_cast<double>(-(go_b + static_cast<T>(m) * ge_b));
         return;
     }
 
     const int seg = (n + W - 1) / W;
     const std::size_t sw = (std::size_t)seg * W;
-    if (buf.sprof.size() < (std::size_t)nalpha * sw) buf.sprof.resize((std::size_t)nalpha * sw);
     for (auto* v : {&buf.rM, &buf.rX, &buf.rY, &buf.qM, &buf.qX})
         if (v->size() < sw) v->resize(sw);
     const T* pad = nullptr;
@@ -294,15 +298,7 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
         return v + p;
     };
 
-    for (int c = 0; c < nalpha; ++c) {
-        const T* row = job.blk + (std::size_t)c * nalpha;
-        T* dst = buf.sprof.data() + (std::size_t)c * sw;
-        for (int l = 0; l < W; ++l)
-            for (int s = 0; s < seg; ++s) {
-                const int j = l * seg + s + 1;
-                dst[(std::size_t)s * W + l] = (j <= n) ? row[b[j - 1]] : NINF;
-            }
-    }
+    striped_profile_build<T, Tr>(buf.sprof, job.blk, nalpha, b, n, seg, W, tr);
 
     T* pD = buf.qM.data(); T* pX = buf.qX.data();                          // row i-1
     T* cD = buf.rM.data(); T* cX = buf.rX.data(); T* cY = buf.rY.data();   // row i
@@ -319,7 +315,7 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
             }
         }
 
-    const vd vgo_a(go_a), vge_a(ge_a), vgo_b(go_b), vge_b(ge_b);
+    vd vgo_a(go_a), vge_a(ge_a), vgo_b(go_b), vge_b(ge_b);
     const vd vzero(static_cast<T>(0)), vninf(NINF);
     vd vbest = vzero;
     T bD = 0;                               // D of column 0, previous row (M(0,0) = 0)
@@ -334,11 +330,17 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
     };
 
     for (int i = 1; i <= m; ++i) {
+        if constexpr (Tr) {
+            go_a = tr.go_a[i]; ge_a = tr.ge_a[i]; go_b = tr.go_b[i]; ge_b = tr.ge_b[i];
+            vgo_a = vd(go_a); vge_a = vd(ge_a); vgo_b = vd(go_b); vge_b = vd(ge_b);
+        }
         const T nbM = Local ? T(0) : NINF;
-        const T nbX = Local ? NINF : -(go_b + i * ge_b);
+        T nbX;
+        if constexpr (Tr) nbX = Local ? NINF : tr.bx0[i];
+        else              nbX = Local ? NINF : -(go_b + i * ge_b);
         const T nbD = std::max(nbM, nbX);   // column 0's VY is -inf
         const T nbOpen = (nbD - go_a) - ge_a;
-        const T* sub = buf.sprof.data() + (std::size_t)a[i - 1] * sw;
+        const T* sub = striped_row_profile<T, Tr>(buf.sprof.data(), job.blk, nalpha, a, b, n, seg, W, i, tr);
 
         vd Oin([&](int q) { return q == 0 ? nbOpen : NINF; });
         vd Yin = vninf;
@@ -413,24 +415,41 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
 // The registered entry: Global or Local; job.variant 0 = the D/X form when both opens
 // are >= 0 (else fused three-state), 1 = two-pass, 2 = fused three-state (for measuring
 // the forms in one binary; NWGRAD_SCORE_VARIANT=twopass / fused3).
-template <class T>
-static void score_entry(ScoreJob<T>& job) {
+template <class T, bool Tr>
+static void score_entry_impl(ScoreJob<T>& job) {
     if (job.variant == 1) {
-        if (job.local) score_affine_striped<T, true, false>(job);
-        else           score_affine_striped<T, false, false>(job);
+        if (job.local) score_affine_striped<T, true, false, Tr>(job);
+        else           score_affine_striped<T, false, false, Tr>(job);
         return;
     }
-    const bool pos_open = job.go_a >= T(0) && job.go_b >= T(0);   // NaN: false
+    // Tracked: the forms' conditions must hold on every row (NaN: false).
+    bool pos_open, pos_ext;
+    if constexpr (Tr) {
+        const TrackJob<T>& tr = job.tr;
+        pos_open = pos_ext = true;
+        for (int i = 0; i <= job.m; ++i) {
+            pos_open &= tr.go_a[i] >= T(0);
+            pos_ext  &= tr.ge_a[i] >= T(0);
+            if (i > 0) { pos_open &= tr.go_b[i] >= T(0); pos_ext &= tr.ge_b[i] >= T(0); }
+        }
+    } else {
+        pos_open = job.go_a >= T(0) && job.go_b >= T(0);   // NaN: false
+        pos_ext  = job.ge_a >= T(0) && job.ge_b >= T(0);
+    }
     if (job.variant == 0 && pos_open) {
-        const bool pos_ext = job.ge_a >= T(0) && job.ge_b >= T(0);
         if (job.local) {
-            if (pos_ext) score_affine_striped_pos<T, true, true>(job);
-            else         score_affine_striped_pos<T, true, false>(job);
+            if (pos_ext) score_affine_striped_pos<T, true, true, Tr>(job);
+            else         score_affine_striped_pos<T, true, false, Tr>(job);
         } else {
-            score_affine_striped_pos<T, false, false>(job);
+            score_affine_striped_pos<T, false, false, Tr>(job);
         }
         return;
     }
-    if (job.local) score_affine_striped<T, true, true>(job);
-    else           score_affine_striped<T, false, true>(job);
+    if (job.local) score_affine_striped<T, true, true, Tr>(job);
+    else           score_affine_striped<T, false, true, Tr>(job);
+}
+template <class T>
+static void score_entry(ScoreJob<T>& job) {
+    if (job.tr.on()) score_entry_impl<T, true>(job);
+    else             score_entry_impl<T, false>(job);
 }

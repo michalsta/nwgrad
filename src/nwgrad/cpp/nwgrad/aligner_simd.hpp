@@ -103,9 +103,29 @@ inline constexpr double NEG_INF = -std::numeric_limits<double>::infinity();
 // per entry against a DP of O(m * n) at ~15 ops per cell — about 2.7/m, so ~5% at
 // m=50 and ~1% at m=200 — and it buys immunity to a whole class of staleness bugs
 // when the matrix changes under a SeqPair between re-alignments.
+//
+// Tracked: one profile row per distinct stacked row the problem uses (ra_/crow_, see
+// fill_track_job_), or none when those would not fit — subrow() then gathers each DP
+// row's scores from its stacked row, as the banded path always has.
 template<GapModel GM, AlignMode AM, AlignBand AB, class T>
-void Aligner<GM, AM, AB, T>::build_profile(DpBuffer& buf) const {
+void Aligner<GM, AM, AB, T>::build_profile(DpBuffer& buf) {
     const size_t w = static_cast<size_t>(n_) + 1;
+    if (tr_) {
+        TrackJob<T> tj;
+        fill_track_job_(tj, true, w);
+        rw_prof_ = tj.ra != nullptr;
+        if (!rw_prof_) return;
+        const size_t need = crow_.size() * w;
+        if (buf.prof.size() < need) buf.prof.resize(need);
+        for (size_t c = 0; c < crow_.size(); ++c) {
+            const double* blk_row = blk_ + static_cast<size_t>(crow_[c]) * static_cast<size_t>(nalpha_);
+            double* dst = buf.prof.data() + c * w;
+            dst[0] = 0.0;  // padding; never read
+            for (int j = 1; j <= n_; ++j)
+                dst[j] = blk_row[b_idx_[static_cast<size_t>(j) - 1]];
+        }
+        return;
+    }
     const size_t need = static_cast<size_t>(nalpha_) * w;
     if (buf.prof.size() < need) buf.prof.resize(need);
 
@@ -125,22 +145,23 @@ void Aligner<GM, AM, AB, T>::build_profile(DpBuffer& buf) const {
 // O(m * band), so for a narrow band it would outcost the thing it is accelerating.
 template<GapModel GM, AlignMode AM, AlignBand AB, class T>
 const double* Aligner<GM, AM, AB, T>::subrow(DpBuffer& buf, int i, int lo, int hi) const {
+    // The DP row's row of the substitution block: its stacked row when tracked.
+    const size_t brow = tr_ ? static_cast<size_t>(rs_[static_cast<size_t>(i) - 1])
+                            : static_cast<size_t>(a_idx_[static_cast<size_t>(i) - 1]);
     if constexpr (AB == AlignBand::Full) {
-        (void)lo; (void)hi;
         const size_t w = static_cast<size_t>(n_) + 1;
-        return buf.prof.data() +
-               static_cast<size_t>(a_idx_[static_cast<size_t>(i) - 1]) * w;
-    } else {
-        const size_t w = static_cast<size_t>(n_) + 1;
-        if (buf.subbuf.size() < w) buf.subbuf.resize(w);
-        const double* blk_row =
-            blk_ + static_cast<size_t>(a_idx_[static_cast<size_t>(i) - 1]) *
-                       static_cast<size_t>(nalpha_);
-        double* dst = buf.subbuf.data();
-        for (int j = lo; j <= hi; ++j)
-            dst[j] = blk_row[b_idx_[static_cast<size_t>(j) - 1]];
-        return dst;
+        if (!tr_)
+            return buf.prof.data() + brow * w;
+        if (rw_prof_)
+            return buf.prof.data() + static_cast<size_t>(ra_[static_cast<size_t>(i) - 1]) * w;
     }
+    const size_t w = static_cast<size_t>(n_) + 1;
+    if (buf.subbuf.size() < w) buf.subbuf.resize(w);
+    const double* blk_row = blk_ + brow * static_cast<size_t>(nalpha_);
+    double* dst = buf.subbuf.data();
+    for (int j = lo; j <= hi; ++j)
+        dst[j] = blk_row[b_idx_[static_cast<size_t>(j) - 1]];
+    return dst;
 }
 
 
@@ -214,10 +235,15 @@ void Aligner<GM, AM, AB, T>::viterbi_affine_simd(DpBuffer& buf, const LevelKerne
     if constexpr (AM == AlignMode::Global) {
         at(buf.VM, 0, 0) = 0.0;
         const int bi = border_rows(), bj = border_cols();
+        if (tr_) {
+            for (int i = 1; i <= bi; ++i) at(buf.VX, i, 0) = tbx0_[static_cast<size_t>(i)];
+            for (int j = 1; j <= bj; ++j) at(buf.VY, 0, j) = -(tgoa_[0] + j * tgea_[0]);
+        } else {
         for (int i = 1; i <= bi; ++i)
             at(buf.VX, i, 0) = -(params_->gap_open_b + i * params_->gap_extend_b);
         for (int j = 1; j <= bj; ++j)
             at(buf.VY, 0, j) = -(params_->gap_open_a + j * params_->gap_extend_a);
+        }
     } else {
         for (int i = 0; i <= m_; ++i) at(buf.VM, i, 0) = 0.0;
         for (int j = 0; j <= n_; ++j) at(buf.VM, 0, j) = 0.0;
@@ -225,8 +251,8 @@ void Aligner<GM, AM, AB, T>::viterbi_affine_simd(DpBuffer& buf, const LevelKerne
 
     if constexpr (AB == AlignBand::Full) build_profile(buf);
 
-    const double go_a = params_->gap_open_a,   ge_a = params_->gap_extend_a;
-    const double go_b = params_->gap_open_b,   ge_b = params_->gap_extend_b;
+    double go_a = params_->gap_open_a,   ge_a = params_->gap_extend_a;
+    double go_b = params_->gap_open_b,   ge_b = params_->gap_extend_b;
 
     best_i_ = 0; best_j_ = 0; best_tbl_ = TBTable::M;
     double best_local = 0.0;
@@ -234,6 +260,10 @@ void Aligner<GM, AM, AB, T>::viterbi_affine_simd(DpBuffer& buf, const LevelKerne
     for (int i = 1; i <= m_; ++i) {
         const int lo = jlo(i), hi = jhi(i);
         if (lo > hi) continue;
+        if (tr_) {   // this row's penalties (T = double here: the arrays hold the fields)
+            go_a = tgoa_[static_cast<size_t>(i)]; ge_a = tgea_[static_cast<size_t>(i)];
+            go_b = tgob_[static_cast<size_t>(i)]; ge_b = tgeb_[static_cast<size_t>(i)];
+        }
 
         const double* sr = subrow(buf, i, lo, hi);
 

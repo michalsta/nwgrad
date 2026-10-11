@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -207,6 +208,24 @@ namespace nwgrad_soft_base {
 // band region (plus a one-column margin and adjacent-row overlap, see band_row_span)
 // is initialised to NEG_INF; band-edge reads therefore always land on an initialised
 // cell and cannot corrupt max/lse operations with stale data from a previous problem.
+
+// A tracked problem's shared query profile (one row per distinct substitution row it
+// uses) is kept only while it fits in this many bytes; past it the kernels build each DP
+// row's profile row as they reach it — O(n) memory, one gather pass per row, the same
+// cell work as the profile when no two rows share a row.  1 MiB (an L2) by default;
+// NWGRAD_TRACK_PROFILE_BYTES overrides it at load, and the tests set it to 0 to drive
+// the per-row path.  Results are identical either way: it is a speed / memory knob.
+inline std::atomic<size_t>& track_profile_bytes() {
+    static std::atomic<size_t> v{[] {
+        if (const char* e = std::getenv("NWGRAD_TRACK_PROFILE_BYTES")) {
+            char* end = nullptr;
+            const unsigned long long x = std::strtoull(e, &end, 10);
+            if (end != e) return static_cast<size_t>(x);
+        }
+        return size_t(1) << 20;
+    }()};
+    return v;
+}
 
 template<GapModel GM, AlignMode AM, AlignBand AB = AlignBand::Full, class T = double>
 struct Aligner {
@@ -503,7 +522,7 @@ struct Aligner {
             return viterbi_score_;
         } else {
             const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
-            if (backend != kBackendScalar && !tr_) {   // INTERIM(tracks)
+            if (backend != kBackendScalar) {
                 const LevelKernels& K = level_kernels(backend);
                 auto fn = [&] {
                     if constexpr (std::is_same_v<T, double>) return K.score;
@@ -522,6 +541,7 @@ struct Aligner {
                     job.local = AM == AlignMode::Local;
                     job.variant = score_variant_env();
                     job.buf = &buf;
+                    if (tr_) fill_track_job_(job.tr, true, static_cast<size_t>(n_) + 16, lin);
                     fn(job);
                     return job.score;
                 }
@@ -767,6 +787,38 @@ private:
     // Per DP row 0..m, precision T: gaps in A within row i (open, extend); gaps in B into
     // row i (open, extend; [0] unused); the Global column-0 border of row i ([0] unused).
     std::vector<T>             tgoa_, tgea_, tgob_, tgeb_, tbx0_;
+    std::vector<T>             tzero_;                  // m+1 zeros: linear's opens, for the affine kernels
+    // The shared query profile's rows (TrackJob::ra/crow): each distinct stacked row once.
+    std::vector<uint32_t>      ra_, crow_;
+    bool                       compact_ready_ = false;  // ra_/crow_ describe this problem
+
+    // The per-row parameters a leveled kernel reads (TrackJob), `profile`: whether it
+    // builds a query profile (rows `row_len` elements long), so whether to offer one.
+    // `linear_opens_zero`: a linear problem run through an affine kernel (score only).
+    void fill_track_job_(TrackJob<T>& tj, bool profile, size_t row_len, bool linear_opens_zero = false) {
+        tj.rs = rs_.data();
+        tj.go_a = tgoa_.data(); tj.ge_a = tgea_.data();
+        tj.go_b = tgob_.data(); tj.ge_b = tgeb_.data();
+        tj.bx0 = tbx0_.data();
+        if (linear_opens_zero) {
+            tzero_.assign(static_cast<size_t>(m_) + 1, static_cast<T>(0));
+            tj.go_a = tj.go_b = tzero_.data();
+        }
+        tj.ra = nullptr; tj.crow = nullptr; tj.nrow = 0;
+        if (!profile) return;
+        if (!compact_ready_) {
+            crow_.assign(rs_.begin(), rs_.end());
+            std::sort(crow_.begin(), crow_.end());
+            crow_.erase(std::unique(crow_.begin(), crow_.end()), crow_.end());
+            ra_.resize(rs_.size());
+            for (size_t i = 0; i < rs_.size(); ++i)
+                ra_[i] = static_cast<uint32_t>(std::lower_bound(crow_.begin(), crow_.end(), rs_[i]) - crow_.begin());
+            compact_ready_ = true;
+        }
+        if (crow_.size() * row_len * sizeof(T) <= track_profile_bytes().load(std::memory_order_relaxed)) {
+            tj.ra = ra_.data(); tj.crow = crow_.data(); tj.nrow = static_cast<int>(crow_.size());
+        }
+    }
 
     // The set of DP row i (1..m) for matches and gaps in B, and of row i (0..m) for gaps in A.
     int tset(int i) const noexcept { return trk_[static_cast<size_t>(i) - 1]; }
@@ -817,6 +869,7 @@ private:
         rs_.resize(m);
         for (size_t i = 0; i < m; ++i)
             rs_[i] = static_cast<uint32_t>(trk_[i]) * static_cast<uint32_t>(nalpha_) + a_idx_[i];
+        compact_ready_ = false;
         tgoa_.resize(m + 1); tgea_.resize(m + 1); tgob_.resize(m + 1); tgeb_.resize(m + 1);
         tbx0_.resize(m + 1);
         for (size_t i = 0; i <= m; ++i) {
@@ -1639,7 +1692,7 @@ private:
         // (a Hirschberg mode reaches here only for a short pair — see above)
         const bool use_ptr = (tb_ == TracebackMode::Pointers || is_hirschberg(tb_)) &&
                              (AB == AlignBand::Full);
-        if (backend == kBackendScalar || tr_) {   // INTERIM(tracks): no tracked simd kernel yet
+        if (backend == kBackendScalar) {
             if (use_ptr) viterbi_affine_ptr(buf); else viterbi_affine(buf);
             return;
         }
@@ -1688,6 +1741,7 @@ private:
         job.align_band = 0; job.band = 0;
         job.guide_j = nullptr; job.guide_len = 0;
         job.buf = &buf;
+        if (tr_) fill_track_job_(job.tr, true, static_cast<size_t>(n_) + 16);
         if constexpr (std::is_same_v<T, double>) { if (use_ptr) K.viterbi_ptr(job); else K.viterbi(job); }
         else                                     { if (use_ptr) K.viterbi_ptr_f(job); else K.viterbi_f(job); }
         pointers_ = use_ptr;   // Pointers leaves codes, not score tables
@@ -1716,7 +1770,8 @@ private:
     // load, not a gather.  Full mode serves a slice of the prebuilt query
     // profile; banded mode gathers the row's short span into buf.subbuf, since a
     // full-width profile would outcost the banded DP.  Defined in aligner_simd.hpp.
-    void build_profile(DpBuffer& buf) const;
+    void build_profile(DpBuffer& buf);
+    bool rw_prof_ = false;   // tracked row-wise Full: build_profile kept a compact profile
     const double* subrow(DpBuffer& buf, int i, int lo, int hi) const;
 
     // ═════════════════════════════════════════════════════════════════════════

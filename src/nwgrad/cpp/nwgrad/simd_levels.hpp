@@ -20,6 +20,7 @@
 // feature of the built extension, where CMake compiles the level TUs with flags.
 
 #include <atomic>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -123,6 +124,36 @@ inline int best_simd_backend() { return (int)detect_available_levels().back(); }
 // level: it switches internally on mode/band (Global/Local × Full/GuideBanded) and
 // runs striped (Global+Full) or row-wise (the rest).  Plain-typed in and out.
 
+// ── Tracks: per-row parameters (see aligner.hpp, "Tracks") ───────────────────
+//
+// A tracked problem reads each DP row's penalties and substitution row from here; an
+// untracked one leaves `go_a` null, and every kernel then runs its untracked code (a
+// template instantiation of its own, so the untracked fill is the code it always was).
+// Row i (1..m) consumes a[i-1].  Arrays are indexed by the ABSOLUTE DP row, so a
+// sub-block sweep (Hirschberg) reads the rows it covers.
+//   rs        m: the stacked substitution row of DP row i at [i-1] — set*nalpha + a[i-1],
+//             a row of `blk`, which then holds the K matrices back to back
+//   ra/crow   the query profile's rows: ra[i-1] is DP row i's profile row, crow[r] the
+//             stacked row profile row r holds (nrow of them, each distinct).  ra null:
+//             no shared profile — a kernel builds each DP row's profile row from rs as it
+//             reaches it (the caller's choice when nrow profile rows would not fit)
+//   go_a/ge_a m+1: gaps in A within row i (row 0 included)
+//   go_b/ge_b m+1: gaps in B into row i ([0] unused)
+//   bx0       m+1: the Global column-0 border of row i (affine VX, linear H; [0] unused)
+//   rgo_b/rge_b m+1: the reverse sweeps' gaps in B (Hirschberg; see aligner.hpp)
+template <class T>
+struct TrackJob {
+    const uint32_t* rs = nullptr;
+    const uint32_t* ra = nullptr;
+    const uint32_t* crow = nullptr;
+    int nrow = 0;
+    const T* go_a = nullptr; const T* ge_a = nullptr;
+    const T* go_b = nullptr; const T* ge_b = nullptr;
+    const T* bx0 = nullptr;
+    const T* rgo_b = nullptr; const T* rge_b = nullptr;
+    bool on() const noexcept { return go_a != nullptr; }
+};
+
 // Everything a forward pass needs, and everything it produces — no std::simd, no
 // Aligner: the only currency that crosses a level boundary.  Templated on the Viterbi
 // precision T (double or float32): the substitution block, gap penalties and DP buffer
@@ -147,6 +178,7 @@ struct ViterbiJob {
     int     best_i, best_j, best_tbl;       // best_tbl: 0=M 1=X 2=Y
     int     table_layout;                   // 0 = row-major VM/VX/VY, 1 = striped
     int     seg, width;                     // striping geometry (set when layout==1)
+    TrackJob<T> tr;                         // tracked rows (tr.on()), else untracked
 };
 
 // One striped-Full entry per precision.  Both are registered by each level TU.
@@ -171,6 +203,7 @@ struct ScoreJob {
     int variant;                            // 0 auto, 1 two-pass, 2 fused three-state (measuring)
     DpBufferT<T>* buf;
     double score;                           // out
+    TrackJob<T> tr;                         // tracked rows (tr.on()), else untracked
 };
 using score_fn   = void (*)(ScoreJob<double>&);
 using score_fn_f = void (*)(ScoreJob<float>&);
@@ -199,6 +232,7 @@ struct HbJob {
     int in_x;                               // 1 = the path enters already inside a gap-in-b run
     DpBufferT<T>* buf;                      // scratch (striped rows, profile, open vector)
     T* outM; T* outX; T* outY;              // final row, CONTIGUOUS, index 0..ncols (0 = border)
+    TrackJob<T> tr;                         // tracked rows (tr.on()), else untracked
 };
 
 using hb_fn   = void (*)(HbJob<double>&);
@@ -235,6 +269,7 @@ struct HbScanJob {
     // outputs: the best cell and its block-1-based coordinates.  Default 0 at (0,0), so
     // an all-nonpositive local block reports the empty alignment.
     T best; int best_i; int best_j;
+    TrackJob<T> tr;                         // tracked rows (tr.on()), else untracked
 };
 
 using hbscan_fn   = void (*)(HbScanJob<double>&);
@@ -264,6 +299,7 @@ struct HbBaseJob {
     T fM; T fX; T fY;
     int seg;                                 // striping segment count (walk-back needs it)
     int width;                               // vector lane count W (walk-back needs it)
+    TrackJob<T> tr;                         // tracked rows (tr.on()), else untracked
 };
 
 using hbbase_fn   = void (*)(HbBaseJob<double>&);

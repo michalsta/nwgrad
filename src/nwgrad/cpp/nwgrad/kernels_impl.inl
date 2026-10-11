@@ -66,10 +66,65 @@ using vd = stdx::native_simd<double>;
 static constexpr int KW = (int)vd::size();     // native double-lane count (row_kernel uses it)
 static constexpr double K_NINF = -std::numeric_limits<double>::infinity();
 
+// ── Tracked rows: the striped query profile ───────────────────────────────────
+// One striped profile row: prof[s*W + l] = row[b[col(l,s)-1]], padding -> -inf.
+template <class T>
+static inline void striped_profile_row(T* dst, const T* row, const unsigned char* b,
+                                       int n, int seg, int W) {
+    const T ninf = -std::numeric_limits<T>::infinity();
+    for (int l = 0; l < W; ++l)
+        for (int s = 0; s < seg; ++s) {
+            const int j = l * seg + s + 1;
+            dst[(std::size_t)s * W + l] = (j <= n) ? row[b[j - 1]] : ninf;
+        }
+}
+// The profile rows a striped fill reads (see TrackJob): Tr with tr.ra builds one per
+// compact symbol; Tr without it builds none here (striped_row_profile builds each DP
+// row's as the fill reaches it, into the single row reserved); untracked, one per
+// alphabet symbol — exactly the loop the untracked kernels always ran.
+template <class T, bool Tr>
+static inline void striped_profile_build(typename DpBufferT<T>::TVec& prof, const T* blk,
+                                         int nalpha, const unsigned char* b, int n, int seg, int W,
+                                         const TrackJob<T>& tr) {
+    const std::size_t sw = (std::size_t)seg * W;
+    if constexpr (Tr) {
+        if (tr.ra) {
+            if (prof.size() < (std::size_t)tr.nrow * sw) prof.resize((std::size_t)tr.nrow * sw);
+            for (int c = 0; c < tr.nrow; ++c)
+                striped_profile_row(prof.data() + (std::size_t)c * sw, blk + (std::size_t)tr.crow[c] * nalpha,
+                                    b, n, seg, W);
+        } else if (prof.size() < sw) {
+            prof.resize(sw);
+        }
+    } else {
+        (void)tr;
+        if (prof.size() < (std::size_t)nalpha * sw) prof.resize((std::size_t)nalpha * sw);
+        for (int c = 0; c < nalpha; ++c)
+            striped_profile_row(prof.data() + (std::size_t)c * sw, blk + (std::size_t)c * nalpha, b, n, seg, W);
+    }
+}
+// DP row i's profile row (1-based i).
+template <class T, bool Tr>
+static inline const T* striped_row_profile(T* prof, const T* blk, int nalpha, const unsigned char* a,
+                                           const unsigned char* b, int n, int seg, int W, int i,
+                                           const TrackJob<T>& tr) {
+    const std::size_t sw = (std::size_t)seg * W;
+    if constexpr (Tr) {
+        if (tr.ra) return prof + (std::size_t)tr.ra[i - 1] * sw;
+        striped_profile_row(prof, blk + (std::size_t)tr.rs[i - 1] * nalpha, b, n, seg, W);
+        return prof;
+    } else {
+        (void)blk; (void)nalpha; (void)b; (void)n; (void)W; (void)tr;
+        return prof + (std::size_t)a[i - 1] * sw;
+    }
+}
+
 // ── striped affine forward, Full (Global if !Local, else Local) ───────────────
 // Templated on the Viterbi precision T (double or float32).  vd / W / the -inf
 // sentinel are all local to T here, shadowing the file-scope double versions above.
-template <class T, bool Local>
+// Tr: a tracked problem (job.tr) — each row's penalties, border and profile row from
+// the track arrays, in the same expressions, so equal sets give the untracked tables.
+template <class T, bool Local, bool Tr = false>
 static void striped_affine_full(ViterbiJob<T>& job) {
     using vd = stdx::native_simd<T>;
     const int W = (int)vd::size();                       // native T-lane count for this level
@@ -77,7 +132,9 @@ static void striped_affine_full(ViterbiJob<T>& job) {
 
     const int m = job.m, n = job.n;
     const int nalpha = job.nalpha;
-    const T go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;
+    T go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;
+    const TrackJob<T>& tr = job.tr;
+    if constexpr (Tr) { go_a = tr.go_a[0]; ge_a = tr.ge_a[0]; }   // row 0's gaps in A
     const T* blk = job.blk;
     const unsigned char* a = job.a;
     const unsigned char* b = job.b;
@@ -95,7 +152,6 @@ static void striped_affine_full(ViterbiJob<T>& job) {
     const std::size_t rowsz = (std::size_t)(seg + 1) * W;
     const std::size_t off   = (std::size_t)W;   // striped columns start here (col 0 at 0)
     if (buf.sopenv.size() < sw)     buf.sopenv.resize(sw);
-    if (buf.sprof.size()  < (std::size_t)nalpha * sw) buf.sprof.resize((std::size_t)nalpha * sw);
     const std::size_t vsz = (std::size_t)(m + 1) * rowsz;
     // Per vector, never keyed on one (see kernels_pointers_impl.inl): a fill that grows
     // only part of a group must not leave the rest short for the next one.
@@ -106,15 +162,7 @@ static void striped_affine_full(ViterbiJob<T>& job) {
     };
 
     // striped query profile: prof[c][s*W+l] = score(c, b[col(l,s)-1]), padding -> NINF
-    for (int c = 0; c < nalpha; ++c) {
-        const T* row = blk + (std::size_t)c * nalpha;
-        T* dst = buf.sprof.data() + (std::size_t)c * sw;
-        for (int l = 0; l < W; ++l)
-            for (int s = 0; s < seg; ++s) {
-                const int j = l * seg + s + 1;
-                dst[(std::size_t)s * W + l] = (j <= n) ? row[b[j - 1]] : K_NINF;
-            }
-    }
+    striped_profile_build<T, Tr>(buf.sprof, blk, nalpha, b, n, seg, W, tr);
 
     T* ov = buf.sopenv.data();
 
@@ -138,7 +186,7 @@ static void striped_affine_full(ViterbiJob<T>& job) {
             }
     }
 
-    const vd vgo_a(go_a), vge_a(ge_a), vgo_b(go_b), vge_b(ge_b);
+    vd vgo_a(go_a), vge_a(ge_a), vgo_b(go_b), vge_b(ge_b);
     const vd vzero(static_cast<T>(0));
     // column-0 border of the previous row
     T bM = 0, bX = K_NINF, bY = K_NINF;
@@ -146,11 +194,17 @@ static void striped_affine_full(ViterbiJob<T>& job) {
     T best_local = 0; int best_i = 0, best_j = 0, best_tbl = 0;
 
     for (int i = 1; i <= m; ++i) {
+        if constexpr (Tr) {
+            go_a = tr.go_a[i]; ge_a = tr.ge_a[i]; go_b = tr.go_b[i]; ge_b = tr.ge_b[i];
+            vgo_a = vd(go_a); vge_a = vd(ge_a); vgo_b = vd(go_b); vge_b = vd(ge_b);
+        }
         // column-0 border of this row
         const T nbM = Local ? T(0) : K_NINF;
-        const T nbX = Local ? K_NINF : -(go_b + i * ge_b);
+        T nbX;
+        if constexpr (Tr) nbX = Local ? K_NINF : tr.bx0[i];
+        else              nbX = Local ? K_NINF : -(go_b + i * ge_b);
         const T nbOpen = (std::max(nbM, nbX) - go_a) - ge_a;
-        const T* sub = buf.sprof.data() + (std::size_t)a[i - 1] * sw;
+        const T* sub = striped_row_profile<T, Tr>(buf.sprof.data(), blk, nalpha, a, b, n, seg, W, i, tr);
 
         // this row and the previous row, striped, written in place in the tables
         T* cM = buf.VM.data() + (std::size_t)i * rowsz + off;
@@ -295,6 +349,11 @@ static void striped_affine_full(ViterbiJob<T>& job) {
 // is not handled here (the caller routes it to the row-wise kernel).
 template <class T>
 static void striped_full_entry(ViterbiJob<T>& job) {
+    if (job.tr.on()) {
+        if (job.align_mode) striped_affine_full<T, true, true>(job);
+        else                striped_affine_full<T, false, true>(job);
+        return;
+    }
     if (job.align_mode) striped_affine_full<T, true>(job);
     else                striped_affine_full<T, false>(job);
 }
