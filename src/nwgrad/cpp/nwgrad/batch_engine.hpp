@@ -989,6 +989,10 @@ private:
     // with equal params share one copy, so the inter-pair plan (which groups pairs by
     // params address) still shares a fill across them.  Behind unique_ptr so the
     // addresses survive a move of the engine.
+    // Per owned params: its gap fields cast to T, 4 per set (setup_tracks_ reads them),
+    // and (float32, K > 1) its whole matrix stack cast to T.
+    struct Prep { const AlignParams* p; std::vector<T> stack; std::vector<T> gaps; };
+    std::vector<Prep> prep_;
     std::vector<std::unique_ptr<const AlignParams>> params_own_;
     std::unordered_multimap<size_t, const AlignParams*> params_idx_;
 
@@ -1027,22 +1031,37 @@ private:
         params_own_.push_back(std::make_unique<const AlignParams>(p));
         const AlignParams* q = params_own_.back().get();
         params_idx_.emplace(h, q);
+        Prep pr;
+        pr.p = q;
+        const std::vector<double> all = q->all_gaps();
+        pr.gaps.resize(all.size());
+        for (size_t k = 0; k < all.size(); ++k) pr.gaps[k] = static_cast<T>(all[k]);
         if constexpr (!std::is_same_v<T, double>) {
             if (q->num_sets() > 1) {
                 const size_t nk = static_cast<size_t>(q->matrix.size()) * q->matrix.size() * q->num_sets();
-                std::vector<T>& v = prep_[q];
-                v.resize(nk);
-                for (size_t k = 0; k < nk; ++k) v[k] = static_cast<T>(q->matrix.data()[k]);
+                pr.stack.resize(nk);
+                for (size_t k = 0; k < nk; ++k) pr.stack[k] = static_cast<T>(q->matrix.data()[k]);
             }
         }
+        prep_.push_back(std::move(pr));
         return q;
     }
-    // The prepared stack of pair i's params (float32 tracked), or null.
+    // A batch owns one or two params copies: a linear scan, cheaper per pair than a hash.
+    const Prep* prep_find_(const AlignParams* p) const {
+        for (const Prep& x : prep_) if (x.p == p) return &x;
+        return nullptr;
+    }
+    // Owned params' gap fields cast to T (4 per set), for setup_tracks_.
+    const T* prep_gaps_(const AlignParams* p) const {
+        const Prep* x = prep_find_(p);
+        return x ? x->gaps.data() : nullptr;
+    }
+    // The prepared stack of pair i's params (float32, K > 1), or null.
     const T* prep_of_(const AlignParams* p) const {
         if constexpr (std::is_same_v<T, double>) { (void)p; return nullptr; }
         else {
-            auto it = prep_.find(p);
-            return it == prep_.end() ? nullptr : it->second.data();
+            const Prep* x = prep_find_(p);
+            return (x && !x->stack.empty()) ? x->stack.data() : nullptr;
         }
     }
     // Free the copies no segment points at any more (after set_params*).
@@ -1054,8 +1073,7 @@ private:
         auto in_use = [&](const AlignParams* q) { return std::binary_search(used.begin(), used.end(), q); };
         for (auto it = params_idx_.begin(); it != params_idx_.end();)
             it = in_use(it->second) ? std::next(it) : params_idx_.erase(it);
-        for (auto it = prep_.begin(); it != prep_.end();)
-            it = in_use(it->first) ? std::next(it) : prep_.erase(it);
+        std::erase_if(prep_, [&](const Prep& x) { return !in_use(x.p); });
         std::erase_if(params_own_, [&](const auto& u) { return !in_use(u.get()); });
     }
 
@@ -1090,7 +1108,6 @@ private:
     std::vector<size_t>   sro_{0};
     // float32 tracked: each owned params' whole matrix stack in T, cast once (the Aligner
     // would otherwise cast K matrices per pair).  Keyed by the owned copy.
-    std::unordered_map<const AlignParams*, std::vector<T>> prep_;
     // Stored paths (keep_paths): run-length ops, (type << 30) | length, type 0 = both
     // advance, 1 = gap in B (A advances), 2 = gap in A; and the cell the path ends at.
     std::vector<std::vector<uint32_t>> path_;
@@ -1435,7 +1452,7 @@ private:
     template<class Al>
     void problem_(Al& al, size_t i, const AlignParams& p, int band, std::vector<int> guide) const {
         if (tracked_) al.set_problem(codes_a(i), codes_b(i), p, band, std::move(guide),
-                                     track(i), gap_track(i), prep_of_(&p));
+                                     track(i), gap_track(i), prep_of_(&p), prep_gaps_(&p));
         else          al.set_problem(codes_a(i), codes_b(i), p, band, std::move(guide));
     }
     void store_grad_(size_t i, const AlignParams& g) {

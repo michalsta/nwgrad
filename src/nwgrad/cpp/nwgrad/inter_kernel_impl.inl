@@ -151,6 +151,15 @@ struct InterCommon {
             }
             return;
         }
+        if constexpr (Tr) {   // each lane's row once, then its letters
+            const T* rowp[IW];
+            for (int l = 0; l < IW; ++l) rowp[l] = J.blk + brow<Tr>(l, i) * na;
+            for (int c = 0; c < 8; ++c) {
+                const int cc = c < na ? c : 0;
+                for (int l = 0; l < IW; ++l) P[c][l] = rowp[l][cc];
+            }
+            return;
+        }
         for (int c = 0; c < 8; ++c) {
             const int cc = c < na ? c : 0;
             for (int l = 0; l < IW; ++l)

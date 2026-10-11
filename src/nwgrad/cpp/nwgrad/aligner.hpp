@@ -293,7 +293,7 @@ struct Aligner {
                      std::vector<int> guide_j = {},
                      std::span<const uint16_t> track = {},
                      std::span<const uint16_t> gap_track = {},
-                     const T* blkT = nullptr) {
+                     const T* blkT = nullptr, const T* gapsT = nullptr) {
         // Invalidate first: a guide rejected below must not leave the previous
         // problem's results readable against this problem's sequences.
         problem_set_      = false;
@@ -357,7 +357,7 @@ struct Aligner {
                 guide_j_ = std::move(guide_j);
             }
         }
-        if (tr_) setup_tracks_(track, gap_track);
+        if (tr_) setup_tracks_(track, gap_track, gapsT);
         problem_set_      = true;
     }
 
@@ -948,7 +948,10 @@ private:
     double drow_go_b(int i) const noexcept { return tr_ ? params_->gap(tset(i), AlignParams::kOpenB)   : params_->gap_open_b; }
     double drow_ge_b(int i) const noexcept { return tr_ ? params_->gap(tset(i), AlignParams::kExtendB) : params_->gap_extend_b; }
 
-    void setup_tracks_(std::span<const uint16_t> track, std::span<const uint16_t> gap_track) {
+    // `gapsT`: params' gap fields already cast to T, 4 per set (the batch prepares them
+    // once per params); null: read and cast here.
+    void setup_tracks_(std::span<const uint16_t> track, std::span<const uint16_t> gap_track,
+                       const T* gapsT = nullptr) {
         const int K = params_->num_sets();
         const size_t m = static_cast<size_t>(m_);
         if (!track.empty() && track.size() != m)
@@ -986,17 +989,28 @@ private:
         rev_ready_ = false;
         tgoa_.resize(m + 1); tgea_.resize(m + 1); tgob_.resize(m + 1); tgeb_.resize(m + 1);
         tbx0_.resize(m + 1);
-        for (size_t i = 0; i <= m; ++i) {
-            const int g = gtrk_[i];
-            tgoa_[i] = static_cast<T>(params_->gap(g, AlignParams::kOpenA));
-            tgea_[i] = static_cast<T>(params_->gap(g, AlignParams::kExtendA));
+        if (gapsT) {
+            for (size_t i = 0; i <= m; ++i) {
+                const T* g = gapsT + 4 * static_cast<size_t>(gtrk_[i]);
+                tgoa_[i] = g[AlignParams::kOpenA]; tgea_[i] = g[AlignParams::kExtendA];
+            }
+            for (size_t i = 1; i <= m; ++i) {
+                const T* g = gapsT + 4 * static_cast<size_t>(trk_[i - 1]);
+                tgob_[i] = g[AlignParams::kOpenB]; tgeb_[i] = g[AlignParams::kExtendB];
+            }
+        } else {
+            for (size_t i = 0; i <= m; ++i) {
+                const int g = gtrk_[i];
+                tgoa_[i] = static_cast<T>(params_->gap(g, AlignParams::kOpenA));
+                tgea_[i] = static_cast<T>(params_->gap(g, AlignParams::kExtendA));
+            }
+            for (size_t i = 1; i <= m; ++i) {
+                const int t = trk_[i - 1];
+                tgob_[i] = static_cast<T>(params_->gap(t, AlignParams::kOpenB));
+                tgeb_[i] = static_cast<T>(params_->gap(t, AlignParams::kExtendB));
+            }
         }
         tgob_[0] = tgeb_[0] = tbx0_[0] = static_cast<T>(0);
-        for (size_t i = 1; i <= m; ++i) {
-            const int t = trk_[i - 1];
-            tgob_[i] = static_cast<T>(params_->gap(t, AlignParams::kOpenB));
-            tgeb_[i] = static_cast<T>(params_->gap(t, AlignParams::kExtendB));
-        }
         // The column-0 border, by runs of bitwise-equal extends (see above).
         T csum = static_cast<T>(0);     // C_{s-1}: the sum over rows before the current run
         size_t s = 1;                   // the current run's first row
