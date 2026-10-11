@@ -511,9 +511,9 @@ public:
                 double* gi = gaps + i * K * 4;
                 std::fill(mi, mi + K * nn_, 0.0);
                 std::fill(gi, gi + K * 4, 0.0);
-                Touched t;
+                Touched& t = touched_tls_();
                 pair_grad_(i, t);
-                for (size_t q = 0; q < t.keys.size(); ++q) {
+                for (size_t q = 0; q < t.n; ++q) {
                     const size_t k = t.keys[q];
                     if (k < K * nn_) mi[k] = t.vals[q]; else gi[k - K * nn_] = t.vals[q];
                 }
@@ -1219,23 +1219,45 @@ private:
             d[k >> 2] = static_cast<uint8_t>(d[k >> 2] | (moves[k] << ((k & 3) * 2)));
         tps_[i] = {i0, j0, static_cast<int32_t>(moves.size())};
     }
-    // One pair's gradient, sparse: the fields it touches (keys, in first-touch order) and
-    // their values; `slot` (one per field of the flat K-set layout, 0 = untouched, else
-    // position + 1) finds a field's entry, and is left all-zero again after each pair.
+    // One pair's gradient, sparse: the first n entries of keys / vals are the fields it
+    // touches (in first-touch order) and their values.  `slot` has one entry per field of
+    // the flat K-set layout and is left all-zero again after each pair; while a pair is
+    // gathered it holds a hard path's step COUNT per field (count / end_counts), or a soft
+    // block's position + 1 at the block's first field (add_block / end_blocks).
     struct Touched {
         std::vector<uint32_t> keys, slot;
         std::vector<double> vals;
-        void begin(size_t nfields) {
-            keys.clear(); vals.clear();
+        size_t n = 0;
+        void begin(size_t nfields, size_t maxkeys) {
             if (slot.size() < nfields) slot.assign(nfields, 0);
+            if (keys.size() < maxkeys) { keys.resize(maxkeys); vals.resize(maxkeys); }
+            n = 0;
         }
-        void add(size_t k, double v) {
-            uint32_t& sl = slot[k];
-            if (sl) { vals[sl - 1] += v; return; }
-            keys.push_back(static_cast<uint32_t>(k)); vals.push_back(v);
-            sl = static_cast<uint32_t>(keys.size());
+        // One step on field k: its key is kept on the first (no branch).
+        void count(uint32_t k) { keys[n] = k; n += slot[k]++ == 0; }
+        // The counts as values, negative from field `neg` on (the gap fields).
+        void end_counts(uint32_t neg) {
+            for (size_t q = 0; q < n; ++q) {
+                const uint32_t k = keys[q];
+                const double c = static_cast<double>(slot[k]);
+                vals[q] = k >= neg ? -c : c;
+                slot[k] = 0;
+            }
         }
-        void end() { for (uint32_t k : keys) slot[k] = 0; }
+        // `len` values onto the fields k0.. (the layout's blocks are disjoint, and a block
+        // always comes with the same k0 and len).
+        void add_block(uint32_t k0, const double* v, uint32_t len) {
+            uint32_t& sl = slot[k0];
+            if (sl) {
+                double* d = vals.data() + (sl - 1);
+                for (uint32_t q = 0; q < len; ++q) d[q] += v[q];
+                return;
+            }
+            sl = static_cast<uint32_t>(n + 1);
+            for (uint32_t q = 0; q < len; ++q) { keys[n + q] = k0 + q; vals[n + q] = v[q]; }
+            n += len;
+        }
+        void end_blocks() { for (size_t q = 0; q < n; ++q) slot[keys[q]] = 0; }
     };
     // Pair i's hard gradient from its stored path, sparse into `t`: every field of the
     // flat K-set layout it touches — the matrix stack first (set*n*n + a*n + b), then the
@@ -1245,30 +1267,30 @@ private:
         const auto tk = track(i), gk = gap_track(i);
         const size_t na = static_cast<size_t>(alpha_->size());
         const size_t gbase = static_cast<size_t>(nsets_) * nn_;
-        t.begin(kstride_());
         const uint8_t* d = tp_.data() + tpo_[i];
         size_t r = static_cast<size_t>(tps_[i][0]), c = static_cast<size_t>(tps_[i][1]);
         const int steps = tps_[i][2];
+        t.begin(kstride_(), 2 * static_cast<size_t>(steps) + 1);
         int prev = 3;
         for (int k = 0; k < steps; ++k) {
             const int mv = (d[k >> 2] >> ((k & 3) * 2)) & 3;
             if (mv == 0) {
-                t.add(static_cast<size_t>(tk[r]) * nn_ + ca[r] * na + cb[c], 1.0);
+                t.count(static_cast<uint32_t>(static_cast<size_t>(tk[r]) * nn_ + ca[r] * na + cb[c]));
                 ++r; ++c;
             } else if (mv == 1) {   // gap in B into row r+1: the set of residue a[r]
-                const size_t g = gbase + 4 * static_cast<size_t>(tk[r]);
-                if (GM == GapModel::Affine && prev != 1) t.add(g + AlignParams::kOpenB, -1.0);
-                t.add(g + AlignParams::kExtendB, -1.0);
+                const uint32_t g = static_cast<uint32_t>(gbase + 4 * static_cast<size_t>(tk[r]));
+                if (GM == GapModel::Affine && prev != 1) t.count(g + AlignParams::kOpenB);
+                t.count(g + AlignParams::kExtendB);
                 ++r;
             } else {                // gap in A within row r: its gap-track set
-                const size_t g = gbase + 4 * static_cast<size_t>(gk[r]);
-                if (GM == GapModel::Affine && prev != 2) t.add(g + AlignParams::kOpenA, -1.0);
-                t.add(g + AlignParams::kExtendA, -1.0);
+                const uint32_t g = static_cast<uint32_t>(gbase + 4 * static_cast<size_t>(gk[r]));
+                if (GM == GapModel::Affine && prev != 2) t.count(g + AlignParams::kOpenA);
+                t.count(g + AlignParams::kExtendA);
                 ++c;
             }
             prev = mv;
         }
-        t.end();
+        t.end_counts(static_cast<uint32_t>(gbase));
     }
     // The flat K-set gradient layout tpath_grad_ emits into, to and from an AlignParams.
     size_t kstride_() const noexcept { return static_cast<size_t>(nsets_) * (nn_ + 4); }
@@ -1351,7 +1373,7 @@ private:
                 const size_t end = std::min(n, (b + 1) * WEIGHTED_GRAD_BLOCK);
                 for (size_t i = b * WEIGHTED_GRAD_BLOCK; i < end; ++i) {
                     pair_grad_(i, t);
-                    const size_t nk = t.keys.size();
+                    const size_t nk = t.n;
                     if (weights) {
                         if (scaled.size() < nk) scaled.resize(nk);
                         scale_into_(scaled.data(), t.vals.data(), nk, weights[i]);
@@ -1371,8 +1393,6 @@ private:
         flat_to_params_(tot.data(), out);
         return out;
     }
-    // Pair i's stored tracked gradient, field by field (emit(index, value) into the flat
-    // K-set layout of tpath_grad_).
     // Pair i's stored soft record, scattered into the flat K-set layout (tpath_grad_'s):
     // row r's counts to its set's block, its gap fields to its sets — summed in row order,
     // each touched field emitted once.
@@ -1381,22 +1401,19 @@ private:
         const auto tk = track(i), gk = gap_track(i);
         const size_t na = static_cast<size_t>(alpha_->size()), m = len_a(i);
         const size_t gbase = static_cast<size_t>(nsets_) * nn_;
-        t.begin(kstride_());
+        t.begin(kstride_(), m * na + 4 * (m + 1));
         const double* rec = sr_.data() + sro_[i];
-        for (size_t r = 0; r < m; ++r) {
-            const size_t base = (static_cast<size_t>(tk[r]) * na + ca[r]) * na;
-            for (size_t c = 0; c < na; ++c) t.add(base + c, rec[r * na + c]);
-        }
+        const uint32_t nau = static_cast<uint32_t>(na);
+        for (size_t r = 0; r < m; ++r)   // row r's counts: its set's row of a[r]
+            t.add_block(static_cast<uint32_t>((static_cast<size_t>(tk[r]) * na + ca[r]) * na), rec + r * na, nau);
         const double* g = rec + m * na;
-        for (size_t r = 0; r <= m; ++r) {
-            t.add(gbase + 4 * static_cast<size_t>(gk[r]) + AlignParams::kOpenA, g[4 * r]);
-            t.add(gbase + 4 * static_cast<size_t>(gk[r]) + AlignParams::kExtendA, g[4 * r + 1]);
-            if (r > 0) {
-                t.add(gbase + 4 * static_cast<size_t>(tk[r - 1]) + AlignParams::kOpenB, g[4 * r + 2]);
-                t.add(gbase + 4 * static_cast<size_t>(tk[r - 1]) + AlignParams::kExtendB, g[4 * r + 3]);
-            }
+        for (size_t r = 0; r <= m; ++r) {   // (open, extend) pairs: A's of row r, B's into it
+            t.add_block(static_cast<uint32_t>(gbase + 4 * static_cast<size_t>(gk[r]) + AlignParams::kOpenA), g + 4 * r, 2);
+            if (r > 0)
+                t.add_block(static_cast<uint32_t>(gbase + 4 * static_cast<size_t>(tk[r - 1]) + AlignParams::kOpenB),
+                            g + 4 * r + 2, 2);
         }
-        t.end();
+        t.end_blocks();
     }
     // Pair i's stored tracked gradient, sparse into `t` (keys / vals).
     void pair_grad_(size_t i, Touched& t) const {
@@ -1404,10 +1421,11 @@ private:
         else                              tpath_grad_(i, t);
     }
     void pair_flat_grad_(size_t i, double* flat) const {
-        Touched t;
+        Touched& t = touched_tls_();
         pair_grad_(i, t);
-        for (size_t q = 0; q < t.keys.size(); ++q) flat[t.keys[q]] = t.vals[q];
+        for (size_t q = 0; q < t.n; ++q) flat[t.keys[q]] = t.vals[q];
     }
+    static Touched& touched_tls_() { static thread_local Touched t; return t; }
 
     // ── A worker's state: one buffer, one Aligner per band, gradient scratch ─────
     struct Work {
@@ -1424,6 +1442,10 @@ private:
         std::vector<std::vector<double>> srw;     // ... and weights (InterSoftJob::rs / rw)
         std::vector<const uint32_t*> srsp;
         std::vector<const double*> srwp;
+        // ... and each set's four weights, of params *swp: valid for one call (inter-pair
+        // groups run on the call's own Works, never on the persistent solo_).
+        const AlignParams* swp = nullptr;
+        std::vector<double> sw;
         explicit Work(const BatchEngine& e) : g(e.alphabet(), e.nsets_) { configure(e); }
         // The batch's settings, (re)applied: a reused Work follows setting changes.
         void configure(const BatchEngine& e) {
@@ -1772,6 +1794,18 @@ private:
         const double it = 1.0 / s_.soft_temperature, big = std::numeric_limits<double>::max();
         const uint32_t na = static_cast<uint32_t>(alpha_->size());
         constexpr bool lin = GM == GapModel::Linear;
+        if (w.swp != &P) {   // each set's four weights, once per params and call
+            const int K = P.num_sets();
+            w.sw.assign(4 * static_cast<size_t>(K), 0.0);
+            for (int k = 0; k < K; ++k) {
+                double* sk = w.sw.data() + 4 * static_cast<size_t>(k);
+                sk[1] = std::exp(-P.gap(k, AlignParams::kExtendA) * it);
+                if (!lin) sk[0] = std::exp(-(P.gap(k, AlignParams::kOpenA) + P.gap(k, AlignParams::kExtendA)) * it);
+                sk[3] = std::exp(-P.gap(k, AlignParams::kExtendB) * it);
+                if (!lin) sk[2] = std::exp(-(P.gap(k, AlignParams::kOpenB) + P.gap(k, AlignParams::kExtendB)) * it);
+            }
+            w.swp = &P;
+        }
         bool ok = true;
         for (int l = 0; l < W; ++l) {
             const size_t ll = std::min<size_t>(static_cast<size_t>(l), real - 1);
@@ -1782,15 +1816,16 @@ private:
             const auto tk = track(i), gk = gap_track(i);
             rs.resize(m);
             for (size_t r = 0; r < m; ++r) rs[r] = static_cast<uint32_t>(tk[r]) * na + ca[r];
-            rw.assign(4 * (m + 1), 0.0);
+            rw.resize(4 * (m + 1));
+            const double* sw = w.sw.data();
             for (size_t r = 0; r <= m; ++r) {
-                const int g = gk[r];
-                rw[4 * r + 1] = std::exp(-P.gap(g, AlignParams::kExtendA) * it);
-                if (!lin) rw[4 * r] = std::exp(-(P.gap(g, AlignParams::kOpenA) + P.gap(g, AlignParams::kExtendA)) * it);
+                const size_t g = 4 * static_cast<size_t>(gk[r]);
+                rw[4 * r] = sw[g]; rw[4 * r + 1] = sw[g + 1];
                 if (r > 0) {
-                    const int t = tk[r - 1];
-                    rw[4 * r + 3] = std::exp(-P.gap(t, AlignParams::kExtendB) * it);
-                    if (!lin) rw[4 * r + 2] = std::exp(-(P.gap(t, AlignParams::kOpenB) + P.gap(t, AlignParams::kExtendB)) * it);
+                    const size_t t = 4 * static_cast<size_t>(tk[r - 1]);
+                    rw[4 * r + 2] = sw[t + 2]; rw[4 * r + 3] = sw[t + 3];
+                } else {
+                    rw[2] = rw[3] = 0.0;
                 }
                 for (int f = 0; f < 4; ++f) ok &= rw[4 * r + static_cast<size_t>(f)] <= big;
             }

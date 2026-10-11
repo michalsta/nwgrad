@@ -158,7 +158,9 @@ struct InterCommon {
             for (int l = 0; l < IW; ++l) rowp[l] = J.blk + brow<Tr>(l, i) * na;
             for (int c = 0; c < 8; ++c) {
                 const int cc = c < na ? c : 0;
-                for (int l = 0; l < IW; ++l) P[c][l] = rowp[l][cc];
+                ivd v{};   // (every lane written; the init keeps gcc's maybe-uninitialized quiet)
+                for (int l = 0; l < IW; ++l) v[l] = rowp[l][cc];
+                P[c] = v;
             }
             return;
         }
