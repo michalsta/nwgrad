@@ -363,6 +363,61 @@ struct Aligner {
 
     // Whether the current problem is tracked (see set_problem).
     bool tracked() const noexcept { return tr_; }
+    // The current tracked problem's per-row parameters for a kernel without a query
+    // profile (the inter-pair fills).  Valid until the next set_problem().
+    void track_job(TrackJob<T>& tj) { fill_track_job_(tj, false, 0, GM == GapModel::Linear); }
+
+    // The optimal path as forward moves (0 = diagonal, 1 = gap in B, 2 = gap in A) from
+    // its start cell (i0, j0), and (with gj) the guide, after compute_viterbi() — for
+    // storing a path instead of its gradient (a tracked batch's hard gradients: see
+    // BatchEngine).  The same walk hard_grad() takes, so the same moves.
+    void hard_path_and_guide(const DpBuffer& buf, std::vector<uint8_t>& moves, int& i0, int& j0,
+                             std::vector<int>* gj) const {
+        moves.clear();
+        if (hirschberg_) {
+            moves.assign(hops_.begin(), hops_.end());
+            i0 = hb_start_i_; j0 = hb_start_j_;
+            if (gj) *gj = guide_j_affine_hb();
+            return;
+        }
+        int ci = 0, cj = 0;   // the cell the last emitted move left from
+        if constexpr (GM == GapModel::Linear) {
+            ci = (AM == AlignMode::Global) ? m_ : best_i_;
+            cj = (AM == AlignMode::Global) ? n_ : best_j_;
+            if (gj) {
+                gj->assign(static_cast<size_t>(m_ + 1), -1);
+                (*gj)[0] = 0;
+                (*gj)[static_cast<size_t>(m_)] = n_;
+                const int i_end = (AM == AlignMode::Global) ? m_ : best_i_;
+                (*gj)[static_cast<size_t>(i_end)] = (AM == AlignMode::Global) ? n_ : best_j_;
+            }
+            walk_linear(buf, [&](int k, int i, int j) {
+                moves.push_back(static_cast<uint8_t>(k));
+                if (gj) {
+                    if (k == 0)      (*gj)[static_cast<size_t>(i - 1)] = j - 1;
+                    else if (k == 1) (*gj)[static_cast<size_t>(i - 1)] = j;
+                }
+                ci = (k == 2) ? i : i - 1;
+                cj = (k == 1) ? j : j - 1;
+            });
+        } else {
+            ci = best_i_; cj = best_j_;
+            if (gj) guide_affine_init(*gj);
+            walk_affine(buf, [&](TBTable st, int i, int j, bool) {
+                const uint8_t k = st == TBTable::M ? 0 : st == TBTable::X ? 1 : 2;
+                moves.push_back(k);
+                if (gj) {
+                    if (k == 0)      (*gj)[static_cast<size_t>(i - 1)] = j - 1;
+                    else if (k == 1) (*gj)[static_cast<size_t>(i - 1)] = j;
+                }
+                ci = (k == 2) ? i : i - 1;
+                cj = (k == 1) ? j : j - 1;
+            });
+        }
+        if (gj) fill_guide_gaps(*gj);
+        std::reverse(moves.begin(), moves.end());
+        i0 = ci; j0 = cj;
+    }
 
     // Allocate an empty buffer shell. Must be called once before compute_viterbi()
     // / compute_forward_back() with own buffer. Buffers grow implicitly as needed.

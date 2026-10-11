@@ -124,6 +124,20 @@ static std::vector<uint16_t> to_track(const nb::handle& obj, const char* what) {
     return out;
 }
 
+// A per-pair list of tracks (None, or one sequence per pair; an entry may be None for
+// that pair's default) as uint16 vectors.
+static std::vector<std::vector<uint16_t>> to_tracks(const nb::handle& obj, size_t n, const char* what) {
+    std::vector<std::vector<uint16_t>> out;
+    if (!obj.is_valid() || obj.is_none()) return out;
+    const size_t len = nb::len(obj);
+    if (len != n)
+        throw nb::value_error((std::string("nwgrad: ") + what + " needs one entry per pair (got " +
+                               std::to_string(len) + " for " + std::to_string(n) + " pairs)").c_str());
+    out.reserve(n);
+    for (nb::handle h : obj) out.push_back(to_track(h, what));
+    return out;
+}
+
 static GapModel parse_gap_model(const std::string& name) {
     if (name == "linear") return GapModel::Linear;
     if (name == "affine") return GapModel::Affine;
@@ -350,15 +364,18 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
             [](SP* self, const std::string& seq_a, const std::string& seq_b,
                const AlignParams& params, const std::string& gap_model,
                const std::string& mode, const std::string& grad_mode,
-               const std::string& kernel, const std::string& traceback) {
+               const std::string& kernel, const std::string& traceback,
+               nb::handle track, nb::handle gap_track) {
                 new (self) SP(seq_a, seq_b, params, parse_gap_model(gap_model),
                               parse_align_mode(mode), parse_grad_mode<GradMode>(grad_mode),
-                              parse_backend(kernel), parse_traceback(traceback));
+                              parse_backend(kernel), parse_traceback(traceback),
+                              to_track(track, "track"), to_track(gap_track, "gap_track"));
             },
             nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("params"),
             nb::arg("gap_model") = "affine", nb::arg("mode") = "global",
             nb::arg("grad_mode") = "hard", nb::arg("kernel") = "auto",
-            nb::arg("traceback") = "auto",
+            nb::arg("traceback") = "auto", nb::kw_only(),
+            nb::arg("track").none() = nb::none(), nb::arg("gap_track").none() = nb::none(),
             "One sequence pair, aligned on the calling thread.\n"
             "  gap_model : \"linear\" | \"affine\"\n"
             "  mode      : \"global\" | \"local\"\n"
@@ -367,6 +384,8 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
             "              \"avx512\" | \"neon\" — bit-exact speed knob (Viterbi path).\n"
             "  traceback : \"auto\" (default) | \"pointers\" | \"scores\" | \"hirschberg\"\n"
             "              | \"hirschberg_pmax\" — see SeqPairBatch.\n"
+            "  track / gap_track (keyword): parameter sets per residue of seq_a and per DP\n"
+            "              row for gaps in seq_a — see SeqPairBatch.add_many.\n"
             "A pair taken from a batch (batch[i]) is a view of that batch's pair i: its\n"
             "results are the batch's, and its settings (params, fill, soft options,\n"
             "hb_cutoff) are the batch's too — set them on the batch.")
@@ -491,7 +510,16 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
         .def_prop_ro("mode",      [](const SP& s) { return align_mode_name(s.align_mode()); })
         .def_prop_ro("grad_mode", [](const SP& s) { return grad_mode_name(s.grad_mode()); })
         .def_prop_ro("seq_a", [](const SP& s) { return s.seq_a(); })
-        .def_prop_ro("seq_b", [](const SP& s) { return s.seq_b(); });
+        .def_prop_ro("seq_b", [](const SP& s) { return s.seq_b(); })
+        .def_prop_ro("track", [](const SP& s) -> nb::object {
+            if (!s.tracked()) return nb::none();
+            return nb::cast(s.track());
+        }, "The pair's parameter set per residue of seq_a (None when not tracked).")
+        .def_prop_ro("gap_track", [](const SP& s) -> nb::object {
+            if (!s.tracked()) return nb::none();
+            return nb::cast(s.gap_track());
+        }, "The pair's parameter set per DP row 0..len(seq_a) for gaps in seq_a (None when\n"
+           "not tracked).");
 }
 
 // ── SeqPairBatch ─────────────────────────────────────────────────────────────
@@ -554,13 +582,32 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             "add_many",
             [](SPB& self, const std::vector<std::string_view>& seqs_a,
                const std::vector<std::string_view>& seqs_b, const AlignParams& params,
-               const std::string& kernel) {
-                self.add_many(seqs_a, seqs_b, params, parse_backend(kernel));
+               const std::string& kernel, nb::handle tracks, nb::handle gap_tracks) {
+                const auto tk = to_tracks(tracks, seqs_a.size(), "tracks");
+                const auto gk = to_tracks(gap_tracks, seqs_a.size(), "gap_tracks");
+                self.add_many(seqs_a, seqs_b, params, parse_backend(kernel),
+                              tracks.is_none() ? nullptr : &tk, gap_tracks.is_none() ? nullptr : &gk);
             },
             nb::arg("seqs_a"), nb::arg("seqs_b"), nb::arg("params"), nb::arg("kernel") = "auto",
+            nb::kw_only(), nb::arg("tracks").none() = nb::none(), nb::arg("gap_tracks").none() = nb::none(),
             "Append pairs under an owned copy of params (one segment). Sequences are\n"
             "validated and encoded in parallel; a bad character raises and adds nothing.\n"
-            "The problem type is fixed by the constructor.")
+            "The problem type is fixed by the constructor.\n"
+            "\n"
+            "Tracks.  params may hold K parameter sets (AlignParams.from_arrays /\n"
+            "AlignParams.stack); each residue of sequence A is then scored by the set its\n"
+            "track names.  tracks: one sequence per pair, len(seqs_a[i]) set indices in\n"
+            "[0, K); gap_tracks: one per pair, len(seqs_a[i]) + 1 indices, the set of each\n"
+            "DP row 0..len(A) for gaps in A.  Either may be None (every pair defaults), or an\n"
+            "entry None (that pair defaults): the track to all set 0, the gap track to\n"
+            "row 0 -> track[0] and row i -> track[i-1].  Within row i (1-based, after\n"
+            "residue i-1 of A): a match uses set track[i-1]'s matrix; a gap in B there\n"
+            "(A's residue against '-') costs track[i-1]'s gap_extend_b, plus its\n"
+            "gap_open_b if the gap run starts in that row; a gap in A within row i costs\n"
+            "gap_tracks[i]'s gap_open_a / gap_extend_a.  The gradient then has K sets\n"
+            "too.  A batch with tracks (or K > 1) is TRACKED: every pair carries tracks,\n"
+            "and every set_params() must keep K.  Its hard gradients are stored as paths\n"
+            "(2 bits per step) and summed on demand, so memory does not grow with K.")
         .def("__len__", &SPB::size)
         .def(
             "__getitem__",
@@ -654,11 +701,19 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             [](const SPB& self) {
                 const size_t N = self.size();
                 const size_t n = static_cast<size_t>(self.alphabet().size());   // throws if empty
-                double* mats = new double[std::max<size_t>(N * n * n, 1)];
+                const bool tr = self.tracked();
+                const size_t K = tr ? static_cast<size_t>(self.num_sets()) : 1;
+                double* mats = new double[std::max<size_t>(N * K * n * n, 1)];
                 nb::capsule mats_owner(mats, [](void* p) noexcept { delete[] static_cast<double*>(p); });
-                double* gaps = new double[std::max<size_t>(N * 4, 1)];
+                double* gaps = new double[std::max<size_t>(N * K * 4, 1)];
                 nb::capsule gaps_owner(gaps, [](void* p) noexcept { delete[] static_cast<double*>(p); });
                 self.grads_into(mats, gaps);
+                if (tr) {
+                    size_t mats_shape[4] = {N, K, n, n};
+                    size_t gaps_shape[3] = {N, K, 4};
+                    return nb::make_tuple(nb::ndarray<nb::numpy, double>(mats, 4, mats_shape, mats_owner),
+                                          nb::ndarray<nb::numpy, double>(gaps, 3, gaps_shape, gaps_owner));
+                }
                 size_t mats_shape[3] = {N, n, n};
                 size_t gaps_shape[2] = {N, 4};
                 return nb::make_tuple(nb::ndarray<nb::numpy, double>(mats, 3, mats_shape, mats_owner),
@@ -668,7 +723,13 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             "(matrices, gaps).  matrices has shape (N, n, n), rows and columns in the\n"
             "order of the batch's alphabet; gaps has shape (N, 4), with columns\n"
             "gap_open_a, gap_extend_a, gap_open_b, gap_extend_b.  Runs no alignment.\n"
-            "Raises on an empty batch and on a pair without a valid gradient.")
+            "Raises on an empty batch and on a pair without a valid gradient.  A tracked\n"
+            "batch returns every pair's K sets: shapes (N, K, n, n) and (N, K, 4) —\n"
+            "N*K*(n*n+4) doubles, so for many pairs prefer weighted_grad().")
+        .def_prop_ro("tracked", [](const SPB& s) { return s.tracked(); },
+                     "Whether the pairs carry tracks (add_many(tracks=...) or K > 1 sets).")
+        .def_prop_ro("num_sets", [](const SPB& s) { return s.num_sets(); },
+                     "K, the number of parameter sets of the batch's params (0 when empty).")
         .def("drop_paths", &SPB::drop_paths,
              "Free the stored alignment paths (score_and_grad(keep_paths=True)).")
         .def_prop_ro(

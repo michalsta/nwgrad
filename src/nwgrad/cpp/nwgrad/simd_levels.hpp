@@ -345,6 +345,10 @@ struct InterJobT {
     // right and down only, so they cannot reach its cells — and excluded from its Local
     // best; its pair adopts the tables at the group's stride (n+1).
     const int* nb = nullptr;
+    // Tracked (nullptr = untracked): W TrackJobs, one per lane, each lane's rows read from
+    // its own (rs into `blk`, which is then the stacked block; the four gap arrays; bx0).
+    // The go_*/ge_* scalars above are then unused.  ra/crow are not read: no profile here.
+    const TrackJob<T>* tr = nullptr;
 };
 using InterJob = InterJobT<double>;
 using inter_fn   = void (*)(InterJobT<double>&);

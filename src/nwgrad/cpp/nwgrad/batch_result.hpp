@@ -20,4 +20,6 @@ struct BatchResult {
     AlignParams grad;
 
     explicit BatchResult(const Alphabet& alpha) : grad(alpha) {}
+    // A zero gradient shaped like `params` (its alphabet and its number of sets).
+    explicit BatchResult(const AlignParams& params) : grad(AlignParams::zeros_like(params)) {}
 };

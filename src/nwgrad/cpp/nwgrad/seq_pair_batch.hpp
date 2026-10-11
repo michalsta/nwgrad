@@ -66,14 +66,18 @@ public:
 
     // ── Adding pairs ─────────────────────────────────────────────────────────
 
-    // Append a segment under an owned copy of params.
+    // Append a segment under an owned copy of params (tracks: see BatchEngine::add_many).
     void add_many(const std::vector<std::string_view>& seqs_a,
                   const std::vector<std::string_view>& seqs_b,
-                  const AlignParams& params, int kernel = kBackendAuto) {
-        visit([&](auto& e) { e.add_many(seqs_a, seqs_b, params, kernel); });
+                  const AlignParams& params, int kernel = kBackendAuto,
+                  const std::vector<std::vector<uint16_t>>* tracks = nullptr,
+                  const std::vector<std::vector<uint16_t>>* gap_tracks = nullptr) {
+        visit([&](auto& e) { e.add_many(seqs_a, seqs_b, params, kernel, tracks, gap_tracks); });
     }
 
     size_t size() const noexcept { return visit([](const auto& e) { return e.size(); }); }
+    bool tracked() const noexcept { return visit([](const auto& e) { return e.tracked(); }); }
+    int num_sets() const noexcept { return visit([](const auto& e) { return e.num_sets(); }); }
     const Alphabet& alphabet() const {
         return visit([](const auto& e) -> const Alphabet& { return e.alphabet(); });
     }
@@ -187,13 +191,17 @@ class SeqPairT {
 public:
     using Batch = SeqPairBatchT<T>;
 
-    // Standalone: a one-pair batch of its own, holding a copy of `params`.
+    // Standalone: a one-pair batch of its own, holding a copy of `params`; optionally
+    // tracked (empty: the default track / gap track).
     SeqPairT(std::string_view a, std::string_view b, const AlignParams& params,
              GapModel gm, AlignMode am, GradMode gd = GradMode::Hard,
-             int kernel = kBackendAuto, TracebackMode tb = TracebackMode::Default)
+             int kernel = kBackendAuto, TracebackMode tb = TracebackMode::Default,
+             std::vector<uint16_t> track = {}, std::vector<uint16_t> gap_track = {})
         : own_(std::make_unique<Batch>(gm, am, gd, 1, tb)), b_(own_.get()), i_(0) {
         own_->set_fill(false, false);   // one pair: nothing to share a vector with
-        own_->add_many({a}, {b}, params, kernel);
+        const bool tr = !track.empty() || !gap_track.empty();
+        std::vector<std::vector<uint16_t>> tk{std::move(track)}, gk{std::move(gap_track)};
+        own_->add_many({a}, {b}, params, kernel, tr ? &tk : nullptr, tr ? &gk : nullptr);
     }
     // View of pair i of `batch` (which must outlive the view).
     SeqPairT(Batch& batch, size_t i) : b_(&batch), i_(i) {}
@@ -231,6 +239,13 @@ public:
     // ── Results ──────────────────────────────────────────────────────────────
     double score() const { return ce([&](const auto& x) { return x.score(i_); }); }
     AlignParams grad() const { return ce([&](const auto& x) { return x.grad(i_); }); }
+    std::vector<uint16_t> track() const {
+        return ce([&](const auto& x) { auto t = x.track(i_); return std::vector<uint16_t>(t.begin(), t.end()); });
+    }
+    std::vector<uint16_t> gap_track() const {
+        return ce([&](const auto& x) { auto t = x.gap_track(i_); return std::vector<uint16_t>(t.begin(), t.end()); });
+    }
+    bool tracked() const { return b_->tracked(); }
     std::pair<std::string, std::string> aligned() const {
         return ce([&](const auto& x) { return x.aligned(i_); });
     }

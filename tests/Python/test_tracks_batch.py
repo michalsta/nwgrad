@@ -1,0 +1,308 @@
+"""Tracks in SeqPairBatch / SeqPair: storage, every fill, gradients stored as paths.
+
+Each pair of a tracked batch must give exactly what the single-pair functions give for
+that pair (themselves checked against an exhaustive oracle in test_tracks.py), under
+every fill — the inter-pair fill reads each lane's own rows — and every traceback; the
+sums (weighted_grad, compute_grad) must be the per-pair sums, and a batch whose sets
+are all equal must reproduce the untracked batch bit for bit.
+"""
+
+import numpy as np
+import pytest
+
+import nwgrad
+
+ALPHA = "ACGT"
+N = len(ALPHA)
+
+FUNCS = {
+    ("linear", "global"): "nw_grad",
+    ("linear", "local"): "sw_grad",
+    ("affine", "global"): "nw_affine_grad",
+    ("affine", "local"): "sw_affine_grad",
+}
+CASES = list(FUNCS)
+BATCH = {"_double": nwgrad.SeqPairBatchDouble, "": nwgrad.SeqPairBatch}
+PAIR = {"_double": nwgrad.SeqPairDouble, "": nwgrad.SeqPair}
+
+
+def to_params(mats, gaps):
+    return nwgrad.AlignParams.from_arrays(np.ascontiguousarray(mats), np.ascontiguousarray(gaps), ALPHA)
+
+
+def random_problem(rng, n_pairs, K, maxlen=30, integral=False, equal=False, mirna=False):
+    if mirna:   # PosimiR-shaped: A ~ 18..25, B ~ 50, one set per position
+        la = rng.integers(18, 26, size=n_pairs)
+        lb = rng.integers(45, 56, size=n_pairs)
+    else:
+        la = rng.integers(0, maxlen, size=n_pairs)
+        lb = rng.integers(0, maxlen, size=n_pairs)
+    A = ["".join(rng.choice(list(ALPHA), size=int(m))) for m in la]
+    B = ["".join(rng.choice(list(ALPHA), size=int(n))) for n in lb]
+    if integral:
+        mats = rng.integers(-3, 4, size=(K, N, N)).astype(float)
+        gaps = rng.integers(1, 4, size=(K, 4)).astype(float)
+    else:
+        mats = rng.normal(0, 1.5, size=(K, N, N))
+        gaps = rng.uniform(0.2, 2.0, size=(K, 4))
+    if equal:
+        mats[:] = mats[0]
+        gaps[:] = gaps[0]
+    if mirna:
+        tracks = [list(np.minimum(np.arange(len(a)), K - 1)) for a in A]
+    else:
+        tracks = [list(rng.integers(0, K, size=len(a))) for a in A]
+    gtracks = [list(rng.integers(0, K, size=len(a) + 1)) for a in A]
+    return A, B, mats, gaps, tracks, gtracks
+
+
+def per_pair(case, prec, A, B, P, tracks, gtracks):
+    f = getattr(nwgrad, FUNCS[case] + prec)
+    out = []
+    for k, (a, b) in enumerate(zip(A, B)):
+        s, g = f(a, b, P, track=tracks[k], gap_track=gtracks[k] if gtracks else None)
+        out.append((s, g.matrices, g.gaps))
+    return out
+
+
+def make_batch(case, prec, A, B, P, tracks, gtracks, fill="interpair", traceback="auto",
+               grad_mode="hard", threads=4):
+    gm, mode = case
+    batch = BATCH[prec](threads, traceback, gap_model=gm, mode=mode, grad_mode=grad_mode)
+    batch.fill = fill
+    batch.add_many(A, B, P, tracks=tracks, gap_tracks=gtracks)
+    return batch
+
+
+FILLS = ["interpair", "striped", "rowwise"]
+
+
+@pytest.mark.parametrize("case", CASES)
+@pytest.mark.parametrize("prec", ["_double", ""])
+@pytest.mark.parametrize("fill", FILLS)
+@pytest.mark.parametrize("mirna", [False, True])
+def test_batch_matches_per_pair(case, prec, fill, mirna):
+    rng = np.random.default_rng(31 + mirna)
+    K = 25 if mirna else 3
+    A, B, mats, gaps, tracks, gtracks = random_problem(rng, 120, K, mirna=mirna)
+    P = to_params(mats, gaps)
+    use_g = None if mirna else gtracks
+    ref = per_pair(case, prec, A, B, P, tracks, use_g)
+    batch = make_batch(case, prec, A, B, P, tracks, use_g, fill=fill)
+    assert batch.tracked and batch.num_sets == K
+    batch.score_and_grad()
+    scores = batch.scores()
+    gm4, gg3 = batch.grads()
+    assert gm4.shape == (len(A), K, N, N) and gg3.shape == (len(A), K, 4)
+    for k, (s, m, g) in enumerate(ref):
+        assert scores[k] == s, k
+        np.testing.assert_array_equal(gm4[k], m)
+        np.testing.assert_array_equal(gg3[k], g)
+        pk = batch[k].grad
+        np.testing.assert_array_equal(pk.matrices, m)
+        np.testing.assert_array_equal(pk.gaps, g)
+
+
+@pytest.mark.parametrize("case", CASES)
+@pytest.mark.parametrize("traceback", ["pointers", "scores", "hirschberg"])
+def test_batch_tracebacks_agree(case, traceback):
+    rng = np.random.default_rng(5)
+    A, B, mats, gaps, tracks, gtracks = random_problem(rng, 80, 4)
+    P = to_params(mats, gaps)
+    ref = make_batch(case, "_double", A, B, P, tracks, gtracks, fill="striped", traceback="pointers")
+    ref.score_and_grad()
+    for fill in FILLS:
+        b = make_batch(case, "_double", A, B, P, tracks, gtracks, fill=fill, traceback=traceback)
+        b.score_and_grad()
+        np.testing.assert_array_equal(b.scores(), ref.scores())
+        for x, y in zip(b.grads(), ref.grads()):
+            np.testing.assert_array_equal(x, y)
+
+
+@pytest.mark.parametrize("case", CASES)
+@pytest.mark.parametrize("prec", ["_double", ""])
+def test_weighted_grad_is_the_weighted_sum_of_pair_gradients(case, prec):
+    rng = np.random.default_rng(8)
+    A, B, mats, gaps, tracks, gtracks = random_problem(rng, 300, 5)
+    P = to_params(mats, gaps)
+    batch = make_batch(case, prec, A, B, P, tracks, gtracks)
+    batch.score_and_grad()
+    gm, gg = batch.grads()
+    w = rng.normal(size=len(A))
+    acc_m = np.zeros(gm.shape[1:])
+    acc_g = np.zeros(gg.shape[1:])
+    for k in range(len(A)):            # one block (< 4096 pairs): the C++ order exactly
+        acc_m += w[k] * gm[k]
+        acc_g += w[k] * gg[k]
+    G = batch.weighted_grad(w)
+    assert G.num_sets == 5
+    np.testing.assert_array_equal(G.matrices, acc_m)
+    np.testing.assert_array_equal(G.gaps, acc_g)
+    C = batch.compute_grad()
+    np.testing.assert_array_equal(C.matrices, gm.sum(axis=0))
+    np.testing.assert_array_equal(C.gaps, gg.sum(axis=0))
+    # reproducible whatever the thread count
+    b1 = make_batch(case, prec, A, B, P, tracks, gtracks, threads=1)
+    b1.score_and_grad()
+    G1 = b1.weighted_grad(w)
+    np.testing.assert_array_equal(G1.matrices, G.matrices)
+    np.testing.assert_array_equal(G1.gaps, G.gaps)
+
+
+@pytest.mark.parametrize("case", CASES)
+@pytest.mark.parametrize("prec", ["_double", ""])
+@pytest.mark.parametrize("fill", FILLS)
+def test_equal_sets_batch_is_the_untracked_batch(case, prec, fill):
+    rng = np.random.default_rng(12)
+    A, B, mats, gaps, tracks, gtracks = random_problem(rng, 200, 4, integral=True, equal=True)
+    PK = to_params(mats, gaps)
+    P1 = PK[0]
+    bt = make_batch(case, prec, A, B, PK, tracks, gtracks, fill=fill)
+    bu = BATCH[prec](4, gap_model=case[0], mode=case[1])
+    bu.fill = fill
+    bu.add_many(A, B, P1)
+    bt.score_and_grad(keep_paths=True)
+    bu.score_and_grad(keep_paths=True)
+    np.testing.assert_array_equal(bt.scores(), bu.scores())
+    # per-pair counts are integers: summed over the sets they are the untracked ones
+    # exactly (a weighted sum per set, summed over the sets, is another association)
+    gmt, ggt = bt.grads()
+    gmu, ggu = bu.grads()
+    np.testing.assert_array_equal(gmt.sum(axis=1), gmu)
+    np.testing.assert_array_equal(ggt.sum(axis=1), ggu)
+    for k in range(0, len(A), 17):
+        assert bt[k].aligned() == bu[k].aligned()
+        assert bt[k].guide_j == bu[k].guide_j
+
+
+@pytest.mark.parametrize("case", CASES)
+@pytest.mark.parametrize("prec", ["_double", ""])
+def test_banded_grad_fills_agree_and_wide_band_is_full(case, prec):
+    rng = np.random.default_rng(13)
+    A, B, mats, gaps, tracks, gtracks = random_problem(rng, 150, 4)
+    P = to_params(mats, gaps)
+    P2 = to_params(mats + rng.normal(0, 0.3, size=mats.shape), gaps * 1.1)
+    res = []
+    for fill in ["interpair", "striped"]:
+        b = make_batch(case, prec, A, B, P, tracks, gtracks, fill=fill)
+        b.score_and_grad()
+        b.set_params(P2)
+        b.banded_grad(3)
+        res.append((b.scores(), b.grads()))
+        # a band past every B is the full DP
+        b.banded_grad(64)
+        s_wide = b.scores()
+        f = make_batch(case, prec, A, B, P2, tracks, gtracks, fill=fill)
+        f.score_and_grad()
+        np.testing.assert_array_equal(s_wide, f.scores())
+    np.testing.assert_array_equal(res[0][0], res[1][0])
+    for x, y in zip(res[0][1], res[1][1]):
+        np.testing.assert_array_equal(x, y)
+
+
+@pytest.mark.parametrize("case", CASES)
+@pytest.mark.parametrize("prec", ["_double", ""])
+@pytest.mark.parametrize("fill", FILLS)
+def test_score_only_batch(case, prec, fill):
+    rng = np.random.default_rng(14)
+    A, B, mats, gaps, tracks, gtracks = random_problem(rng, 150, 3)
+    P = to_params(mats, gaps)
+    hard = make_batch(case, prec, A, B, P, tracks, gtracks, fill=fill, traceback="pointers")
+    none = make_batch(case, prec, A, B, P, tracks, gtracks, fill=fill, grad_mode="none")
+    hard.score_and_grad()
+    none.score_and_grad()
+    np.testing.assert_array_equal(none.scores(), hard.scores())
+    none.banded_grad(4)   # pending guides resolve under the params scored
+    hard.banded_grad(4)
+    np.testing.assert_array_equal(none.scores(), hard.scores())
+
+
+def test_tracked_seq_pair_and_views():
+    rng = np.random.default_rng(15)
+    mats, gaps = rng.normal(size=(3, N, N)), rng.uniform(0.5, 1.5, size=(3, 4))
+    P = to_params(mats, gaps)
+    sp = nwgrad.SeqPairDouble("ACGTAC", "ACTTAGC", P, track=[0, 1, 2, 2, 1, 0])
+    s, g = sp.score_and_grad()
+    s2, g2 = nwgrad.nw_affine_grad_double("ACGTAC", "ACTTAGC", P, track=[0, 1, 2, 2, 1, 0])
+    assert s == s2
+    np.testing.assert_array_equal(g.matrices, g2.matrices)
+    np.testing.assert_array_equal(g.gaps, g2.gaps)
+    assert sp.track == [0, 1, 2, 2, 1, 0]
+    assert sp.gap_track == [0, 0, 1, 2, 2, 1, 0]
+    a, b = sp.aligned()
+    assert a.replace("-", "") == "ACGTAC"
+    # a one-set pair is not tracked
+    assert nwgrad.SeqPairDouble("AC", "AC", P[0]).track is None
+    batch = nwgrad.SeqPairBatchDouble(2, gap_model="affine", mode="global")
+    batch.add_many(["ACGT", "GG"], ["ACT", "GGA"], P, tracks=[[0, 1, 2, 0], None],
+                   gap_tracks=[None, [2, 2, 2]])
+    assert batch[0].track == [0, 1, 2, 0] and batch[0].gap_track == [0, 0, 1, 2, 0]
+    assert batch[1].track == [0, 0] and batch[1].gap_track == [2, 2, 2]
+
+
+def test_tracked_batch_validation():
+    P3 = to_params(np.zeros((3, N, N)), np.ones((3, 4)))
+    P2 = to_params(np.zeros((2, N, N)), np.ones((2, 4)))
+    b = nwgrad.SeqPairBatchDouble(2, gap_model="linear", mode="local")
+    with pytest.raises(ValueError, match="one entry per pair"):
+        b.add_many(["AC"], ["AC"], P3, tracks=[[0, 1], [0]])
+    with pytest.raises(ValueError, match="pair 0: track has 1 entries"):
+        b.add_many(["AC"], ["AC"], P3, tracks=[[0]])
+    with pytest.raises(ValueError, match="is not a parameter set"):
+        b.add_many(["AC"], ["AC"], P3, tracks=[[0, 3]])
+    with pytest.raises(ValueError, match="gap_track has 2 entries"):
+        b.add_many(["AC"], ["AC"], P3, gap_tracks=[[0, 1]])
+    assert len(b) == 0
+    b.add_many(["AC"], ["AC"], P3, tracks=[[0, 2]])
+    with pytest.raises(ValueError, match="parameter sets cannot join"):
+        b.add_many(["AC"], ["AC"], P2)
+    with pytest.raises(ValueError, match="number of parameter sets"):
+        b.set_params(P2)
+    b.set_params(P3 * 2.0)
+
+
+def test_untracked_batch_becomes_tracked():
+    rng = np.random.default_rng(16)
+    mats, gaps = rng.normal(size=(1, N, N)), rng.uniform(0.5, 1.5, size=(1, 4))
+    P = to_params(mats, gaps)
+    b = nwgrad.SeqPairBatchDouble(2, gap_model="affine", mode="local")
+    b.add_many(["ACGT", "AAC"], ["ACGG", "AC"], P)
+    b.score_and_grad()
+    s_before = b.scores()
+    assert not b.tracked
+    b.add_many(["GGT"], ["GCT"], P, tracks=[[0, 0, 0]])
+    assert b.tracked and b.num_sets == 1
+    with pytest.raises(RuntimeError):   # the earlier results were dropped with the switch
+        b.scores()
+    b.score_and_grad()
+    np.testing.assert_array_equal(b.scores()[:2], s_before)
+    assert b.grads()[0].shape == (3, 1, N, N)
+
+
+def test_tracked_soft_raises_until_supported():
+    pytest.skip("tracked soft lands with the soft-path phase")
+
+
+@pytest.mark.parametrize("case", CASES)
+@pytest.mark.parametrize("prec", ["_double", ""])
+def test_one_set_tracked_weighted_grad_is_untracked_bit_for_bit(case, prec):
+    """With one set, the tracked sum (each pair's touched fields, weight * count, in pair
+    order, fixed blocks) is the untracked dense sum to the bit — more than 4096 pairs, so
+    several blocks are combined."""
+    rng = np.random.default_rng(17)
+    A, B, mats, gaps, tracks, gtracks = random_problem(rng, 9000, 1, maxlen=12)
+    P = to_params(mats, gaps)
+    bt = make_batch(case, prec, A, B, P, tracks, None, threads=8)
+    bu = BATCH[prec](8, gap_model=case[0], mode=case[1])
+    bu.add_many(A, B, P)
+    assert bt.tracked and not bu.tracked
+    bt.score_and_grad()
+    bu.score_and_grad()
+    np.testing.assert_array_equal(bt.scores(), bu.scores())
+    w = rng.normal(size=len(A))
+    Gt, Gu = bt.weighted_grad(w), bu.weighted_grad(w)
+    np.testing.assert_array_equal(Gt.matrices, Gu.matrices)
+    np.testing.assert_array_equal(Gt.gaps, Gu.gaps)
+    Ct, Cu = bt.compute_grad(), bu.compute_grad()
+    np.testing.assert_array_equal(Ct.matrices, Cu.matrices)
+    np.testing.assert_array_equal(Ct.gaps, Cu.gaps)

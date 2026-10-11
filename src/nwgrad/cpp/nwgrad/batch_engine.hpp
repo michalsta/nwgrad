@@ -168,9 +168,20 @@ public:
     // does) and Viterbi backend `kernel`.  Sequences are validated and encoded here, in
     // parallel, straight into the batch's arrays; an out-of-alphabet character throws
     // (naming it and its position) and leaves the batch exactly as it was.
+    //
+    // Tracks (see aligner.hpp, "Tracks"): `tracks` — one per pair, each the parameter set
+    // of every residue of A — and `gap_tracks` — one per pair, the set of every DP row
+    // 0..m for gaps in A — are optional (null: all pairs default; an EMPTY entry: that
+    // pair defaults).  Defaults are as Aligner::set_problem's.  A batch is TRACKED once
+    // its params have more than one set or any pair was given a track; every pair then
+    // carries both tracks (zeros / derived where not given), and every segment's params
+    // must have the same number of sets.  A tracked batch stores a hard gradient as the
+    // pair's PATH (2 bits per step), not as K dense sets, and sums it on demand.
     void add_many(const std::vector<std::string_view>& seqs_a,
                   const std::vector<std::string_view>& seqs_b,
-                  const AlignParams& params, int kernel = kBackendAuto) {
+                  const AlignParams& params, int kernel = kBackendAuto,
+                  const std::vector<std::vector<uint16_t>>* tracks = nullptr,
+                  const std::vector<std::vector<uint16_t>>* gap_tracks = nullptr) {
         if (seqs_a.size() != seqs_b.size())
             throw std::invalid_argument(
                 "nwgrad: add_many() needs seqs_a and seqs_b of equal length (got " +
@@ -181,9 +192,28 @@ public:
                 "nwgrad: SeqPair over alphabet \"" + alpha.symbols() +
                 "\" cannot join a batch over alphabet \"" + alpha_->symbols() + "\"");
         const size_t N = seqs_a.size();
+        if (tracks && tracks->size() != N)
+            throw std::invalid_argument("nwgrad: add_many() needs one track per pair (got " +
+                                        std::to_string(tracks->size()) + " for " + std::to_string(N) + " pairs)");
+        if (gap_tracks && gap_tracks->size() != N)
+            throw std::invalid_argument("nwgrad: add_many() needs one gap_track per pair (got " +
+                                        std::to_string(gap_tracks->size()) + " for " + std::to_string(N) + " pairs)");
         if (N == 0) return;
         if (N > std::numeric_limits<uint32_t>::max() - size())
             throw std::length_error("nwgrad: batch too large");
+        const int K = params.num_sets();
+        if (!empty() && K != nsets_)
+            throw std::invalid_argument(
+                "nwgrad: params with " + std::to_string(K) + " parameter sets cannot join a batch of " +
+                std::to_string(nsets_) + "-set params");
+        // Tracks: lengths and set indices checked up front, on the caller's thread, so a
+        // bad one leaves the batch exactly as it was.
+        for (size_t k = 0; k < N; ++k) {
+            const size_t m = seqs_a[k].size();
+            if (tracks && !(*tracks)[k].empty()) check_track_((*tracks)[k], m, K, k, "track");
+            if (gap_tracks && !(*gap_tracks)[k].empty()) check_track_((*gap_tracks)[k], m + 1, K, k, "gap_track");
+        }
+        const bool want_tracked = tracked_ || K > 1 || tracks || gap_tracks;
 
         const size_t N0 = size();
         const size_t ca0 = ca_.size(), cb0 = cb_.size();
@@ -206,13 +236,44 @@ public:
         }
         alpha_ = &alpha;
         nn_ = static_cast<size_t>(alpha.size()) * static_cast<size_t>(alpha.size());
+        nsets_ = K;
         segs_.push_back({own_params_(params), kernel, N0});
         seg_.resize(N0 + N, static_cast<uint32_t>(segs_.size() - 1));
         score_.resize(N0 + N, 0.0);
         flags_.resize(N0 + N, 0);
         guide_.resize(oa_.back() + N0 + N, 0);   // pair i: m+1 entries at oa_[i] + i
-        if (grad_mode_ != GradMode::None) grad_.resize((N0 + N) * gstride(), 0.0);
+        if (want_tracked && !tracked_) make_tracked_(N0);
+        if (tracked_) {
+            tk_.resize(oa_.back(), 0);              // pair i: m entries at oa_[i]
+            gk_.resize(oa_.back() + N0 + N, 0);     // pair i: m+1 entries at oa_[i] + i
+            parallel_for_(N, [&](size_t k) {
+                const size_t i = N0 + k, m = len_a(i);
+                uint16_t* t = tk_.data() + oa_[i];
+                uint16_t* g = gk_.data() + oa_[i] + i;
+                if (tracks && !(*tracks)[k].empty()) std::copy((*tracks)[k].begin(), (*tracks)[k].end(), t);
+                if (gap_tracks && !(*gap_tracks)[k].empty()) {
+                    std::copy((*gap_tracks)[k].begin(), (*gap_tracks)[k].end(), g);
+                } else {
+                    g[0] = m ? t[0] : 0;
+                    for (size_t r = 1; r <= m; ++r) g[r] = t[r - 1];
+                }
+            });
+            grow_tpaths_(N0);
+        }
+        if (grad_mode_ != GradMode::None && !tracked_) grad_.resize((N0 + N) * gstride(), 0.0);
         ++generation_;
+    }
+
+    // Whether the batch is tracked, and its parameter set count K (0 when empty).
+    bool tracked() const noexcept { return tracked_; }
+    int num_sets() const noexcept { return nsets_; }
+    // Pair i's track (len_a entries) and gap track (len_a + 1), tracked batches only.
+    std::span<const uint16_t> track(size_t i) const noexcept {
+        return tracked_ ? std::span<const uint16_t>(tk_.data() + oa_[i], len_a(i)) : std::span<const uint16_t>();
+    }
+    std::span<const uint16_t> gap_track(size_t i) const noexcept {
+        return tracked_ ? std::span<const uint16_t>(gk_.data() + oa_[i] + i, len_a(i) + 1)
+                        : std::span<const uint16_t>();
     }
 
     size_t size() const noexcept { return score_.size(); }
@@ -246,16 +307,22 @@ public:
                 "nwgrad: score not valid; compute an alignment first");
         return score_[i];
     }
-    // Pair i's gradient into `out` (same alphabet).
+    // Pair i's gradient into `out` (same alphabet; K sets when tracked).
     void grad(size_t i, AlignParams& out) const {
         if (!grad_valid(i))
             throw std::logic_error("nwgrad: gradient not computed; call score_and_grad() or banded_grad() first");
+        if (tracked_) {
+            std::vector<double> flat(kstride_(), 0.0);
+            pair_flat_grad_(i, flat.data());
+            flat_to_params_(flat.data(), out);
+            return;
+        }
         const double* g = grad_.data() + i * gstride();
         std::memcpy(out.matrix.data(), g, nn_ * sizeof(double));
         out.gap_open_a = g[nn_]; out.gap_extend_a = g[nn_ + 1];
         out.gap_open_b = g[nn_ + 2]; out.gap_extend_b = g[nn_ + 3];
     }
-    AlignParams grad(size_t i) const { AlignParams g(alphabet()); grad(i, g); return g; }
+    AlignParams grad(size_t i) const { AlignParams g(alphabet(), nsets_); grad(i, g); return g; }
 
     // The cached guide (column after each row of A), resolving a pending lazy guide.
     std::vector<int> guide_j(size_t i) {
@@ -316,6 +383,7 @@ public:
             throw std::invalid_argument(
                 "nwgrad: set_params() cannot change the alphabet (\"" + alpha_->symbols() +
                 "\" -> \"" + params.matrix.alphabet().symbols() + "\"); construct new pairs instead");
+        check_sets_(params);
         const AlignParams* own = own_params_(params);
         for (auto& s : segs_) s.params = own;
         drop_unused_params_();
@@ -327,6 +395,7 @@ public:
             throw std::invalid_argument(
                 "nwgrad: set_params() cannot change the alphabet (\"" + alpha_->symbols() +
                 "\" -> \"" + params.matrix.alphabet().symbols() + "\"); construct a new SeqPair instead");
+        check_sets_(params);
         segs_[seg].params = own_params_(params);
         drop_unused_params_();
         const size_t end = seg + 1 < segs_.size() ? segs_[seg + 1].begin : size();
@@ -430,10 +499,26 @@ public:
         return blocked_sum_(alpha, nullptr);
     }
     // The cached gradients as arrays: matrices[i*n*n ..] (row-major, alphabet order) and
-    // gaps[i*4 ..] (gap_open_a, gap_extend_a, gap_open_b, gap_extend_b).
+    // gaps[i*4 ..] (gap_open_a, gap_extend_a, gap_open_b, gap_extend_b).  Tracked: K sets
+    // per pair, matrices[(i*K + k)*n*n ..] and gaps[(i*K + k)*4 ..] — zeros included.
     void grads_into(double* matrices, double* gaps) const {
         alphabet();
         check_all_grads_();
+        if (tracked_) {
+            const size_t K = static_cast<size_t>(nsets_);
+            parallel_for_c_(size(), [&](size_t i) {
+                double* mi = matrices + i * K * nn_;
+                double* gi = gaps + i * K * 4;
+                std::fill(mi, mi + K * nn_, 0.0);
+                std::fill(gi, gi + K * 4, 0.0);
+                std::vector<double> scratch(kstride_(), 0.0);
+                std::vector<uint32_t> touched;
+                pair_grad_emit_(i, scratch, touched, [&](size_t k, double v) {
+                    if (k < K * nn_) mi[k] = v; else gi[k - K * nn_] = v;
+                });
+            });
+            return;
+        }
         for (size_t i = 0; i < size(); ++i) {
             const double* g = grad_.data() + i * gstride();
             std::memcpy(matrices + i * nn_, g, nn_ * sizeof(double));
@@ -457,7 +542,7 @@ public:
                              const AlignParams& params, int band = 0,
                              int kernel = kBackendAuto) const {
         const size_t N = problems.size();
-        BatchResult result(params.matrix.alphabet());
+        BatchResult result(params);
         result.scores.resize(N, 0.0);
         if (N == 0) return result;
         if (alpha_ && &params.matrix.alphabet() != alpha_)
@@ -822,7 +907,23 @@ private:
         params_own_.push_back(std::make_unique<const AlignParams>(p));
         const AlignParams* q = params_own_.back().get();
         params_idx_.emplace(h, q);
+        if constexpr (!std::is_same_v<T, double>) {
+            if (q->num_sets() > 1) {
+                const size_t nk = static_cast<size_t>(q->matrix.size()) * q->matrix.size() * q->num_sets();
+                std::vector<T>& v = prep_[q];
+                v.resize(nk);
+                for (size_t k = 0; k < nk; ++k) v[k] = static_cast<T>(q->matrix.data()[k]);
+            }
+        }
         return q;
+    }
+    // The prepared stack of pair i's params (float32 tracked), or null.
+    const T* prep_of_(const AlignParams* p) const {
+        if constexpr (std::is_same_v<T, double>) { (void)p; return nullptr; }
+        else {
+            auto it = prep_.find(p);
+            return it == prep_.end() ? nullptr : it->second.data();
+        }
     }
     // Free the copies no segment points at any more (after set_params*).
     void drop_unused_params_() {
@@ -833,6 +934,8 @@ private:
         auto in_use = [&](const AlignParams* q) { return std::binary_search(used.begin(), used.end(), q); };
         for (auto it = params_idx_.begin(); it != params_idx_.end();)
             it = in_use(it->second) ? std::next(it) : params_idx_.erase(it);
+        for (auto it = prep_.begin(); it != prep_.end();)
+            it = in_use(it->first) ? std::next(it) : prep_.erase(it);
         std::erase_if(params_own_, [&](const auto& u) { return !in_use(u.get()); });
     }
 
@@ -849,7 +952,21 @@ private:
     std::vector<uint8_t> flags_;
     std::vector<uint32_t> seg_;
     std::vector<Segment> segs_;
-    std::vector<double>  grad_;             // pair i: gstride() doubles (matrix, 4 gaps)
+    std::vector<double>  grad_;             // pair i: gstride() doubles (matrix, 4 gaps); untracked
+    // ── Tracks ──
+    bool tracked_ = false;
+    int  nsets_ = 0;                        // K of every segment's params
+    std::vector<uint16_t> tk_;              // tracked: pair i's track at oa_[i]
+    std::vector<uint16_t> gk_;              // tracked: pair i's gap track at oa_[i] + i
+    // Tracked hard gradients, as paths: pair i's moves, 2 bits each (0 diagonal, 1 gap in
+    // B, 2 gap in A), in tp_[tpo_[i] ..], at most len_a + len_b of them (a path has no
+    // more steps); tps_[i] = {i0, j0, steps}: the start cell and the move count.
+    std::vector<uint8_t>  tp_;
+    std::vector<size_t>   tpo_{0};
+    std::vector<std::array<int32_t, 3>> tps_;
+    // float32 tracked: each owned params' whole matrix stack in T, cast once (the Aligner
+    // would otherwise cast K matrices per pair).  Keyed by the owned copy.
+    std::unordered_map<const AlignParams*, std::vector<T>> prep_;
     // Stored paths (keep_paths): run-length ops, (type << 30) | length, type 0 = both
     // advance, 1 = gap in B (A advances), 2 = gap in A; and the cell the path ends at.
     std::vector<std::vector<uint32_t>> path_;
@@ -892,6 +1009,103 @@ private:
             if (!grad_valid(i))
                 throw std::logic_error("nwgrad: gradient not computed; call score_and_grad() or banded_grad() first");
     }
+    void check_sets_(const AlignParams& params) const {
+        if (params.num_sets() != nsets_)
+            throw std::invalid_argument(
+                "nwgrad: set_params() cannot change the number of parameter sets (" +
+                std::to_string(nsets_) + " -> " + std::to_string(params.num_sets()) + ")");
+    }
+    static void check_track_(const std::vector<uint16_t>& t, size_t want, int K, size_t pair,
+                             const char* what) {
+        if (t.size() != want)
+            throw std::invalid_argument(
+                "nwgrad: pair " + std::to_string(pair) + ": " + what + " has " + std::to_string(t.size()) +
+                " entries, expected " + std::to_string(want) +
+                (std::string(what) == "track" ? " (one set per residue of A)" : " (one per DP row 0..len(A))"));
+        for (size_t r = 0; r < t.size(); ++r)
+            if (t[r] >= K)
+                throw std::invalid_argument(
+                    "nwgrad: pair " + std::to_string(pair) + ": " + what + "[" + std::to_string(r) + "] = " +
+                    std::to_string(t[r]) + " is not a parameter set (params has " + std::to_string(K) + ")");
+    }
+    // The first N0 pairs (already added, untracked) become tracked: all-zero tracks.
+    // Their cached gradients were stored densely; they are dropped with their scores.
+    void make_tracked_(size_t N0) {
+        tracked_ = true;
+        tk_.assign(oa_[N0], 0);
+        gk_.assign(oa_[N0] + N0, 0);
+        std::vector<double>().swap(grad_);
+        for (size_t i = 0; i < N0; ++i) flags_[i] &= static_cast<uint8_t>(~(kScore | kGrad | kStored));
+        tpo_.assign(1, 0);
+        tps_.clear();
+        grow_tpaths_(0);
+    }
+    // Path slots for pairs [from, size()) of a tracked hard batch.
+    void grow_tpaths_(size_t from) {
+        if (grad_mode_ != GradMode::Hard) return;
+        for (size_t i = tpo_.size() - 1; i < size(); ++i)
+            tpo_.push_back(tpo_.back() + (len_a(i) + len_b(i) + 3) / 4);
+        (void)from;
+        tp_.resize(tpo_.back());
+        tps_.resize(size(), {0, 0, 0});
+    }
+    void store_tpath_(size_t i, const std::vector<uint8_t>& moves, int i0, int j0) {
+        uint8_t* d = tp_.data() + tpo_[i];
+        const size_t nbytes = (moves.size() + 3) / 4;
+        std::fill(d, d + nbytes, uint8_t{0});
+        for (size_t k = 0; k < moves.size(); ++k)
+            d[k >> 2] = static_cast<uint8_t>(d[k >> 2] | (moves[k] << ((k & 3) * 2)));
+        tps_[i] = {i0, j0, static_cast<int32_t>(moves.size())};
+    }
+    // Pair i's hard gradient from its stored path: emit(index, count) for each field of a
+    // K-set gradient it touches, the matrix stack first (index set*n*n + a*n + b) then the
+    // gaps (K*n*n + 4*set + field) — counts as the walk's gradient holds them (gap fields
+    // negative).  `scratch` (K*(n*n+4) doubles, zero) accumulates and is left zero.
+    template <class Emit>
+    void tpath_grad_(size_t i, std::vector<double>& scratch, std::vector<uint32_t>& touched, Emit&& emit) const {
+        const auto ca = codes_a(i), cb = codes_b(i);
+        const auto tk = track(i), gk = gap_track(i);
+        const size_t na = static_cast<size_t>(alpha_->size());
+        const size_t gbase = static_cast<size_t>(nsets_) * nn_;
+        auto add = [&](size_t k, double v) {
+            if (scratch[k] == 0.0) touched.push_back(static_cast<uint32_t>(k));
+            scratch[k] += v;
+        };
+        const uint8_t* d = tp_.data() + tpo_[i];
+        int r = tps_[i][0], c = tps_[i][1];
+        const int steps = tps_[i][2];
+        int prev = 3;
+        touched.clear();
+        for (int k = 0; k < steps; ++k) {
+            const int mv = (d[k >> 2] >> ((k & 3) * 2)) & 3;
+            if (mv == 0) {
+                add(static_cast<size_t>(tk[static_cast<size_t>(r)]) * nn_ + ca[static_cast<size_t>(r)] * na +
+                    cb[static_cast<size_t>(c)], 1.0);
+                ++r; ++c;
+            } else if (mv == 1) {   // gap in B into row r+1: the set of residue a[r]
+                const size_t g = gbase + 4 * static_cast<size_t>(tk[static_cast<size_t>(r)]);
+                if (GM == GapModel::Affine && prev != 1) add(g + AlignParams::kOpenB, -1.0);
+                add(g + AlignParams::kExtendB, -1.0);
+                ++r;
+            } else {                // gap in A within row r: its gap-track set
+                const size_t g = gbase + 4 * static_cast<size_t>(gk[static_cast<size_t>(r)]);
+                if (GM == GapModel::Affine && prev != 2) add(g + AlignParams::kOpenA, -1.0);
+                add(g + AlignParams::kExtendA, -1.0);
+                ++c;
+            }
+            prev = mv;
+        }
+        for (uint32_t k : touched) { emit(k, scratch[k]); scratch[k] = 0.0; }
+    }
+    // The flat K-set gradient layout tpath_grad_ emits into, to and from an AlignParams.
+    size_t kstride_() const noexcept { return static_cast<size_t>(nsets_) * (nn_ + 4); }
+    void flat_to_params_(const double* flat, AlignParams& out) const {
+        std::memcpy(out.matrix.data(), flat, static_cast<size_t>(nsets_) * nn_ * sizeof(double));
+        const double* g = flat + static_cast<size_t>(nsets_) * nn_;
+        for (int k = 0; k < nsets_; ++k)
+            for (int f = 0; f < 4; ++f) out.gap_ref(k, f) = g[4 * static_cast<size_t>(k) + static_cast<size_t>(f)];
+    }
+
     void prepare_paths_(bool keep, bool all = true) {
         if (!keep) {
             if (all) {   // every path is about to be stale: free them, don't just flag them
@@ -913,6 +1127,7 @@ private:
         for (size_t k = 0; k < n; ++k) dst[k] = src[k] * s;
     }
     AlignParams blocked_sum_(const Alphabet& alpha, const double* weights) const {
+        if (tracked_) return blocked_sum_tracked_(alpha, weights);
         const size_t n = size(), gs = gstride();
         const size_t nblocks = (n + WEIGHTED_GRAD_BLOCK - 1) / WEIGHTED_GRAD_BLOCK;
         std::vector<double> partial(nblocks * gs, 0.0);
@@ -945,6 +1160,59 @@ private:
         return out;
     }
 
+    // Tracked: as blocked_sum_, from each pair's stored gradient (tpath_grad_): per pair,
+    // each field it touches gets weight * count, formed out of line, added once — exactly
+    // what the dense sum adds there; the fields it does not touch would get w * 0, which
+    // leaves a sum that started at +0 unchanged.  So with one set this is bit-identical
+    // to the untracked sum, and with K the same arithmetic per field.
+    AlignParams blocked_sum_tracked_(const Alphabet& alpha, const double* weights) const {
+        const size_t n = size(), gs = kstride_();
+        const size_t nblocks = (n + WEIGHTED_GRAD_BLOCK - 1) / WEIGHTED_GRAD_BLOCK;
+        std::vector<double> partial(nblocks * gs, 0.0);
+        std::atomic<size_t> next{0};
+        auto worker = [&]() {
+            std::vector<double> scratch(gs, 0.0), vals, scaled;
+            std::vector<uint32_t> touched, keys;
+            for (size_t b; (b = next.fetch_add(1, std::memory_order_relaxed)) < nblocks; ) {
+                double* acc = partial.data() + b * gs;
+                const size_t end = std::min(n, (b + 1) * WEIGHTED_GRAD_BLOCK);
+                for (size_t i = b * WEIGHTED_GRAD_BLOCK; i < end; ++i) {
+                    keys.clear(); vals.clear();
+                    pair_grad_emit_(i, scratch, touched, [&](size_t k, double v) {
+                        keys.push_back(static_cast<uint32_t>(k)); vals.push_back(v);
+                    });
+                    if (weights) {
+                        scaled.resize(vals.size());
+                        scale_into_(scaled.data(), vals.data(), vals.size(), weights[i]);
+                        for (size_t q = 0; q < keys.size(); ++q) acc[keys[q]] += scaled[q];
+                    } else {
+                        for (size_t q = 0; q < keys.size(); ++q) acc[keys[q]] += vals[q];
+                    }
+                }
+            }
+        };
+        if (nblocks > 0)
+            run_workers_guarded(std::min<int>(s_.n_threads, static_cast<int>(nblocks)), worker);
+        std::vector<double> tot(gs, 0.0);
+        for (size_t b = 0; b < nblocks; ++b)
+            for (size_t k = 0; k < gs; ++k) tot[k] += partial[b * gs + k];
+        AlignParams out(alpha, nsets_);
+        flat_to_params_(tot.data(), out);
+        return out;
+    }
+    // Pair i's stored tracked gradient, field by field (emit(index, value) into the flat
+    // K-set layout of tpath_grad_).
+    template <class Emit>
+    void pair_grad_emit_(size_t i, std::vector<double>& scratch, std::vector<uint32_t>& touched,
+                         Emit&& emit) const {
+        tpath_grad_(i, scratch, touched, emit);
+    }
+    void pair_flat_grad_(size_t i, double* flat) const {
+        std::vector<double> scratch(kstride_(), 0.0);
+        std::vector<uint32_t> touched;
+        pair_grad_emit_(i, scratch, touched, [&](size_t k, double v) { flat[k] = v; });
+    }
+
     // ── A worker's state: one buffer, one Aligner per band, gradient scratch ─────
     struct Work {
         DpBuffer buf;
@@ -952,7 +1220,11 @@ private:
         BandAl band;
         AlignParams g;
         std::vector<int> gj;
-        explicit Work(const BatchEngine& e) : g(e.alphabet()) { configure(e); }
+        std::vector<uint8_t> moves;          // tracked hard: the path being stored
+        std::vector<FullAl> lanes;           // tracked inter-pair: one aligner per lane
+        std::vector<BandAl> blanes;
+        std::vector<TrackJob<T>> tjobs;
+        explicit Work(const BatchEngine& e) : g(e.alphabet(), e.nsets_) { configure(e); }
         // The batch's settings, (re)applied: a reused Work follows setting changes.
         void configure(const BatchEngine& e) {
             full.set_traceback(e.s_.traceback);
@@ -981,7 +1253,14 @@ private:
     template<class Al>
     void set_problem_(Al& al, size_t i) const {
         al.set_kernel(kernel(i));
-        al.set_problem(codes_a(i), codes_b(i), params(i));
+        problem_(al, i, params(i), 0, {});
+    }
+    // Pair i on `al` under params `p` (band, guide), with its tracks when tracked.
+    template<class Al>
+    void problem_(Al& al, size_t i, const AlignParams& p, int band, std::vector<int> guide) const {
+        if (tracked_) al.set_problem(codes_a(i), codes_b(i), p, band, std::move(guide),
+                                     track(i), gap_track(i), prep_of_(&p));
+        else          al.set_problem(codes_a(i), codes_b(i), p, band, std::move(guide));
     }
     void store_grad_(size_t i, const AlignParams& g) {
         double* d = grad_ptr_(i);
@@ -1010,9 +1289,33 @@ private:
         path_end_[i] = {end.first, end.second};
         flags_[i] |= kStored;
     }
+    // The hard gradient and the guide of the DP `al` just ran, into pair i, in one walk:
+    // tracked, the path itself (store_tpath_); otherwise the dense gradient.
+    template<class Al>
+    void hard_grad_guide_(size_t i, Al& al, Work& w) {
+        if (tracked_) {
+            int i0 = 0, j0 = 0;
+            al.hard_path_and_guide(w.buf, w.moves, i0, j0, &w.gj);
+            store_tpath_(i, w.moves, i0, j0);
+        } else {
+            w.g.zero();
+            al.hard_grad_and_guide(w.buf, w.g, w.gj);
+            store_grad_(i, w.g);
+        }
+        store_guide_(i, w.gj);
+    }
     // Hard or soft gradient of the DP `al` just ran, into pair i.
     template<class Al>
     void grad_with_buf_(size_t i, Al& al, Work& w) {
+        if (tracked_) {
+            if (grad_mode_ == GradMode::Hard) {
+                int i0 = 0, j0 = 0;
+                al.hard_path_and_guide(w.buf, w.moves, i0, j0, nullptr);
+                store_tpath_(i, w.moves, i0, j0);
+                return;
+            }
+            throw std::logic_error("nwgrad: INTERIM(tracks): tracked soft batches not implemented yet");
+        }
         w.g.zero();
         if (grad_mode_ == GradMode::Hard) al.hard_grad(w.buf, w.g);
         else                              al.soft_grad(w.buf, w.g);
@@ -1052,10 +1355,7 @@ private:
         if (grad_mode_ == GradMode::Hard) {
             al.compute_viterbi(w.buf);
             score_[i] = al.score();
-            w.g.zero();
-            al.hard_grad_and_guide(w.buf, w.g, w.gj);
-            store_grad_(i, w.g);
-            store_guide_(i, w.gj);
+            hard_grad_guide_(i, al, w);
             if (keep) store_path_(i, al, w.buf);
             finish_(i, false, false);
             return;
@@ -1080,7 +1380,7 @@ private:
         if (!guide_pending(i)) return;
         const AlignParams* gp = segs_[seg_[i]].gparams;
         w.full.set_kernel(kernel(i));
-        w.full.set_problem(codes_a(i), codes_b(i), gp ? *gp : params(i));
+        problem_(w.full, i, gp ? *gp : params(i), 0, {});
         w.full.compute_viterbi(w.buf);
         store_guide_(i, w.full.guide_j_from_viterbi(w.buf));
         flags_[i] &= static_cast<uint8_t>(~(kPending | kStored));
@@ -1093,15 +1393,11 @@ private:
         auto& al = w.band;
         al.set_kernel(kernel(i));
         const int* g = guide_ptr_(i);
-        al.set_problem(codes_a(i), codes_b(i), params(i), bandwidth,
-                       std::vector<int>(g, g + len_a(i) + 1));
+        problem_(al, i, params(i), bandwidth, std::vector<int>(g, g + len_a(i) + 1));
         if (grad_mode_ == GradMode::Hard) {   // one traceback walk for guide and gradient
             al.compute_viterbi(w.buf);
             score_[i] = al.score();
-            w.g.zero();
-            al.hard_grad_and_guide(w.buf, w.g, w.gj);
-            store_grad_(i, w.g);
-            store_guide_(i, w.gj);
+            hard_grad_guide_(i, al, w);
             if (keep) store_path_(i, al, w.buf);
             finish_(i, true, false);
             return;
@@ -1128,18 +1424,16 @@ private:
     }
 
     // SeqPair::score_and_grad_interleaved: pair i is lane `lane` of an inter-pair fill.
+    // `pre`: the lane's aligner, already set up with pair i (tracked lanes); else w.full.
     void run_interleaved_(size_t i, Work& w, int W, int lane, double best, int bi, int bj,
-                          const SoftLane* soft, size_t stride, bool keep) {
+                          const SoftLane* soft, size_t stride, bool keep, FullAl* pre = nullptr) {
         flags_[i] &= static_cast<uint8_t>(~kStored);
-        auto& al = w.full;
-        set_problem_(al, i);
+        auto& al = pre ? *pre : w.full;
+        if (!pre) set_problem_(al, i);
         al.adopt_interleaved(w.buf, W, lane, best, bi, bj, stride);
         score_[i] = al.score();
         if (grad_mode_ == GradMode::Hard) {
-            w.g.zero();
-            al.hard_grad_and_guide(w.buf, w.g, w.gj);   // one walk for both
-            store_grad_(i, w.g);
-            store_guide_(i, w.gj);
+            hard_grad_guide_(i, al, w);   // one walk for both
         } else {
             store_guide_(i, al.guide_j_from_viterbi(w.buf));
             if (grad_mode_ == GradMode::Soft && soft) {
@@ -1181,28 +1475,26 @@ private:
                             int* blo, int* bhi, int* slo, int* shi, int& bri, int& brj) {
         const int* g = guide_ptr_(i);
         w.band.set_kernel(kernel(i));
-        w.band.set_problem(codes_a(i), codes_b(i), params(i), bandwidth,
-                           std::vector<int>(g, g + len_a(i) + 1));
+        problem_(w.band, i, params(i), bandwidth, std::vector<int>(g, g + len_a(i) + 1));
         w.band.banded_lane_rows(W, lane, M, blo, bhi, slo, shi, bri, brj);
     }
     void banded_interleaved_(size_t i, Work& w, int bandwidth, int W, int lane,
-                             double best, int bi, int bj) {
+                             double best, int bi, int bj, BandAl* pre = nullptr) {
         // The lane's problem was set by banded_lane_setup_ on a fresh BandAl per lane?
         // No: one BandAl per worker, so set it again (set_problem is cheap and the
-        // banded tables live in the shared buffer, untouched by set_problem).
-        const int* g = guide_ptr_(i);
-        auto& al = w.band;
-        al.set_kernel(kernel(i));
-        al.set_problem(codes_a(i), codes_b(i), params(i), bandwidth,
-                       std::vector<int>(g, g + len_a(i) + 1));
+        // banded tables live in the shared buffer, untouched by set_problem).  Tracked
+        // lanes have their own (`pre`), set up before the fill.
+        auto& al = pre ? *pre : w.band;
+        if (!pre) {
+            const int* g = guide_ptr_(i);
+            al.set_kernel(kernel(i));
+            problem_(al, i, params(i), bandwidth, std::vector<int>(g, g + len_a(i) + 1));
+        }
         flags_[i] &= static_cast<uint8_t>(~kStored);
         al.adopt_interleaved(w.buf, W, lane, best, bi, bj);
         score_[i] = al.score();
         if (grad_mode_ == GradMode::Hard) {
-            w.g.zero();
-            al.hard_grad_and_guide(w.buf, w.g, w.gj);
-            store_grad_(i, w.g);
-            store_guide_(i, w.gj);
+            hard_grad_guide_(i, al, w);
         } else {
             store_guide_(i, al.guide_j_from_viterbi(w.buf));
         }
@@ -1224,10 +1516,48 @@ private:
     //   wire_inter_tables_: size the shared tables (H for linear, VM/VX/VY for affine) to
     //                       `sz` cells per table and point the job at them
     //   run_inter_fill_:    the kernel of this precision
+    // (The whole matrix stack: a tracked lane reads its stacked row.)
     static void cast_block_(const AlignParams& P, std::vector<T>& blkT) {
-        const size_t nbk = static_cast<size_t>(P.matrix.size()) * P.matrix.size();
+        const size_t nbk = static_cast<size_t>(P.matrix.size()) * P.matrix.size() *
+                           static_cast<size_t>(P.num_sets());
         blkT.resize(nbk);
         for (size_t k = 0; k < nbk; ++k) blkT[k] = static_cast<T>(P.matrix.data()[k]);
+    }
+    // Tracked inter-pair lanes: lane l's aligner set up with its pair (the group's last
+    // pair repeated in spare lanes) and its rows in w.tjobs[l], before the fill, so the
+    // fill reads every lane's own rows and the lane adopts its tables without a second
+    // set_problem().  Untracked groups need none of this (they share the scalars).
+    template <class Al>
+    void tracked_lanes_(Work& w, std::vector<Al>& lanes, int W, size_t real,
+                        const std::vector<size_t>& order, size_t s, int bandwidth = 0) {
+        if (lanes.size() < static_cast<size_t>(W)) lanes.resize(static_cast<size_t>(W));
+        w.tjobs.assign(static_cast<size_t>(W), TrackJob<T>{});
+        for (int l = 0; l < W; ++l) {
+            if (static_cast<size_t>(l) >= real) { w.tjobs[static_cast<size_t>(l)] = w.tjobs[real - 1]; continue; }
+            const size_t i = order[s + static_cast<size_t>(l)];
+            Al& al = lanes[static_cast<size_t>(l)];
+            configure_lane_(al);
+            al.set_kernel(kernel(i));
+            if constexpr (std::is_same_v<Al, BandAl>) {
+                const int* g = guide_ptr_(i);
+                problem_(al, i, params(i), bandwidth, std::vector<int>(g, g + len_a(i) + 1));
+            } else {
+                problem_(al, i, params(i), 0, {});
+            }
+            al.track_job(w.tjobs[static_cast<size_t>(l)]);
+        }
+    }
+    void configure_lane_(FullAl& al) const {
+        al.set_traceback(s_.traceback);
+        al.set_hb_cutoff(s_.hb_cutoff);
+        al.set_rowwise_full(s_.rowwise_full);
+        al.set_soft_impl(s_.soft_impl);
+        al.set_soft_temperature(s_.soft_temperature);
+    }
+    void configure_lane_(BandAl& al) const {
+        al.set_traceback(TracebackMode::Scores);
+        al.set_soft_impl(s_.soft_impl);
+        al.set_soft_temperature(s_.soft_temperature);
     }
     static void set_inter_params_(InterJobT<T>& job, const AlignParams& P, const std::vector<T>& blkT) {
         job.blk = blkT.data(); job.nalpha = P.matrix.size();
@@ -1403,6 +1733,11 @@ private:
                 job.align_mode = (AM == AlignMode::Local) ? 1 : 0;
                 if (ragged) job.nb = nb.data();
                 auto& buf = w.buf;
+                const bool tl = tracked_ && !skip_fill;   // tracked lanes, set up before the fill
+                if (tl) {
+                    tracked_lanes_(w, w.lanes, W, real, elig, s);
+                    job.tr = w.tjobs.data();
+                }
                 if (!skip_fill) {
                     cast_block_(P, blkT);
                     set_inter_params_(job, P, blkT);
@@ -1412,7 +1747,8 @@ private:
                 }
                 // Soft lanes share the forward-backward too (one soft_impl, not "log",
                 // one temperature — batch-wide here), when the weights fit.
-                bool soft_group = K.inter_soft != nullptr && soft && s_.soft_impl != SoftImpl::Log;
+                // INTERIM(tracks): no tracked inter-pair soft pass yet.
+                bool soft_group = K.inter_soft != nullptr && soft && s_.soft_impl != SoftImpl::Log && !tracked_;
                 const size_t nnk = nn_;
                 if (soft_group) {
                     InterSoftJob sj{};
@@ -1456,7 +1792,8 @@ private:
                     }
                     if (skip_fill) run_soft_lane_(i, w, use ? &lane : nullptr, keep);
                     else run_interleaved_(i, w, W, static_cast<int>(l), best[l], bi[l], bj[l],
-                                          use ? &lane : nullptr, gstride_, keep);
+                                          use ? &lane : nullptr, gstride_, keep,
+                                          tl ? &w.lanes[l] : nullptr);
                 }
             }
         };
@@ -1567,13 +1904,21 @@ private:
                     if (static_cast<size_t>(l) >= real) continue;
                     resolve_guide_(i, w);
                     m[l] = static_cast<int>(len_a(i));
-                    banded_lane_setup_(i, w, bandwidth, W, l, M, blo.data(), bhi.data(),
-                                       ulo.data(), uhi.data(), bri[l], brj[l]);
+                    if (!tracked_)
+                        banded_lane_setup_(i, w, bandwidth, W, l, M, blo.data(), bhi.data(),
+                                           ulo.data(), uhi.data(), bri[l], brj[l]);
+                }
+                if (tracked_) {
+                    tracked_lanes_(w, w.blanes, W, real, elig, s, bandwidth);
+                    for (size_t l = 0; l < real; ++l)
+                        w.blanes[l].banded_lane_rows(W, static_cast<int>(l), M, blo.data(), bhi.data(),
+                                                     ulo.data(), uhi.data(), bri[l], brj[l]);
                 }
                 const AlignParams& P = params(i0);
                 InterJobT<T> job{};
                 job.a = a.data(); job.m = m.data(); job.b = b.data(); job.n = n; job.M = M;
                 job.align_mode = (AM == AlignMode::Local) ? 1 : 0;
+                if (tracked_) job.tr = w.tjobs.data();
                 cast_block_(P, blkT);
                 set_inter_params_(job, P, blkT);   // affine: this path runs for affine only
                 wire_inter_tables_(job, w.buf, static_cast<size_t>(M + 1) * (n + 1) * W);
@@ -1584,7 +1929,7 @@ private:
                 run_inter_fill_(K, job);
                 for (size_t l = 0; l < real; ++l)
                     banded_interleaved_(elig[s + l], w, bandwidth, W, static_cast<int>(l),
-                                        best[l], bi[l], bj[l]);
+                                        best[l], bi[l], bj[l], tracked_ ? &w.blanes[l] : nullptr);
             }
         };
         if constexpr (GM == GapModel::Affine) run_workers_(tasks, worker);
@@ -1651,6 +1996,10 @@ private:
                 job.a = a.data(); job.m = m.data(); job.b = b.data(); job.n = n; job.M = M;
                 job.align_mode = (AM == AlignMode::Local) ? 1 : 0;
                 if (ragged) job.nb = nb.data();
+                if (tracked_) {
+                    tracked_lanes_(w, w.lanes, W, real, plan_.elig, s);
+                    job.tr = w.tjobs.data();
+                }
                 cast_block_(params(i0), blkT);
                 set_inter_params_(job, params(i0), blkT);
                 wire_inter_tables_(job, w.buf, static_cast<size_t>(n + 1) * W);
@@ -1804,6 +2153,15 @@ private:
         run_workers_(N, worker);
     }
 
+    template<typename Fn>
+    void parallel_for_c_(size_t N, Fn&& fn) const {
+        std::atomic<size_t> idx{0};
+        auto worker = [&]() {
+            for (size_t i; (i = idx.fetch_add(1, std::memory_order_relaxed)) < N; ) fn(i);
+        };
+        if (N == 0) return;
+        run_workers_guarded(std::min<int>(s_.n_threads, static_cast<int>(std::min<size_t>(N, 1u << 30))), worker);
+    }
     template<typename Fn>
     void parallel_for_(size_t N, Fn&& fn) {
         std::atomic<size_t> idx{0};
