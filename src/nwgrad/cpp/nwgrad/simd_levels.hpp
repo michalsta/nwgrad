@@ -375,6 +375,13 @@ struct InterSoftJob {
     int* iscratch;                     // (M+1)*W ints
     double* logz; double* counts; double* gaps; int* ok;   // W, W*nalpha^2, W*4, W
     int* gpost = nullptr;              // soft_guide="posterior": (M+1)*W, as SoftPairJob
+    // Tracked (rs != nullptr): per lane, rs[l][i-1] is DP row i's row of `es` (then the
+    // exp'd matrix STACK) and rw[l][4i ..] row i's weights (oa, ea, ob, eb, as
+    // SoftPairJob::rw).  Outputs per lane and row instead of per lane: counts at
+    // (l*M + i-1)*nalpha (row i's match posteriors by B letter; W*M*nalpha) and gaps at
+    // (l*(M+1) + i)*4 (W*(M+1)*4).
+    const uint32_t* const* rs = nullptr;
+    const double* const* rw = nullptr;
 };
 using inter_soft_fn = void (*)(InterSoftJob&);
 
@@ -407,6 +414,13 @@ struct SoftPairJob {
     // records (the last column of row i on the path), so along a gap run only its last
     // cell scores — a plain posterior argmax picks any cell of the run, on rounding.
     int* gpost = nullptr;
+    // Tracked (rw != nullptr; see aligner.hpp, "Tracks"): row i's weights rw[4i ..] =
+    // oa, ea (gaps in A within row i), ob, eb (gaps in B into row i; [0] unused); P has a
+    // row per DP row (row i-1 for DP row i) and scnt likewise (m x nalpha: row i's match
+    // posteriors by B letter); grow[4i ..] receives row i's gap gradient (g_oa, g_ea,
+    // g_ob, g_eb, negative).  The scalar weights and g_* are then unused.
+    const double* rw = nullptr;
+    double* grow = nullptr;
 };
 using soft_pair_fn = void (*)(SoftPairJob&);
 // Whether a pair of lengths (la, lb) may join an inter-pair group: the group's

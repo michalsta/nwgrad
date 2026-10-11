@@ -367,6 +367,14 @@ struct Aligner {
     // profile (the inter-pair fills).  Valid until the next set_problem().
     void track_job(TrackJob<T>& tj) { fill_track_job_(tj, false, 0, GM == GapModel::Linear); }
 
+    // A tracked soft result (after compute_forward_back()): the expected counts PER DP
+    // ROW — cnt[(i-1)*n + c], row i's match posteriors against letter c (its set and
+    // residue are the row's), and gaps[4*i + f], row i's four gap fields (negative: the
+    // gradient's sign) — from which soft_grad() scatters into the K sets.  The batch
+    // stores this record per pair (it does not grow with K).
+    const std::vector<double>& soft_record_counts() const noexcept { return srec_cnt_; }
+    const std::vector<double>& soft_record_gaps() const noexcept { return srec_gap_; }
+
     // The optimal path as forward moves (0 = diagonal, 1 = gap in B, 2 = gap in A) from
     // its start cell (i0, j0), and (with gj) the guide, after compute_viterbi() — for
     // storing a path instead of its gradient (a tracked batch's hard gradients: see
@@ -765,6 +773,7 @@ struct Aligner {
     }
 
     void soft_grad(const DpBuffer& buf, AlignParams& grad) const {
+        if (tr_) { add_soft_record_(grad); return; }   // the per-row record (run_fwdbwd)
         if (soft_counts_ready_) { add_scaled_counts(grad); return; }
         if constexpr (GM == GapModel::Linear) soft_grad_linear(buf, grad);
         else                                   soft_grad_affine(buf, grad);
@@ -844,6 +853,10 @@ private:
     std::vector<T>             tgoa_, tgea_, tgob_, tgeb_, tbx0_;
     mutable std::vector<T>     tzero_;                  // m+1 zeros: linear's opens, for the affine kernels
     mutable std::vector<T>     trgob_, trgeb_;          // Hirschberg's reverse gaps in B (hb_reverse_rows_)
+    // Tracked soft: the per-row record (soft_record_counts / _gaps), and the scaled
+    // kernel's per-row weights (4 per row) and exp'd profile rows.
+    std::vector<double>        srec_cnt_, srec_gap_, srw_;
+    std::vector<double>        dbx0_;                   // the log path's column-0 border, double
     mutable bool               rev_ready_ = false;
     // The shared query profile's rows (TrackJob::ra/crow): each distinct stacked row once.
     mutable std::vector<uint32_t> ra_, crow_;
@@ -3339,10 +3352,11 @@ private:
         if constexpr (AM == AlignMode::Global) {
             sat(buf.F, 0, 0) = 0.0;
             const int bi = border_rows(), bj = border_cols();
+            if (tr_) build_dbx0_();
             for (int i = 1; i <= bi; ++i)
-                sat(buf.F, i, 0) = -static_cast<double>(i) * params_->gap_extend_b;
+                sat(buf.F, i, 0) = tr_ ? dbx0_[static_cast<size_t>(i)] : -static_cast<double>(i) * params_->gap_extend_b;
             for (int j = 1; j <= bj; ++j)
-                sat(buf.F, 0, j) = -static_cast<double>(j) * params_->gap_extend_a;
+                sat(buf.F, 0, j) = -static_cast<double>(j) * drow_ge_a(0);
         } else {
             for (int i = 0; i <= m_; ++i) sat(buf.F, i, 0) = 0.0;
             for (int j = 0; j <= n_; ++j) sat(buf.F, 0, j) = 0.0;
@@ -3352,8 +3366,8 @@ private:
             for (int j = jlo(i); j <= jhi(i); ++j) {
                 double v = lse3(
                     srat(buf.F, i-1, j-1) + sub(i, j),
-                    srat(buf.F, i-1, j)   - params_->gap_extend_b,
-                    srat(buf.F, i,   j-1) - params_->gap_extend_a
+                    srat(buf.F, i-1, j)   - drow_ge_b(i),
+                    srat(buf.F, i,   j-1) - drow_ge_a(i)
                 );
                 if constexpr (AM == AlignMode::Local) v = lse2(v, 0.0);
                 sat(buf.F, i, j) = v;
@@ -3385,9 +3399,9 @@ private:
                     sat(buf.B,i-1,j-1) = lse2(srat(buf.B,i-1,j-1),
                                               bval + sub(i, j));
                 if (i > 0)
-                    sat(buf.B,i-1,j)   = lse2(srat(buf.B,i-1,j),   bval - params_->gap_extend_b);
+                    sat(buf.B,i-1,j)   = lse2(srat(buf.B,i-1,j),   bval - drow_ge_b(i));
                 if (j > 0)
-                    sat(buf.B,i,j-1)   = lse2(srat(buf.B,i,j-1),   bval - params_->gap_extend_a);
+                    sat(buf.B,i,j-1)   = lse2(srat(buf.B,i,j-1),   bval - drow_ge_a(i));
             }
         }
     }
@@ -3449,10 +3463,12 @@ private:
         if constexpr (AM == AlignMode::Global) {
             sat(buf.FM, 0, 0) = 0.0;
             const int bi = border_rows(), bj = border_cols();
+            if (tr_) build_dbx0_();
             for (int i = 1; i <= bi; ++i)
-                sat(buf.FX, i, 0) = -(params_->gap_open_b + static_cast<double>(i) * params_->gap_extend_b);
+                sat(buf.FX, i, 0) = tr_ ? dbx0_[static_cast<size_t>(i)]
+                                        : -(params_->gap_open_b + static_cast<double>(i) * params_->gap_extend_b);
             for (int j = 1; j <= bj; ++j)
-                sat(buf.FY, 0, j) = -(params_->gap_open_a + static_cast<double>(j) * params_->gap_extend_a);
+                sat(buf.FY, 0, j) = -(drow_go_a(0) + static_cast<double>(j) * drow_ge_a(0));
         } else {
             for (int i = 0; i <= m_; ++i) sat(buf.FM, i, 0) = 0.0;
             for (int j = 0; j <= n_; ++j) sat(buf.FM, 0, j) = 0.0;
@@ -3462,14 +3478,15 @@ private:
             for (int j = jlo(i); j <= jhi(i); ++j) {
                 double diag  = lse3(srat(buf.FM,i-1,j-1), srat(buf.FX,i-1,j-1), srat(buf.FY,i-1,j-1));
                 double m_val = diag + sub(i, j);
+                const double gob = drow_go_b(i), geb = drow_ge_b(i), goa = drow_go_a(i), gea = drow_ge_a(i);
                 double x_val = lse3(
-                    srat(buf.FM,i-1,j) - params_->gap_open_b - params_->gap_extend_b,
-                    srat(buf.FX,i-1,j)                       - params_->gap_extend_b,
-                    srat(buf.FY,i-1,j) - params_->gap_open_b - params_->gap_extend_b);
+                    srat(buf.FM,i-1,j) - gob - geb,
+                    srat(buf.FX,i-1,j)       - geb,
+                    srat(buf.FY,i-1,j) - gob - geb);
                 double y_val = lse3(
-                    srat(buf.FM,i,j-1) - params_->gap_open_a - params_->gap_extend_a,
-                    srat(buf.FX,i,j-1) - params_->gap_open_a - params_->gap_extend_a,
-                    srat(buf.FY,i,j-1)                       - params_->gap_extend_a);
+                    srat(buf.FM,i,j-1) - goa - gea,
+                    srat(buf.FX,i,j-1) - goa - gea,
+                    srat(buf.FY,i,j-1)       - gea);
                 if constexpr (AM == AlignMode::Local) m_val = lse2(m_val, 0.0);
                 sat(buf.FM, i, j) = m_val; sat(buf.FX, i, j) = x_val; sat(buf.FY, i, j) = y_val;
             }
@@ -3508,19 +3525,17 @@ private:
                 }
                 // X state (gap in B) contribution to predecessors at (i-1,j)
                 if (bx != NEG_INF && i > 0) {
-                    sat(buf.BM,i-1,j) = lse2(srat(buf.BM,i-1,j),
-                                             bx - params_->gap_open_b - params_->gap_extend_b);
-                    sat(buf.BX,i-1,j) = lse2(srat(buf.BX,i-1,j), bx - params_->gap_extend_b);
-                    sat(buf.BY,i-1,j) = lse2(srat(buf.BY,i-1,j),
-                                             bx - params_->gap_open_b - params_->gap_extend_b);
+                    const double gob = drow_go_b(i), geb = drow_ge_b(i);
+                    sat(buf.BM,i-1,j) = lse2(srat(buf.BM,i-1,j), bx - gob - geb);
+                    sat(buf.BX,i-1,j) = lse2(srat(buf.BX,i-1,j), bx - geb);
+                    sat(buf.BY,i-1,j) = lse2(srat(buf.BY,i-1,j), bx - gob - geb);
                 }
                 // Y state (gap in A) contribution to predecessors at (i,j-1)
                 if (by != NEG_INF && j > 0) {
-                    sat(buf.BM,i,j-1) = lse2(srat(buf.BM,i,j-1),
-                                             by - params_->gap_open_a - params_->gap_extend_a);
-                    sat(buf.BX,i,j-1) = lse2(srat(buf.BX,i,j-1),
-                                             by - params_->gap_open_a - params_->gap_extend_a);
-                    sat(buf.BY,i,j-1) = lse2(srat(buf.BY,i,j-1), by - params_->gap_extend_a);
+                    const double goa = drow_go_a(i), gea = drow_ge_a(i);
+                    sat(buf.BM,i,j-1) = lse2(srat(buf.BM,i,j-1), by - goa - gea);
+                    sat(buf.BX,i,j-1) = lse2(srat(buf.BX,i,j-1), by - goa - gea);
+                    sat(buf.BY,i,j-1) = lse2(srat(buf.BY,i,j-1), by - gea);
                 }
             }
         }
@@ -3615,7 +3630,7 @@ private:
 
     void run_fwdbwd(DpBuffer& buf) {
         soft_counts_ready_ = false;
-        if (tr_) throw std::logic_error("nwgrad: INTERIM(tracks): tracked soft path not implemented yet");
+
         if (soft_impl_ != SoftImpl::Log) {
             bool ok;
             ok = fwdbwd_scaled(buf);
@@ -3639,6 +3654,7 @@ private:
             if constexpr (GM == GapModel::Linear) fwdbwd_linear(buf);
             else                                   fwdbwd_affine(buf);
             if (want_post_) posterior_rows_log(buf);
+            if (tr_) soft_record_log_(buf);   // tracked: the per-row record, now
             return;   // soft_grad() sweeps the tables lazily, as it always has
         }
         // T != 1: run the log path on θ/T, and sweep the gradient NOW, while params_ and
@@ -3649,6 +3665,15 @@ private:
         params_ = &tp;
         blk_ = tp.matrix.data();
         try {
+            if (tr_) {   // the per-row record, of theta/T
+                if constexpr (GM == GapModel::Linear) fwdbwd_linear(buf); else fwdbwd_affine(buf);
+                if (want_post_) posterior_rows_log(buf);
+                soft_record_log_(buf);
+                params_ = orig; blk_ = orig_blk;
+                log_z_ *= soft_temp_;
+                soft_counts_ready_ = true;
+                return;
+            }
             AlignParams g = AlignParams::zeros_like(tp);
             if constexpr (GM == GapModel::Linear) { fwdbwd_linear(buf); soft_grad_linear(buf, g); }
             else                                   { fwdbwd_affine(buf); soft_grad_affine(buf, g); }
@@ -3662,6 +3687,109 @@ private:
         blk_ = orig_blk;
         log_z_ *= soft_temp_;
         soft_counts_ready_ = true;
+    }
+
+    void add_soft_record_(AlignParams& grad) const {
+        double* gblk = grad_block(grad);
+        const size_t na = static_cast<size_t>(nalpha_);
+        for (int i = 1; i <= m_; ++i) {
+            double* dst = gblk + static_cast<size_t>(rs_[static_cast<size_t>(i) - 1]) * na;
+            const double* src = srec_cnt_.data() + static_cast<size_t>(i - 1) * na;
+            for (size_t c = 0; c < na; ++c) dst[c] += src[c];
+        }
+        for (int i = 0; i <= m_; ++i) {
+            const double* g = srec_gap_.data() + 4 * static_cast<size_t>(i);
+            grad.gap_ref(gset(i), AlignParams::kOpenA) += g[0];
+            grad.gap_ref(gset(i), AlignParams::kExtendA) += g[1];
+            if (i > 0) {
+                grad.gap_ref(tset(i), AlignParams::kOpenB) += g[2];
+                grad.gap_ref(tset(i), AlignParams::kExtendB) += g[3];
+            }
+        }
+    }
+    // The tracked log path's record, from the forward/backward tables of params_ (theta,
+    // or theta/T): soft_grad_linear / soft_grad_affine's sums, kept per row.
+    void soft_record_log_(const DpBuffer& buf) {
+        const size_t na = static_cast<size_t>(nalpha_);
+        srec_cnt_.assign(static_cast<size_t>(m_) * na, 0.0);
+        srec_gap_.assign(4 * (static_cast<size_t>(m_) + 1), 0.0);
+        double* G = srec_gap_.data();
+        if constexpr (GM == GapModel::Linear) {
+            for (int i = 1; i <= m_; ++i)
+                for (int j = jlo(i); j <= jhi(i); ++j) {
+                    const double bval = srat(buf.B, i, j);
+                    if (bval == NEG_INF) continue;
+                    srec_cnt_[static_cast<size_t>(i - 1) * na + b_idx_[static_cast<size_t>(j) - 1]] +=
+                        std::exp(srat(buf.F, i - 1, j - 1) + sub(i, j) + bval - log_z_);
+                }
+            for (int i = 1; i <= m_; ++i)
+                for (int j = std::max(kGapTargetMin, jlo0(i)); j <= jhi0(i); ++j) {
+                    const double bval = srat(buf.B, i, j), fval = srat(buf.F, i - 1, j);
+                    if (bval == NEG_INF || fval == NEG_INF) continue;
+                    G[4 * i + 3] -= std::exp(fval - drow_ge_b(i) + bval - log_z_);
+                }
+            for (int i = kGapTargetMin; i <= m_; ++i)
+                for (int j = std::max(1, jlo0(i)); j <= jhi0(i); ++j) {
+                    const double bval = srat(buf.B, i, j), fval = srat(buf.F, i, j - 1);
+                    if (bval == NEG_INF || fval == NEG_INF) continue;
+                    G[4 * i + 1] -= std::exp(fval - drow_ge_a(i) + bval - log_z_);
+                }
+        } else {
+            for (int i = 1; i <= m_; ++i)
+                for (int j = jlo(i); j <= jhi(i); ++j) {
+                    const double bm = srat(buf.BM, i, j);
+                    if (bm == NEG_INF) continue;
+                    const double pred = lse3(srat(buf.FM, i-1, j-1), srat(buf.FX, i-1, j-1), srat(buf.FY, i-1, j-1));
+                    srec_cnt_[static_cast<size_t>(i - 1) * na + b_idx_[static_cast<size_t>(j) - 1]] +=
+                        std::exp(pred + sub(i, j) + bm - log_z_);
+                }
+            for (int i = 1; i <= m_; ++i)
+                for (int j = jlo0(i); j <= jhi0(i); ++j) {
+                    const double fx = srat(buf.FX, i, j), bx = srat(buf.BX, i, j);
+                    if (fx == NEG_INF || bx == NEG_INF) continue;
+                    G[4 * i + 3] -= std::exp(fx + bx - log_z_);
+                }
+            for (int i = 0; i <= m_; ++i)
+                for (int j = std::max(1, jlo0(i)); j <= jhi0(i); ++j) {
+                    const double fy = srat(buf.FY, i, j), by = srat(buf.BY, i, j);
+                    if (fy == NEG_INF || by == NEG_INF) continue;
+                    G[4 * i + 1] -= std::exp(fy + by - log_z_);
+                }
+            for (int i = 1; i <= m_; ++i)
+                for (int j = std::max(kGapTargetMin, jlo0(i)); j <= jhi0(i); ++j) {
+                    const double bx = srat(buf.BX, i, j);
+                    if (bx == NEG_INF) continue;
+                    const double lo = lse2(srat(buf.FM, i-1, j), srat(buf.FY, i-1, j))
+                                      - drow_go_b(i) - drow_ge_b(i) + bx - log_z_;
+                    if (lo > -700) G[4 * i + 2] -= std::exp(lo);
+                }
+            for (int i = kGapTargetMin; i <= m_; ++i)
+                for (int j = std::max(1, jlo0(i)); j <= jhi0(i); ++j) {
+                    const double by = srat(buf.BY, i, j);
+                    if (by == NEG_INF) continue;
+                    const double lo = lse2(srat(buf.FM, i, j-1), srat(buf.FX, i, j-1))
+                                      - drow_go_a(i) - drow_ge_a(i) + by - log_z_;
+                    if (lo > -700) G[4 * i] -= std::exp(lo);
+                }
+        }
+    }
+    // The log path's Global column-0 border (tracked), in double: -(go_b(1) + C_i), C_i
+    // the sum of ge_b over rows 1..i (linear: -C_i), by the T-precision rule's runs.
+    void build_dbx0_() {
+        const size_t m = static_cast<size_t>(m_);
+        dbx0_.assign(m + 1, 0.0);
+        double csum = 0.0; size_t s0 = 1;
+        for (size_t i = 1; i <= m; ++i) {
+            const double ge = drow_ge_b(static_cast<int>(i));
+            if (i > 1 && std::bit_cast<uint64_t>(ge) != std::bit_cast<uint64_t>(drow_ge_b(static_cast<int>(i) - 1))) {
+                csum = (s0 == 1) ? static_cast<double>(i - 1) * drow_ge_b(static_cast<int>(i) - 1)
+                                 : csum + static_cast<double>(i - s0) * drow_ge_b(static_cast<int>(i) - 1);
+                s0 = i;
+            }
+            const double C = (s0 == 1) ? static_cast<double>(i) * ge : csum + static_cast<double>(i - s0 + 1) * ge;
+            if constexpr (GM == GapModel::Linear) dbx0_[i] = -C;
+            else                                   dbx0_[i] = -(drow_go_b(1) + C);
+        }
     }
 
     void add_scaled_counts(AlignParams& grad) const {
@@ -3712,8 +3840,8 @@ private:
     void posterior_rows_log(const DpBuffer& buf) {
         post_rows_.assign(static_cast<size_t>(m_) + 1, 0);
         std::vector<double> lp, ly;
-        const double lea = -params_->gap_extend_a;   // log ea (params_ is theta/T here)
         for (int i = 0; i <= m_; ++i) {
+            const double lea = -drow_ge_a(i);   // log ea (params_ is theta/T here)
             const int lo = jlo0(i), hi = jhi0(i);
             if (lo > hi) continue;
             lp.assign(static_cast<size_t>(hi - lo + 2), NEG_INF);
@@ -3747,11 +3875,45 @@ private:
     // aligner's backend (soft_kernel_impl.inl; the baseline copy when the backend is
     // scalar_fallback or its level has none).  False: out of range (see run_fwdbwd).
     bool fwdbwd_scaled(DpBuffer& buf) {
-        if (!prepare_scaled()) return false;
         constexpr bool lin = (GM == GapModel::Linear);
         const double it = 1.0 / soft_temp_;
         SoftPairJob J{};
+        const size_t w = static_cast<size_t>(n_) + 2;
+        if (tr_) {
+            // Tracked: each row's weights, and a profile row per DP row (its stacked row,
+            // exp'd: nalpha exps a row, not per cell); counts and gaps per row.
+            const size_t na = static_cast<size_t>(nalpha_), m = static_cast<size_t>(m_);
+            srw_.assign(4 * (m + 1), 0.0);
+            bool bad = false;
+            for (int i = 0; i <= m_; ++i) {
+                double* r = srw_.data() + 4 * static_cast<size_t>(i);
+                r[1] = std::exp(-drow_ge_a(i) * it);
+                if (!lin) r[0] = std::exp(-(drow_go_a(i) + drow_ge_a(i)) * it);
+                bad |= weight_bad(r[0]) || weight_bad(r[1]);
+                if (i > 0) {
+                    r[3] = std::exp(-drow_ge_b(i) * it);
+                    if (!lin) r[2] = std::exp(-(drow_go_b(i) + drow_ge_b(i)) * it);
+                    bad |= weight_bad(r[2]) || weight_bad(r[3]);
+                }
+            }
+            buf.sqp.assign(m * w, 0.0);
+            srow_.resize(na);
+            for (size_t i = 0; i < m; ++i) {
+                const double* br = blk_ + static_cast<size_t>(rs_[i]) * na;
+                for (size_t c = 0; c < na; ++c) { srow_[c] = std::exp(br[c] * it); bad |= weight_bad(srow_[c]); }
+                double* pr = buf.sqp.data() + i * w;
+                for (int j = 1; j <= n_; ++j) pr[j] = srow_[b_idx_[static_cast<size_t>(j) - 1]];
+            }
+            if (bad) return false;
+            scnt_.assign(m * na, 0.0);
+            srec_gap_.assign(4 * (m + 1), 0.0);
+            J.rw = srw_.data();
+            J.grow = srec_gap_.data();
+        } else {
+            if (!prepare_scaled()) return false;
+        }
         if (want_post_) { post_rows_.assign(static_cast<size_t>(m_) + 1, 0); J.gpost = post_rows_.data(); }
+        if (!tr_) {
         J.ea = std::exp(-params_->gap_extend_a * it);
         J.eb = std::exp(-params_->gap_extend_b * it);
         if (!lin) {
@@ -3760,9 +3922,9 @@ private:
             if (weight_bad(J.oa) || weight_bad(J.ob)) return false;
         }
         if (weight_bad(J.ea) || weight_bad(J.eb)) return false;
+        }
         if constexpr (lin) { if (buf.F.size() < sz_) buf.F.resize(sz_); }
         else for (auto* v : {&buf.FM, &buf.FX, &buf.FY}) if (v->size() < sz_) v->resize(sz_);
-        const size_t w = static_cast<size_t>(n_) + 2;
         for (DVec* r : {&buf.sb0, &buf.sb1, &buf.sb2, &buf.sb3, &buf.sb4, &buf.sb5})
             if (r->size() < w) r->resize(w);
         const size_t mm = static_cast<size_t>(m_) + 1;
@@ -3778,7 +3940,7 @@ private:
         srs_.resize(2 * mm);
         J.m = m_; J.n = n_; J.nalpha = nalpha_;
         J.a = a_idx_.data(); J.b = b_idx_.data();
-        J.P = build_profile(buf, w);
+        J.P = tr_ ? buf.sqp.data() : build_profile(buf, w);
         J.local = (AM == AlignMode::Local) ? 1 : 0;
         J.full = (AB == AlignBand::Full) ? 1 : 0;
         J.bi = border_rows(); J.bj = border_cols();
@@ -3802,6 +3964,7 @@ private:
         if (!J.ok) return false;
         log_z_ = J.log_z;
         sg_go_a_ = J.g_oa; sg_ge_a_ = J.g_ea; sg_go_b_ = J.g_ob; sg_ge_b_ = J.g_eb;
+        if (tr_) srec_cnt_.swap(scnt_);   // per row: the record (srec_gap_ filled by the kernel)
         return true;
     }
 };

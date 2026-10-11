@@ -100,15 +100,22 @@ static inline double sp_post(int e, double izr, bool& bad) noexcept {
     if (!(f <= std::numeric_limits<double>::max())) bad = true;
     return f;
 }
-// Match posteriors tmp[j] of row i into the count row of a[i-1], times g.
-static inline void sp_scatter(const SoftPairJob& J, const double* tmp, int i, int lo, int hi,
+// Match posteriors tmp[j] of row i into count row `crow` (the row of a[i-1]; tracked,
+// row i-1 itself), times g.
+static inline void sp_scatter(const SoftPairJob& J, const double* tmp, size_t crow, int lo, int hi,
                               double g) noexcept {
     const int na = J.nalpha;
     double* srow = J.srow;
     for (int c = 0; c < na; ++c) srow[c] = 0.0;
     for (int j = lo; j <= hi; ++j) srow[J.b[j - 1]] += tmp[j];
-    double* gr = J.scnt + static_cast<size_t>(J.a[i - 1]) * na;
+    double* gr = J.scnt + crow * na;
     for (int c = 0; c < na; ++c) gr[c] += srow[c] * g;
+}
+// The profile / count row of DP row i (1..m): its residue's, or (Tr) its own.
+template <bool Tr>
+static inline size_t sp_row(const SoftPairJob& J, int i) noexcept {
+    if constexpr (Tr) return static_cast<size_t>(i - 1);
+    else              return static_cast<size_t>(J.a[i - 1]);
 }
 // Z = 2^ze·zr from per-row sums (Local) or the (m, n) cell (Global), zr normalized
 // into [1, 2).  Returns false if Z is not positive and finite (handled by caller).
@@ -130,12 +137,20 @@ static inline bool sp_log_z(SoftPairJob& J, const int* S, const double* rowsum_o
     return true;
 }
 
-NWGRAD_SP_FMA_FN static void soft_pair_linear(SoftPairJob& J) noexcept {
+// Tr: tracked (J.rw) — each row's weights, its own profile and count row, and the gap
+// gradient per row into J.grow.
+template <bool Tr>
+NWGRAD_SP_FMA_FN static void soft_pair_linear_t(SoftPairJob& J) noexcept {
     NWGRAD_SP_FMA_BODY
     const int m = J.m, n = J.n;
     const bool L = J.local != 0;
     const int kmin = L ? 1 : 0;
-    const double ea = J.ea, eb = J.eb;
+    double ea = J.ea, eb = J.eb;
+    const double* RW = J.rw;
+    if constexpr (Tr) {
+        ea = RW[1];
+        for (int i = 0; i <= m; ++i) for (int f = 0; f < 4; ++f) J.grow[4 * i + f] = 0.0;
+    }
     const size_t st = J.stride, w = static_cast<size_t>(n) + 2;
     double* F = J.FM;
     int* S = J.S;
@@ -166,10 +181,11 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear(SoftPairJob& J) noexcept {
     for (int i = 1; i <= m; ++i) {
         double* __restrict r = F + static_cast<size_t>(i) * st;
         const double* __restrict p = r - st;
+        if constexpr (Tr) { ea = RW[4 * i + 1]; eb = RW[4 * i + 3]; }
         double fr = 0.0;
         if (L) { fr = std::ldexp(1.0, -S[i - 1]); r[0] = fr; }
         else   r[0] = (i <= J.bi) ? p[0] * eb : 0.0;
-        const double* __restrict pr = P + static_cast<size_t>(J.a[i - 1]) * w;
+        const double* __restrict pr = P + sp_row<Tr>(J, i) * w;
         const int lo = J.jlo[i], hi = J.jhi[i];
         for (int j = lo; j <= hi; ++j) r[j] = p[j - 1] * pr[j] + p[j] * eb + fr;
         if (lo <= hi) sp_carry_fwd(r, r, lo, hi, ea);
@@ -207,11 +223,13 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear(SoftPairJob& J) noexcept {
         const int lo0 = J.jlo0[i], hi0 = J.jhi0[i];
         for (int j = clo; j <= chi; ++j) cur[j] = 0.0;
         const double init = L ? std::ldexp(1.0, -Tn) : 0.0;
+        double ebn = eb;   // the move down into row i+1 (Tr: that row's)
+        if constexpr (Tr) { ea = RW[4 * i + 1]; eb = RW[4 * i + 3]; if (i < m) ebn = RW[4 * (i + 1) + 3]; }
         if (i < m) {
-            const double* __restrict pn = P + static_cast<size_t>(J.a[i]) * w;
+            const double* __restrict pn = P + sp_row<Tr>(J, i + 1) * w;
             double* __restrict c = cur;
             const double* __restrict nx = nxt;
-            for (int j = lo0; j <= hi0; ++j) c[j] = pn[j + 1] * nx[j + 1] + nx[j] * eb + init;
+            for (int j = lo0; j <= hi0; ++j) c[j] = pn[j + 1] * nx[j + 1] + nx[j] * ebn + init;
         } else {
             for (int j = lo0; j <= hi0; ++j) cur[j] = init;
             if (!L && n >= lo0 && n <= hi0) cur[n] = 1.0;
@@ -227,7 +245,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear(SoftPairJob& J) noexcept {
         if (lo0 == 0) { mx = cb[0]; if (i >= 1 && kmin == 0) sb += (Fi - st)[0] * cb[0]; }
         if (i >= 1) {
             const double* __restrict Fp = Fi - st;
-            const double* __restrict pr = P + static_cast<size_t>(J.a[i - 1]) * w;
+            const double* __restrict pr = P + sp_row<Tr>(J, i) * w;
             double* __restrict t = tmp;
             NWGRAD_SP_PRAGMA_(omp simd reduction(+:sa, sb) reduction(max:mx))
             for (int j = j1; j <= hi0; ++j) {
@@ -261,11 +279,15 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear(SoftPairJob& J) noexcept {
         const double gh0 = sp_post(S[i] + Tn - ze, izr, bad);
         const double gh = sp_post(S[i] + Ti - ze, izr, bad);
         loss += sp_loss(n, i > 0 ? S[i] - S[i - 1] : 0, kb, mf[i], mx, gh);
-        if (i >= kmin) g_ea += sa * ea * gh0;
+        if (i >= kmin) {
+            g_ea += sa * ea * gh0;
+            if constexpr (Tr) J.grow[4 * i + 1] = -(sa * ea * gh0);
+        }
         if (i >= 1) {
             const double gv0 = sp_post(S[i - 1] + Tn - ze, izr, bad);
             g_eb += sb * eb * gv0;
-            sp_scatter(J, tmp, i, j1, hi0, gv0);
+            if constexpr (Tr) J.grow[4 * i + 3] = -(sb * eb * gv0);
+            sp_scatter(J, tmp, sp_row<Tr>(J, i), j1, hi0, gv0);
         }
         if (bad) return;
         Tn = Ti;
@@ -276,12 +298,18 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear(SoftPairJob& J) noexcept {
     J.ok = 1;
 }
 
-NWGRAD_SP_FMA_FN static void soft_pair_affine(SoftPairJob& J) noexcept {
+template <bool Tr>
+NWGRAD_SP_FMA_FN static void soft_pair_affine_t(SoftPairJob& J) noexcept {
     NWGRAD_SP_FMA_BODY
     const int m = J.m, n = J.n;
     const bool L = J.local != 0;
     const int kmin = L ? 1 : 0;
-    const double oa = J.oa, ea = J.ea, ob = J.ob, eb = J.eb;
+    double oa = J.oa, ea = J.ea, ob = J.ob, eb = J.eb;
+    const double* RW = J.rw;
+    if constexpr (Tr) {
+        oa = RW[0]; ea = RW[1];
+        for (int i = 0; i <= m; ++i) for (int f = 0; f < 4; ++f) J.grow[4 * i + f] = 0.0;
+    }
     const size_t st = J.stride, w = static_cast<size_t>(n) + 2;
     double* FM = J.FM; double* FX = J.FX; double* FY = J.FY;
     int* S = J.S;
@@ -323,13 +351,14 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine(SoftPairJob& J) noexcept {
         double* __restrict rY = FY + ro;
         const double* __restrict pM = rM - st; const double* __restrict pX = rX - st;
         const double* __restrict pY = rY - st;
+        if constexpr (Tr) { oa = RW[4 * i]; ea = RW[4 * i + 1]; ob = RW[4 * i + 2]; eb = RW[4 * i + 3]; }
         double fr = 0.0;
         if (L) { fr = std::ldexp(1.0, -S[i - 1]); rM[0] = fr; rX[0] = 0.0; rY[0] = 0.0; }
         else {
             rM[0] = 0.0; rY[0] = 0.0;
             rX[0] = (i <= J.bi) ? (pM[0] + pY[0]) * ob + pX[0] * eb : 0.0;
         }
-        const double* __restrict pr = P + static_cast<size_t>(J.a[i - 1]) * w;
+        const double* __restrict pr = P + sp_row<Tr>(J, i) * w;
         const double* __restrict tq = tp;
         double* __restrict u = uy;
         const int lo = J.jlo[i], hi = J.jhi[i];
@@ -388,16 +417,21 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine(SoftPairJob& J) noexcept {
         // row i+1 over [nlo, nhi].
         for (int j = nlo; j <= nhi; ++j) cY[j] = 0.0;
         const double init = L ? std::ldexp(1.0, -Tn) : 0.0;
+        double obn = ob, ebn = eb;   // the move down into row i+1 (Tr: that row's)
+        if constexpr (Tr) {
+            oa = RW[4 * i]; ea = RW[4 * i + 1]; ob = RW[4 * i + 2]; eb = RW[4 * i + 3];
+            if (i < m) { obn = RW[4 * (i + 1) + 2]; ebn = RW[4 * (i + 1) + 3]; }
+        }
         {
             double* __restrict b1 = cM; double* __restrict b2 = cX;
             double* __restrict y = cY;
             const double* __restrict nm = nM; const double* __restrict nx = nX;
             if (i < m) {
-                const double* __restrict pn = P + static_cast<size_t>(J.a[i]) * w;
+                const double* __restrict pn = P + sp_row<Tr>(J, i + 1) * w;
                 for (int j = lo0; j <= hi0; ++j) {
                     const double d = pn[j + 1] * nm[j + 1] + init, v = nx[j];
-                    const double v1 = d + v * ob;
-                    b1[j] = v1; b2[j] = d + v * eb; y[j] = v1;
+                    const double v1 = d + v * obn;
+                    b1[j] = v1; b2[j] = d + v * ebn; y[j] = v1;
                 }
             } else {
                 for (int j = lo0; j <= hi0; ++j) { b1[j] = init; b2[j] = init; y[j] = init; }
@@ -429,7 +463,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine(SoftPairJob& J) noexcept {
         if (i >= 1) {
             const double* __restrict qM = fM - st; const double* __restrict qX = fX - st;
             const double* __restrict qY = fY - st;
-            const double* __restrict pr = P + static_cast<size_t>(J.a[i - 1]) * w;
+            const double* __restrict pr = P + sp_row<Tr>(J, i) * w;
             double* __restrict t = tmp;
             NWGRAD_SP_PRAGMA_(omp simd reduction(+:sx, sy, so, sob) reduction(max:mx))
             for (int j = j1; j <= hi0; ++j) {
@@ -476,10 +510,16 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine(SoftPairJob& J) noexcept {
         g_eb += sx * gh0;
         g_ea += sy * gh0;
         if (i >= kmin) g_oa += so * oa * gh0;
+        if constexpr (Tr) {
+            J.grow[4 * i + 3] = -(sx * gh0);
+            J.grow[4 * i + 1] = -(sy * gh0);
+            if (i >= kmin) J.grow[4 * i] = -(so * oa * gh0);
+        }
         if (i >= 1) {
             const double gv0 = sp_post(S[i - 1] + Tn - ze, izr, bad);
             g_ob += sob * ob * gv0;
-            sp_scatter(J, tmp, i, j1, hi0, gv0);
+            if constexpr (Tr) J.grow[4 * i + 2] = -(sob * ob * gv0);
+            sp_scatter(J, tmp, sp_row<Tr>(J, i), j1, hi0, gv0);
         }
         if (bad) return;
         Tn = Ti;
@@ -489,4 +529,11 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine(SoftPairJob& J) noexcept {
     if (!(loss <= kSpLossTol)) return;
     J.g_oa = -g_oa; J.g_ea = -g_ea; J.g_ob = -g_ob; J.g_eb = -g_eb;
     J.ok = 1;
+}
+
+NWGRAD_SP_FMA_FN static void soft_pair_linear(SoftPairJob& J) noexcept {
+    if (J.rw) soft_pair_linear_t<true>(J); else soft_pair_linear_t<false>(J);
+}
+NWGRAD_SP_FMA_FN static void soft_pair_affine(SoftPairJob& J) noexcept {
+    if (J.rw) soft_pair_affine_t<true>(J); else soft_pair_affine_t<false>(J);
 }
