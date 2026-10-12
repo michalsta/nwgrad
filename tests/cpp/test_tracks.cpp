@@ -13,6 +13,7 @@
 #include "catch.hpp"
 #include "align_params.hpp"
 #include "aligner.hpp"
+#include "batch_engine.hpp"
 
 #include <bit>
 #include <cmath>
@@ -405,4 +406,70 @@ TEST_CASE("tracked Hirschberg: optimal, scalar == simd, gradient is the path's",
 TEST_CASE("tracked Hirschberg: equal sets are the untracked recursion", "[tracks]") {
     hb_equal_sets<double>(31, Alphabet::get("ACGT"), 40, 30);
     hb_equal_sets<float>(32, Alphabet::get("ACGT"), 40, 30);
+}
+
+namespace {
+// A tracked batch on 8 threads (the inter-pair fill), against each pair's own Aligner:
+// whole-batch fills, every pair recomputed alone over and over (its stored gradient
+// rewritten each time), wide bands, and the weighted sum after each — for the
+// sanitizers as much as for the values.
+template <GapModel GM, AlignMode AM, class T>
+void check_batch(uint64_t seed) {
+    std::mt19937_64 rng(seed);
+    const Alphabet& alpha = Alphabet::get("ACGT");
+    const int K = 4;
+    const AlignParams p = random_sets(rng, alpha, K, false, false);
+    const size_t N = 400;
+    std::uniform_int_distribution<int> dl(0, 60);
+    std::vector<std::string> A, B;
+    std::vector<std::vector<uint16_t>> tk, gk;
+    for (size_t i = 0; i < N; ++i) {
+        A.push_back(random_seq(rng, alpha, dl(rng)));
+        B.push_back(random_seq(rng, alpha, dl(rng)));
+        tk.push_back(random_track(rng, A.back().size(), K));
+        gk.push_back(random_track(rng, A.back().size() + 1, K));
+    }
+    std::vector<std::string_view> Av(A.begin(), A.end()), Bv(B.begin(), B.end());
+    BatchEngine<T, GM, AM> eng(8, GradMode::Hard, TracebackMode::Pointers);
+    eng.set_fill(false, true);
+    eng.add_many(Av, Bv, p, kBackendAuto, &tk, &gk);
+    std::vector<Run<T>> ref;
+    for (size_t i = 0; i < N; ++i)
+        ref.push_back(run<GM, AM, AlignBand::Full, T>(p, A[i], B[i], 0, tk[i], gk[i], kBackendAuto,
+                                                      TracebackMode::Pointers));
+    std::vector<double> w(N);
+    for (auto& x : w) x = std::uniform_real_distribution<double>(-2, 2)(rng);
+    auto check = [&]() {
+        std::vector<double> acc;
+        for (size_t i = 0; i < N; ++i) {
+            INFO("pair " << i);
+            REQUIRE(same_bits_d(eng.score(i), ref[i].score));
+            AlignParams g(alpha, K);
+            eng.grad(i, g);
+            const std::vector<double> f = flatten(g);
+            REQUIRE(same_bits(f, ref[i].grad));
+            if (acc.empty()) acc.assign(f.size(), 0.0);
+            for (size_t k = 0; k < f.size(); ++k) acc[k] += w[i] * f[k];   // one block: pair order
+        }
+        REQUIRE(same_bits(flatten(eng.weighted_grad(w.data(), N)), acc));
+    };
+    for (int round = 0; round < 3; ++round) {
+        eng.score_and_grad();
+        check();
+        for (int rep = 0; rep < 5; ++rep)
+            for (size_t i = 0; i < N; ++i) eng.score_and_grad_one(i, false);
+        check();
+        eng.banded_grad(128);
+        check();
+    }
+}
+}  // namespace
+
+TEST_CASE("tracked batch: threaded fills, single-pair recomputes, weighted sums", "[tracks]") {
+    check_batch<GapModel::Linear, AlignMode::Global, double>(41);
+    check_batch<GapModel::Linear, AlignMode::Local, double>(42);
+    check_batch<GapModel::Affine, AlignMode::Global, double>(43);
+    check_batch<GapModel::Affine, AlignMode::Local, double>(44);
+    check_batch<GapModel::Affine, AlignMode::Global, float>(45);
+    check_batch<GapModel::Linear, AlignMode::Local, float>(46);
 }
