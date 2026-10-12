@@ -39,6 +39,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -78,6 +79,10 @@ struct BatchSettings {
     double weight_lo = 500.0;
     double weight_hi = 1700.0;
     bool   profile = false;
+    // How a tracked batch stores its hard gradients: false, each pair's path (2 bits a
+    // move, replayed on demand); true, its sparse field counts (faster to sum, ~10x the
+    // memory).  See BatchEngine, "Tracked hard gradients".
+    bool   track_counts = false;
 
     void set_hb_cutoff(int rows) {
         if (rows < 1) throw std::invalid_argument("nwgrad: hb_cutoff must be >= 1");
@@ -153,6 +158,16 @@ public:
     void set_weight_lo(double v) noexcept { s_.weight_lo = v; }
     void set_weight_hi(double v) noexcept { s_.weight_hi = v; }
     void set_profile(bool v) noexcept { s_.profile = v; }
+    // Paths or counts for a tracked batch's hard gradients: a change drops the stored ones
+    // (scores and guides stay; the next score_and_grad / banded_grad stores them anew).
+    void set_track_counts(bool v) {
+        if (v == s_.track_counts) return;
+        s_.track_counts = v;
+        if (!tracked_ || grad_mode_ != GradMode::Hard) return;
+        for (auto& f : flags_) f &= static_cast<uint8_t>(~kGrad);
+        reset_hard_store_();
+        grow_tpaths_(0);
+    }
 
     struct PhaseProfile {
         double chunk_s = 0.0, reserve_s = 0.0;
@@ -177,7 +192,8 @@ public:
     // its params have more than one set or any pair was given a track; every pair then
     // carries both tracks (zeros / derived where not given), and every segment's params
     // must have the same number of sets.  A tracked batch stores a hard gradient as the
-    // pair's PATH (2 bits per step), not as K dense sets, and sums it on demand.
+    // pair's PATH (2 bits per step) or, with track_counts, its sparse field counts — not
+    // as K dense sets — and sums it on demand.
     void add_many(const std::vector<std::string_view>& seqs_a,
                   const std::vector<std::string_view>& seqs_b,
                   const AlignParams& params, int kernel = kBackendAuto,
@@ -414,6 +430,7 @@ public:
         if (N == 0) return 0.0;
         prepare_paths_(keep_paths);
         ++full_calls_;   // guides may have moved: the banded grouping is stale
+        tc_begin_full_();
         if (grad_mode_ == GradMode::None && !keep_paths) score_only_();
         else if (s_.inter_fill)      score_and_grad_inter_(keep_paths);
         else if (s_.sorted_schedule) score_and_grad_sorted_(keep_paths);
@@ -435,6 +452,7 @@ public:
                 throw std::logic_error(
                     "nwgrad: banded_grad() needs a guide path; run score_and_grad() first");
         prepare_paths_(keep_paths);
+        tc_begin_full_();
         if (s_.inter_fill && !keep_paths) banded_grad_inter_(bandwidth);
         else if (s_.sorted_schedule)      banded_grad_lpt_(bandwidth, keep_paths);
         else                           banded_grad_dynamic_(bandwidth, keep_paths);
@@ -1103,14 +1121,37 @@ private:
     int  nsets_ = 0;                        // K of every segment's params
     std::vector<uint16_t> tk_;              // tracked: pair i's track at oa_[i]
     std::vector<uint16_t> gk_;              // tracked: pair i's gap track at oa_[i] + i
-    // Tracked hard gradients, as paths: pair i's moves, 2 bits each (0 diagonal, 1 gap in
-    // B, 2 gap in A), in tp_[tpo_[i] ..], at most len_a + len_b of them (a path has no
-    // more steps), the path at its END (written from the back: Aligner::hard_path_packed);
-    // tps_[i] = {i0, j0, steps, off}: the start cell, the move count and the first move's
-    // index.  8 bytes of padding at the end (tpath_grad_'s window).
+    // Tracked hard gradients, in one of two stores (settings().track_counts): the summed
+    // values are the same, the costs differ.
+    // Paths (the default): pair i's moves, 2 bits each (0 diagonal, 1 gap in B, 2 gap in
+    // A), in tp_[tpo_[i] ..], at most len_a + len_b of them (a path has no more steps),
+    // the path at its END (written from the back: Aligner::hard_path_packed); tps_[i] =
+    // {i0, j0, steps, off}: the start cell, the move count and the first move's index.
+    // 8 bytes of padding at the end (tpath_grad_'s window).  Replayed per sum.
     std::vector<uint8_t>  tp_;
     std::vector<size_t>   tpo_{0};
     std::vector<std::array<int32_t, 4>> tps_;
+    // Counts: pair i's touched fields of the flat K-set layout and their counts (gap
+    // fields stand for -count), exactly as many as it has (~10-40 a miRNA pair), counted
+    // in the walk (Aligner::hard_fields).  Each WRITER (a worker of one fill call, or the
+    // single-pair path's Work) appends its pairs' entries to its own buffer,
+    // tcw_[writer]; tcp_[i] says where pair i's are.  A whole-batch fill (score_and_grad,
+    // banded_grad) starts a new generation: it recomputes every pair, so every buffer is
+    // reused from empty (tcw_used_ counts the writers handed out).  Single-pair
+    // recomputes append to their writer and leave the old entries dead; tc_compact_
+    // drops them when they outgrow the live ones.
+    // An entry is one word, key << 12 | count, while count < 4095 and key < 2^20 (K *
+    // (n*n + 4) fields: 2600 sets of a 20-letter alphabet), else three: kTcEscape, key,
+    // count (a one-word entry never equals kTcEscape).  Read in order, never indexed.
+    static constexpr uint32_t kTcEscape = 0xFFFFFFFFu;
+    static constexpr size_t kTcAhead = 16;   // pairs prefetched ahead in the sum (8-32: the same)
+    // n, off: in words; esc: whether any entry is escaped (else n entries, one word each)
+    struct TRef { uint32_t w = 0, n = 0, gen = 0, esc = 0; uint64_t off = 0; };
+    std::deque<std::vector<uint32_t>> tcw_;    // (a deque: a buffer never moves)
+    std::vector<TRef>     tcp_;
+    size_t   tcw_used_ = 0;
+    uint32_t tc_gen_ = 1;
+    size_t   tc_dead_ = 0;   // dead entries in the single-pair writer's buffer
     // Tracked soft gradients: pair i's per-row record (Aligner::soft_record_counts / _gaps)
     // at sr_[sro_[i] ..]: len_a*n counts, then 4*(len_a+1) gap fields.
     std::vector<double>   sr_;
@@ -1187,13 +1228,25 @@ private:
         gk_.assign(oa_[N0] + N0, 0);
         std::vector<double>().swap(grad_);
         for (size_t i = 0; i < N0; ++i) flags_[i] &= static_cast<uint8_t>(~(kScore | kGrad | kStored));
-        tpo_.assign(1, 0);
-        tps_.clear();
+        reset_hard_store_();
         sro_.assign(1, 0);
         sr_.clear();
         grow_tpaths_(0);
     }
-    // Path slots (hard) or record slots (soft) for pairs [from, size()) of a tracked batch.
+    // Both hard stores emptied (their memory freed).  A new generation: no counts entry,
+    // nor a Work's writer, from before survives.
+    void reset_hard_store_() {
+        std::vector<uint8_t>().swap(tp_);
+        tpo_.assign(1, 0);
+        std::vector<std::array<int32_t, 4>>().swap(tps_);
+        tcw_.clear();
+        std::vector<TRef>().swap(tcp_);
+        ++tc_gen_;
+        tcw_used_ = 0;
+        tc_dead_ = 0;
+    }
+    // Path or count slots (hard) or record slots (soft) for pairs [from, size()) of a
+    // tracked batch.
     void grow_tpaths_(size_t from) {
         if (grad_mode_ == GradMode::Soft) {
             const size_t na = static_cast<size_t>(alpha_->size());
@@ -1203,6 +1256,10 @@ private:
             return;
         }
         if (grad_mode_ != GradMode::Hard) return;
+        if (s_.track_counts) {
+            tcp_.resize(size());
+            return;
+        }
         for (size_t i = tpo_.size() - 1; i < size(); ++i)
             tpo_.push_back(tpo_.back() + (len_a(i) + len_b(i) + 3) / 4);
         (void)from;
@@ -1224,11 +1281,83 @@ private:
         const int off = al.hard_path_packed(buf, d, cap, i0, j0, gj);
         tps_[i] = {i0, j0, cap - off, off};
     }
+    struct Work;   // (below: a worker's state)
+    // A whole-batch hard fill begins (it recomputes every pair): a new generation, every
+    // writer buffer reused from empty, and no pair's gradient valid until it is stored.
+    void tc_begin_full_() {
+        if (!tracked_ || grad_mode_ != GradMode::Hard || !s_.track_counts) return;
+        ++tc_gen_;
+        tcw_used_ = 0;
+        tc_dead_ = 0;
+        for (auto& f : flags_) f &= static_cast<uint8_t>(~kGrad);
+    }
+    static std::mutex& tc_mutex_() { static std::mutex m; return m; }
+    // Work w's buffer for this generation (handed out under a lock: workers start
+    // concurrently).
+    std::vector<uint32_t>& tc_writer_(Work& w) {
+        if (w.tcbuf && w.tcgen == tc_gen_) return *w.tcbuf;
+        std::lock_guard<std::mutex> lk(tc_mutex_());
+        const size_t idx = tcw_used_++;
+        if (idx == tcw_.size()) tcw_.emplace_back();
+        tcw_[idx].clear();
+        w.tcbuf = &tcw_[idx];
+        w.tcw = static_cast<uint32_t>(idx);
+        w.tcgen = tc_gen_;
+        return *w.tcbuf;
+    }
+    // Pair i's hard gradient (and with gj its guide) from the DP `al` just ran: counted
+    // field by field along the traceback walk, then appended to w's buffer.
+    template <class Al>
+    void store_tcounts_(size_t i, const Al& al, const DpBuffer& buf, std::vector<int>* gj, Work& w) {
+        Touched& t = w.tc;
+        t.begin(kstride_(), 2 * (len_a(i) + len_b(i)) + 2);
+        uint32_t* keys = t.keys.data();
+        uint32_t* slot = t.slot.data();
+        size_t nk = 0;
+        al.hard_fields(buf, [&](uint32_t k) { if (slot[k]++ == 0) keys[nk++] = k; }, gj);
+        std::vector<uint32_t>& out = tc_writer_(w);
+        const uint64_t off = out.size();
+        uint32_t esc = 0;
+        for (size_t q = 0; q < nk; ++q) {
+            const uint32_t k = keys[q], c = slot[k];
+            slot[k] = 0;
+            if (c < 4095u && k < (1u << 20)) out.push_back(k << 12 | c);
+            else { out.push_back(kTcEscape); out.push_back(k); out.push_back(c); esc = 1; }
+        }
+        TRef& r = tcp_[i];
+        const bool solo = &w == solo_.get();
+        if (solo && r.gen == tc_gen_ && r.w == w.tcw) tc_dead_ += r.n;   // overwritten in place
+        r = {w.tcw, static_cast<uint32_t>(out.size() - off), tc_gen_, esc, off};
+        if (solo && tc_dead_ > 4096 && tc_dead_ * 2 > out.size()) tc_compact_(w);
+    }
+    // Drop the dead entries of w's buffer (the single-pair writer's: only it overwrites).
+    void tc_compact_(Work& w) {
+        std::vector<uint32_t>& b = *w.tcbuf;
+        std::vector<uint32_t> nb;
+        nb.reserve(b.size() - tc_dead_);
+        for (TRef& r : tcp_) {
+            if (r.gen != tc_gen_ || r.w != w.tcw) continue;
+            const uint64_t off = nb.size();
+            nb.insert(nb.end(), b.begin() + static_cast<std::ptrdiff_t>(r.off),
+                      b.begin() + static_cast<std::ptrdiff_t>(r.off + r.n));
+            r.off = off;
+        }
+        b.swap(nb);
+        tc_dead_ = 0;
+    }
+    // Pair i's hard gradient (and with gj its guide) from the DP `al` just ran, into the
+    // batch's store.
+    template <class Al>
+    void store_hard_(size_t i, const Al& al, const DpBuffer& buf, std::vector<int>* gj, Work& w) {
+        if (s_.track_counts) store_tcounts_(i, al, buf, gj, w);
+        else                 store_tpath_(i, al, buf, gj);
+    }
     // One pair's gradient, sparse: the first n entries of keys / vals are the fields it
     // touches (in first-touch order) and their values.  `slot` has one entry per field of
     // the flat K-set layout and is left all-zero again after each pair; while a pair is
-    // gathered it holds a hard path's step COUNT per field (count / end_counts), or a soft
-    // block's position + 1 at the block's first field (add_block / end_blocks).
+    // gathered it holds a hard path's or walk's COUNT per field (tpath_grad_ / end_counts,
+    // store_tcounts_), or a soft block's position + 1 at the block's first field
+    // (add_block / end_blocks).
     struct Touched {
         std::vector<uint32_t> keys, slot;
         std::vector<double> vals;
@@ -1316,7 +1445,35 @@ private:
         t.n = n;
         t.end_counts(static_cast<uint32_t>(gbase));
     }
-    // The flat K-set gradient layout tpath_grad_ emits into, to and from an AlignParams.
+    // Pair i's stored hard gradient, sparse into `t`: its fields of the flat K-set layout
+    // — the matrix stack first (set*n*n + a*n + b), then the gaps (K*n*n + 4*set +
+    // field) — with the walk gradient's counts (gap fields negative).
+    void tcount_grad_(size_t i, Touched& t) const {
+        const TRef& r = tcp_[i];
+        t.begin(kstride_(), r.n);   // (entries <= words)
+        const uint32_t gbase = static_cast<uint32_t>(static_cast<size_t>(nsets_) * nn_);
+        const uint32_t* d = tcw_[r.w].data() + r.off;
+        // The value: the count, its sign bit set on the gap fields (no branch: the two
+        // kinds interleave unpredictably).
+        auto put = [&](size_t n, uint32_t k, uint32_t c) {
+            t.keys[n] = k;
+            t.vals[n] = std::bit_cast<double>(std::bit_cast<uint64_t>(static_cast<double>(c)) |
+                                              (static_cast<uint64_t>(k >= gbase) << 63));
+        };
+        if (!r.esc) {   // every entry one word
+            for (size_t q = 0; q < r.n; ++q) put(q, d[q] >> 12, d[q] & 0xFFFu);
+            t.n = r.n;
+            return;
+        }
+        size_t n = 0;
+        for (size_t q = 0; q < r.n; ++n) {
+            if (d[q] != kTcEscape) { put(n, d[q] >> 12, d[q] & 0xFFFu); q += 1; }
+            else                   { put(n, d[q + 1], d[q + 2]); q += 3; }
+        }
+        t.n = n;
+    }
+    // The flat K-set gradient layout of tpath_grad_, tcount_grad_ and srec_grad_, to and
+    // from an AlignParams.
     size_t kstride_() const noexcept { return static_cast<size_t>(nsets_) * (nn_ + 4); }
     void flat_to_params_(const double* flat, AlignParams& out) const {
         std::memcpy(out.matrix.data(), flat, static_cast<size_t>(nsets_) * nn_ * sizeof(double));
@@ -1379,7 +1536,7 @@ private:
         return out;
     }
 
-    // Tracked: as blocked_sum_, from each pair's stored gradient (tpath_grad_): per pair,
+    // Tracked: as blocked_sum_, from each pair's stored gradient (pair_grad_): per pair,
     // each field it touches gets weight * count, formed out of line, added once — exactly
     // what the dense sum adds there; the fields it does not touch would get w * 0, which
     // leaves a sum that started at +0 unchanged.  So with one set this is bit-identical
@@ -1389,6 +1546,7 @@ private:
         const size_t nblocks = (n + WEIGHTED_GRAD_BLOCK - 1) / WEIGHTED_GRAD_BLOCK;
         std::vector<double> partial(nblocks * gs, 0.0);
         std::atomic<size_t> next{0};
+        const bool counts = grad_mode_ != GradMode::Soft && s_.track_counts;
         auto worker = [&]() {
             std::vector<double> scaled;
             Touched t;
@@ -1396,6 +1554,11 @@ private:
                 double* acc = partial.data() + b * gs;
                 const size_t end = std::min(n, (b + 1) * WEIGHTED_GRAD_BLOCK);
                 for (size_t i = b * WEIGHTED_GRAD_BLOCK; i < end; ++i) {
+                    if (counts && i + kTcAhead < end) {   // the pairs' entries are scattered over the writers
+                        const TRef& r = tcp_[i + kTcAhead];
+                        const uint32_t* d = tcw_[r.w].data() + r.off;
+                        for (uint32_t q = 0; q < r.n; q += 16) __builtin_prefetch(d + q);
+                    }
                     pair_grad_(i, t);
                     const size_t nk = t.n;
                     if (weights) {
@@ -1417,7 +1580,7 @@ private:
         flat_to_params_(tot.data(), out);
         return out;
     }
-    // Pair i's stored soft record, scattered into the flat K-set layout (tpath_grad_'s):
+    // Pair i's stored soft record, scattered into the flat K-set layout (kstride_'s):
     // row r's counts to its set's block, its gap fields to its sets — summed in row order,
     // each touched field emitted once.
     void srec_grad_(size_t i, Touched& t) const {
@@ -1442,6 +1605,7 @@ private:
     // Pair i's stored tracked gradient, sparse into `t` (keys / vals).
     void pair_grad_(size_t i, Touched& t) const {
         if (grad_mode_ == GradMode::Soft) srec_grad_(i, t);
+        else if (s_.track_counts)         tcount_grad_(i, t);
         else                              tpath_grad_(i, t);
     }
     void pair_flat_grad_(size_t i, double* flat) const {
@@ -1469,6 +1633,10 @@ private:
         // groups run on the call's own Works, never on the persistent solo_).
         const AlignParams* swp = nullptr;
         std::vector<double> sw;
+        // tracked hard, counts: this Work's writer buffer (BatchEngine::tc_writer_) and its scratch
+        std::vector<uint32_t>* tcbuf = nullptr;
+        uint32_t tcw = 0, tcgen = 0;
+        Touched tc;
         explicit Work(const BatchEngine& e) : g(e.alphabet(), e.nsets_) { configure(e); }
         // The batch's settings, (re)applied: a reused Work follows setting changes.
         void configure(const BatchEngine& e) {
@@ -1548,10 +1716,10 @@ private:
         flags_[i] |= kStored;
     }
     // The hard gradient and the guide of the DP `al` just ran, into pair i, in one walk:
-    // tracked, the path itself (store_tpath_); otherwise the dense gradient.
+    // tracked, into the batch's store (store_hard_); otherwise the dense gradient.
     template<class Al>
-    void hard_grad_guide_(size_t i, Al& al, Work& w) {   // tracked: the path itself
-        store_tpath_(i, al, w.buf, &w.gj);
+    void hard_grad_guide_(size_t i, Al& al, Work& w) {   // tracked
+        store_hard_(i, al, w.buf, &w.gj, w);
         store_guide_(i, w.gj);
     }
     // Hard or soft gradient of the DP `al` just ran, into pair i.
@@ -1559,7 +1727,7 @@ private:
     void grad_with_buf_(size_t i, Al& al, Work& w) {
         if (tracked_) {
             if (grad_mode_ == GradMode::Hard) {
-                store_tpath_(i, al, w.buf, nullptr);
+                store_hard_(i, al, w.buf, nullptr, w);
                 return;
             }
             store_srec_(i, al.soft_record_counts(), al.soft_record_gaps());

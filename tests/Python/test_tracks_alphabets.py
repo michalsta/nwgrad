@@ -18,7 +18,26 @@ HARD = {("linear", "global"): "nw_grad", ("linear", "local"): "sw_grad",
         ("affine", "global"): "nw_affine_grad", ("affine", "local"): "sw_affine_grad"}
 SOFT = {("linear", "global"): "nw_soft_grad", ("linear", "local"): "sw_soft_grad",
         ("affine", "global"): "nw_affine_soft_grad", ("affine", "local"): "sw_affine_soft_grad"}
-BATCH = {"_double": nwgrad.SeqPairBatchDouble, "": nwgrad.SeqPairBatch}
+STORAGE = ["paths"]   # the hard-gradient store of every batch built here (track_storage)
+
+
+@pytest.fixture(autouse=True, params=["paths", "counts"])
+def track_storage(request):
+    """Every test here runs once per store of a tracked batch's hard gradients."""
+    STORAGE[0] = request.param
+    yield request.param
+    STORAGE[0] = "paths"
+
+
+def _batch(cls):
+    def make(*args, **kwargs):
+        b = cls(*args, **kwargs)
+        b.track_storage = STORAGE[0]
+        return b
+    return make
+
+
+BATCH = {"_double": _batch(nwgrad.SeqPairBatchDouble), "": _batch(nwgrad.SeqPairBatch)}
 FILLS = ["interpair", "striped", "rowwise"]
 
 

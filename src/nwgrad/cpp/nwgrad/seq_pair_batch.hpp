@@ -132,6 +132,7 @@ public:
     double weight_lo() const { return settings().weight_lo; }
     double weight_hi() const { return settings().weight_hi; }
     bool profile() const { return settings().profile; }
+    bool track_counts() const { return settings().track_counts; }
 
 #define NWGRAD_BATCH_SETTER(NAME, TYPE) \
     void NAME(TYPE v) { visit([&](auto& e) { e.NAME(v); }); }
@@ -145,6 +146,7 @@ public:
     NWGRAD_BATCH_SETTER(set_weight_lo, double)
     NWGRAD_BATCH_SETTER(set_weight_hi, double)
     NWGRAD_BATCH_SETTER(set_profile, bool)
+    NWGRAD_BATCH_SETTER(set_track_counts, bool)
 #undef NWGRAD_BATCH_SETTER
     void set_fill(bool rowwise, bool inter) {
         visit([&](auto& e) { e.set_fill(rowwise, inter); });

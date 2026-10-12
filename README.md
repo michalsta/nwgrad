@@ -108,6 +108,14 @@ objectives that weight each pair differently.
   batch's default `fill="interpair"` aligns several pairs per vector instruction —
   2.5–5× the per-pair `"striped"` fill on AVX2 — with bit-identical results; see
   [`SeqPairBatch.fill`](docs/api.md#seqpairbatch).
+- **Parameter sets and tracks.** An `AlignParams` can hold K parameter sets, and a
+  per-pair track picks the set for each residue of A (and a gap track for each DP row),
+  e.g. position-specific scoring of a miRNA; gradients come back per set. See
+  [parameter sets and tracks](docs/api.md#parameter-sets-and-tracks). A tracked batch
+  stores each pair's hard gradient as its path by default; `track_storage="counts"`
+  stores the counts instead, which is slightly faster (a training step measured 5–15%
+  faster with linear gaps, about the same with affine) at the cost of about 10× more
+  memory.
 - **Scoring without keeping pairs.** `batch.align(seqs_a, seqs_b, params)` returns the
   scores and the summed gradient and stores nothing per pair.
 - **Stateless one-offs.** Twelve functions (`nw_score`, `sw_affine_grad`,

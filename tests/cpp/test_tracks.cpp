@@ -412,9 +412,9 @@ namespace {
 // A tracked batch on 8 threads (the inter-pair fill), against each pair's own Aligner:
 // whole-batch fills, every pair recomputed alone over and over (its stored gradient
 // rewritten each time), wide bands, and the weighted sum after each — for the
-// sanitizers as much as for the values.
+// sanitizers as much as for the values.  In either store of the hard gradients.
 template <GapModel GM, AlignMode AM, class T>
-void check_batch(uint64_t seed) {
+void check_batch(uint64_t seed, bool counts) {
     std::mt19937_64 rng(seed);
     const Alphabet& alpha = Alphabet::get("ACGT");
     const int K = 4;
@@ -432,6 +432,7 @@ void check_batch(uint64_t seed) {
     std::vector<std::string_view> Av(A.begin(), A.end()), Bv(B.begin(), B.end());
     BatchEngine<T, GM, AM> eng(8, GradMode::Hard, TracebackMode::Pointers);
     eng.set_fill(false, true);
+    eng.set_track_counts(counts);
     eng.add_many(Av, Bv, p, kBackendAuto, &tk, &gk);
     std::vector<Run<T>> ref;
     for (size_t i = 0; i < N; ++i)
@@ -466,10 +467,13 @@ void check_batch(uint64_t seed) {
 }  // namespace
 
 TEST_CASE("tracked batch: threaded fills, single-pair recomputes, weighted sums", "[tracks]") {
-    check_batch<GapModel::Linear, AlignMode::Global, double>(41);
-    check_batch<GapModel::Linear, AlignMode::Local, double>(42);
-    check_batch<GapModel::Affine, AlignMode::Global, double>(43);
-    check_batch<GapModel::Affine, AlignMode::Local, double>(44);
-    check_batch<GapModel::Affine, AlignMode::Global, float>(45);
-    check_batch<GapModel::Linear, AlignMode::Local, float>(46);
+    for (bool counts : {false, true}) {   // the two stores of the hard gradients
+        INFO("counts " << counts);
+        check_batch<GapModel::Linear, AlignMode::Global, double>(41, counts);
+        check_batch<GapModel::Linear, AlignMode::Local, double>(42, counts);
+        check_batch<GapModel::Affine, AlignMode::Global, double>(43, counts);
+        check_batch<GapModel::Affine, AlignMode::Local, double>(44, counts);
+        check_batch<GapModel::Affine, AlignMode::Global, float>(45, counts);
+        check_batch<GapModel::Linear, AlignMode::Local, float>(46, counts);
+    }
 }

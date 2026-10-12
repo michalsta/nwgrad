@@ -22,7 +22,26 @@ FUNCS = {
     ("affine", "local"): "sw_affine_grad",
 }
 CASES = list(FUNCS)
-BATCH = {"_double": nwgrad.SeqPairBatchDouble, "": nwgrad.SeqPairBatch}
+STORAGE = ["paths"]   # the hard-gradient store of every batch built here (track_storage)
+
+
+@pytest.fixture(autouse=True, params=["paths", "counts"])
+def track_storage(request):
+    """Every test here runs once per store of a tracked batch's hard gradients."""
+    STORAGE[0] = request.param
+    yield request.param
+    STORAGE[0] = "paths"
+
+
+def _batch(cls):
+    def make(*args, **kwargs):
+        b = cls(*args, **kwargs)
+        b.track_storage = STORAGE[0]
+        return b
+    return make
+
+
+BATCH = {"_double": _batch(nwgrad.SeqPairBatchDouble), "": _batch(nwgrad.SeqPairBatch)}
 PAIR = {"_double": nwgrad.SeqPairDouble, "": nwgrad.SeqPair}
 
 
@@ -265,7 +284,7 @@ def test_untracked_batch_becomes_tracked():
     rng = np.random.default_rng(16)
     mats, gaps = rng.normal(size=(1, N, N)), rng.uniform(0.5, 1.5, size=(1, 4))
     P = to_params(mats, gaps)
-    b = nwgrad.SeqPairBatchDouble(2, gap_model="affine", mode="local")
+    b = BATCH["_double"](2, gap_model="affine", mode="local")
     b.add_many(["ACGT", "AAC"], ["ACGG", "AC"], P)
     b.score_and_grad()
     s_before = b.scores()
@@ -407,3 +426,50 @@ def test_streaming_track_validation():
         s.align(["AC", "AC"], ["AC", "AC"], P3, tracks=[[0, 1], [0]])
     with pytest.raises(ValueError, match="is not a parameter set"):
         s.align(["AC"], ["AC"], P3, gap_tracks=[[0, 0, 7]])
+
+
+@pytest.mark.parametrize("case", CASES)
+@pytest.mark.parametrize("prec", ["_double", ""])
+def test_track_storage_switch(case, prec):
+    """track_storage picks paths or counts for a tracked batch's hard gradients: the
+    results are identical, and a switch drops the stored gradients (not the scores or
+    guides) until the next fill.  An untracked batch keeps the setting and ignores it."""
+    rng = np.random.default_rng(55)
+    A, B, mats, gaps, tracks, gtracks = random_problem(rng, 300, 3)
+    P = to_params(mats, gaps)
+    w = rng.normal(size=len(A))
+    batch = make_batch(case, prec, A, B, P, tracks, gtracks)
+    other = {"paths": "counts", "counts": "paths"}
+    first = batch.track_storage
+    batch.score_and_grad()
+    s0, (gm0, gg0), G0 = batch.scores(), batch.grads(), batch.weighted_grad(w)
+    batch.track_storage = first   # no change: nothing dropped
+    batch.weighted_grad(w)
+    batch.track_storage = other[first]
+    assert batch.track_storage == other[first]
+    np.testing.assert_array_equal(batch.scores(), s0)
+    with pytest.raises(RuntimeError, match="gradient not computed"):
+        batch.weighted_grad(w)
+    with pytest.raises(RuntimeError, match="gradient not computed"):
+        batch.grads()
+    batch.banded_grad(64)   # the guides survived the switch
+    for storage in [other[first], first, other[first]]:
+        batch.track_storage = storage
+        batch.score_and_grad()
+        for k in range(0, len(A), 11):   # single-pair recomputes, in this store
+            batch[k].score_and_grad()
+        np.testing.assert_array_equal(batch.scores(), s0)
+        gm, gg = batch.grads()
+        np.testing.assert_array_equal(gm, gm0)
+        np.testing.assert_array_equal(gg, gg0)
+        G = batch.weighted_grad(w)
+        np.testing.assert_array_equal(G.matrices, G0.matrices)
+        np.testing.assert_array_equal(G.gaps, G0.gaps)
+    with pytest.raises(ValueError, match="unknown track_storage"):
+        batch.track_storage = "dense"
+    u = BATCH[prec](2, gap_model=case[0], mode=case[1])
+    u.track_storage = other[first]
+    u.add_many(A[:20], B[:20], to_params(mats[:1], gaps[:1]))
+    assert not u.tracked and u.track_storage == other[first]
+    u.score_and_grad()
+    u.weighted_grad(w[:20])

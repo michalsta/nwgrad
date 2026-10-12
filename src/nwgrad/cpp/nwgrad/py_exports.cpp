@@ -737,6 +737,27 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
                      "Whether the pairs carry tracks (add_many(tracks=...) or K > 1 sets).")
         .def_prop_ro("num_sets", [](const SPB& s) { return s.num_sets(); },
                      "K, the number of parameter sets of the batch's params (0 when empty).")
+        .def_prop_rw(
+            "track_storage",
+            [](const SPB& s) { return s.track_counts() ? "counts" : "paths"; },
+            [](SPB& s, const std::string& v) {
+                if      (v == "paths")  s.set_track_counts(false);
+                else if (v == "counts") s.set_track_counts(true);
+                else throw nb::value_error(
+                    ("nwgrad: unknown track_storage \"" + v +
+                     "\" (expected \"paths\" or \"counts\")").c_str());
+            },
+            "How a tracked batch keeps its hard gradients between score_and_grad() /\n"
+            "banded_grad() and weighted_grad() / grads().\n"
+            "  \"paths\" (default): each pair's alignment path, 2 bits a move, replayed\n"
+            "     through the tracks on every read.  ~35 B a miRNA-sized pair.\n"
+            "  \"counts\": each pair's per-set field counts, counted during the\n"
+            "     traceback.  Reads are a plain sparse sum: measured 5-15% faster per\n"
+            "     training step on linear gaps, about the same on affine, at ~10x the\n"
+            "     memory (120-370 B a pair after a fill).\n"
+            "Results are identical either way.  Changing it drops the stored hard\n"
+            "gradients (scores and guides stay): run score_and_grad() or banded_grad()\n"
+            "again.  No effect on an untracked batch or on soft gradients.")
         .def("drop_paths", &SPB::drop_paths,
              "Free the stored alignment paths (score_and_grad(keep_paths=True)).")
         .def_prop_ro(

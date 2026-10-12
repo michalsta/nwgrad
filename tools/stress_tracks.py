@@ -70,11 +70,14 @@ def one_round(seed, max_len):
     if tb == "hirschberg_pmax":
         integral = True   # (its path may be suboptimal; compare only what is exact)
     threads = int(rng.integers(1, 9))
+    storage = ["paths", "counts"][rng.integers(2)]
     desc = f"seed={seed} alpha={na} K={K} n={n} case={case} prec={prec!r} integral={integral} " \
-           f"tracks={'none' if tracked_none else 'yes'} fill={fill} tb={tb} threads={threads}"
+           f"tracks={'none' if tracked_none else 'yes'} fill={fill} tb={tb} threads={threads} " \
+           f"storage={storage}"
 
     batch = BATCH[prec](threads, tb, gap_model=case[0], mode=case[1], grad_mode="hard")
     batch.fill = fill
+    batch.track_storage = storage
     if tracked_none:
         batch.add_many(A, B, P)
     else:

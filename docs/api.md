@@ -179,7 +179,8 @@ Contracts:
 - **Equal sets are the untracked problem**: K copies of one set, under any track, give
   bit for bit the untracked tables, score and path (the column-0 border is summed by
   runs of equal extends, which reproduces the untracked closed form).
-- A tracked batch stores a **hard gradient as the pair's path** (2 bits per step) and a
+- A tracked batch stores a **hard gradient as the pair's path** (2 bits per step; or,
+  with `track_storage="counts"`, as its sparse per-set field counts) and a
   **soft gradient as a per-row record** (`len(A)` match-count rows plus four gap
   fields per DP row), so memory does not grow with K; `weighted_grad()` and
   `compute_grad()` replay them. With one set, `weighted_grad()` is bit-identical to
@@ -355,6 +356,7 @@ keeps its batch alive, so it stays usable after the batch itself is dropped.
 | `fill` | `str` | How `score_and_grad()` / `banded_grad()` / `align()` vectorize the DP: `"interpair"` (default), `"striped"` or `"rowwise"`. Hard results are bit-identical whichever fill runs. See below. |
 | `soft_impl` | `str` | Soft-path evaluation: `"scaled"` (default; scaled probability space, raises `ValueError` for a pair out of its range), `"scaled_or_log"` (falls back to log space per pair, silently) or `"log"` (the log-space recurrences). |
 | `soft_temperature` | `float` | Soft score `T·log Z(θ/T)`; the gradient is the expected counts under `θ/T`. Default 1. |
+| `track_storage` | `str` | How a [tracked](#parameter-sets-and-tracks) batch keeps its hard gradients: `"paths"` (default; each pair's path, 2 bits a move, replayed through the tracks on every `weighted_grad()` / `grads()`) or `"counts"` (each pair's per-set field counts, counted during the traceback: a training step measured 5–15% faster with linear gaps and about the same with affine, at ~10× the memory — 120–370 B a miRNA-sized pair against ~35 B). Results are identical. A change drops the stored hard gradients (scores and guides stay) until the next `score_and_grad()` / `banded_grad()`. No effect on untracked batches or soft gradients. |
 | `soft_guide` | `str` | When soft pairs get the guide path that `banded_grad()` bands around: `"eager"` (default; `score_and_grad()` runs the guide Viterbi), `"lazy"` (computed on first use, under the params current then) or `"posterior"` (no Viterbi: per row of A the column where the posterior path most likely leaves the row, made non-decreasing — a band centre from the soft pass itself, under the params scored). |
 
 **Choosing a fill.** All three fills compute bit-identical tables, so scores, paths and

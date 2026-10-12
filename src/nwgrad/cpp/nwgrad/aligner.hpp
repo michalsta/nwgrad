@@ -398,6 +398,75 @@ struct Aligner {
         i0 = ci; j0 = cj;
     }
 
+    // The hard gradient as unit counts on the flat K-set layout (BatchEngine's: matrix
+    // stack, then 4 gap fields per set): add(key) once per count — counts on gap fields
+    // stand for -1 each — and (with gj) the guide, from one walk: the same walk, and so
+    // the same path, as hard_grad() (a tracked batch's hard gradients stored as counts:
+    // see BatchEngine).
+    template <class Add>
+    void hard_fields(const DpBuffer& buf, Add&& add, std::vector<int>* gj) const {
+        const uint32_t gbase = static_cast<uint32_t>(params_->num_sets()) * static_cast<uint32_t>(nalpha_ * nalpha_);
+        auto gk = [&](int i, int f) {
+            const int set = (f == AlignParams::kOpenA || f == AlignParams::kExtendA) ? gset(i) : tset(i);
+            return gbase + 4 * static_cast<uint32_t>(set) + static_cast<uint32_t>(f);
+        };
+        auto sk = [&](int i, int j) { return static_cast<uint32_t>(sub_off(i, j)); };
+        if (hirschberg_) {
+            int i = hb_start_i_, j = hb_start_j_;
+            unsigned char prev = 3;
+            for (unsigned char op : hops_) {
+                if (op == 0) { ++i; ++j; add(sk(i, j)); }
+                else if (op == 1) {
+                    ++i;
+                    if (GM == GapModel::Affine && prev != 1) add(gk(i, AlignParams::kOpenB));
+                    add(gk(i, AlignParams::kExtendB));
+                } else {
+                    if (GM == GapModel::Affine && prev != 2) add(gk(i, AlignParams::kOpenA));
+                    add(gk(i, AlignParams::kExtendA)); ++j;
+                }
+                prev = op;
+            }
+            if (gj) *gj = guide_j_affine_hb();
+            return;
+        }
+        if constexpr (GM == GapModel::Linear) {
+            if (gj) {
+                gj->assign(static_cast<size_t>(m_ + 1), -1);
+                (*gj)[0] = 0;
+                (*gj)[static_cast<size_t>(m_)] = n_;
+                const int i_end = (AM == AlignMode::Global) ? m_ : best_i_;
+                (*gj)[static_cast<size_t>(i_end)] = (AM == AlignMode::Global) ? n_ : best_j_;
+            }
+            walk_linear(buf, [&](int k, int i, int j) {
+                if (k == 0) {
+                    add(sk(i, j));
+                    if (gj) (*gj)[static_cast<size_t>(i - 1)] = j - 1;
+                } else if (k == 1) {
+                    add(gk(i, AlignParams::kExtendB));
+                    if (gj) (*gj)[static_cast<size_t>(i - 1)] = j;
+                } else {
+                    add(gk(i, AlignParams::kExtendA));
+                }
+            });
+        } else {
+            if (gj) guide_affine_init(*gj);
+            walk_affine(buf, [&](TBTable st, int i, int j, bool open) {
+                if (st == TBTable::M) {
+                    add(sk(i, j));
+                    if (gj) (*gj)[static_cast<size_t>(i - 1)] = j - 1;
+                } else if (st == TBTable::X) {
+                    add(gk(i, AlignParams::kExtendB));
+                    if (open) add(gk(i, AlignParams::kOpenB));
+                    if (gj) (*gj)[static_cast<size_t>(i - 1)] = j;
+                } else {
+                    add(gk(i, AlignParams::kExtendA));
+                    if (open) add(gk(i, AlignParams::kOpenA));
+                }
+            });
+        }
+        if (gj) fill_guide_gaps(*gj);
+    }
+
     // Allocate an empty buffer shell. Must be called once before compute_viterbi()
     // / compute_forward_back() with own buffer. Buffers grow implicitly as needed.
     void alloc_buf() {

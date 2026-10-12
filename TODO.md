@@ -201,16 +201,12 @@ Tracks landed on branch `tracks` (2026-10-11; see AGENTS.md, "Tracks").  Deferre
   its own set; `align()` (streaming) stores nothing.  Hard gradients are paths (≈ 30 B).
 - **Tracked affine global is 1.16-1.27x untracked, soft 1.18-1.34x** (100k Manakov
   pairs, K = 25; profile, what was done and tried: AGENTS.md, "Tracks", Performance).
-- **Stored counts instead of paths**: done, exact-size, on branch `tracks-counts`
-  (2026-10-12; its AGENTS.md has the numbers: linear -5 to -15% a step, affine +-4%,
-  12-37 MB per 100k pairs after a fill against ~1-4 MB for paths).  The prototype
-  (branch `tracks-counts-proto`; numbers in AGENTS.md): -5 to -13% a step at 1 thread, -8% linear global at 12 threads, but
-  slots sized to the worst case (~270-450 B a pair vs ~35 B for a path).  To adopt:
-  exact-size storage (~130 B a pair) — each worker appends its pairs' (key, count)
-  entries to its own buffer and records (buffer, offset, n) per pair; weighted_grad
-  reads them in pair order with prefetch; a single-pair recompute appends to the solo
-  buffer, compacted when its garbage outgrows the live entries.  Worth it for linear
-  (PosimiR) once untracked linear walks once (`linear-guide-walk`).
+- **Stored counts (`track_storage="counts"`) cost memory**: 120-370 B a pair after a fill
+  (100k Manakov pairs: 12-37 MB) against ~35 B for a path; for 2.5 M pairs, 0.3-0.9 GB.
+  The buffers grow by doubling (the 12-thread figures are ~1.5x the 1-thread ones):
+  sizing each writer from the last generation's use, or one shrink after a fill, would
+  cut that.  Keys and counts fit 16 bits each for every PosimiR shape (one word an
+  entry already).  Paths stay the default; counts win 5-15% on linear, are +-4% on affine.
 - **`linear-guide-walk` (from `main`)**: the untracked linear batch walked each
   traceback twice (gradient, then guide); one walk: -11 to -37% on linear sg,
   bit-identical.  Also there: inter-pair rows built in registers (only the vectors

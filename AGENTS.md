@@ -263,10 +263,25 @@ row), then scattered into the K sets (`add_soft_record_`). Tolerance-tested like
 of the soft path.
 
 **Batch storage** (`BatchEngine`). Tracks per pair at `oa_[i]` / `oa_[i]+i` (uint16, K <=
-65536). A HARD gradient is stored as the pair's PATH, 2 bits per step (`tp_`, slots of
-`(len_a+len_b+3)/4` bytes) plus its start cell, and replayed on demand (`tpath_grad_`):
-memory does not grow with K (≈ 30 B per Manakov pair; K dense sets would be 4 KB at
-K = 25). A SOFT gradient is the per-row record (`sr_`). `weighted_grad()` /
+65536). A HARD gradient is kept in one of two stores, chosen by `track_storage`
+(`BatchSettings::track_counts`; results identical, a change drops the stored gradients).
+Neither grows with K (K dense sets would be 4 KB a pair at K = 25).
+- `"paths"` (default): the pair's PATH, 2 bits per step (`tp_`, slots of
+  `(len_a+len_b+3)/4` bytes) plus its start cell, replayed on demand (`tpath_grad_`):
+  ≈ 30 B per Manakov pair.
+- `"counts"`: the pair's SPARSE COUNTS: the walk (`Aligner::hard_fields`, the same walk
+  as `hard_grad()`, Hirschberg's replay included) counts each touched field of the flat
+  K-set layout, and the pair's (key, count) entries (one 32-bit word each, key << 12 |
+  count, while the count is under 4095 and the key under 2^20, else an escaped
+  three-word entry; ~10-40 a miRNA pair) are appended to its WRITER's buffer: each
+  worker of a fill call, and the single-pair path's Work, own one (`tcw_`, a deque;
+  `tc_writer_` hands them out under a lock); `tcp_[i]` = {writer, n, generation,
+  offset}. A whole-batch fill (score_and_grad, banded_grad) starts a generation: it
+  recomputes every pair, so the buffers are reused from empty and every pair's gradient
+  flag is cleared until it is stored again. A pair recomputed alone appends again; its
+  old entries are dead and `tc_compact_` drops them once they outnumber the live ones in
+  that buffer. The sum reads each pair's entries in pair order, prefetching 16 pairs
+  ahead (they are scattered over the writers). 120-370 B a pair after a fill. A SOFT gradient is the per-row record (`sr_`). `weighted_grad()` /
 `compute_grad()` sum each pair's touched fields, weight * count formed out of line,
 added once, in the same fixed blocks — with one set bit-identical to the untracked dense
 sum (an untouched field would get w*0, which leaves a +0 sum unchanged). float32 batches
@@ -336,6 +351,32 @@ these pairs, ~450 / 270 B a pair against ~35 B for a path; actual use is 32 (glo
 after every fill (to get the wg of exact-size storage now) cost more in sg than it saved
 in wg. Not adopted: worth it for linear (PosimiR's model) once untracked linear walks
 once, with exact-size per-worker storage (TODO.md).
+
+**Exact-size stored counts, `track_storage="counts"`** (built on branch `tracks-counts`,
+where they replaced the paths; on `tracks` both stores are kept, paths the default, since
+counts cost ~10x the memory: see Batch storage). The walk counts (`hard_fields`),
+each worker appends one 32-bit word an entry to its own buffer, `weighted_grad` reads
+them in pair order. Two details carried the read: the sign of a gap field set as a bit,
+not by a branch (the matrix and gap keys interleave: the branch cost 12.3 vs 5.2 ms
+per 100k pairs, linear global), and a one-word fast path per pair (an escaped entry is
+flagged in the pair's record); the prefetch distance (8, 16, 32 pairs) made no
+difference. 2026-10-12, nighthaven, 100k Manakov pairs, K = 25, tracked / untracked per
+step (1 / 12 threads), paths (`tracks`) -> counts: double linear local 1.03/1.04 ->
+0.98/1.00, global 0.95/1.01 -> 0.84/0.92; float linear local 1.04/1.03 -> 0.97/0.99,
+global 0.95/0.98 -> 0.81/0.92; affine global 1.21/1.15 -> 1.16/1.16 (double),
+1.28/1.22 -> 1.26/1.25 (float); affine local +1-2%. On `linear-guide-walk` (the
+merges `tracks-on-lg` -> `tracks-counts-on-lg`): double linear local 1.23/1.17 ->
+1.16/1.13, global 1.37/1.32 -> 1.25/1.24; float linear local 1.32/1.25 -> 1.22/1.19,
+global 1.45/1.42 -> 1.27/1.32; affine within +-4%. Memory after a fill (RSS, 100k
+pairs, 1 / 12 threads; the buffers grow by doubling): affine global 25/37 MB, linear
+global 25/35, linear local 12/19, affine local 4/12, against ~1-4 MB for paths (which
+also take ~2.7 MB more at add_many) and 24 MB for the untracked dense gradients.
+Tested: the suite, `test_single_pair_recomputes_keep_the_stored_gradients` (single-pair
+recomputes, compaction: a planted bug in it failed all 8 cases),
+`test_stored_counts_wide_entries` (counts past 4094, keys past 2^20: a planted bug in the
+escape failed exactly its 4 cases), the C++ threaded batch test under ASan/UBSan (gcc,
+clang) and TSan, `tools/stress_tracks.py` on wloczykij (6 x 40 min on the 8-byte
+version, 6 x 30 min on the final one) and skynet: no mismatch.
 
 **After `main` took `linear-guide-walk` (merged into `tracks` / `tracks-counts`,
 2026-10-12; nighthaven, 100k Manakov pairs, K = 25).** Untracked code vs `main`
