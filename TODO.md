@@ -201,8 +201,10 @@ Tracks landed on branch `tracks` (2026-10-11; see AGENTS.md, "Tracks").  Deferre
   its own set; `align()` (streaming) stores nothing.  Hard gradients are paths (≈ 30 B).
 - **Tracked affine global is 1.16-1.27x untracked, soft 1.18-1.34x** (100k Manakov
   pairs, K = 25; profile, what was done and tried: AGENTS.md, "Tracks", Performance).
-- **Stored counts instead of paths** (prototype on branch `tracks-counts-proto`; numbers
-  in AGENTS.md): -5 to -13% a step at 1 thread, -8% linear global at 12 threads, but
+- **Stored counts instead of paths**: done, exact-size, on branch `tracks-counts`
+  (2026-10-12; its AGENTS.md has the numbers: linear -5 to -15% a step, affine +-4%,
+  12-37 MB per 100k pairs after a fill against ~1-4 MB for paths).  The prototype
+  (branch `tracks-counts-proto`; numbers in AGENTS.md): -5 to -13% a step at 1 thread, -8% linear global at 12 threads, but
   slots sized to the worst case (~270-450 B a pair vs ~35 B for a path).  To adopt:
   exact-size storage (~130 B a pair) — each worker appends its pairs' (key, count)
   entries to its own buffer and records (buffer, offset, n) per pair; weighted_grad
