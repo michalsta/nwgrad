@@ -620,11 +620,13 @@ struct Aligner {
     }
 
     // guide_j_from_viterbi(buf) and hard_grad(buf, grad) in one traceback walk where
-    // the path is walked back over the DP's own record (affine, scores or Pointers); two
-    // walks otherwise (linear, Hirschberg).  Same guide, same gradient either way.
+    // the path is walked back over the DP's own record (scores or Pointers, either gap
+    // model); two walks for Hirschberg.  Same guide, same gradient either way.
     void hard_grad_and_guide(const DpBuffer& buf, AlignParams& grad, std::vector<int>& gj) const {
-        if constexpr (GM == GapModel::Affine) {
-            if (!hirschberg_) { hard_grad_affine(buf, grad, &gj); return; }
+        if (!hirschberg_) {
+            if constexpr (GM == GapModel::Affine) hard_grad_affine(buf, grad, &gj);
+            else                                   hard_grad_linear(buf, grad, &gj);
+            return;
         }
         gj = guide_j_from_viterbi(buf);
         hard_grad(buf, grad);
@@ -1666,13 +1668,28 @@ private:
         std::reverse(b.begin(), b.end());
     }
 
-    void hard_grad_linear(const DpBuffer& buf, AlignParams& grad) const {
+    // With gj: the guide too, from the same walk (guide_j_linear's, move for move).
+    void hard_grad_linear(const DpBuffer& buf, AlignParams& grad, std::vector<int>* gj = nullptr) const {
         double* gblk = grad_block(grad);
+        if (gj) {
+            gj->assign(static_cast<size_t>(m_ + 1), -1);
+            (*gj)[0] = 0;
+            (*gj)[static_cast<size_t>(m_)] = n_;
+            const int i0 = (AM == AlignMode::Global) ? m_ : best_i_;
+            (*gj)[static_cast<size_t>(i0)] = (AM == AlignMode::Global) ? n_ : best_j_;
+        }
         walk_linear(buf, [&](int k, int i, int j) {
-            if (k == 0)      gblk[sub_off(i, j)] += 1.0;
-            else if (k == 1) grad.gap_extend_b -= 1.0;   // the score subtracts this penalty
-            else             grad.gap_extend_a -= 1.0;
+            if (k == 0) {
+                gblk[sub_off(i, j)] += 1.0;
+                if (gj) (*gj)[static_cast<size_t>(i - 1)] = j - 1;
+            } else if (k == 1) {
+                grad.gap_extend_b -= 1.0;   // the score subtracts this penalty
+                if (gj) (*gj)[static_cast<size_t>(i - 1)] = j;
+            } else {
+                grad.gap_extend_a -= 1.0;
+            }
         });
+        if (gj) fill_guide_gaps(*gj);
     }
 
     // ═════════════════════════════════════════════════════════════════════════
