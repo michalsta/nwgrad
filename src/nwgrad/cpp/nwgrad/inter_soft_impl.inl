@@ -48,12 +48,10 @@
 // Tracked lanes (J.rs): weight f (0 oa, 1 ea, 2 ob, 3 eb) of DP row i, per lane — each
 // lane's own row, clamped to its last row past its A (rows it computes and ignores).
 static inline ivd isj_w(const InterSoftJob& J, int i, int f) noexcept {
-    ivd v;
-    for (int l = 0; l < IW; ++l) {
+    return ivlanes<ivd, IW>([&](int l) {
         const int r = i <= J.m[l] ? i : J.m[l];
-        v[l] = J.rw[l][4 * r + f];
-    }
-    return v;
+        return J.rw[l][4 * r + f];
+    });
 }
 // The row of J.es lane l reads at DP row i (tracked: its stacked row; row 0 past its A).
 template <bool Tr>
@@ -135,10 +133,17 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_affine(InterSoftJob& J) noexcept {
             return;
         }
         ivd P[8];
-        for (int c = 0; c < na; ++c)
-            for (int l = 0; l < IW; ++l) {
-                P[c][l] = J.es[isj_row<Tr>(J, l, i) * na + c];
-            }
+        if constexpr (Tr) {   // each lane's row once; the vectors built in registers
+            size_t ro[IW];
+            for (int l = 0; l < IW; ++l) ro[l] = isj_row<Tr>(J, l, i) * na;
+            for (int c = 0; c < na; ++c)
+                P[c] = ivlanes<ivd, IW>([&](int l) { return J.es[ro[l] + c]; });
+        } else {
+            for (int c = 0; c < na; ++c)
+                for (int l = 0; l < IW; ++l) {
+                    P[c][l] = J.es[isj_row<Tr>(J, l, i) * na + c];
+                }
+        }
         for (int j = 1; j <= n; ++j) {
             ivd s = z;
             const ivl* mk = eqm + static_cast<size_t>(j) * na;
@@ -472,10 +477,17 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_linear(InterSoftJob& J) noexcept {
             return;
         }
         ivd P[8];
-        for (int c = 0; c < na; ++c)
-            for (int l = 0; l < IW; ++l) {
-                P[c][l] = J.es[isj_row<Tr>(J, l, i) * na + c];
-            }
+        if constexpr (Tr) {   // each lane's row once; the vectors built in registers
+            size_t ro[IW];
+            for (int l = 0; l < IW; ++l) ro[l] = isj_row<Tr>(J, l, i) * na;
+            for (int c = 0; c < na; ++c)
+                P[c] = ivlanes<ivd, IW>([&](int l) { return J.es[ro[l] + c]; });
+        } else {
+            for (int c = 0; c < na; ++c)
+                for (int l = 0; l < IW; ++l) {
+                    P[c][l] = J.es[isj_row<Tr>(J, l, i) * na + c];
+                }
+        }
         for (int j = 1; j <= n; ++j) {
             ivd sv = z;
             const ivl* mk = eqm + static_cast<size_t>(j) * na;
