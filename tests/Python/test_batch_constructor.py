@@ -106,3 +106,29 @@ def test_pairless_form_and_add_many_compat():
     with pytest.warns(DeprecationWarning, match=r"SeqPairBatch\(seqs_a, seqs_b, params"):
         full.add_many(A[:5], B[:5], P)
     assert len(full) == len(A) + 5
+
+
+@pytest.mark.parametrize("dtype", [None, object])
+def test_numpy_string_arrays(dtype):
+    """A numpy string array yields a new str object per item; the sequences must stay
+    alive for the whole call (they were read through dangling views before)."""
+    rng = np.random.default_rng(10)
+    A, B, P, _ = problem(rng, 3000, 1)
+    A = [a + "ACGT" * 5 for a in A]   # long enough that a freed buffer gets reused
+    B = [b + "TGCA" * 5 for b in B]
+    ref = nwgrad.SeqPairBatchDouble(A, B, P, n_threads=2)
+    ref.score_and_grad()
+    na, nb = np.array(A, dtype=dtype), np.array(B, dtype=dtype)
+    got = nwgrad.SeqPairBatchDouble(na, nb, P, n_threads=2)
+    got.score_and_grad()
+    np.testing.assert_array_equal(got.scores(), ref.scores())
+    res = nwgrad.SeqPairBatchDouble(2).align(na, nb, P)
+    np.testing.assert_array_equal(res.scores, ref.scores())
+    with pytest.warns(DeprecationWarning):
+        legacy = nwgrad.SeqPairBatchDouble(2)
+        legacy.add_many(na, nb, P)
+    legacy.score_and_grad()
+    np.testing.assert_array_equal(legacy.scores(), ref.scores())
+    for bad in ("ACGT", [b"AC"], ["AC", 3]):
+        with pytest.raises(TypeError):
+            nwgrad.SeqPairBatchDouble(bad, ["AC"] * len(bad), P)

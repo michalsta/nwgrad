@@ -18,6 +18,42 @@
 
 namespace nb = nanobind;
 
+// A sequence of str, read in place as views into the str objects.  The views are only
+// valid while those objects live, so the argument keeps the container that owns them:
+// the caller's list or tuple itself, or, for any other sequence, a list made from it.
+// (nanobind's std::vector<std::string_view> does not: a numpy string array yields a NEW
+// np.str_ per item, freed when the conversion returns, leaving the views dangling.)
+struct SeqViews {
+    nb::object hold;
+    std::vector<std::string_view> v;
+};
+
+namespace nanobind::detail {
+template <> struct type_caster<SeqViews> {
+    NB_TYPE_CASTER(SeqViews, const_name("collections.abc.Sequence[str]"))
+    bool from_python(handle src, uint8_t, cleanup_list*) noexcept {
+        PyObject* o = src.ptr();
+        if (PyUnicode_Check(o) || PyBytes_Check(o) || !PySequence_Check(o)) return false;
+        object seq = steal(PySequence_Fast(o, ""));   // o itself for a list / tuple
+        if (!seq.is_valid()) { PyErr_Clear(); return false; }
+        const Py_ssize_t n = PySequence_Fast_GET_SIZE(seq.ptr());
+        PyObject** items = PySequence_Fast_ITEMS(seq.ptr());
+        std::vector<std::string_view> v;
+        try { v.reserve(static_cast<size_t>(n)); } catch (...) { return false; }
+        for (Py_ssize_t i = 0; i < n; ++i) {
+            if (!PyUnicode_Check(items[i])) return false;
+            Py_ssize_t len = 0;
+            const char* s = PyUnicode_AsUTF8AndSize(items[i], &len);
+            if (!s) { PyErr_Clear(); return false; }
+            v.emplace_back(s, static_cast<size_t>(len));
+        }
+        value.hold = std::move(seq);
+        value.v = std::move(v);
+        return true;
+    }
+};
+}  // namespace nanobind::detail
+
 // Temporary 0.7 deprecations. Warn before mutation so warnings-as-errors is safe.
 static void warn_pair_api(const char* old_name, const char* replacement) {
     const std::string message = std::string("SeqPair.") + old_name +
@@ -636,8 +672,8 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
     nb::class_<SPB>(m, name, nb::dynamic_attr())
         .def(
             "__init__",
-            [](SPB* self, const std::vector<std::string_view>& seqs_a,
-               const std::vector<std::string_view>& seqs_b, const AlignParams& params,
+            [](SPB* self, const SeqViews& seqs_a,
+               const SeqViews& seqs_b, const AlignParams& params,
                int n_threads, const std::string& traceback, const std::string& gap_model,
                const std::string& mode, const std::string& grad_mode, const std::string& kernel,
                nb::handle tracks, nb::handle gap_tracks) {
@@ -645,7 +681,7 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
                                parse_grad_mode<GradMode>(grad_mode), n_threads,
                                parse_traceback(traceback));
                 try {
-                    add_pairs(*self, seqs_a, seqs_b, params, kernel, tracks, gap_tracks);
+                    add_pairs(*self, seqs_a.v, seqs_b.v, params, kernel, tracks, gap_tracks);
                 } catch (...) {
                     self->~SPB();   // nanobind treats a throwing __init__ as never constructed
                     throw;
@@ -719,14 +755,14 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             "SeqPairBatch(seqs_a, seqs_b, params, ...).")
         .def(
             "add_many",
-            [](SPB& self, const std::vector<std::string_view>& seqs_a,
-               const std::vector<std::string_view>& seqs_b, const AlignParams& params,
+            [](SPB& self, const SeqViews& seqs_a,
+               const SeqViews& seqs_b, const AlignParams& params,
                const std::string& kernel, nb::handle tracks, nb::handle gap_tracks) {
                 if (PyErr_WarnEx(PyExc_DeprecationWarning,
                                  "SeqPairBatch.add_many() is deprecated since nwgrad 0.7.0; give the pairs "
                                  "to the constructor: SeqPairBatch(seqs_a, seqs_b, params, ...)", 1) < 0)
                     throw nb::python_error();
-                add_pairs(self, seqs_a, seqs_b, params, kernel, tracks, gap_tracks);
+                add_pairs(self, seqs_a.v, seqs_b.v, params, kernel, tracks, gap_tracks);
             },
             nb::arg("seqs_a"), nb::arg("seqs_b"), nb::arg("params"), nb::arg("kernel") = "auto",
             nb::kw_only(), nb::arg("tracks").none() = nb::none(), nb::arg("gap_tracks").none() = nb::none(),
@@ -776,10 +812,12 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             "no full DP is run.  Returns the sum of scores.")
         .def(
             "align",
-            [](const SPB& self, const std::vector<std::string_view>& seqs_a,
-               const std::vector<std::string_view>& seqs_b, const AlignParams& params, int band,
+            [](const SPB& self, const SeqViews& sa,
+               const SeqViews& sb, const AlignParams& params, int band,
                const std::vector<std::string>& aligned_a, const std::vector<std::string>& aligned_b,
                const std::string& kernel, nb::handle tracks, nb::handle gap_tracks) {
+                const auto& seqs_a = sa.v;
+                const auto& seqs_b = sb.v;
                 if (seqs_a.size() != seqs_b.size())
                     throw nb::value_error("nwgrad: align() needs seqs_a and seqs_b of equal length");
                 const auto [la, lg] = track_lengths(seqs_a);
