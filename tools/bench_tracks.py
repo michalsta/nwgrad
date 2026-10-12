@@ -3,7 +3,7 @@
 
     python tools/bench_tracks.py --data pairs.tsv [--n 100000] [--threads 1 12]
         [--rounds 5] [--sets 25] [--precision double float] [--models linear affine]
-        [--modes local global] [--grad hard soft]
+        [--modes local global] [--grad hard soft] [--storage paths|counts]
 
 PosimiR's shape: miRNA x target-site pairs (Manakov TSV: column 0 the miRNA, column 1
 the site), one parameter set per miRNA position (track = 0, 1, 2, ... clamped to K-1),
@@ -13,7 +13,8 @@ the default gap track.  Arms, each in a fresh process, alternating, best of --ro
   trackedK    K sets, one per position
 Reported per configuration: seconds per step (set_params + score_and_grad + scores +
 weighted_grad) and resident MB added by add_many, with tracked / untracked ratios.
-A control arm (untracked twice) shows the noise floor.
+A control arm (untracked twice) shows the noise floor.  --storage sets the tracked
+arms' SeqPairBatch.track_storage (a build without it keeps its own store).
 """
 import argparse, json, os, subprocess, sys
 
@@ -21,7 +22,7 @@ CHILD = r'''
 import json, resource, sys, time, warnings
 warnings.simplefilter("ignore")
 import numpy as np, nwgrad
-arm, n, threads, data, K, prec, gm, mode, gd = sys.argv[1:10]
+arm, n, threads, data, K, prec, gm, mode, gd, storage = sys.argv[1:11]
 n, threads, K = int(n), int(threads), int(K)
 rows = [l.rstrip("\n").split("\t") for l in open(data)][1:]
 rng = np.random.default_rng(0)
@@ -39,6 +40,8 @@ def rss_mb():
         if l.startswith("VmRSS:"): return int(l.split()[1]) / 1024
 cls = nwgrad.SeqPairBatchDouble if prec == "double" else nwgrad.SeqPairBatch
 b = cls(threads, gap_model=gm, mode=mode, grad_mode=gd)
+if hasattr(b, "track_storage"):
+    b.track_storage = storage
 if gd == "soft":
     b.soft_guide = "lazy"; b.soft_temperature = 0.5; b.soft_impl = "scaled_or_log"
 sets = K if arm == "trackedK" else 1
@@ -62,7 +65,7 @@ print(json.dumps({"s": min(ts), "mb": mb + 0.0}))
 
 def run(py, arm, args, cfg):
     out = subprocess.run([py, "-c", CHILD, arm, str(args.n), str(cfg["t"]), args.data, str(args.sets),
-                          cfg["prec"], cfg["gm"], cfg["mode"], cfg["gd"]],
+                          cfg["prec"], cfg["gm"], cfg["mode"], cfg["gd"], args.storage],
                          capture_output=True, text=True, check=True)
     return json.loads(out.stdout)
 
@@ -79,6 +82,7 @@ def main():
     ap.add_argument("--models", nargs="+", default=["linear", "affine"])
     ap.add_argument("--modes", nargs="+", default=["local"])
     ap.add_argument("--grad", nargs="+", default=["hard"])
+    ap.add_argument("--storage", choices=["paths", "counts"], default="paths")
     args = ap.parse_args()
     arms = ["untracked", "control", "tracked1", "trackedK"]
     print("prec   model  mode   grad thr | untracked s  MB  | control | tracked1 | trackedK   MB")
