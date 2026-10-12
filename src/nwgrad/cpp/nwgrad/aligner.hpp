@@ -334,6 +334,32 @@ struct Aligner {
             if (gj) *gj = guide_j_affine_hb();
             return;
         }
+        path_walk_(buf, [&](uint8_t k) { moves.push_back(k); }, i0, j0, gj);
+        std::reverse(moves.begin(), moves.end());
+    }
+    // The same path packed 2 bits a move straight into `dst` (whose (cap+3)/4 bytes the
+    // caller zeroed; cap >= the path's length, len_a + len_b serves): written from the
+    // back, so it ends at move cap-1; returns the first move's index, cap - steps.
+    int hard_path_packed(const DpBuffer& buf, uint8_t* dst, int cap, int& i0, int& j0,
+                         std::vector<int>* gj) const {
+        auto put = [dst](int pos, uint8_t k) {
+            dst[pos >> 2] = static_cast<uint8_t>(dst[pos >> 2] | (k << ((pos & 3) * 2)));
+        };
+        if (hirschberg_) {
+            const int off = cap - static_cast<int>(hops_.size());
+            for (size_t q = 0; q < hops_.size(); ++q) put(off + static_cast<int>(q), hops_[q]);
+            i0 = hb_start_i_; j0 = hb_start_j_;
+            if (gj) *gj = guide_j_affine_hb();
+            return off;
+        }
+        int pos = cap;
+        path_walk_(buf, [&](uint8_t k) { put(--pos, k); }, i0, j0, gj);
+        return pos;
+    }
+    // The walk of both: emit(k) for each move, LAST move first; the start cell into
+    // (i0, j0) and the guide into gj.
+    template <class Emit>
+    void path_walk_(const DpBuffer& buf, Emit&& emit, int& i0, int& j0, std::vector<int>* gj) const {
         int ci = 0, cj = 0;   // the cell the last emitted move left from
         if constexpr (GM == GapModel::Linear) {
             ci = (AM == AlignMode::Global) ? m_ : best_i_;
@@ -346,7 +372,7 @@ struct Aligner {
                 (*gj)[static_cast<size_t>(i_end)] = (AM == AlignMode::Global) ? n_ : best_j_;
             }
             walk_linear(buf, [&](int k, int i, int j) {
-                moves.push_back(static_cast<uint8_t>(k));
+                emit(static_cast<uint8_t>(k));
                 if (gj) {
                     if (k == 0)      (*gj)[static_cast<size_t>(i - 1)] = j - 1;
                     else if (k == 1) (*gj)[static_cast<size_t>(i - 1)] = j;
@@ -359,7 +385,7 @@ struct Aligner {
             if (gj) guide_affine_init(*gj);
             walk_affine(buf, [&](TBTable st, int i, int j, bool) {
                 const uint8_t k = st == TBTable::M ? 0 : st == TBTable::X ? 1 : 2;
-                moves.push_back(k);
+                emit(k);
                 if (gj) {
                     if (k == 0)      (*gj)[static_cast<size_t>(i - 1)] = j - 1;
                     else if (k == 1) (*gj)[static_cast<size_t>(i - 1)] = j;
@@ -369,7 +395,6 @@ struct Aligner {
             });
         }
         if (gj) fill_guide_gaps(*gj);
-        std::reverse(moves.begin(), moves.end());
         i0 = ci; j0 = cj;
     }
 

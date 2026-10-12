@@ -47,6 +47,12 @@ template <class V, class S> static inline V ivsplat(S x) noexcept {
     return v;
 }
 
+// A vector of f(0), f(1), ... f(W-1), as a braced initializer: built in registers (lane
+// by lane into a local, then read back whole, it stalls on store forwarding).
+template <class V, class F, std::size_t... I>
+static inline V ivlanes_(F& f, std::index_sequence<I...>) noexcept { return V{f(static_cast<int>(I))...}; }
+template <class V, int W, class F>
+static inline V ivlanes(F f) noexcept { return ivlanes_<V>(f, std::make_index_sequence<static_cast<std::size_t>(W)>{}); }
 
 // Per lane, the score of this row's A residue against the column's B residue: a blend
 // tree on the B residue's bits (bits[3*j + k] = bit k of each lane's b[j-1], as masks).
@@ -109,30 +115,26 @@ struct InterCommon {
     // Tracked: row i's four penalties, per lane, each vector built as the untracked
     // kernels build theirs (z + value: the same rounding of a zero's sign).
     void row_gaps(int i, ivd& go_a, ivd& ge_a, ivd& go_b, ivd& ge_b) const {
-        ivd a0, a1, b0, b1;
-        for (int l = 0; l < IW; ++l) {
-            const TrackJob<T>& t = J.tr[l];
-            a0[l] = lane_row(t.go_a, i, J.m[l]); a1[l] = lane_row(t.ge_a, i, J.m[l]);
-            b0[l] = lane_row(t.go_b, i, J.m[l]); b1[l] = lane_row(t.ge_b, i, J.m[l]);
-        }
+        int r[IW];   // each lane's row, clamped
+        for (int l = 0; l < IW; ++l) r[l] = i <= J.m[l] ? i : J.m[l];
         const ivd z = {};
-        go_a = z + a0; ge_a = z + a1; go_b = z + b0; ge_b = z + b1;
+        go_a = z + ivlanes<ivd, IW>([&](int l) { return J.tr[l].go_a[r[l]]; });
+        ge_a = z + ivlanes<ivd, IW>([&](int l) { return J.tr[l].ge_a[r[l]]; });
+        go_b = z + ivlanes<ivd, IW>([&](int l) { return J.tr[l].go_b[r[l]]; });
+        ge_b = z + ivlanes<ivd, IW>([&](int l) { return J.tr[l].ge_b[r[l]]; });
     }
     // Tracked Global borders: column 0 of row i (bx0, -inf past the lane's A) and row 0
     // of column j (-(go_a + j*ge_a) of each lane's row 0; linear: -j*ge_a).
     ivd border_x(int i) const {
-        ivd v;
-        for (int l = 0; l < IW; ++l)
-            v[l] = (i <= J.m[l]) ? J.tr[l].bx0[i] : -std::numeric_limits<T>::infinity();
-        return v;
+        return ivlanes<ivd, IW>([&](int l) {
+            return (i <= J.m[l]) ? J.tr[l].bx0[i] : -std::numeric_limits<T>::infinity();
+        });
     }
     ivd border_y0(int j, bool linear) const {
-        ivd v;
-        for (int l = 0; l < IW; ++l) {
+        return ivlanes<ivd, IW>([&](int l) {
             const TrackJob<T>& t = J.tr[l];
-            v[l] = linear ? -static_cast<T>(j) * t.ge_a[0] : -(t.go_a[0] + static_cast<T>(j) * t.ge_a[0]);
-        }
-        return v;
+            return linear ? -static_cast<T>(j) * t.ge_a[0] : -(t.go_a[0] + static_cast<T>(j) * t.ge_a[0]);
+        });
     }
     // Row i's profile (P[c] = per lane, score of the lane's A residue i vs letter c) and
     // the lanes still inside their own A.
@@ -153,14 +155,13 @@ struct InterCommon {
             }
             return;
         }
-        if constexpr (Tr) {   // each lane's row once, then its letters
+        if constexpr (Tr) {   // each lane's row once, then its letters (the P inter_sub reads)
             const T* rowp[IW];
             for (int l = 0; l < IW; ++l) rowp[l] = J.blk + brow<Tr>(l, i) * na;
-            for (int c = 0; c < 8; ++c) {
+            const int np = 1 << levels;
+            for (int c = 0; c < np; ++c) {
                 const int cc = c < na ? c : 0;
-                ivd v{};   // (every lane written; the init keeps gcc's maybe-uninitialized quiet)
-                for (int l = 0; l < IW; ++l) v[l] = rowp[l][cc];
-                P[c] = v;
+                P[c] = ivlanes<ivd, IW>([&](int l) { return rowp[l][cc]; });
             }
             return;
         }

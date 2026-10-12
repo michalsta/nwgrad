@@ -20,6 +20,7 @@ namespace stdx = std::experimental;
 #include <cstdint>
 #include <limits>
 #include <type_traits>
+#include <utility>
 
 // For the AVX-512 mask-op workaround in kernels_impl.inl (clang + libstdc++ std::simd
 // bug).  Guarded identically to the workaround, and at global scope — intrinsics must

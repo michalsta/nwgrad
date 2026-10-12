@@ -1105,11 +1105,12 @@ private:
     std::vector<uint16_t> gk_;              // tracked: pair i's gap track at oa_[i] + i
     // Tracked hard gradients, as paths: pair i's moves, 2 bits each (0 diagonal, 1 gap in
     // B, 2 gap in A), in tp_[tpo_[i] ..], at most len_a + len_b of them (a path has no
-    // more steps); tps_[i] = {i0, j0, steps}: the start cell and the move count.  8 bytes
-    // of padding at the end (tpath_grad_'s window).
+    // more steps), the path at its END (written from the back: Aligner::hard_path_packed);
+    // tps_[i] = {i0, j0, steps, off}: the start cell, the move count and the first move's
+    // index.  8 bytes of padding at the end (tpath_grad_'s window).
     std::vector<uint8_t>  tp_;
     std::vector<size_t>   tpo_{0};
-    std::vector<std::array<int32_t, 3>> tps_;
+    std::vector<std::array<int32_t, 4>> tps_;
     // Tracked soft gradients: pair i's per-row record (Aligner::soft_record_counts / _gaps)
     // at sr_[sro_[i] ..]: len_a*n counts, then 4*(len_a+1) gap fields.
     std::vector<double>   sr_;
@@ -1206,20 +1207,22 @@ private:
             tpo_.push_back(tpo_.back() + (len_a(i) + len_b(i) + 3) / 4);
         (void)from;
         tp_.resize(tpo_.back() + 8);   // + 8: tpath_grad_ reads the moves 8 bytes at a time
-        tps_.resize(size(), {0, 0, 0});
+        tps_.resize(size(), {0, 0, 0, 0});
     }
     void store_srec_(size_t i, const std::vector<double>& cnt, const std::vector<double>& gaps) {
         double* d = sr_.data() + sro_[i];
         std::copy(cnt.begin(), cnt.end(), d);
         std::copy(gaps.begin(), gaps.end(), d + cnt.size());
     }
-    void store_tpath_(size_t i, const std::vector<uint8_t>& moves, int i0, int j0) {
+    // Pair i's path (and with gj its guide), packed into its slot.
+    template <class Al>
+    void store_tpath_(size_t i, const Al& al, const DpBuffer& buf, std::vector<int>* gj) {
         uint8_t* d = tp_.data() + tpo_[i];
-        const size_t nbytes = (moves.size() + 3) / 4;
-        std::fill(d, d + nbytes, uint8_t{0});
-        for (size_t k = 0; k < moves.size(); ++k)
-            d[k >> 2] = static_cast<uint8_t>(d[k >> 2] | (moves[k] << ((k & 3) * 2)));
-        tps_[i] = {i0, j0, static_cast<int32_t>(moves.size())};
+        const int cap = static_cast<int>(len_a(i) + len_b(i));
+        std::memset(d, 0, (static_cast<size_t>(cap) + 3) / 4);
+        int i0 = 0, j0 = 0;
+        const int off = al.hard_path_packed(buf, d, cap, i0, j0, gj);
+        tps_[i] = {i0, j0, cap - off, off};
     }
     // One pair's gradient, sparse: the first n entries of keys / vals are the fields it
     // touches (in first-touch order) and their values.  `slot` has one entry per field of
@@ -1271,7 +1274,7 @@ private:
         const size_t gbase = static_cast<size_t>(nsets_) * nn_;
         const uint8_t* d = tp_.data() + tpo_[i];
         size_t r = static_cast<size_t>(tps_[i][0]), c = static_cast<size_t>(tps_[i][1]);
-        const int steps = tps_[i][2];
+        const int steps = tps_[i][2], off = tps_[i][3];
         t.begin(kstride_(), 2 * static_cast<size_t>(steps) + 1);
         uint32_t* keys = t.keys.data();
         uint32_t* slot = t.slot.data();
@@ -1283,13 +1286,13 @@ private:
         // split at 28 continues with prev == mv, so it does not open twice.
         int prev = 3;
         static_assert(std::endian::native == std::endian::little, "the window reads move k at bit 2k");
-        for (int k = 0; k < steps; ) {
+        for (int k = off, end = off + steps; k < end; ) {
             uint64_t wd;
             std::memcpy(&wd, d + (k >> 2), sizeof wd);
             wd >>= 2 * (k & 3);
             const int mv = static_cast<int>(wd & 3);
             const uint64_t x = (wd ^ (0x5555555555555555ull * static_cast<uint64_t>(mv))) & ((1ull << 56) - 1);
-            const int run = std::min(x ? std::countr_zero(x) >> 1 : 28, steps - k);
+            const int run = std::min(x ? std::countr_zero(x) >> 1 : 28, end - k);
             if (mv == 0) {
                 for (int q = 0; q < run; ++q)
                     one(static_cast<uint32_t>(static_cast<size_t>(tk[r + q]) * nn_ + ca[r + q] * na + cb[c + q]), 1);
@@ -1455,7 +1458,6 @@ private:
         BandAl band;
         AlignParams g;
         std::vector<int> gj;
-        std::vector<uint8_t> moves;          // tracked hard: the path being stored
         std::vector<FullAl> lanes;           // tracked inter-pair: one aligner per lane
         std::vector<BandAl> blanes;
         std::vector<TrackJob<T>> tjobs;
@@ -1549,9 +1551,7 @@ private:
     // tracked, the path itself (store_tpath_); otherwise the dense gradient.
     template<class Al>
     void hard_grad_guide_(size_t i, Al& al, Work& w) {   // tracked: the path itself
-        int i0 = 0, j0 = 0;
-        al.hard_path_and_guide(w.buf, w.moves, i0, j0, &w.gj);
-        store_tpath_(i, w.moves, i0, j0);
+        store_tpath_(i, al, w.buf, &w.gj);
         store_guide_(i, w.gj);
     }
     // Hard or soft gradient of the DP `al` just ran, into pair i.
@@ -1559,9 +1559,7 @@ private:
     void grad_with_buf_(size_t i, Al& al, Work& w) {
         if (tracked_) {
             if (grad_mode_ == GradMode::Hard) {
-                int i0 = 0, j0 = 0;
-                al.hard_path_and_guide(w.buf, w.moves, i0, j0, nullptr);
-                store_tpath_(i, w.moves, i0, j0);
+                store_tpath_(i, al, w.buf, nullptr);
                 return;
             }
             store_srec_(i, al.soft_record_counts(), al.soft_record_gaps());
