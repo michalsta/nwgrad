@@ -200,7 +200,7 @@ public:
                   const PairTracks& tracks = {}, const PairTracks& gap_tracks = {}) {
         if (seqs_a.size() != seqs_b.size())
             throw std::invalid_argument(
-                "nwgrad: add_many() needs seqs_a and seqs_b of equal length (got " +
+                "nwgrad: seqs_a and seqs_b need equal length (got " +
                 std::to_string(seqs_a.size()) + " and " + std::to_string(seqs_b.size()) + ")");
         const Alphabet& alpha = params.matrix.alphabet();
         if (alpha_ && &alpha != alpha_)
@@ -209,10 +209,10 @@ public:
                 "\" cannot join a batch over alphabet \"" + alpha_->symbols() + "\"");
         const size_t N = seqs_a.size();
         if (tracks && tracks.size() != N)
-            throw std::invalid_argument("nwgrad: add_many() needs one track per pair (got " +
+            throw std::invalid_argument("nwgrad: tracks needs one entry per pair (got " +
                                         std::to_string(tracks.size()) + " for " + std::to_string(N) + " pairs)");
         if (gap_tracks && gap_tracks.size() != N)
-            throw std::invalid_argument("nwgrad: add_many() needs one gap_track per pair (got " +
+            throw std::invalid_argument("nwgrad: gap_tracks needs one entry per pair (got " +
                                         std::to_string(gap_tracks.size()) + " for " + std::to_string(N) + " pairs)");
         if (N == 0) return;
         if (N > std::numeric_limits<uint32_t>::max() - size())

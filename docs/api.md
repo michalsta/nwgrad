@@ -120,7 +120,7 @@ the whole struct in the ascent direction:
 params = params + lr * grad    # element-wise over matrix and all four gap fields
 ```
 
-**Pairs and batches copy their params.** `SeqPair(...)`, `add_many()` and
+**Pairs and batches copy their params.** `SeqPair(...)`, `SeqPairBatch(...)` and
 `set_params()` take a copy, so an `AlignParams` is never shared with the pairs built
 from it: updating it in place (`+=`, `*=`, the setters) changes nothing they compute,
 and their cached scores stay valid. Hand the new values over explicitly:
@@ -167,7 +167,7 @@ and row i from `track[i-1]`. In DP row i (after residue `i-1` of A, 1-based):
 | gap in A within row i (`-` against `b[j-1]`) | `gap_open_a` / `gap_extend_a` of `gap_track[i]`, rows 0 and `len(A)` included |
 
 Tracks are accepted by the single-pair functions (`track=`, `gap_track=` keywords),
-`SeqPair(..., track=, gap_track=)`, `SeqPairBatch.add_many(..., tracks=, gap_tracks=)`
+`SeqPair(..., track=, gap_track=)`, `SeqPairBatch(..., tracks=, gap_tracks=)`
 and `SeqPairBatch.align(..., tracks=, gap_tracks=)` (one sequence per pair; `None`, or a
 `None` entry, for the default). Every path supports them: hard, soft and score-only,
 linear and affine, global and local, full and banded, every fill and traceback
@@ -185,7 +185,7 @@ a tracked streaming `align()` takes 26 ms with flat `uint16` arrays, 46 ms with 
 lens = np.array([len(a) for a in seqs_a])
 starts = np.repeat(np.cumsum(lens) - lens, lens)
 tracks = (np.arange(lens.sum()) - starts).astype(np.uint16)   # residue i -> set i
-batch.add_many(seqs_a, seqs_b, P, tracks=tracks)
+batch = nwgrad.SeqPairBatch(seqs_a, seqs_b, P, tracks=tracks)
 ```
 
 Contracts:
@@ -319,19 +319,28 @@ pair.drop_paths()                    # score, gradient and guide survive
 
 ```python
 nwgrad.SeqPairBatch(
-    n_threads=0, traceback="auto", *,
+    seqs_a, seqs_b, params, *,   # the pairs (seqs_a[i], seqs_b[i]), given once
+    n_threads=0, traceback="auto",
     gap_model="affine",     # "linear" | "affine"
     mode="global",          # "global" | "local"
     grad_mode="hard",       # "hard" | "soft" | "none"
+    kernel="auto",          # Viterbi backend
+    tracks=None, gap_tracks=None,   # see "Parameter sets and tracks"
 )
+nwgrad.SeqPairBatch(n_threads=0, traceback="auto", *, gap_model=..., mode=..., grad_mode=...)
+                            # no pairs: for streaming align()
 ```
 
 Many sequence pairs of **one problem type** — one gap model, alignment mode and grad
-mode — aligned in parallel. Each pair's state (its encoded sequences, score, guide and
+mode — aligned in parallel. The pairs are given **once, to the constructor**: the
+sequences are validated and encoded in parallel (a bad character raises), and the
+batch keeps a **copy** of `params` (later changes to the object do not reach the
+batch — use `set_params()`). With [tracks](#parameter-sets-and-tracks) (or K > 1 sets)
+the batch is **tracked**. Each pair's state (its encoded sequences, score, guide and
 gradient: a few hundred bytes) lives in the batch's own arrays, and the DP runs on
-per-thread buffers. The constructor fixes `gap_model`, `mode` and `grad_mode`,
-including on empty batches. Omitting them selects `"affine"`, `"global"` and `"hard"`.
-`add_many()` cannot change the problem type.
+per-thread buffers. The constructor fixes `gap_model`, `mode` and `grad_mode`;
+omitting them selects `"affine"`, `"global"` and `"hard"`. The pairless form makes a
+batch for [`align()`](#seqpairbatch) only (streaming: nothing kept per pair).
 
 `n_threads=0` (default) uses the number of *physical* cores among the CPUs the
 process may run on — its affinity mask, so `taskset` and container CPU pinning are
@@ -343,7 +352,7 @@ the logical count measured up to 1.44× slower.
 
 | Method | Returns | Description |
 |---|---|---|
-| `add_many(seqs_a, seqs_b, params, kernel="auto", *, tracks=None, gap_tracks=None)` | — | Append the pairs `(seqs_a[i], seqs_b[i])` under `params`: one **segment**. With [tracks](#parameter-sets-and-tracks) (or K > 1 sets) the batch is **tracked**: every pair carries tracks and every segment's params must have the same K. Params may differ between calls (one alphabet); `set_params()` replaces them all. Sequences are validated and encoded in parallel; a bad character raises and adds nothing. The batch keeps a **copy** of `params` (calls with equal params share one); later changes to the object do not reach the batch — use `set_params()`. |
+| `add_many(seqs_a, seqs_b, params, kernel="auto", *, tracks=None, gap_tracks=None)` | — | **Deprecated since 0.7** (`DeprecationWarning`; kept for compatibility): give the pairs to the constructor. Appends the pairs `(seqs_a[i], seqs_b[i])` under `params`: one **segment**. With [tracks](#parameter-sets-and-tracks) (or K > 1 sets) the batch is **tracked**: every pair carries tracks and every segment's params must have the same K. Params may differ between calls (one alphabet); `set_params()` replaces them all. Sequences are validated and encoded in parallel; a bad character raises and adds nothing. The batch keeps a **copy** of `params` (calls with equal params share one); later changes to the object do not reach the batch — use `set_params()`. |
 | `set_params(params)` | — | Give every pair a copy of `params` (same alphabet; a mismatch raises without changing anything). Clears cached scores, gradients and stored paths; keeps the guides, for `banded_grad()`. |
 | `score_and_grad(keep_paths=False)` | `float` (sum of scores) | Full DP on every pair: score, guide and (unless `grad_mode="none"`) gradient, cached per pair. With `grad_mode="none"` and no `keep_paths`: [score only](#score-only), guides deferred. `keep_paths=True` also stores each alignment path, so `batch[i].aligned()` / `.coordinates()` work (a few bytes per alignment column). |
 | `banded_grad(bandwidth, keep_paths=False)` | `float` (sum of scores) | Banded re-align + gradient around each pair's cached guide. Run `score_and_grad()` once to establish the guides, then `set_params()` + `banded_grad(bw)` after each update; no full DP is run. |
@@ -425,9 +434,9 @@ def make_params(m):
                               gap_open_a=11.0, gap_extend_a=1.0,
                               gap_open_b=11.0, gap_extend_b=1.0)
 
-batch = nwgrad.SeqPairBatch(n_threads=8, gap_model="affine", mode="global",
+batch = nwgrad.SeqPairBatch(seqs_a, seqs_b, make_params(mat_array),   # encoded once
+                            n_threads=8, gap_model="affine", mode="global",
                             grad_mode="soft")
-batch.add_many(seqs_a, seqs_b, make_params(mat_array))    # encoded once
 
 batch.score_and_grad()                  # full DP: establishes every pair's guide
 for step in range(n_steps):
@@ -537,6 +546,17 @@ score, grad = nwgrad.nw_affine_grad("PLEASANTLY", "MEANLY", params)
 ```
 
 ---
+
+## Migrating to 0.7: pairs in the constructor
+
+`SeqPairBatch` takes its pairs at construction; `add_many()` is deprecated (it still
+works, with a `DeprecationWarning`).
+
+| 0.6 | 0.7 |
+|---|---|
+| `b = SeqPairBatch(n, gap_model=…, mode=…, grad_mode=…)`<br>`b.add_many(A, B, p, tracks=t)` | `b = SeqPairBatch(A, B, p, n_threads=n, gap_model=…, mode=…, grad_mode=…, tracks=t)` |
+| `SeqPairBatch(n, …)` for `align()` only | unchanged |
+| several `add_many()` calls with different params (segments) | one batch per params, or `set_params()` (the deprecated `add_many()` still appends) |
 
 ## Migrating from 0.5
 

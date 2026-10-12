@@ -39,15 +39,15 @@ params = nwgrad.AlignParams(BLOSUM62,
                             gap_open_a=11.0, gap_extend_a=1.0,
                             gap_open_b=11.0, gap_extend_b=1.0)
 
-batch = nwgrad.SeqPairBatch(n_threads=4,           # 0 = physical core count
+batch = nwgrad.SeqPairBatch(seqs_a, seqs_b, params,  # encoded once, in parallel
+                            n_threads=4,                # 0 = physical core count
                             gap_model="affine", mode="global", grad_mode="soft")
-batch.add_many(seqs_a, seqs_b, params)              # encoded once, in parallel
 print(len(batch))                                   # 4
 ```
 
 The batch copies `params`; later changes require `batch.set_params(params)`.
-`add_many()` may be called again to append more pairs,
-with the same or other parameters (over the same alphabet).
+The pairs are given once, to the constructor. (`add_many()`, which appended pairs to
+an existing batch, is deprecated since 0.7 and kept only for compatibility.)
 
 ## `score_and_grad()`
 
@@ -117,9 +117,8 @@ align the same pairs under several, use one batch for each:
 
 ```python
 params_lin = nwgrad.AlignParams(BLOSUM62, gap_extend_a=1.0, gap_extend_b=1.0)
-batch_lin_global = nwgrad.SeqPairBatch(n_threads=4, gap_model="linear",
-                                       mode="global", grad_mode="hard")
-batch_lin_global.add_many(seqs_a, seqs_b, params_lin)
+batch_lin_global = nwgrad.SeqPairBatch(seqs_a, seqs_b, params_lin, n_threads=4,
+                                       gap_model="linear", mode="global", grad_mode="hard")
 
 total = batch_lin_global.score_and_grad()
 grad  = batch_lin_global.compute_grad()
@@ -134,9 +133,8 @@ same way whichever thread takes it, and the sums (`score_and_grad()`'s total,
 ```python
 ref = None
 for n in [1, 2, 4, 8]:
-    b = nwgrad.SeqPairBatch(n_threads=n, gap_model="affine", mode="global",
-                            grad_mode="soft")
-    b.add_many(seqs_a, seqs_b, params)
+    b = nwgrad.SeqPairBatch(seqs_a, seqs_b, params, n_threads=n,
+                            gap_model="affine", mode="global", grad_mode="soft")
     total = b.score_and_grad()
     g = b.compute_grad().matrix.to_matrix()
     if ref is None:
@@ -159,9 +157,9 @@ ii, jj = np.triu_indices(len(sequences), k=1)
 params_ava = nwgrad.AlignParams(BLOSUM62,
                                 gap_open_a=11.0, gap_extend_a=1.0,
                                 gap_open_b=11.0, gap_extend_b=1.0)
-batch = nwgrad.SeqPairBatch(n_threads=4, gap_model="affine", mode="global",
-                            grad_mode="soft")
-batch.add_many([sequences[i] for i in ii], [sequences[j] for j in jj], params_ava)
+batch = nwgrad.SeqPairBatch([sequences[i] for i in ii], [sequences[j] for j in jj],
+                            params_ava, n_threads=4,
+                            gap_model="affine", mode="global", grad_mode="soft")
 
 total_log_z = batch.score_and_grad()
 grad = batch.compute_grad()

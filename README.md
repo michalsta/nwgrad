@@ -80,10 +80,8 @@ Any differentiable objective over alignment scores works. Here, a contrastive on
 make a set of pairs you believe are homologous score higher than a set of decoys.
 
 ```python
-pos = nwgrad.SeqPairBatch(grad_mode="soft")     # all cores by default
-neg = nwgrad.SeqPairBatch(grad_mode="soft")     # one problem type per batch
-pos.add_many(homologs_a, homologs_b, params)
-neg.add_many(decoys_a, decoys_b, params)
+pos = nwgrad.SeqPairBatch(homologs_a, homologs_b, params, grad_mode="soft")  # all cores
+neg = nwgrad.SeqPairBatch(decoys_a, decoys_b, params, grad_mode="soft")      # by default
 
 for step in range(100):
     margin = pos.score_and_grad() - neg.score_and_grad()     # sums of log Z
@@ -93,7 +91,7 @@ for step in range(100):
     neg.set_params(params)
 ```
 
-`add_many()` encodes the pairs in parallel straight into the batch's arrays — a few
+The constructor encodes the pairs in parallel straight into the batch's arrays — a few
 hundred bytes per pair, no per-pair objects — so batches of millions of pairs are cheap
 to set up and to keep. Per-pair scores and gradients are
 available too (`batch.scores()`, `batch.grads()`, `batch.weighted_grad(weights)`, `batch[i]`), for

@@ -42,9 +42,9 @@ print(f"Config: {GAP_MODEL} gap, {ALIGN_MODE} align, {GRAD_MODE} grad")
 print(f"        gap_open={GAP_OPEN}  gap_extend={GAP_EXTEND}  band={BAND_WIDTH}  lr={LR}")
 
 # ── Build upper-triangle pairs ────────────────────────────────────────────────
-batch = nwgrad.SeqPairBatch(gap_model=GAP_MODEL, mode=ALIGN_MODE, grad_mode=GRAD_MODE)
 ii, jj = np.triu_indices(N_SEQS, k=1)
-batch.add_many([seqs[i] for i in ii], [seqs[j] for j in jj], params)
+batch = nwgrad.SeqPairBatch([seqs[i] for i in ii], [seqs[j] for j in jj], params,
+                            gap_model=GAP_MODEL, mode=ALIGN_MODE, grad_mode=GRAD_MODE)
 
 print(batch[7])
 print(f"\nSequence pairs: {len(batch)}  ({N_SEQS} sequences, upper triangle)")

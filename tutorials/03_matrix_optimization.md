@@ -78,9 +78,8 @@ problem type are fixed.
 ```python
 params = make_params(mat_array)
 
-batch = nwgrad.SeqPairBatch(n_threads=4, gap_model="affine", mode="global",
-                            grad_mode="soft")
-batch.add_many(seqs_a, seqs_b, params)
+batch = nwgrad.SeqPairBatch(seqs_a, seqs_b, params, n_threads=4,
+                            gap_model="affine", mode="global", grad_mode="soft")
 ```
 
 ## Gradient descent loop
@@ -192,9 +191,9 @@ for epoch in range(5):
         idx = all_pairs[start:start + BATCH_SIZE]
         p = make_params(mat_array)
 
-        mini_batch = nwgrad.SeqPairBatch(n_threads=4, gap_model="affine",
+        mini_batch = nwgrad.SeqPairBatch([seqs_a[i] for i in idx], [seqs_b[i] for i in idx], p,
+                                         n_threads=4, gap_model="affine",
                                          mode="global", grad_mode="soft")
-        mini_batch.add_many([seqs_a[i] for i in idx], [seqs_b[i] for i in idx], p)
 
         loss = -mini_batch.score_and_grad()
         grad = mini_batch.compute_grad()
@@ -279,9 +278,8 @@ be annealed because the subgradient is not a descent direction in general.
 
 ```python
 params_hard = make_params(mat_array)
-batch_hard = nwgrad.SeqPairBatch(n_threads=4, gap_model="affine", mode="global",
-                                 grad_mode="hard")
-batch_hard.add_many(seqs_a, seqs_b, params_hard)
+batch_hard = nwgrad.SeqPairBatch(seqs_a, seqs_b, params_hard, n_threads=4,
+                                 gap_model="affine", mode="global", grad_mode="hard")
 
 for t in range(200):
     lr = 1e-2 * (0.99 ** t)

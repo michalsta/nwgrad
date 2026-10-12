@@ -598,11 +598,72 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
 }
 
 // ── SeqPairBatch ─────────────────────────────────────────────────────────────
+#define NWG_BATCH_TRACKS_DOC \
+            "Tracks.  params may hold K parameter sets (AlignParams.from_arrays /\n" \
+            "AlignParams.stack); each residue of sequence A is then scored by the set its\n" \
+            "track names.  tracks: one sequence per pair, len(seqs_a[i]) set indices in\n" \
+            "[0, K); gap_tracks: one per pair, len(seqs_a[i]) + 1 indices, the set of each\n" \
+            "DP row 0..len(A) for gaps in A.  Either may be None (every pair defaults), or an\n" \
+            "entry None (that pair defaults): the track to all set 0, the gap track to\n" \
+            "row 0 -> track[0] and row i -> track[i-1].  Within row i (1-based, after\n" \
+            "residue i-1 of A): a match uses set track[i-1]'s matrix; a gap in B there\n" \
+            "(A's residue against '-') costs track[i-1]'s gap_extend_b, plus its\n" \
+            "gap_open_b if the gap run starts in that row; a gap in A within row i costs\n" \
+            "gap_tracks[i]'s gap_open_a / gap_extend_a.  The gradient then has K sets\n" \
+            "too.  A batch with tracks (or K > 1) is TRACKED: every pair carries tracks,\n" \
+            "and every set_params() must keep K.  Its hard gradients are stored as paths\n" \
+            "(2 bits per step) and summed on demand, so memory does not grow with K.\n" \
+            "Either may also be ONE flat 1-D integer numpy array: every pair's entries\n" \
+            "concatenated in pair order (sum(len(a)) for tracks, sum(len(a) + 1) for\n" \
+            "gap_tracks) — no per-pair Python objects, much cheaper for many pairs."
+
+// Pairs into `self` under params (one segment): what the sequence constructor and the
+// deprecated add_many() both do.
+template<class SPB>
+static void add_pairs(SPB& self, const std::vector<std::string_view>& seqs_a,
+                      const std::vector<std::string_view>& seqs_b, const AlignParams& params,
+                      const std::string& kernel, nb::handle tracks, nb::handle gap_tracks) {
+    const auto [la, lg] = track_lengths(seqs_a);
+    const auto tk = to_tracks(tracks, la, "tracks");
+    const auto gk = to_tracks(gap_tracks, lg, "gap_tracks");
+    self.add_many(seqs_a, seqs_b, params, parse_backend(kernel), tk.view(), gk.view());
+}
+
 template<class T>
 static void bind_seq_pair_batch(nb::module_& m, const char* name) {
     using SPB = SeqPairBatchT<T>;
     using SP  = SeqPairT<T>;
     nb::class_<SPB>(m, name, nb::dynamic_attr())
+        .def(
+            "__init__",
+            [](SPB* self, const std::vector<std::string_view>& seqs_a,
+               const std::vector<std::string_view>& seqs_b, const AlignParams& params,
+               int n_threads, const std::string& traceback, const std::string& gap_model,
+               const std::string& mode, const std::string& grad_mode, const std::string& kernel,
+               nb::handle tracks, nb::handle gap_tracks) {
+                new (self) SPB(parse_gap_model(gap_model), parse_align_mode(mode),
+                               parse_grad_mode<GradMode>(grad_mode), n_threads,
+                               parse_traceback(traceback));
+                try {
+                    add_pairs(*self, seqs_a, seqs_b, params, kernel, tracks, gap_tracks);
+                } catch (...) {
+                    self->~SPB();   // nanobind treats a throwing __init__ as never constructed
+                    throw;
+                }
+            },
+            nb::arg("seqs_a"), nb::arg("seqs_b"), nb::arg("params"), nb::kw_only(),
+            nb::arg("n_threads") = 0, nb::arg("traceback") = "auto",
+            nb::arg("gap_model") = "affine", nb::arg("mode") = "global",
+            nb::arg("grad_mode") = "hard", nb::arg("kernel") = "auto",
+            nb::arg("tracks").none() = nb::none(), nb::arg("gap_tracks").none() = nb::none(),
+            "A batch of the pairs (seqs_a[i], seqs_b[i]) under params, of ONE problem\n"
+            "type, aligned in parallel.  The pairs are given here, once: sequences are\n"
+            "validated and encoded in parallel (a bad character raises), and the batch\n"
+            "keeps an owned copy of params (set_params() replaces it).  gap_model, mode,\n"
+            "grad_mode, n_threads and traceback as in SeqPairBatch(n_threads, traceback)\n"
+            "below; kernel: the Viterbi backend (\"auto\").\n"
+            "\n"
+            NWG_BATCH_TRACKS_DOC)
         .def(
             "__init__",
             [](SPB* self, int n_threads, const std::string& traceback,
@@ -652,40 +713,30 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             "     opt-in at double; it stays bit-identical across ISA levels but not\n"
             "     with any other mode.\n"
             "Pairs live in the batch's own arrays (codes, scores, guides, gradients, a few\n"
-            "hundred bytes per pair) and are aligned on per-thread buffers.")
+            "hundred bytes per pair) and are aligned on per-thread buffers.\n"
+            "This form makes a batch WITHOUT pairs: for align() (streaming, nothing kept\n"
+            "per pair).  To keep pairs, give them to the constructor:\n"
+            "SeqPairBatch(seqs_a, seqs_b, params, ...).")
         .def(
             "add_many",
             [](SPB& self, const std::vector<std::string_view>& seqs_a,
                const std::vector<std::string_view>& seqs_b, const AlignParams& params,
                const std::string& kernel, nb::handle tracks, nb::handle gap_tracks) {
-                const auto [la, lg] = track_lengths(seqs_a);
-                const auto tk = to_tracks(tracks, la, "tracks");
-                const auto gk = to_tracks(gap_tracks, lg, "gap_tracks");
-                self.add_many(seqs_a, seqs_b, params, parse_backend(kernel), tk.view(), gk.view());
+                if (PyErr_WarnEx(PyExc_DeprecationWarning,
+                                 "SeqPairBatch.add_many() is deprecated since nwgrad 0.7.0; give the pairs "
+                                 "to the constructor: SeqPairBatch(seqs_a, seqs_b, params, ...)", 1) < 0)
+                    throw nb::python_error();
+                add_pairs(self, seqs_a, seqs_b, params, kernel, tracks, gap_tracks);
             },
             nb::arg("seqs_a"), nb::arg("seqs_b"), nb::arg("params"), nb::arg("kernel") = "auto",
             nb::kw_only(), nb::arg("tracks").none() = nb::none(), nb::arg("gap_tracks").none() = nb::none(),
-            "Append pairs under an owned copy of params (one segment). Sequences are\n"
-            "validated and encoded in parallel; a bad character raises and adds nothing.\n"
-            "The problem type is fixed by the constructor.\n"
+            "Deprecated since 0.7: give the pairs to the constructor,\n"
+            "SeqPairBatch(seqs_a, seqs_b, params, ...).  Kept for compatibility.\n"
             "\n"
-            "Tracks.  params may hold K parameter sets (AlignParams.from_arrays /\n"
-            "AlignParams.stack); each residue of sequence A is then scored by the set its\n"
-            "track names.  tracks: one sequence per pair, len(seqs_a[i]) set indices in\n"
-            "[0, K); gap_tracks: one per pair, len(seqs_a[i]) + 1 indices, the set of each\n"
-            "DP row 0..len(A) for gaps in A.  Either may be None (every pair defaults), or an\n"
-            "entry None (that pair defaults): the track to all set 0, the gap track to\n"
-            "row 0 -> track[0] and row i -> track[i-1].  Within row i (1-based, after\n"
-            "residue i-1 of A): a match uses set track[i-1]'s matrix; a gap in B there\n"
-            "(A's residue against '-') costs track[i-1]'s gap_extend_b, plus its\n"
-            "gap_open_b if the gap run starts in that row; a gap in A within row i costs\n"
-            "gap_tracks[i]'s gap_open_a / gap_extend_a.  The gradient then has K sets\n"
-            "too.  A batch with tracks (or K > 1) is TRACKED: every pair carries tracks,\n"
-            "and every set_params() must keep K.  Its hard gradients are stored as paths\n"
-            "(2 bits per step) and summed on demand, so memory does not grow with K.\n"
-            "Either may also be ONE flat 1-D integer numpy array: every pair's entries\n"
-            "concatenated in pair order (sum(len(a)) for tracks, sum(len(a) + 1) for\n"
-            "gap_tracks) — no per-pair Python objects, much cheaper for many pairs.")
+            "Append pairs under an owned copy of params (one segment; a batch may hold\n"
+            "several, under different params of one alphabet and one K). Sequences are\n"
+            "validated and encoded in parallel; a bad character raises and adds nothing.\n"
+            "The problem type is fixed by the constructor.  Tracks as the constructor's.")
         .def("__len__", &SPB::size)
         .def(
             "__getitem__",
