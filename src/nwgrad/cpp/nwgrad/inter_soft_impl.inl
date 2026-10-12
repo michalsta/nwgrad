@@ -133,17 +133,10 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_affine(InterSoftJob& J) noexcept {
             return;
         }
         ivd P[8];
-        if constexpr (Tr) {   // each lane's row once; the vectors built in registers
-            size_t ro[IW];
-            for (int l = 0; l < IW; ++l) ro[l] = isj_row<Tr>(J, l, i) * na;
-            for (int c = 0; c < na; ++c)
-                P[c] = ivlanes<ivd, IW>([&](int l) { return J.es[ro[l] + c]; });
-        } else {
-            for (int c = 0; c < na; ++c)
-                for (int l = 0; l < IW; ++l) {
-                    P[c][l] = J.es[isj_row<Tr>(J, l, i) * na + c];
-                }
-        }
+        size_t ro[IW];   // each lane's row once; the vectors built in registers
+        for (int l = 0; l < IW; ++l) ro[l] = isj_row<Tr>(J, l, i) * na;
+        for (int c = 0; c < na; ++c)
+            P[c] = ivlanes<ivd, IW>([&](int l) { return J.es[ro[l] + c]; });
         for (int j = 1; j <= n; ++j) {
             ivd s = z;
             const ivl* mk = eqm + static_cast<size_t>(j) * na;
@@ -477,17 +470,10 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_linear(InterSoftJob& J) noexcept {
             return;
         }
         ivd P[8];
-        if constexpr (Tr) {   // each lane's row once; the vectors built in registers
-            size_t ro[IW];
-            for (int l = 0; l < IW; ++l) ro[l] = isj_row<Tr>(J, l, i) * na;
-            for (int c = 0; c < na; ++c)
-                P[c] = ivlanes<ivd, IW>([&](int l) { return J.es[ro[l] + c]; });
-        } else {
-            for (int c = 0; c < na; ++c)
-                for (int l = 0; l < IW; ++l) {
-                    P[c][l] = J.es[isj_row<Tr>(J, l, i) * na + c];
-                }
-        }
+        size_t ro[IW];   // each lane's row once; the vectors built in registers
+        for (int l = 0; l < IW; ++l) ro[l] = isj_row<Tr>(J, l, i) * na;
+        for (int c = 0; c < na; ++c)
+            P[c] = ivlanes<ivd, IW>([&](int l) { return J.es[ro[l] + c]; });
         for (int j = 1; j <= n; ++j) {
             ivd sv = z;
             const ivl* mk = eqm + static_cast<size_t>(j) * na;
