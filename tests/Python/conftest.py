@@ -108,11 +108,17 @@ def pytest_report_header(config):
     return f"nwgrad: FORCING kernel={(_SWEEP or [_KERNEL])[0]!r} for every aligner call"
 
 
-def _inject_kernel(fn, kernel_position):
-    """Wrap a callable so it passes kernel=<current backend> unless the caller set one."""
+def _inject_kernel(fn, kernel_position, required=()):
+    """Wrap a callable so it passes kernel=<current backend> unless the caller set one.
+
+    `required`: the parameters the kernel-taking signature cannot do without.  A call
+    that does not supply them all is another overload (SeqPairBatch(n_threads, ...),
+    the pairless constructor, beside SeqPairBatch(seqs_a, seqs_b, params, ...)) and is
+    passed through untouched."""
 
     def wrapper(*args, **kwargs):
-        if len(args) <= kernel_position:
+        supplied = len(args) + sum(name in kwargs for name in required[len(args):])
+        if len(args) <= kernel_position and supplied >= len(required):
             kwargs.setdefault("kernel", _current_backend)
         return fn(*args, **kwargs)
 
@@ -136,6 +142,15 @@ def _patch_entry_points(nwgrad):
         params = re.findall(r"(?:^|,\s*)(\w+):", signature.split("(", 1)[1])
         return params.index("kernel") - int(constructor)
 
+    def required_params(signature, constructor=False):
+        # The leading parameters without a default (before any '*'), self dropped.
+        out = []
+        for part in signature.split("(", 1)[1].rsplit(")", 1)[0].split(", "):
+            if part.strip() == "*" or "=" in part:
+                break
+            out.append(part.split(":", 1)[0].strip())
+        return tuple(out[1:]) if constructor and out and out[0] == "self" else tuple(out)
+
     patched = []
     for name in dir(nwgrad):
         if name.startswith("_"):
@@ -151,8 +166,10 @@ def _patch_entry_points(nwgrad):
                     patched.append(f"{name}.{method_name}")
         signature = signature_line(obj)
         if callable(obj) and "kernel:" in signature:
+            ctor = isinstance(obj, type)
             setattr(nwgrad, name, _inject_kernel(
-                obj, kernel_position(signature, constructor=isinstance(obj, type))))
+                obj, kernel_position(signature, constructor=ctor),
+                required_params(signature, constructor=ctor)))
             patched.append(name)
 
     assert patched, "NWGRAD_FORCE_KERNEL set, but no kernel-taking entry point was patched"
