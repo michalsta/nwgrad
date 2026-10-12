@@ -282,43 +282,84 @@ score-only, streaming, Hirschberg splitting, validation), `test_tracks_soft.py`.
 checks (row penalties in the striped/pointer/score kernels, the inter-pair soft weights)
 were each caught.
 
-**Performance** (nighthaven, i5-12500, 2026-10-10/11). Untracked code, `tracks` vs `main`
-A/B (`tools/bench_ab.py`, control arm ~1.00): at 12 threads every workload 1.00-1.01; at
-1 thread 1.00-1.02 except guide-banded iterations, 1.03-1.05. perf stat over 40 banded
-iterations: +1.0% instructions, +3.3% cycles, +6% branch misses, startup equal;
-callgrind shows the DP kernels, walk, `validate_guide` and `fill_guide_gaps`
-instruction-identical to `main`, the excess spread over lane setup and `set_problem`
-bookkeeping, and the ratio moves 1.02-1.06 between builds (layout). Accepted.
-Tracked cost (`tools/bench_tracks.py`, 100k Manakov pairs, K = 25 sets, one per miRNA
-position, one training step, tracked / untracked, 1 and 12 threads; `696db0c`): double
-linear 0.97-1.07; double affine local 1.09-1.12, global 1.19-1.23; float linear
-0.99-1.10; float affine local 1.11-1.15, global 1.28-1.34; soft (double) 1.19-1.38.
-Memory for 100k pairs: 31 MB tracked vs 24 MB untracked (hard paths); soft records 168 MB.
+**Performance** (nighthaven, i5-12500, 2026-10-12, `b2a2b5d`; 100k Manakov pairs).
 
-Where it goes (perf, 1 thread, per step on those 100k pairs; `score_and_grad` = sg,
-`weighted_grad` = wg):
-- **wg replays every pair** (the untracked one sums stored dense gradients: 1 ms). Hard:
-  the stored path, by runs of one move (a run of gaps in A is one key; diagonals and
-  gaps in B take a key per row): affine global 15 ms (paths ~50 steps), local 4 ms (~9),
-  linear global 24 ms (its ~28 gap steps scattered in runs of 1-2). Soft: the per-row
-  record, by row blocks, 23 ms. Parallel over the blocks of 4096 pairs. Before
-  `41b3ea1`/`696db0c`: 18.8 / 4.0 / 25 / 28.8 ms.
-- **sg, linear: tracked is faster** (112 vs 138 ms double global; not profiled — the
-  tracked walk stores the path where the untracked one accumulates a dense gradient).
-- **sg, affine: +6-15%.** Symbol deltas (double affine local): the tracked inter-pair
-  `row()` (each lane's stacked row through its track, then its letters) 1.9x the
-  untracked one, about +7% of sg; the fill kernel +6% of its own time, ~4% of sg
-  (per-row penalty vectors per lane); `setup_tracks_` per pair ~+4% of sg; recording the path (walk + moves +
-  packing) a little more than the untracked gradient walk.
-- **sg, soft: +17%** (was +27%: the lanes' row weights were exp'd per pair and row; now
-  each set's four once per params, `41b3ea1`): the inter-pair soft kernel +10% (per-lane
-  weights per row), the lanes' row setup.
+Untracked code, `tracks` vs `main` (`tools/bench_ab.py`, control arm ~1.00): 12 threads
+1.00-1.02; 1 thread 1.00-1.02 except guide-banded iterations 1.04 and `seqpair` 1.03
+(+1% instructions over 40 banded iterations, kernels instruction-identical, spread over
+lane setup and `set_problem`, 1.02-1.06 between builds: layout). Score-only paths
+(`tools/bench_score_ab.py`) 0.98-1.03.
+
+Tracked cost (`tools/bench_tracks.py`, K = 25 sets, one per miRNA position, one training
+step, tracked / untracked, 1 and 12 threads): double linear 0.95-1.04; double affine
+local 1.04-1.08, global 1.16-1.22; float linear 0.95-1.04; float affine local 1.07-1.12,
+global 1.21-1.27; soft (double) 1.18-1.34. Memory: 31 MB tracked vs 24 MB untracked
+(hard paths); soft records 168 MB.
+
+Where it goes (perf, 1 thread; `score_and_grad` = sg, `weighted_grad` = wg):
+- **Linear sg: tracked is faster than untracked — because the untracked batch walks
+  each linear traceback twice** (`hard_grad_and_guide`: the gradient walk, then
+  `guide_j_from_viterbi`'s; affine has one fused walk). perf, double linear global:
+  untracked `walk_linear` x2 (2882 + 2624 samples) vs the tracked walk recording path
+  and guide at once. Fixed on branch `linear-guide-walk` (from `main`, not part of
+  tracks): untracked linear sg -31% double global, -37% float global, -11% double local,
+  affine unchanged, bit-identical to `main` (hashes of scores, gradients, sums and
+  banded results over 144 configurations). Once that is in `main`, tracked linear pays
+  its replay (below) against an untracked walk no longer doubled.
+- **wg replays every pair** (untracked sums stored dense gradients: 1 ms). Hard: the
+  stored path by runs of one move: affine global 15 ms (~50 steps a path), local 4 ms
+  (~9), linear global 24 ms (~28 gap steps scattered in runs of 1-2), linear local
+  12 ms. Soft: the per-row record (~180 doubles a pair, 144 MB per 100k): 23 ms, memory
+  bound. At 12 threads (blocks of 4096 pairs) 1-3.5 ms, over a fixed ~0.8 ms that the
+  untracked sum pays too.
+- **Affine sg: +2.5-10% left** (was +6-15%). The tracked inter-pair `row()` spent 47% of
+  its samples on one instruction: the reload of a vector just assembled lane by lane on
+  the stack (store forwarding fails); built as a braced initializer over the lanes
+  (`ivlanes`), and only the 1 << levels vectors `inter_sub` reads, it dropped 1958 ->
+  369 samples (untracked: 1041). The same for the penalty vectors, borders and the soft
+  pass's rows and weights; paths packed straight into their slots from the back
+  (`Aligner::hard_path_packed`: no move vector, no reverse, no second pass). Left: the
+  fill's per-lane penalties, `setup_tracks_` (~3%: per-row gathers), the path record.
+- **Soft sg: +11-16%** (was +17%; +27% before the per-set weight cache of `41b3ea1`).
+
+**Stored counts instead of paths** (prototype, branch `tracks-counts-proto`,
+`NWGRAD_TRACK_COUNTS=1`): the walk counts each pair's touched fields (slot table, as the
+replay) and stores (key, count) pairs, 16-bit, in a slot sized to the bound
+`min(m,n) + g*(min(m,K) + min(m+1,K))` (g = 2 affine, 1 linear); wg sums them,
+prefetching 8 pairs ahead (without the prefetch the first entry of each pair missed:
+70% of wg on one load). Per step (sg + wg), counts vs paths, 1 thread: affine global
+-5/-7%, linear global -13%, linear local -5%, affine local +1%; 12 threads: linear
+global -8%, linear local -1.5%, affine +2-4%. sg pays 1-6 ms for counting in the walk,
+wg drops to 2.5-5 ms. Memory: the bound is 112 entries (affine) / 67 (linear) for
+these pairs, ~450 / 270 B a pair against ~35 B for a path; actual use is 32 (global) /
+10-19 (local) entries, so exact-size storage would be ~130 B. Compacting into pair order
+after every fill (to get the wg of exact-size storage now) cost more in sg than it saved
+in wg. Not adopted: worth it for linear (PosimiR's model) once untracked linear walks
+once, with exact-size per-worker storage (TODO.md).
 
 Tried and dropped (measured on nighthaven): all rows' penalty vectors built once per
-inter-pair group before the fill (double unchanged, float 2-6% slower); a branch-free row
-index in the tracked `row()` (rs padded with a 0, the index clamped: within +-3%, either
-sign); a branch-free per-step path replay (selects and conditional counts: slower than
-the branchy one, 24 vs 18.8 ms — the counts chain through memory).
+inter-pair group before the fill (double unchanged, float 2-6% slower — built lane by
+lane, the stall only moved); a branch-free row index in the tracked `row()` (+-3%); a
+branch-free per-step path replay (24 vs 18.8 ms: the counts chain through memory);
+compacting stored counts after each fill (above).
+
+Testing beyond the suite: `tests/Python/test_tracks_alphabets.py` (alphabets of 1-20
+letters: every profile depth of the inter-pair kernels and their gather path; a planted
+`np = 4` failed exactly the 5- and 8-letter cases), `tools/stress_tracks.py` (random
+alphabets, K up to 40, lengths up to 400, tracks or none, integral parameters for ties,
+every fill / traceback / precision / thread count; checks against the pair functions,
+<gradient, parameters> == score, weighted sums, wide bands, streaming, soft): 2026-10-12,
+`b2a2b5d`: wloczykij 6 processes x 60 min (simd, scalar_fallback,
+NWGRAD_TRACK_PROFILE_BYTES=0; 716k rounds, 72M pairs), nighthaven (avx2) 2 x 25 min
+(394k rounds, 39.5M pairs), skynet 20 min (39k rounds): no mismatch.
+
+**After `linear-guide-walk` lands in `main`** (measured on its merge into `tracks`,
+branch `tracks-on-lg`, with the counts prototype on top: `tracks-on-lg-counts`),
+tracked / untracked per step, paths -> stored counts: linear global 1.39-1.45 -> 1.20-1.22
+(1 thread), 1.33-1.41 -> 1.24-1.27 (12); linear local 1.23-1.32 -> 1.15-1.21 (1),
+1.16-1.25 -> 1.16-1.25 (12); affine global 1.25-1.34 -> 1.17-1.25 (1), 1.25-1.31 ->
+1.28-1.37 (12); affine local 1.11-1.16 (1), 1.07-1.11 -> 1.11-1.17 (12). Tracked sg is
+then +11-15% over the one-walk untracked sg (fill, lane setup, `setup_tracks_`).
 
 ### Vectorization: the faster hard-gradient kernels (prototyped, measured on 3 machines)
 

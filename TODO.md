@@ -199,12 +199,20 @@ Tracks landed on branch `tracks` (2026-10-11; see AGENTS.md, "Tracks").  Deferre
 - **Tracked soft batches store a per-row record per pair**: `len(A) * n + 4 * (len(A)+1)`
   doubles (≈ 1.4 KB per Manakov pair, ≈ 3.6 GB for 2.5 M).  Inherent when every row has
   its own set; `align()` (streaming) stores nothing.  Hard gradients are paths (≈ 30 B).
-- **Tracked affine global is 1.19-1.34x untracked, soft 1.19-1.38x** (100k Manakov
-  pairs, K = 25; profile and what was tried: AGENTS.md, "Tracks", Performance).  Left:
-  the replay in `weighted_grad` (15-24 ms per 100k pairs at 1 thread vs 1 ms untracked;
-  storing each pair's sparse counts at fill time instead of its path would make it a
-  plain sum, for ~8 B per touched field instead of ~30 B per path), and the inter-pair
-  kernels' per-lane row setup (tracked `row()` 1.9x the untracked one).
+- **Tracked affine global is 1.16-1.27x untracked, soft 1.18-1.34x** (100k Manakov
+  pairs, K = 25; profile, what was done and tried: AGENTS.md, "Tracks", Performance).
+- **Stored counts instead of paths** (prototype on branch `tracks-counts-proto`; numbers
+  in AGENTS.md): -5 to -13% a step at 1 thread, -8% linear global at 12 threads, but
+  slots sized to the worst case (~270-450 B a pair vs ~35 B for a path).  To adopt:
+  exact-size storage (~130 B a pair) — each worker appends its pairs' (key, count)
+  entries to its own buffer and records (buffer, offset, n) per pair; weighted_grad
+  reads them in pair order with prefetch; a single-pair recompute appends to the solo
+  buffer, compacted when its garbage outgrows the live entries.  Worth it for linear
+  (PosimiR) once untracked linear walks once (`linear-guide-walk`).
+- **`linear-guide-walk` (from `main`)**: the untracked linear batch walked each
+  traceback twice (gradient, then guide); one walk: -11 to -37% on linear sg,
+  bit-identical.  Also there: inter-pair rows built in registers (only the vectors
+  `inter_sub` reads).  To merge into `main` separately; `tracks` then rebases.
 - **Untracked guide-banded iterations at 1 thread are 3-5% slower than on `main`** (+1%
   instructions, kernels identical; spread over lane setup and `set_problem`, layout
   sensitive).  12 threads: 1.01.
