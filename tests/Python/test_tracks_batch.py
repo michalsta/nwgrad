@@ -473,3 +473,52 @@ def test_track_storage_switch(case, prec):
     assert not u.tracked and u.track_storage == other[first]
     u.score_and_grad()
     u.weighted_grad(w[:20])
+
+
+@pytest.mark.parametrize("case", CASES)
+@pytest.mark.parametrize("dtype", [np.uint16, np.int32, np.int64, np.uint8])
+def test_flat_track_arrays(case, dtype):
+    """tracks / gap_tracks may be one flat 1-D integer array each, every pair's entries
+    concatenated: the same batch, and the same streamed result, as per-pair lists."""
+    rng = np.random.default_rng(91)
+    A, B, mats, gaps, tracks, gtracks = random_problem(rng, 200, 4)
+    P = to_params(mats, gaps)
+    flat_t = np.concatenate([np.asarray(t, dtype=np.int64) for t in tracks]).astype(dtype)
+    flat_g = np.concatenate([np.asarray(g, dtype=np.int64) for g in gtracks]).astype(dtype)
+    nested = make_batch(case, "_double", A, B, P, tracks, gtracks)
+    flat = make_batch(case, "_double", A, B, P, flat_t, flat_g)
+    for b in (nested, flat):
+        b.score_and_grad()
+    np.testing.assert_array_equal(flat.scores(), nested.scores())
+    for x, y in zip(flat.grads(), nested.grads()):
+        np.testing.assert_array_equal(x, y)
+    assert [flat[k].track for k in range(5)] == [list(map(int, t)) for t in tracks[:5]]
+    # only the track flat, then a strided view
+    half = make_batch(case, "_double", A, B, P, np.ascontiguousarray(np.repeat(flat_t, 2)[::2]), gtracks)
+    half.score_and_grad()
+    np.testing.assert_array_equal(half.scores(), nested.scores())
+    s = BATCH["_double"](3, gap_model=case[0], mode=case[1])
+    r_flat = s.align(A, B, P, tracks=np.repeat(flat_t, 2)[::2], gap_tracks=flat_g)
+    r_nested = s.align(A, B, P, tracks=tracks, gap_tracks=gtracks)
+    np.testing.assert_array_equal(r_flat.scores, r_nested.scores)
+    np.testing.assert_array_equal(r_flat.grad.matrices, r_nested.grad.matrices)
+    np.testing.assert_array_equal(r_flat.grad.gaps, r_nested.grad.gaps)
+
+
+def test_flat_track_array_validation():
+    P3 = to_params(np.zeros((3, N, N)), np.ones((3, 4)))
+    b = BATCH["_double"](2, gap_model="linear", mode="global")
+    with pytest.raises(ValueError, match="flat tracks has 4 entries, expected 5"):
+        b.add_many(["AC", "GTA"], ["AC", "AC"], P3, tracks=np.zeros(4, dtype=np.int32))
+    with pytest.raises(ValueError, match="flat gap_tracks has 5 entries, expected 7"):
+        b.add_many(["AC", "GTA"], ["AC", "AC"], P3, gap_tracks=np.zeros(5, dtype=np.int32))
+    with pytest.raises(ValueError, match=r"tracks\[3\] = -1 is not a parameter set"):
+        b.add_many(["AC", "GTA"], ["AC", "AC"], P3, tracks=np.array([0, 1, 2, -1, 0]))
+    with pytest.raises(ValueError, match="is not a parameter set"):   # against K, by the batch
+        b.add_many(["AC", "GTA"], ["AC", "AC"], P3, tracks=np.array([0, 1, 2, 3, 0]))
+    with pytest.raises(TypeError, match="integer dtype"):
+        b.add_many(["AC", "GTA"], ["AC", "AC"], P3, tracks=np.zeros(5))
+    assert len(b) == 0   # every failure added nothing
+    # a 2-D array is still one row per pair (all of A's lengths equal)
+    b.add_many(["AC", "GT"], ["AC", "AC"], P3, tracks=np.array([[0, 1], [2, 2]]))
+    assert b[1].track == [2, 2]

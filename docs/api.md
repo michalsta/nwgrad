@@ -173,6 +173,21 @@ and `SeqPairBatch.align(..., tracks=, gap_tracks=)` (one sequence per pair; `Non
 linear and affine, global and local, full and banded, every fill and traceback
 (Hirschberg too), at both precisions.
 
+For many pairs, the batch methods also take each of `tracks` / `gap_tracks` as **one
+flat 1-D integer numpy array**: every pair's entries concatenated in pair order
+(`sum(len(a))` entries for `tracks`, `sum(len(a) + 1)` for `gap_tracks`; every pair
+then has a track). A C-contiguous `uint16` array is read in place; other integer
+dtypes and strided views are converted once. Measured on 20k miRNA pairs (8 threads):
+a tracked streaming `align()` takes 26 ms with flat `uint16` arrays, 46 ms with lists,
+24 ms with the default tracks.
+
+```python
+lens = np.array([len(a) for a in seqs_a])
+starts = np.repeat(np.cumsum(lens) - lens, lens)
+tracks = (np.arange(lens.sum()) - starts).astype(np.uint16)   # residue i -> set i
+batch.add_many(seqs_a, seqs_b, P, tracks=tracks)
+```
+
 Contracts:
 - The hard path stays **bit-exact across ISA levels** (every SIMD kernel against the
   scalar tracked fill).

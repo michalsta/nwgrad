@@ -70,8 +70,7 @@ public:
     void add_many(const std::vector<std::string_view>& seqs_a,
                   const std::vector<std::string_view>& seqs_b,
                   const AlignParams& params, int kernel = kBackendAuto,
-                  const std::vector<std::vector<uint16_t>>* tracks = nullptr,
-                  const std::vector<std::vector<uint16_t>>* gap_tracks = nullptr) {
+                  const PairTracks& tracks = {}, const PairTracks& gap_tracks = {}) {
         visit([&](auto& e) { e.add_many(seqs_a, seqs_b, params, kernel, tracks, gap_tracks); });
     }
 

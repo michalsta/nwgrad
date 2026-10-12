@@ -197,8 +197,7 @@ public:
     void add_many(const std::vector<std::string_view>& seqs_a,
                   const std::vector<std::string_view>& seqs_b,
                   const AlignParams& params, int kernel = kBackendAuto,
-                  const std::vector<std::vector<uint16_t>>* tracks = nullptr,
-                  const std::vector<std::vector<uint16_t>>* gap_tracks = nullptr) {
+                  const PairTracks& tracks = {}, const PairTracks& gap_tracks = {}) {
         if (seqs_a.size() != seqs_b.size())
             throw std::invalid_argument(
                 "nwgrad: add_many() needs seqs_a and seqs_b of equal length (got " +
@@ -209,12 +208,12 @@ public:
                 "nwgrad: SeqPair over alphabet \"" + alpha.symbols() +
                 "\" cannot join a batch over alphabet \"" + alpha_->symbols() + "\"");
         const size_t N = seqs_a.size();
-        if (tracks && tracks->size() != N)
+        if (tracks && tracks.size() != N)
             throw std::invalid_argument("nwgrad: add_many() needs one track per pair (got " +
-                                        std::to_string(tracks->size()) + " for " + std::to_string(N) + " pairs)");
-        if (gap_tracks && gap_tracks->size() != N)
+                                        std::to_string(tracks.size()) + " for " + std::to_string(N) + " pairs)");
+        if (gap_tracks && gap_tracks.size() != N)
             throw std::invalid_argument("nwgrad: add_many() needs one gap_track per pair (got " +
-                                        std::to_string(gap_tracks->size()) + " for " + std::to_string(N) + " pairs)");
+                                        std::to_string(gap_tracks.size()) + " for " + std::to_string(N) + " pairs)");
         if (N == 0) return;
         if (N > std::numeric_limits<uint32_t>::max() - size())
             throw std::length_error("nwgrad: batch too large");
@@ -225,11 +224,8 @@ public:
                 std::to_string(nsets_) + "-set params");
         // Tracks: lengths and set indices checked up front, on the caller's thread, so a
         // bad one leaves the batch exactly as it was.
-        for (size_t k = 0; k < N; ++k) {
-            const size_t m = seqs_a[k].size();
-            if (tracks && !(*tracks)[k].empty()) check_track_((*tracks)[k], m, K, k, "track");
-            if (gap_tracks && !(*gap_tracks)[k].empty()) check_track_((*gap_tracks)[k], m + 1, K, k, "gap_track");
-        }
+        check_tracks_(tracks, [&](size_t k) { return seqs_a[k].size(); }, K, "track");
+        check_tracks_(gap_tracks, [&](size_t k) { return seqs_a[k].size() + 1; }, K, "gap_track");
         const bool want_tracked = tracked_ || K > 1 || tracks || gap_tracks;
 
         const size_t N0 = size();
@@ -267,9 +263,11 @@ public:
                 const size_t i = N0 + k, m = len_a(i);
                 uint16_t* t = tk_.data() + oa_[i];
                 uint16_t* g = gk_.data() + oa_[i] + i;
-                if (tracks && !(*tracks)[k].empty()) std::copy((*tracks)[k].begin(), (*tracks)[k].end(), t);
-                if (gap_tracks && !(*gap_tracks)[k].empty()) {
-                    std::copy((*gap_tracks)[k].begin(), (*gap_tracks)[k].end(), g);
+                const auto tr = tracks ? tracks[k] : std::span<const uint16_t>();
+                const auto gt = gap_tracks ? gap_tracks[k] : std::span<const uint16_t>();
+                if (!tr.empty()) std::copy(tr.begin(), tr.end(), t);
+                if (!gt.empty()) {
+                    std::copy(gt.begin(), gt.end(), g);
                 } else {
                     g[0] = m ? t[0] : 0;
                     for (size_t r = 1; r <= m; ++r) g[r] = t[r - 1];
@@ -588,18 +586,12 @@ public:
         const bool banded = band > 0 || !problems[0].guide_j.empty();
         // Tracks: checked here, on the caller's thread, naming the problem.
         const int K = params.num_sets();
-        if (st.tracks && st.tracks->size() != N)
+        if (st.tracks && st.tracks.size() != N)
             throw std::invalid_argument("nwgrad: align() needs one track per problem");
-        if (st.gap_tracks && st.gap_tracks->size() != N)
+        if (st.gap_tracks && st.gap_tracks.size() != N)
             throw std::invalid_argument("nwgrad: align() needs one gap_track per problem");
-        if (st.any())
-            for (size_t i = 0; i < N; ++i) {
-                const auto& p = problems[i];
-                if (st.tracks && !(*st.tracks)[i].empty())
-                    check_track_((*st.tracks)[i], p.seq_a.size(), K, i, "track");
-                if (st.gap_tracks && !(*st.gap_tracks)[i].empty())
-                    check_track_((*st.gap_tracks)[i], p.seq_a.size() + 1, K, i, "gap_track");
-            }
+        check_tracks_(st.tracks, [&](size_t i) { return problems[i].seq_a.size(); }, K, "track");
+        check_tracks_(st.gap_tracks, [&](size_t i) { return problems[i].seq_a.size() + 1; }, K, "gap_track");
         if (s_.inter_fill) {
             const int be = stream_inter_backend_(params, kernel, banded);
             if (be >= 0) {
@@ -1206,7 +1198,21 @@ private:
                 "nwgrad: set_params() cannot change the number of parameter sets (" +
                 std::to_string(nsets_) + " -> " + std::to_string(params.num_sets()) + ")");
     }
-    static void check_track_(const std::vector<uint16_t>& t, size_t want, int K, size_t pair,
+    // Every pair's track of `t` (want(k) entries each, or empty: the default) against
+    // K sets: the lengths per pair (a flat buffer's are its offsets'), the values in one
+    // pass over all of them; the per-pair search only names an offender.
+    template <class Want>
+    static void check_tracks_(const PairTracks& t, Want&& want, int K, const char* what) {
+        if (!t) return;
+        for (size_t k = 0; k < t.size(); ++k) {
+            const auto r = t[k];
+            if (!r.empty() && r.size() != want(k)) check_track_(r, want(k), K, k, what);
+        }
+        if (t.max_entry() < K) return;
+        for (size_t k = 0; k < t.size(); ++k)
+            if (!t[k].empty()) check_track_(t[k], want(k), K, k, what);
+    }
+    static void check_track_(std::span<const uint16_t> t, size_t want, int K, size_t pair,
                              const char* what) {
         if (t.size() != want)
             throw std::invalid_argument(

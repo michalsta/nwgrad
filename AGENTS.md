@@ -378,6 +378,15 @@ escape failed exactly its 4 cases), the C++ threaded batch test under ASan/UBSan
 clang) and TSan, `tools/stress_tracks.py` on wloczykij (6 x 40 min on the 8-byte
 version, 6 x 30 min on the final one) and skynet: no mismatch.
 
+**Flat track arrays (2026-10-12).** `add_many` / `align` take `tracks` / `gap_tracks`
+as one flat 1-D integer numpy array (pair entries concatenated; a C-contiguous uint16
+array is read in place) beside the per-pair sequences. Both forms reach the engine as
+a `PairTracks` view (nested vectors, or a flat buffer + offsets; batch_result.hpp), and
+are checked by `check_tracks_`: per-pair lengths, then ONE max pass over all entries
+(the per-pair search only names an offender). Before, a tracked streaming `align()`
+spent ~16 ms per 20k pairs on the caller's thread converting and checking per entry
+(46-53 ms vs 24 ms with default tracks, 8 threads, skynet); flat uint16: 26 ms.
+
 **Both stores on `tracks` (`track_storage`, 2026-10-12).** The combined build matches
 the two branches it came from (nighthaven, 100k Manakov pairs, K = 25, tracked /
 untracked, 1 / 12 threads): paths double linear local 1.20/1.16, global 1.36/1.33,

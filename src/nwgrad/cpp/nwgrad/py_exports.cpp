@@ -124,18 +124,93 @@ static std::vector<uint16_t> to_track(const nb::handle& obj, const char* what) {
     return out;
 }
 
-// A per-pair list of tracks (None, or one sequence per pair; an entry may be None for
-// that pair's default) as uint16 vectors.
-static std::vector<std::vector<uint16_t>> to_tracks(const nb::handle& obj, size_t n, const char* what) {
-    std::vector<std::vector<uint16_t>> out;
+// Element q of a 1-D integer array of any width and signedness, widened.
+static int64_t flat_at(const nb::ndarray<nb::ro, nb::ndim<1>, nb::device::cpu>& arr, size_t q) {
+    const auto* base = static_cast<const char*>(arr.data()) + static_cast<int64_t>(q) * arr.stride(0) *
+                       static_cast<int64_t>(arr.dtype().bits / 8);
+    const bool sgn = arr.dtype().code == static_cast<uint8_t>(nb::dlpack::dtype_code::Int);
+    switch (arr.dtype().bits) {
+        case 8:  return sgn ? *reinterpret_cast<const int8_t*>(base)  : *reinterpret_cast<const uint8_t*>(base);
+        case 16: return sgn ? *reinterpret_cast<const int16_t*>(base) : *reinterpret_cast<const uint16_t*>(base);
+        case 32: return sgn ? *reinterpret_cast<const int32_t*>(base) : *reinterpret_cast<const uint32_t*>(base);
+        default: {
+            if (sgn) return *reinterpret_cast<const int64_t*>(base);
+            const uint64_t u = *reinterpret_cast<const uint64_t*>(base);
+            return u > static_cast<uint64_t>(INT64_MAX) ? -1 : static_cast<int64_t>(u);
+        }
+    }
+}
+
+// A tracks argument, converted: None; one sequence per pair (an entry may be None for
+// that pair's default); or ONE flat 1-D integer numpy array, every pair's entries
+// concatenated in pair order, pair i taking lens[i] of them (a flat array gives every
+// pair a track).  A C-contiguous uint16 array is read in place (`keep` holds it);
+// anything else is converted once into `own`.  view() is what the engine takes.
+struct TracksArg {
+    std::vector<std::vector<uint16_t>> nested;
+    std::vector<uint16_t> own;
+    std::vector<size_t> off;
+    nb::ndarray<nb::ro, nb::ndim<1>, nb::device::cpu> keep;
+    const uint16_t* flat = nullptr;
+    bool given = false, is_flat = false;
+    PairTracks view() const {
+        if (!given) return {};
+        if (is_flat) return PairTracks(flat, off.data(), off.size() - 1);
+        return PairTracks(&nested);
+    }
+};
+
+static TracksArg to_tracks(const nb::handle& obj, const std::vector<size_t>& lens, const char* what) {
+    TracksArg out;
     if (!obj.is_valid() || obj.is_none()) return out;
+    out.given = true;
+    const size_t n = lens.size();
+    if (nb::try_cast(obj, out.keep, false)) {
+        const auto& arr = out.keep;
+        const auto code = arr.dtype().code;
+        if ((code != static_cast<uint8_t>(nb::dlpack::dtype_code::Int) &&
+             code != static_cast<uint8_t>(nb::dlpack::dtype_code::UInt)) || arr.dtype().lanes != 1)
+            throw nb::type_error((std::string("nwgrad: ") + what +
+                                  " as one flat array must have an integer dtype").c_str());
+        out.off.resize(n + 1);
+        out.off[0] = 0;
+        for (size_t i = 0; i < n; ++i) out.off[i + 1] = out.off[i] + lens[i];
+        const size_t total = out.off[n];
+        if (arr.shape(0) != total)
+            throw nb::value_error((std::string("nwgrad: flat ") + what + " has " + std::to_string(arr.shape(0)) +
+                                   " entries, expected " + std::to_string(total) +
+                                   " (every pair's entries, concatenated)").c_str());
+        out.is_flat = true;
+        if (code == static_cast<uint8_t>(nb::dlpack::dtype_code::UInt) && arr.dtype().bits == 16 &&
+            (arr.stride(0) == 1 || total <= 1)) {
+            out.flat = static_cast<const uint16_t*>(arr.data());   // in place
+            return out;
+        }
+        out.own.resize(total);
+        for (size_t q = 0; q < total; ++q) {
+            const int64_t v = flat_at(arr, q);
+            if (v < 0 || v >= SubstMatrix::kMaxSets)
+                throw nb::value_error((std::string("nwgrad: ") + what + "[" + std::to_string(q) + "] = " +
+                                       std::to_string(v) + " is not a parameter set index").c_str());
+            out.own[q] = static_cast<uint16_t>(v);
+        }
+        out.flat = out.own.data();
+        return out;
+    }
     const size_t len = nb::len(obj);
     if (len != n)
         throw nb::value_error((std::string("nwgrad: ") + what + " needs one entry per pair (got " +
                                std::to_string(len) + " for " + std::to_string(n) + " pairs)").c_str());
-    out.reserve(n);
-    for (nb::handle h : obj) out.push_back(to_track(h, what));
+    out.nested.reserve(n);
+    for (nb::handle h : obj) out.nested.push_back(to_track(h, what));
     return out;
+}
+
+// Per pair, the lengths of its track (len(A)) and gap track (len(A) + 1).
+static std::pair<std::vector<size_t>, std::vector<size_t>> track_lengths(const std::vector<std::string_view>& seqs_a) {
+    std::vector<size_t> la(seqs_a.size()), lg(seqs_a.size());
+    for (size_t i = 0; i < seqs_a.size(); ++i) { la[i] = seqs_a[i].size(); lg[i] = la[i] + 1; }
+    return {std::move(la), std::move(lg)};
 }
 
 static GapModel parse_gap_model(const std::string& name) {
@@ -583,10 +658,10 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             [](SPB& self, const std::vector<std::string_view>& seqs_a,
                const std::vector<std::string_view>& seqs_b, const AlignParams& params,
                const std::string& kernel, nb::handle tracks, nb::handle gap_tracks) {
-                const auto tk = to_tracks(tracks, seqs_a.size(), "tracks");
-                const auto gk = to_tracks(gap_tracks, seqs_a.size(), "gap_tracks");
-                self.add_many(seqs_a, seqs_b, params, parse_backend(kernel),
-                              tracks.is_none() ? nullptr : &tk, gap_tracks.is_none() ? nullptr : &gk);
+                const auto [la, lg] = track_lengths(seqs_a);
+                const auto tk = to_tracks(tracks, la, "tracks");
+                const auto gk = to_tracks(gap_tracks, lg, "gap_tracks");
+                self.add_many(seqs_a, seqs_b, params, parse_backend(kernel), tk.view(), gk.view());
             },
             nb::arg("seqs_a"), nb::arg("seqs_b"), nb::arg("params"), nb::arg("kernel") = "auto",
             nb::kw_only(), nb::arg("tracks").none() = nb::none(), nb::arg("gap_tracks").none() = nb::none(),
@@ -607,7 +682,10 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             "gap_tracks[i]'s gap_open_a / gap_extend_a.  The gradient then has K sets\n"
             "too.  A batch with tracks (or K > 1) is TRACKED: every pair carries tracks,\n"
             "and every set_params() must keep K.  Its hard gradients are stored as paths\n"
-            "(2 bits per step) and summed on demand, so memory does not grow with K.")
+            "(2 bits per step) and summed on demand, so memory does not grow with K.\n"
+            "Either may also be ONE flat 1-D integer numpy array: every pair's entries\n"
+            "concatenated in pair order (sum(len(a)) for tracks, sum(len(a) + 1) for\n"
+            "gap_tracks) — no per-pair Python objects, much cheaper for many pairs.")
         .def("__len__", &SPB::size)
         .def(
             "__getitem__",
@@ -653,8 +731,9 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
                const std::string& kernel, nb::handle tracks, nb::handle gap_tracks) {
                 if (seqs_a.size() != seqs_b.size())
                     throw nb::value_error("nwgrad: align() needs seqs_a and seqs_b of equal length");
-                auto tk = to_tracks(tracks, seqs_a.size(), "tracks");
-                auto gk = to_tracks(gap_tracks, seqs_a.size(), "gap_tracks");
+                const auto [la, lg] = track_lengths(seqs_a);
+                auto tk = to_tracks(tracks, la, "tracks");
+                auto gk = to_tracks(gap_tracks, lg, "gap_tracks");
                 const bool guides = !aligned_a.empty() || !aligned_b.empty();
                 if (guides && (aligned_a.size() != seqs_a.size() || aligned_b.size() != seqs_a.size()))
                     throw nb::value_error("nwgrad: aligned_a / aligned_b need one entry per pair");
@@ -668,8 +747,8 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
                     if (guides) problems[i].guide_j = guide_j_from_aligned(aligned_a[i], aligned_b[i]);
                 }
                 StreamTracks st;
-                if (!tracks.is_none()) st.tracks = &tk;
-                if (!gap_tracks.is_none()) st.gap_tracks = &gk;
+                st.tracks = tk.view();
+                st.gap_tracks = gk.view();
                 return self.align(problems, params, band, parse_backend(kernel), st);
             },
             nb::arg("seqs_a"), nb::arg("seqs_b"), nb::arg("params"), nb::arg("band") = 0,
