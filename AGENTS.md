@@ -378,6 +378,18 @@ escape failed exactly its 4 cases), the C++ threaded batch test under ASan/UBSan
 clang) and TSan, `tools/stress_tracks.py` on wloczykij (6 x 40 min on the 8-byte
 version, 6 x 30 min on the final one) and skynet: no mismatch.
 
+**Both stores on `tracks` (`track_storage`, 2026-10-12).** The combined build matches
+the two branches it came from (nighthaven, 100k Manakov pairs, K = 25, tracked /
+untracked, 1 / 12 threads): paths double linear local 1.20/1.16, global 1.36/1.33,
+float linear local 1.30/1.22, global 1.43/1.38, affine 1.08-1.33; counts double linear
+local 1.17/1.13, global 1.24/1.23, float linear local 1.25/1.24, global 1.25/1.29,
+affine 1.08-1.34 (within ~5% of the separate branches either way). Memory after a fill
+unchanged (paths 0.5-3.6 MB, counts 4.3-37 MB). Tested: every tracks batch test once
+per store, the switch test, the C++ threaded batch test in both stores under ASan/UBSan
+(gcc, clang), TSan and Release; a planted bug in the counts read failed 48 counts cases
+and no paths case; wloczykij: full suite 4248, simd / scalar tracks tests 588 each,
+ctest 14/14, `stress_tracks.py` (store drawn per round) 6 x 20 min, ~238k rounds, OK.
+
 **After `main` took `linear-guide-walk` (merged into `tracks` / `tracks-counts`,
 2026-10-12; nighthaven, 100k Manakov pairs, K = 25).** Untracked code vs `main`
 (`bench_ab`, control ~1.00): 0.94-1.01 everywhere except guide-banded 1.03-1.04 and
