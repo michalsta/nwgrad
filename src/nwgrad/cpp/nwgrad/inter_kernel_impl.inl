@@ -48,6 +48,13 @@ template <class V, class S> static inline V ivsplat(S x) noexcept {
 }
 
 
+// A vector of f(0), f(1), ... f(W-1), as a braced initializer: built in registers (lane
+// by lane into memory, then read back whole, it stalls on store forwarding).
+template <class V, class F, std::size_t... I>
+static inline V ivlanes_(F& f, std::index_sequence<I...>) noexcept { return V{f(static_cast<int>(I))...}; }
+template <class V, int W, class F>
+static inline V ivlanes(F f) noexcept { return ivlanes_<V>(f, std::make_index_sequence<static_cast<std::size_t>(W)>{}); }
+
 // Per lane, the score of this row's A residue against the column's B residue: a blend
 // tree on the B residue's bits (bits[3*j + k] = bit k of each lane's b[j-1], as masks).
 template <class V, class L>
@@ -111,12 +118,14 @@ struct InterCommon {
             }
             return;
         }
-        for (int c = 0; c < 8; ++c) {
+        // Each lane's row once, then the 1 << levels vectors inter_sub reads, built in
+        // registers.
+        size_t ro[IW];
+        for (int l = 0; l < IW; ++l) ro[l] = static_cast<size_t>((i <= J.m[l]) ? J.a[l][i - 1] : 0) * na;
+        const int np = 1 << levels;
+        for (int c = 0; c < np; ++c) {
             const int cc = c < na ? c : 0;
-            for (int l = 0; l < IW; ++l) {
-                const int a = (i <= J.m[l]) ? J.a[l][i - 1] : 0;
-                P[c][l] = J.blk[a * na + cc];
-            }
+            P[c] = ivlanes<ivd, IW>([&](int l) { return J.blk[ro[l] + cc]; });
         }
     }
     ivd s(const ivd* P, int j) const {
