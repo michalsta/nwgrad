@@ -337,6 +337,18 @@ after every fill (to get the wg of exact-size storage now) cost more in sg than 
 in wg. Not adopted: worth it for linear (PosimiR's model) once untracked linear walks
 once, with exact-size per-worker storage (TODO.md).
 
+**After `main` took `linear-guide-walk` (merged into `tracks` / `tracks-counts`,
+2026-10-12; nighthaven, 100k Manakov pairs, K = 25).** Untracked code vs `main`
+(`bench_ab`, control ~1.00): 0.94-1.01 everywhere except guide-banded 1.03-1.04 and
+`seqpair` 1.02-1.03 (the residue noted above); score-only 0.98-1.02. Tracked / untracked
+per step, 1 / 12 threads, paths (`tracks`) -> counts (`tracks-counts`): double linear
+local 1.21/1.17 -> 1.17/1.13, global 1.40/1.32 -> 1.25/1.24; float linear local
+1.31/1.24 -> 1.23/1.19, global 1.46/1.41 -> 1.27/1.35; double affine local 1.11/1.07 ->
+1.12/1.09, global 1.26/1.24 -> 1.18/1.26; float affine local 1.14/1.12 -> 1.17/1.13,
+global 1.34/1.31 -> 1.29/1.35. Soft (double, `tracks`): 1.21-1.41. Memory after a fill,
+100k pairs, 1 / 12 threads, paths -> counts: affine global 0.7/3.6 -> 25/37 MB, linear
+global 0.7/2.0 -> 25/36, linear local 0.6/1.8 -> 12/20, affine local 0.6/3.5 -> 4.5/12.
+
 Tried and dropped (measured on nighthaven): all rows' penalty vectors built once per
 inter-pair group before the fill (double unchanged, float 2-6% slower — built lane by
 lane, the stall only moved); a branch-free row index in the tracked `row()` (+-3%); a
