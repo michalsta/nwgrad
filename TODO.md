@@ -35,15 +35,18 @@ several segments under different params or kernels. Different params per pair ar
 with a constant track per pair (`AlignParams.stack`); a per-segment kernel has no use
 outside tests and benchmarks.
 
-**Before the 0.7.0 release (open):** the C++ API has no replacement yet. `SeqPairBatchT`
-is built pairless and filled with `add_many()` (`docs/cpp.md`, ~44 uses in `tests/cpp`),
-and C++ `add_many()` carries no `[[deprecated]]`. For a C++ deprecation window, 0.7.0
-needs a C++ constructor taking the pairs (seqs, params, kernel, tracks, gap tracks) and
-`[[deprecated]]` on `add_many()`; otherwise the C++ removal waits for 0.9.
+**C++ follows the same pattern in 0.7.0:** `SeqPairBatchT(seqs_a, seqs_b, params, gm, am,
+gd, n_threads, tb, kernel, tracks, gap_tracks)` takes the pairs; the pairless
+`SeqPairBatchT(gm, am, gd, n_threads, tb)` stays for streaming `align()`;
+`SeqPairBatchT::add_many()` is `[[deprecated]]` (removed in 0.8.0). Its callers: the
+Python `add_many` binding (`add_pairs()` in `py_exports.cpp`, warning suppressed) and the
+appending tests at the end of `tests/cpp/test_batch_build.cpp` (likewise).
+`BatchEngine::add_many()` (internal; `SeqPairBatchT`'s constructor and a few engine tests
+call it) is not deprecated: it becomes the engine's construction step in 0.8.
 
-**0.8.0, Python:**
-- Delete the `add_many` binding and its warning; `add_pairs()` in `py_exports.cpp`
-  becomes the constructor's body.
+**0.8.0, Python and C++:**
+- Delete `SeqPairBatchT::add_many()`, the `add_many` binding and its warning, and
+  `add_pairs()` in `py_exports.cpp`; the appending tests in `tests/cpp/test_batch_build.cpp`.
 - Delete the tests marked `filterwarnings("ignore:SeqPairBatch.add_many")` (appends,
   segments, failed appends leaving the batch unchanged): `test_batch_build.py`,
   `test_tracks_batch.py`, `test_fill.py`, `test_alphabet.py`, `test_removed_api.py`; the

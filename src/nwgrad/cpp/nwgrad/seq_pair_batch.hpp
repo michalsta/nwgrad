@@ -7,8 +7,11 @@
 // A batch holds pairs of ONE problem type — one gap model, one alignment mode, one
 // grad mode — fixed at construction:
 //
-//     SeqPairBatchT<double> b(GapModel::Affine, AlignMode::Local, GradMode::Hard);
-//     b.add_many(seqs_a, seqs_b, params);              // params per call (a segment)
+//     SeqPairBatchT<double> b(seqs_a, seqs_b, params,  // the pairs, given once
+//                             GapModel::Affine, AlignMode::Local, GradMode::Hard);
+//
+// The pairless constructor makes a batch for streaming align() only (nothing kept per
+// pair).  add_many(), which appended pairs, is deprecated in 0.7.0 and removed in 0.8.0.
 //
 // One BatchEngine is selected at construction: one dispatch per batch call, never
 // per pair. Settings live in that engine.
@@ -43,6 +46,20 @@ public:
                              Engine<GapModel::Affine, AlignMode::Local>>;
     using SeqPair = SeqPairT<T>;
 
+    // The pairs (seqs_a[i], seqs_b[i]) under an owned copy of params, validated and
+    // encoded in parallel (a bad character throws).  tracks / gap_tracks: one entry per
+    // pair, or empty (see BatchEngine::add_many); a batch with tracks or K > 1 parameter
+    // sets is tracked.  kernel: the Viterbi backend (kBackendAuto, kBackendScalar or a
+    // SimdLevel).
+    SeqPairBatchT(const std::vector<std::string_view>& seqs_a,
+                  const std::vector<std::string_view>& seqs_b, const AlignParams& params,
+                  GapModel gm, AlignMode am, GradMode gd, int n_threads = 0,
+                  TracebackMode tb = TracebackMode::Default, int kernel = kBackendAuto,
+                  const PairTracks& tracks = {}, const PairTracks& gap_tracks = {})
+        : SeqPairBatchT(gm, am, gd, n_threads, tb) {
+        append_(seqs_a, seqs_b, params, kernel, tracks, gap_tracks);
+    }
+    // No pairs: a batch for streaming align().
     SeqPairBatchT(GapModel gm, AlignMode am, GradMode gd, int n_threads = 0,
                   TracebackMode tb = TracebackMode::Default)
         : e_(make_engine_(gm, am, gd, n_threads, tb)), gm_(gm), am_(am), gd_(gd) {}
@@ -67,11 +84,12 @@ public:
     // ── Adding pairs ─────────────────────────────────────────────────────────
 
     // Append a segment under an owned copy of params (tracks: see BatchEngine::add_many).
+    [[deprecated("give the pairs to the SeqPairBatchT constructor; removed in nwgrad 0.8.0")]]
     void add_many(const std::vector<std::string_view>& seqs_a,
                   const std::vector<std::string_view>& seqs_b,
                   const AlignParams& params, int kernel = kBackendAuto,
                   const PairTracks& tracks = {}, const PairTracks& gap_tracks = {}) {
-        visit([&](auto& e) { e.add_many(seqs_a, seqs_b, params, kernel, tracks, gap_tracks); });
+        append_(seqs_a, seqs_b, params, kernel, tracks, gap_tracks);
     }
 
     size_t size() const noexcept { return visit([](const auto& e) { return e.size(); }); }
@@ -166,6 +184,12 @@ public:
     }
 
 private:
+    void append_(const std::vector<std::string_view>& seqs_a, const std::vector<std::string_view>& seqs_b,
+                 const AlignParams& params, int kernel, const PairTracks& tracks,
+                 const PairTracks& gap_tracks) {
+        visit([&](auto& e) { e.add_many(seqs_a, seqs_b, params, kernel, tracks, gap_tracks); });
+    }
+
     Var e_;
     GapModel gm_ = GapModel::Affine;
     AlignMode am_ = AlignMode::Global;
@@ -198,12 +222,8 @@ public:
              GapModel gm, AlignMode am, GradMode gd = GradMode::Hard,
              int kernel = kBackendAuto, TracebackMode tb = TracebackMode::Default,
              std::vector<uint16_t> track = {}, std::vector<uint16_t> gap_track = {})
-        : own_(std::make_unique<Batch>(gm, am, gd, 1, tb)), b_(own_.get()), i_(0) {
-        own_->set_fill(false, false);   // one pair: nothing to share a vector with
-        const bool tr = !track.empty() || !gap_track.empty();
-        std::vector<std::vector<uint16_t>> tk{std::move(track)}, gk{std::move(gap_track)};
-        own_->add_many({a}, {b}, params, kernel, tr ? &tk : nullptr, tr ? &gk : nullptr);
-    }
+        : own_(make_own_(a, b, params, gm, am, gd, kernel, tb, std::move(track), std::move(gap_track))),
+          b_(own_.get()), i_(0) {}
     // View of pair i of `batch` (which must outlive the view).
     SeqPairT(Batch& batch, size_t i) : b_(&batch), i_(i) {}
 
@@ -286,6 +306,19 @@ public:
     void set_soft_temperature(double t) { standalone_("soft_temperature"); own_->set_soft_temperature(t); }
 
 private:
+    static std::unique_ptr<Batch> make_own_(std::string_view a, std::string_view b, const AlignParams& params,
+                                            GapModel gm, AlignMode am, GradMode gd, int kernel,
+                                            TracebackMode tb, std::vector<uint16_t> track,
+                                            std::vector<uint16_t> gap_track) {
+        const bool tr = !track.empty() || !gap_track.empty();
+        std::vector<std::vector<uint16_t>> tk{std::move(track)}, gk{std::move(gap_track)};
+        auto own = std::make_unique<Batch>(std::vector<std::string_view>{a}, std::vector<std::string_view>{b},
+                                           params, gm, am, gd, 1, tb, kernel, tr ? &tk : nullptr,
+                                           tr ? &gk : nullptr);
+        own->set_fill(false, false);   // one pair: nothing to share a vector with
+        return own;
+    }
+
     std::unique_ptr<Batch> own_;
     Batch* b_;
     size_t i_;

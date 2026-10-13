@@ -654,8 +654,8 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
             "concatenated in pair order (sum(len(a)) for tracks, sum(len(a) + 1) for\n" \
             "gap_tracks) — no per-pair Python objects, much cheaper for many pairs."
 
-// Pairs into `self` under params (one segment): what the sequence constructor and the
-// deprecated add_many() both do.
+// The deprecated add_many() (removed in 0.8.0): pairs appended to `self` under params
+// (one segment).  The C++ method is deprecated too; this is its one sanctioned caller.
 template<class SPB>
 static void add_pairs(SPB& self, const std::vector<std::string_view>& seqs_a,
                       const std::vector<std::string_view>& seqs_b, const AlignParams& params,
@@ -663,7 +663,10 @@ static void add_pairs(SPB& self, const std::vector<std::string_view>& seqs_a,
     const auto [la, lg] = track_lengths(seqs_a);
     const auto tk = to_tracks(tracks, la, "tracks");
     const auto gk = to_tracks(gap_tracks, lg, "gap_tracks");
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
     self.add_many(seqs_a, seqs_b, params, parse_backend(kernel), tk.view(), gk.view());
+#pragma GCC diagnostic pop
 }
 
 template<class T>
@@ -678,15 +681,13 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
                int n_threads, const std::string& traceback, const std::string& gap_model,
                const std::string& mode, const std::string& grad_mode, const std::string& kernel,
                nb::handle tracks, nb::handle gap_tracks) {
-                new (self) SPB(parse_gap_model(gap_model), parse_align_mode(mode),
-                               parse_grad_mode<GradMode>(grad_mode), n_threads,
-                               parse_traceback(traceback));
-                try {
-                    add_pairs(*self, seqs_a.v, seqs_b.v, params, kernel, tracks, gap_tracks);
-                } catch (...) {
-                    self->~SPB();   // nanobind treats a throwing __init__ as never constructed
-                    throw;
-                }
+                const auto [la, lg] = track_lengths(seqs_a.v);
+                const auto tk = to_tracks(tracks, la, "tracks");
+                const auto gk = to_tracks(gap_tracks, lg, "gap_tracks");
+                new (self) SPB(seqs_a.v, seqs_b.v, params, parse_gap_model(gap_model),
+                               parse_align_mode(mode), parse_grad_mode<GradMode>(grad_mode),
+                               n_threads, parse_traceback(traceback), parse_backend(kernel),
+                               tk.view(), gk.view());
             },
             nb::arg("seqs_a"), nb::arg("seqs_b"), nb::arg("params"), nb::kw_only(),
             nb::arg("n_threads") = 0, nb::arg("traceback") = "auto",

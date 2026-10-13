@@ -11,6 +11,21 @@ python -m nwgrad --include
 
 Add that path to your include path and `#include "nwgrad/aligner.hpp"` etc.
 
+A batch takes its pairs at construction, as in Python:
+
+```cpp
+#include "nwgrad/seq_pair_batch.hpp"
+
+std::vector<std::string_view> a = {"ACGT", "GATTACA"}, b = {"AGT", "GATACA"};
+SeqPairBatchT<double> batch(a, b, params, GapModel::Affine, AlignMode::Local,
+                            GradMode::Hard, /*n_threads=*/0);
+double total = batch.score_and_grad();
+std::vector<double> scores = batch.scores();
+```
+
+`SeqPairBatchT(gm, am, gd, n_threads, tb)` without pairs is for streaming `align()`.
+`add_many()`, which appended pairs, is `[[deprecated]]` in 0.7.0 and removed in 0.8.0.
+
 ## Building from source
 
 Requirements: Python ≥ 3.10, `nanobind>=3.0`, `scikit-build-core`, and a C++20
