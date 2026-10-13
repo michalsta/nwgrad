@@ -219,8 +219,7 @@ EPS = 1e-5
 
 sp = nwgrad.SeqPair(a, b, make_params(blosum_arr),
                     gap_model="affine", mode="global", grad_mode="soft")
-sp.align_full()
-sp.compute_grad()
+sp.align()
 log_z = sp.score
 g_ana = sp.grad.matrix.to_matrix().copy()   # (not `grad`: the loops' AlignParams)
 
@@ -232,12 +231,12 @@ m_minus = blosum_arr.copy(); m_minus[i, j] -= EPS; m_minus[j, i] -= EPS
 p_plus  = make_params(m_plus)
 sp_p = nwgrad.SeqPair(a, b, p_plus,
                       gap_model="affine", mode="global", grad_mode="soft")
-sp_p.align_full()
+sp_p.align()
 
 p_minus = make_params(m_minus)
 sp_m = nwgrad.SeqPair(a, b, p_minus,
                       gap_model="affine", mode="global", grad_mode="soft")
-sp_m.align_full()
+sp_m.align()
 
 numerical  = (sp_p.score - sp_m.score) / (2 * EPS)
 analytical = g_ana[i, j] + g_ana[j, i]   # both entries changed by the perturbation

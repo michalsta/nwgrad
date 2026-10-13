@@ -140,13 +140,12 @@ Later changes to `params` reach the pair only after `sp.set_params(params)`.
 ### Computing the score
 
 ```python
-sp.align_full()
-print(sp.score)   # -3.0
+print(sp.align())   # -3.0, also in sp.score
 ```
 
-`align_full()` runs the full O(m×n) DP and caches the alignment path (`guide_j`).
-The DP tables are temporary; what the pair keeps is the result — score, path and
-gradient.
+`align()` runs the full O(m×n) DP and caches the result: the score, the gradient
+(for `grad_mode="hard"` / `"soft"`), the alignment path (`guide_j`) and, by default,
+the stored alignment that `aligned()` reads. The DP tables are temporary.
 
 ### Inspecting the alignment
 
@@ -162,10 +161,9 @@ print(sp.formatted())   # PLEASANTLY
 ### Computing the hard subgradient
 
 ```python
-sp.compute_grad()
-grad = sp.grad     # AlignParams object
+grad = sp.grad     # AlignParams object, published by align()
 
-# Or do both in one call:
+# Or align and take both in one call:
 score, grad = sp.score_and_grad()
 ```
 
@@ -209,10 +207,9 @@ sp_soft = nwgrad.SeqPair(
     gap_model="affine", mode="global",
     grad_mode="soft",
 )
-sp_soft.align_full()
+sp_soft.align()
 print(sp_soft.score)    # log Z — always >= hard score
 
-sp_soft.compute_grad()
 soft_grad = sp_soft.grad                         # AlignParams object
 soft_mat  = sp_soft.grad.matrix.to_matrix()      # fractional, shape (N, N)
 print(f"soft_grad sum: {soft_mat.sum()}")  # <= min(len(a), len(b))
@@ -232,8 +229,7 @@ for gap_model in ("linear", "affine"):
         p = nwgrad.AlignParams(BLOSUM62, **kw)
         sp = nwgrad.SeqPair("PLEASANTLY", "MEANLY", p,
                             gap_model=gap_model, mode=mode)
-        sp.align_full()
-        print(f"{gap_model:6s} {mode:6s}  score={sp.score:.1f}")
+        print(f"{gap_model:6s} {mode:6s}  score={sp.align():.1f}")
 ```
 
 Local alignment scores are always ≥ 0 (a zero-length local alignment is valid).
@@ -242,7 +238,7 @@ Local alignment scores are always ≥ 0 (a zero-length local alignment is valid)
 
 After a gradient step the matrix changes but the alignment path is still a
 reasonable guide. `set_params()` swaps the parameters and preserves the cached
-path, so `realign_banded()` can re-score cheaply around it instead of running
+path, so `banded_align()` can re-score cheaply around it instead of running
 the full O(m×n) DP again.
 
 ```python
@@ -252,8 +248,7 @@ new_params = nwgrad.AlignParams(new_mat_array,
                                 gap_open_b=11.0, gap_extend_b=1.0)
 
 sp.set_params(new_params)      # clears score/grad; path_valid stays True
-sp.realign_banded(bandwidth=20)
-sp.compute_grad()
+sp.banded_align(bandwidth=20)
 print(sp.score, sp.grad.matrix.to_matrix().sum())
 ```
 
@@ -265,17 +260,20 @@ optimal path lies outside the band, the result is silently sub-optimal.
 ## State flags
 
 ```python
-sp.path_valid   # guide_j is usable (realign_banded is callable)
-sp.score_valid  # score matches current matrix and path
-sp.grad_valid   # grad is populated
-sp.dp_valid     # an alignment path is stored (aligned()/coordinates() are callable)
+sp.path_valid          # guide_j is usable (banded_align is callable)
+sp.score_valid         # score matches the current params
+sp.grad_valid          # grad is populated
+sp.stored_path_valid   # an alignment is stored (aligned()/coordinates() are callable)
 ```
 
-`compute_grad()` returns the cached gradient, or releases the gradient held by
-`align_full()` / `realign_banded()`. It needs a current gradient, not DP tables or
-a stored path. `drop_dp()` discards a held gradient, but a released gradient survives.
-After a batch `score_and_grad()` (see Tutorial 2), `grad_valid` is
-`True`; `dp_valid` is `True` only if `keep_paths=True` was requested.
+`align()`, `banded_align()` and `score_and_grad()` publish the gradient at once.
+`drop_paths()` frees the stored alignment; score, gradient and guide survive.
+After a batch `score_and_grad()` (see Tutorial 2), `grad_valid` is `True`;
+`stored_path_valid` is `True` only if `keep_paths=True` was requested.
+
+The 0.6 names `align_full()`, `realign_banded()`, `compute_grad()`, `drop_dp()` and
+`dp_valid` are deprecated in 0.7 and removed in 0.8; see the
+[API reference](../docs/api.md#pair-compatibility-deprecated-in-070-removed-in-080).
 
 ## Summary
 
@@ -283,7 +281,7 @@ After a batch `score_and_grad()` (see Tutorial 2), `grad_valid` is
 |---|---|---|
 | `"hard"` | Viterbi alignment score | Substitution-pair counts (integer-valued) |
 | `"soft"` | Log-partition function `log Z` | Expected counts (differentiable) |
-| `"none"` | Viterbi alignment score | `compute_grad()` throws |
+| `"none"` | Optimal alignment score (score only) | `None` |
 
 The soft gradient satisfies `log_z ≥ hard_score`. At high matrix scale (low temperature), `log_z → score` and `soft_grad → hard_grad`.
 

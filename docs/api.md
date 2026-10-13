@@ -352,7 +352,7 @@ the logical count measured up to 1.44× slower.
 
 | Method | Returns | Description |
 |---|---|---|
-| `add_many(seqs_a, seqs_b, params, kernel="auto", *, tracks=None, gap_tracks=None)` | — | **Deprecated since 0.7** (`DeprecationWarning`; kept for compatibility): give the pairs to the constructor. Appends the pairs `(seqs_a[i], seqs_b[i])` under `params`: one **segment**. With [tracks](#parameter-sets-and-tracks) (or K > 1 sets) the batch is **tracked**: every pair carries tracks and every segment's params must have the same K. Params may differ between calls (one alphabet); `set_params()` replaces them all. Sequences are validated and encoded in parallel; a bad character raises and adds nothing. The batch keeps a **copy** of `params` (calls with equal params share one); later changes to the object do not reach the batch — use `set_params()`. |
+| `add_many(seqs_a, seqs_b, params, kernel="auto", *, tracks=None, gap_tracks=None)` | — | **Deprecated in 0.7.0, removed in 0.8.0** (`DeprecationWarning`): give the pairs to the constructor. Appends the pairs `(seqs_a[i], seqs_b[i])` under `params`: one **segment**. With [tracks](#parameter-sets-and-tracks) (or K > 1 sets) the batch is **tracked**: every pair carries tracks and every segment's params must have the same K. Params may differ between calls (one alphabet); `set_params()` replaces them all. Sequences are validated and encoded in parallel; a bad character raises and adds nothing. The batch keeps a **copy** of `params` (calls with equal params share one); later changes to the object do not reach the batch — use `set_params()`. |
 | `set_params(params)` | — | Give every pair a copy of `params` (same alphabet; a mismatch raises without changing anything). Clears cached scores, gradients and stored paths; keeps the guides, for `banded_grad()`. |
 | `score_and_grad(keep_paths=False)` | `float` (sum of scores) | Full DP on every pair: score, guide and (unless `grad_mode="none"`) gradient, cached per pair. With `grad_mode="none"` and no `keep_paths`: [score only](#score-only), guides deferred. `keep_paths=True` also stores each alignment path, so `batch[i].aligned()` / `.coordinates()` work (a few bytes per alignment column). |
 | `banded_grad(bandwidth, keep_paths=False)` | `float` (sum of scores) | Banded re-align + gradient around each pair's cached guide. Run `score_and_grad()` once to establish the guides, then `set_params()` + `banded_grad(bw)` after each update; no full DP is run. |
@@ -549,14 +549,25 @@ score, grad = nwgrad.nw_affine_grad("PLEASANTLY", "MEANLY", params)
 
 ## Migrating to 0.7: pairs in the constructor
 
-`SeqPairBatch` takes its pairs at construction; `add_many()` is deprecated (it still
-works, with a `DeprecationWarning`).
+0.7 in short:
+
+- **Removed:** the batch API deprecated in 0.6.0 (see [Migrating from 0.5](#migrating-from-05)).
+- **Deprecated, removed in 0.8.0:** `SeqPairBatch.add_many()` (below) and the old pair
+  lifecycle, `align_full()` / `realign_banded()` / `compute_grad()` / `drop_dp()` /
+  `dp_valid` on a `SeqPair` (see [Pair compatibility](#pair-compatibility-deprecated-in-070-removed-in-080)).
+  Both warn with a `DeprecationWarning`.
+- **New:** [parameter sets and tracks](#parameter-sets-and-tracks) (`track_storage`,
+  tracks as one flat integer array) and the pairs-in-the-constructor batch.
+
+`SeqPairBatch` takes its pairs at construction; `add_many()` still works in 0.7, with a
+`DeprecationWarning`, and is removed in 0.8.0.
 
 | 0.6 | 0.7 |
 |---|---|
 | `b = SeqPairBatch(n, gap_model=…, mode=…, grad_mode=…)`<br>`b.add_many(A, B, p, tracks=t)` | `b = SeqPairBatch(A, B, p, n_threads=n, gap_model=…, mode=…, grad_mode=…, tracks=t)` |
 | `SeqPairBatch(n, …)` for `align()` only | unchanged |
-| several `add_many()` calls with different params (segments) | one batch per params, or `set_params()` (the deprecated `add_many()` still appends) |
+| several `add_many()` calls with different params (segments) | one batch per params; or one batch over `AlignParams.stack([p0, p1, ...])` with each pair's track on its set (a constant track per pair) |
+| appending to a batch | build a new batch from all the pairs |
 
 ## Migrating from 0.5
 
@@ -567,9 +578,9 @@ in 0.6.0 have now been removed; use the replacements below.
 
 | Old API | Current API | Status |
 |---|---|---|
-| `SeqPairBatch(n)` + `add_many(A, B, p, gap_model=…, mode=…, grad_mode=…)` | `SeqPairBatch(n, gap_model=…, mode=…, grad_mode=…)` + `add_many(A, B, p)` | removed; constructor defaults are `"affine"` / `"global"` / `"hard"` |
+| `SeqPairBatch(n)` + `add_many(A, B, p, gap_model=…, mode=…, grad_mode=…)` | `SeqPairBatch(A, B, p, n_threads=n, gap_model=…, mode=…, grad_mode=…)` | removed; defaults are `"affine"` / `"global"` / `"hard"` |
 | one batch mixing gap models, modes or grad modes | one batch per problem type | per-add type arguments raise `TypeError` |
-| `batch.add(seq_pair)` | `batch.add_many([...], [...], params)` | removed |
+| `batch.add(seq_pair)` | `SeqPairBatch([...], [...], params, ...)` | removed |
 | `BatchAligner(p, band, gap_model, mode, grad_mode, n_threads, kernel).align(A, B, ga, gb)` | `SeqPairBatch(n_threads, gap_model=…, mode=…, grad_mode=…).align(A, B, p, band, ga, gb, kernel)` | removed; same results |
 | `batch.alloc_dp(); batch.align_full()` | `batch.score_and_grad(keep_paths=True)` | removed; gradients are immediately available |
 | `batch.realign_banded(bw)` | `batch.banded_grad(bw, keep_paths=True)` | removed |
@@ -580,7 +591,7 @@ in 0.6.0 have now been removed; use the replacements below.
 
 Other behaviour changes since 0.5.2:
 
-- **Params are copied, not borrowed — check training loops.** `SeqPair`, `add_many()`
+- **Params are copied, not borrowed — check training loops.** `SeqPair`, `SeqPairBatch(...)`
   and `set_params()` keep a copy, so an in-place update of an `AlignParams` (`+=`, `*=`,
   the gap / matrix setters) no longer reaches existing pairs. In 0.5 the pairs held a
   reference, so a loop like `params += lr * g; batch.score_and_grad()` picked up the new

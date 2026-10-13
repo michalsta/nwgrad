@@ -393,7 +393,8 @@ static void bind_convenience(nb::module_& m, const std::string& sfx) {
     "\n\ntrack / gap_track (keyword, optional): the parameter set of each residue of seq_a\n" \
     "(len(seq_a) entries) and of each DP row 0..len(seq_a) for gaps in seq_a\n" \
     "(len(seq_a)+1 entries; default: row 0 -> track[0], row i -> track[i-1]).  See\n" \
-    "SeqPairBatch.add_many.  With several sets the gradient has as many."
+    "SeqPairBatch(seqs_a, seqs_b, params, tracks=..., gap_tracks=...).  With several sets\n" \
+    "the gradient has as many."
 #define NWG_SCORE(FN, GM, AM, DOC) \
     m.def((std::string(FN) + sfx).c_str(), \
         [](const std::string& a, const std::string& b, const AlignParams& params, int band, \
@@ -496,7 +497,7 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
             "  traceback : \"auto\" (default) | \"pointers\" | \"scores\" | \"hirschberg\"\n"
             "              | \"hirschberg_pmax\" — see SeqPairBatch.\n"
             "  track / gap_track (keyword): parameter sets per residue of seq_a and per DP\n"
-            "              row for gaps in seq_a — see SeqPairBatch.add_many.\n"
+            "              row for gaps in seq_a — see SeqPairBatch.\n"
             "A pair taken from a batch (batch[i]) is a view of that batch's pair i: its\n"
             "results are the batch's, and its settings (params, fill, soft options,\n"
             "hb_cutoff) are the batch's too — set them on the batch.")
@@ -759,15 +760,16 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
                const SeqViews& seqs_b, const AlignParams& params,
                const std::string& kernel, nb::handle tracks, nb::handle gap_tracks) {
                 if (PyErr_WarnEx(PyExc_DeprecationWarning,
-                                 "SeqPairBatch.add_many() is deprecated since nwgrad 0.7.0; give the pairs "
-                                 "to the constructor: SeqPairBatch(seqs_a, seqs_b, params, ...)", 1) < 0)
+                                 "SeqPairBatch.add_many() is deprecated in nwgrad 0.7.0 and will be removed in "
+                                 "0.8.0; give the pairs to the constructor: "
+                                 "SeqPairBatch(seqs_a, seqs_b, params, ...)", 1) < 0)
                     throw nb::python_error();
                 add_pairs(self, seqs_a.v, seqs_b.v, params, kernel, tracks, gap_tracks);
             },
             nb::arg("seqs_a"), nb::arg("seqs_b"), nb::arg("params"), nb::arg("kernel") = "auto",
             nb::kw_only(), nb::arg("tracks").none() = nb::none(), nb::arg("gap_tracks").none() = nb::none(),
-            "Deprecated since 0.7: give the pairs to the constructor,\n"
-            "SeqPairBatch(seqs_a, seqs_b, params, ...).  Kept for compatibility.\n"
+            "Deprecated in 0.7; removed in 0.8.  Give the pairs to the constructor,\n"
+            "SeqPairBatch(seqs_a, seqs_b, params, ...).\n"
             "\n"
             "Append pairs under an owned copy of params (one segment; a batch may hold\n"
             "several, under different params of one alphabet and one K). Sequences are\n"
@@ -850,7 +852,7 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             "batch's problem type, grad mode, threads and settings.  band > 0 bands every\n"
             "pair (aligned_a / aligned_b, one gapped string per pair, give the guides; the\n"
             "diagonal otherwise).  Soft: forward-backward only.  tracks / gap_tracks: as\n"
-            "add_many's; the summed gradient then has params' K sets.")
+            "the constructor's; the summed gradient then has params' K sets.")
         .def("compute_grad", [](SPB& self) { return self.compute_grad(); },
              nb::rv_policy::move,
              "The gradient summed over all pairs (cached; no DP).  Summed in fixed blocks\n"
@@ -902,7 +904,7 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             "batch returns every pair's K sets: shapes (N, K, n, n) and (N, K, 4) —\n"
             "N*K*(n*n+4) doubles, so for many pairs prefer weighted_grad().")
         .def_prop_ro("tracked", [](const SPB& s) { return s.tracked(); },
-                     "Whether the pairs carry tracks (add_many(tracks=...) or K > 1 sets).")
+                     "Whether the pairs carry tracks (SeqPairBatch(..., tracks=...) or K > 1 sets).")
         .def_prop_ro("num_sets", [](const SPB& s) { return s.num_sets(); },
                      "K, the number of parameter sets of the batch's params (0 when empty).")
         .def_prop_rw(
@@ -1251,7 +1253,7 @@ NB_MODULE(nwgrad_ext, m) {
             nb::arg("matrices"), nb::arg("gaps"), nb::arg("alphabet") = std::string(AA_ORDER),
             "K parameter sets from arrays: matrices (K, N, N) and gaps (K, 4), the gap\n"
             "columns being gap_open_a, gap_extend_a, gap_open_b, gap_extend_b.  Set k is\n"
-            "what a track entry k selects (SeqPairBatch.add_many(tracks=...)).")
+            "what a track entry k selects (SeqPairBatch(..., tracks=...)).")
         .def_static(
             "stack", [](const std::vector<AlignParams>& parts) { return AlignParams::stack(parts); },
             nb::arg("sets"),

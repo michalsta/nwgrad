@@ -47,7 +47,7 @@ print(len(batch))                                   # 4
 
 The batch copies `params`; later changes require `batch.set_params(params)`.
 The pairs are given once, to the constructor. (`add_many()`, which appended pairs to
-an existing batch, is deprecated since 0.7 and kept only for compatibility.)
+an existing batch, is deprecated in 0.7 and removed in 0.8.)
 
 ## `score_and_grad()`
 
