@@ -166,9 +166,8 @@ def test_gradient_uses_matrix_alphabet():
 
 def test_batch_gradient_uses_matrix_alphabet():
     p = _affine_params(BLOSUM62)
-    batch = nwgrad.SeqPairBatch(n_threads=2, gap_model="affine", mode="global",
-                                grad_mode="hard")
-    batch.add_many(["PLEASANTLY", "ACDE"], ["MEANLY", "ACDF"], p)
+    batch = nwgrad.SeqPairBatch(["PLEASANTLY", "ACDE"], ["MEANLY", "ACDF"], p,
+                                n_threads=2, gap_model="affine", mode="global", grad_mode="hard")
     batch.score_and_grad()
     grad = batch.compute_grad()
     assert grad.matrix.alphabet == BLOSUM62.alphabet
@@ -193,9 +192,8 @@ def test_seqpair_keeps_params_alive():
 
 def _build_batch_with_local_everything():
     p = _affine_params(BLOSUM62)
-    batch = nwgrad.SeqPairBatch(n_threads=2, gap_model="affine", mode="global",
-                                grad_mode="hard")
-    batch.add_many(["PLEASANTLY", "ACDE"], ["MEANLY", "ACDF"], p)
+    batch = nwgrad.SeqPairBatch(["PLEASANTLY", "ACDE"], ["MEANLY", "ACDF"], p,
+                                n_threads=2, gap_model="affine", mode="global", grad_mode="hard")
     return batch
 
 

@@ -43,8 +43,8 @@ def _seqs(n, lo, hi, seed):
 
 
 def _batch(seqs_a, seqs_b, params, mode, traceback, grad_mode="hard", threads=4):
-    b = nwgrad.SeqPairBatch(n_threads=threads, traceback=traceback, gap_model="affine", mode=mode, grad_mode=grad_mode)
-    b.add_many(seqs_a, seqs_b, params, kernel="auto")
+    b = nwgrad.SeqPairBatch(seqs_a, seqs_b, params,
+                            n_threads=threads, traceback=traceback, gap_model="affine", mode=mode, grad_mode=grad_mode, kernel="auto")
     return b
 
 

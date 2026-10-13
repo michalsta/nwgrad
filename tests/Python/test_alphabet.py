@@ -178,6 +178,7 @@ def test_cannot_sum_gradients_across_alphabets():
         g_dna + g_aa
 
 
+@pytest.mark.filterwarnings("ignore:SeqPairBatch.add_many")   # appends: deprecated, removed in 0.8
 def test_batch_rejects_a_pair_over_a_different_alphabet():
     """Checked eagerly in add(), on the caller's thread -- not deep inside a
     worker where the diagnostic would be useless."""

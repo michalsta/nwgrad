@@ -23,8 +23,8 @@ def dna_params():
 
 def make_batch(cls, gap_model="affine", mode="local", n_threads=2, grad_mode="hard", **kw):
     params = dna_params()
-    batch = cls(n_threads=n_threads, gap_model=gap_model, mode=mode, grad_mode=grad_mode, **kw)
-    batch.add_many(SEQS_A, SEQS_B, params)
+    batch = cls(SEQS_A, SEQS_B, params, n_threads=n_threads, gap_model=gap_model, mode=mode,
+                grad_mode=grad_mode, **kw)
     return batch, params
 
 
@@ -204,8 +204,8 @@ def test_weighted_grad_over_many_blocks_is_thread_independent_and_matches_numpy(
     w = rng.normal(size=n)
     results = []
     for threads in (1, 3, 8):
-        batch = nwgrad.SeqPairBatchDouble(n_threads=threads, gap_model="affine", mode="local")
-        batch.add_many(seqs_a, seqs_b, dna_params())
+        batch = nwgrad.SeqPairBatchDouble(seqs_a, seqs_b, dna_params(),
+                                          n_threads=threads, gap_model="affine", mode="local")
         batch.score_and_grad()
         results.append(batch.weighted_grad(w).to_dict())
     for r in results[1:]:

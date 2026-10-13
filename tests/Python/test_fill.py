@@ -45,9 +45,9 @@ _CLS = {"double": (nwgrad.SeqPairBatchDouble, nwgrad.SeqPairDouble),
 
 def _run(seqs_a, seqs_b, params, mode, traceback, fill, kernel="auto", prec="double"):
     bcls, pcls = _CLS[prec]
-    b = bcls(n_threads=4, traceback=traceback, gap_model="affine", mode=mode, grad_mode="hard")
+    b = bcls(seqs_a, seqs_b, params,
+             n_threads=4, traceback=traceback, gap_model="affine", mode=mode, grad_mode="hard", kernel=kernel)
     b.fill = fill
-    b.add_many(seqs_a, seqs_b, params, kernel=kernel)
     b.score_and_grad()
     mats, gaps = b.grads()
     aligned = []
@@ -129,10 +129,9 @@ def test_interpair_falls_back_where_it_cannot_run():
     for gm, mode in (("affine", "local"), ("linear", "global")):
         out = []
         for fill in ("striped", "interpair"):
-            batch = nwgrad.SeqPairBatchDouble(n_threads=3, traceback="pointers",
-                                              gap_model=gm, mode=mode)
+            batch = nwgrad.SeqPairBatchDouble(pa, pb, p,
+                                              n_threads=3, traceback="pointers", gap_model=gm, mode=mode)
             batch.fill = fill
-            batch.add_many(pa, pb, p)
             batch.score_and_grad()
             out.append((batch.scores(), *batch.grads()))
         for x, y in zip(*out):
@@ -146,10 +145,9 @@ def test_interpair_every_problem_type(gm, mode):
     p = _params("random")
     out = []
     for fill in ("striped", "interpair"):
-        batch = nwgrad.SeqPairBatchDouble(n_threads=3, traceback="pointers",
-                                          gap_model=gm, mode=mode)
+        batch = nwgrad.SeqPairBatchDouble(a, b, p,
+                                          n_threads=3, traceback="pointers", gap_model=gm, mode=mode)
         batch.fill = fill
-        batch.add_many(a, b, p)
         batch.score_and_grad()
         out.append((batch.scores(), *batch.grads()))
     for x, y in zip(*out):
@@ -158,8 +156,8 @@ def test_interpair_every_problem_type(gm, mode):
 
 def test_setting_fill_applies_to_existing_pairs():
     a, b = _seqs(50, 10, 30, 5), _seqs(50, 30, 60, 6)
-    batch = nwgrad.SeqPairBatchDouble(n_threads=2, traceback="pointers", gap_model="affine", mode="local")
-    batch.add_many(a, b, _params("random"))
+    batch = nwgrad.SeqPairBatchDouble(a, b, _params("random"),
+                                      n_threads=2, traceback="pointers", gap_model="affine", mode="local")
     assert batch[0].fill == "striped"
     batch.fill = "rowwise"
     assert all(batch[i].fill == "rowwise" for i in range(len(batch)))
@@ -173,9 +171,9 @@ def test_float32_default_batch_interpair():
         for gm in ("affine", "linear"):
             out = []
             for fill in ("striped", "interpair"):
-                batch = nwgrad.SeqPairBatch(n_threads=3, gap_model=gm, mode=mode)
+                batch = nwgrad.SeqPairBatch(a, b, _params("ties"),
+                                            n_threads=3, gap_model=gm, mode=mode)
                 batch.fill = fill
-                batch.add_many(a, b, _params("ties"))
                 batch.score_and_grad()
                 out.append((batch.scores(), *batch.grads(),
                             [list(batch[i].guide_j) for i in range(0, 301, 5)]))
@@ -190,15 +188,15 @@ def test_float32_and_linear_ignore_it():
     for cls, gm in ((nwgrad.SeqPairBatch, "affine"), (nwgrad.SeqPairBatchDouble, "linear")):
         out = []
         for fill in ("striped", "rowwise"):
-            batch = cls(n_threads=2, traceback="pointers", gap_model=gm, mode="local")
+            batch = cls(a, b, p, n_threads=2, traceback="pointers", gap_model=gm, mode="local")
             batch.fill = fill
-            batch.add_many(a, b, p)
             batch.score_and_grad()
             out.append((batch.scores(), *batch.grads()))
         for x, y in zip(*out):
             assert np.array_equal(x, y)
 
 
+@pytest.mark.filterwarnings("ignore:SeqPairBatch.add_many")   # appends: deprecated, removed in 0.8
 def test_interpair_plan_follows_set_params_and_add_many():
     """The grouping is cached across calls: it must survive set_params() and be
     rebuilt when pairs are added."""
@@ -236,11 +234,10 @@ def test_interpair_plan_follows_cutoff_changes(traceback, threads, initial_cutof
     b = ["TATATTATACGGAACTCGATTCTCCCATAC"] * 17
 
     def make(fill, cutoff):
-        batch = nwgrad.SeqPairBatchDouble(n_threads=threads, traceback=traceback,
-                                          grad_mode="hard")
+        batch = nwgrad.SeqPairBatchDouble(a, b, p,
+                                          n_threads=threads, traceback=traceback, grad_mode="hard")
         batch.fill = fill
         batch.hb_cutoff = cutoff
-        batch.add_many(a, b, p)
         batch.score_and_grad()
         return batch
 
@@ -270,9 +267,9 @@ def test_guides_match_striped(fill, mode):
     p1, p2 = _params("cheap_gaps"), _params("random")
     out = []
     for f in ("striped", fill):
-        batch = nwgrad.SeqPairBatchDouble(n_threads=3, traceback="pointers", gap_model="affine", mode=mode)
+        batch = nwgrad.SeqPairBatchDouble(a, b, p1,
+                                          n_threads=3, traceback="pointers", gap_model="affine", mode=mode)
         batch.fill = f
-        batch.add_many(a, b, p1)
         batch.score_and_grad()
         batch.set_params(p2)
         batch.banded_grad(2)
@@ -288,9 +285,9 @@ def test_guides_match_striped(fill, mode):
 
 def _run_linear(seqs_a, seqs_b, params, mode, fill, grad_mode="hard", kernel="auto",
                 prec="double"):
-    b = _CLS[prec][0](n_threads=4, traceback="pointers", gap_model="linear", mode=mode, grad_mode=grad_mode)
+    b = _CLS[prec][0](seqs_a, seqs_b, params,
+                      n_threads=4, traceback="pointers", gap_model="linear", mode=mode, grad_mode=grad_mode, kernel=kernel)
     b.fill = fill
-    b.add_many(seqs_a, seqs_b, params, kernel=kernel)
     b.score_and_grad()
     mats, gaps = b.grads()
     guides = [list(b[i].guide_j) for i in range(len(b))]
@@ -346,9 +343,9 @@ def test_linear_interpair_soft_guides(mode, prec):
 # match the per-pair path exactly, ties included.
 
 def _banded(prec, gm, mode, A, B, p, fill, bws, kernel="auto", p2=None):
-    b = _CLS[prec][0](n_threads=3, traceback="pointers", gap_model=gm, mode=mode, grad_mode="hard")
+    b = _CLS[prec][0](A, B, p,
+                      n_threads=3, traceback="pointers", gap_model=gm, mode=mode, grad_mode="hard", kernel=kernel)
     b.fill = fill
-    b.add_many(A, B, p, kernel=kernel)
     b.score_and_grad()
     if p2 is not None:
         b.set_params(p2)
@@ -405,10 +402,9 @@ def test_banded_interpair_paths_and_soft_lanes():
     for fill in ("striped", "interpair"):
         out, guides = [], []
         for gd, lo, hi in (("hard", 0, 80), ("soft", 80, 120)):   # one batch per grad mode
-            b = nwgrad.SeqPairBatchDouble(n_threads=2, traceback="pointers",
-                                          gap_model="affine", mode="local", grad_mode=gd)
+            b = nwgrad.SeqPairBatchDouble(A[lo:hi], B[lo:hi], p,
+                                          n_threads=2, traceback="pointers", gap_model="affine", mode="local", grad_mode=gd)
             b.fill = fill
-            b.add_many(A[lo:hi], B[lo:hi], p)
             b.score_and_grad()
             b.banded_grad(3)
             s, m, g = b.scores(), *b.grads()
@@ -431,9 +427,9 @@ def test_banded_interpair_paths_and_soft_lanes():
 
 def test_banded_interpair_needs_a_guide():
     A, B = _seqs(20, 10, 30, 37), _fixed_len_b(range(20), 40, 38)
-    b = nwgrad.SeqPairBatch(n_threads=2, gap_model="affine", mode="local", grad_mode="hard")
+    b = nwgrad.SeqPairBatch(A, B, _params("random"),
+                            n_threads=2, gap_model="affine", mode="local", grad_mode="hard")
     b.fill = "interpair"
-    b.add_many(A, B, _params("random"))
     with pytest.raises(Exception, match="guide"):
         b.banded_grad(3)
 
@@ -449,9 +445,8 @@ def test_banded_grad_guides_match_realign_banded(prec, gm, mode, fill):
     A, B = _seqs(90, 5, 30, 41), _fixed_len_b(range(90), 35, 42)
     p = _params("ties")
     bcls, pcls = _CLS[prec]
-    b = bcls(n_threads=2, traceback="pointers", gap_model=gm, mode=mode, grad_mode="hard")
+    b = bcls(A, B, p, n_threads=2, traceback="pointers", gap_model=gm, mode=mode, grad_mode="hard")
     b.fill = fill
-    b.add_many(A, B, p)
     b.score_and_grad()
     b.banded_grad(2)
     for i in range(90):
@@ -479,9 +474,9 @@ def test_ragged_b_groups(prec, gm, mode, grad, level):
     p = _params("ties" if grad == "hard" else "random")
     out = []
     for fill in ("striped", "interpair"):
-        b = _CLS[prec][0](n_threads=3, traceback="pointers", gap_model=gm, mode=mode, grad_mode=grad)
+        b = _CLS[prec][0](A, B, p,
+                          n_threads=3, traceback="pointers", gap_model=gm, mode=mode, grad_mode=grad, kernel=level)
         b.fill = fill
-        b.add_many(A, B, p, kernel=level)
         b.score_and_grad()
         out.append((b.scores(), *b.grads(), [list(b[i].guide_j) for i in range(len(b))]))
     for x, y in zip(out[0][:3], out[1][:3]):
@@ -521,9 +516,9 @@ def test_protein_interpair(prec, gm, mode, grad, level):
     p = _protein("ties" if grad == "hard" else "random", gm)
     out = []
     for fill in ("striped", "interpair"):
-        b = _CLS[prec][0](n_threads=3, traceback="pointers", gap_model=gm, mode=mode, grad_mode=grad)
+        b = _CLS[prec][0](A, B, p,
+                          n_threads=3, traceback="pointers", gap_model=gm, mode=mode, grad_mode=grad, kernel=level)
         b.fill = fill
-        b.add_many(A, B, p, kernel=level)
         b.score_and_grad()
         out.append((b.scores(), *b.grads(), [list(b[i].guide_j) for i in range(len(b))]))
         if grad == "hard" and gm == "affine":

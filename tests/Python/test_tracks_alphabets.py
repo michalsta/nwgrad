@@ -65,9 +65,9 @@ def test_hard_batch_matches_per_pair(alpha, case, prec):
     w = rng.normal(size=len(A))
     for fill in FILLS:
         for tb in ("pointers", "auto"):
-            batch = BATCH[prec](4, tb, gap_model=case[0], mode=case[1], grad_mode="hard")
+            batch = BATCH[prec](A, B, P,
+                                n_threads=4, traceback=tb, gap_model=case[0], mode=case[1], grad_mode="hard", tracks=tracks, gap_tracks=gtracks)
             batch.fill = fill
-            batch.add_many(A, B, P, tracks=tracks, gap_tracks=gtracks)
             batch.score_and_grad()
             sc = batch.scores()
             gm, gg = batch.grads()
@@ -96,13 +96,13 @@ def test_equal_sets_are_untracked(alpha, case, prec):
     tracks = [list(rng.integers(0, K, size=len(a))) for a in A]
     gtracks = [list(rng.integers(0, K, size=len(a) + 1)) for a in A]
     for fill in FILLS:
-        bt = BATCH[prec](4, gap_model=case[0], mode=case[1])
+        bt = BATCH[prec](A, B, PK,
+                         n_threads=4, gap_model=case[0], mode=case[1], tracks=tracks, gap_tracks=gtracks)
         bt.fill = fill
-        bt.add_many(A, B, PK, tracks=tracks, gap_tracks=gtracks)
-        bu = BATCH[prec](4, gap_model=case[0], mode=case[1])
+        bu = BATCH[prec](A, B, nwgrad.AlignParams(d["matrix"], alpha, d["gap_open_a"], d["gap_extend_a"],
+                                             d["gap_open_b"], d["gap_extend_b"]),
+                         n_threads=4, gap_model=case[0], mode=case[1])
         bu.fill = fill
-        bu.add_many(A, B, nwgrad.AlignParams(d["matrix"], alpha, d["gap_open_a"], d["gap_extend_a"],
-                                             d["gap_open_b"], d["gap_extend_b"]))
         bt.score_and_grad()
         bu.score_and_grad()
         np.testing.assert_array_equal(bt.scores(), bu.scores())
@@ -120,10 +120,10 @@ def test_soft_batch_matches_per_pair(alpha, case):
     A, B, P, tracks, gtracks = problem(rng, alpha, 50, K, maxlen=22)
     f = getattr(nwgrad, SOFT[case] + "_double")
     for fill in ("interpair", "striped"):
-        batch = nwgrad.SeqPairBatchDouble(4, gap_model=case[0], mode=case[1], grad_mode="soft")
+        batch = nwgrad.SeqPairBatchDouble(A, B, P,
+                                          n_threads=4, gap_model=case[0], mode=case[1], grad_mode="soft", tracks=tracks, gap_tracks=gtracks)
         batch.fill = fill
         batch.soft_temperature = 0.8
-        batch.add_many(A, B, P, tracks=tracks, gap_tracks=gtracks)
         batch.score_and_grad()
         sc = batch.scores()
         gm, gg = batch.grads()

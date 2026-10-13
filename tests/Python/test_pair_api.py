@@ -23,8 +23,7 @@ def test_final_lifecycle(suffix, gap_model, mode, gd, tb, seqs, keep, view):
     kw = dict(gap_model=gap_model, mode=mode, grad_mode=gd, traceback=tb)
     p = params()
     if view:
-        owner = getattr(n, "SeqPairBatch"+suffix)(n_threads=1, **kw)
-        owner.add_many([seqs[0], "AC"], [seqs[1], "AC"], p)
+        owner = getattr(n, "SeqPairBatch"+suffix)([seqs[0], "AC"], [seqs[1], "AC"], p, n_threads=1, **kw)
         owner.hb_cutoff = 2
         pair = owner[0]
     else:

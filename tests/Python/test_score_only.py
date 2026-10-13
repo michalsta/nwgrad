@@ -97,9 +97,8 @@ def test_batch_none_scores_and_deferred_guides(sp_cls, spb_cls, sfx, gm, md, fil
     A, B = A + A2, B + B2
 
     def make():
-        b = getattr(nwgrad, spb_cls)(2, gap_model=gm, mode=md, grad_mode="none")
+        b = getattr(nwgrad, spb_cls)(A, B, p0, n_threads=2, gap_model=gm, mode=md, grad_mode="none")
         b.fill = fill
-        b.add_many(A, B, p0)
         return b
 
     lazy, eager = make(), make()
@@ -130,8 +129,8 @@ def test_score_only_ignores_stored_path_state():
     rng = np.random.default_rng(4)
     p = _params("ACGT", rng)
     A, B = _pairs("ACGT", rng, 5, 5, 30)
-    b = nwgrad.SeqPairBatchDouble(1, gap_model="affine", mode="global", grad_mode="none")
-    b.add_many(A, B, p)
+    b = nwgrad.SeqPairBatchDouble(A, B, p,
+                                  n_threads=1, gap_model="affine", mode="global", grad_mode="none")
     b.score_and_grad(keep_paths=True)
     b[0].aligned()
     b.score_and_grad()

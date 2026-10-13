@@ -347,9 +347,8 @@ class TestSeqPairBatchSums:
     @pytest.mark.parametrize("gap_model,mode,gap_open,gap_extend", ALL_CONFIGS)
     def test_align_full_sum_matches_individual(self, gap_model, mode, gap_open, gap_extend):
         p = make_params(gap_extend, gap_open)
-        batch = nwgrad.SeqPairBatch(n_threads=1, gap_model=gap_model, mode=mode,
-                                  grad_mode="hard")
-        batch.add_many([x for x, _ in PAIRS], [y for _, y in PAIRS], p)
+        batch = nwgrad.SeqPairBatch([x for x, _ in PAIRS], [y for _, y in PAIRS], p,
+                                    n_threads=1, gap_model=gap_model, mode=mode, grad_mode="hard")
         pairs_obj = list(batch)
 
         total = batch.score_and_grad(keep_paths=True)
@@ -359,9 +358,8 @@ class TestSeqPairBatchSums:
     @pytest.mark.parametrize("gap_model,mode,gap_open,gap_extend", ALL_CONFIGS)
     def test_compute_grad_sum_matches_individual(self, gap_model, mode, gap_open, gap_extend):
         p = make_params(gap_extend, gap_open)
-        batch = nwgrad.SeqPairBatch(n_threads=1, gap_model=gap_model, mode=mode,
-                                  grad_mode="hard")
-        batch.add_many([x for x, _ in PAIRS], [y for _, y in PAIRS], p)
+        batch = nwgrad.SeqPairBatch([x for x, _ in PAIRS], [y for _, y in PAIRS], p,
+                                    n_threads=1, gap_model=gap_model, mode=mode, grad_mode="hard")
         pairs_obj = list(batch)
 
         batch.score_and_grad(keep_paths=True)
@@ -375,9 +373,8 @@ class TestSeqPairBatchSums:
 
     def test_realign_banded_sum_matches_individual(self):
         p = make_params(1.0, 11.0)
-        batch = nwgrad.SeqPairBatch(n_threads=1, gap_model="affine", mode="global",
-                                  grad_mode="hard")
-        batch.add_many([x for x, _ in PAIRS], [y for _, y in PAIRS], p)
+        batch = nwgrad.SeqPairBatch([x for x, _ in PAIRS], [y for _, y in PAIRS], p,
+                                    n_threads=1, gap_model="affine", mode="global", grad_mode="hard")
         pairs_obj = list(batch)
 
         batch.score_and_grad(keep_paths=True)
@@ -402,9 +399,8 @@ class TestSeqPairBatchVsBatchAligner:
         ref_result = ref_aligner.align(seqs_a, seqs_b)
         ref_scores = np.array(ref_result.scores)
 
-        batch = nwgrad.SeqPairBatch(n_threads=1, gap_model=gap_model, mode=mode,
-                                  grad_mode="hard")
-        batch.add_many([x for x, _ in PAIRS], [y for _, y in PAIRS], p)
+        batch = nwgrad.SeqPairBatch([x for x, _ in PAIRS], [y for _, y in PAIRS], p,
+                                    n_threads=1, gap_model=gap_model, mode=mode, grad_mode="hard")
         pairs_obj = list(batch)
         batch.score_and_grad(keep_paths=True)
 
@@ -423,9 +419,8 @@ class TestSeqPairBatchVsBatchAligner:
         ref_result = ref_aligner.align(seqs_a, seqs_b)
         ref_grad = ref_result.grad.matrix.to_matrix()
 
-        batch = nwgrad.SeqPairBatch(n_threads=1, gap_model=gap_model, mode=mode,
-                                  grad_mode="hard")
-        batch.add_many([x for x, _ in PAIRS], [y for _, y in PAIRS], p)
+        batch = nwgrad.SeqPairBatch([x for x, _ in PAIRS], [y for _, y in PAIRS], p,
+                                    n_threads=1, gap_model=gap_model, mode=mode, grad_mode="hard")
         batch.score_and_grad(keep_paths=True)
         new_grad = grad_matrix(batch.compute_grad())
 
@@ -439,9 +434,8 @@ class TestSeqPairBatchThreading:
     def test_align_full_multithread_matches_single(self, n_threads):
         def make_batch(nt):
             p = make_params(1.0, 11.0)
-            b = nwgrad.SeqPairBatch(n_threads=nt, gap_model="affine", mode="global",
-                                      grad_mode="hard")
-            b.add_many([x for x, _ in PAIRS * 3], [y for _, y in PAIRS * 3], p)
+            b = nwgrad.SeqPairBatch([x for x, _ in PAIRS * 3], [y for _, y in PAIRS * 3], p,
+                                    n_threads=nt, gap_model="affine", mode="global", grad_mode="hard")
             return b
 
         b1 = make_batch(1)
@@ -463,9 +457,8 @@ class TestSeqPairBatchThreading:
 
     def test_set_params_then_realign_multithread(self, blosum2):
         p = make_params(1.0, 11.0)
-        batch = nwgrad.SeqPairBatch(n_threads=2, gap_model="affine", mode="global",
-                                  grad_mode="hard")
-        batch.add_many([x for x, _ in PAIRS], [y for _, y in PAIRS], p)
+        batch = nwgrad.SeqPairBatch([x for x, _ in PAIRS], [y for _, y in PAIRS], p,
+                                    n_threads=2, gap_model="affine", mode="global", grad_mode="hard")
 
         batch.score_and_grad(keep_paths=True)
         batch.set_params(blosum2)
@@ -480,9 +473,8 @@ class TestSeqPairBatchThreading:
 # ── SeqPairBatch.score_and_grad ───────────────────────────────────────────────
 
 def typed_batch(pairs, p, gap_model="affine", mode="global", grad_mode="hard", n_threads=1):
-    b = nwgrad.SeqPairBatch(n_threads=n_threads, gap_model=gap_model, mode=mode,
-                            grad_mode=grad_mode)
-    b.add_many([x for x, _ in pairs], [y for _, y in pairs], p)
+    b = nwgrad.SeqPairBatch([x for x, _ in pairs], [y for _, y in pairs], p,
+                            n_threads=n_threads, gap_model=gap_model, mode=mode, grad_mode=grad_mode)
     return b
 
 
@@ -769,9 +761,8 @@ class TestDropPathsBatch:
     """Dropping batch paths preserves cached scores, gradients and guides."""
     def _make_batch(self, n_threads=1):
         p = make_params(1.0, 11.0)
-        batch = nwgrad.SeqPairBatch(n_threads=n_threads, gap_model="affine", mode="global",
-                                  grad_mode="hard")
-        batch.add_many([x for x, _ in PAIRS], [y for _, y in PAIRS], p)
+        batch = nwgrad.SeqPairBatch([x for x, _ in PAIRS], [y for _, y in PAIRS], p,
+                                    n_threads=n_threads, gap_model="affine", mode="global", grad_mode="hard")
         pairs_obj = list(batch)
         return batch, pairs_obj
 
@@ -826,9 +817,8 @@ class TestDropPathsBatch:
 
 class TestSeqPairBatchAPI:
     def test_len(self, blosum):
-        batch = nwgrad.SeqPairBatch(grad_mode="hard")
-        assert len(batch) == 0
-        batch.add_many([a for a, _ in PAIRS], [b for _, b in PAIRS], blosum)
+        assert len(nwgrad.SeqPairBatch(grad_mode="hard")) == 0
+        batch = nwgrad.SeqPairBatch([a for a, _ in PAIRS], [b for _, b in PAIRS], blosum, grad_mode="hard")
         assert len(batch) == len(PAIRS)
 
     def test_getitem(self, blosum):

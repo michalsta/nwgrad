@@ -87,9 +87,9 @@ def per_pair(case, prec, A, B, P, tracks, gtracks):
 def make_batch(case, prec, A, B, P, tracks, gtracks, fill="interpair", traceback="auto",
                grad_mode="hard", threads=4):
     gm, mode = case
-    batch = BATCH[prec](threads, traceback, gap_model=gm, mode=mode, grad_mode=grad_mode)
+    batch = BATCH[prec](A, B, P,
+                        n_threads=threads, traceback=traceback, gap_model=gm, mode=mode, grad_mode=grad_mode, tracks=tracks, gap_tracks=gtracks)
     batch.fill = fill
-    batch.add_many(A, B, P, tracks=tracks, gap_tracks=gtracks)
     return batch
 
 
@@ -177,9 +177,8 @@ def test_equal_sets_batch_is_the_untracked_batch(case, prec, fill):
     PK = to_params(mats, gaps)
     P1 = PK[0]
     bt = make_batch(case, prec, A, B, PK, tracks, gtracks, fill=fill)
-    bu = BATCH[prec](4, gap_model=case[0], mode=case[1])
+    bu = BATCH[prec](A, B, P1, n_threads=4, gap_model=case[0], mode=case[1])
     bu.fill = fill
-    bu.add_many(A, B, P1)
     bt.score_and_grad(keep_paths=True)
     bu.score_and_grad(keep_paths=True)
     np.testing.assert_array_equal(bt.scores(), bu.scores())
@@ -252,9 +251,8 @@ def test_tracked_seq_pair_and_views():
     assert a.replace("-", "") == "ACGTAC"
     # a one-set pair is not tracked
     assert nwgrad.SeqPairDouble("AC", "AC", P[0]).track is None
-    batch = nwgrad.SeqPairBatchDouble(2, gap_model="affine", mode="global")
-    batch.add_many(["ACGT", "GG"], ["ACT", "GGA"], P, tracks=[[0, 1, 2, 0], None],
-                   gap_tracks=[None, [2, 2, 2]])
+    batch = nwgrad.SeqPairBatchDouble(["ACGT", "GG"], ["ACT", "GGA"], P,
+                                      n_threads=2, gap_model="affine", mode="global", tracks=[[0, 1, 2, 0], None], gap_tracks=[None, [2, 2, 2]])
     assert batch[0].track == [0, 1, 2, 0] and batch[0].gap_track == [0, 0, 1, 2, 0]
     assert batch[1].track == [0, 0] and batch[1].gap_track == [2, 2, 2]
 
@@ -262,24 +260,34 @@ def test_tracked_seq_pair_and_views():
 def test_tracked_batch_validation():
     P3 = to_params(np.zeros((3, N, N)), np.ones((3, 4)))
     P2 = to_params(np.zeros((2, N, N)), np.ones((2, 4)))
-    b = nwgrad.SeqPairBatchDouble(2, gap_model="linear", mode="local")
+    kw = dict(n_threads=2, gap_model="linear", mode="local")
+    make = nwgrad.SeqPairBatchDouble
     with pytest.raises(ValueError, match="one entry per pair"):
-        b.add_many(["AC"], ["AC"], P3, tracks=[[0, 1], [0]])
+        make(["AC"], ["AC"], P3, tracks=[[0, 1], [0]], **kw)
     with pytest.raises(ValueError, match="pair 0: track has 1 entries"):
-        b.add_many(["AC"], ["AC"], P3, tracks=[[0]])
+        make(["AC"], ["AC"], P3, tracks=[[0]], **kw)
     with pytest.raises(ValueError, match="is not a parameter set"):
-        b.add_many(["AC"], ["AC"], P3, tracks=[[0, 3]])
+        make(["AC"], ["AC"], P3, tracks=[[0, 3]], **kw)
     with pytest.raises(ValueError, match="gap_track has 2 entries"):
-        b.add_many(["AC"], ["AC"], P3, gap_tracks=[[0, 1]])
-    assert len(b) == 0
-    b.add_many(["AC"], ["AC"], P3, tracks=[[0, 2]])
-    with pytest.raises(ValueError, match="parameter sets cannot join"):
-        b.add_many(["AC"], ["AC"], P2)
+        make(["AC"], ["AC"], P3, gap_tracks=[[0, 1]], **kw)
+    b = make(["AC"], ["AC"], P3, tracks=[[0, 2]], **kw)
     with pytest.raises(ValueError, match="number of parameter sets"):
         b.set_params(P2)
     b.set_params(P3 * 2.0)
 
 
+@pytest.mark.filterwarnings("ignore:SeqPairBatch.add_many")   # appends: deprecated, removed in 0.8
+def test_tracked_batch_append_keeps_its_set_count():
+    P3 = to_params(np.zeros((3, N, N)), np.ones((3, 4)))
+    P2 = to_params(np.zeros((2, N, N)), np.ones((2, 4)))
+    b = nwgrad.SeqPairBatchDouble(["AC"], ["AC"], P3, n_threads=2, gap_model="linear", mode="local",
+                                  tracks=[[0, 2]])
+    with pytest.raises(ValueError, match="parameter sets cannot join"):
+        b.add_many(["AC"], ["AC"], P2)
+    assert len(b) == 1
+
+
+@pytest.mark.filterwarnings("ignore:SeqPairBatch.add_many")   # appends: deprecated, removed in 0.8
 def test_untracked_batch_becomes_tracked():
     rng = np.random.default_rng(16)
     mats, gaps = rng.normal(size=(1, N, N)), rng.uniform(0.5, 1.5, size=(1, 4))
@@ -345,8 +353,7 @@ def test_one_set_tracked_weighted_grad_is_untracked_bit_for_bit(case, prec):
     A, B, mats, gaps, tracks, gtracks = random_problem(rng, 9000, 1, maxlen=12)
     P = to_params(mats, gaps)
     bt = make_batch(case, prec, A, B, P, tracks, None, threads=8)
-    bu = BATCH[prec](8, gap_model=case[0], mode=case[1])
-    bu.add_many(A, B, P)
+    bu = BATCH[prec](A, B, P, n_threads=8, gap_model=case[0], mode=case[1])
     assert bt.tracked and not bu.tracked
     bt.score_and_grad()
     bu.score_and_grad()
@@ -467,9 +474,9 @@ def test_track_storage_switch(case, prec):
         np.testing.assert_array_equal(G.gaps, G0.gaps)
     with pytest.raises(ValueError, match="unknown track_storage"):
         batch.track_storage = "dense"
-    u = BATCH[prec](2, gap_model=case[0], mode=case[1])
+    u = BATCH[prec](A[:20], B[:20], to_params(mats[:1], gaps[:1]),
+                    n_threads=2, gap_model=case[0], mode=case[1])
     u.track_storage = other[first]
-    u.add_many(A[:20], B[:20], to_params(mats[:1], gaps[:1]))
     assert not u.tracked and u.track_storage == other[first]
     u.score_and_grad()
     u.weighted_grad(w[:20])
@@ -507,18 +514,18 @@ def test_flat_track_arrays(case, dtype):
 
 def test_flat_track_array_validation():
     P3 = to_params(np.zeros((3, N, N)), np.ones((3, 4)))
-    b = BATCH["_double"](2, gap_model="linear", mode="global")
+    def make(A, **tk):
+        return BATCH["_double"](A, ["AC", "AC"], P3, n_threads=2, gap_model="linear", mode="global", **tk)
     with pytest.raises(ValueError, match="flat tracks has 4 entries, expected 5"):
-        b.add_many(["AC", "GTA"], ["AC", "AC"], P3, tracks=np.zeros(4, dtype=np.int32))
+        make(["AC", "GTA"], tracks=np.zeros(4, dtype=np.int32))
     with pytest.raises(ValueError, match="flat gap_tracks has 5 entries, expected 7"):
-        b.add_many(["AC", "GTA"], ["AC", "AC"], P3, gap_tracks=np.zeros(5, dtype=np.int32))
+        make(["AC", "GTA"], gap_tracks=np.zeros(5, dtype=np.int32))
     with pytest.raises(ValueError, match=r"tracks\[3\] = -1 is not a parameter set"):
-        b.add_many(["AC", "GTA"], ["AC", "AC"], P3, tracks=np.array([0, 1, 2, -1, 0]))
+        make(["AC", "GTA"], tracks=np.array([0, 1, 2, -1, 0]))
     with pytest.raises(ValueError, match="is not a parameter set"):   # against K, by the batch
-        b.add_many(["AC", "GTA"], ["AC", "AC"], P3, tracks=np.array([0, 1, 2, 3, 0]))
+        make(["AC", "GTA"], tracks=np.array([0, 1, 2, 3, 0]))
     with pytest.raises(TypeError, match="integer dtype"):
-        b.add_many(["AC", "GTA"], ["AC", "AC"], P3, tracks=np.zeros(5))
-    assert len(b) == 0   # every failure added nothing
+        make(["AC", "GTA"], tracks=np.zeros(5))
     # a 2-D array is still one row per pair (all of A's lengths equal)
-    b.add_many(["AC", "GT"], ["AC", "AC"], P3, tracks=np.array([[0, 1], [2, 2]]))
+    b = make(["AC", "GT"], tracks=np.array([[0, 1], [2, 2]]))
     assert b[1].track == [2, 2]

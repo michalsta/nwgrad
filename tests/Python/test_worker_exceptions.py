@@ -24,9 +24,8 @@ def make_params(gap_extend=1.0, gap_open=11.0):
 
 
 def make_batch(params, grad_mode="hard"):
-    batch = nwgrad.SeqPairBatch(n_threads=N_THREADS, gap_model="affine", mode="local",
-                                grad_mode=grad_mode)
-    batch.add_many(["ACDEFGHIK"] * N_PAIRS, ["ACDEFGHIK"] * N_PAIRS, params)
+    batch = nwgrad.SeqPairBatch(["ACDEFGHIK"] * N_PAIRS, ["ACDEFGHIK"] * N_PAIRS, params,
+                                n_threads=N_THREADS, gap_model="affine", mode="local", grad_mode=grad_mode)
     return batch, list(batch)
 
 

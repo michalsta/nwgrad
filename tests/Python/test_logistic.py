@@ -84,8 +84,7 @@ def many_pairs(n, seed=6):
 @pytest.mark.parametrize("cls", [nwgrad.SeqPairBatch, nwgrad.SeqPairBatchDouble])
 def test_step_is_its_parts_composed(cls):
     a, b, y = many_pairs(2 * 4096 + 5)
-    batch = cls(n_threads=4, gap_model="affine", mode="local")
-    batch.add_many(a, b, dna_params())
+    batch = cls(a, b, dna_params(), n_threads=4, gap_model="affine", mode="local")
     batch.score_and_grad()
     alpha0 = -0.4
     st = L.step(batch, y, alpha0)
@@ -101,8 +100,8 @@ def test_step_does_not_depend_on_threads():
     a, b, y = many_pairs(2 * 4096 + 5, seed=7)
     out = []
     for t in (1, 3, 8):
-        batch = nwgrad.SeqPairBatchDouble(n_threads=t, gap_model="linear", mode="global")
-        batch.add_many(a, b, dna_params())
+        batch = nwgrad.SeqPairBatchDouble(a, b, dna_params(),
+                                          n_threads=t, gap_model="linear", mode="global")
         batch.score_and_grad()
         st = L.step(batch, y, 0.2)
         g = st.grad.to_dict()
@@ -111,8 +110,8 @@ def test_step_does_not_depend_on_threads():
 
 
 def test_step_needs_one_label_per_pair_and_cached_scores():
-    batch = nwgrad.SeqPairBatchDouble(n_threads=2, gap_model="affine", mode="local")
-    batch.add_many(SEQS_A, SEQS_B, dna_params())
+    batch = nwgrad.SeqPairBatchDouble(SEQS_A, SEQS_B, dna_params(),
+                                      n_threads=2, gap_model="affine", mode="local")
     y = np.array([0.0, 1.0] * 3)
     with pytest.raises(RuntimeError, match="score not valid"):
         L.step(batch, y, 0.0)
@@ -138,8 +137,8 @@ def test_fit_alpha_rejects_nan_scores():
 def test_step_with_soft_labels_is_its_parts_composed():
     a, b, _ = many_pairs(2 * 4096 + 5, seed=9)
     y = np.random.default_rng(9).random(len(a))
-    batch = nwgrad.SeqPairBatchDouble(n_threads=4, gap_model="affine", mode="local")
-    batch.add_many(a, b, dna_params())
+    batch = nwgrad.SeqPairBatchDouble(a, b, dna_params(),
+                                      n_threads=4, gap_model="affine", mode="local")
     batch.score_and_grad()
     st = L.step(batch, y, -0.4)
     s = batch.scores()

@@ -177,9 +177,9 @@ def test_linear_float32_and_batch(params, mode):
                 _lin(a, b, params, "pointers", mode, cls=nwgrad.SeqPair).score)
     tot = {}
     for tb in ("pointers", "hirschberg"):
-        batch = nwgrad.SeqPairBatchDouble(n_threads=3, traceback=tb, gap_model="linear", mode=mode, grad_mode="hard")
+        batch = nwgrad.SeqPairBatchDouble(A, B, params,
+                                          n_threads=3, traceback=tb, gap_model="linear", mode=mode, grad_mode="hard")
         batch.hb_cutoff = HB_CUTOFF
-        batch.add_many(A, B, params)
         tot[tb] = batch.score_and_grad()
     assert tot["hirschberg"] == tot["pointers"]
 
@@ -413,13 +413,13 @@ def test_batch_matches_single_pair(params):
     """The batch path must agree with the per-pair path, and be reproducible."""
     A = _seqs(120, 1, 200, 13)
     B = _seqs(120, 1, 200, 14)
-    b1 = nwgrad.SeqPairBatch(n_threads=4, traceback="hirschberg", gap_model="affine", mode="global", grad_mode="hard")
+    b1 = nwgrad.SeqPairBatch(A, B, params,
+                             n_threads=4, traceback="hirschberg", gap_model="affine", mode="global", grad_mode="hard", kernel="auto")
     b1.hb_cutoff = HB_CUTOFF
-    b1.add_many(A, B, params, kernel="auto")
     t1 = b1.score_and_grad()
-    b2 = nwgrad.SeqPairBatch(n_threads=1, traceback="hirschberg", gap_model="affine", mode="global", grad_mode="hard")
+    b2 = nwgrad.SeqPairBatch(A, B, params,
+                             n_threads=1, traceback="hirschberg", gap_model="affine", mode="global", grad_mode="hard", kernel="auto")
     b2.hb_cutoff = HB_CUTOFF
-    b2.add_many(A, B, params, kernel="auto")
     assert b2.score_and_grad() == t1          # thread count must not change the answer
 
 
@@ -429,9 +429,9 @@ def test_batch_total_matches_pointers(params):
     B = _seqs(200, 1, 250, 16)
     out = {}
     for tb in ("pointers", "hirschberg"):
-        batch = nwgrad.SeqPairBatch(n_threads=4, traceback=tb, gap_model="affine", mode="global", grad_mode="hard")
+        batch = nwgrad.SeqPairBatch(A, B, params,
+                                    n_threads=4, traceback=tb, gap_model="affine", mode="global", grad_mode="hard", kernel="auto")
         batch.hb_cutoff = HB_CUTOFF
-        batch.add_many(A, B, params, kernel="auto")
         out[tb] = batch.score_and_grad()
     assert out["hirschberg"] == pytest.approx(out["pointers"], rel=1e-5, abs=1e-2)
 
@@ -555,9 +555,9 @@ def test_local_batch_matches_pointers(params):
     B = _seqs(150, 1, 250, 48)
     out = {}
     for tb in ("pointers", "hirschberg"):
-        batch = nwgrad.SeqPairBatch(n_threads=4, traceback=tb, gap_model="affine", mode="local", grad_mode="hard")
+        batch = nwgrad.SeqPairBatch(A, B, params,
+                                    n_threads=4, traceback=tb, gap_model="affine", mode="local", grad_mode="hard", kernel="auto")
         batch.hb_cutoff = HB_CUTOFF
-        batch.add_many(A, B, params, kernel="auto")
         out[tb] = batch.score_and_grad()          # scalar: total score over the batch
     assert out["hirschberg"] == pytest.approx(out["pointers"], rel=1e-5, abs=1e-2)
 
@@ -724,8 +724,8 @@ def test_soft_gradient_unaffected(params):
     B = _seqs(40, 5, 200, 38)
     out = {}
     for tb in ("pointers", "hirschberg"):
-        batch = nwgrad.SeqPairBatch(n_threads=2, traceback=tb, gap_model="affine", mode="global", grad_mode="soft")
-        batch.add_many(A, B, params, kernel="auto")
+        batch = nwgrad.SeqPairBatch(A, B, params,
+                                    n_threads=2, traceback=tb, gap_model="affine", mode="global", grad_mode="soft", kernel="auto")
         out[tb] = (batch.score_and_grad(), batch.compute_grad().to_dict())
     assert out["hirschberg"][0] == pytest.approx(out["pointers"][0], rel=1e-12)
     np.testing.assert_allclose(out["hirschberg"][1]["matrix"],
@@ -749,9 +749,9 @@ def test_banded_composes_but_does_not_agree(params, band):
     A = _seqs(60, 20, 300, 39)
     B = _seqs(60, 20, 300, 40)
     for tb in ("pointers", "hirschberg"):
-        batch = nwgrad.SeqPairBatch(n_threads=2, traceback=tb, gap_model="affine", mode="global", grad_mode="hard")
+        batch = nwgrad.SeqPairBatch(A, B, params,
+                                    n_threads=2, traceback=tb, gap_model="affine", mode="global", grad_mode="hard", kernel="auto")
         batch.hb_cutoff = HB_CUTOFF
-        batch.add_many(A, B, params, kernel="auto")
         full = batch.score_and_grad()
         banded = batch.banded_grad(band)
         assert banded <= full + 1e-9, (tb, band, banded, full)
@@ -762,9 +762,9 @@ def test_self_pair_closed_form(params):
     Hirschberg has no tie to break and must reproduce the closed form exactly —
     score and gradient both.  This is the one case where it is provably bit-exact."""
     seqs = _seqs(40, 5, 300, 17)
-    batch = nwgrad.SeqPairBatch(n_threads=4, traceback="hirschberg", gap_model="affine", mode="global", grad_mode="hard")
+    batch = nwgrad.SeqPairBatch(seqs, seqs, params,
+                                n_threads=4, traceback="hirschberg", gap_model="affine", mode="global", grad_mode="hard", kernel="auto")
     batch.hb_cutoff = HB_CUTOFF
-    batch.add_many(seqs, seqs, params, kernel="auto")
     total = batch.score_and_grad()
     idx = {c: i for i, c in enumerate(AA)}
     want_total = 0.0

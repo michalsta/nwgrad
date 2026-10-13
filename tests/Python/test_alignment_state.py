@@ -91,11 +91,11 @@ else:
 @pytest.mark.parametrize("realign", [False, True], ids=["cached-path", "realigned"])
 def test_batch_set_params_invalidates_owned_pair_traceback(precision, traceback,
                                                            realign):
-    # Batch-owned pairs (add_many) borrow the batch's params cell, so a batch
+    # Batch-owned pairs borrow the batch's params cell, so a batch
     # set_params() releases the params their tables were computed under.
     proc = run_isolated(PRELUDE + f"""
-b = n.SeqPairBatch{precision}(n_threads=1, traceback={traceback!r})
-b.add_many(["ACGT", "ACGTT"], ["ACGT", "ACGT"], params(), kernel="scalar_fallback")
+b = n.SeqPairBatch{precision}(["ACGT", "ACGTT"], ["ACGT", "ACGT"], params(), n_threads=1,
+                               traceback={traceback!r}, kernel="scalar_fallback")
 b.set_params(params(4))
 b.score_and_grad(keep_paths=True)
 expected = [b[i].aligned() for i in range(len(b))]

@@ -6,8 +6,7 @@ import nwgrad
 @pytest.mark.parametrize("suffix", ["", "Double"])
 def test_optional_paths_on_views_preserve_other_pairs(suffix):
     p = nwgrad.AlignParams(np.eye(4), alphabet="ACGT")
-    batch = getattr(nwgrad, "SeqPairBatch" + suffix)(n_threads=1)
-    batch.add_many(["ACGT", "ACG"], ["ACGT", "ACG"], p)
+    batch = getattr(nwgrad, "SeqPairBatch" + suffix)(["ACGT", "ACG"], ["ACGT", "ACG"], p, n_threads=1)
     batch.score_and_grad(keep_paths=True)
     first, other = batch[0], batch[0]  # two handles must observe the same state
     batch[1].score_and_grad(keep_paths=False)
@@ -57,8 +56,7 @@ def test_deprecations_and_mixed_lifecycle(suffix, view):
     from pathlib import Path
     p = nwgrad.AlignParams(np.eye(4), alphabet="ACGT")
     if view:
-        batch = getattr(nwgrad, "SeqPairBatch"+suffix)(n_threads=1)
-        batch.add_many(["ACGT", "AC"], ["ACGT", "AC"], p)
+        batch = getattr(nwgrad, "SeqPairBatch"+suffix)(["ACGT", "AC"], ["ACGT", "AC"], p, n_threads=1)
         batch.score_and_grad()
         pair = batch[0]
     else:

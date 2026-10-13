@@ -6,6 +6,7 @@ import nwgrad
 
 
 @pytest.mark.parametrize("suffix", ["", "Double"])
+@pytest.mark.filterwarnings("ignore:SeqPairBatch.add_many")   # deprecated, removed in 0.8
 def test_removed_methods_and_per_add_types(suffix):
     cls = getattr(nwgrad, "SeqPairBatch" + suffix)
     batch = cls(n_threads=1)
@@ -25,14 +26,14 @@ def test_type_is_fixed_before_successful_add(suffix):
     cls = getattr(nwgrad, "SeqPairBatch" + suffix)
     default = cls(n_threads=1)
     assert (default.gap_model, default.mode, default.grad_mode) == ("affine", "global", "hard")
-    batch = cls(n_threads=1, gap_model="linear", mode="local", grad_mode="soft")
+    kw = dict(n_threads=1, gap_model="linear", mode="local", grad_mode="soft")
     params = nwgrad.AlignParams(np.eye(4), alphabet="ACGT")
-    batch.add_many([], [], params)
-    with pytest.raises(ValueError):
-        batch.add_many(["ACGZ"], ["ACGT"], params)
-    assert len(batch) == 0
+    batch = cls([], [], params, **kw)
     assert (batch.gap_model, batch.mode, batch.grad_mode) == ("linear", "local", "soft")
-    batch.add_many(["ACGT"], ["ACGT"], params)
+    with pytest.raises(ValueError):
+        cls(["ACGZ"], ["ACGT"], params, **kw)
+    batch = cls(["ACGT"], ["ACGT"], params, **kw)
+    assert (batch.gap_model, batch.mode, batch.grad_mode) == ("linear", "local", "soft")
     batch.score_and_grad(keep_paths=True)
     assert batch[0].grad_valid
     gradients = batch.grads()
@@ -47,8 +48,7 @@ def test_type_is_fixed_before_successful_add(suffix):
 @pytest.mark.parametrize("suffix", ["", "Double"])
 def test_supported_pair_view_can_release_gradient_through_batch(suffix):
     params = nwgrad.AlignParams(np.eye(4), alphabet="ACGT")
-    batch = getattr(nwgrad, "SeqPairBatch" + suffix)(n_threads=1)
-    batch.add_many(["ACGT"], ["ACGT"], params)
+    batch = getattr(nwgrad, "SeqPairBatch" + suffix)(["ACGT"], ["ACGT"], params, n_threads=1)
     view = batch[0]
     view.align_full()
     assert not view.grad_valid

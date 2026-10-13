@@ -15,7 +15,7 @@ gradient, alignment and biopython test into a simd test.
 (sse2/avx2/avx512 on x86, neon on ARM) — the whole suite runs once per level, so the
 baseline (sse2) kernel is tested from Python too, not just the strongest.  It mirrors the
 C++ ctest cpp_tests_isa_* loop.  The backend is passed per-call via kernel= (the unified
-vocabulary in simd_levels.hpp), including batch add_many() and align(). Explicit
+vocabulary in simd_levels.hpp), including the batch constructor (and the deprecated add_many()) and align(). Explicit
 kernel arguments are preserved. The unforced run uses auto (best available SIMD);
 run =scalar_fallback separately to exercise the scalar backend.
 """

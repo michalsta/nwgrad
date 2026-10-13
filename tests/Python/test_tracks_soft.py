@@ -136,11 +136,11 @@ def test_soft_batch_matches_per_pair(case, fill, prec, guide):
     gaps = rng.uniform(0.3, 1.5, size=(K, 4))
     P = to_params(mats, gaps)
     cls = nwgrad.SeqPairBatchDouble if prec == "_double" else nwgrad.SeqPairBatch
-    batch = cls(4, gap_model=case[0], mode=case[1], grad_mode="soft")
+    batch = cls(A, B, P,
+                n_threads=4, gap_model=case[0], mode=case[1], grad_mode="soft", tracks=tracks, gap_tracks=gtracks)
     batch.fill = fill
     batch.soft_guide = guide
     batch.soft_temperature = 0.9
-    batch.add_many(A, B, P, tracks=tracks, gap_tracks=gtracks)
     batch.score_and_grad()
     sc = batch.scores()
     gm, gg = batch.grads()

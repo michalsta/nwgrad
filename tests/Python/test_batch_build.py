@@ -1,25 +1,25 @@
-"""Tests for SeqPairBatch.add_many() — bulk C++-side construction of SeqPairs.
+"""Tests for building a SeqPairBatch — bulk C++-side construction of its pairs,
+SeqPairBatch(seqs_a, seqs_b, params, ...).
 
-add_many() exists purely for speed: building N SeqPairs one at a time from
+Bulk construction exists purely for speed: building N SeqPairs one at a time from
 Python costs more than the DP they feed.  So the first thing it must earn is the
 right to be trusted, and every test here is really the same test — that a batch
 built in bulk is *indistinguishable* from one built by hand.
 
 Coverage:
-  - add_many() == the pairs aligned one by one (standalone SeqPairs) for per-pair
+  - the batch == the pairs aligned one by one (standalone SeqPairs) for per-pair
     score, per-pair grad, and summed grad,
     across every gap_model x mode x grad_mode combination
   - per-pair gradients survive: batch[i].grad is the whole point of the API
   - len / indexing / negative indexing / out-of-range
   - the pairs are usable through the full SeqPair lifecycle (
     align_full, compute_grad, realign_banded, aligned, drop_dp)
-  - several add_many() segments in one batch (one problem type, params per segment)
   - single-thread == multi-thread (construction is parallel)
-  - params lifetime: the batch pins params, including across two add_many()
-    calls with *different* params objects
-  - failure modes leave the batch UNCHANGED: length mismatch, out-of-alphabet
-    character, alphabet mismatch with the existing batch
-  - empty add_many() is a no-op
+  - params lifetime: the batch pins params
+  - length mismatch raises; an empty batch
+  - the deprecated add_many() (removed in 0.8): several segments in one batch, two
+    calls with *different* params objects, failed appends leave the batch UNCHANGED
+    (out-of-alphabet character, alphabet mismatch with the existing batch)
 """
 
 import gc
@@ -62,7 +62,7 @@ def dna_params(gap_open=3.0, gap_extend=1.0):
 
 
 class HandBatch:
-    """The pairs aligned one by one as standalone SeqPairs — what add_many() must be
+    """The pairs aligned one by one as standalone SeqPairs — what the batch must be
     indistinguishable from (a batch used to be built from such pairs with add())."""
 
     def __init__(self, pairs, gd):
@@ -95,8 +95,8 @@ def build_by_hand(seqs_a, seqs_b, params, gm, md, gd, n_threads=1):
 
 
 def build_bulk(seqs_a, seqs_b, params, gm, md, gd, n_threads=1):
-    batch = nwgrad.SeqPairBatch(n_threads=n_threads, gap_model=gm, mode=md, grad_mode=gd)
-    batch.add_many(seqs_a, seqs_b, params)
+    batch = nwgrad.SeqPairBatch(seqs_a, seqs_b, params,
+                                n_threads=n_threads, gap_model=gm, mode=md, grad_mode=gd)
     return batch
 
 
@@ -116,7 +116,7 @@ def assert_grads_equal(g1, g2):
 # ── equivalence with the hand-built batch ─────────────────────────────────────
 
 @pytest.mark.parametrize("gm,md,gd", ALL_MODES)
-def test_add_many_matches_add(gm, md, gd):
+def test_batch_matches_pairs(gm, md, gd):
     """The load-bearing test: same scores, same per-pair grads, same sum."""
     params = prot_params()
     ref_batch, _keep = build_by_hand(PROT_A, PROT_B, params, gm, md, gd)
@@ -144,7 +144,7 @@ def test_per_pair_grads_are_distinct():
     assert any(not np.allclose(mats[0], m) for m in mats[1:])
 
 
-def test_add_many_dna():
+def test_batch_dna():
     params = dna_params()
     ref_batch, _keep = build_by_hand(DNA_A, DNA_B, params, "affine", "local", "hard")
     bulk_batch = build_bulk(DNA_A, DNA_B, params, "affine", "local", "hard")
@@ -183,7 +183,7 @@ def test_full_seqpair_lifecycle_on_owned_pairs():
         assert not batch[i].stored_path_valid
 
 
-def test_set_params_after_add_many():
+def test_set_params_after_construction():
     """A gradient-descent step: swap params, re-run, get a different answer."""
     batch = build_bulk(PROT_A, PROT_B, prot_params(gap_extend=1.0),
                        "affine", "local", "hard")
@@ -207,6 +207,7 @@ def test_indexing():
 
 # ── mixing, threading ─────────────────────────────────────────────────────────
 
+@pytest.mark.filterwarnings("ignore:SeqPairBatch.add_many")   # appends: deprecated, removed in 0.8
 def test_several_add_many_segments():
     params = prot_params()
     batch = nwgrad.SeqPairBatch(n_threads=2, gap_model="affine", mode="local", grad_mode="hard")
@@ -236,6 +237,7 @@ def test_threads_do_not_change_the_answer():
 
 # ── params lifetime ───────────────────────────────────────────────────────────
 
+@pytest.mark.filterwarnings("ignore:SeqPairBatch.add_many")   # appends: deprecated, removed in 0.8
 def test_dropping_params_after_two_add_many_calls():
     """Sanitizer bait.  Its job is to *commit the crime*, not to detect it.
 
@@ -265,15 +267,15 @@ def test_dropping_params_after_two_add_many_calls():
     assert batch[len(PROT_A)].score_valid
 
 
-def test_add_many_copies_params():
+def test_batch_copies_params():
     """The batch owns a COPY of its params: it holds no reference to the caller's
     object, and an in-place change to that object does not reach the batch (the
     scan's B3: cached results stayed "valid" under params that had changed).
     set_params() is how new params reach it."""
     params = prot_params()
     before = sys.getrefcount(params)
-    batch = nwgrad.SeqPairBatch(n_threads=2, gap_model="affine", mode="local")
-    batch.add_many(PROT_A, PROT_B, params)
+    batch = nwgrad.SeqPairBatch(PROT_A, PROT_B, params,
+                                n_threads=2, gap_model="affine", mode="local")
     assert sys.getrefcount(params) == before
     first = batch.score_and_grad()
 
@@ -296,6 +298,7 @@ def test_standalone_pair_copies_params():
     assert nwgrad.SeqPairDouble(PROT_A[0], PROT_B[0], params).score_and_grad()[0] != s0
 
 
+@pytest.mark.filterwarnings("ignore:SeqPairBatch.add_many")   # appends: deprecated, removed in 0.8
 def test_two_add_many_calls_keep_their_own_params():
     """A second add_many() must not replace the first call's params."""
     p1 = prot_params(gap_extend=1.0)
@@ -323,12 +326,11 @@ def test_two_add_many_calls_keep_their_own_params():
 # ── failure modes leave the batch unchanged ───────────────────────────────────
 
 def test_length_mismatch_raises():
-    batch = nwgrad.SeqPairBatch(n_threads=2)
     with pytest.raises(Exception, match="equal length"):
-        batch.add_many(PROT_A, PROT_B[:-1], prot_params())
-    assert len(batch) == 0
+        nwgrad.SeqPairBatch(PROT_A, PROT_B[:-1], prot_params(), n_threads=2)
 
 
+@pytest.mark.filterwarnings("ignore:SeqPairBatch.add_many")   # appends: deprecated, removed in 0.8
 def test_bad_character_raises_and_leaves_batch_unchanged():
     """The throw happens on a worker thread, mid-construction.  The batch must
     not be left half-filled behind it."""
@@ -347,6 +349,7 @@ def test_bad_character_raises_and_leaves_batch_unchanged():
     assert batch[0].score_valid
 
 
+@pytest.mark.filterwarnings("ignore:SeqPairBatch.add_many")   # appends: deprecated, removed in 0.8
 def test_alphabet_mismatch_raises_and_leaves_batch_unchanged():
     batch = nwgrad.SeqPairBatch(n_threads=2, gap_model="affine", mode="local", grad_mode="hard")
     batch.add_many(PROT_A, PROT_B, prot_params())
@@ -356,9 +359,8 @@ def test_alphabet_mismatch_raises_and_leaves_batch_unchanged():
     batch.score_and_grad()
 
 
-def test_empty_add_many_is_a_noop():
-    batch = nwgrad.SeqPairBatch(n_threads=2)
-    batch.add_many([], [], prot_params())
+def test_empty_batch():
+    batch = nwgrad.SeqPairBatch([], [], prot_params(), n_threads=2)
     assert len(batch) == 0
     # An empty batch still has no alphabet to sum a gradient over.
     with pytest.raises(Exception):

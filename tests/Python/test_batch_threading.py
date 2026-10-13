@@ -52,7 +52,7 @@ def dna_params():
 @pytest.mark.skipif(running_under_asan(),
                     reason="ASan's own threads and allocator make the thread budget "
                            "unpredictable; the plain build is what matters here")
-@pytest.mark.parametrize("entry", ["score_and_grad", "sorted", "align_full", "add_many"])
+@pytest.mark.parametrize("entry", ["score_and_grad", "sorted", "align_full", "construct"])
 def test_thread_launch_failure_does_not_abort(entry):
     """Cap the user's thread count a few above what is running, then ask for 32
     workers: the first launches succeed, a later one fails.  The process must survive —
@@ -63,13 +63,12 @@ def test_thread_launch_failure_does_not_abort(entry):
                           gap_open_a=2.0, gap_extend_a=1.0, gap_open_b=2.0, gap_extend_b=1.0)
         A, B = ["ACGTACGTAC"] * 64, ["ACGTTCGTAC"] * 64
         want = 64 * n.SeqPair(A[0], B[0], p).score_and_grad()[0]
-        b = n.SeqPairBatch(n_threads=32)
+        if "{entry}" != "construct":
+            b = n.SeqPairBatch(A, B, p, n_threads=32)
         if "{entry}" == "sorted":
             # Static chunk-per-worker scheduler: a worker that never started must
             # not take its chunk with it.
             b.schedule = "sorted"
-        if "{entry}" != "add_many":
-            b.add_many(A, B, p)
         # Count every thread this user owns (RLIMIT_NPROC's unit), leave room for 3.
         uid = os.getuid(); used = 0
         for pid in filter(str.isdigit, os.listdir("/proc")):
@@ -80,8 +79,8 @@ def test_thread_launch_failure_does_not_abort(entry):
                 pass
         resource.setrlimit(resource.RLIMIT_NPROC, (used + 3, used + 3))
         try:
-            if "{entry}" == "add_many":
-                b.add_many(A, B, p)
+            if "{entry}" == "construct":   # the pairs are encoded in parallel
+                b = n.SeqPairBatch(A, B, p, n_threads=32)
                 got = None
             elif "{entry}" == "align_full":
                 got = b.score_and_grad(keep_paths=True)
