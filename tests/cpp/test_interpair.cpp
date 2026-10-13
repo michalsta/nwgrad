@@ -7,7 +7,7 @@
 //
 // Written after the Python sanitizer jobs caught `&eqm[j * nm]` on an EMPTY vector
 // (nm = 0 for alphabets over 8) in the inter-pair soft pass — UB that release builds
-// never notice, and that no C++ test reached: the C++ add_many test aligned protein
+// never notice, and that no C++ test reached: the C++ batch-build test aligned protein
 // pairs in hard mode only.
 
 #include "catch.hpp"
@@ -63,11 +63,10 @@ void batch_case(const std::string& alpha, GapModel gm, AlignMode am, GradMode gd
     std::vector<std::string> A, B;
     make_seqs(alpha, 61, 1, 30, 30, 38, seed, A, B);   // B lengths mixed within the cap
     const AlignParams p = params_for(alpha, gm == GapModel::Linear, seed);
-    SeqPairBatchT<T> own(gm, am, gd, 3, TracebackMode::Pointers), inter(gm, am, gd, 3, TracebackMode::Pointers);
+    SeqPairBatchT<T> own(views(A), views(B), p, gm, am, gd, 3, TracebackMode::Pointers),
+                     inter(views(A), views(B), p, gm, am, gd, 3, TracebackMode::Pointers);
     own.set_fill(false, false);
     inter.set_fill(false, true);
-    own.add_many(views(A), views(B), p);
-    inter.add_many(views(A), views(B), p);
     own.score_and_grad();
     inter.score_and_grad();
     if (band > 0) { own.banded_grad(band); inter.banded_grad(band); }

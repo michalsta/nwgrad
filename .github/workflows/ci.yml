@@ -341,7 +341,7 @@ jobs:
             # pair in add_many()'s throw path.  LSan cannot tell our leaks from
             # CPython's and numpy's intentional allocations in an uninstrumented
             # interpreter.  That check is not lost — it lives in the C++ ASan job,
-            # where test_add_many.cpp throws from a worker mid-construction.
+            # where test_batch_build.cpp throws from a worker mid-construction.
             export LD_PRELOAD="$(gcc -print-file-name=libasan.so):$(gcc -print-file-name=libstdc++.so)"
             export ASAN_OPTIONS=detect_leaks=0
           else

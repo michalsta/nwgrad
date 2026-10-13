@@ -201,7 +201,7 @@ if (NWGRAD_BUILD_TESTS)
         tests/cpp/test_batch_engine.cpp
         tests/cpp/test_hirschberg_scan.cpp
         tests/cpp/test_hirschberg_pmax.cpp
-        tests/cpp/test_add_many.cpp
+        tests/cpp/test_batch_build.cpp
         tests/cpp/test_interpair.cpp
         tests/cpp/test_weighted_grad.cpp
         tests/cpp/test_logistic.cpp

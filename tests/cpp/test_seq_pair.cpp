@@ -262,8 +262,8 @@ static std::vector<std::string_view> views(const std::vector<std::string>& v) {
 }
 
 static SeqPairBatch corpus_batch(const Corpus& c, const AlignParams& p, int threads) {
-    SeqPairBatch batch(GapModel::Affine, AlignMode::Global, GradMode::Hard, threads);
-    batch.add_many(views(c.as), views(c.bs), p);
+    SeqPairBatch batch(views(c.as), views(c.bs), p,
+                       GapModel::Affine, AlignMode::Global, GradMode::Hard, threads);
     return batch;
 }
 
@@ -430,9 +430,8 @@ TEST_CASE("SeqPairBatch: scheduling knobs set on the batch reach the engine", "[
     // façade fields that only the Python binding copied over, so C++ ran dynamic).
     auto p = asym_params(4.0, 0.5, 1.5, 2.0);
     Corpus c;
-    SeqPairBatch batch(GapModel::Affine, AlignMode::Global, GradMode::Hard, 2);
-    batch.add_many(std::vector<std::string_view>(c.as.begin(), c.as.end()),
-                   std::vector<std::string_view>(c.bs.begin(), c.bs.end()), p);
+    SeqPairBatch batch(std::vector<std::string_view>(c.as.begin(), c.as.end()), std::vector<std::string_view>(c.bs.begin(), c.bs.end()), p,
+                       GapModel::Affine, AlignMode::Global, GradMode::Hard, 2);
     batch.set_fill(false, false);          // the sorted scheduler runs the own-fill path
     batch.set_sorted_schedule(true);
     batch.set_profile(true);
@@ -462,8 +461,8 @@ static void modern_pair_api() {
         REQUIRE(sp.banded_align(100) == Approx(initial));
         REQUIRE(sp.stored_path_valid());
         REQUIRE(sp.grad_valid() == (gd != GradMode::None));
-        SeqPairBatchT<T> batch(GapModel::Affine, AlignMode::Global, gd, 1);
-        batch.add_many({A, B}, {B, A}, p);
+        SeqPairBatchT<T> batch({A, B}, {B, A}, p,
+                               GapModel::Affine, AlignMode::Global, gd, 1);
         auto first = batch[0];
         REQUIRE(first.align(false) == Approx(initial));
         REQUIRE_FALSE(batch[1].score_valid());
