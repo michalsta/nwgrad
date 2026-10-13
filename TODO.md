@@ -25,6 +25,56 @@ flag. Delete `pair_api_compat.hpp`, the deprecated facade methods/bindings and
 reduction bridge in 0.8, keeping modern lifecycle regressions. DiscrimAlign's
 ported API is tested from PR #16, rather than modifying the old consumer checkout.
 
+## Remove `SeqPairBatch.add_many()` in 0.8.0 — PLANNED
+
+0.7.0 gives the pairs to the constructor, `SeqPairBatch(seqs_a, seqs_b, params, ...)`,
+and deprecates `add_many()` (Python `DeprecationWarning`: "deprecated in nwgrad 0.7.0
+and will be removed in 0.8.0"). The pairless `SeqPairBatch(n_threads, ...)` stays, for
+streaming `align()`. What a batch can no longer do afterwards: append pairs, and hold
+several segments under different params or kernels. Different params per pair are K sets
+with a constant track per pair (`AlignParams.stack`); a per-segment kernel has no use
+outside tests and benchmarks.
+
+**Before the 0.7.0 release (open):** the C++ API has no replacement yet. `SeqPairBatchT`
+is built pairless and filled with `add_many()` (`docs/cpp.md`, ~44 uses in `tests/cpp`),
+and C++ `add_many()` carries no `[[deprecated]]`. For a C++ deprecation window, 0.7.0
+needs a C++ constructor taking the pairs (seqs, params, kernel, tracks, gap tracks) and
+`[[deprecated]]` on `add_many()`; otherwise the C++ removal waits for 0.9.
+
+**0.8.0, Python:**
+- Delete the `add_many` binding and its warning; `add_pairs()` in `py_exports.cpp`
+  becomes the constructor's body.
+- Delete the tests marked `filterwarnings("ignore:SeqPairBatch.add_many")` (appends,
+  segments, failed appends leaving the batch unchanged): `test_batch_build.py`,
+  `test_tracks_batch.py`, `test_fill.py`, `test_alphabet.py`, `test_removed_api.py`; the
+  `legacy()` comparisons and the `add_many` warning tests in `test_batch_constructor.py`;
+  the `filterwarnings` entry in `pyproject.toml`. Keep each test's non-append coverage.
+- `tools/fuzz_fill.py` and `tools/fuzz_ab.py` build several segments with their own
+  params: one segment per case, or K sets with constant tracks per pair.
+- Docs: drop the `add_many` row from `docs/api.md`, keep its line in the migration table.
+
+**0.8.0, engine** (`batch_engine.hpp`; est. 150-250 lines; no DP kernel changes, no
+speed claim without a measurement):
+- Pairs set once: the construction path loses the append bookkeeping (`N0` offsets, the
+  rollback after a failed encode, incremental `grow_tpaths_(from)`, the alphabet / K
+  checks against existing pairs) and `generation_` with the plan's check of it.
+- Segments go: `Segment`, `segs_`, the per-pair `seg_`; `params(i)` / `kernel(i)` become
+  one params pointer and one kernel. `set_params_segment()` (standalone `SeqPair`)
+  becomes `set_params()`. The pending-guide params (`gparams`) stay, as one pointer.
+- The params store shrinks to the current params plus the pending guides' params:
+  `own_params_` deduplication, `params_idx_`, `params_same_`, `drop_unused_params_` and
+  the `prep_` list go.
+- The inter-pair "same params" lane checks (`same_params` / `shared`, three places)
+  always hold; delete them.
+- `make_tracked_()` goes: a batch is tracked or not from construction.
+
+**Validation:** full C++ and Python suites, ASan/UBSan, forced kernels on every level
+(sse2/avx2/neon in CI, avx512 on solace), `tools/stress_tracks.py`; bit-identical scores
+and gradients before/after on the fuzzers' single-segment cases; the PosimiR
+`nwgrad-sklearn` tests and DiscrimAlign PR #16's acceptance fits, as in
+`docs/release-validation.md`. Do together with the pair-compatibility removal
+(`docs/pair-api-transition.md`) so 0.8.0 is validated once.
+
 ## Default thread count (`n_threads=0`): physical cores are wrong for short pairs
 
 `default_thread_count()` (`parallel.hpp`) resolves `n_threads=0` to the number
