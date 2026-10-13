@@ -33,10 +33,10 @@ def run(threads, L, mode, grad_mode, guide="eager"):
     rng = np.random.default_rng(L)
     A = ["".join(rng.choice(list(canon), L)) for _ in range(args.n)]
     B = ["".join(rng.choice(list(canon), L)) for _ in range(args.n)]
-    b = nwgrad.SeqPairBatchDouble(n_threads=threads, traceback="pointers", gap_model="affine", mode=mode, grad_mode=grad_mode)
+    b = nwgrad.SeqPairBatchDouble(A, B, params, n_threads=threads, traceback="pointers", gap_model="affine",
+                                  mode=mode, grad_mode=grad_mode)
     if grad_mode == "soft":
         b.soft_guide = guide
-    b.add_many(A, B, params)
     b.score_and_grad()
     best = 1e30
     for _ in range(args.reps):

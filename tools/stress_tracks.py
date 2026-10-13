@@ -75,13 +75,11 @@ def one_round(seed, max_len):
            f"tracks={'none' if tracked_none else 'yes'} fill={fill} tb={tb} threads={threads} " \
            f"storage={storage}"
 
-    batch = BATCH[prec](threads, tb, gap_model=case[0], mode=case[1], grad_mode="hard")
+    tk = {} if tracked_none else dict(tracks=tracks, gap_tracks=gtracks)
+    batch = BATCH[prec](A, B, P, n_threads=threads, traceback=tb, gap_model=case[0], mode=case[1],
+                        grad_mode="hard", **tk)
     batch.fill = fill
     batch.track_storage = storage
-    if tracked_none:
-        batch.add_many(A, B, P)
-    else:
-        batch.add_many(A, B, P, tracks=tracks, gap_tracks=gtracks)
     batch.score_and_grad()
     sc = batch.scores()
     gm, gg = batch.grads()
@@ -128,14 +126,11 @@ def one_round(seed, max_len):
     # soft, now and then
     if rng.random() < 0.25 and prec == "_double":
         T = float(rng.uniform(0.5, 1.5))
-        sb = nwgrad.SeqPairBatchDouble(threads, gap_model=case[0], mode=case[1], grad_mode="soft")
+        sb = nwgrad.SeqPairBatchDouble(A, B, P, n_threads=threads, gap_model=case[0], mode=case[1],
+                                       grad_mode="soft", **tk)
         sb.fill = ["interpair", "striped"][rng.integers(2)]
         sb.soft_temperature = T
         sb.soft_impl = "scaled_or_log"
-        if tracked_none:
-            sb.add_many(A, B, P)
-        else:
-            sb.add_many(A, B, P, tracks=tracks, gap_tracks=gtracks)
         sb.score_and_grad()
         ssc = sb.scores()
         sgm, sgg = sb.grads()

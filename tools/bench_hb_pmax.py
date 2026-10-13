@@ -126,10 +126,10 @@ def homology_pairs(rate, rng):
 
 
 def build(pairs, tb, threads):
-    b = nwgrad.SeqPairBatch(n_threads=threads, traceback=tb, gap_model="affine", mode="global", grad_mode="hard")
+    b = nwgrad.SeqPairBatch([x for x, _ in pairs], [y for _, y in pairs], params, n_threads=threads,
+                            traceback=tb, gap_model="affine", mode="global", grad_mode="hard")
     if tb.startswith("hirschberg"):
         b.hb_cutoff = args.cutoff
-    b.add_many([x for x, _ in pairs], [y for _, y in pairs], params, kernel="auto")
     return b
 
 

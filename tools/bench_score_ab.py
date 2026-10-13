@@ -50,8 +50,12 @@ if sec in ("mk_align", "mk_align_f32"):
     print(timed(lambda: b.align(A, B, pd)))
 elif sec == "mk_step":
     A, B = manakov(100000)
-    b = nwgrad.SeqPairBatchDouble(threads, gap_model="affine", mode="local", grad_mode="none")
-    b.add_many(A, B, pd)
+    kw = dict(gap_model="affine", mode="local", grad_mode="none")
+    try:      # pairs in the constructor (0.7+)
+        b = nwgrad.SeqPairBatchDouble(A, B, pd, n_threads=threads, **kw)
+    except TypeError:
+        b = nwgrad.SeqPairBatchDouble(threads, **kw)
+        b.add_many(A, B, pd)
     b.score_and_grad()
     def step():
         b.set_params(pd); b.score_and_grad(); b.scores()

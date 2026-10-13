@@ -14,7 +14,7 @@ may differ in the last bits (pre-0.6 merged per-thread sums in completion order)
 
     python tools/fuzz_ab.py --dump SEED OUT.pkl    # internal: one build, one seed
 """
-import argparse, pickle, subprocess, sys
+import argparse, pickle, subprocess, sys, warnings
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -70,8 +70,21 @@ def dump(seed, out):
 
     cls = nwgrad.SeqPairBatchDouble if prec == "double" else nwgrad.SeqPairBatch
     new_api = not hasattr(nwgrad, "BatchAligner")
+    ctor = "seqs_a" in (cls.__init__.__doc__ or "")   # pairs in the constructor (0.7+)
 
     def make():
+        if ctor:
+            A, B, p = segs[0]
+            b = cls(A, B, p, n_threads=threads, traceback=tb, gap_model=gm, mode=mode, grad_mode=gd)
+            b.fill = fill
+            b.soft_guide = soft_guide
+            b.hb_cutoff = hb
+            # Further segments only through the deprecated add_many(), until 0.8.
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", "SeqPairBatch.add_many", DeprecationWarning)
+                for A, B, p in segs[1:]:
+                    b.add_many(A, B, p)
+            return b
         if new_api:
             b = cls(threads, tb, gap_model=gm, mode=mode, grad_mode=gd)
         else:

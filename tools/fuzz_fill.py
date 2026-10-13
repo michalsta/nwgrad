@@ -2,7 +2,7 @@
 """Differential fuzz: SeqPairBatch fill="interpair" against fill="striped".
 
 Each seed builds one random batch of one problem type (gap model, mode, grad mode --
-one per batch since 0.6) from several add_many() segments, each with its own
+one per batch since 0.6) from several segments (the deprecated add_many()), each with its own
 parameters (ties, integer, real-valued; cheap and dear gaps),
 empty and one-residue sequences, lengths past hb_cutoff, shared and ragged len B, both
 precisions, every traceback -- and runs score_and_grad() and then banded_grad(bw) under
@@ -23,6 +23,7 @@ models; since 0.6 a batch holds one type, which removes that mix but not the bug
 import argparse
 import subprocess
 import sys
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -89,10 +90,15 @@ def make_case(seed):
 
 def run_fill(prec, tb, specs, fill, bw):
     _, _, _, gm, mode, gr = specs[0]
-    b = CLS[prec](n_threads=3, traceback=tb, gap_model=gm, mode=mode, grad_mode=gr)
+    A, B, p = specs[0][:3]
+    b = CLS[prec](A, B, p, n_threads=3, traceback=tb, gap_model=gm, mode=mode, grad_mode=gr)
     b.fill = fill
-    for A, B, p, _, _, _ in specs:
-        b.add_many(A, B, p)
+    # Further segments (their own params) only through the deprecated add_many(), until
+    # its removal in 0.8 (TODO.md): then one segment per case, or K sets with tracks.
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", "SeqPairBatch.add_many", DeprecationWarning)
+        for A, B, p, _, _, _ in specs[1:]:
+            b.add_many(A, B, p)
     try:
         b.score_and_grad()
     except Exception as e:  # must match across fills, checked by the caller

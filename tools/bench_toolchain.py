@@ -86,13 +86,13 @@ SHORT = related_pairs(args.short_n, args.short_len, args.rate, 4)
 
 def run(pairs, tb, dtype, kernel="auto"):
     cls = nwgrad.SeqPairBatchDouble if dtype == "double" else nwgrad.SeqPairBatch
-    b = cls(n_threads=args.threads, traceback=tb, gap_model="affine", mode="global", grad_mode="hard")
+    b = cls([x for x, _ in pairs], [y for _, y in pairs], params, n_threads=args.threads, traceback=tb,
+            gap_model="affine", mode="global", grad_mode="hard", kernel=kernel)
     if tb.startswith("hirschberg") or tb == "auto":
         try:
             b.hb_cutoff = args.cutoff
         except AttributeError:
             pass
-    b.add_many([x for x, _ in pairs], [y for _, y in pairs], params, kernel=kernel)
     b.score_and_grad()                      # warm up / fault in
     best = float("inf")
     for _ in range(args.reps):

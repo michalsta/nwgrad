@@ -11,7 +11,7 @@ against itself first; read every ratio relative to it (if the control is not ~1.
 the host is too noisy for the numbers below it).
 
 Sections (the DiscrimAlign shape: miRNA x target-site pairs, local affine, double):
-  construct      add_many() of N pairs, seconds and resident MB added
+  construct      building a batch of N pairs, seconds and resident MB added
   iter_hard      set_params + score_and_grad + scores + weighted_grad  (one training step)
   iter_banded    set_params + banded_grad(4) + scores + weighted_grad
   iter_soft      the same, grad_mode soft, soft_guide lazy, T = 0.5
@@ -34,7 +34,13 @@ M = np.array([[0.53, -0.61, -0.60, -0.56], [-0.44, 0.58, -0.57, -0.48],
 def params(k):
     return nwgrad.AlignParams(nwgrad.SubstMatrix(M * k, alphabet="ACGT"), 1.0, 0.5, 1.0, 0.5)
 new = not hasattr(nwgrad, "BatchAligner")
+ctor = "seqs_a" in (nwgrad.SeqPairBatchDouble.__init__.__doc__ or "")   # pairs in the constructor (0.7+)
 def batch(gd, **kw):
+    if ctor:
+        b = nwgrad.SeqPairBatchDouble(A, B, params(1.0), n_threads=threads, traceback="pointers",
+                                      gap_model="affine", mode="local", grad_mode=gd)
+        for k, v in kw.items(): setattr(b, k, v)
+        return b
     if new:
         b = nwgrad.SeqPairBatchDouble(threads, "pointers", gap_model="affine", mode="local",
                                       grad_mode=gd)

@@ -12,7 +12,7 @@ the default gap track.  Arms, each in a fresh process, alternating, best of --ro
   tracked1    one set, an all-zero track (the tracked code path, the same numbers)
   trackedK    K sets, one per position
 Reported per configuration: seconds per step (set_params + score_and_grad + scores +
-weighted_grad) and resident MB added by add_many, with tracked / untracked ratios.
+weighted_grad) and resident MB added by building the batch, with tracked / untracked ratios.
 A control arm (untracked twice) shows the noise floor.  --storage sets the tracked
 arms' SeqPairBatch.track_storage (a build without it keeps its own store).
 """
@@ -39,18 +39,16 @@ def rss_mb():
     for l in open("/proc/self/status"):
         if l.startswith("VmRSS:"): return int(l.split()[1]) / 1024
 cls = nwgrad.SeqPairBatchDouble if prec == "double" else nwgrad.SeqPairBatch
-b = cls(threads, gap_model=gm, mode=mode, grad_mode=gd)
-if hasattr(b, "track_storage"):
-    b.track_storage = storage
-if gd == "soft":
-    b.soft_guide = "lazy"; b.soft_temperature = 0.5; b.soft_impl = "scaled_or_log"
 sets = K if arm == "trackedK" else 1
 tracks = None
 if arm == "tracked1": tracks = [[0] * len(a) for a in A]
 if arm == "trackedK": tracks = [[min(p, K - 1) for p in range(len(a))] for a in A]
 r0 = rss_mb()
-b.add_many(A, B, params(1.0, sets), tracks=tracks) if tracks is not None else b.add_many(A, B, params(1.0, sets))
+b = cls(A, B, params(1.0, sets), n_threads=threads, gap_model=gm, mode=mode, grad_mode=gd, tracks=tracks)
 mb = rss_mb() - r0
+b.track_storage = storage
+if gd == "soft":
+    b.soft_guide = "lazy"; b.soft_temperature = 0.5; b.soft_impl = "scaled_or_log"
 b.score_and_grad()
 w = rng.normal(size=len(A))
 ts = []

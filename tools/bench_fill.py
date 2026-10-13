@@ -65,9 +65,9 @@ CLS = {"float32": nwgrad.SeqPairBatch, "double": nwgrad.SeqPairBatchDouble}
 
 
 def run(prec, threads, mode, gap, tb, fill, bw=0):
-    b = CLS[prec](n_threads=threads, traceback=tb, gap_model=gap, mode=mode, grad_mode="hard")
+    b = CLS[prec](A, B, params if gap == "affine" else lin,
+                  n_threads=threads, traceback=tb, gap_model=gap, mode=mode, grad_mode="hard")
     b.fill = fill
-    b.add_many(A, B, params if gap == "affine" else lin)
     b.score_and_grad()  # warm: allocation, plan (and the guides banded_grad needs)
     step = (lambda: b.banded_grad(bw)) if bw else b.score_and_grad
     if bw:
