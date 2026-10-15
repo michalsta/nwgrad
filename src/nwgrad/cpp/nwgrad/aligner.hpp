@@ -3519,28 +3519,40 @@ private:
         best_i_ = 0; best_j_ = 0; best_tbl_ = TBTable::M;
         T best_local = static_cast<T>(0);
 
+        // Row pointers, not rat()/at(): run_viterbi cleared the layout flags, so the
+        // tables are row-major here, and cell_index()'s layout switch inside the loop is
+        // dead weight that gcc unswitches and clang does not.  The left cell rides in
+        // registers (clang re-loaded the cells it had just stored), the substitution row
+        // is hoisted per row.  Same operands, same order: the tables are unchanged.
+        const uint8_t* bcode = b_idx_.data();
         for (int i = 1; i <= m_; ++i) {
-            const T* srow = nullptr;
+            const T* srow;
             if constexpr (Tr) {
                 go_a = tgoa_[static_cast<size_t>(i)]; ge_a = tgea_[static_cast<size_t>(i)];
                 go_b = tgob_[static_cast<size_t>(i)]; ge_b = tgeb_[static_cast<size_t>(i)];
                 srow = blkT_ + static_cast<size_t>(rs_[static_cast<size_t>(i) - 1]) * static_cast<size_t>(nalpha_);
+            } else {
+                srow = blkT_ + static_cast<size_t>(a_idx_[static_cast<size_t>(i) - 1]) * static_cast<size_t>(nalpha_);
             }
-            for (int j = jlo(i); j <= jhi(i); ++j) {
-                T diag  = std::max({rat(buf.VM,i-1,j-1), rat(buf.VX,i-1,j-1), rat(buf.VY,i-1,j-1)});
-                T m_val;
-                if constexpr (Tr) m_val = diag + srow[b_idx_[static_cast<size_t>(j) - 1]];
-                else              m_val = diag + subTu(i, j);
+            const size_t rp = static_cast<size_t>(i - 1) * stride_, rc = static_cast<size_t>(i) * stride_;
+            const T* pM = buf.VM.data() + rp; const T* pX = buf.VX.data() + rp; const T* pY = buf.VY.data() + rp;
+            T* cM = buf.VM.data() + rc; T* cX = buf.VX.data() + rc; T* cY = buf.VY.data() + rc;
+            const int j0 = jlo(i), j1 = jhi(i);
+            if (j0 > j1) continue;   // an empty band row reads nothing (as before)
+            T lM = cM[j0 - 1], lX = cX[j0 - 1], lY = cY[j0 - 1];
+            for (int j = j0; j <= j1; ++j) {
+                T diag  = std::max({pM[j-1], pX[j-1], pY[j-1]});
+                T m_val = diag + srow[bcode[static_cast<size_t>(j) - 1]];
                 // X state: gap in B (advance i), uses gap_b params
                 T x_val = std::max({
-                    rat(buf.VM,i-1,j) - go_b - ge_b,
-                    rat(buf.VX,i-1,j)        - ge_b,
-                    rat(buf.VY,i-1,j) - go_b - ge_b});
+                    pM[j] - go_b - ge_b,
+                    pX[j]        - ge_b,
+                    pY[j] - go_b - ge_b});
                 // Y state: gap in A (advance j), uses gap_a params
                 T y_val = std::max({
-                    rat(buf.VM,i,j-1) - go_a - ge_a,
-                    rat(buf.VX,i,j-1) - go_a - ge_a,
-                    rat(buf.VY,i,j-1)        - ge_a});
+                    lM - go_a - ge_a,
+                    lX - go_a - ge_a,
+                    lY        - ge_a});
 
                 if constexpr (AM == AlignMode::Local) {
                     m_val = std::max(m_val, static_cast<T>(0));
@@ -3553,7 +3565,8 @@ private:
                     }
                 }
 
-                at(buf.VM, i, j) = m_val; at(buf.VX, i, j) = x_val; at(buf.VY, i, j) = y_val;
+                cM[j] = m_val; cX[j] = x_val; cY[j] = y_val;
+                lM = m_val; lX = x_val; lY = y_val;
             }
         }
 
