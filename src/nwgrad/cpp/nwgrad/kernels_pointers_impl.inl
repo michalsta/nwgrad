@@ -292,8 +292,11 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
             }
 
             if constexpr (Local) {
-                for (int j = 1; j <= n; ++j) {
-                    const std::size_t k = scol(j);
+                // Column order without scol's % and / per cell (as in kernels_impl.inl).
+                int j = 1;
+                for (int l = 0; l < W && j <= n; ++l)
+                for (int s = 0; s < seg && j <= n; ++s, ++j) {
+                    const std::size_t k = (std::size_t)s * W + (std::size_t)l;
                     const T mm = cM[off + k], xx = cX[off + k], yy = cY[off + k];
                     const T here = std::max({mm, xx, yy});
                     if (here > best_local) {
