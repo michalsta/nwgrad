@@ -55,9 +55,12 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
     set(NWGRAD_LEVEL_SOURCES
         ${NWGRAD_LEVEL_DIR}/simd_levels.cpp
         ${NWGRAD_LEVEL_DIR}/level_baseline.cpp
+        ${NWGRAD_LEVEL_DIR}/level_sse4.cpp
         ${NWGRAD_LEVEL_DIR}/level_avx2.cpp
         ${NWGRAD_LEVEL_DIR}/level_avx512.cpp)
-    # baseline is the x86-64 default (SSE2); the wider levels get their flags per-file
+    # baseline is the x86-64 default (SSE2); the other levels get their flags per-file
+    set_source_files_properties(${NWGRAD_LEVEL_DIR}/level_sse4.cpp    PROPERTIES
+        COMPILE_OPTIONS "-msse4.2")
     set_source_files_properties(${NWGRAD_LEVEL_DIR}/level_avx2.cpp    PROPERTIES
         COMPILE_OPTIONS "-mavx2;-mfma")
     set_source_files_properties(${NWGRAD_LEVEL_DIR}/level_avx512.cpp  PROPERTIES
@@ -272,7 +275,7 @@ if (NWGRAD_BUILD_TESTS)
     # machine that lacks the named hardware.  That is why they are unconditional.  Names are
     # the unified backend vocabulary (sse2 replaces the old "baseline"; neon is the AArch64
     # level, a no-op on x86).
-    foreach(isa sse2 avx2 avx512 neon)
+    foreach(isa sse2 sse4 avx2 avx512 neon)
         add_test(NAME cpp_tests_isa_${isa} COMMAND nwgrad_tests "[simd]")
         set_tests_properties(cpp_tests_isa_${isa}
             PROPERTIES ENVIRONMENT "NWGRAD_ISA=${isa}")
@@ -284,7 +287,7 @@ if (NWGRAD_BUILD_TESTS)
     # "tested" are as far apart for it as for the score-table kernel.  [traceback]
     # carries the pointers-vs-scores equivalence cases; forcing the ISA runs them
     # against each level's pointer kernel in turn.
-    foreach(isa sse2 avx2 avx512 neon)
+    foreach(isa sse2 sse4 avx2 avx512 neon)
         add_test(NAME cpp_tests_traceback_${isa} COMMAND nwgrad_tests "[traceback]")
         set_tests_properties(cpp_tests_traceback_${isa}
             PROPERTIES ENVIRONMENT "NWGRAD_ISA=${isa}")
@@ -293,7 +296,7 @@ if (NWGRAD_BUILD_TESTS)
     # ── tracks, once per instruction set ─────────────────────────────────────────
     #
     # Every tracked leveled kernel against the scalar tracked fill (test_tracks.cpp).
-    foreach(isa sse2 avx2 avx512 neon)
+    foreach(isa sse2 sse4 avx2 avx512 neon)
         add_test(NAME cpp_tests_tracks_${isa} COMMAND nwgrad_tests "[tracks]")
         set_tests_properties(cpp_tests_tracks_${isa}
             PROPERTIES ENVIRONMENT "NWGRAD_ISA=${isa}")

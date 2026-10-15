@@ -34,7 +34,7 @@ def seq(rng, length):
 
 
 def test_simd_isa_is_reported():
-    assert nwgrad.simd_isa() in ("scalar_fallback", "sse2", "avx2", "avx512", "neon")
+    assert nwgrad.simd_isa() in ("scalar_fallback", "sse2", "sse4", "avx2", "avx512", "neon")
 
 
 def test_bad_kernel_name_raises():

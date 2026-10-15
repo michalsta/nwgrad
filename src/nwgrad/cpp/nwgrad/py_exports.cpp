@@ -100,7 +100,7 @@ static nb::object numpy_copy(const double* src, size_t n, std::initializer_list<
 // ── Aligner factory: picks Full or GuideBanded at runtime. ───────────────────
 
 // The `kernel=` string names the Viterbi backend: "auto" (default; best simd the CPU
-// runs), "scalar_fallback", or a named simd level ("sse2"/"avx2"/"avx512"/"neon").  Every
+// runs), "scalar_fallback", or a named simd level ("sse2"/"sse4"/"avx2"/"avx512"/"neon").  Every
 // simd level is bit-exact with the scalar one, so it is a speed knob and never a
 // correctness one.  simd_levels.hpp::parse_backend() turns the string into a backend int
 // and throws on anything unrecognised or a level this CPU cannot run — a typo that

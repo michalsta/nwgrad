@@ -12,7 +12,7 @@ That is the strongest verification available: one environment variable turns eve
 gradient, alignment and biopython test into a simd test.
 
 **Every level.**  NWGRAD_FORCE_KERNEL=simd sweeps all simd levels the CPU can run
-(sse2/avx2/avx512 on x86, neon on ARM) — the whole suite runs once per level, so the
+(sse2/sse4/avx2/avx512 on x86, neon on ARM) — the whole suite runs once per level, so the
 baseline (sse2) kernel is tested from Python too, not just the strongest.  It mirrors the
 C++ ctest cpp_tests_isa_* loop.  The backend is passed per-call via kernel= (the unified
 vocabulary in simd_levels.hpp), including the batch constructor (and the deprecated add_many()) and align(). Explicit

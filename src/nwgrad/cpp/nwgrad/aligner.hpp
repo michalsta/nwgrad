@@ -107,7 +107,7 @@ inline constexpr bool is_hirschberg(TracebackMode t) noexcept {
 // Which Viterbi backend fills the DP tables is a runtime field (backend_, below), one of
 // the unified vocabulary in simd_levels.hpp: "scalar_fallback" (the original plain
 // kernel), "auto" (defer to the global default = best simd), or a named simd level
-// ("sse2"/"avx2"/"avx512"/"neon").  Every simd level is *bit-exact* with the scalar one —
+// ("sse2"/"sse4"/"avx2"/"avx512"/"neon").  Every simd level is *bit-exact* with the scalar one —
 // identical tables to the last bit — which is what lets the exact-float-equality
 // tracebacks keep working unchanged; so the backend is a speed knob, never a correctness
 // one.  It selects the Viterbi (hence hard_grad) path only; forward-backward and soft_grad

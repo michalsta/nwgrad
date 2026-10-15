@@ -91,7 +91,7 @@ struct Args {
         "  --gap-open F           gap-open penalty (default 11.0)\n"
         "  --gap-extend F         gap-extend penalty (default 1.0)\n"
         "  --n-threads T...       one or more thread counts (default 4)\n"
-        "  --kernel BACKEND       Viterbi backend: scalar_fallback|auto|sse2|avx2|avx512|neon\n"
+        "  --kernel BACKEND       Viterbi backend: scalar_fallback|auto|sse2|sse4|avx2|avx512|neon\n"
         "                         (default scalar_fallback); every simd level is bit-exact\n"
         "  --seed N               RNG seed (default: random)\n"
         "  --warmup               run a silent warmup pass before timing\n"
@@ -180,7 +180,7 @@ static Args parse_args(int argc, char** argv) {
             seed_set = true;
         } else if (std::strcmp(argv[i], "--kernel") == 0) {
             need(1); ++i;
-            a.kernel = parse_backend(argv[i]);  // scalar_fallback|auto|sse2|avx2|avx512|neon
+            a.kernel = parse_backend(argv[i]);  // scalar_fallback|auto|sse2|sse4|avx2|avx512|neon
         } else if (std::strcmp(argv[i], "--warmup") == 0) {
             a.warmup = true;
         } else {

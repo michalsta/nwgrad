@@ -69,7 +69,7 @@ import time
 # The ISA levels the dispatch table knows about, weakest first.  "neon" is the sole
 # AArch64 level (mandatory baseline, no dispatch); the x86 levels never appear there and
 # vice versa, so probing all of them and keeping whatever answers is harmless.
-ISA_LEVELS = ["sse2", "avx2", "avx512", "neon"]  # NWGRAD_ISA values; unknown -> auto
+ISA_LEVELS = ["sse2", "sse4", "avx2", "avx512", "neon"]  # NWGRAD_ISA values; unknown -> auto
 
 
 # ─────────────────────────────────────────────────────────────────────────────

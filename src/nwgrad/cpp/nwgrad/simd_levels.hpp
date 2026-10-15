@@ -33,15 +33,18 @@ using DpBuffer = DpBufferT<double>;    // ViterbiJob carries the double buffer f
 // ── Levels ────────────────────────────────────────────────────────────────────
 // Ordered weakest → strongest within an architecture.  Plain AVX is deliberately
 // absent: it is a measured regression on Bulldozer/Piledriver and buys nothing over
-// SSE2 elsewhere, so AVX-only CPUs run the Baseline level.
+// SSE2 elsewhere, so AVX-only CPUs run the Sse4 level (or Baseline, if they lack SSE4.2).
+// Sse4 is the same width as Baseline (W=2); it exists for the SSE4.1 blends/ptest the
+// compiler then emits in place of SSE2's and/andn/or sequences.
 enum class SimdLevel : int {
 #if defined(__aarch64__) || defined(_M_ARM64)
     Neon = 0,          // mandatory baseline on AArch64; the only level (no dispatch)
     Baseline = 0,
 #else
     Baseline = 0,      // SSE2 (x86-64 baseline)
-    Avx2 = 1,
-    Avx512 = 2,
+    Sse4 = 1,          // SSE4.2 (the x86-64-v2 vector set), still W=2
+    Avx2 = 2,
+    Avx512 = 3,
 #endif
 };
 
@@ -51,6 +54,7 @@ inline const char* level_name(SimdLevel l) {
         case SimdLevel::Neon:     return "neon";
 #else
         case SimdLevel::Baseline: return "sse2";
+        case SimdLevel::Sse4:     return "sse4";
         case SimdLevel::Avx2:     return "avx2";
         case SimdLevel::Avx512:   return "avx512";
 #endif
@@ -66,6 +70,8 @@ inline std::vector<SimdLevel> detect_available_levels() {
 #elif defined(__GNUC__) || defined(__clang__)
     __builtin_cpu_init();
     out.push_back(SimdLevel::Baseline);
+    if (__builtin_cpu_supports("sse4.2"))
+        out.push_back(SimdLevel::Sse4);
     if (__builtin_cpu_supports("avx2"))
         out.push_back(SimdLevel::Avx2);
     // W=8 needs the 512-bit lanes plus the VL/DQ/BW subsets the kernels use.
@@ -82,7 +88,7 @@ inline std::vector<SimdLevel> detect_available_levels() {
 //
 // One unified vocabulary selects the Viterbi backend, per aligner and as a global
 // default: "scalar_fallback" (the plain scalar kernel), "auto" (the strongest simd
-// level the CPU can run), or a named simd level — "sse2"/"avx2"/"avx512" on x86,
+// level the CPU can run), or a named simd level — "sse2"/"sse4"/"avx2"/"avx512" on x86,
 // "neon" on AArch64.  Backends are encoded as ints so an aligner can store one:
 //   kBackendAuto (-2)   defer to the global default (a per-aligner value only)
 //   kBackendScalar (-1) the scalar fallback
@@ -100,13 +106,13 @@ inline int parse_backend(const std::string& name) {
         if (name == level_name(l)) return (int)l;
     // Every level name on every platform, so a real level this CPU lacks is told
     // apart from a name that is not a backend at all (e.g. the pre-0.3 "simd").
-    if (name == "sse2" || name == "avx2" || name == "avx512" || name == "neon")
+    if (name == "sse2" || name == "sse4" || name == "avx2" || name == "avx512" || name == "neon")
         throw std::invalid_argument(
             "nwgrad: backend \"" + name + "\" is not available on this CPU — expected "
             "\"scalar_fallback\", \"auto\", or a simd level this CPU runs (see available_isa_levels())");
     throw std::invalid_argument(
         "nwgrad: unknown backend \"" + name + "\" — expected \"auto\", \"scalar_fallback\", "
-        "\"sse2\", \"avx2\", \"avx512\" or \"neon\"");
+        "\"sse2\", \"sse4\", \"avx2\", \"avx512\" or \"neon\"");
 }
 
 inline std::string backend_name(int backend) {
