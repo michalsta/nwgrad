@@ -109,12 +109,10 @@ struct InterCommon {
         if (bits.size() < static_cast<size_t>(3 * (n + 1))) bits.resize(3 * (n + 1));
         for (int j = 1; j <= n; ++j)
             for (int k = 0; k < levels; ++k) {
-                ivl v;
-                for (int l = 0; l < IW; ++l) {
+                bits[3 * j + k] = ivlanes<ivl, IW>([&](int l) {
                     const int bl = (!J.nb || j <= J.nb[l]) ? J.b[l][j - 1] : 0;   // ragged: pad
-                    v[l] = ((bl >> k) & 1) ? -1 : 0;
-                }
-                bits[3 * j + k] = v;
+                    return ((bl >> k) & 1) ? -1 : 0;
+                });
             }
         if (J.nb)
             for (int l = 0; l < IW; ++l) nbv[l] = static_cast<T>(J.nb[l]);
