@@ -36,8 +36,28 @@ template <> struct IVT<double> { using v = ivd; using l = ivl; static constexpr 
 template <> struct IVT<float>  { using v = ivf; using l = ivi; static constexpr int W = 2 * IW; };
 
 // Lane-wise std::max(a, b), i.e. a < b ? b : a — the same choice on ties as the
-// scalar and row-wise kernels.
-template <class V> static inline V ivmax(V a, V b) noexcept { return a < b ? b : a; }
+// scalar and row-wise kernels.  On 128-bit x86 vectors it is MAXPD/MAXPS(b, a), which
+// computes b > a ? b : a: the same lane on ties, ±0 and NaN included.  gcc emits that
+// instruction for the select from SSE4.1 on, but at SSE2 it lowers it to cmpltpd +
+// andpd + andnpd + orpd, four ops on the VY carry chain (0.49-0.70x the time of a
+// training step on Manakov pairs, sse2 vs sse4 level).  clang emits maxpd at SSE2
+// already.  Compilers without the builtins keep the select.
+#if defined(__SSE2__) && defined(__has_builtin)
+#  if __has_builtin(__builtin_ia32_maxpd) && __has_builtin(__builtin_ia32_maxps)
+#    define NWGRAD_IVMAX_X86 1
+#  endif
+#endif
+template <class V> static inline V ivmax(V a, V b) noexcept {
+#ifdef NWGRAD_IVMAX_X86
+    using E = std::remove_cvref_t<decltype(a[0])>;
+    if constexpr (sizeof(V) == 16 && std::is_same_v<E, double>)
+        return __builtin_ia32_maxpd(b, a);
+    else if constexpr (sizeof(V) == 16 && std::is_same_v<E, float>)
+        return __builtin_ia32_maxps(b, a);
+    else
+#endif
+    return a < b ? b : a;
+}
 template <class L, class V> static inline V ivsel(L m, V a, V b) noexcept { return m ? a : b; }
 // Every lane = x.  Not `ivd{} + x`: +0 + -0 is +0, so that idiom loses the sign of a
 // zero border (-0 when a gap extend is 0), which the scalar fill keeps.

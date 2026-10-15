@@ -42,7 +42,7 @@ enum class SimdLevel : int {
     Baseline = 0,
 #else
     Baseline = 0,      // SSE2 (x86-64 baseline)
-    Sse4 = 1,          // SSE4.2 (the x86-64-v2 vector set), still W=2
+    Sse4 = 1,          // x86-64-v2 (SSE4.2 + POPCNT), still W=2
     Avx2 = 2,
     Avx512 = 3,
 #endif
@@ -70,7 +70,8 @@ inline std::vector<SimdLevel> detect_available_levels() {
 #elif defined(__GNUC__) || defined(__clang__)
     __builtin_cpu_init();
     out.push_back(SimdLevel::Baseline);
-    if (__builtin_cpu_supports("sse4.2"))
+    // x86-64-v2's vector set: the level TU is built with -msse4.2 -mpopcnt.
+    if (__builtin_cpu_supports("sse4.2") && __builtin_cpu_supports("popcnt"))
         out.push_back(SimdLevel::Sse4);
     if (__builtin_cpu_supports("avx2"))
         out.push_back(SimdLevel::Avx2);

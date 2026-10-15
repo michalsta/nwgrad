@@ -58,9 +58,11 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
         ${NWGRAD_LEVEL_DIR}/level_sse4.cpp
         ${NWGRAD_LEVEL_DIR}/level_avx2.cpp
         ${NWGRAD_LEVEL_DIR}/level_avx512.cpp)
-    # baseline is the x86-64 default (SSE2); the other levels get their flags per-file
+    # baseline is the x86-64 default (SSE2); the other levels get their flags per-file.
+    # sse4 is the x86-64-v2 feature set (SSE4.2 + POPCNT), spelled as -m flags like the
+    # others so no -march/-mtune change rides along.
     set_source_files_properties(${NWGRAD_LEVEL_DIR}/level_sse4.cpp    PROPERTIES
-        COMPILE_OPTIONS "-msse4.2")
+        COMPILE_OPTIONS "-msse4.2;-mpopcnt")
     set_source_files_properties(${NWGRAD_LEVEL_DIR}/level_avx2.cpp    PROPERTIES
         COMPILE_OPTIONS "-mavx2;-mfma")
     set_source_files_properties(${NWGRAD_LEVEL_DIR}/level_avx512.cpp  PROPERTIES
