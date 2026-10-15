@@ -3121,13 +3121,17 @@ private:
                 const T gb = ge_b, ga = ge_a;
                 T diag = row[0];
                 row[0] = row[0] - gb;
+                // The left neighbour rides in a register: clang re-loaded row[c-1] just
+                // stored, a store-forward on the serial chain.
+                T left = row[0];
                 for (int c = 1; c <= W; ++c) {
                     T v = diag + srow[bc[jb + S * c]];
-                    const T u = row[c] - gb, l = row[c - 1] - ga;
+                    const T u = row[c] - gb, l = left - ga;
                     if (v < u) v = u;
                     if (v < l) v = l;
                     diag = row[c];
                     row[c] = v;
+                    left = v;
                 }
             }
         };
@@ -3157,13 +3161,14 @@ private:
             const T* srow = sub_row_(i0 + r);
             const uint8_t* bc = b_idx_.data();
             const T gb = ge_b, ga = ge_a;
+            T left = cur[0];   // in a register, as in lhb_sweep
             for (int c = 1; c <= W; ++c) {
                 T v = prev[c - 1] + srow[bc[j0 + c - 1]];
                 unsigned char k = 0;
-                const T u = prev[c] - gb, l = cur[c - 1] - ga;
+                const T u = prev[c] - gb, l = left - ga;
                 if (v < u) { v = u; k = 1; }
                 if (v < l) { v = l; k = 2; }
-                cur[c] = v; d[c] = k;
+                cur[c] = v; d[c] = k; left = v;
             }
             std::swap(prev, cur);
         }
