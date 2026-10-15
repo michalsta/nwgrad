@@ -57,6 +57,7 @@ static constexpr double kSpLossTol = 0x1p-45;
 // chain (one FMA latency per four cells); y[j..j+2] hang off it.  Reassociated — the
 // soft path is tolerance-tested.
 static inline void sp_carry_fwd(double* y, const double* u, int lo, int hi, double e) noexcept {
+    NWGRAD_SP_FMA_BODY   // clang: a pragma reaches only its own scope, not the caller's
     double c = y[lo - 1];
     const double e2 = e * e, e3 = e2 * e, e4 = e2 * e2;
     int j = lo;
@@ -73,6 +74,7 @@ static inline void sp_carry_fwd(double* y, const double* u, int lo, int hi, doub
 }
 // y[j] += e·y[j+1], j = hi..lo, four cells per carry step.
 static inline void sp_carry_bwd(double* y, int lo, int hi, double e) noexcept {
+    NWGRAD_SP_FMA_BODY   // clang: a pragma reaches only its own scope, not the caller's
     double c = y[hi + 1];
     const double e2 = e * e, e3 = e2 * e, e4 = e2 * e2;
     int j = hi;
@@ -92,6 +94,7 @@ static inline void sp_carry_bwd(double* y, int lo, int hi, double e) noexcept {
 // Scales [lo, hi] of the given rows (nullptr skips) and mx; returns the exponent removed.
 static inline int sp_lazy(double& mx, int lo, int hi, bool& bad, double* r0, double* r1 = nullptr,
                           double* r2 = nullptr, double* r3 = nullptr) noexcept {
+    NWGRAD_SP_FMA_BODY
     if (!(mx <= std::numeric_limits<double>::max())) { bad = true; return 0; }
     if (mx == 0.0 || (mx <= 0x1p256 && mx >= 0x1p-256)) return 0;
     const int k = std::ilogb(mx);
@@ -105,6 +108,7 @@ static inline int sp_lazy(double& mx, int lo, int hi, bool& bad, double* r0, dou
 // are below DMIN in stored units (x2^-k where a rescale scaled UP), and act through the
 // other direction's actual row max times the row's posterior factor g.
 static inline double sp_loss(int n, int kf, int kb, double mxf, double mxb, double g) noexcept {
+    NWGRAD_SP_FMA_BODY
     const double lf = kf < 0 ? std::ldexp(1.0, -kf) : 1.0;
     const double lb = kb < 0 ? std::ldexp(1.0, -kb) : 1.0;
     return 32.0 * (n + 1) * std::numeric_limits<double>::min() * (lf * mxb + lb * mxf) * g;
@@ -118,6 +122,7 @@ static inline double sp_post(int e, double izr, bool& bad) noexcept {
 // row i-1 itself), times g.
 static inline void sp_scatter(const SoftPairJob& J, const double* tmp, size_t crow, int lo, int hi,
                               double g) noexcept {
+    NWGRAD_SP_FMA_BODY
     const int na = J.nalpha;
     double* srow = J.srow;
     for (int c = 0; c < na; ++c) srow[c] = 0.0;
