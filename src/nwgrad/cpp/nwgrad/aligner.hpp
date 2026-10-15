@@ -1456,6 +1456,13 @@ private:
     // re-derivation happens in the SAME precision the forward pass rounded in — which is
     // load-bearing for bit-exactness when T=float.  For T=double it equals sub().
     T subT(int i, int j) const noexcept { return blkT_[sub_off(i, j)]; }
+    // DP row i's substitution row (subT(i, j) == sub_row_(i)[b[j-1]]), for hoisting the
+    // row lookup out of a column loop.
+    const T* sub_row_(int i) const noexcept {
+        const size_t r = tr_ ? static_cast<size_t>(rs_[static_cast<size_t>(i) - 1])
+                             : static_cast<size_t>(a_idx_[static_cast<size_t>(i) - 1]);
+        return blkT_ + r * static_cast<size_t>(nalpha_);
+    }
 
     // The characters behind those indices — used only to render alignments.
     char sym_a(int i) const noexcept {
@@ -2097,36 +2104,37 @@ private:
 
         best_i_ = 0; best_j_ = 0;
         double best_local = 0.0;
+        // Row pointers, not rat()/at(): run_viterbi cleared the layout flags, so H is
+        // row-major here, and cell_index()'s layout switch inside the loop is dead weight
+        // that gcc unswitches and clang does not (clang/gcc 1.77x on this fill).  The
+        // gap costs and the substitution row are hoisted per row for the same reason;
+        // same operands, same order, so the table is unchanged bit for bit.
+        const uint8_t* bcode = b_idx_.data();
         for (int i = 1; i <= m_; ++i) {
             T ge_b_r, ge_a_r;
-            const T* srow = nullptr;
+            const T* srow;
             if constexpr (Tr) {
                 ge_b_r = tgeb_[static_cast<size_t>(i)]; ge_a_r = tgea_[static_cast<size_t>(i)];
                 srow = blkT_ + static_cast<size_t>(rs_[static_cast<size_t>(i) - 1]) * static_cast<size_t>(nalpha_);
             } else {
-                ge_b_r = static_cast<T>(params_->gap_extend_b); ge_a_r = static_cast<T>(params_->gap_extend_a);
+                ge_b_r = static_cast<T>(params_->gap_extend_b);   // gap in B (advance i)
+                ge_a_r = static_cast<T>(params_->gap_extend_a);   // gap in A (advance j)
+                srow = blkT_ + static_cast<size_t>(a_idx_[static_cast<size_t>(i) - 1]) * static_cast<size_t>(nalpha_);
             }
-            for (int j = jlo(i); j <= jhi(i); ++j) {
-                T v;
-                if constexpr (Tr) {
-                    v = std::max({
-                        rat(buf.H, i-1, j-1) + srow[b_idx_[static_cast<size_t>(j) - 1]],
-                        rat(buf.H, i-1, j)   - ge_b_r,
-                        rat(buf.H, i,   j-1) - ge_a_r,
-                    });
-                } else {
-                    (void)srow; (void)ge_b_r; (void)ge_a_r;
-                    v = std::max({
-                        rat(buf.H, i-1, j-1) + subTu(i, j),
-                        rat(buf.H, i-1, j)   - static_cast<T>(params_->gap_extend_b),  // gap in B (advance i)
-                        rat(buf.H, i,   j-1) - static_cast<T>(params_->gap_extend_a),  // gap in A (advance j)
-                    });
-                }
+            const T* hp = buf.H.data() + static_cast<size_t>(i - 1) * stride_;
+            T*       hc = buf.H.data() + static_cast<size_t>(i) * stride_;
+            const int j1 = jhi(i);
+            for (int j = jlo(i); j <= j1; ++j) {
+                T v = std::max({
+                    hp[j-1] + srow[bcode[static_cast<size_t>(j) - 1]],
+                    hp[j]   - ge_b_r,
+                    hc[j-1] - ge_a_r,
+                });
                 if constexpr (AM == AlignMode::Local) {
                     v = std::max(v, static_cast<T>(0));
                     if (v > best_local) { best_local = v; best_i_ = i; best_j_ = j; }
                 }
-                at(buf.H, i, j) = v;
+                hc[j] = v;
             }
         }
 
@@ -3099,21 +3107,32 @@ private:
         T ge_b = static_cast<T>(params_->gap_extend_b);
         row[0] = static_cast<T>(0);
         for (int c = 1; c <= W; ++c) row[c] = row[c - 1] - ge_a;
-        for (int r = 1; r <= i1 - i0; ++r) {
-            const int i = rev ? i1 - r + 1 : i0 + r;   // 1-based DP row of A[i-1]
-            if (tr_) { ge_b = tgeb_[static_cast<size_t>(i)]; ge_a = hb_ge_a(rev ? i - 1 : i); }
-            T diag = row[0];
-            row[0] = row[0] - ge_b;
-            for (int c = 1; c <= W; ++c) {
-                const int j = rev ? j1 - c + 1 : j0 + c;
-                T v = diag + (tr_ ? subT(i, j) : subTu(i, j));
-                const T u = row[c] - ge_b, l = row[c - 1] - ge_a;
-                if (v < u) v = u;
-                if (v < l) v = l;
-                diag = row[c];
-                row[c] = v;
+        // The direction and the substitution row are resolved outside the column loop
+        // (gcc unswitched them, clang did not: clang/gcc 1.65x); the same arithmetic.
+        auto sweep = [&](auto step) {
+            constexpr int S = decltype(step)::value;
+            for (int r = 1; r <= i1 - i0; ++r) {
+                const int i = S < 0 ? i1 - r + 1 : i0 + r;   // 1-based DP row of A[i-1]
+                if (tr_) { ge_b = tgeb_[static_cast<size_t>(i)]; ge_a = hb_ge_a(S < 0 ? i - 1 : i); }
+                const T* srow = sub_row_(i);
+                // B code of column c: forward b[j0 + c - 1], reverse b[j1 - c].
+                const uint8_t* bc = b_idx_.data();
+                const int jb = S < 0 ? j1 : j0 - 1;
+                const T gb = ge_b, ga = ge_a;
+                T diag = row[0];
+                row[0] = row[0] - gb;
+                for (int c = 1; c <= W; ++c) {
+                    T v = diag + srow[bc[jb + S * c]];
+                    const T u = row[c] - gb, l = row[c - 1] - ga;
+                    if (v < u) v = u;
+                    if (v < l) v = l;
+                    diag = row[c];
+                    row[c] = v;
+                }
             }
-        }
+        };
+        if (rev) sweep(std::integral_constant<int, -1>{});
+        else     sweep(std::integral_constant<int, 1>{});
         std::copy(row, row + W + 1, out);
     }
 
@@ -3135,10 +3154,13 @@ private:
             unsigned char* d = D + static_cast<std::size_t>(r) * st;
             if (tr_) { ge_a = tgea_[static_cast<size_t>(i0 + r)]; ge_b = tgeb_[static_cast<size_t>(i0 + r)]; }
             cur[0] = prev[0] - ge_b; d[0] = 1;
+            const T* srow = sub_row_(i0 + r);
+            const uint8_t* bc = b_idx_.data();
+            const T gb = ge_b, ga = ge_a;
             for (int c = 1; c <= W; ++c) {
-                T v = prev[c - 1] + (tr_ ? subT(i0 + r, j0 + c) : subTu(i0 + r, j0 + c));
+                T v = prev[c - 1] + srow[bc[j0 + c - 1]];
                 unsigned char k = 0;
-                const T u = prev[c] - ge_b, l = cur[c - 1] - ge_a;
+                const T u = prev[c] - gb, l = cur[c - 1] - ga;
                 if (v < u) { v = u; k = 1; }
                 if (v < l) { v = l; k = 2; }
                 cur[c] = v; d[c] = k;
