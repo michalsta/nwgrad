@@ -38,7 +38,10 @@
 // among them.  IEEE `maximum` is a reduction LLVM vectorizes without fast-math, and
 // equals the select here: the values are probability mass, never NaN or -0.  gcc
 // vectorizes the select (and would call libm for fmax), so it keeps it.
-#  if defined(__clang__) && defined(__has_builtin)
+// Not on x86 below SSE4.1: without blendvpd, clang lowers IEEE maximum (NaN and +-0
+// ordering) to and/andn/or sequences that cost more than the scalar loop (measured
+// 1.07-1.15x slower at sse2 / scalar_fallback); NEON's fmax is maximum itself.
+#  if defined(__clang__) && defined(__has_builtin) && (!(defined(__x86_64__) || defined(__i386__)) || defined(__SSE4_1__))
 #    if __has_builtin(__builtin_elementwise_maximum)
 #      define NWGRAD_SP_VMAX(m, v) __builtin_elementwise_maximum((m), (v))
 #    endif
