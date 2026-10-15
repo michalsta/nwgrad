@@ -89,6 +89,11 @@ def test_constructor_errors():
         nwgrad.SeqPairBatch(["AC"], ["AC"], P, tracks=[[0, 2]])
     with pytest.raises(ValueError, match="unknown gap_model"):
         nwgrad.SeqPairBatch(["AC"], ["AC"], P, gap_model="convex")
+    for make in (lambda: nwgrad.SeqPairBatch(["AC"], ["AC"], P, n_threads=-1),
+                 lambda: nwgrad.SeqPairBatchDouble([], [], P, n_threads=-8),
+                 lambda: nwgrad.SeqPairBatch(-1)):   # pairless (streaming) form
+        with pytest.raises(ValueError, match=r"n_threads must be >= 0 .*got -"):
+            make()
 
 
 def test_pairless_form_and_add_many_compat():

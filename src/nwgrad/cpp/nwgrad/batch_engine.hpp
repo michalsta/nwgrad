@@ -99,7 +99,12 @@ struct BatchSettings {
         soft_guide_posterior = posterior;
     }
     void set_fill(bool rowwise, bool inter) noexcept { rowwise_full = rowwise; inter_fill = inter; }
-    void set_n_threads(int n) noexcept { n_threads = n > 0 ? n : default_thread_count(); }
+    void set_n_threads(int n) {
+        if (n < 0)
+            throw std::invalid_argument("nwgrad: n_threads must be >= 0 (0: the default thread count), got " +
+                                        std::to_string(n));
+        n_threads = n > 0 ? n : default_thread_count();
+    }
 };
 
 template<class T, GapModel GM, AlignMode AM>
@@ -140,7 +145,7 @@ public:
     TracebackMode traceback() const noexcept { return s_.traceback; }
     TracebackMode traceback_resolved() const noexcept { return tb_resolved_; }
 
-    void set_n_threads(int n) noexcept { s_.set_n_threads(n); }
+    void set_n_threads(int n) { s_.set_n_threads(n); }
     void set_hb_cutoff(int rows) { s_.set_hb_cutoff(rows); }
     void set_fill(bool rowwise, bool inter) noexcept { s_.set_fill(rowwise, inter); }
     // soft_impl changes results within tolerance only and invalidates nothing (as

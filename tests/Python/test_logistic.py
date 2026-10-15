@@ -48,6 +48,15 @@ def test_results_do_not_depend_on_threads():
     assert len({L.probabilities(s, 0.3, n_threads=t).tobytes() for t in (1, 3, 8)}) == 1
 
 
+def test_negative_n_threads_raise():
+    s, y = data(5)
+    for n in (s, s[:0]):
+        with pytest.raises(ValueError, match="n_threads must be >= 0"):
+            L.probabilities(n, 0.3, n_threads=-1)
+    with pytest.raises(ValueError, match="n_threads must be >= 0"):
+        L.fit_alpha(s, y, -1.0, n_threads=-2)
+
+
 def test_soft_labels_fit_the_root_of_the_cross_entropy_gradient():
     """Labels are not checked, and soft labels in [0, 1] are supported as such:
     alpha is the root of sum(y - p) for fractional y too."""

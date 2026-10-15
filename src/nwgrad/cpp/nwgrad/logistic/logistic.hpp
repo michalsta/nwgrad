@@ -45,7 +45,10 @@ inline constexpr size_t BLOCK = 4096;
 // The logistic function, in scipy.special.expit's form.
 inline double expit(double x) noexcept { return 1.0 / (1.0 + std::exp(-x)); }
 
-inline int resolve_threads(int n_threads) noexcept {
+inline int resolve_threads(int n_threads) {
+    if (n_threads < 0)
+        throw std::invalid_argument("nwgrad: n_threads must be >= 0 (0: the default thread count), got " +
+                                    std::to_string(n_threads));
     return n_threads > 0 ? n_threads : default_thread_count();
 }
 
@@ -83,6 +86,7 @@ namespace detail {
 // Run fn(block_index, lo, hi) for every block, in parallel.
 template<class Fn>
 void for_blocks(size_t n, int n_threads, Fn&& fn) {
+    const int nt = resolve_threads(n_threads);   // validates, even with nothing to do
     const size_t nblocks = (n + BLOCK - 1) / BLOCK;
     if (nblocks == 0) return;
     std::atomic<size_t> next{0};
@@ -90,7 +94,7 @@ void for_blocks(size_t n, int n_threads, Fn&& fn) {
         for (size_t b; (b = next.fetch_add(1, std::memory_order_relaxed)) < nblocks; )
             fn(b, b * BLOCK, std::min(n, (b + 1) * BLOCK));
     };
-    run_workers_guarded(std::min<int>(resolve_threads(n_threads), static_cast<int>(nblocks)),
+    run_workers_guarded(std::min<int>(nt, static_cast<int>(nblocks)),
                         worker);
 }
 

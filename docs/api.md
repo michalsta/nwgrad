@@ -346,7 +346,8 @@ batch for [`align()`](#seqpairbatch) only (streaming: nothing kept per pair).
 process may run on — its affinity mask, so `taskset` and container CPU pinning are
 respected (a cgroup CPU *quota* is not) — falling back to the allowed logical count
 where the topology cannot be read: the DP is stall-bound, so SMT siblings contend and
-the logical count measured up to 1.44× slower.
+the logical count measured up to 1.44× slower. A negative `n_threads` raises
+`ValueError` (it used to mean the default, silently).
 
 **Methods:**
 
@@ -454,7 +455,8 @@ A binary logistic link over per-pair alignment scores, P(y = 1) = expit(α + sco
 likelihood [DiscrimAlign](https://github.com/BioGeMT/DiscrimAlign) maximises. It lives in
 its own module (`src/nwgrad/cpp/nwgrad/logistic/`) and uses only `SeqPairBatch`'s public
 interface. Every sum is taken over fixed blocks of 4096 elements and the block sums are
-added in order, so results do not depend on `n_threads` (0 = the default thread count).
+added in order, so results do not depend on `n_threads` (0 = the default thread count; negative raises
+`ValueError`).
 `labels` are float64 arrays with each label in [0, 1]: 0/1 class labels, or soft labels
 (target probabilities, for which the likelihood is the Bernoulli cross-entropy). They must
 not be all 0 or all 1, or the likelihood has no finite maximum in α. **Labels are not

@@ -156,6 +156,20 @@ TEST_CASE("batch build: length mismatch throws", "[batch_build]") {
                       std::invalid_argument);
 }
 
+TEST_CASE("batch build: negative n_threads throws", "[batch_build]") {
+    auto p = aa_params();
+    REQUIRE_THROWS_AS(SeqPairBatch(views(AA_A), views(AA_B), p,
+                                   GapModel::Affine, AlignMode::Local, GradMode::Hard, -1),
+                      std::invalid_argument);
+    REQUIRE_THROWS_AS(SeqPairBatch(GapModel::Affine, AlignMode::Local, GradMode::Hard, -4),
+                      std::invalid_argument);
+    SeqPairBatch batch(GapModel::Affine, AlignMode::Local, GradMode::Hard, 2);
+    REQUIRE_THROWS_AS(batch.set_n_threads(-1), std::invalid_argument);
+    CHECK(batch.n_threads() == 2);
+    batch.set_n_threads(0);
+    CHECK(batch.n_threads() >= 1);   // 0: the default thread count, resolved
+}
+
 TEST_CASE("batch build: bad character throws from a worker", "[batch_build]") {
     // Enough pairs that several threads are mid-construction when one throws:
     // what the others encoded must all be released, not leaked.
