@@ -147,6 +147,24 @@ static std::vector<uint16_t> to_track(const nb::handle& obj, const char* what) {
     try {
         v = nb::cast<std::vector<int64_t>>(obj);
     } catch (const nb::cast_error&) {
+        // Integers outside int64 fail the cast too: name the value, not the type.
+        if (PySequence_Check(obj.ptr())) {
+            size_t k = 0;
+            for (nb::handle h : obj) {
+                PyObject* ix = PyNumber_Index(h.ptr());
+                if (!ix) {
+                    PyErr_Clear();
+                    break;
+                }
+                const nb::object o = nb::steal(ix);
+                int overflow = 0;
+                PyLong_AsLongLongAndOverflow(o.ptr(), &overflow);
+                if (overflow)
+                    throw nb::value_error((std::string("nwgrad: ") + what + "[" + std::to_string(k) + "] = " +
+                                           nb::str(o).c_str() + " is not a parameter set index").c_str());
+                ++k;
+            }
+        }
         throw nb::type_error((std::string("nwgrad: ") + what +
                               " must be a sequence of integers (parameter set indices) or None").c_str());
     }
@@ -160,7 +178,8 @@ static std::vector<uint16_t> to_track(const nb::handle& obj, const char* what) {
     return out;
 }
 
-// Element q of a 1-D integer array of any width and signedness, widened.
+// Element q of a 1-D integer array of any width and signedness, widened.  A uint64
+// above INT64_MAX comes back as -1 (rejected all the same); flat_str prints it.
 static int64_t flat_at(const nb::ndarray<nb::ro, nb::ndim<1>, nb::device::cpu>& arr, size_t q) {
     const auto* base = static_cast<const char*>(arr.data()) + static_cast<int64_t>(q) * arr.stride(0) *
                        static_cast<int64_t>(arr.dtype().bits / 8);
@@ -175,6 +194,14 @@ static int64_t flat_at(const nb::ndarray<nb::ro, nb::ndim<1>, nb::device::cpu>& 
             return u > static_cast<uint64_t>(INT64_MAX) ? -1 : static_cast<int64_t>(u);
         }
     }
+}
+
+// Element q as written in the array, for error messages.
+static std::string flat_str(const nb::ndarray<nb::ro, nb::ndim<1>, nb::device::cpu>& arr, size_t q) {
+    if (arr.dtype().code == static_cast<uint8_t>(nb::dlpack::dtype_code::UInt) && arr.dtype().bits == 64)
+        return std::to_string(*reinterpret_cast<const uint64_t*>(static_cast<const char*>(arr.data()) +
+                                                                 static_cast<int64_t>(q) * arr.stride(0) * 8));
+    return std::to_string(flat_at(arr, q));
 }
 
 // A tracks argument, converted: None; one sequence per pair (an entry may be None for
@@ -227,7 +254,7 @@ static TracksArg to_tracks(const nb::handle& obj, const std::vector<size_t>& len
             const int64_t v = flat_at(arr, q);
             if (v < 0 || v >= SubstMatrix::kMaxSets)
                 throw nb::value_error((std::string("nwgrad: ") + what + "[" + std::to_string(q) + "] = " +
-                                       std::to_string(v) + " is not a parameter set index").c_str());
+                                       flat_str(arr, q) + " is not a parameter set index").c_str());
             out.own[q] = static_cast<uint16_t>(v);
         }
         out.flat = out.own.data();

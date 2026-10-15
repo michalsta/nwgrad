@@ -299,6 +299,13 @@ def test_bad_tracks_raise():
         nwgrad.nw_grad_double("AC", "AC", P, track=[0, -1])
     with pytest.raises(TypeError):
         nwgrad.nw_grad_double("AC", "AC", P, track="xy")
+    for big in (2**63, -(2**63) - 1, 2**70):   # beyond int64: a range error, not a type error
+        with pytest.raises(ValueError, match=rf"track\[1\] = {big} is not a parameter set index"):
+            nwgrad.nw_grad_double("AC", "AC", P, track=[0, big])
+    with pytest.raises(ValueError, match=rf"track\[1\] = {2**63} is not a parameter set index"):
+        nwgrad.nw_grad_double("AC", "AC", P, track=[0, np.uint64(2**63)])   # a numpy integer
+    with pytest.raises(TypeError, match="sequence of integers"):
+        nwgrad.nw_grad_double("AC", "AC", P, track=[0, 1.5])
 
 
 def test_default_track_is_set_zero():

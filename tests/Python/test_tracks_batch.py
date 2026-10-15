@@ -526,6 +526,9 @@ def test_flat_track_array_validation():
         make(["AC", "GTA"], tracks=np.array([0, 1, 2, 3, 0]))
     with pytest.raises(TypeError, match="integer dtype"):
         make(["AC", "GTA"], tracks=np.zeros(5))
+    for big in (2**63, 2**64 - 1):   # read as -1 internally; the message names the value
+        with pytest.raises(ValueError, match=rf"tracks\[3\] = {big} is not a parameter set"):
+            make(["AC", "GTA"], tracks=np.array([0, 1, 2, big, 0], dtype=np.uint64))
     # a 2-D array is still one row per pair (all of A's lengths equal)
     b = make(["AC", "GT"], tracks=np.array([[0, 1], [2, 2]]))
     assert b[1].track == [2, 2]
