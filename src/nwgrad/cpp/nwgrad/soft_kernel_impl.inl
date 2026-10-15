@@ -32,6 +32,20 @@
 #    define NWGRAD_SP_FMA_BODY
 #  endif
 #  define NWGRAD_SP_PRAGMA_(x) _Pragma(#x)
+// Row maxima as reductions.  clang does not recognise `v > m ? v : m` as an FP max
+// reduction without no-NaN/no-signed-zero flags, so every loop carrying one stayed
+// scalar under clang (omp simd included: -Wpass-failed) — the fused backward pass
+// among them.  IEEE `maximum` is a reduction LLVM vectorizes without fast-math, and
+// equals the select here: the values are probability mass, never NaN or -0.  gcc
+// vectorizes the select (and would call libm for fmax), so it keeps it.
+#  if defined(__clang__) && defined(__has_builtin)
+#    if __has_builtin(__builtin_elementwise_maximum)
+#      define NWGRAD_SP_VMAX(m, v) __builtin_elementwise_maximum((m), (v))
+#    endif
+#  endif
+#  ifndef NWGRAD_SP_VMAX
+#    define NWGRAD_SP_VMAX(m, v) ((v) > (m) ? (v) : (m))
+#  endif
 #  define NWGRAD_SP_SUM(...) NWGRAD_SP_PRAGMA_(omp simd reduction(+:__VA_ARGS__))
 #  define NWGRAD_SP_MAX(v) NWGRAD_SP_PRAGMA_(omp simd reduction(max:v))
 #endif
@@ -174,7 +188,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear_t(SoftPairJob& J) noexcept {
     S[0] = 0;
     {
         double mx = 0.0;
-        for (int j = J.slo[0]; j <= J.shi[0]; ++j) mx = F[j] > mx ? F[j] : mx;
+        for (int j = J.slo[0]; j <= J.shi[0]; ++j) mx = NWGRAD_SP_VMAX(mx, F[j]);
         mf[0] = mx;
         if (L) { double s = 0.0; for (int j = J.jlo0[0]; j <= J.jhi0[0]; ++j) s += F[j]; rs[0] = s; }
     }
@@ -191,7 +205,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear_t(SoftPairJob& J) noexcept {
         if (lo <= hi) sp_carry_fwd(r, r, lo, hi, ea);
         double mx = 0.0;
         NWGRAD_SP_MAX(mx)
-        for (int j = J.slo[i]; j <= J.shi[i]; ++j) mx = r[j] > mx ? r[j] : mx;
+        for (int j = J.slo[i]; j <= J.shi[i]; ++j) mx = NWGRAD_SP_VMAX(mx, r[j]);
         S[i] = S[i - 1] + sp_lazy(mx, J.slo[i], J.shi[i], bad, r);
         if (bad) return;
         mf[i] = mx;
@@ -250,7 +264,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear_t(SoftPairJob& J) noexcept {
             NWGRAD_SP_PRAGMA_(omp simd reduction(+:sa, sb) reduction(max:mx))
             for (int j = j1; j <= hi0; ++j) {
                 const double b = cb[j];
-                mx = b > mx ? b : mx;
+                mx = NWGRAD_SP_VMAX(mx, b);
                 sa += Fi[j - 1] * b;
                 sb += Fp[j] * b;
                 t[j] = Fp[j - 1] * pr[j] * b;
@@ -259,7 +273,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear_t(SoftPairJob& J) noexcept {
             NWGRAD_SP_PRAGMA_(omp simd reduction(+:sa) reduction(max:mx))
             for (int j = j1; j <= hi0; ++j) {
                 const double b = cb[j];
-                mx = b > mx ? b : mx;
+                mx = NWGRAD_SP_VMAX(mx, b);
                 sa += Fi[j - 1] * b;
             }
         }
@@ -339,7 +353,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine_t(SoftPairJob& J) noexcept {
         double mx = 0.0;
         for (int j = J.slo[0]; j <= J.shi[0]; ++j) {
             tp[j] = FM[j] + FX[j] + FY[j];
-            mx = tp[j] > mx ? tp[j] : mx;
+            mx = NWGRAD_SP_VMAX(mx, tp[j]);
         }
         mf[0] = mx;
     }
@@ -379,7 +393,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine_t(SoftPairJob& J) noexcept {
         for (int j = J.slo[i]; j <= J.shi[i]; ++j) {
             const double v = rM[j] + rX[j] + rY[j];
             t[j] = v;
-            mx = v > mx ? v : mx;
+            mx = NWGRAD_SP_VMAX(mx, v);
         }
         S[i] = S[i - 1] + sp_lazy(mx, J.slo[i], J.shi[i], bad, rM, rX, rY, tp);
         if (bad) return;
@@ -472,7 +486,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine_t(SoftPairJob& J) noexcept {
                 const double mv = bM[j] + h, xv = bX[j] + h;
                 bM[j] = mv; bX[j] = xv;
                 const double tot = mv + xv + y;
-                mx = tot > mx ? tot : mx;
+                mx = NWGRAD_SP_VMAX(mx, tot);
                 sx += fX[j] * xv;
                 sy += fY[j] * y;
                 so += (fM[j - 1] + fX[j - 1]) * y;
@@ -487,7 +501,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine_t(SoftPairJob& J) noexcept {
                 const double mv = bM[j] + h, xv = bX[j] + h;
                 bM[j] = mv; bX[j] = xv;
                 const double tot = mv + xv + y;
-                mx = tot > mx ? tot : mx;
+                mx = NWGRAD_SP_VMAX(mx, tot);
                 sy += fY[j] * y;
                 so += (fM[j - 1] + fX[j - 1]) * y;
             }
