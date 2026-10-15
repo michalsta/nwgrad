@@ -56,8 +56,8 @@ bytes.
 ## Kernel selection
 
 `kernel=` picks the Viterbi backend: `"auto"` (default — the strongest SIMD level
-the CPU runs), `"scalar_fallback"`, or a named level: `"sse2"`, `"avx2"`, `"avx512"`
-(x86) or `"neon"` (ARM). Every level is **bit-exact** with `"scalar_fallback"`
+the CPU runs), `"scalar_fallback"`, or a named level: `"sse2"`, `"sse4"` (x86-64-v2:
+SSE4.2 + POPCNT), `"avx2"`, `"avx512"` (x86) or `"neon"` (ARM). Every level is **bit-exact** with `"scalar_fallback"`
 (same tables, paths and gradients), so this is purely a speed knob. An unknown
 name, or a level this CPU cannot run, raises. It affects the Viterbi (hard / none)
 path and the inter-pair fills; a single linear-gap pair has no SIMD kernel (only the
