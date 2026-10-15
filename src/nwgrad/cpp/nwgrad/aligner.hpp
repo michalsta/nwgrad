@@ -2203,7 +2203,8 @@ private:
                 unsigned char c = static_cast<unsigned char>(d[j] + tl * (2 - d[j]));
                 if constexpr (local) {
                     v = std::max(v, static_cast<T>(0));
-                    c = (v <= static_cast<T>(0)) ? static_cast<unsigned char>(3) : c;
+                    // c is 0..2: OR-ing 3 sets the stop code without the branch gcc made
+                    c = static_cast<unsigned char>(c | (3u * static_cast<unsigned>(v <= static_cast<T>(0))));
                     if (v > best_local) { best_local = v; bi = i; bj = j; }
                 }
                 cv[j] = v; d[j] = c;
@@ -2320,12 +2321,13 @@ private:
         unsigned char* dY = buf.DY.data();
 
         // Same three-way argmax the traceback runs, in one place so the two cannot drift.
-        // Branch-free (the values are finite or -inf, never NaN, so !(vm >= vx) is
-        // vm < vx): gcc compiled the && / ?: form to branches, mispredicted on real
-        // alignments — its scalar pointer fill ran 2-3x slower than clang's selects.
+        // Selects between constants on one compare each (the values are finite or -inf,
+        // never NaN, so vm >= max(vx, vy) is vm >= vx && vm >= vy): gcc compiled the
+        // && / ?: form to branches, mispredicted on real alignments — its scalar pointer
+        // fill ran 2-3x slower than clang's selects.
         auto pick = [](T vm, T vx, T vy) -> unsigned char {
-            const unsigned not_m = static_cast<unsigned>(vm < vx) | static_cast<unsigned>(vm < vy);
-            return static_cast<unsigned char>(not_m * (2u - static_cast<unsigned>(vx >= vy)));
+            const unsigned char kxy = vx >= vy ? 1 : 2;
+            return vm >= std::max(vx, vy) ? static_cast<unsigned char>(0) : kxy;
         };
 
         // ── row 0 ────────────────────────────────────────────────────────────
@@ -2388,7 +2390,9 @@ private:
                         else if (x_val >= y_val)                    best_tbl_ = TBTable::X;
                         else                                         best_tbl_ = TBTable::Y;
                     }
-                    if (m_val <= static_cast<T>(0)) km = 3;   // traceback stops here
+                    // traceback stops here; km is 0..2, so OR-ing 3 sets 3 (no branch: gcc
+                    // branched on the sign, a coin toss on unrelated sequences)
+                    km = static_cast<unsigned char>(km | (3u * static_cast<unsigned>(m_val <= static_cast<T>(0))));
                 }
 
                 cM[k] = m_val; cX[k] = x_val; cY[k] = y_val;
