@@ -3395,15 +3395,21 @@ private:
             }
             cM[0] = local ? static_cast<T>(0) : ninf;
             cY[0] = ninf;
+            // The left cell (j-1) rides in registers: read back from cM/cX/cY (which may
+            // alias the p rows as far as the compiler knows), clang re-loaded the values
+            // it had just stored, a store-forward on the Y chain.
+            T lM = cM[0], lX = cX[0], lY = cY[0];
+            const uint8_t* bcode = b_idx_.data();
             for (int j = 1; j <= n_; ++j) {
-                T m_val = std::max({pM[j-1], pX[j-1], pY[j-1]}) + sub[b_idx_[j - 1]];
+                T m_val = std::max({pM[j-1], pX[j-1], pY[j-1]}) + sub[bcode[j - 1]];
                 const T x_val = std::max({pM[j] - go_b - ge_b, pX[j] - ge_b, pY[j] - go_b - ge_b});
-                const T y_val = std::max({cM[j-1] - go_a - ge_a, cX[j-1] - go_a - ge_a, cY[j-1] - ge_a});
+                const T y_val = std::max({lM - go_a - ge_a, lX - go_a - ge_a, lY - ge_a});
                 if constexpr (local) {
                     m_val = std::max(m_val, static_cast<T>(0));
                     best = std::max(best, std::max({m_val, x_val, y_val}));
                 }
                 cM[j] = m_val; cX[j] = x_val; cY[j] = y_val;
+                lM = m_val; lX = x_val; lY = y_val;
             }
             std::swap(pM, cM); std::swap(pX, cX); std::swap(pY, cY);
         }
@@ -3437,13 +3443,16 @@ private:
                 cur[0] = local ? static_cast<T>(0) : -static_cast<T>(i) * ge_b;
                 sub = blkT_ + static_cast<std::size_t>(a_idx_[i - 1]) * nalpha_;
             }
+            T left = cur[0];   // in a register, as in score_affine_scalar_impl
+            const uint8_t* bcode = b_idx_.data();
             for (int j = 1; j <= n_; ++j) {
-                T v = std::max({prev[j-1] + sub[b_idx_[j - 1]], prev[j] - ge_b, cur[j-1] - ge_a});
+                T v = std::max({prev[j-1] + sub[bcode[j - 1]], prev[j] - ge_b, left - ge_a});
                 if constexpr (local) {
                     v = std::max(v, static_cast<T>(0));
                     if (v > best) best = v;
                 }
                 cur[j] = v;
+                left = v;
             }
             std::swap(prev, cur);
         }
