@@ -2320,9 +2320,12 @@ private:
         unsigned char* dY = buf.DY.data();
 
         // Same three-way argmax the traceback runs, in one place so the two cannot drift.
+        // Branch-free (the values are finite or -inf, never NaN, so !(vm >= vx) is
+        // vm < vx): gcc compiled the && / ?: form to branches, mispredicted on real
+        // alignments — its scalar pointer fill ran 2-3x slower than clang's selects.
         auto pick = [](T vm, T vx, T vy) -> unsigned char {
-            if (vm >= vx && vm >= vy) return 0;
-            return (vx >= vy) ? 1 : 2;
+            const unsigned not_m = static_cast<unsigned>(vm < vx) | static_cast<unsigned>(vm < vy);
+            return static_cast<unsigned char>(not_m * (2u - static_cast<unsigned>(vx >= vy)));
         };
 
         // ── row 0 ────────────────────────────────────────────────────────────
