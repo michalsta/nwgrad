@@ -137,12 +137,20 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_affine(InterSoftJob& J) noexcept {
         for (int l = 0; l < IW; ++l) ro[l] = isj_row<Tr>(J, l, i) * na;
         for (int c = 0; c < na; ++c)
             P[c] = ivlanes<ivd, IW>([&](int l) { return J.es[ro[l] + c]; });
-        for (int j = 1; j <= n; ++j) {
-            ivd s = z;
-            const ivl* mk = eqm + static_cast<size_t>(j) * na;
-            for (int c = 0; c < na; ++c) s = ivsel(mk[c], P[c], s);
-            E[j] = s;
-        }
+        // The letter loop with a compile-time trip count for DNA/RNA (na = 4): clang left
+        // the runtime-na loop rolled, P[] on the stack (10 instructions a letter).
+        auto cols = [&](auto NAc) {
+            constexpr int NA = decltype(NAc)::value;
+            const int nn = NA > 0 ? NA : na;
+            for (int j = 1; j <= n; ++j) {
+                ivd s = z;
+                const ivl* mk = eqm + static_cast<size_t>(j) * nn;
+                for (int c = 0; c < nn; ++c) s = ivsel(mk[c], P[c], s);
+                E[j] = s;
+            }
+        };
+        if (na == 4) cols(std::integral_constant<int, 4>{});
+        else         cols(std::integral_constant<int, 0>{});
     };
     // LAZY rescale.  A lane is rescaled only when its row max leaves [2^-256, 2^256]
     // (or is exactly 0: nothing to do); kv[l] receives the exponent removed (0 when
@@ -312,6 +320,12 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_affine(InterSoftJob& J) noexcept {
             return std::make_pair(mv, xv);
         };
         if (i >= 1) {
+            // The per-letter sums at a compile-time trip count for nm = 4 (DNA/RNA), so
+            // acc[0..3] can live in registers; with a runtime nm both compilers kept the
+            // loop rolled over acc[] in memory, in the hottest loop of the pass.
+            auto cols = [&](auto NMc) {
+            constexpr int NM = decltype(NMc)::value;
+            const int k = NM >= 0 ? NM : nm;
             for (int j = n; j >= 1; --j) {
                 const auto [mv, xv] = cell(j);
                 const ivd y = c;
@@ -321,9 +335,12 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_affine(InterSoftJob& J) noexcept {
                 sob += (qM[j] + qY[j]) * xv;
                 const ivd t = (qM[j - 1] + qX[j - 1] + qY[j - 1]) * Ec[j] * mv;
                 if (big) trow[j] = t;
-                const ivl* mk = eqm + static_cast<size_t>(j) * nm;
-                for (int cc = 0; cc < nm; ++cc) acc[cc] += ivsel(mk[cc], t, z);
+                const ivl* mk = eqm + static_cast<size_t>(j) * k;
+                for (int cc = 0; cc < k; ++cc) acc[cc] += ivsel(mk[cc], t, z);
             }
+            };
+            if (nm == 4) cols(std::integral_constant<int, 4>{});
+            else         cols(std::integral_constant<int, -1>{});
             const auto [mv0, xv0] = cell(0);
             (void)mv0;
             sx += fX[0] * xv0;
@@ -474,12 +491,18 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_linear(InterSoftJob& J) noexcept {
         for (int l = 0; l < IW; ++l) ro[l] = isj_row<Tr>(J, l, i) * na;
         for (int c = 0; c < na; ++c)
             P[c] = ivlanes<ivd, IW>([&](int l) { return J.es[ro[l] + c]; });
-        for (int j = 1; j <= n; ++j) {
-            ivd sv = z;
-            const ivl* mk = eqm + static_cast<size_t>(j) * na;
-            for (int c = 0; c < na; ++c) sv = ivsel(mk[c], P[c], sv);
-            E[j] = sv;
-        }
+        auto cols = [&](auto NAc) {   // na = 4 at a compile-time trip count (see the affine fill_E)
+            constexpr int NA = decltype(NAc)::value;
+            const int nn = NA > 0 ? NA : na;
+            for (int j = 1; j <= n; ++j) {
+                ivd sv = z;
+                const ivl* mk = eqm + static_cast<size_t>(j) * nn;
+                for (int c = 0; c < nn; ++c) sv = ivsel(mk[c], P[c], sv);
+                E[j] = sv;
+            }
+        };
+        if (na == 4) cols(std::integral_constant<int, 4>{});
+        else         cols(std::integral_constant<int, 0>{});
     };
     int kv[IW];
     bool bad[IW];
@@ -586,6 +609,9 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_linear(InterSoftJob& J) noexcept {
         for (int cc = 0; cc < nm; ++cc) acc[cc] = z;
         const bool post = J.gpost != nullptr;   // as in inter_soft_affine
         ivd pbv = z - 1.0, pbj = z;
+        auto cols = [&](auto NMc) {   // nm = 4 at a compile-time trip count (see inter_soft_affine)
+        constexpr int NM = decltype(NMc)::value;
+        const int k = NM >= 0 ? NM : nm;
         for (int j = n; j >= 0; --j) {
             const ivd bn = c;   // B at j+1 (exit mass)
             ivd b = (En ? En[j + 1] * nxt[j + 1] : z) + nxt[j] * ebn + init + ea * c;
@@ -607,11 +633,14 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_linear(InterSoftJob& J) noexcept {
                 if (j >= 1) {
                     const ivd t = q[j - 1] * Ec[j] * b;
                     if (big) trow[j] = t;
-                    const ivl* mk = eqm + static_cast<size_t>(j) * nm;
-                    for (int cc = 0; cc < nm; ++cc) acc[cc] += ivsel(mk[cc], t, z);
+                    const ivl* mk = eqm + static_cast<size_t>(j) * k;
+                    for (int cc = 0; cc < k; ++cc) acc[cc] += ivsel(mk[cc], t, z);
                 }
             }
         }
+        };
+        if (nm == 4) cols(std::integral_constant<int, 4>{});
+        else         cols(std::integral_constant<int, -1>{});
         if (post)
             for (int l = 0; l < IW; ++l) J.gpost[static_cast<size_t>(i) * IW + l] = static_cast<int>(pbj[l]);
         rescale(cur, mx);
