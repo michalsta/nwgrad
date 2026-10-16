@@ -79,6 +79,15 @@ nanobind_add_module(nwgrad_ext
     src/nwgrad/cpp/nwgrad/py_exports.cpp
     src/nwgrad/cpp/nwgrad/logistic/py_logistic.cpp
     ${NWGRAD_LEVEL_SOURCES})
+# clang's SLP vectorizer, in the TU that holds the scalar code (every Aligner fill,
+# traceback and walk; scalar_fallback; the linear Pointers fill at every level): it packs
+# pairs of independent scalar chains (the X and Y updates, the argmax operands) into
+# 2-wide vectors with shuffles on the serial carry, or extracts a packed max through a
+# movmsk and a branch.  Off there (nighthaven, clang 22, scalar_fallback): score-only
+# 1.9-2.6x faster, affine DNA fills 1.5x, protein Pointers 1.6x.  The per-ISA level TUs
+# keep it: the float32 std::simd kernels lose 1.35-1.6x without it.  gcc is unaffected.
+set_source_files_properties(src/nwgrad/cpp/nwgrad/py_exports.cpp PROPERTIES
+    COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:Clang,AppleClang>:-fno-slp-vectorize>")
 
 # Add -Wall -Wextra for Unix-style compilers (GCC/Clang)
 if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
