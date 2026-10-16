@@ -62,6 +62,60 @@ static inline stdx::native_simd<double> avx512d_blend(__mmask8 k, stdx::native_s
 }
 #endif
 
+// ── Local: the best cell of one striped row, vectorized ──────────────────────
+// Exactly the scalar scan in column order (max(M,X,Y), strict `>` against the running
+// best, M>X>Y for the table): each lane keeps its largest value and the FIRST segment
+// that reached it (strict `>`; columns grow with s within a lane), and the first lane
+// holding the row's maximum is the leftmost column (lane order is column order).  The
+// scalar form compiled under gcc to compare-and-branch on every cell, mispredicted
+// (~30% of a Local Pointers fill).  pad[k] = 0 for a real column, -inf for padding: with
+// a negative gap extend a Y run GAINS score into the padding, so it must be masked.
+template <class T>
+static inline void striped_row_best(const T* cM, const T* cX, const T* cY, const T* pad,
+                                    int seg, int i, T& best, int& bi, int& bj, int& btbl) {
+    using vt = stdx::native_simd<T>;
+    constexpr int W = (int)vt::size();
+    vt lmax(-std::numeric_limits<T>::infinity()), ls(T(0));
+    for (int s = 0; s < seg; ++s) {
+        const std::size_t o = (std::size_t)s * W;
+        vt vm, vx, vy, vp;
+        vm.copy_from(cM + o, stdx::element_aligned);
+        vx.copy_from(cX + o, stdx::element_aligned);
+        vy.copy_from(cY + o, stdx::element_aligned);
+        vp.copy_from(pad + o, stdx::element_aligned);
+        const vt h = stdx::max(stdx::max(vm, vx), vy) + vp;
+#if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
+        if constexpr (std::is_same_v<T, double>) ls = avx512d_blend(avx512d_gt(h, lmax), ls, vt(T(s)));
+        else                                      stdx::where(h > lmax, ls) = vt(T(s));
+#else
+        stdx::where(h > lmax, ls) = vt(T(s));
+#endif
+        lmax = stdx::max(lmax, h);
+    }
+    T rmax = lmax[0];
+    for (int l = 1; l < W; ++l) rmax = std::max(rmax, T(lmax[l]));
+    if (!(rmax > best)) return;
+    int l = 0;
+    while (!(lmax[l] == rmax)) ++l;
+    const int s = (int)ls[l];
+    const std::size_t k = (std::size_t)s * W + (std::size_t)l;
+    const T mm = cM[k], xx = cX[k], yy = cY[k];
+    best = rmax; bi = i; bj = l * seg + s + 1;
+    btbl = (mm >= xx && mm >= yy) ? 0 : ((xx >= yy) ? 1 : 2);
+}
+
+// pad[s*W + l] = 0 for a real column (l*seg + s + 1 <= n), -inf for padding.
+template <class V>
+static inline const typename V::value_type* striped_pad(V& v, int n, int seg, int W) {
+    using T = typename V::value_type;
+    const std::size_t sw = (std::size_t)seg * W;
+    if (v.size() < sw) v.resize(sw);
+    for (int l = 0; l < W; ++l)
+        for (int s = 0; s < seg; ++s)
+            v[(std::size_t)s * W + l] = (l * seg + s + 1 <= n) ? T(0) : -std::numeric_limits<T>::infinity();
+    return v.data();
+}
+
 using vd = stdx::native_simd<double>;
 static constexpr int KW = (int)vd::size();     // native double-lane count (row_kernel uses it)
 static constexpr double K_NINF = -std::numeric_limits<double>::infinity();
@@ -192,6 +246,7 @@ static void striped_affine_full(ViterbiJob<T>& job) {
     T bM = 0, bX = K_NINF, bY = K_NINF;
 
     T best_local = 0; int best_i = 0, best_j = 0, best_tbl = 0;
+    const T* pad = Local ? striped_pad(buf.spad, n, seg, W) : nullptr;
 
     for (int i = 1; i <= m; ++i) {
         if constexpr (Tr) {
@@ -312,22 +367,8 @@ static void striped_affine_full(ViterbiJob<T>& job) {
 
             // ── Local: argmax over this row, j ascending, reading the striped cells,
             // with the scalar kernel's M>X>Y tie-break and strict > (bit-exact path) ──
-            if constexpr (Local) {
-                // Lanes outer, segments inner is column order (j - 1 = l*seg + s, so
-                // scol(j) = s*W + l) without scol's % and / per cell; stops at n, so
-                // the padding columns stay out as before.
-                int j = 1;
-                for (int l = 0; l < W && j <= n; ++l)
-                for (int s = 0; s < seg && j <= n; ++s, ++j) {
-                    const std::size_t k = (std::size_t)s * W + (std::size_t)l;
-                    const T mm = cM[k], xx = cX[k], yy = cY[k];
-                    const T here = std::max({mm, xx, yy});
-                    if (here > best_local) {
-                        best_local = here; best_i = i; best_j = j;
-                        best_tbl = (mm >= xx && mm >= yy) ? 0 : ((xx >= yy) ? 1 : 2);
-                    }
-                }
-            }
+            if constexpr (Local)
+                striped_row_best<T>(cM, cX, cY, pad, seg, i, best_local, best_i, best_j, best_tbl);
         }
         bM = nbM; bX = nbX; bY = K_NINF;
     }

@@ -106,6 +106,7 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
     const vd vthree(static_cast<T>(3));
     T bM = 0, bX = K_NINF, bY = K_NINF;
     T best_local = 0; int best_i = 0, best_j = 0, best_tbl = 0;
+    const T* pad = Local ? striped_pad(buf.spad, n, seg, W) : nullptr;
 
     for (int i = 1; i <= m; ++i) {
         if constexpr (Tr) {
@@ -291,20 +292,9 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                 store_codes<T, W>(k, dY + (std::size_t)s * W);
             }
 
-            if constexpr (Local) {
-                // Column order without scol's % and / per cell (as in kernels_impl.inl).
-                int j = 1;
-                for (int l = 0; l < W && j <= n; ++l)
-                for (int s = 0; s < seg && j <= n; ++s, ++j) {
-                    const std::size_t k = (std::size_t)s * W + (std::size_t)l;
-                    const T mm = cM[off + k], xx = cX[off + k], yy = cY[off + k];
-                    const T here = std::max({mm, xx, yy});
-                    if (here > best_local) {
-                        best_local = here; best_i = i; best_j = j;
-                        best_tbl = (mm >= xx && mm >= yy) ? 0 : ((xx >= yy) ? 1 : 2);
-                    }
-                }
-            }
+            if constexpr (Local)
+                striped_row_best<T>(cM + off, cX + off, cY + off, pad, seg, i,
+                                    best_local, best_i, best_j, best_tbl);
         }
         bM = nbM; bX = nbX; bY = K_NINF;
         std::swap(pM, cM); std::swap(pX, cX); std::swap(pY, cY);
