@@ -313,8 +313,13 @@ static void striped_affine_full(ViterbiJob<T>& job) {
             // ── Local: argmax over this row, j ascending, reading the striped cells,
             // with the scalar kernel's M>X>Y tie-break and strict > (bit-exact path) ──
             if constexpr (Local) {
-                for (int j = 1; j <= n; ++j) {
-                    const std::size_t k = scol(j);
+                // Lanes outer, segments inner is column order (j - 1 = l*seg + s, so
+                // scol(j) = s*W + l) without scol's % and / per cell; stops at n, so
+                // the padding columns stay out as before.
+                int j = 1;
+                for (int l = 0; l < W && j <= n; ++l)
+                for (int s = 0; s < seg && j <= n; ++s, ++j) {
+                    const std::size_t k = (std::size_t)s * W + (std::size_t)l;
                     const T mm = cM[k], xx = cX[k], yy = cY[k];
                     const T here = std::max({mm, xx, yy});
                     if (here > best_local) {
