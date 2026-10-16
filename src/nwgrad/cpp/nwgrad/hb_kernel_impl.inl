@@ -209,9 +209,9 @@ static void hb_sweep_striped(HbJob<T>& job) {
                 lM.copy_from(pM + (std::size_t)(seg - 1) * W, stdx::element_aligned);
                 lX.copy_from(pX + (std::size_t)(seg - 1) * W, stdx::element_aligned);
                 lY.copy_from(pY + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                dM = vd([&](int q) { return q == 0 ? bM : lM[q - 1]; });
-                dX = vd([&](int q) { return q == 0 ? bX : lX[q - 1]; });
-                dY = vd([&](int q) { return q == 0 ? bY : lY[q - 1]; });
+                dM = lane_shift_in(lM, bM);
+                dX = lane_shift_in(lX, bX);
+                dY = lane_shift_in(lY, bY);
             } else {
                 dM.copy_from(pM + (std::size_t)(s - 1) * W, stdx::element_aligned);
                 dX.copy_from(pX + (std::size_t)(s - 1) * W, stdx::element_aligned);
@@ -244,7 +244,7 @@ static void hb_sweep_striped(HbJob<T>& job) {
             vd O;
             if (s == 0) {
                 vd lo; lo.copy_from(ov + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                O = vd([&](int q) { return q == 0 ? nbOpen : lo[q - 1]; });
+                O = lane_shift_in(lo, nbOpen);
             } else {
                 O.copy_from(ov + (std::size_t)(s - 1) * W, stdx::element_aligned);
             }
@@ -259,7 +259,7 @@ static void hb_sweep_striped(HbJob<T>& job) {
         // before the buffer.  Guard it; there is nothing to correct with no columns.
         if (seg > 0) for (int r = 0; r < W; ++r) {
             vd last; last.copy_from(cY + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-            vd F([&](int q) { return q == 0 ? bY : last[q - 1]; });
+            vd F = lane_shift_in(last, bY);
             F = F - vge_a;
             bool changed = false;
             for (int s = 0; s < seg; ++s) {
@@ -461,9 +461,9 @@ static void hb_sweep_striped_pmax(HbJob<T>& job) {
                 lM.copy_from(pM + (std::size_t)(seg - 1) * W, stdx::element_aligned);
                 lX.copy_from(pX + (std::size_t)(seg - 1) * W, stdx::element_aligned);
                 lY.copy_from(pY + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                dM = vd([&](int q) { return q == 0 ? bM : lM[q - 1]; });
-                dX = vd([&](int q) { return q == 0 ? bX : lX[q - 1]; });
-                dY = vd([&](int q) { return q == 0 ? bY : lY[q - 1]; });
+                dM = lane_shift_in(lM, bM);
+                dX = lane_shift_in(lX, bX);
+                dY = lane_shift_in(lY, bY);
             } else {
                 dM.copy_from(pM + (std::size_t)(s - 1) * W, stdx::element_aligned);
                 dX.copy_from(pX + (std::size_t)(s - 1) * W, stdx::element_aligned);
@@ -494,7 +494,7 @@ static void hb_sweep_striped_pmax(HbJob<T>& job) {
             vd O;
             if (s == 0) {
                 vd lo; lo.copy_from(ov + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                O = vd([&](int q) { return q == 0 ? nbOpen : lo[q - 1]; });
+                O = lane_shift_in(lo, nbOpen);
             } else {
                 O.copy_from(ov + (std::size_t)(s - 1) * W, stdx::element_aligned);
             }
@@ -695,9 +695,9 @@ static void hb_scan_impl(HbScanJob<T>& job) {
                 lM.copy_from(pM + (std::size_t)(seg - 1) * W, stdx::element_aligned);
                 lX.copy_from(pX + (std::size_t)(seg - 1) * W, stdx::element_aligned);
                 lY.copy_from(pY + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                dM = vd([&](int q) { return q == 0 ? bM : lM[q - 1]; });
-                dX = vd([&](int q) { return q == 0 ? bX : lX[q - 1]; });
-                dY = vd([&](int q) { return q == 0 ? bY : lY[q - 1]; });
+                dM = lane_shift_in(lM, bM);
+                dX = lane_shift_in(lX, bX);
+                dY = lane_shift_in(lY, bY);
             } else {
                 dM.copy_from(pM + (std::size_t)(s - 1) * W, stdx::element_aligned);
                 dX.copy_from(pX + (std::size_t)(s - 1) * W, stdx::element_aligned);
@@ -726,7 +726,7 @@ static void hb_scan_impl(HbScanJob<T>& job) {
                 vd O;
                 if (s == 0) {
                     vd lo; lo.copy_from(ov + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                    O = vd([&](int q) { return q == 0 ? nbOpen : lo[q - 1]; });
+                    O = lane_shift_in(lo, nbOpen);
                 } else {
                     O.copy_from(ov + (std::size_t)(s - 1) * W, stdx::element_aligned);
                 }
@@ -751,7 +751,7 @@ static void hb_scan_impl(HbScanJob<T>& job) {
             vd O;
             if (s == 0) {
                 vd lo; lo.copy_from(ov + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                O = vd([&](int q) { return q == 0 ? nbOpen : lo[q - 1]; });
+                O = lane_shift_in(lo, nbOpen);
             } else {
                 O.copy_from(ov + (std::size_t)(s - 1) * W, stdx::element_aligned);
             }
@@ -761,7 +761,7 @@ static void hb_scan_impl(HbScanJob<T>& job) {
         }
         for (int r = 0; r < W; ++r) {
             vd last; last.copy_from(cY + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-            vd F([&](int q) { return q == 0 ? bY : last[q - 1]; });
+            vd F = lane_shift_in(last, bY);
             F = F - vge_a;
             bool changed = false;
             for (int s = 0; s < seg; ++s) {
@@ -969,9 +969,9 @@ static void hb_base_striped(HbBaseJob<T>& job) {
                 lM.copy_from(pM + off + (std::size_t)(seg - 1) * W, stdx::element_aligned);
                 lX.copy_from(pX + off + (std::size_t)(seg - 1) * W, stdx::element_aligned);
                 lY.copy_from(pY + off + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                dgM = vd([&](int q) { return q == 0 ? bM : lM[q - 1]; });
-                dgX = vd([&](int q) { return q == 0 ? bX : lX[q - 1]; });
-                dgY = vd([&](int q) { return q == 0 ? bY : lY[q - 1]; });
+                dgM = lane_shift_in(lM, bM);
+                dgX = lane_shift_in(lX, bX);
+                dgY = lane_shift_in(lY, bY);
             } else {
                 dgM.copy_from(pM + off + (std::size_t)(s - 1) * W, stdx::element_aligned);
                 dgX.copy_from(pX + off + (std::size_t)(s - 1) * W, stdx::element_aligned);
@@ -1039,8 +1039,8 @@ static void hb_base_striped(HbBaseJob<T>& job) {
                 vd lo, lk;
                 lo.copy_from(ov + (std::size_t)(seg - 1) * W, stdx::element_aligned);
                 lk.copy_from(ok + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                O  = vd([&](int q) { return q == 0 ? nbOpen  : lo[q - 1]; });
-                OK = vd([&](int q) { return q == 0 ? nbOpenK : lk[q - 1]; });
+                O  = lane_shift_in(lo, nbOpen);
+                OK = lane_shift_in(lk, nbOpenK);
             } else {
                 O.copy_from(ov + (std::size_t)(s - 1) * W, stdx::element_aligned);
                 OK.copy_from(ok + (std::size_t)(s - 1) * W, stdx::element_aligned);
@@ -1063,7 +1063,7 @@ static void hb_base_striped(HbBaseJob<T>& job) {
         }
         if (seg > 0) for (int rr = 0; rr < W; ++rr) {   // seg==0 (NC==0): nothing to correct
             vd last; last.copy_from(cY + off + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-            vd F([&](int q) { return q == 0 ? bY : last[q - 1]; });
+            vd F = lane_shift_in(last, bY);
             F = F - vge_a;
             bool changed = false;
             for (int s = 0; s < seg; ++s) {

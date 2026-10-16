@@ -137,9 +137,9 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                     lM.copy_from(pM + off + (std::size_t)(seg - 1) * W, stdx::element_aligned);
                     lX.copy_from(pX + off + (std::size_t)(seg - 1) * W, stdx::element_aligned);
                     lY.copy_from(pY + off + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                    dgM = vd([&](int q) { return q == 0 ? bM : lM[q - 1]; });
-                    dgX = vd([&](int q) { return q == 0 ? bX : lX[q - 1]; });
-                    dgY = vd([&](int q) { return q == 0 ? bY : lY[q - 1]; });
+                    dgM = lane_shift_in(lM, bM);
+                    dgX = lane_shift_in(lX, bX);
+                    dgY = lane_shift_in(lY, bY);
                 } else {
                     dgM.copy_from(pM + off + (std::size_t)(s - 1) * W, stdx::element_aligned);
                     dgX.copy_from(pX + off + (std::size_t)(s - 1) * W, stdx::element_aligned);
@@ -223,8 +223,8 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                     vd lo, lk;
                     lo.copy_from(ov + (std::size_t)(seg - 1) * W, stdx::element_aligned);
                     lk.copy_from(ok + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                    O  = vd([&](int q) { return q == 0 ? nbOpen  : lo[q - 1]; });
-                    OK = vd([&](int q) { return q == 0 ? nbOpenK : lk[q - 1]; });
+                    O  = lane_shift_in(lo, nbOpen);
+                    OK = lane_shift_in(lk, nbOpenK);
                 } else {
                     O.copy_from(ov + (std::size_t)(s - 1) * W, stdx::element_aligned);
                     OK.copy_from(ok + (std::size_t)(s - 1) * W, stdx::element_aligned);
@@ -247,7 +247,7 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
             }
             for (int r = 0; r < W; ++r) {
                 vd last; last.copy_from(cY + off + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                vd F([&](int q) { return q == 0 ? bY : last[q - 1]; });
+                vd F = lane_shift_in(last, bY);
                 F = F - vge_a;
                 bool changed = false;
                 for (int s = 0; s < seg; ++s) {

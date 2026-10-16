@@ -133,9 +133,9 @@ static void score_affine_striped(ScoreJob<T>& job) {
                     lM.copy_from(pM + (std::size_t)(seg - 1) * W, stdx::element_aligned);
                     lX.copy_from(pX + (std::size_t)(seg - 1) * W, stdx::element_aligned);
                     lY.copy_from(pY + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                    dM = vd([&](int q) { return q == 0 ? bM : lM[q - 1]; });
-                    dX = vd([&](int q) { return q == 0 ? bX : lX[q - 1]; });
-                    dY = vd([&](int q) { return q == 0 ? bY : lY[q - 1]; });
+                    dM = lane_shift_in(lM, bM);
+                    dX = lane_shift_in(lX, bX);
+                    dY = lane_shift_in(lY, bY);
                 } else {
                     dM.copy_from(pM + (std::size_t)(s - 1) * W, stdx::element_aligned);
                     dX.copy_from(pX + (std::size_t)(s - 1) * W, stdx::element_aligned);
@@ -169,9 +169,9 @@ static void score_affine_striped(ScoreJob<T>& job) {
                     lM.copy_from(pM + (std::size_t)(seg - 1) * W, stdx::element_aligned);
                     lX.copy_from(pX + (std::size_t)(seg - 1) * W, stdx::element_aligned);
                     lY.copy_from(pY + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                    dM = vd([&](int q) { return q == 0 ? bM : lM[q - 1]; });
-                    dX = vd([&](int q) { return q == 0 ? bX : lX[q - 1]; });
-                    dY = vd([&](int q) { return q == 0 ? bY : lY[q - 1]; });
+                    dM = lane_shift_in(lM, bM);
+                    dX = lane_shift_in(lX, bX);
+                    dY = lane_shift_in(lY, bY);
                 } else {
                     dM.copy_from(pM + (std::size_t)(s - 1) * W, stdx::element_aligned);
                     dX.copy_from(pX + (std::size_t)(s - 1) * W, stdx::element_aligned);
@@ -195,7 +195,7 @@ static void score_affine_striped(ScoreJob<T>& job) {
                 vd O;
                 if (s == 0) {
                     vd lo; lo.copy_from(ov + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                    O = vd([&](int q) { return q == 0 ? nbOpen : lo[q - 1]; });
+                    O = lane_shift_in(lo, nbOpen);
                 } else {
                     O.copy_from(ov + (std::size_t)(s - 1) * W, stdx::element_aligned);
                 }
@@ -212,11 +212,11 @@ static void score_affine_striped(ScoreJob<T>& job) {
         // (whose carry pass already saw the opens), carry the extension only.
         for (int r = 0; r < W; ++r) {
             vd last; last.copy_from(cY + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-            vd F([&](int q) { return q == 0 ? NINF : last[q - 1]; });
+            vd F = lane_shift_in(last, NINF);
             F = F - vge_a;
             if constexpr (Fused) {
                 if (r == 0) {
-                    vd Os([&](int q) { return q == 0 ? NINF : Olast[q - 1]; });
+                    vd Os = lane_shift_in(Olast, NINF);
                     F = stdx::max(Os, F);
                 }
             }
@@ -348,7 +348,7 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
             vd dD;
             if (s == 0) {
                 vd lD; lD.copy_from(pD + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                dD = vd([&](int q) { return q == 0 ? bD : lD[q - 1]; });
+                dD = lane_shift_in(lD, bD);
             } else {
                 dD.copy_from(pD + (std::size_t)(s - 1) * W, stdx::element_aligned);
             }
@@ -376,10 +376,10 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
 
         for (int r = 0; r < W; ++r) {
             vd last; last.copy_from(cY + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-            vd F([&](int q) { return q == 0 ? NINF : last[q - 1]; });
+            vd F = lane_shift_in(last, NINF);
             F = F - vge_a;
             if (r == 0) {
-                vd Os([&](int q) { return q == 0 ? NINF : Olast[q - 1]; });
+                vd Os = lane_shift_in(Olast, NINF);
                 F = stdx::max(Os, F);
             }
             bool changed = false;

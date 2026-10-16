@@ -120,6 +120,28 @@ using vd = stdx::native_simd<double>;
 static constexpr int KW = (int)vd::size();     // native double-lane count (row_kernel uses it)
 static constexpr double K_NINF = -std::numeric_limits<double>::infinity();
 
+// The segment-boundary lane shift: [b, x0, x1, ..., x(W-2)].  Written as a std::simd
+// generator, gcc lowers it at AVX2 width to partial reloads of x through memory at an
+// 8-byte offset (vmovupd 8(%r), vmovhpd, vinsertf128) -- in the lazy-F rounds right
+// after the carry stored that very vector -- where clang permutes it in a register
+// (vpermpd + blend).  The intrinsic form gets gcc the same.  A pure lane move, so the
+// result is identical; every other width keeps the generator.
+template <class V>
+static inline V lane_shift_in(V x, typename V::value_type b) {
+#if defined(__AVX2__) && !defined(__AVX512F__)
+    using T = typename V::value_type;
+    if constexpr (std::is_same_v<T, double> && V::size() == 4) {
+        const __m256d r = _mm256_permute4x64_pd(static_cast<__m256d>(x), 0x90);
+        return V(_mm256_blend_pd(r, _mm256_set1_pd(b), 1));
+    } else if constexpr (std::is_same_v<T, float> && V::size() == 8) {
+        const __m256 r = _mm256_permutevar8x32_ps(static_cast<__m256>(x),
+                                                  _mm256_setr_epi32(0, 0, 1, 2, 3, 4, 5, 6));
+        return V(_mm256_blend_ps(r, _mm256_set1_ps(b), 1));
+    } else
+#endif
+    return V([&](int q) { return q == 0 ? b : x[q - 1]; });
+}
+
 // ── Tracked rows: the striped query profile ───────────────────────────────────
 // One striped profile row: prof[s*W + l] = row[b[col(l,s)-1]], padding -> -inf.
 template <class T>
@@ -282,9 +304,9 @@ static void striped_affine_full(ViterbiJob<T>& job) {
                     lM.copy_from(pM + (std::size_t)(seg - 1) * W, stdx::element_aligned);
                     lX.copy_from(pX + (std::size_t)(seg - 1) * W, stdx::element_aligned);
                     lY.copy_from(pY + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                    dM = vd([&](int q) { return q == 0 ? bM : lM[q - 1]; });
-                    dX = vd([&](int q) { return q == 0 ? bX : lX[q - 1]; });
-                    dY = vd([&](int q) { return q == 0 ? bY : lY[q - 1]; });
+                    dM = lane_shift_in(lM, bM);
+                    dX = lane_shift_in(lX, bX);
+                    dY = lane_shift_in(lY, bY);
                 } else {
                     dM.copy_from(pM + (std::size_t)(s - 1) * W, stdx::element_aligned);
                     dX.copy_from(pX + (std::size_t)(s - 1) * W, stdx::element_aligned);
@@ -310,7 +332,7 @@ static void striped_affine_full(ViterbiJob<T>& job) {
                 vd O;
                 if (s == 0) {
                     vd lo; lo.copy_from(ov + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                    O = vd([&](int q) { return q == 0 ? nbOpen : lo[q - 1]; });
+                    O = lane_shift_in(lo, nbOpen);
                 } else {
                     O.copy_from(ov + (std::size_t)(s - 1) * W, stdx::element_aligned);
                 }
@@ -320,7 +342,7 @@ static void striped_affine_full(ViterbiJob<T>& job) {
             }
             for (int r = 0; r < W; ++r) {
                 vd last; last.copy_from(cY + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                vd F([&](int q) { return q == 0 ? bY : last[q - 1]; });
+                vd F = lane_shift_in(last, bY);
                 F = F - vge_a;
                 bool changed = false;
                 for (int s = 0; s < seg; ++s) {
