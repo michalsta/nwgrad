@@ -3543,16 +3543,13 @@ private:
             for (int j = j0; j <= j1; ++j) {
                 T diag  = std::max({pM[j-1], pX[j-1], pY[j-1]});
                 T m_val = diag + srow[bcode[static_cast<size_t>(j) - 1]];
-                // X state: gap in B (advance i), uses gap_b params
-                T x_val = std::max({
-                    pM[j] - go_b - ge_b,
-                    pX[j]        - ge_b,
-                    pY[j] - go_b - ge_b});
-                // Y state: gap in A (advance j), uses gap_a params
-                T y_val = std::max({
-                    lM - go_a - ge_a,
-                    lX - go_a - ge_a,
-                    lY        - ge_a});
+                // X state: gap in B (advance i), uses gap_b params.  Y: gap in A, gap_a.
+                // The open from the max of the two opening states first: (v - go) - ge is
+                // monotone in v, so the value is the three-way max's exactly (the
+                // inter-pair kernels' form), and clang's SLP vectorizer finds no isomorphic
+                // subtraction pairs to pack onto the Y chain (it did, with shuffles).
+                T x_val = std::max((std::max(pM[j], pY[j]) - go_b) - ge_b, pX[j] - ge_b);
+                T y_val = std::max((std::max(lM, lX) - go_a) - ge_a, lY - ge_a);
 
                 if constexpr (AM == AlignMode::Local) {
                     m_val = std::max(m_val, static_cast<T>(0));
