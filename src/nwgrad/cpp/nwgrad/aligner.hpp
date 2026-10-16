@@ -3402,8 +3402,12 @@ private:
             const uint8_t* bcode = b_idx_.data();
             for (int j = 1; j <= n_; ++j) {
                 T m_val = std::max({pM[j-1], pX[j-1], pY[j-1]}) + sub[bcode[j - 1]];
-                const T x_val = std::max({pM[j] - go_b - ge_b, pX[j] - ge_b, pY[j] - go_b - ge_b});
-                const T y_val = std::max({lM - go_a - ge_a, lX - go_a - ge_a, lY - ge_a});
+                // The open from max(M, Y) / max(M, X) first: (v - go) - ge is monotone in v,
+                // so this is the three-way max's value exactly (the inter-pair kernels' form),
+                // and it leaves clang's SLP vectorizer no isomorphic pairs to pack onto the
+                // Y chain (it did, with shuffles: 2.3x gcc on scalar Global).
+                const T x_val = std::max((std::max(pM[j], pY[j]) - go_b) - ge_b, pX[j] - ge_b);
+                const T y_val = std::max((std::max(lM, lX) - go_a) - ge_a, lY - ge_a);
                 if constexpr (local) {
                     m_val = std::max(m_val, static_cast<T>(0));
                     best = std::max(best, std::max({m_val, x_val, y_val}));
