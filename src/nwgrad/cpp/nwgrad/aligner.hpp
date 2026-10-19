@@ -2123,8 +2123,9 @@ private:
             }
             const T* hp = buf.H.data() + static_cast<size_t>(i - 1) * stride_;
             T*       hc = buf.H.data() + static_cast<size_t>(i) * stride_;
-            const int j1 = jhi(i);
-            for (int j = jlo(i); j <= j1; ++j) {
+            const int j0 = jlo(i), j1 = jhi(i);
+            T rowmax = static_cast<T>(0);   // Local: see local_row_best_
+            for (int j = j0; j <= j1; ++j) {
                 T v = std::max({
                     hp[j-1] + srow[bcode[static_cast<size_t>(j) - 1]],
                     hp[j]   - ge_b_r,
@@ -2132,10 +2133,16 @@ private:
                 });
                 if constexpr (AM == AlignMode::Local) {
                     v = std::max(v, static_cast<T>(0));
-                    if (v > best_local) { best_local = v; best_i_ = i; best_j_ = j; }
+                    rowmax = std::max(rowmax, v);
                 }
                 hc[j] = v;
             }
+            if constexpr (AM == AlignMode::Local)
+                if (rowmax > best_local) {
+                    int j = j0;
+                    while (!(hc[j] == rowmax)) ++j;
+                    best_local = rowmax; best_i_ = i; best_j_ = j;
+                }
         }
 
         viterbi_score_ = (AM == AlignMode::Global) ? rat(buf.H, m_, n_) : best_local;
@@ -2372,6 +2379,7 @@ private:
             dM[rb] = 3;
             dX[rb] = (i <= 1) ? 0 : 1;    // (1,0) opens from M(0,0); deeper rows extend X
             dY[rb] = 0;
+            T rowmax = static_cast<T>(0);   // Local: see local_row_best_
 
             for (int j = 1; j <= n_; ++j) {
                 const std::size_t k = static_cast<std::size_t>(j);
@@ -2391,13 +2399,7 @@ private:
 
                 if constexpr (AM == AlignMode::Local) {
                     m_val = std::max(m_val, static_cast<T>(0));
-                    const T best_here = std::max({m_val, x_val, y_val});
-                    if (best_here > best_local) {
-                        best_local = best_here; best_i_ = i; best_j_ = j;
-                        if      (m_val >= x_val && m_val >= y_val) best_tbl_ = TBTable::M;
-                        else if (x_val >= y_val)                    best_tbl_ = TBTable::X;
-                        else                                         best_tbl_ = TBTable::Y;
-                    }
+                    rowmax = std::max(rowmax, std::max({m_val, x_val, y_val}));
                     // traceback stops here; km is 0..2, so OR-ing 3 sets 3 (no branch: gcc
                     // branched on the sign, a coin toss on unrelated sequences)
                     km = static_cast<unsigned char>(km | (3u * static_cast<unsigned>(m_val <= static_cast<T>(0))));
@@ -2406,6 +2408,8 @@ private:
                 cM[k] = m_val; cX[k] = x_val; cY[k] = y_val;
                 dM[rb + k] = km; dX[rb + k] = kx; dY[rb + k] = ky;
             }
+            if constexpr (AM == AlignMode::Local)
+                if (rowmax > best_local) local_row_best_(cM, cX, cY, 1, rowmax, i, best_local);
             std::swap(pM, cM); std::swap(pX, cX); std::swap(pY, cY);
         }
 
@@ -3483,18 +3487,38 @@ private:
             }
             T left = cur[0];   // in a register, as in score_affine_scalar_impl
             const uint8_t* bcode = b_idx_.data();
+            T rowmax = static_cast<T>(0);
             for (int j = 1; j <= n_; ++j) {
                 T v = std::max({prev[j-1] + sub[bcode[j - 1]], prev[j] - ge_b, left - ge_a});
                 if constexpr (local) {
                     v = std::max(v, static_cast<T>(0));
-                    if (v > best) best = v;
+                    rowmax = std::max(rowmax, v);
                 }
                 cur[j] = v;
                 left = v;
             }
+            if constexpr (local) if (rowmax > best) best = rowmax;
             std::swap(prev, cur);
         }
         return local ? best : static_cast<double>(prev[n_]);
+    }
+
+    // Local fills: the best cell of row i, found AFTER the row.  The fill keeps only a
+    // running rowmax = max over the row of max(M, X, Y) (one maxsd per cell, no branch);
+    // when it beats best_local, the first column from j0 holding it is exactly the cell
+    // the old in-loop strict-`>` scan stopped at (an equal later cell never replaced it),
+    // and the table is picked by the same M>X>Y rule.  In the loop, gcc compiled that
+    // scan to compare-and-branch per cell, mispredicted on unrelated sequences.
+    template <class V>
+    void local_row_best_(const V* cM, const V* cX, const V* cY, int j0, V rowmax, int i,
+                         V& best_local) {
+        int j = j0;
+        while (!(std::max({cM[j], cX[j], cY[j]}) == rowmax)) ++j;
+        const V m_val = cM[j], x_val = cX[j], y_val = cY[j];
+        best_local = rowmax; best_i_ = i; best_j_ = j;
+        if      (m_val >= x_val && m_val >= y_val) best_tbl_ = TBTable::M;
+        else if (x_val >= y_val)                    best_tbl_ = TBTable::X;
+        else                                         best_tbl_ = TBTable::Y;
     }
 
     void viterbi_affine(DpBuffer& buf) {
@@ -3560,6 +3584,7 @@ private:
             const int j0 = jlo(i), j1 = jhi(i);
             if (j0 > j1) continue;   // an empty band row reads nothing (as before)
             T lM = cM[j0 - 1], lX = cX[j0 - 1], lY = cY[j0 - 1];
+            T rowmax = static_cast<T>(0);   // Local: see local_row_best_
             for (int j = j0; j <= j1; ++j) {
                 T diag  = std::max({pM[j-1], pX[j-1], pY[j-1]});
                 T m_val = diag + srow[bcode[static_cast<size_t>(j) - 1]];
@@ -3573,18 +3598,14 @@ private:
 
                 if constexpr (AM == AlignMode::Local) {
                     m_val = std::max(m_val, static_cast<T>(0));
-                    T best_here = std::max({m_val, x_val, y_val});
-                    if (best_here > best_local) {
-                        best_local = best_here; best_i_ = i; best_j_ = j;
-                        if      (m_val >= x_val && m_val >= y_val) best_tbl_ = TBTable::M;
-                        else if (x_val >= y_val)                    best_tbl_ = TBTable::X;
-                        else                                         best_tbl_ = TBTable::Y;
-                    }
+                    rowmax = std::max(rowmax, std::max({m_val, x_val, y_val}));
                 }
 
                 cM[j] = m_val; cX[j] = x_val; cY[j] = y_val;
                 lM = m_val; lX = x_val; lY = y_val;
             }
+            if constexpr (AM == AlignMode::Local)
+                if (rowmax > best_local) local_row_best_(cM, cX, cY, j0, rowmax, i, best_local);
         }
 
         if constexpr (AM == AlignMode::Global) {
