@@ -118,7 +118,7 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
         if constexpr (Tr) nbX = Local ? K_NINF : tr.bx0[i];
         else              nbX = Local ? K_NINF : -(go_b + i * ge_b);
         const T nbOpen = (std::max(nbM, nbX) - go_a) - ge_a;
-        const T nbOpenK = (nbM >= nbX) ? T(0) : T(1);
+        const T nbOpenK = ((nbM - go_a) - ge_a >= (nbX - go_a) - ge_a) ? T(0) : T(1);
         const T* sub = striped_row_profile<T, Tr>(buf.sprof.data(), blk, nalpha, a, b, n, seg, W, i, tr);
 
         unsigned char* dM = buf.DM.data() + (std::size_t)i * rowsz + off;
@@ -200,17 +200,21 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                 vxv.copy_to(cX + off + (std::size_t)s * W, stdx::element_aligned);
                 store_codes<T, W>(kx, dX + (std::size_t)s * W);
 
-                ((stdx::max(vmv, vxv) - vgo_a) - vge_a)
-                    .copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
+                // The open's source is chosen on the ROUNDED candidates, as the scalar pick(uy, vy, wy)
+                // does: M and X values that differ can round to the same open, and then M wins.
+                // Comparing vmv >= vxv before subtracting picked X there (float32, a path moved).
+                // max(om, ox) is bitwise max(vmv, vxv) - go - ge: rounding is monotone.
+                const vd om = (vmv - vgo_a) - vge_a, ox = (vxv - vgo_a) - vge_a;
+                stdx::max(om, ox).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
                 vd okv = vone;
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
                 if constexpr (std::is_same_v<T, double>) {
-                    okv = avx512d_blend(avx512d_ge(vmv, vxv), okv, vzero);
+                    okv = avx512d_blend(avx512d_ge(om, ox), okv, vzero);
                 } else {
-                    stdx::where(vmv >= vxv, okv) = vzero;
+                    stdx::where(om >= ox, okv) = vzero;
                 }
 #else
-                stdx::where(vmv >= vxv, okv) = vzero;
+                stdx::where(om >= ox, okv) = vzero;
 #endif
                 okv.copy_to(ok + (std::size_t)s * W, stdx::element_aligned);
             }

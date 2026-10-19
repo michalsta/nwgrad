@@ -757,6 +757,25 @@ than its solver could deliver and the loss compounded with recursion depth (up t
 unreachable and the first swept row's column 0 is seeded `0 - ge_b`, in every sweep and base
 case (scalar and leveled) — see the comment at `hb_solve`'s join.
 
+**Also found and FIXED (2026-10-19): the leveled direction-byte kernels chose a Y open's
+source before rounding.** The scalar fills (`viterbi_affine_ptr`, `hb_base`) record the
+predecessor of a gap-in-A open with `pick(uy, vy, wy)` over the ROUNDED candidates
+`uy = (M - go_a) - ge_a`, `vy = (X - go_a) - ge_a`, M winning ties; the striped Pointers
+kernel (`kernels_pointers_impl.inl`) and the vectorized Hirschberg base case
+(`hb_kernel_impl.inl::hb_base_striped`) compared `M >= X` first (the border's `nbOpenK`
+too). Where M < X but both round to one open they recorded X: identical tables, a
+different path, and under Hirschberg (which replays its score from the path) a different
+SCORE per ISA level. Found by cross-level fuzzing (`xlevel.py` seeds past 0): Pointers at
+float32 with negative opens (6/8000 problems at seed 3); Hirschberg's base case at double
+with ordinary positive gaps (10 in 8 x 12000 configurations), i.e. reachable through the
+double `auto` default. Both now compare the rounded opens (`om >= ox`) and store their
+max, bitwise the old value since rounding is monotone. Verified: 0 mismatches after, under
+gcc and clang, at sse2/sse4 (skynet), avx2 (nighthaven), avx512 (solace), where the
+pre-fix builds mismatched at every width; `tests/Python/test_rounded_open_ties.py` pins
+four fixtures (each failed before); suite and ctest green. Cost (nighthaven, `bench_cc.py`,
+fix / main, release-wheel flags): striped Pointers 1.00-1.02 at avx2, 1.02-1.04 at sse4
+under gcc (two subtractions per vector, off the carry); Scores and Hirschberg arms 1.00.
+
 **Hirschberg does not support NEGATIVE gap penalties — by design (decided 2026-10-11).**
 A gap that pays to open, or (Local) a run that gains score, is not a meaningful alignment
 model, so the recursion is not made to handle it. The guard in `run_viterbi`
