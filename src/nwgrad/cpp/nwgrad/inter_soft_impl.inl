@@ -26,6 +26,11 @@
 #if defined(__clang__)
 #  define NWGRAD_SOFT_FMA_FN
 #  define NWGRAD_SOFT_FMA_BODY _Pragma("clang fp contract(fast)")
+#elif defined(__GNUC__) && defined(__aarch64__)
+// gcc on AArch64 also unrolls: it ran the per-lane scalar loops (the protein weight
+// gather, the match-count scatter) one element per trip, where clang unrolls them.
+#  define NWGRAD_SOFT_FMA_FN __attribute__((optimize("fp-contract=fast", "unroll-loops")))
+#  define NWGRAD_SOFT_FMA_BODY
 #elif defined(__GNUC__)
 #  define NWGRAD_SOFT_FMA_FN __attribute__((optimize("fp-contract=fast")))
 #  define NWGRAD_SOFT_FMA_BODY
@@ -127,7 +132,10 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_affine(InterSoftJob& J) noexcept {
                 const double* pr = J.es + isj_row<Tr>(J, l, i) * na;
                 const unsigned char* bl = J.b[l];
                 const int nl = Rag ? J.nb[l] : n;
-                for (int j = 1; j <= nl; ++j) E[j][l] = pr[bl[j - 1]];
+                // Through a double* into lane l, size_t-indexed: with ivd[j][l] and an int j,
+                // gcc on AArch64 zero-extended j per element and spilled the unrolled indices.
+                double* el = reinterpret_cast<double*>(E + 1) + l;
+                for (size_t j = 0; j < static_cast<size_t>(nl); ++j) el[j * IW] = pr[bl[j]];
                 for (int j = nl + 1; j <= n; ++j) E[j][l] = 0.0;
             }
             return;
@@ -402,7 +410,8 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_affine(InterSoftJob& J) noexcept {
                     const double f = std::ldexp(gv[l], -kv[l]);
                     const unsigned char* bl = J.b[l];
                     const int nl = Rag ? J.nb[l] : n;
-                    for (int j = 1; j <= nl; ++j) gr[bl[j - 1]] += trow[j][l] * f;
+                    const double* tl = reinterpret_cast<const double*>(trow + 1) + l;   // as fill_E
+                    for (size_t j = 0; j < static_cast<size_t>(nl); ++j) gr[bl[j]] += tl[j * IW] * f;
                 }
                 for (int cc = 0; cc < nm; ++cc) gr[cc] += acc[cc][l] * gv[l];
             }
@@ -481,7 +490,10 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_linear(InterSoftJob& J) noexcept {
                 const double* pr = J.es + isj_row<Tr>(J, l, i) * na;
                 const unsigned char* bl = J.b[l];
                 const int nl = Rag ? J.nb[l] : n;
-                for (int j = 1; j <= nl; ++j) E[j][l] = pr[bl[j - 1]];
+                // Through a double* into lane l, size_t-indexed: with ivd[j][l] and an int j,
+                // gcc on AArch64 zero-extended j per element and spilled the unrolled indices.
+                double* el = reinterpret_cast<double*>(E + 1) + l;
+                for (size_t j = 0; j < static_cast<size_t>(nl); ++j) el[j * IW] = pr[bl[j]];
                 for (int j = nl + 1; j <= n; ++j) E[j][l] = 0.0;
             }
             return;
@@ -675,7 +687,8 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_linear(InterSoftJob& J) noexcept {
                     const double f = std::ldexp(gv, -kv[l]);
                     const unsigned char* bl = J.b[l];
                     const int nl = Rag ? J.nb[l] : n;
-                    for (int j = 1; j <= nl; ++j) gr[bl[j - 1]] += trow[j][l] * f;
+                    const double* tl = reinterpret_cast<const double*>(trow + 1) + l;   // as fill_E
+                    for (size_t j = 0; j < static_cast<size_t>(nl); ++j) gr[bl[j]] += tl[j * IW] * f;
                 }
                 for (int cc = 0; cc < nm; ++cc) gr[cc] += acc[cc][l] * gv;
             }
