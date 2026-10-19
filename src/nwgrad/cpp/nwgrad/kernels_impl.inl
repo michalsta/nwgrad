@@ -124,11 +124,24 @@ static constexpr double K_NINF = -std::numeric_limits<double>::infinity();
 // generator, gcc lowers it at AVX2 width to partial reloads of x through memory at an
 // 8-byte offset (vmovupd 8(%r), vmovhpd, vinsertf128) -- in the lazy-F rounds right
 // after the carry stored that very vector -- where clang permutes it in a register
-// (vpermpd + blend).  The intrinsic form gets gcc the same.  A pure lane move, so the
-// result is identical; every other width keeps the generator.
+// (vpermpd + blend).  The intrinsic form gets gcc the same; at AVX-512 it is one valign
+// (gcc 0.84-0.98 on the striped arms, clang unchanged).  A pure lane move, so the result
+// is identical; SSE2/SSE4/NEON (W=2) keep the generator.
 template <class V>
 static inline V lane_shift_in(V x, typename V::value_type b) {
-#if defined(__AVX2__) && !defined(__AVX512F__)
+#if defined(__AVX512F__)
+    // One valignq / valignd: (x : splat(b)) shifted right by W-1 lanes is [b, x0..x_{W-2}].
+    using T = typename V::value_type;
+    if constexpr (std::is_same_v<T, double> && V::size() == 8) {
+        const __m512i r = _mm512_alignr_epi64(_mm512_castpd_si512(static_cast<__m512d>(x)),
+                                              _mm512_castpd_si512(_mm512_set1_pd(b)), 7);
+        return V(_mm512_castsi512_pd(r));
+    } else if constexpr (std::is_same_v<T, float> && V::size() == 16) {
+        const __m512i r = _mm512_alignr_epi32(_mm512_castps_si512(static_cast<__m512>(x)),
+                                              _mm512_castps_si512(_mm512_set1_ps(b)), 15);
+        return V(_mm512_castsi512_ps(r));
+    } else
+#elif defined(__AVX2__)
     using T = typename V::value_type;
     if constexpr (std::is_same_v<T, double> && V::size() == 4) {
         const __m256d r = _mm256_permute4x64_pd(static_cast<__m256d>(x), 0x90);
