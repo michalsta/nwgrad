@@ -2211,6 +2211,7 @@ private:
                 d[j] = static_cast<unsigned char>(d0 < u);
             }
             T left = cv[0];
+            int hit = 0;
             for (int j = 1; j <= n; ++j) {
                 const T t = cv[j], l = left - ge_a;
                 T v = std::max(t, l);
@@ -2218,13 +2219,31 @@ private:
                 unsigned char c = static_cast<unsigned char>(d[j] + tl * (2 - d[j]));
                 if constexpr (local) {
                     v = std::max(v, static_cast<T>(0));
+#if defined(__GNUC__) && !defined(__clang__) && defined(__aarch64__)
+                    // gcc on AArch64 turned every form of the float stop compare into a
+                    // branch around the code (out of line, mispredicted where many cells
+                    // clamp to 0) and branched on the best cell too: 1.8x clang.  So: stop
+                    // where v <= 0, which after the clamp (v >= 0, -0 or NaN) is "the bits
+                    // without the sign are 0", an integer test; the best cell as selects,
+                    // its row taken once after the row (0.53x).  x86 keeps the plain form:
+                    // this one was 5-7 % slower there under both compilers.
+                    using U = std::conditional_t<sizeof(T) == 8, std::uint64_t, std::uint32_t>;
+                    const unsigned z = static_cast<unsigned>((std::bit_cast<U>(v) << 1) == 0);
+                    c = static_cast<unsigned char>(c | (3u * z));
+                    const bool up = v > best_local;
+                    best_local = up ? static_cast<double>(v) : best_local;
+                    bj = up ? j : bj;
+                    hit |= static_cast<int>(up);
+#else
                     // c is 0..2: OR-ing 3 sets the stop code without the branch gcc made
                     c = static_cast<unsigned char>(c | (3u * static_cast<unsigned>(v <= static_cast<T>(0))));
                     if (v > best_local) { best_local = v; bi = i; bj = j; }
+#endif
                 }
                 cv[j] = v; d[j] = c;
                 left = v;
             }
+            if constexpr (local) bi = hit ? i : bi;   // hit stays 0 on the plain form
             std::swap(prev, cur);
         }
         best_i_ = bi; best_j_ = bj;
