@@ -46,11 +46,29 @@
 #      define NWGRAD_SP_VMAX(m, v) __builtin_elementwise_maximum((m), (v))
 #    endif
 #  endif
+// gcc on AArch64: an `omp simd reduction(max:)` keeps its per-lane accumulator in a stack
+// array, stored and reloaded every vector step (it is never promoted back to a register),
+// while a plain fmax loop is vectorized as a register reduction (fmaxnm is one
+// instruction there; on x86 fmax is a libm call, hence the select above).  So there the
+// max is reduced WITHOUT the pragma, and the fused backward passes take it in a separate
+// loop over the row they just wrote (NWGRAD_SP_SPLIT_MAX): the same values, the same
+// order of additions.  The values are mass, never NaN or -0, so fmax equals the select.
+#  if !defined(NWGRAD_SP_VMAX) && defined(__GNUC__) && !defined(__clang__) && defined(__aarch64__)
+#    define NWGRAD_SP_VMAX(m, v) __builtin_fmax((m), (v))
+#    define NWGRAD_SP_SPLIT_MAX 1
+#  endif
 #  ifndef NWGRAD_SP_VMAX
 #    define NWGRAD_SP_VMAX(m, v) ((v) > (m) ? (v) : (m))
 #  endif
+#  ifndef NWGRAD_SP_SPLIT_MAX
+#    define NWGRAD_SP_SPLIT_MAX 0
+#  endif
 #  define NWGRAD_SP_SUM(...) NWGRAD_SP_PRAGMA_(omp simd reduction(+:__VA_ARGS__))
-#  define NWGRAD_SP_MAX(v) NWGRAD_SP_PRAGMA_(omp simd reduction(max:v))
+#  if NWGRAD_SP_SPLIT_MAX
+#    define NWGRAD_SP_MAX(v)
+#  else
+#    define NWGRAD_SP_MAX(v) NWGRAD_SP_PRAGMA_(omp simd reduction(max:v))
+#  endif
 #endif
 
 static constexpr double kSpLossTol = 0x1p-45;
@@ -269,19 +287,33 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear_t(SoftPairJob& J) noexcept {
             const double* __restrict Fp = Fi - st;
             const double* __restrict pr = P + sp_row<Tr>(J, i) * w;
             double* __restrict t = tmp;
+#if NWGRAD_SP_SPLIT_MAX
+            for (int j = j1; j <= hi0; ++j) mx = NWGRAD_SP_VMAX(mx, cb[j]);
+            NWGRAD_SP_PRAGMA_(omp simd reduction(+:sa, sb))
+#else
             NWGRAD_SP_PRAGMA_(omp simd reduction(+:sa, sb) reduction(max:mx))
+#endif
             for (int j = j1; j <= hi0; ++j) {
                 const double b = cb[j];
+#if !NWGRAD_SP_SPLIT_MAX
                 mx = NWGRAD_SP_VMAX(mx, b);
+#endif
                 sa += Fi[j - 1] * b;
                 sb += Fp[j] * b;
                 t[j] = Fp[j - 1] * pr[j] * b;
             }
         } else {
+#if NWGRAD_SP_SPLIT_MAX
+            for (int j = j1; j <= hi0; ++j) mx = NWGRAD_SP_VMAX(mx, cb[j]);
+            NWGRAD_SP_SUM(sa)
+#else
             NWGRAD_SP_PRAGMA_(omp simd reduction(+:sa) reduction(max:mx))
+#endif
             for (int j = j1; j <= hi0; ++j) {
                 const double b = cb[j];
+#if !NWGRAD_SP_SPLIT_MAX
                 mx = NWGRAD_SP_VMAX(mx, b);
+#endif
                 sa += Fi[j - 1] * b;
             }
         }
@@ -487,32 +519,50 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine_t(SoftPairJob& J) noexcept {
             const double* __restrict qY = fY - st;
             const double* __restrict pr = P + sp_row<Tr>(J, i) * w;
             double* __restrict t = tmp;
+#if NWGRAD_SP_SPLIT_MAX
+            NWGRAD_SP_SUM(sx, sy, so, sob)
+#else
             NWGRAD_SP_PRAGMA_(omp simd reduction(+:sx, sy, so, sob) reduction(max:mx))
+#endif
             for (int j = j1; j <= hi0; ++j) {
                 const double y = bY[j];
                 const double h = bY[j + 1] * oa;
                 const double mv = bM[j] + h, xv = bX[j] + h;
                 bM[j] = mv; bX[j] = xv;
+#if !NWGRAD_SP_SPLIT_MAX
                 const double tot = mv + xv + y;
                 mx = NWGRAD_SP_VMAX(mx, tot);
+#endif
                 sx += fX[j] * xv;
                 sy += fY[j] * y;
                 so += (fM[j - 1] + fX[j - 1]) * y;
                 sob += (qM[j] + qY[j]) * xv;
                 t[j] = (qM[j - 1] + qX[j - 1] + qY[j - 1]) * pr[j] * mv;
             }
+#if NWGRAD_SP_SPLIT_MAX
+            for (int j = j1; j <= hi0; ++j) mx = NWGRAD_SP_VMAX(mx, bM[j] + bX[j] + bY[j]);
+#endif
         } else {
+#if NWGRAD_SP_SPLIT_MAX
+            NWGRAD_SP_SUM(sy, so)
+#else
             NWGRAD_SP_PRAGMA_(omp simd reduction(+:sy, so) reduction(max:mx))
+#endif
             for (int j = j1; j <= hi0; ++j) {
                 const double y = bY[j];
                 const double h = bY[j + 1] * oa;
                 const double mv = bM[j] + h, xv = bX[j] + h;
                 bM[j] = mv; bX[j] = xv;
+#if !NWGRAD_SP_SPLIT_MAX
                 const double tot = mv + xv + y;
                 mx = NWGRAD_SP_VMAX(mx, tot);
+#endif
                 sy += fY[j] * y;
                 so += (fM[j - 1] + fX[j - 1]) * y;
             }
+#if NWGRAD_SP_SPLIT_MAX
+            for (int j = j1; j <= hi0; ++j) mx = NWGRAD_SP_VMAX(mx, bM[j] + bX[j] + bY[j]);
+#endif
         }
         if (J.gpost) {   // row argmax of the EXIT mass (see SoftPairJob::gpost)
             int bj = lo0; double bv = -1.0;
