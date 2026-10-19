@@ -525,9 +525,22 @@ inline LevelKernels* level_table() {
 // registrar to scalar `lea`s; the struct is assembled and stored here, in baseline code.
 // The score-only kernels, registered separately (same baseline-code rule) right after
 // register_level by the same registrar, so they cannot be overwritten by it.
+// Out-of-line is not enough under LTO: the link-time inliner may put a baseline callee
+// into an AVX-512 caller (a callee with fewer target features is inlinable), and gcc
+// -flto did exactly that, SIGILLing at load (vinserti64x2) on an AVX2 CPU.  So the two
+// registrars are never inlined or IPA-specialized into their callers.
+#if defined(__GNUC__) && !defined(__clang__)
+#define NWGRAD_BASELINE_ONLY __attribute__((noipa))
+#elif defined(__clang__)
+#define NWGRAD_BASELINE_ONLY __attribute__((noinline))
+#else
+#define NWGRAD_BASELINE_ONLY
+#endif
+NWGRAD_BASELINE_ONLY
 void register_level_score(SimdLevel l, score_fn score, score_fn_f score_f,
                           inter_fn inter_score, inter_fn_f inter_score_f);
 
+NWGRAD_BASELINE_ONLY
 void register_level(SimdLevel l, viterbi_fn viterbi, viterbi_fn_f viterbi_f,
                     viterbi_fn viterbi_ptr, viterbi_fn_f viterbi_ptr_f,
                     banded_row_fn banded_row_global, banded_row_fn banded_row_local,
