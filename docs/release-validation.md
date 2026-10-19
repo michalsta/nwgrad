@@ -1,4 +1,38 @@
-# 0.6 release validation
+# Release validation
+
+## 0.7 release validation
+
+Checked on 2026-10-19 against candidate
+`948f9bed0e65057f64b97bf847872f4470f801d2` (version 0.7.0), on skynet (x86,
+GCC 16.2.1, runtime dispatch `sse4`). The candidate was exported with
+`git archive` and installed non-editably into fresh virtual environments; the
+consumer checkouts were not modified. CI on `main` passed for this commit.
+
+| Check | Result |
+|---|---|
+| DiscrimAlign `main` (`8f564c2`, after the PR #16 port) fast tests, Python 3.14.7, numpy 2.5.4, scipy 1.18.1 | 1,152 passed, 31 deselected, 1 expected failure |
+| The same with `-W 'error:SeqPairBatch.add_many'` | 131 failed, 1,021 passed: DiscrimAlign `main` still calls `add_many()` |
+| PosimiR `nwgrad` branch (`bcaddc6`) tests, Python 3.12.14, numpy 1.26.4, numba 0.66.0, scikit-learn 1.9.0 | 33 passed |
+
+DiscrimAlign's fast test command was
+`pytest tests -q -m 'not slow' --ignore=tests/test_mirbench.py`; PosimiR's was
+`pytest tests -q`. DiscrimAlign `main` no longer uses the API removed in 0.7
+(`alloc_dp`, `align_full`, per-add problem-type arguments). It works with 0.7
+through the deprecated `add_many()` and will break in 0.8 unless it moves to the
+pair constructor or bounds `nwgrad<0.8`; its `pyproject.toml` requires
+`nwgrad>=0.6.0` without an upper bound.
+
+### Remaining 0.7 release checks
+
+- Run the Wheels workflow manually against the final candidate. Its last run was
+  the `v0.6.0` tag.
+- Run the extended score fuzz and the old-walker comparison on AVX-512 (solace).
+  They were not run for 0.6 either, CI has no AVX-512 runner, and `main` has
+  changed AVX-512 code since 0.6 (`cc/avx512-lane-shift`).
+- Optionally repeat the NEON checks below on spot. CI's `ubuntu-24.04-arm` job
+  runs the Python suite under NEON but not the extended score fuzz.
+
+## 0.6 release validation
 
 NEON checks completed on 2026-10-09 against candidate
 `e0e434b3eecba893ed489941637e018cc3ac1a6d`.
@@ -44,7 +78,7 @@ empty sequences, ties and non-representable gap costs. Scores, aligned strings,
 index paths, guides and both gradient consumers matched, as did 29,408 rejected
 cases. The harness and logs remain under the isolated directory above.
 
-## Removal of the API deprecated in 0.6.0
+### Removal of the API deprecated in 0.6.0
 
 Checked on the local x86 host on 2026-10-09 against `389a5ac`, GCC 16.2.1,
 Python 3.14.7, SSE2 runtime dispatch. The untyped batch state and deprecated
@@ -81,7 +115,7 @@ Logs and comparison results remain under `/tmp/nwgrad-api-*`,
 The preceding NEON results describe their explicitly named earlier candidate;
 this API-removal validation is local.
 
-## Follow-up cleanup and optional pair paths
+### Follow-up cleanup and optional pair paths
 
 Checked locally on 2026-10-09 with GCC 16.2.1, Python 3.14.7 and SSE2 runtime
 dispatch. Changes are recorded in `579462e`, `0559df0`, `ac3fd56`, `cc10315`
@@ -139,7 +173,7 @@ provides the same three-arm comparison with calibrated repeat counts:
 python tools/bench_pair_paths.py --seq-len 50 200 --cpu 0
 ```
 
-## Remaining release checks
+### Remaining 0.6 release checks
 
 - Run the corresponding extended score fuzz and old-walker comparison on AVX-512.
   Solace's SSH tunnel refused connections during the preceding fleet-access check.
