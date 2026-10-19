@@ -77,16 +77,17 @@ Build dependencies: `scikit-build-core`, `nanobind>=3.0` (the bindings call its 
 
 ## Open TODOs
 
-- **Measure what `-ffp-contract=off` costs on AArch64.** `CMakeLists.txt` now builds every
-  target with it (commit `42df954`): clang fused the striped kernels' closed-form borders
-  `-(go + j*ge)` into FMAs in the avx2/avx512 TUs, so with a non-representable gap cost
-  `kernel="avx2"` could return a different alignment than `scalar_fallback`. On x86 it is
-  free — gcc emitted 0 FMAs there already, and the Viterbi kernels are max/add chains. It
-  is **unmeasured on AArch64**, where gcc contracts by default and FMA is baseline, so the
-  shared scalar code (forward-backward / `soft_grad`, gradient accumulation) may have lost
-  fusions it had. Time the soft path and `tools/bench_simd.py` on spot (M1) with and
-  without the flag. If it costs, prefer narrowing the flag to the level TUs and the
-  Viterbi/traceback code over dropping it — bit-exactness across levels is the contract.
+- **gcc's `scalar_fallback` soft path on AArch64 misses its FMA contraction.** `CMakeLists.txt`
+  builds every target with `-ffp-contract=off` (commit `42df954`: clang had fused the striped
+  kernels' closed-form borders `-(go + j*ge)` into FMAs, so `kernel="avx2"` could disagree
+  with `scalar_fallback`). Measured on AArch64 2026-10-19 (spot, Fedora Asahi, gcc 16.2 /
+  clang 22.1, `bench_cc.py` every arm, the flag removed / main, control 0.96-1.04): at `neon`
+  — what AArch64 always runs — it costs nothing under either compiler (+-2 %), hard or soft,
+  because the soft kernels contract per function anyway. The one cost: gcc at
+  `scalar_fallback`, soft path 7-13 % (per-pair soft 0.87-0.92, DNA soft 0.90-0.93; clang
+  unaffected), so some of the baseline soft copy (`nwgrad_soft_base` in `aligner.hpp`) is
+  not reached by `NWGRAD_SP_FMA_FN` under gcc — lambdas or helpers outside the attributed
+  functions are the suspects; unconfirmed. Only a forced fallback runs it; keep the flag.
 - **Release the GIL during batch computation** (from the 2026-10-01 release review). The
   bindings hold it throughout, so a long `score_and_grad()` blocks every other Python
   thread. Lifetimes are now safe for it: a view pins its batch (`_owner`), and the batch
