@@ -628,9 +628,21 @@ So: **Pointers when it fits and threads ≤ its peak; Hirschberg above the cross
   (SLP runs at link time, with the link's options): scalar_fallback 1.19 geomean, score-only
   2.0-4.85x; with `-Wl,-mllvm,-vectorize-slp=false` scalar recovers (0.96-1.04) and the
   float32 striped Pointers kernels lose 1.55-1.61x at avx2 — one switch cannot serve both
-  TUs, so clang LTO needs the SLP split solved another way first. The PGO wins are worth
-  chasing in source (what made `weighted_grad` 0.67 and clang's soft passes 0.75-0.78),
-  not by shipping a profile whose losses are as large as its gains.
+  TUs, so clang LTO needs the SLP split solved another way first. The PGO wins were then
+  taken in source instead of shipping a profile whose losses are as large as its gains
+  (disassembly of base vs PGO, unstripped builds, perf on the timed loop only):
+  - clang's inter-pair soft pass kept the forward/backward row max on the STACK (a
+    `vcmpltpd` + `vmaskmovpd` store and a reload per column, ~31 % of the kernel), because
+    `mx` went to the `rescale` lambda by reference and clang did not inline it; PGO
+    inlined it. `mx` now goes by value and comes back: clang avx2 DNA soft 0.74-0.76
+    (= PGO), protein inter-pair soft 0.84 (PGO 0.78; the rest is diffuse), gcc unchanged.
+  - `weighted_grad` made one out-of-line `scale_into_` call per pair over a 20-double
+    loop; gcc PGO unrolled it for the trip it saw. Now one call per 64 pairs
+    (`scale_rows_`, still out of line: no product beside its add), and the adds on a local
+    fixed-size accumulator at gstride 20 / 29 (`add_rows_<GS>`): gcc 0.57-0.61 (better than
+    PGO), clang 0.81-0.87.
+  Both bit-identical to before (hashes of scores, `weighted_grad`, `compute_grad`, soft
+  results; 1 and 4 threads; chunk and block edges), suite and ctest green.
 - **64-byte-aligning the DP buffers — a real +15–18% win on AVX2, free, and now SHIPPED.** Chasing the "keep alignment" thread from the above found the actual lever: it is not the boundary shift, it is the *main-loop* W-wide loads/stores. `std::vector<double>` guarantees only **16-byte** alignment, so on AVX2 every 256-bit (32-byte) access is misaligned and some split cache lines. `dp_buffer.hpp`'s `AlignedAllocator` (C++17 aligned `operator new`, 64-byte, with `rebind`; `DVec` aliases `vector<double>` over it) backs every `DpBuffer` table, and the striped kernel pads each row to `rowsz = (seg+1)*W` with the striped columns starting at offset `W`, so every W-wide access is aligned. Measured on the shipped Full kernel (i5, forward-only, len=200): **594→698 Mcell/s (+17 %) on avx2**, `1.73×→2.06×`. **Nothing on SSE2/Piledriver or NEON/M1** (flat) — there W=2 is 16-byte and 16-byte alignment already suffices. So: worth doing on any 256-bit-or-wider target, pointless below.
 
 ### Short pairs: `fill="rowwise"` and `fill="interpair"` (2026-10-02; interpair the batch default since 2026-10-05)
