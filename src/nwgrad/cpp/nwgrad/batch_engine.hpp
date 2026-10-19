@@ -1513,25 +1513,57 @@ private:
     [[gnu::noinline]] static void scale_into_(double* dst, const double* src, size_t n, double s) {
         for (size_t k = 0; k < n; ++k) dst[k] = src[k] * s;
     }
+    // dst row r = w[r] * src row r, for cnt rows of gs.  Out of line for the same reason.
+    static constexpr size_t SUM_CHUNK = 64;
+    [[gnu::noinline]] static void scale_rows_(double* dst, const double* src, size_t gs,
+                                              const double* w, size_t cnt) {
+        for (size_t r = 0; r < cnt; ++r) {
+            const double s = w[r];
+            for (size_t k = 0; k < gs; ++k) dst[r * gs + k] = src[r * gs + k] * s;
+        }
+    }
+    // acc[k] += src row r [k] for r = 0..cnt-1, in row order.  GS > 0: gs == GS, summed in
+    // a local array the compiler can keep in registers (acc may alias nothing it reads,
+    // but a pointer cannot say so).
+    template <size_t GS>
+    static void add_rows_(double* acc, const double* src, size_t gs, size_t cnt) {
+        if constexpr (GS > 0) {
+            double a[GS];
+            for (size_t k = 0; k < GS; ++k) a[k] = acc[k];
+            for (size_t r = 0; r < cnt; ++r)
+                for (size_t k = 0; k < GS; ++k) a[k] += src[r * GS + k];
+            for (size_t k = 0; k < GS; ++k) acc[k] = a[k];
+        } else {
+            for (size_t r = 0; r < cnt; ++r)
+                for (size_t k = 0; k < gs; ++k) acc[k] += src[r * gs + k];
+        }
+    }
     AlignParams blocked_sum_(const Alphabet& alpha, const double* weights) const {
         if (tracked_) return blocked_sum_tracked_(alpha, weights);
         const size_t n = size(), gs = gstride();
         const size_t nblocks = (n + WEIGHTED_GRAD_BLOCK - 1) / WEIGHTED_GRAD_BLOCK;
         std::vector<double> partial(nblocks * gs, 0.0);
         std::atomic<size_t> next{0};
+        // Products for SUM_CHUNK pairs per out-of-line call, then the adds; at the DNA/RNA
+        // gradient sizes the adds run on a fixed-size local accumulator (registers, a
+        // compile-time trip).  Each acc[k] adds the same products in the same pair order.
+        // One call per pair over a 20-double loop was ~0.14 ms per 20k pairs; gcc PGO got
+        // 0.10 by unrolling that loop for the trip it saw.
         auto worker = [&]() {
-            std::vector<double> scaled(gs);
+            std::vector<double> scaled(SUM_CHUNK * gs);
             for (size_t b; (b = next.fetch_add(1, std::memory_order_relaxed)) < nblocks; ) {
                 double* acc = partial.data() + b * gs;
                 const size_t end = std::min(n, (b + 1) * WEIGHTED_GRAD_BLOCK);
-                for (size_t i = b * WEIGHTED_GRAD_BLOCK; i < end; ++i) {
+                for (size_t i = b * WEIGHTED_GRAD_BLOCK; i < end; i += SUM_CHUNK) {
+                    const size_t cnt = std::min(SUM_CHUNK, end - i);
                     const double* g = grad_.data() + i * gs;
                     if (weights) {
-                        scale_into_(scaled.data(), g, gs, weights[i]);
-                        for (size_t k = 0; k < gs; ++k) acc[k] += scaled[k];
-                    } else {
-                        for (size_t k = 0; k < gs; ++k) acc[k] += g[k];
+                        scale_rows_(scaled.data(), g, gs, weights + i, cnt);
+                        g = scaled.data();
                     }
+                    if (gs == 20)      add_rows_<20>(acc, g, gs, cnt);
+                    else if (gs == 29) add_rows_<29>(acc, g, gs, cnt);
+                    else               add_rows_<0>(acc, g, gs, cnt);
                 }
             }
         };
