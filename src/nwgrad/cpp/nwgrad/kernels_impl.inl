@@ -124,8 +124,9 @@ static constexpr double K_NINF = -std::numeric_limits<double>::infinity();
 // generator, gcc lowers it at AVX2 width to partial reloads of x through memory at an
 // 8-byte offset (vmovupd 8(%r), vmovhpd, vinsertf128) -- in the lazy-F rounds right
 // after the carry stored that very vector -- where clang permutes it in a register
-// (vpermpd + blend).  The intrinsic form gets gcc the same.  A pure lane move, so the
-// result is identical; every other width keeps the generator.
+// (vpermpd + blend).  The intrinsic form gets gcc the same; at AVX-512 it is one valign
+// (gcc 0.84-0.98 on the striped arms, clang unchanged).  A pure lane move, so the result
+// is identical; SSE2/SSE4/NEON (W=2) keep the generator.
 template <class V>
 static inline V lane_shift_in(V x, typename V::value_type b) {
 #if defined(__AVX512F__)
