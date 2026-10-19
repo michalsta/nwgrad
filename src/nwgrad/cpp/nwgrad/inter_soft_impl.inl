@@ -167,7 +167,10 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_affine(InterSoftJob& J) noexcept {
     int kv[IW];
     bool bad[IW];
     for (int l = 0; l < IW; ++l) bad[l] = false;
-    auto rescale = [&](ivd* r0, ivd* r1, ivd* r2, ivd* tot, ivd& mx) {
+    // mx by value, returned: taken by reference its address escaped whenever clang did not
+    // inline the lambda, and the row loops' running max then lived on the stack (a compare
+    // and a masked store per column, ~30 % of the DNA soft pass; clang PGO inlined it).
+    auto rescale = [&](ivd* r0, ivd* r1, ivd* r2, ivd* tot, ivd mx) -> ivd {
         ivd sc;
         bool any = false;
         for (int l = 0; l < IW; ++l) {
@@ -179,10 +182,10 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_affine(InterSoftJob& J) noexcept {
             any |= (k != 0);
             sc[l] = std::ldexp(1.0, -k);
         }
-        if (!any) return;
+        if (!any) return mx;
         for (int j = 0; j <= n; ++j) { r0[j] *= sc; r1[j] *= sc; r2[j] *= sc; }
         if (tot) for (int j = 0; j <= n; ++j) tot[j] *= sc;
-        mx *= sc;
+        return mx * sc;
     };
 
     // ── Forward ──
@@ -229,7 +232,7 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_affine(InterSoftJob& J) noexcept {
             tq2[j] = t; s += t; mx = ivmax(mx, t);
         }
         std::swap(tq, tq2);
-        rescale(rM, rX, rY, tq, mx);
+        mx = rescale(rM, rX, rY, tq, mx);
         for (int l = 0; l < IW; ++l) {
             S[i * IW + l] = S[(i - 1) * IW + l] + kv[l];
             if (kv[l]) s[l] = std::ldexp(s[l], -kv[l]);
@@ -364,7 +367,7 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_affine(InterSoftJob& J) noexcept {
         }
         if (post)
             for (int l = 0; l < IW; ++l) J.gpost[static_cast<size_t>(i) * IW + l] = static_cast<int>(pbj[l]);
-        rescale(cM, cX, cY, nullptr, mx);
+        mx = rescale(cM, cX, cY, nullptr, mx);
         for (int l = 0; l < IW; ++l)
             if (kv[l]) {
                 const double f = std::ldexp(1.0, -kv[l]);
@@ -519,7 +522,7 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_linear(InterSoftJob& J) noexcept {
     int kv[IW];
     bool bad[IW];
     for (int l = 0; l < IW; ++l) bad[l] = false;
-    auto rescale = [&](ivd* r, ivd& mx) {
+    auto rescale = [&](ivd* r, ivd mx) -> ivd {   // mx by value: see the affine kernel
         ivd sc;
         bool any = false;
         for (int l = 0; l < IW; ++l) {
@@ -531,9 +534,9 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_linear(InterSoftJob& J) noexcept {
             any |= (k != 0);
             sc[l] = std::ldexp(1.0, -k);
         }
-        if (!any) return;
+        if (!any) return mx;
         for (int j = 0; j <= n; ++j) r[j] *= sc;
-        mx *= sc;
+        return mx * sc;
     };
 
     // ── Forward ──
@@ -562,7 +565,7 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_linear(InterSoftJob& J) noexcept {
             if constexpr (Rag) lv = ivsel(cok[j], lv, z);
             r[j] = lv; sv += lv; mx = ivmax(mx, lv);
         }
-        rescale(r, mx);
+        mx = rescale(r, mx);
         for (int l = 0; l < IW; ++l) {
             S[i * IW + l] = S[(i - 1) * IW + l] + kv[l];
             if (kv[l]) sv[l] = std::ldexp(sv[l], -kv[l]);
@@ -655,7 +658,7 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_linear(InterSoftJob& J) noexcept {
         else         cols(std::integral_constant<int, -1>{});
         if (post)
             for (int l = 0; l < IW; ++l) J.gpost[static_cast<size_t>(i) * IW + l] = static_cast<int>(pbj[l]);
-        rescale(cur, mx);
+        mx = rescale(cur, mx);
         for (int l = 0; l < IW; ++l)
             if (kv[l]) {
                 const double fct = std::ldexp(1.0, -kv[l]);
