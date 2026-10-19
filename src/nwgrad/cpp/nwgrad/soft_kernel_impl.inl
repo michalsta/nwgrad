@@ -24,6 +24,12 @@
 #  if defined(__clang__)
 #    define NWGRAD_SP_FMA_FN
 #    define NWGRAD_SP_FMA_BODY _Pragma("clang fp contract(fast)")
+#  elif defined(__GNUC__) && defined(__aarch64__)
+// gcc on AArch64 also unrolls these loops: it issues one vector iteration per loop trip
+// where clang unrolls and interleaves (whole-TU -funroll-loops, NEON: 7-14 % on the soft
+// kernels).
+#    define NWGRAD_SP_FMA_FN __attribute__((optimize("fp-contract=fast", "unroll-loops")))
+#    define NWGRAD_SP_FMA_BODY
 #  elif defined(__GNUC__)
 #    define NWGRAD_SP_FMA_FN __attribute__((optimize("fp-contract=fast")))
 #    define NWGRAD_SP_FMA_BODY
