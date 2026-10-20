@@ -912,8 +912,13 @@ doubles carry full relative precision; the only error is mass LOST below `DBL_MI
 (subnormal cells, a weight like exp(-100), an underflowed free start). A lost term is
 < `DBL_MIN` in its row's stored units (×2^-k if the row was scaled UP), and mass lost at a
 cell moves any posterior — and Z — by at most its own posterior. So each row's damage is
-bounded by `32(n+1)·DBL_MIN·(lf·maxB̂ + lb·maxF̂)·2^(S+T-ze)/zr` with the rows' ACTUAL maxima
-(`sp_loss`), computable from quantities in hand; a pair fails when the sum exceeds 2^-45,
+bounded by `c(n+1)·DBL_MIN·(lf·maxB̂ + lb·maxF̂)·2^(S+T-ze)/zr` with the rows' ACTUAL maxima
+(`sp_loss`), computable from quantities in hand; `c` counts the operations per cell and
+direction that can round below `DBL_MIN`, with margin: 16 linear (~6 inter-pair, ~7.5
+per pair with its four-cell carry), 32 affine. Both fills must charge the SAME `c`, or a
+pair passes in one and raises in the other: until 2026-10-20 the per-pair kernel charged
+linear gaps 32, refusing (`fuzz_fill.py` seed 395, a 3 × 687 global protein pair, bound
+3.8e-14) what interpair computed to 1e-15; a pair fails when the sum exceeds 2^-45,
 or a weight/row overflows (a step score beyond ~709 nats). An earlier per-cell rule (every
 cell 0 or normal; weights ≥ 2^-50) refused gap cost 100 and a 200-aa local protein
 self-pair with log Z ~1600 nats — both are fine and pass (1e-11 vs log). What genuinely

@@ -145,6 +145,33 @@ def test_scaled_raises_out_of_range():
         b.score_and_grad()
 
 
+def test_linear_range_bound_agrees_across_fills():
+    """The per-pair scaled kernel charged linear gaps the affine kernels' range bound
+    (32 lost terms per cell; the inter-pair linear kernel 16), so fill="striped" refused
+    a pair that fill="interpair" computed to ~1e-15 (tools/fuzz_fill.py seed 395).  A
+    3 x 687 global protein pair whose bound is 1.58x the tolerance charged 32 terms and
+    0.79x charged 16: both fills must accept it and match the log path."""
+    from test_subst_matrix import BLOSUM62
+    params = nwgrad.AlignParams(BLOSUM62, gap_open_a=0.0, gap_extend_a=1.0,
+                                gap_open_b=0.0, gap_extend_b=1.0)
+    a = "YFR"
+    b = rand_seq(np.random.default_rng(42), nwgrad.PROTEIN.symbols, 687)
+    ref = nwgrad.SeqPairDouble(a, b, params, gap_model="linear", mode="global", grad_mode="soft")
+    ref.soft_impl = "log"
+    want, gref = ref.score_and_grad()
+    sp = nwgrad.SeqPairDouble(a, b, params, gap_model="linear", mode="global", grad_mode="soft")
+    assert sp.soft_impl == "scaled"
+    got, g = sp.score_and_grad()
+    assert got == pytest.approx(want, rel=REL)
+    close(g.to_dict()["matrix"], gref.to_dict()["matrix"])
+    for fill in ("striped", "interpair"):
+        batch = nwgrad.SeqPairBatchDouble([a] * 5, [b] * 5, params, n_threads=2,
+                                          gap_model="linear", mode="global", grad_mode="soft")
+        batch.fill = fill
+        batch.score_and_grad()
+        close(batch.scores(), np.full(5, want))
+
+
 def test_scaled_or_log_falls_back():
     s, params = out_of_range_case()
     rng = np.random.default_rng(5)

@@ -389,6 +389,7 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_affine(InterSoftJob& J) noexcept {
             const int kf = i > 0 ? S[i * IW + l] - S[(i - 1) * IW + l] : 0, kb = kv[l];
             const double lf = kf < 0 ? std::ldexp(1.0, -kf) : 1.0;
             const double lb = kb < 0 ? std::ldexp(1.0, -kb) : 1.0;
+            // 32 terms per cell: sp_loss's kSpTermsAffine (both fills must agree).
             loss[l] += 32.0 * (n + 1) * DMIN * (lf * mx[l] + lb * mf[i][l]) * gh[l];
         }
         for (int l = 0; l < IW; ++l) {
@@ -674,6 +675,7 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_linear(InterSoftJob& J) noexcept {
             const int kf = i > 0 ? S[i * IW + l] - S[(i - 1) * IW + l] : 0, kb = kv[l];
             const double lf = kf < 0 ? std::ldexp(1.0, -kf) : 1.0;
             const double lb = kb < 0 ? std::ldexp(1.0, -kb) : 1.0;
+            // 16 terms per cell: sp_loss's kSpTermsLinear (both fills must agree).
             loss[l] += 16.0 * (n + 1) * DMIN * (lf * mx[l] + lb * mf[i][l]) * gh;
             const double eal = Tr ? ea[l] : J.ea, ebl = Tr ? eb[l] : J.eb;
             if (i >= kmin) g_ea[l] += sa[l] * eal * gh;

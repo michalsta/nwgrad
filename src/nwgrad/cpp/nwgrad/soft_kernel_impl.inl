@@ -133,12 +133,18 @@ static inline int sp_lazy(double& mx, int lo, int hi, bool& bad, double* r0, dou
 }
 // Bound on the posterior damage of mass lost in one row pair (see AGENTS.md): lost terms
 // are below DMIN in stored units (x2^-k where a rescale scaled UP), and act through the
-// other direction's actual row max times the row's posterior factor g.
-static inline double sp_loss(int n, int kf, int kb, double mxf, double mxb, double g) noexcept {
+// other direction's actual row max times the row's posterior factor g.  `terms`: the
+// operations per cell and direction whose result can fall below DMIN, with margin —
+// kSpTermsLinear (~7.5 here: the cell sum and the four-cell carry) and kSpTermsAffine,
+// the same counts the inter-pair soft kernels (inter_soft_impl.inl) charge, so a pair
+// passes or fails the range check whichever fill computes it.
+static constexpr double kSpTermsLinear = 16.0, kSpTermsAffine = 32.0;
+static inline double sp_loss(double terms, int n, int kf, int kb, double mxf, double mxb,
+                             double g) noexcept {
     NWGRAD_SP_FMA_BODY
     const double lf = kf < 0 ? std::ldexp(1.0, -kf) : 1.0;
     const double lb = kb < 0 ? std::ldexp(1.0, -kb) : 1.0;
-    return 32.0 * (n + 1) * std::numeric_limits<double>::min() * (lf * mxb + lb * mxf) * g;
+    return terms * (n + 1) * std::numeric_limits<double>::min() * (lf * mxb + lb * mxf) * g;
 }
 static inline double sp_post(int e, double izr, bool& bad) noexcept {
     const double f = std::ldexp(izr, e);
@@ -338,7 +344,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear_t(SoftPairJob& J) noexcept {
         // Sums were taken before any rescale: their factor uses Tn, the bound uses Ti.
         const double gh0 = sp_post(S[i] + Tn - ze, izr, bad);
         const double gh = sp_post(S[i] + Ti - ze, izr, bad);
-        loss += sp_loss(n, i > 0 ? S[i] - S[i - 1] : 0, kb, mf[i], mx, gh);
+        loss += sp_loss(kSpTermsLinear, n, i > 0 ? S[i] - S[i - 1] : 0, kb, mf[i], mx, gh);
         if (i >= kmin) {
             g_ea += sa * ea * gh0;
             if constexpr (Tr) J.grow[4 * i + 1] = -(sa * ea * gh0);
@@ -584,7 +590,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine_t(SoftPairJob& J) noexcept {
         const int Ti = Tn + kb;
         const double gh0 = sp_post(S[i] + Tn - ze, izr, bad);
         const double gh = sp_post(S[i] + Ti - ze, izr, bad);
-        loss += sp_loss(n, i > 0 ? S[i] - S[i - 1] : 0, kb, mf[i], mx, gh);
+        loss += sp_loss(kSpTermsAffine, n, i > 0 ? S[i] - S[i - 1] : 0, kb, mf[i], mx, gh);
         g_eb += sx * gh0;
         g_ea += sy * gh0;
         if (i >= kmin) g_oa += so * oa * gh0;
