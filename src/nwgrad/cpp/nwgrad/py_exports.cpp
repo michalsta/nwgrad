@@ -54,14 +54,6 @@ template <> struct type_caster<SeqViews> {
 };
 }  // namespace nanobind::detail
 
-// Temporary 0.7 deprecations. Warn before mutation so warnings-as-errors is safe.
-static void warn_pair_api(const char* old_name, const char* replacement) {
-    const std::string message = std::string("SeqPair.") + old_name +
-        " is deprecated in nwgrad 0.7.0 and will be removed in 0.8.0; use " + replacement;
-    if (PyErr_WarnEx(PyExc_DeprecationWarning, message.c_str(), 1) < 0)
-        throw nb::python_error();
-}
-
 void bind_logistic(nb::module_& parent);   // logistic/py_logistic.cpp
 using nb_arr_f64    = nb::ndarray<double, nb::ndim<2>, nb::c_contig, nb::device::cpu>;
 using nb_arr_f64_3d = nb::ndarray<double, nb::ndim<3>, nb::c_contig, nb::device::cpu>;
@@ -548,22 +540,6 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
              "skips storing the path. Raises if grad_mode is \"none\".")
         .def("drop_paths", &SP::drop_paths,
              "Free the stored path and reusable scratch memory; scores, gradients and guides survive.")
-        .def("align_full", [](SP& s) {
-            warn_pair_api("align_full()", "align() or score_and_grad()");
-            PairApiCompat::full(s);
-        }, "Deprecated in 0.7; removed in 0.8. Stores paths and defers gradient visibility.")
-        .def("realign_banded", [](SP& s, int bandwidth) {
-            warn_pair_api("realign_banded()", "banded_align()");
-            PairApiCompat::banded(s, bandwidth);
-        }, nb::arg("bandwidth"), "Deprecated in 0.7; removed in 0.8. Defers gradient visibility.")
-        .def("compute_grad", [](SP& s) {
-            warn_pair_api("compute_grad()", "grad after align() or banded_align()");
-            PairApiCompat::publish(s);
-        }, "Deprecated in 0.7; removed in 0.8. Releases a deferred cached gradient.")
-        .def("drop_dp", [](SP& s) {
-            warn_pair_api("drop_dp()", "drop_paths()");
-            s.drop_paths();
-        }, "Deprecated in 0.7; removed in 0.8. Use drop_paths().")
         .def("aligned", &SP::aligned,
              "Return the alignment as a pair of gapped strings (seq_a, seq_b).")
         .def(
@@ -621,10 +597,6 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
         .def_prop_ro("grad_valid",  &SP::grad_valid)
         .def_prop_ro("stored_path_valid", &SP::stored_path_valid,
                      "Whether a stored path is available (aligned(), coordinates()).")
-        .def_prop_ro("dp_valid", [](const SP& s) {
-            warn_pair_api("dp_valid", "stored_path_valid");
-            return s.stored_path_valid();
-        }, "Deprecated in 0.7; removed in 0.8. Use stored_path_valid.")
         .def_prop_rw(
             "hb_cutoff",
             [](const SP& s) { return s.hb_cutoff(); },
@@ -680,21 +652,6 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
             "Either may also be ONE flat 1-D integer numpy array: every pair's entries\n" \
             "concatenated in pair order (sum(len(a)) for tracks, sum(len(a) + 1) for\n" \
             "gap_tracks) — no per-pair Python objects, much cheaper for many pairs."
-
-// The deprecated add_many() (removed in 0.8.0): pairs appended to `self` under params
-// (one segment).  The C++ method is deprecated too; this is its one sanctioned caller.
-template<class SPB>
-static void add_pairs(SPB& self, const std::vector<std::string_view>& seqs_a,
-                      const std::vector<std::string_view>& seqs_b, const AlignParams& params,
-                      const std::string& kernel, nb::handle tracks, nb::handle gap_tracks) {
-    const auto [la, lg] = track_lengths(seqs_a);
-    const auto tk = to_tracks(tracks, la, "tracks");
-    const auto gk = to_tracks(gap_tracks, lg, "gap_tracks");
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-    self.add_many(seqs_a, seqs_b, params, parse_backend(kernel), tk.view(), gk.view());
-#pragma GCC diagnostic pop
-}
 
 template<class T>
 static void bind_seq_pair_batch(nb::module_& m, const char* name) {
@@ -783,27 +740,6 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             "This form makes a batch WITHOUT pairs: for align() (streaming, nothing kept\n"
             "per pair).  To keep pairs, give them to the constructor:\n"
             "SeqPairBatch(seqs_a, seqs_b, params, ...).")
-        .def(
-            "add_many",
-            [](SPB& self, const SeqViews& seqs_a,
-               const SeqViews& seqs_b, const AlignParams& params,
-               const std::string& kernel, nb::handle tracks, nb::handle gap_tracks) {
-                if (PyErr_WarnEx(PyExc_DeprecationWarning,
-                                 "SeqPairBatch.add_many() is deprecated in nwgrad 0.7.0 and will be removed in "
-                                 "0.8.0; give the pairs to the constructor: "
-                                 "SeqPairBatch(seqs_a, seqs_b, params, ...)", 1) < 0)
-                    throw nb::python_error();
-                add_pairs(self, seqs_a.v, seqs_b.v, params, kernel, tracks, gap_tracks);
-            },
-            nb::arg("seqs_a"), nb::arg("seqs_b"), nb::arg("params"), nb::arg("kernel") = "auto",
-            nb::kw_only(), nb::arg("tracks").none() = nb::none(), nb::arg("gap_tracks").none() = nb::none(),
-            "Deprecated in 0.7; removed in 0.8.  Give the pairs to the constructor,\n"
-            "SeqPairBatch(seqs_a, seqs_b, params, ...).\n"
-            "\n"
-            "Append pairs under an owned copy of params (one segment; a batch may hold\n"
-            "several, under different params of one alphabet and one K). Sequences are\n"
-            "validated and encoded in parallel; a bad character raises and adds nothing.\n"
-            "The problem type is fixed by the constructor.  Tracks as the constructor's.")
         .def("__len__", &SPB::size)
         .def(
             "__getitem__",
@@ -1034,10 +970,10 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
                 s.set_soft_guide(lazy, post);
             },
             "When soft pairs compute their guide path (the Viterbi alignment that\n"
-            "realign_banded()/banded_grad() band around).\n"
+            "banded_grad()/banded_align() band around).\n"
             "  \"eager\" (default): score_and_grad() runs the guide Viterbi, as always.\n"
             "  \"lazy\": it does not; the guide is computed on first use (guide_j,\n"
-            "     realign_banded, banded_grad) under the params CURRENT THEN — after\n"
+            "     banded_align, banded_grad) under the params CURRENT THEN — after\n"
             "     set_params() it follows the new params.\n"
             "     Saves the whole Viterbi for loops that rescore in full each step and\n"
             "     never band (soft-score continuation); use eager to band around the\n"

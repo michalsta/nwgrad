@@ -52,7 +52,7 @@ def dna_params():
 @pytest.mark.skipif(running_under_asan(),
                     reason="ASan's own threads and allocator make the thread budget "
                            "unpredictable; the plain build is what matters here")
-@pytest.mark.parametrize("entry", ["score_and_grad", "sorted", "align_full", "construct"])
+@pytest.mark.parametrize("entry", ["score_and_grad", "sorted", "keep_paths", "construct"])
 def test_thread_launch_failure_does_not_abort(entry):
     """Cap the user's thread count a few above what is running, then ask for 32
     workers: the first launches succeed, a later one fails.  The process must survive —
@@ -82,7 +82,7 @@ def test_thread_launch_failure_does_not_abort(entry):
             if "{entry}" == "construct":   # the pairs are encoded in parallel
                 b = n.SeqPairBatch(A, B, p, n_threads=32)
                 got = None
-            elif "{entry}" == "align_full":
+            elif "{entry}" == "keep_paths":
                 got = b.score_and_grad(keep_paths=True)
             else:
                 got = b.score_and_grad()

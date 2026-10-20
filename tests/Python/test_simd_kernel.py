@@ -116,7 +116,7 @@ def test_seq_pair_kernels_agree_including_banded_realign():
                             grad_mode="hard", kernel=kern)
         sp.align()
         full = sp.score
-        # realign_banded takes the per-row gather path inside the simd kernel rather
+        # banded_align takes the per-row gather path inside the simd kernel rather
         # than the query profile, so it is genuinely different code — not just the
         # same kernel over fewer columns.
         sp.banded_align(12)

@@ -1,10 +1,9 @@
-// Contains deprecated pair lifecycle regressions; remove compatibility cases in 0.8.
 // SeqPair and SeqPairBatch.
 //
 // These two headers were never instantiated by the C++ test binary — they were
 // only ever reached through the Python bindings.  Anyone using nwgrad as a
 // header-only library hits this code directly, so it needs coverage here:
-// the state machine (alloc_dp / align_full / drop_dp and the *_valid flags),
+// the state machine (align / banded_align / drop_paths and the *_valid flags),
 // all four GapModel x AlignMode variants of the std::variant type erasure,
 // every GradMode, banded re-alignment, and the threaded batch.
 //
@@ -105,9 +104,8 @@ TEST_CASE("SeqPair: accessors throw before anything is computed", "[seq_pair]") 
     REQUIRE_THROWS_AS(sp.grad(),  std::logic_error);
 }
 
-TEST_CASE("SeqPair: align_full needs no alloc_dp", "[seq_pair]") {
-    // The DP runs on a worker buffer; there are no pair-owned tables to allocate, and
-    // alloc_dp() is kept only as a no-op for old callers.
+TEST_CASE("SeqPair: align needs no setup", "[seq_pair]") {
+    // The DP runs on a worker buffer; there are no pair-owned tables to allocate.
     auto p = asym_params(4.0, 0.5, 1.5, 2.0);
     SeqPair sp(A, B, p, GapModel::Affine, AlignMode::Global, GradMode::Hard);
     sp.align();
@@ -118,19 +116,17 @@ TEST_CASE("SeqPair: validity flags follow the lifecycle", "[seq_pair]") {
     auto p = asym_params(4.0, 0.5, 1.5, 2.0);
     SeqPair sp(A, B, p, GapModel::Affine, AlignMode::Global, GradMode::Hard);
 
-    sp.align_full();
+    sp.align();
     REQUIRE(sp.score_valid());
     REQUIRE(sp.path_valid());
-    REQUIRE(sp.dp_valid());
-    REQUIRE_FALSE(sp.grad_valid());     // gradient is lazy
+    REQUIRE(sp.stored_path_valid());
+    REQUIRE(sp.grad_valid());           // published with the score
 
-    sp.compute_grad();
+    sp.drop_paths();
+    REQUIRE_FALSE(sp.stored_path_valid());
+    REQUIRE(sp.score_valid());          // the score survives dropping the path
     REQUIRE(sp.grad_valid());
-
-    sp.drop_dp();
-    REQUIRE_FALSE(sp.dp_valid());
-    REQUIRE(sp.score_valid());          // the score survives dropping the tables
-    REQUIRE(sp.grad_valid());
+    REQUIRE(sp.path_valid());           // and so does the guide
 }
 
 TEST_CASE("SeqPair: set_params invalidates the cached results", "[seq_pair]") {
@@ -152,13 +148,12 @@ TEST_CASE("SeqPair: set_params invalidates the cached results", "[seq_pair]") {
     REQUIRE(sp.score() != Approx(first));           // the new params actually bit
 }
 
-TEST_CASE("SeqPair: score_and_grad matches align_full + compute_grad", "[seq_pair]") {
+TEST_CASE("SeqPair: score_and_grad matches align + grad", "[seq_pair]") {
     auto p = asym_params(4.0, 0.5, 1.5, 2.0);
 
     SeqPair a(A, B, p, GapModel::Affine, AlignMode::Global, GradMode::Hard);
 
-    a.align_full();
-    a.compute_grad();
+    a.align();
 
     SeqPair b(A, B, p, GapModel::Affine, AlignMode::Global, GradMode::Hard);
     auto [score, grad] = b.score_and_grad();
@@ -232,7 +227,7 @@ TEST_CASE("SeqPair: a wide band reproduces the full-DP score", "[seq_pair][bande
     REQUIRE(sp.score() == Approx(full));
 }
 
-TEST_CASE("SeqPair: realign_banded picks up new params", "[seq_pair][banded]") {
+TEST_CASE("SeqPair: banded_align picks up new params", "[seq_pair][banded]") {
     auto p = asym_params(4.0, 0.5, 1.5, 2.0);
     SeqPair sp(A, B, p, GapModel::Affine, AlignMode::Global, GradMode::Hard);
 
@@ -404,7 +399,7 @@ TEST_CASE("SeqPair: set_params invalidates the retained traceback", "[seq_pair]"
         SeqPair sp(A, B, *p1, GapModel::Affine, AlignMode::Global, GradMode::Hard,
                    kBackendAuto, tb);
 
-        sp.align_full();
+        sp.align();
         const auto expected = sp.aligned();
         const auto guide    = sp.guide_j();
 
@@ -412,15 +407,14 @@ TEST_CASE("SeqPair: set_params invalidates the retained traceback", "[seq_pair]"
         sp.set_params(p2);
         delete p1;
 
-        REQUIRE_FALSE(sp.dp_valid());
+        REQUIRE_FALSE(sp.stored_path_valid());
         REQUIRE(sp.path_valid());
         REQUIRE(sp.guide_j() == guide);
         REQUIRE_THROWS_AS(sp.aligned(), std::logic_error);
-        REQUIRE_THROWS_AS(sp.compute_grad(), std::logic_error);
+        REQUIRE_THROWS_AS(sp.grad(), std::logic_error);
 
-        sp.realign_banded(4);
+        sp.banded_align(4);
         REQUIRE(sp.aligned() == expected);
-        sp.compute_grad();
         REQUIRE(sp.grad_valid());
     }
 }

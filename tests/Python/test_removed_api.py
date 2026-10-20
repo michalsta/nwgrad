@@ -1,4 +1,4 @@
-"""The 0.6.0 compatibility surface is removed; batch types are always fixed."""
+"""The 0.6.0 and 0.7.0 compatibility surfaces are removed; batch types are always fixed."""
 
 import numpy as np
 import pytest
@@ -6,19 +6,15 @@ import nwgrad
 
 
 @pytest.mark.parametrize("suffix", ["", "Double"])
-@pytest.mark.filterwarnings("ignore:SeqPairBatch.add_many")   # deprecated, removed in 0.8
-def test_removed_methods_and_per_add_types(suffix):
-    cls = getattr(nwgrad, "SeqPairBatch" + suffix)
-    batch = cls(n_threads=1)
+def test_removed_methods(suffix):
     params = nwgrad.AlignParams(np.eye(4), alphabet="ACGT")
-    for method in ("alloc_dp", "align_full", "realign_banded", "drop_dp"):
+    batch = getattr(nwgrad, "SeqPairBatch" + suffix)(["ACGT"], ["ACGT"], params, n_threads=1)
+    for method in ("add_many", "alloc_dp", "align_full", "realign_banded", "drop_dp"):
         assert not hasattr(batch, method)
-    pair = getattr(nwgrad, "SeqPair" + suffix)("ACGT", "ACGT", params)
-    assert not hasattr(pair, "alloc_dp")
-    for field, value in (("gap_model", "affine"), ("mode", "global"), ("grad_mode", "hard")):
-        with pytest.raises(TypeError):
-            batch.add_many(["ACGT"], ["ACGT"], params, **{field: value})
-        assert len(batch) == 0
+    for pair in (getattr(nwgrad, "SeqPair" + suffix)("ACGT", "ACGT", params), batch[0]):
+        for name in ("alloc_dp", "align_full", "realign_banded", "compute_grad", "drop_dp",
+                     "dp_valid"):
+            assert not hasattr(pair, name)
 
 
 @pytest.mark.parametrize("suffix", ["", "Double"])
@@ -43,14 +39,3 @@ def test_type_is_fixed_before_successful_add(suffix):
     for before, after in zip(gradients, batch.grads()):
         np.testing.assert_array_equal(before, after)
     np.testing.assert_array_equal(total["matrix"], batch.compute_grad().to_dict()["matrix"])
-
-
-@pytest.mark.parametrize("suffix", ["", "Double"])
-def test_supported_pair_view_can_release_gradient_through_batch(suffix):
-    params = nwgrad.AlignParams(np.eye(4), alphabet="ACGT")
-    batch = getattr(nwgrad, "SeqPairBatch" + suffix)(["ACGT"], ["ACGT"], params, n_threads=1)
-    view = batch[0]
-    view.align_full()
-    assert not view.grad_valid
-    batch.compute_grad()
-    assert view.grad_valid

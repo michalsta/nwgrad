@@ -1,7 +1,7 @@
 // Randomized batch regressions against direct public Aligner calls. The reference
 // does not use BatchEngine, SeqPair, inter-pair scheduling or stored-path compression.
 // Covers 192 stored-batch and 240 streaming configurations across precisions, types,
-// parameter segments, schedules, fills, traceback modes, soft options and guide bands.
+// kernels, schedules, fills, traceback modes, soft options and guide bands.
 #include "catch.hpp"
 #include "batch_engine.hpp"
 #include <algorithm>
@@ -22,7 +22,7 @@ struct Cfg {
     int hb_cutoff;
     int threads;
     bool protein;
-    bool two_segments, scalar_second;
+    bool scalar;           // the batch's kernel: scalar, else auto
     int bw;
 };
 
@@ -200,33 +200,30 @@ void run_case(unsigned seed, const Cfg& c) {
     const Alphabet& alpha = Alphabet::get(c.protein ? "ACDEFGHIKLMNPQRSTVWY" : "ACGT");
     const int kind = static_cast<int>(rng() % 3);
     const AlignParams p1 = rparams(rng, alpha, GM, kind);
-    const AlignParams p1b = rparams(rng, alpha, GM, (kind + 1) % 3);
     const AlignParams p2 = rparams(rng, alpha, GM, (kind + 2) % 3);
-    const int N1 = 1 + static_cast<int>(rng() % 30), N2 = c.two_segments ? 1 + static_cast<int>(rng() % 20) : 0;
+    const int N0 = 1 + static_cast<int>(rng() % 50);
     std::vector<std::string> A, B;
     const int lb = rlen(rng);
-    for (int k = 0; k < N1 + N2; ++k) {
+    for (int k = 0; k < N0; ++k) {
         A.push_back(rseq(rng, alpha.symbols(), rlen(rng)));
         B.push_back(rseq(rng, alpha.symbols(), rng() % 4 ? lb : rlen(rng)));
     }
-    std::vector<std::string_view> A1(A.begin(), A.begin() + N1), B1(B.begin(), B.begin() + N1);
-    std::vector<std::string_view> A2(A.begin() + N1, A.end()), B2(B.begin() + N1, B.end());
-    const int k2 = c.scalar_second ? kBackendScalar : kBackendAuto;
-    BatchEngine<T, GM, AM> eng(c.threads, c.gd, c.tb);
+    const int kern = c.scalar ? kBackendScalar : kBackendAuto;
+    BatchEngine<T, GM, AM> eng(BatchSettings{c.threads, c.tb}, c.gd,
+                               std::vector<std::string_view>(A.begin(), A.end()),
+                               std::vector<std::string_view>(B.begin(), B.end()), p1, kern);
     eng.set_fill(c.rowwise, c.inter); eng.set_sorted_schedule(c.sorted);
     eng.set_soft_impl(c.soft_impl); eng.set_soft_temperature(c.temp);
     eng.set_soft_guide(c.soft_guide == 1, c.soft_guide == 2); eng.set_hb_cutoff(c.hb_cutoff);
-    eng.add_many(A1, B1, p1);
-    if (N2) eng.add_many(A2, B2, p1b, k2);
     const size_t N = A.size();
     REQUIRE(eng.size() == N);
     const bool soft = c.gd == GradMode::Soft;
     std::vector<Expected> expected;
-    auto kernel = [&](size_t i) { return i < static_cast<size_t>(N1) ? kBackendAuto : k2; };
+    auto kernel = [&](size_t) { return kern; };
     double sum = 0;
     for (size_t i = 0; i < N; ++i) {
         expected.push_back(reference<T, GM, AM, AlignBand::Full>(A[i], B[i],
-            i < static_cast<size_t>(N1) ? p1 : p1b, c, kernel(i), false));
+            p1, c, kernel(i), false));
         sum += expected.back().score;
     }
     check_number(sum, eng.score_and_grad(), soft);
@@ -243,8 +240,7 @@ void run_case(unsigned seed, const Cfg& c) {
         if (!(soft && c.soft_guide == 1)) {
             const auto actual_guide = eng.guide_j(i);
             if (soft && c.soft_guide == 2) {
-                check_posterior_guide<T, GM, AM>(A[i], B[i],
-                    i < static_cast<size_t>(N1) ? p1 : p1b, c, actual_guide);
+                check_posterior_guide<T, GM, AM>(A[i], B[i], p1, c, actual_guide);
                 expected[i].guide = actual_guide;
             } else CHECK(expected[i].guide == actual_guide);
         }
@@ -320,16 +316,15 @@ void sweep(int n) {
         c.hb_cutoff = rng() % 2 ? 512 : 1 + static_cast<int>(rng() % 24);
         c.threads = 1 + static_cast<int>(rng() % 4);
         c.protein = rng() % 4 == 0;
-        c.two_segments = rng() % 2;
-        c.scalar_second = rng() % 2;
+        c.scalar = rng() % 2;
         c.bw = 1 + static_cast<int>(rng() % 8);
         const unsigned seed = static_cast<unsigned>(rng());
         INFO("case " << k << " seed " << seed << " gd " << static_cast<int>(c.gd) << " tb "
              << static_cast<int>(c.tb) << " inter " << c.inter << " rowwise " << c.rowwise
              << " sorted " << c.sorted << " guide " << c.soft_guide << " impl "
              << static_cast<int>(c.soft_impl) << " T " << c.temp << " cutoff " << c.hb_cutoff
-             << " threads " << c.threads << " protein " << c.protein << " segs "
-             << c.two_segments << " bw " << c.bw);
+             << " threads " << c.threads << " protein " << c.protein << " scalar "
+             << c.scalar << " bw " << c.bw);
         run_case<T, GM, AM>(seed, c);
     }
 }

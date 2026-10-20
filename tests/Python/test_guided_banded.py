@@ -271,7 +271,7 @@ def test_narrow_band_does_not_crash():
     back to the origin, so every predecessor in the traceback sat at -inf.  The
     M>=X>=Y tie-break then chose M, which steps diagonally, so i or j went negative;
     cell_index() turned that into a huge size_t and the walk read off the end of the
-    table.  `realign_banded(8)` on these two sequences segfaulted; band >= 64 did not.
+    table.  `banded_align(8)` on these two sequences segfaulted; band >= 64 did not.
 
     The documented contract is that a too-narrow band "silently returns a suboptimal
     score (no detection)" — so the assertion is that it returns *something* finite and

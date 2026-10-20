@@ -89,7 +89,7 @@ def test_score_and_grad_identical(params, mode):
 
 @pytest.mark.parametrize("mode", ["global", "local"])
 def test_aligned_strings_identical(params, mode):
-    """align_full() + aligned() — the pair's OWN buffers.
+    """score_and_grad(keep_paths=True) + aligned() — the stored paths.
 
     Regression: "pointers" skips allocating VM/VX/VY, and `aligned_affine` used to
     read them anyway.  That was a SEGFAULT, not a wrong answer, and nothing covered

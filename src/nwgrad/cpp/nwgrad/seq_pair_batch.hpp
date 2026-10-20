@@ -10,8 +10,8 @@
 //     SeqPairBatchT<double> b(seqs_a, seqs_b, params,  // the pairs, given once
 //                             GapModel::Affine, AlignMode::Local, GradMode::Hard);
 //
-// The pairless constructor makes a batch for streaming align() only (nothing kept per
-// pair).  add_many(), which appended pairs, is deprecated in 0.7.0 and removed in 0.8.0.
+// The pairs are given once, to the constructor.  The pairless constructor makes a batch
+// for streaming align() only (nothing kept per pair).
 //
 // One BatchEngine is selected at construction: one dispatch per batch call, never
 // per pair. Settings live in that engine.
@@ -48,21 +48,21 @@ public:
 
     // The pairs (seqs_a[i], seqs_b[i]) under an owned copy of params, validated and
     // encoded in parallel (a bad character throws).  tracks / gap_tracks: one entry per
-    // pair, or empty (see BatchEngine::add_many); a batch with tracks or K > 1 parameter
-    // sets is tracked.  kernel: the Viterbi backend (kBackendAuto, kBackendScalar or a
-    // SimdLevel).
+    // pair, or empty (see BatchEngine's constructor); a batch with tracks or K > 1
+    // parameter sets is tracked.  kernel: the Viterbi backend (kBackendAuto,
+    // kBackendScalar or a SimdLevel).
     SeqPairBatchT(const std::vector<std::string_view>& seqs_a,
                   const std::vector<std::string_view>& seqs_b, const AlignParams& params,
                   GapModel gm, AlignMode am, GradMode gd, int n_threads = 0,
                   TracebackMode tb = TracebackMode::Default, int kernel = kBackendAuto,
                   const PairTracks& tracks = {}, const PairTracks& gap_tracks = {})
-        : SeqPairBatchT(gm, am, gd, n_threads, tb) {
-        append_(seqs_a, seqs_b, params, kernel, tracks, gap_tracks);
-    }
+        : e_(make_engine_(gm, am, gd, settings_(n_threads, tb), seqs_a, seqs_b, params, kernel,
+                          tracks, gap_tracks)),
+          gm_(gm), am_(am), gd_(gd) {}
     // No pairs: a batch for streaming align().
     SeqPairBatchT(GapModel gm, AlignMode am, GradMode gd, int n_threads = 0,
                   TracebackMode tb = TracebackMode::Default)
-        : e_(make_engine_(gm, am, gd, n_threads, tb)), gm_(gm), am_(am), gd_(gd) {}
+        : e_(make_engine_(gm, am, gd, settings_(n_threads, tb))), gm_(gm), am_(am), gd_(gd) {}
 
     SeqPairBatchT(const SeqPairBatchT&)            = delete;
     SeqPairBatchT& operator=(const SeqPairBatchT&) = delete;
@@ -81,16 +81,7 @@ public:
         return std::visit(std::forward<F>(f), e_);
     }
 
-    // ── Adding pairs ─────────────────────────────────────────────────────────
-
-    // Append a segment under an owned copy of params (tracks: see BatchEngine::add_many).
-    [[deprecated("give the pairs to the SeqPairBatchT constructor; removed in nwgrad 0.8.0")]]
-    void add_many(const std::vector<std::string_view>& seqs_a,
-                  const std::vector<std::string_view>& seqs_b,
-                  const AlignParams& params, int kernel = kBackendAuto,
-                  const PairTracks& tracks = {}, const PairTracks& gap_tracks = {}) {
-        append_(seqs_a, seqs_b, params, kernel, tracks, gap_tracks);
-    }
+    // ── Pairs ────────────────────────────────────────────────────────────────
 
     size_t size() const noexcept { return visit([](const auto& e) { return e.size(); }); }
     bool tracked() const noexcept { return visit([](const auto& e) { return e.tracked(); }); }
@@ -110,7 +101,7 @@ public:
         return visit([&](auto& e) { return e.banded_grad(bandwidth, keep_paths); });
     }
     void drop_paths() { visit([](auto& e) { e.drop_paths(); }); }
-    AlignParams compute_grad() {
+    AlignParams compute_grad() const {
         return visit([](auto& e) { return e.compute_grad(); });
     }
     std::vector<double> scores() const {
@@ -184,27 +175,27 @@ public:
     }
 
 private:
-    void append_(const std::vector<std::string_view>& seqs_a, const std::vector<std::string_view>& seqs_b,
-                 const AlignParams& params, int kernel, const PairTracks& tracks,
-                 const PairTracks& gap_tracks) {
-        visit([&](auto& e) { e.add_many(seqs_a, seqs_b, params, kernel, tracks, gap_tracks); });
-    }
-
     Var e_;
     GapModel gm_ = GapModel::Affine;
     AlignMode am_ = AlignMode::Global;
     GradMode gd_ = GradMode::Hard;
-    static Var make_engine_(GapModel gm, AlignMode am, GradMode gd,
-                            int n_threads, TracebackMode tb) {
+    static BatchSettings settings_(int n_threads, TracebackMode tb) {
         BatchSettings settings;
         settings.set_n_threads(n_threads);
         settings.traceback = tb;
+        return settings;
+    }
+    // The engine of this problem type, built from `args` (its constructor's, after the
+    // grad mode).
+    template<class... Args>
+    static Var make_engine_(GapModel gm, AlignMode am, GradMode gd, BatchSettings settings,
+                            const Args&... args) {
         if (gm == GapModel::Linear) {
-            if (am == AlignMode::Global) return Var(std::in_place_index<0>, settings, gd);
-            return Var(std::in_place_index<1>, settings, gd);
+            if (am == AlignMode::Global) return Var(std::in_place_index<0>, settings, gd, args...);
+            return Var(std::in_place_index<1>, settings, gd, args...);
         }
-        if (am == AlignMode::Global) return Var(std::in_place_index<2>, settings, gd);
-        return Var(std::in_place_index<3>, settings, gd);
+        if (am == AlignMode::Global) return Var(std::in_place_index<2>, settings, gd, args...);
+        return Var(std::in_place_index<3>, settings, gd, args...);
     }
 
 };
@@ -248,15 +239,6 @@ public:
     }
     void drop_paths() { e([&](auto& x) { x.drop_path(i_); }); }
 
-    [[deprecated("use align(); removed in nwgrad 0.8.0")]]
-    void align_full() { PairApiCompat::full(*this); }
-    [[deprecated("use banded_align(); removed in nwgrad 0.8.0")]]
-    void realign_banded(int bandwidth) { PairApiCompat::banded(*this, bandwidth); }
-    [[deprecated("read grad after align(); removed in nwgrad 0.8.0")]]
-    void compute_grad() { PairApiCompat::publish(*this); }
-    [[deprecated("use drop_paths(); removed in nwgrad 0.8.0")]]
-    void drop_dp() { drop_paths(); }
-
     // ── Results ──────────────────────────────────────────────────────────────
     double score() const { return ce([&](const auto& x) { return x.score(i_); }); }
     AlignParams grad() const { return ce([&](const auto& x) { return x.grad(i_); }); }
@@ -278,13 +260,11 @@ public:
     bool score_valid() const { return ce([&](const auto& x) { return x.score_valid(i_); }); }
     bool grad_valid()  const { return ce([&](const auto& x) { return x.grad_valid(i_); }); }
     bool stored_path_valid() const { return ce([&](const auto& x) { return x.path_stored(i_); }); }
-    [[deprecated("use stored_path_valid(); removed in nwgrad 0.8.0")]]
-    bool dp_valid() const { return stored_path_valid(); }
     std::string seq_a() const { return ce([&](const auto& x) { return x.seq_a(i_); }); }
     std::string seq_b() const { return ce([&](const auto& x) { return x.seq_b(i_); }); }
     size_t len_a() const { return ce([&](const auto& x) { return x.len_a(i_); }); }
     size_t len_b() const { return ce([&](const auto& x) { return x.len_b(i_); }); }
-    int kernel() const { return ce([&](const auto& x) { return x.kernel(i_); }); }
+    int kernel() const { return ce([](const auto& x) { return x.kernel(); }); }
     GapModel gap_model() const { return b_->gap_model(); }
     AlignMode align_mode() const { return b_->align_mode(); }
     GradMode grad_mode() const { return b_->grad_mode(); }
@@ -294,7 +274,7 @@ public:
     // ── Settings: a standalone pair's own; a view's belong to its batch ──────
     void set_params(const AlignParams& p) {
         standalone_("set_params");
-        own_->visit([&](auto& x) { x.set_params_segment(0, p); });
+        own_->set_params(p);
     }
     int hb_cutoff() const { return b_->hb_cutoff(); }
     void set_hb_cutoff(int v) { standalone_("hb_cutoff"); own_->set_hb_cutoff(v); }

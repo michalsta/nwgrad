@@ -68,7 +68,7 @@ def test_scaled_matches_log(gm, mode, alpha):
 @pytest.mark.parametrize("gm,mode", MODES)
 @pytest.mark.parametrize("bw", [0, 1, 3, 8])
 def test_scaled_matches_log_banded(gm, mode, bw):
-    """realign_banded runs the GuideBanded aligner — band edges, guard cells, and
+    """banded_align runs the GuideBanded aligner — band edges, guard cells, and
     (local) borders that lie outside the band."""
     rng = np.random.default_rng(7 + bw)
     params = dna_params(rng)

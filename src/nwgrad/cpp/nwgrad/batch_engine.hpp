@@ -26,10 +26,9 @@
 // the same order of Aligner calls: the per-pair results are bit-identical to the old
 // classes; tests/cpp/test_batch_engine.cpp checks them against raw Aligners.
 //
-// Params are per add_many() call: a SEGMENT of consecutive pairs shares one
-// AlignParams (and one Viterbi backend).  set_params() points every segment at the new
-// params.  Params are owned copies, deduplicated by value, so callers can update or
-// release their originals without changing cached results.
+// The pairs are given once, at construction, under one AlignParams and one Viterbi
+// backend; set_params() replaces the params for every pair.  Params are owned copies,
+// so callers can update or release their originals without changing cached results.
 
 #include <algorithm>
 #include <array>
@@ -48,7 +47,6 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 #include <vector>
 
 #include "align_params.hpp"
@@ -56,7 +54,6 @@
 #include "batch_result.hpp"
 #include "grad_mode.hpp"
 #include "parallel.hpp"
-#include "pair_api_compat.hpp"
 #include "simd_levels.hpp"
 
 // Every setting of a batch, its default and its validation, in one place. The engine
@@ -109,7 +106,6 @@ struct BatchSettings {
 
 template<class T, GapModel GM, AlignMode AM>
 class BatchEngine {
-    friend struct PairApiCompat;
 public:
     using DpBuffer = DpBufferT<T>;
     using FullAl   = Aligner<GM, AM, AlignBand::Full, T>;
@@ -119,6 +115,7 @@ public:
 
     // ── Construction ─────────────────────────────────────────────────────────
 
+    // No pairs: an engine for streaming align_stream() only.
     BatchEngine(BatchSettings s, GradMode gd) : s_(std::move(s)), grad_mode_(gd) {
         s_.set_n_threads(s_.n_threads);
         FullAl probe;   // what "auto" resolves to for this problem type
@@ -127,6 +124,88 @@ public:
     }
     BatchEngine(int n_threads, GradMode gd, TracebackMode tb = TracebackMode::Default)
         : BatchEngine(BatchSettings{n_threads, tb}, gd) {}
+
+    // The N pairs (seqs_a[i], seqs_b[i]) under a copy of `params` (the batch owns its
+    // params: a later in-place change to the caller's object does not reach it —
+    // set_params() does) and Viterbi backend `kernel`.  Sequences are validated and
+    // encoded here, in parallel, straight into the batch's arrays; an out-of-alphabet
+    // character throws, naming it and its position.
+    //
+    // Tracks (see aligner.hpp, "Tracks"): `tracks` — one per pair, each the parameter set
+    // of every residue of A — and `gap_tracks` — one per pair, the set of every DP row
+    // 0..m for gaps in A — are optional (null: all pairs default; an EMPTY entry: that
+    // pair defaults).  Defaults are as Aligner::set_problem's.  The batch is TRACKED when
+    // its params have more than one set or any track is given; every pair then carries
+    // both tracks (zeros / derived where not given), and set_params() must keep K.  A
+    // tracked batch stores a hard gradient as the pair's PATH (2 bits per step) or, with
+    // track_counts, its sparse field counts — not as K dense sets — and sums it on demand.
+    BatchEngine(BatchSettings s, GradMode gd, const std::vector<std::string_view>& seqs_a,
+                const std::vector<std::string_view>& seqs_b, const AlignParams& params,
+                int kernel = kBackendAuto, const PairTracks& tracks = {},
+                const PairTracks& gap_tracks = {})
+        : BatchEngine(std::move(s), gd) {
+        if (seqs_a.size() != seqs_b.size())
+            throw std::invalid_argument(
+                "nwgrad: seqs_a and seqs_b need equal length (got " +
+                std::to_string(seqs_a.size()) + " and " + std::to_string(seqs_b.size()) + ")");
+        const size_t N = seqs_a.size();
+        if (tracks && tracks.size() != N)
+            throw std::invalid_argument("nwgrad: tracks needs one entry per pair (got " +
+                                        std::to_string(tracks.size()) + " for " + std::to_string(N) + " pairs)");
+        if (gap_tracks && gap_tracks.size() != N)
+            throw std::invalid_argument("nwgrad: gap_tracks needs one entry per pair (got " +
+                                        std::to_string(gap_tracks.size()) + " for " + std::to_string(N) + " pairs)");
+        if (N == 0) return;
+        if (N > std::numeric_limits<uint32_t>::max())
+            throw std::length_error("nwgrad: batch too large");
+        const int K = params.num_sets();
+        check_tracks_(tracks, [&](size_t k) { return seqs_a[k].size(); }, K, "track");
+        check_tracks_(gap_tracks, [&](size_t k) { return seqs_a[k].size() + 1; }, K, "gap_track");
+
+        const Alphabet& alpha = params.matrix.alphabet();
+        // Offsets first (serial: a prefix sum), then encode in parallel into place.
+        oa_.reserve(N + 1); ob_.reserve(N + 1);
+        for (size_t i = 0; i < N; ++i) {
+            oa_.push_back(oa_.back() + seqs_a[i].size());
+            ob_.push_back(ob_.back() + seqs_b[i].size());
+        }
+        ca_.resize(oa_.back());
+        cb_.resize(ob_.back());
+        parallel_for_(N, [&](size_t k) {
+            alpha.encode_into(seqs_a[k], ca_.data() + oa_[k]);
+            alpha.encode_into(seqs_b[k], cb_.data() + ob_[k]);
+        });
+        alpha_ = &alpha;
+        nn_ = static_cast<size_t>(alpha.size()) * static_cast<size_t>(alpha.size());
+        nsets_ = K;
+        tracked_ = K > 1 || tracks || gap_tracks;
+        params_ = own_params_(params);
+        kernel_ = kernel;
+        score_.assign(N, 0.0);
+        flags_.assign(N, 0);
+        guide_.assign(oa_.back() + N, 0);   // pair i: m+1 entries at oa_[i] + i
+        if (tracked_) {
+            tk_.assign(oa_.back(), 0);         // pair i: m entries at oa_[i]
+            gk_.assign(oa_.back() + N, 0);     // pair i: m+1 entries at oa_[i] + i
+            parallel_for_(N, [&](size_t i) {
+                const size_t m = len_a(i);
+                uint16_t* t = tk_.data() + oa_[i];
+                uint16_t* g = gk_.data() + oa_[i] + i;
+                const auto tr = tracks ? tracks[i] : std::span<const uint16_t>();
+                const auto gt = gap_tracks ? gap_tracks[i] : std::span<const uint16_t>();
+                if (!tr.empty()) std::copy(tr.begin(), tr.end(), t);
+                if (!gt.empty()) {
+                    std::copy(gt.begin(), gt.end(), g);
+                } else {
+                    g[0] = m ? t[0] : 0;
+                    for (size_t r = 1; r <= m; ++r) g[r] = t[r - 1];
+                }
+            });
+            size_grad_store_();
+        } else if (grad_mode_ != GradMode::None) {
+            grad_.assign(N * gstride(), 0.0);
+        }
+    }
 
     BatchEngine(const BatchEngine&)            = delete;
     BatchEngine& operator=(const BatchEngine&) = delete;
@@ -171,7 +250,7 @@ public:
         if (!tracked_ || grad_mode_ != GradMode::Hard) return;
         for (auto& f : flags_) f &= static_cast<uint8_t>(~kGrad);
         reset_hard_store_();
-        grow_tpaths_(0);
+        size_grad_store_();
     }
 
     struct PhaseProfile {
@@ -181,108 +260,6 @@ public:
         double finish_s = 0.0;
     };
     std::vector<PhaseProfile> profile_out;   // per worker, after a profiled sorted run
-
-    // ── Adding pairs ─────────────────────────────────────────────────────────
-
-    // Append N pairs as one segment under a copy of `params` (the batch owns its params:
-    // a later in-place change to the caller's object does not reach it — set_params()
-    // does) and Viterbi backend `kernel`.  Sequences are validated and encoded here, in
-    // parallel, straight into the batch's arrays; an out-of-alphabet character throws
-    // (naming it and its position) and leaves the batch exactly as it was.
-    //
-    // Tracks (see aligner.hpp, "Tracks"): `tracks` — one per pair, each the parameter set
-    // of every residue of A — and `gap_tracks` — one per pair, the set of every DP row
-    // 0..m for gaps in A — are optional (null: all pairs default; an EMPTY entry: that
-    // pair defaults).  Defaults are as Aligner::set_problem's.  A batch is TRACKED once
-    // its params have more than one set or any pair was given a track; every pair then
-    // carries both tracks (zeros / derived where not given), and every segment's params
-    // must have the same number of sets.  A tracked batch stores a hard gradient as the
-    // pair's PATH (2 bits per step) or, with track_counts, its sparse field counts — not
-    // as K dense sets — and sums it on demand.
-    void add_many(const std::vector<std::string_view>& seqs_a,
-                  const std::vector<std::string_view>& seqs_b,
-                  const AlignParams& params, int kernel = kBackendAuto,
-                  const PairTracks& tracks = {}, const PairTracks& gap_tracks = {}) {
-        if (seqs_a.size() != seqs_b.size())
-            throw std::invalid_argument(
-                "nwgrad: seqs_a and seqs_b need equal length (got " +
-                std::to_string(seqs_a.size()) + " and " + std::to_string(seqs_b.size()) + ")");
-        const Alphabet& alpha = params.matrix.alphabet();
-        if (alpha_ && &alpha != alpha_)
-            throw std::invalid_argument(
-                "nwgrad: SeqPair over alphabet \"" + alpha.symbols() +
-                "\" cannot join a batch over alphabet \"" + alpha_->symbols() + "\"");
-        const size_t N = seqs_a.size();
-        if (tracks && tracks.size() != N)
-            throw std::invalid_argument("nwgrad: tracks needs one entry per pair (got " +
-                                        std::to_string(tracks.size()) + " for " + std::to_string(N) + " pairs)");
-        if (gap_tracks && gap_tracks.size() != N)
-            throw std::invalid_argument("nwgrad: gap_tracks needs one entry per pair (got " +
-                                        std::to_string(gap_tracks.size()) + " for " + std::to_string(N) + " pairs)");
-        if (N == 0) return;
-        if (N > std::numeric_limits<uint32_t>::max() - size())
-            throw std::length_error("nwgrad: batch too large");
-        const int K = params.num_sets();
-        if (!empty() && K != nsets_)
-            throw std::invalid_argument(
-                "nwgrad: params with " + std::to_string(K) + " parameter sets cannot join a batch of " +
-                std::to_string(nsets_) + "-set params");
-        // Tracks: lengths and set indices checked up front, on the caller's thread, so a
-        // bad one leaves the batch exactly as it was.
-        check_tracks_(tracks, [&](size_t k) { return seqs_a[k].size(); }, K, "track");
-        check_tracks_(gap_tracks, [&](size_t k) { return seqs_a[k].size() + 1; }, K, "gap_track");
-        const bool want_tracked = tracked_ || K > 1 || tracks || gap_tracks;
-
-        const size_t N0 = size();
-        const size_t ca0 = ca_.size(), cb0 = cb_.size();
-        // Offsets first (serial: a prefix sum), then encode in parallel into place.
-        for (size_t i = 0; i < N; ++i) {
-            oa_.push_back(oa_.back() + seqs_a[i].size());
-            ob_.push_back(ob_.back() + seqs_b[i].size());
-        }
-        try {
-            ca_.resize(oa_.back());
-            cb_.resize(ob_.back());
-            parallel_for_(N, [&](size_t k) {
-                alpha.encode_into(seqs_a[k], ca_.data() + oa_[N0 + k]);
-                alpha.encode_into(seqs_b[k], cb_.data() + ob_[N0 + k]);
-            });
-        } catch (...) {
-            oa_.resize(N0 + 1); ob_.resize(N0 + 1);
-            ca_.resize(ca0);    cb_.resize(cb0);
-            throw;
-        }
-        alpha_ = &alpha;
-        nn_ = static_cast<size_t>(alpha.size()) * static_cast<size_t>(alpha.size());
-        nsets_ = K;
-        segs_.push_back({own_params_(params), kernel, N0});
-        seg_.resize(N0 + N, static_cast<uint32_t>(segs_.size() - 1));
-        score_.resize(N0 + N, 0.0);
-        flags_.resize(N0 + N, 0);
-        guide_.resize(oa_.back() + N0 + N, 0);   // pair i: m+1 entries at oa_[i] + i
-        if (want_tracked && !tracked_) make_tracked_(N0);
-        if (tracked_) {
-            tk_.resize(oa_.back(), 0);              // pair i: m entries at oa_[i]
-            gk_.resize(oa_.back() + N0 + N, 0);     // pair i: m+1 entries at oa_[i] + i
-            parallel_for_(N, [&](size_t k) {
-                const size_t i = N0 + k, m = len_a(i);
-                uint16_t* t = tk_.data() + oa_[i];
-                uint16_t* g = gk_.data() + oa_[i] + i;
-                const auto tr = tracks ? tracks[k] : std::span<const uint16_t>();
-                const auto gt = gap_tracks ? gap_tracks[k] : std::span<const uint16_t>();
-                if (!tr.empty()) std::copy(tr.begin(), tr.end(), t);
-                if (!gt.empty()) {
-                    std::copy(gt.begin(), gt.end(), g);
-                } else {
-                    g[0] = m ? t[0] : 0;
-                    for (size_t r = 1; r <= m; ++r) g[r] = t[r - 1];
-                }
-            });
-            grow_tpaths_(N0);
-        }
-        if (grad_mode_ != GradMode::None && !tracked_) grad_.resize((N0 + N) * gstride(), 0.0);
-        ++generation_;
-    }
 
     // Whether the batch is tracked, and its parameter set count K (0 when empty).
     bool tracked() const noexcept { return tracked_; }
@@ -311,8 +288,9 @@ public:
     std::span<const uint8_t> codes_b(size_t i) const noexcept { return {cb_.data() + ob_[i], len_b(i)}; }
     std::string seq_a(size_t i) const { return decode_(codes_a(i)); }
     std::string seq_b(size_t i) const { return decode_(codes_b(i)); }
-    const AlignParams& params(size_t i) const noexcept { return *segs_[seg_[i]].params; }
-    int kernel(size_t i) const noexcept { return segs_[seg_[i]].kernel; }
+    // The batch's params (non-empty batches) and Viterbi backend.
+    const AlignParams& params() const noexcept { return params_->p; }
+    int kernel() const noexcept { return kernel_; }
 
     bool path_valid(size_t i)  const noexcept { return flags_[i] & kPath; }
     bool score_valid(size_t i) const noexcept { return flags_[i] & kScore; }
@@ -395,8 +373,8 @@ public:
 
     // ── Batch operations ─────────────────────────────────────────────────────
 
-    // Point every segment at a copy of `params` (same alphabet).  Clears every cached score,
-    // gradient and stored path; guides stay (banded_grad() bands around them).
+    // Replace the params with a copy of `params` (same alphabet, same K).  Clears every
+    // cached score, gradient and stored path; guides stay (banded_grad() bands around them).
     void set_params(const AlignParams& params) {
         if (empty()) return;
         if (&params.matrix.alphabet() != alpha_)
@@ -404,23 +382,8 @@ public:
                 "nwgrad: set_params() cannot change the alphabet (\"" + alpha_->symbols() +
                 "\" -> \"" + params.matrix.alphabet().symbols() + "\"); construct new pairs instead");
         check_sets_(params);
-        const AlignParams* own = own_params_(params);
-        for (auto& s : segs_) s.params = own;
-        drop_unused_params_();
+        params_ = own_params_(params);
         for (auto& f : flags_) f &= static_cast<uint8_t>(~(kScore | kGrad | kStored));
-    }
-    // set_params for one pair's segment only (a single-pair batch: SeqPair).
-    void set_params_segment(size_t seg, const AlignParams& params) {
-        if (&params.matrix.alphabet() != alpha_)
-            throw std::invalid_argument(
-                "nwgrad: set_params() cannot change the alphabet (\"" + alpha_->symbols() +
-                "\" -> \"" + params.matrix.alphabet().symbols() + "\"); construct a new SeqPair instead");
-        check_sets_(params);
-        segs_[seg].params = own_params_(params);
-        drop_unused_params_();
-        const size_t end = seg + 1 < segs_.size() ? segs_[seg + 1].begin : size();
-        for (size_t i = segs_[seg].begin; i < end; ++i)
-            flags_[i] &= static_cast<uint8_t>(~(kScore | kGrad | kStored));
     }
 
     // Full DP on every pair: score, guide and (unless grad_mode None) gradient, cached
@@ -513,11 +476,9 @@ public:
     }
     // The summed gradient (weights all 1: w*g == g exactly, so this is the plain blocked
     // sum).  Unlike the old per-thread completion-order merge, reproducible bit for bit.
-    AlignParams compute_grad() {
-        const Alphabet& alpha = alphabet();
-        // Temporary compatibility bridge for deferred results from old calls on views.
-        // Remove in 0.8; modern pair and batch fills publish gradients directly.
-        PairApiCompat::release_for_sum(*this);  // remove the 0.7 view bridge in 0.8
+    AlignParams compute_grad() const {
+        const Alphabet& alpha = alphabet();   // throws if empty
+        check_all_grads_();
         return blocked_sum_(alpha, nullptr);
     }
     // The cached gradients as arrays: matrices[i*n*n ..] (row-major, alphabet order) and
@@ -995,108 +956,27 @@ private:
         kLastBanded = 16,  // the cached results came from a banded DP
         kStored = 32,      // path_ holds the current alignment
     };
-    // gparams: the params the segment's PENDING guides belong to.  Null for the lazy soft
-    // guide ("under the params current then"); set by score_only_() to the params it
-    // scored, so a deferred guide is the one the eager path would have stored.
-    struct Segment { const AlignParams* params; int kernel; size_t begin;
-                     const AlignParams* gparams = nullptr; };
-
-    // The batch's own copies of its params, one per distinct VALUE: add_many() calls
-    // with equal params share one copy, so the inter-pair plan (which groups pairs by
-    // params address) still shares a fill across them.  Behind unique_ptr so the
-    // addresses survive a move of the engine.
-    // Per owned params: its gap fields cast to T, 4 per set (setup_tracks_ reads them),
-    // and (float32, K > 1) its whole matrix stack cast to T.
-    struct Prep { const AlignParams* p; std::vector<T> stack; std::vector<T> gaps; };
-    std::vector<Prep> prep_;
-    std::vector<std::unique_ptr<const AlignParams>> params_own_;
-    std::unordered_multimap<size_t, const AlignParams*> params_idx_;
-
-    static size_t params_hash_(const AlignParams& p) noexcept {
-        size_t h = 1469598103934665603ull;
-        auto mix = [&](const void* d, size_t n) {
-            const auto* c = static_cast<const unsigned char*>(d);
-            for (size_t k = 0; k < n; ++k) { h ^= c[k]; h *= 1099511628211ull; }
-        };
-        const double g[4] = {p.gap_open_a, p.gap_extend_a, p.gap_open_b, p.gap_extend_b};
-        mix(g, sizeof g);
-        const size_t na = p.matrix.alphabet().size();
-        mix(p.matrix.data(), na * na * static_cast<size_t>(p.num_sets()) * sizeof(double));
-        mix(p.more_gaps().data(), p.more_gaps().size() * sizeof(double));
-        return h;
-    }
-    // Bitwise, so equal copies are interchangeable bit for bit (0.0 vs -0.0 and NaNs
-    // simply do not share).
-    static bool params_same_(const AlignParams& x, const AlignParams& y) noexcept {
-        if (&x.matrix.alphabet() != &y.matrix.alphabet()) return false;
-        if (x.num_sets() != y.num_sets()) return false;
-        const double gx[4] = {x.gap_open_a, x.gap_extend_a, x.gap_open_b, x.gap_extend_b};
-        const double gy[4] = {y.gap_open_a, y.gap_extend_a, y.gap_open_b, y.gap_extend_b};
-        const size_t na = x.matrix.alphabet().size();
-        const size_t K = static_cast<size_t>(x.num_sets());
-        return std::memcmp(gx, gy, sizeof gx) == 0 &&
-               std::memcmp(x.matrix.data(), y.matrix.data(), na * na * K * sizeof(double)) == 0 &&
-               (K == 1 || std::memcmp(x.more_gaps().data(), y.more_gaps().data(),
-                                      x.more_gaps().size() * sizeof(double)) == 0);
-    }
-    const AlignParams* own_params_(const AlignParams& p) {
-        const size_t h = params_hash_(p);
-        auto [lo, hi] = params_idx_.equal_range(h);
-        for (auto it = lo; it != hi; ++it)
-            if (params_same_(*it->second, p)) return it->second;
-        params_own_.push_back(std::make_unique<const AlignParams>(p));
-        const AlignParams* q = params_own_.back().get();
-        params_idx_.emplace(h, q);
-        if (tracked_ || q->num_sets() > 1) add_prep_(q);
-        return q;
-    }
-    // Prepared data for owned params `q` (tracked batches only: an untracked batch, and
-    // a standalone SeqPair, must not pay an allocation per params copy).
-    void add_prep_(const AlignParams* q) {
-        if (prep_find_(q)) return;
-        Prep pr;
-        pr.p = q;
-        const std::vector<double> all = q->all_gaps();
-        pr.gaps.resize(all.size());
-        for (size_t k = 0; k < all.size(); ++k) pr.gaps[k] = static_cast<T>(all[k]);
+    // The batch's own copy of its params, with what a tracked batch prepares from it
+    // once: its gap fields cast to T, 4 per set (setup_tracks_ reads them), and (float32,
+    // K > 1) its whole matrix stack cast to T (the Aligner would otherwise cast K matrices
+    // per pair).  Shared: the pending guides' params (gparams_) may be the current ones.
+    struct OwnedParams {
+        AlignParams p;
+        std::vector<T> stack, gaps;
+        const T* stack_or_null() const noexcept { return stack.empty() ? nullptr : stack.data(); }
+    };
+    std::shared_ptr<const OwnedParams> own_params_(const AlignParams& p) const {
+        auto o = std::make_shared<OwnedParams>(OwnedParams{p, {}, {}});
+        if (!tracked_) return o;   // untracked (and standalone SeqPair): no allocation
+        const std::vector<double> all = p.all_gaps();
+        o->gaps.assign(all.begin(), all.end());
         if constexpr (!std::is_same_v<T, double>) {
-            if (q->num_sets() > 1) {
-                const size_t nk = static_cast<size_t>(q->matrix.size()) * q->matrix.size() * q->num_sets();
-                pr.stack.resize(nk);
-                for (size_t k = 0; k < nk; ++k) pr.stack[k] = static_cast<T>(q->matrix.data()[k]);
+            if (p.num_sets() > 1) {
+                const size_t nk = static_cast<size_t>(p.matrix.size()) * p.matrix.size() * p.num_sets();
+                o->stack.assign(p.matrix.data(), p.matrix.data() + nk);
             }
         }
-        prep_.push_back(std::move(pr));
-    }
-    // A batch owns one or two params copies: a linear scan, cheaper per pair than a hash.
-    const Prep* prep_find_(const AlignParams* p) const {
-        for (const Prep& x : prep_) if (x.p == p) return &x;
-        return nullptr;
-    }
-    // Owned params' gap fields cast to T (4 per set), for setup_tracks_.
-    const T* prep_gaps_(const AlignParams* p) const {
-        const Prep* x = prep_find_(p);
-        return x ? x->gaps.data() : nullptr;
-    }
-    // The prepared stack of pair i's params (float32, K > 1), or null.
-    const T* prep_of_(const AlignParams* p) const {
-        if constexpr (std::is_same_v<T, double>) { (void)p; return nullptr; }
-        else {
-            const Prep* x = prep_find_(p);
-            return (x && !x->stack.empty()) ? x->stack.data() : nullptr;
-        }
-    }
-    // Free the copies no segment points at any more (after set_params*).
-    void drop_unused_params_() {
-        std::vector<const AlignParams*> used;
-        used.reserve(segs_.size());
-        for (const auto& s : segs_) { used.push_back(s.params); if (s.gparams) used.push_back(s.gparams); }
-        std::sort(used.begin(), used.end());
-        auto in_use = [&](const AlignParams* q) { return std::binary_search(used.begin(), used.end(), q); };
-        for (auto it = params_idx_.begin(); it != params_idx_.end();)
-            it = in_use(it->second) ? std::next(it) : params_idx_.erase(it);
-        std::erase_if(prep_, [&](const Prep& x) { return !in_use(x.p); });
-        std::erase_if(params_own_, [&](const auto& u) { return !in_use(u.get()); });
+        return o;
     }
 
     BatchSettings s_;
@@ -1110,12 +990,16 @@ private:
     std::vector<int>     guide_;            // pair i: m+1 entries at oa_[i] + i
     std::vector<double>  score_;
     std::vector<uint8_t> flags_;
-    std::vector<uint32_t> seg_;
-    std::vector<Segment> segs_;
+    std::shared_ptr<const OwnedParams> params_;
+    // The params the PENDING guides belong to: null for the lazy soft guide ("under the
+    // params current then"); set by score_only_() to the params it scored, so a deferred
+    // guide is the one the eager path would have stored.
+    std::shared_ptr<const OwnedParams> gparams_;
+    int kernel_ = kBackendAuto;
     std::vector<double>  grad_;             // pair i: gstride() doubles (matrix, 4 gaps); untracked
     // ── Tracks ──
     bool tracked_ = false;
-    int  nsets_ = 0;                        // K of every segment's params
+    int  nsets_ = 0;                        // K of the params
     std::vector<uint16_t> tk_;              // tracked: pair i's track at oa_[i]
     std::vector<uint16_t> gk_;              // tracked: pair i's gap track at oa_[i] + i
     // Tracked hard gradients, in one of two stores (settings().track_counts): the summed
@@ -1153,8 +1037,6 @@ private:
     // at sr_[sro_[i] ..]: len_a*n counts, then 4*(len_a+1) gap fields.
     std::vector<double>   sr_;
     std::vector<size_t>   sro_{0};
-    // float32 tracked: each owned params' whole matrix stack in T, cast once (the Aligner
-    // would otherwise cast K matrices per pair).  Keyed by the owned copy.
     // Stored paths (keep_paths): run-length ops, (type << 30) | length, type 0 = both
     // advance, 1 = gap in B (A advances), 2 = gap in A; and the cell the path ends at.
     std::vector<std::vector<uint32_t>> path_;
@@ -1230,20 +1112,6 @@ private:
                     "nwgrad: pair " + std::to_string(pair) + ": " + what + "[" + std::to_string(r) + "] = " +
                     std::to_string(t[r]) + " is not a parameter set (params has " + std::to_string(K) + ")");
     }
-    // The first N0 pairs (already added, untracked) become tracked: all-zero tracks.
-    // Their cached gradients were stored densely; they are dropped with their scores.
-    void make_tracked_(size_t N0) {
-        tracked_ = true;
-        for (const auto& u : params_own_) add_prep_(u.get());
-        tk_.assign(oa_[N0], 0);
-        gk_.assign(oa_[N0] + N0, 0);
-        std::vector<double>().swap(grad_);
-        for (size_t i = 0; i < N0; ++i) flags_[i] &= static_cast<uint8_t>(~(kScore | kGrad | kStored));
-        reset_hard_store_();
-        sro_.assign(1, 0);
-        sr_.clear();
-        grow_tpaths_(0);
-    }
     // Both hard stores emptied (their memory freed).  A new generation: no counts entry,
     // nor a Work's writer, from before survives.
     void reset_hard_store_() {
@@ -1256,26 +1124,28 @@ private:
         tcw_used_ = 0;
         tc_dead_ = 0;
     }
-    // Path or count slots (hard) or record slots (soft) for pairs [from, size()) of a
-    // tracked batch.
-    void grow_tpaths_(size_t from) {
+    // A tracked batch's gradient store, sized for every pair: path or count slots (hard)
+    // or record slots (soft).  Called on an empty store (construction, a reset).
+    void size_grad_store_() {
+        const size_t N = size();
         if (grad_mode_ == GradMode::Soft) {
             const size_t na = static_cast<size_t>(alpha_->size());
-            for (size_t i = sro_.size() - 1; i < size(); ++i)
+            sro_.reserve(N + 1);
+            for (size_t i = 0; i < N; ++i)
                 sro_.push_back(sro_.back() + len_a(i) * na + 4 * (len_a(i) + 1));
-            sr_.resize(sro_.back(), 0.0);
+            sr_.assign(sro_.back(), 0.0);
             return;
         }
         if (grad_mode_ != GradMode::Hard) return;
         if (s_.track_counts) {
-            tcp_.resize(size());
+            tcp_.resize(N);
             return;
         }
-        for (size_t i = tpo_.size() - 1; i < size(); ++i)
+        tpo_.reserve(N + 1);
+        for (size_t i = 0; i < N; ++i)
             tpo_.push_back(tpo_.back() + (len_a(i) + len_b(i) + 3) / 4);
-        (void)from;
-        tp_.resize(tpo_.back() + 8);   // + 8: tpath_grad_ reads the moves 8 bytes at a time
-        tps_.resize(size(), {0, 0, 0, 0});
+        tp_.assign(tpo_.back() + 8, 0);   // + 8: tpath_grad_ reads the moves 8 bytes at a time
+        tps_.assign(N, {0, 0, 0, 0});
     }
     void store_srec_(size_t i, const std::vector<double>& cnt, const std::vector<double>& gaps) {
         double* d = sr_.data() + sro_[i];
@@ -1708,16 +1578,16 @@ private:
 
     template<class Al>
     void set_problem_(Al& al, size_t i) const {
-        al.set_kernel(kernel(i));
-        problem_(al, i, params(i), 0, {});
+        al.set_kernel(kernel_);
+        problem_(al, i, *params_, 0, {});
     }
-    // Pair i on `al` under params `p` (band, guide), with its tracks when tracked.
+    // Pair i on `al` under params `o` (band, guide), with its tracks when tracked.
     template<class Al>
-    [[gnu::always_inline]] inline void problem_(Al& al, size_t i, const AlignParams& p, int band,
+    [[gnu::always_inline]] inline void problem_(Al& al, size_t i, const OwnedParams& o, int band,
                                                 std::vector<int>&& guide) const {
-        if (tracked_) al.set_problem(codes_a(i), codes_b(i), p, band, std::move(guide),
-                                     track(i), gap_track(i), prep_of_(&p), prep_gaps_(&p));
-        else          al.set_problem(codes_a(i), codes_b(i), p, band, std::move(guide));
+        if (tracked_) al.set_problem(codes_a(i), codes_b(i), o.p, band, std::move(guide),
+                                     track(i), gap_track(i), o.stack_or_null(), o.gaps.data());
+        else          al.set_problem(codes_a(i), codes_b(i), o.p, band, std::move(guide));
     }
     // The hard gradient and guide of the DP `al` just ran, into pair i, in one walk —
     // the untracked sequence spelled out at each site (the code it always was).
@@ -1835,12 +1705,12 @@ private:
         finish_(i, false, false);
     }
 
-    // SeqPair::resolve_guide: the pending lazy guide, under the params current now.
+    // SeqPair::resolve_guide: the pending guide, under the params it belongs to (gparams_;
+    // a lazy soft guide: the params current now).
     void resolve_guide_(size_t i, Work& w) {
         if (!guide_pending(i)) return;
-        const AlignParams* gp = segs_[seg_[i]].gparams;
-        w.full.set_kernel(kernel(i));
-        problem_(w.full, i, gp ? *gp : params(i), 0, {});
+        w.full.set_kernel(kernel_);
+        problem_(w.full, i, gparams_ ? *gparams_ : *params_, 0, {});
         w.full.compute_viterbi(w.buf);
         store_guide_(i, w.full.guide_j_from_viterbi(w.buf));
         flags_[i] &= static_cast<uint8_t>(~(kPending | kStored));
@@ -1851,9 +1721,9 @@ private:
         resolve_guide_(i, w);
         flags_[i] &= static_cast<uint8_t>(~(kScore | kGrad | kStored));
         auto& al = w.band;
-        al.set_kernel(kernel(i));
+        al.set_kernel(kernel_);
         const int* g = guide_ptr_(i);
-        problem_(al, i, params(i), bandwidth, std::vector<int>(g, g + len_a(i) + 1));
+        problem_(al, i, *params_, bandwidth, std::vector<int>(g, g + len_a(i) + 1));
         if (grad_mode_ == GradMode::Hard) {   // one traceback walk for guide and gradient
             al.compute_viterbi(w.buf);
             score_[i] = al.score();
@@ -1941,8 +1811,8 @@ private:
     void banded_lane_setup_(size_t i, Work& w, int bandwidth, int W, int lane, int M,
                             int* blo, int* bhi, int* slo, int* shi, int& bri, int& brj) {
         const int* g = guide_ptr_(i);
-        w.band.set_kernel(kernel(i));
-        problem_(w.band, i, params(i), bandwidth, std::vector<int>(g, g + len_a(i) + 1));
+        w.band.set_kernel(kernel_);
+        problem_(w.band, i, *params_, bandwidth, std::vector<int>(g, g + len_a(i) + 1));
         w.band.banded_lane_rows(W, lane, M, blo, bhi, slo, shi, bri, brj);
     }
     void banded_interleaved_(size_t i, Work& w, int bandwidth, int W, int lane,
@@ -1954,8 +1824,8 @@ private:
         auto& al = pre ? *pre : w.band;
         if (!pre) {
             const int* g = guide_ptr_(i);
-            al.set_kernel(kernel(i));
-            problem_(al, i, params(i), bandwidth, std::vector<int>(g, g + len_a(i) + 1));
+            al.set_kernel(kernel_);
+            problem_(al, i, *params_, bandwidth, std::vector<int>(g, g + len_a(i) + 1));
         }
         flags_[i] &= static_cast<uint8_t>(~kStored);
         al.adopt_interleaved(w.buf, W, lane, best, bi, bj);
@@ -2004,12 +1874,12 @@ private:
             const size_t i = order[s + static_cast<size_t>(l)];
             Al& al = lanes[static_cast<size_t>(l)];
             configure_lane_(al);
-            al.set_kernel(kernel(i));
+            al.set_kernel(kernel_);
             if constexpr (std::is_same_v<Al, BandAl>) {
                 const int* g = guide_ptr_(i);
-                problem_(al, i, params(i), bandwidth, std::vector<int>(g, g + len_a(i) + 1));
+                problem_(al, i, *params_, bandwidth, std::vector<int>(g, g + len_a(i) + 1));
             } else {
-                problem_(al, i, params(i), 0, {});
+                problem_(al, i, *params_, 0, {});
             }
             al.track_job(w.tjobs[static_cast<size_t>(l)]);
         }
@@ -2082,12 +1952,13 @@ private:
         job.go_b = static_cast<T>(P.gap_open_b); job.ge_b = static_cast<T>(P.gap_extend_b);
         job.linear = GM == GapModel::Linear ? 1 : 0;
     }
-    // cast_block_ + set_inter_params_, except that a float32 tracked group reads the
-    // batch's own once-cast stack of P (prep_) instead of casting K matrices again.
-    void block_for_(InterJobT<T>& job, const AlignParams& P, std::vector<T>& blkT) const {
-        const T* pp = prep_of_(&P);
-        if (!pp) cast_block_(P, blkT);
-        set_inter_params_(job, P, blkT);
+    // cast_block_ + set_inter_params_ for the batch's params, except that a float32
+    // tracked group reads their once-cast stack (OwnedParams) instead of casting K
+    // matrices again.
+    void block_for_(InterJobT<T>& job, std::vector<T>& blkT) const {
+        const T* pp = params_->stack_or_null();
+        if (!pp) cast_block_(params_->p, blkT);
+        set_inter_params_(job, params_->p, blkT);
         if (pp) job.blk = pp;
     }
     static void wire_inter_tables_(InterJobT<T>& job, DpBuffer& buf, size_t sz) {
@@ -2121,20 +1992,24 @@ private:
         return !(GM == GapModel::Linear && AM == AlignMode::Global &&
                  (inter_w_(K) < 4 || alpha_->size() > 8));
     }
-    // The vector backend an inter-pair fill of pair i runs on, or -1 (own fill).
-    int inter_backend_(size_t i) const {
-        if (len_a(i) == 0 || len_b(i) == 0) return -1;
-        const int backend = (kernel(i) == kBackendAuto) ? global_default_backend() : kernel(i);
+    // The vector backend the batch's inter-pair fills run on, or -1 (every pair its own
+    // fill).
+    int inter_backend_() const {
+        const int backend = (kernel_ == kBackendAuto) ? global_default_backend() : kernel_;
         if (backend < 0) return -1;
         const LevelKernels& K = level_kernels(backend);
         if (inter_w_(K) <= 0) return -1;
+        if (!linear_fill_ok_(K) && grad_mode_ != GradMode::Soft) return -1;
+        return backend;
+    }
+    // Whether pair i joins an inter-pair fill on `backend` (else: its own fill).
+    bool inter_eligible_(size_t i, const LevelKernels& K) const {
+        if (len_a(i) == 0 || len_b(i) == 0) return false;
         if (!inter_pair_fits(len_a(i), len_b(i), GM == GapModel::Affine,
                              grad_mode_ == GradMode::Soft, inter_w_(K), sizeof(T), K.inter_w))
-            return -1;
-        if (!linear_fill_ok_(K) && grad_mode_ != GradMode::Soft) return -1;
+            return false;
         // Hirschberg pairs past the cutoff split: no shared fill.
-        if (is_hirschberg(tb_resolved_) && len_a(i) > static_cast<size_t>(s_.hb_cutoff)) return -1;
-        return backend;
+        return !(is_hirschberg(tb_resolved_) && len_a(i) > static_cast<size_t>(s_.hb_cutoff));
     }
 
 public:
@@ -2145,50 +2020,49 @@ public:
     }
 private:
     struct InterPlan {
-        size_t generation = static_cast<size_t>(-1);
-        int default_backend = -1000, hb_cutoff = -1;
+        int default_backend = -1000, hb_cutoff = -1;   // what it was built for
+        int backend = -1;                               // every group's vector backend
         std::vector<size_t> elig, other;
-        std::vector<int> backend;
         std::vector<std::pair<size_t, size_t>> groups;   // [start, end) into elig
     };
     InterPlan plan_;
-    size_t generation_ = 0;   // bumped by add_many(); keys plan_
 
-    // Built once and reused until pairs are added, the default ISA changes or the
-    // Hirschberg cutoff moves: re-sorting 2.5M pairs every training iteration was ~0.9 s
-    // of serial work per call.  Groups: (backend, len B) runs of len-A-sorted pairs, cut
-    // every W and wherever len B outgrows the group's shortest past ragged_ok().
+    // Built once and reused until the default ISA changes or the Hirschberg cutoff moves:
+    // re-sorting 2.5M pairs every training iteration was ~0.9 s of serial work per call.
+    // Groups: len B runs of len-A-sorted pairs, cut every W and wherever len B outgrows
+    // the group's shortest past ragged_ok().
     void ensure_plan_() {
         const int def_backend = global_default_backend();
-        if (plan_.generation == generation_ && plan_.default_backend == def_backend &&
-            plan_.hb_cutoff == s_.hb_cutoff)
-            return;
+        if (plan_.default_backend == def_backend && plan_.hb_cutoff == s_.hb_cutoff) return;
         const size_t N = size();
         InterPlan P;
-        P.generation = generation_; P.default_backend = def_backend; P.hb_cutoff = s_.hb_cutoff;
-        P.backend.assign(N, -1);
-        struct Key { int backend; size_t len_b, len_a, i; };
+        P.default_backend = def_backend; P.hb_cutoff = s_.hb_cutoff;
+        P.backend = inter_backend_();
+        if (P.backend < 0) {
+            P.other.resize(N);
+            std::iota(P.other.begin(), P.other.end(), size_t{0});
+            plan_ = std::move(P);
+            return;
+        }
+        const LevelKernels& K = level_kernels(P.backend);
+        struct Key { size_t len_b, len_a, i; };
         std::vector<Key> keys;
         keys.reserve(N);
         for (size_t i = 0; i < N; ++i) {
-            P.backend[i] = inter_backend_(i);
-            if (P.backend[i] < 0) { P.other.push_back(i); continue; }
-            keys.push_back({P.backend[i], len_b(i), len_a(i), i});
+            if (!inter_eligible_(i, K)) { P.other.push_back(i); continue; }
+            keys.push_back({len_b(i), len_a(i), i});
         }
         std::sort(keys.begin(), keys.end(), [](const Key& x, const Key& y) {
-            if (x.backend != y.backend) return x.backend < y.backend;
             if (x.len_b != y.len_b) return x.len_b < y.len_b;
             if (x.len_a != y.len_a) return x.len_a < y.len_a;
             return x.i < y.i;
         });
         P.elig.reserve(keys.size());
         for (const Key& k : keys) P.elig.push_back(k.i);
+        const size_t W = static_cast<size_t>(inter_w_(K));
         for (size_t s = 0; s < keys.size();) {
-            const int W = inter_w_(level_kernels(keys[s].backend));
             size_t e = s + 1;
-            while (e < keys.size() && e - s < static_cast<size_t>(W) &&
-                   keys[e].backend == keys[s].backend && ragged_ok(keys[s].len_b, keys[e].len_b))
-                ++e;
+            while (e < keys.size() && e - s < W && ragged_ok(keys[s].len_b, keys[e].len_b)) ++e;
             P.groups.emplace_back(s, e);
             s = e;
         }
@@ -2202,7 +2076,6 @@ private:
         ensure_plan_();
         const auto& elig = plan_.elig;
         const auto& other = plan_.other;
-        const auto& backend = plan_.backend;
         const auto& groups = plan_.groups;
         const size_t G = groups.size(), tasks = G + other.size();
         const bool soft = grad_mode_ == GradMode::Soft;
@@ -2225,15 +2098,7 @@ private:
                 if (t >= G) { run_full_(other[t - G], w, keep); continue; }
                 const auto [s, e] = groups[t];
                 const size_t real = e - s;
-                const size_t i0 = elig[s];
-                bool same_params = true;
-                for (size_t l = 1; l < real; ++l)
-                    same_params &= &params(elig[s + l]) == &params(i0);
-                if (!same_params) {   // pairs given their own params: no shared fill
-                    for (size_t l = 0; l < real; ++l) run_full_(elig[s + l], w, keep);
-                    continue;
-                }
-                const LevelKernels& K = level_kernels(backend[i0]);
+                const LevelKernels& K = level_kernels(plan_.backend);
                 const int W = inter_w_(K);
                 a.assign(W, nullptr); b.assign(W, nullptr); m.assign(W, 0);
                 bi.assign(W, 0); bj.assign(W, 0); best.assign(W, T(0));
@@ -2251,7 +2116,7 @@ private:
                     ragged |= nb[l] != nb[0];
                 }
                 const size_t gstride_ = ragged ? static_cast<size_t>(n) + 1 : 0;
-                const AlignParams& P = params(i0);
+                const AlignParams& P = params();
                 constexpr bool lin = GM == GapModel::Linear;
                 const bool skip_fill = no_viterbi || !linear_fill_ok_(K);
                 InterJobT<T> job{};
@@ -2265,7 +2130,7 @@ private:
                     job.tr = w.tjobs.data();
                 }
                 if (!skip_fill) {
-                    block_for_(job, P, blkT);
+                    block_for_(job, blkT);
                     wire_inter_tables_(job, buf, static_cast<size_t>(M + 1) * (n + 1) * W);
                     job.best = best.data(); job.best_i = bi.data(); job.best_j = bj.data();
                     run_inter_fill_(K, job);
@@ -2353,7 +2218,7 @@ private:
     // every guide).  Hard affine only: soft and linear pairs run their own banded path
     // in PAIR order (walking them permuted measured 5-10 % slower).
     struct BandGroups {
-        size_t plan_gen = static_cast<size_t>(-1), full_calls = static_cast<size_t>(-1);
+        size_t full_calls = static_cast<size_t>(-1);
         int default_backend = -1000, hb_cutoff = -1;
         std::vector<size_t> elig, other;
         std::vector<std::pair<size_t, size_t>> groups;
@@ -2363,11 +2228,11 @@ private:
 
     void ensure_band_groups_() {
         ensure_plan_();
-        if (band_.plan_gen == plan_.generation && band_.full_calls == full_calls_ &&
-            band_.default_backend == plan_.default_backend && band_.hb_cutoff == plan_.hb_cutoff)
+        if (band_.full_calls == full_calls_ && band_.default_backend == plan_.default_backend &&
+            band_.hb_cutoff == plan_.hb_cutoff)
             return;
         BandGroups Bg;
-        Bg.plan_gen = plan_.generation; Bg.full_calls = full_calls_;
+        Bg.full_calls = full_calls_;
         Bg.default_backend = plan_.default_backend; Bg.hb_cutoff = plan_.hb_cutoff;
         Bg.other = plan_.other;
         const bool shared = GM == GapModel::Affine && grad_mode_ != GradMode::Soft;
@@ -2378,10 +2243,10 @@ private:
         Bg.elig = E;
         struct Key { int mid, len_a; size_t i; };
         std::vector<Key> keys;
+        const size_t W = E.empty() ? 0 : static_cast<size_t>(inter_w_(level_kernels(plan_.backend)));
         for (size_t s = 0; s < E.size();) {
-            const int be = plan_.backend[E[s]];
             size_t e = s + 1;
-            while (e < E.size() && plan_.backend[E[e]] == be && len_b(E[e]) == len_b(E[s])) ++e;
+            while (e < E.size() && len_b(E[e]) == len_b(E[s])) ++e;
             keys.clear();
             for (size_t k = s; k < e; ++k) {
                 const size_t i = E[k];
@@ -2394,9 +2259,7 @@ private:
                 return x.i < y.i;
             });
             for (size_t k = s; k < e; ++k) Bg.elig[k] = keys[k - s].i;
-            const int W = inter_w_(level_kernels(be));
-            for (size_t g = s; g < e; g += W)
-                Bg.groups.emplace_back(g, std::min(e, g + static_cast<size_t>(W)));
+            for (size_t g = s; g < e; g += W) Bg.groups.emplace_back(g, std::min(e, g + W));
             s = e;
         }
         band_ = std::move(Bg);
@@ -2409,7 +2272,6 @@ private:
         ensure_band_groups_();
         const auto& elig = band_.elig;
         const auto& other = band_.other;
-        const auto& backend = plan_.backend;
         const auto& groups = band_.groups;
         const size_t G = groups.size(), tasks = G + other.size();
         std::atomic<size_t> idx{0};
@@ -2425,13 +2287,7 @@ private:
                 const auto [s, e] = groups[t];
                 const size_t real = e - s;
                 const size_t i0 = elig[s];
-                bool shared = true;
-                for (size_t l = 0; l < real && shared; ++l) shared = &params(elig[s + l]) == &params(i0);
-                if (!shared) {
-                    for (size_t l = 0; l < real; ++l) run_banded_(elig[s + l], w, bandwidth, false);
-                    continue;
-                }
-                const LevelKernels& K = level_kernels(backend[i0]);
+                const LevelKernels& K = level_kernels(plan_.backend);
                 const int W = inter_w_(K);
                 int M = 0;
                 for (size_t l = 0; l < real; ++l)
@@ -2460,12 +2316,11 @@ private:
                         w.blanes[l].banded_lane_rows(W, static_cast<int>(l), M, blo.data(), bhi.data(),
                                                      ulo.data(), uhi.data(), bri[l], brj[l]);
                 }
-                const AlignParams& P = params(i0);
                 InterJobT<T> job{};
                 job.a = a.data(); job.m = m.data(); job.b = b.data(); job.n = n; job.M = M;
                 job.align_mode = (AM == AlignMode::Local) ? 1 : 0;
                 if (tracked_) job.tr = w.tjobs.data();
-                block_for_(job, P, blkT);   // affine: this path runs for affine only
+                block_for_(job, blkT);   // affine: this path runs for affine only
                 wire_inter_tables_(job, w.buf, static_cast<size_t>(M + 1) * (n + 1) * W);
                 job.best = best.data(); job.best_i = bi.data(); job.best_j = bj.data();
                 job.blo = blo.data(); job.bhi = bhi.data();
@@ -2486,12 +2341,11 @@ private:
     // grad_mode None without stored paths: scores only — compute_score per pair, the
     // inter-pair score kernel for the plan's groups — and no Viterbi table or traceback.
     // The guides banded_grad() bands around become PENDING, resolved on first use under
-    // the params scored here (Segment::gparams), so they are exactly the guides the eager
+    // the params scored here (gparams_), so they are exactly the guides the eager
     // path would have stored.  Scores are the exact optimum (the Pointers fill's score):
     // under float32 `auto` the traceback-bearing modes report hirschberg_pmax's instead.
     void score_only_() {
-        for (auto& sg : segs_) sg.gparams = sg.params;
-        drop_unused_params_();
+        gparams_ = params_;
         const size_t N = size();
         const bool inter = s_.inter_fill;
         if (inter) ensure_plan_();
@@ -2514,12 +2368,8 @@ private:
                 if (t >= G) { own(plan_.other[t - G]); continue; }
                 const auto [s, e] = plan_.groups[t];
                 const size_t real = e - s;
-                const size_t i0 = plan_.elig[s];
-                bool same_params = true;
-                for (size_t l = 1; l < real; ++l)
-                    same_params &= &params(plan_.elig[s + l]) == &params(i0);
-                const LevelKernels& K = level_kernels(plan_.backend[i0]);
-                if (!same_params || !has_inter_score_(K) || !linear_fill_ok_(K)) {
+                const LevelKernels& K = level_kernels(plan_.backend);
+                if (!has_inter_score_(K) || !linear_fill_ok_(K)) {
                     for (size_t l = 0; l < real; ++l) own(plan_.elig[s + l]);
                     continue;
                 }
@@ -2545,7 +2395,7 @@ private:
                     tracked_lanes_(w, w.lanes, W, real, plan_.elig, s);
                     job.tr = w.tjobs.data();
                 }
-                block_for_(job, params(i0), blkT);
+                block_for_(job, blkT);
                 wire_inter_tables_(job, w.buf, static_cast<size_t>(n + 1) * W);
                 job.best = best.data();
                 run_inter_score_(K, job);

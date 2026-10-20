@@ -74,23 +74,19 @@ TEST_CASE("B2: Aligner is movable but not copyable", "[scan]") {
     REQUIRE(b.aligned() == before);
 }
 
-TEST_CASE("B3: the batch owns its params, shared per distinct value", "[scan]") {
-    BatchEngine<double, GapModel::Affine, AlignMode::Local> e(1, GradMode::Hard);
-    AlignParams p1(Alphabet::dna()), p2(Alphabet::dna()), p3(Alphabet::dna());
-    p1.gap_open_a = p2.gap_open_a = 2.0;
+TEST_CASE("B3: the batch owns its params", "[scan]") {
+    AlignParams p1(Alphabet::dna()), p3(Alphabet::dna());
+    p1.gap_open_a = 2.0;
     p3.gap_open_a = 3.0;
-    e.add_many({"ACGT"}, {"ACGT"}, p1);
-    e.add_many({"ACGT"}, {"ACGT"}, p2);   // equal value: the same copy (the plan groups by address)
-    e.add_many({"ACGT"}, {"ACGT"}, p3);
-    REQUIRE(&e.params(0) != &p1);
-    REQUIRE(&e.params(0) == &e.params(1));
-    REQUIRE(&e.params(0) != &e.params(2));
-    REQUIRE(e.params(2).gap_open_a == 3.0);
+    BatchEngine<double, GapModel::Affine, AlignMode::Local> e(
+        BatchSettings{1}, GradMode::Hard, {"ACGT", "ACGT"}, {"ACGT", "ACGT"}, p1);
+    REQUIRE(&e.params() != &p1);
     p1.gap_open_a = 99.0;                  // the caller's object is not the batch's
-    REQUIRE(e.params(0).gap_open_a == 2.0);
+    REQUIRE(e.params().gap_open_a == 2.0);
     e.set_params(p3);
-    REQUIRE(&e.params(0) == &e.params(2));
-    REQUIRE(e.params(1).gap_open_a == 3.0);
+    REQUIRE(&e.params() != &p3);
+    p3.gap_open_a = 99.0;
+    REQUIRE(e.params().gap_open_a == 3.0);
 }
 
 TEST_CASE("B5: fit_alpha rejects non-finite scores", "[scan]") {

@@ -1,9 +1,7 @@
 """SeqPairBatch(seqs_a, seqs_b, params, ...): the pairs given once, at construction.
 
-The constructor is the add_many() of an empty batch (one segment), so its batch must
-be exactly the one add_many() builds; add_many() itself is deprecated, still works,
-and warns.  The pairless form, SeqPairBatch(n_threads, traceback, ...), stays for
-streaming align()."""
+The pairless form, SeqPairBatch(n_threads, traceback, ...), is for streaming align(),
+which aligns the same pairs without keeping them: the two must agree."""
 
 import warnings
 
@@ -25,39 +23,30 @@ def problem(rng, n, K):
     return A, B, P, tracks
 
 
-def legacy(cls, A, B, P, **kw):
-    """The deprecated way: an empty batch, then add_many()."""
-    tracks = kw.pop("tracks", None)
-    b = cls(**kw)
-    with pytest.warns(DeprecationWarning, match=r"add_many\(\) is deprecated"):
-        b.add_many(A, B, P, tracks=tracks)
-    return b
-
-
 @pytest.mark.parametrize("case", CASES)
 @pytest.mark.parametrize("prec", ["_double", ""])
 @pytest.mark.parametrize("K", [1, 3])
 @pytest.mark.parametrize("grad_mode", ["hard", "soft", "none"])
-def test_constructor_is_add_many(case, prec, K, grad_mode):
+def test_constructor_matches_streaming(case, prec, K, grad_mode):
     rng = np.random.default_rng(7)
     A, B, P, tracks = problem(rng, 120, K)
     kw = dict(n_threads=3, gap_model=case[0], mode=case[1], grad_mode=grad_mode)
     with warnings.catch_warnings():
-        warnings.simplefilter("error", DeprecationWarning)   # the new form never warns
+        warnings.simplefilter("error", DeprecationWarning)   # nothing here warns
         new = BATCH[prec](A, B, P, tracks=tracks, **kw)
-    old = legacy(BATCH[prec], A, B, P, tracks=tracks, **kw)
-    assert len(new) == len(old) == len(A)
+        ref = BATCH[prec](**kw).align(A, B, P, tracks=tracks)
+    assert len(new) == len(A)
     assert (new.gap_model, new.mode, new.grad_mode, new.n_threads) == (case[0], case[1], grad_mode, 3)
-    assert new.tracked == old.tracked == (K > 1)
-    s_new, s_old = new.score_and_grad(), old.score_and_grad()
+    assert new.tracked == (K > 1)
+    new.score_and_grad()
     if grad_mode == "soft":
-        np.testing.assert_allclose(new.scores(), old.scores(), rtol=1e-12)
+        np.testing.assert_allclose(new.scores(), ref.scores, rtol=1e-12)
     else:
-        assert s_new == s_old
-        np.testing.assert_array_equal(new.scores(), old.scores())
+        np.testing.assert_array_equal(new.scores(), ref.scores)
     if grad_mode != "none":
-        for x, y in zip(new.grads(), old.grads()):
-            np.testing.assert_allclose(x, y, rtol=1e-12, atol=1e-12)
+        g = new.compute_grad()
+        np.testing.assert_allclose(g.matrices, ref.grad.matrices, rtol=1e-9, atol=1e-9)
+        np.testing.assert_allclose(g.gaps, ref.grad.gaps, rtol=1e-9, atol=1e-9)
 
 
 def test_constructor_keywords_and_settings():
@@ -96,7 +85,7 @@ def test_constructor_errors():
             make()
 
 
-def test_pairless_form_and_add_many_compat():
+def test_pairless_form():
     rng = np.random.default_rng(9)
     A, B, P, _ = problem(rng, 40, 1)
     with warnings.catch_warnings():
@@ -107,10 +96,6 @@ def test_pairless_form_and_add_many_compat():
     full = nwgrad.SeqPairBatchDouble(A, B, P, n_threads=2)
     full.score_and_grad()
     np.testing.assert_array_equal(full.scores(), res.scores)
-    # add_many still appends, to a constructed batch too (a second segment)
-    with pytest.warns(DeprecationWarning, match=r"SeqPairBatch\(seqs_a, seqs_b, params"):
-        full.add_many(A[:5], B[:5], P)
-    assert len(full) == len(A) + 5
 
 
 @pytest.mark.parametrize("dtype", [None, object])
@@ -129,11 +114,6 @@ def test_numpy_string_arrays(dtype):
     np.testing.assert_array_equal(got.scores(), ref.scores())
     res = nwgrad.SeqPairBatchDouble(2).align(na, nb, P)
     np.testing.assert_array_equal(res.scores, ref.scores())
-    with pytest.warns(DeprecationWarning):
-        legacy = nwgrad.SeqPairBatchDouble(2)
-        legacy.add_many(na, nb, P)
-    legacy.score_and_grad()
-    np.testing.assert_array_equal(legacy.scores(), ref.scores())
     for bad in ("ACGT", [b"AC"], ["AC", 3]):
         with pytest.raises(TypeError):
             nwgrad.SeqPairBatchDouble(bad, ["AC"] * len(bad), P)

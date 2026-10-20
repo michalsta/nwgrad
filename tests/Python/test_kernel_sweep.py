@@ -9,8 +9,8 @@ def test_batch_methods_and_positional_overrides(monkeypatch):
     class Batch:
         """A stand-in with the signatures nanobind exposes through docstrings."""
 
-        def add_many(self, seqs_a, seqs_b, params, kernel="auto"):
-            """add_many(self: Batch, seqs_a: list[str], seqs_b: list[str], params: object, kernel: str = 'auto')"""
+        def score_many(self, seqs_a, seqs_b, params, kernel="auto"):
+            """score_many(self: Batch, seqs_a: list[str], seqs_b: list[str], params: object, kernel: str = 'auto')"""
             return kernel
 
         def align(self, seqs_a, seqs_b, params, kernel="auto"):
@@ -20,9 +20,9 @@ def test_batch_methods_and_positional_overrides(monkeypatch):
     module = SimpleNamespace(Batch=Batch)
     monkeypatch.setattr(conftest, "_current_backend", "scalar_fallback")
     patched = conftest._patch_entry_points(module)
-    assert set(patched) == {"Batch.add_many", "Batch.align"}
+    assert set(patched) == {"Batch.score_many", "Batch.align"}
     batch = module.Batch()
-    for method in (batch.add_many, batch.align):
+    for method in (batch.score_many, batch.align):
         assert method([], [], None) == "scalar_fallback"
         assert method([], [], None, kernel="auto") == "auto"
         assert method([], [], None, "auto") == "auto"

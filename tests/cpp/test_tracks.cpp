@@ -430,10 +430,10 @@ void check_batch(uint64_t seed, bool counts) {
         gk.push_back(random_track(rng, A.back().size() + 1, K));
     }
     std::vector<std::string_view> Av(A.begin(), A.end()), Bv(B.begin(), B.end());
-    BatchEngine<T, GM, AM> eng(8, GradMode::Hard, TracebackMode::Pointers);
+    BatchEngine<T, GM, AM> eng(BatchSettings{8, TracebackMode::Pointers}, GradMode::Hard, Av, Bv, p,
+                               kBackendAuto, &tk, &gk);
     eng.set_fill(false, true);
     eng.set_track_counts(counts);
-    eng.add_many(Av, Bv, p, kBackendAuto, &tk, &gk);
     std::vector<Run<T>> ref;
     for (size_t i = 0; i < N; ++i)
         ref.push_back(run<GM, AM, AlignBand::Full, T>(p, A[i], B[i], 0, tk[i], gk[i], kBackendAuto,

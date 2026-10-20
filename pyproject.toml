@@ -32,10 +32,6 @@ dev = ["pytest", "pytest-rerunfailures", "biopython", "scipy"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests/Python"]
-# The suite still builds most batches with the deprecated add_many(); its own tests
-# (test_batch_constructor.py) assert the warning explicitly.
-# A test that appends with the deprecated add_many() says so with its own filter mark.
-filterwarnings = ["error:SeqPairBatch.add_many\\(\\) is deprecated:DeprecationWarning"]
 
 # PyPy is deliberately NOT built (cibuildwheel builds it only when `enable` asks for
 # it, so it needs no skip selector).  This is a nanobind C-extension whose test extras

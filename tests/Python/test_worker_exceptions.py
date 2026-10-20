@@ -30,16 +30,15 @@ def make_batch(params, grad_mode="hard"):
 
 
 def test_compute_grad_before_align_raises_not_aborts():
-    """The precondition throw fires inside a worker.  Must surface as a Python
-    exception, not SIGABRT."""
+    """The precondition throw must surface as a Python exception, not SIGABRT."""
     params = make_params()
     batch, _pairs = make_batch(params)
-    with pytest.raises(RuntimeError, match="align_full"):
+    with pytest.raises(RuntimeError, match="score_and_grad"):
         batch.compute_grad()
 
 
 def test_compute_grad_with_grad_mode_none_raises():
-    """grad_mode=None makes SeqPair::compute_grad() throw, again from a worker."""
+    """grad_mode=None makes compute_grad() throw."""
     params = make_params()
     batch, _pairs = make_batch(params, grad_mode="none")
     batch.score_and_grad(keep_paths=True)
@@ -54,7 +53,7 @@ def test_batch_stores_paths_without_explicit_allocation():
     assert batch.score_and_grad(keep_paths=True) == pytest.approx(N_PAIRS * batch[0].score)
 
 
-def test_realign_banded_without_path_raises():
+def test_banded_grad_without_guide_raises():
     """banded_grad() requires a guide from score_and_grad()."""
     params = make_params()
     batch, _pairs = make_batch(params)

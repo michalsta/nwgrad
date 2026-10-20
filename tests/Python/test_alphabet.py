@@ -178,20 +178,6 @@ def test_cannot_sum_gradients_across_alphabets():
         g_dna + g_aa
 
 
-@pytest.mark.filterwarnings("ignore:SeqPairBatch.add_many")   # appends: deprecated, removed in 0.8
-def test_batch_rejects_a_pair_over_a_different_alphabet():
-    """Checked eagerly in add(), on the caller's thread -- not deep inside a
-    worker where the diagnostic would be useless."""
-    dna = dna_params(gap_extend_a=1.0, gap_extend_b=1.0)
-    aa = nwgrad.AlignParams(nwgrad.SubstMatrix(AA_ARR), gap_extend_a=1.0,
-                            gap_extend_b=1.0)
-    batch = nwgrad.SeqPairBatch(n_threads=2, gap_model="linear", mode="local")
-    batch.add_many(["ACGT"], ["ACGT"], dna)
-    with pytest.raises(ValueError, match="cannot join a batch"):
-        batch.add_many(["ACDE"], ["ACDE"], aa)
-    assert len(batch) == 1
-
-
 def test_set_params_cannot_change_the_alphabet():
     """The sequences are already encoded to indices; a new alphabet would
     silently reinterpret them as different residues."""

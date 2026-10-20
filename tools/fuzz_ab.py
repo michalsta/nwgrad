@@ -4,17 +4,17 @@
     python tools/fuzz_ab.py --a /path/to/old/python --b /path/to/new/python 0 200
 
 Each seed builds one homogeneous batch (one gap model / mode / grad mode — what 0.6
-requires; segments with different params), runs score_and_grad(), set_params() +
+requires; one params — what 0.8 requires), runs score_and_grad(), set_params() +
 banded_grad(), the stored-path alignment (keep_paths / the old align_full) and
 weighted_grad(), and dumps every per-pair result.  Run under each interpreter (with
-whichever API that build has) and compared: scores, per-pair gradients, guides,
+whichever API that build has: the constructor from 0.7, add_many() before) and compared: scores, per-pair gradients, guides,
 alignments and weighted_grad bit for bit — both builds run the same kernels, so even
 soft per-pair results must agree exactly.  Only the summed compute_grad() of soft pairs
 may differ in the last bits (pre-0.6 merged per-thread sums in completion order).
 
     python tools/fuzz_ab.py --dump SEED OUT.pkl    # internal: one build, one seed
 """
-import argparse, pickle, subprocess, sys, warnings
+import argparse, pickle, subprocess, sys
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -58,15 +58,13 @@ def dump(seed, out):
     threads = int(rng.integers(1, 5))
     hb = int(rng.choice([512, 8, 24]))
     bw = int(rng.integers(1, 10))
-    segs = []
-    for _ in range(int(rng.integers(1, 4))):
-        k = int(rng.integers(1, 30)); lb = rlen(rng)
-        A = ["".join(rng.choice(list(alpha), rlen(rng))) for _ in range(k)]
-        B = ["".join(rng.choice(list(alpha), lb if rng.random() < 0.7 else rlen(rng)))
-             for _ in range(k)]
-        segs.append((A, B, rparams(nwgrad, rng, alpha, gm)))
+    k = int(rng.integers(1, 90)); lb = rlen(rng)
+    A = ["".join(rng.choice(list(alpha), rlen(rng))) for _ in range(k)]
+    B = ["".join(rng.choice(list(alpha), lb if rng.random() < 0.7 else rlen(rng)))
+         for _ in range(k)]
+    p = rparams(nwgrad, rng, alpha, gm)
     p2 = rparams(nwgrad, rng, alpha, gm)
-    w = rng.normal(size=sum(len(s[0]) for s in segs))
+    w = rng.normal(size=k)
 
     cls = nwgrad.SeqPairBatchDouble if prec == "double" else nwgrad.SeqPairBatch
     new_api = not hasattr(nwgrad, "BatchAligner")
@@ -74,16 +72,10 @@ def dump(seed, out):
 
     def make():
         if ctor:
-            A, B, p = segs[0]
             b = cls(A, B, p, n_threads=threads, traceback=tb, gap_model=gm, mode=mode, grad_mode=gd)
             b.fill = fill
             b.soft_guide = soft_guide
             b.hb_cutoff = hb
-            # Further segments only through the deprecated add_many(), until 0.8.
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", "SeqPairBatch.add_many", DeprecationWarning)
-                for A, B, p in segs[1:]:
-                    b.add_many(A, B, p)
             return b
         if new_api:
             b = cls(threads, tb, gap_model=gm, mode=mode, grad_mode=gd)
@@ -92,11 +84,10 @@ def dump(seed, out):
         b.fill = fill
         b.soft_guide = soft_guide
         b.hb_cutoff = hb
-        for A, B, p in segs:
-            if new_api:
-                b.add_many(A, B, p)
-            else:
-                b.add_many(A, B, p, gap_model=gm, mode=mode, grad_mode=gd)
+        if new_api:
+            b.add_many(A, B, p)
+        else:
+            b.add_many(A, B, p, gap_model=gm, mode=mode, grad_mode=gd)
         return b
 
     def snap(b, paths=False):

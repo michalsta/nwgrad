@@ -13,13 +13,10 @@ Coverage:
   - per-pair gradients survive: batch[i].grad is the whole point of the API
   - len / indexing / negative indexing / out-of-range
   - the pairs are usable through the full SeqPair lifecycle (
-    align_full, compute_grad, realign_banded, aligned, drop_dp)
+    score_and_grad, compute_grad, banded_grad, aligned, drop_paths)
   - single-thread == multi-thread (construction is parallel)
-  - params lifetime: the batch pins params
-  - length mismatch raises; an empty batch
-  - the deprecated add_many() (removed in 0.8): several segments in one batch, two
-    calls with *different* params objects, failed appends leave the batch UNCHANGED
-    (out-of-alphabet character, alphabet mismatch with the existing batch)
+  - params lifetime: the batch owns a copy of its params
+  - length mismatch and a bad character raise; an empty batch
 """
 
 import gc
@@ -205,21 +202,7 @@ def test_indexing():
         batch[-len(DNA_A) - 1]
 
 
-# ── mixing, threading ─────────────────────────────────────────────────────────
-
-@pytest.mark.filterwarnings("ignore:SeqPairBatch.add_many")   # appends: deprecated, removed in 0.8
-def test_several_add_many_segments():
-    params = prot_params()
-    batch = nwgrad.SeqPairBatch(n_threads=2, gap_model="affine", mode="local", grad_mode="hard")
-    batch.add_many(PROT_A[:1], PROT_B[:1], params)
-    batch.add_many(PROT_A[1:], PROT_B[1:], params)
-    assert len(batch) == len(PROT_A)
-
-    ref, _keep = build_by_hand(PROT_A, PROT_B, params, "affine", "local", "hard")
-    assert batch.score_and_grad() == pytest.approx(ref.score_and_grad())
-    for i in range(len(PROT_A)):
-        assert batch[i].score == pytest.approx(ref[i].score)
-
+# ── threading ─────────────────────────────────────────────────────────────────
 
 def test_threads_do_not_change_the_answer():
     """Construction is parallel; order and content must not depend on that."""
@@ -237,34 +220,28 @@ def test_threads_do_not_change_the_answer():
 
 # ── params lifetime ───────────────────────────────────────────────────────────
 
-@pytest.mark.filterwarnings("ignore:SeqPairBatch.add_many")   # appends: deprecated, removed in 0.8
-def test_dropping_params_after_two_add_many_calls():
+def test_dropping_params_after_set_params():
     """Sanitizer bait.  Its job is to *commit the crime*, not to detect it.
 
-    On a normal build this proves almost nothing: if the batch failed to pin
-    params, the first half's pairs would read freed memory, which is undefined
-    behaviour rather than a crash -- freed heap usually still holds its old bytes,
-    the scores come out right, and the test goes green over a live
-    use-after-free.  The refcount tests above are the real guarantee.
-
-    What this buys is the *access*: it must be two add_many() calls with
-    different params (one call is pinned even by a single `_params` slot, so it
-    frees nothing and there is nothing to trap).  Verified: against a
-    single-slot binding under the CI ASan job this raises
-    "heap-use-after-free ... READ of size 8 ... thread T3" from a worker thread.
-    A sanitizer finds no bug it is not walked into; this walks it in.
+    On a normal build this proves almost nothing: if the batch read the caller's
+    params instead of its own copy, the workers would read freed memory, which is
+    undefined behaviour rather than a crash -- freed heap usually still holds its
+    old bytes, the scores come out right, and the test goes green over a live
+    use-after-free.  test_batch_copies_params is the real guarantee; under the CI
+    ASan job this walks the workers into the access.
     """
-    batch = nwgrad.SeqPairBatch(n_threads=2, gap_model="affine", mode="local", grad_mode="hard")
     p1 = prot_params(gap_extend=1.0)
     p2 = prot_params(gap_extend=9.0)
-    batch.add_many(PROT_A, PROT_B, p1)
-    batch.add_many(PROT_A, PROT_B, p2)
+    batch = nwgrad.SeqPairBatch(PROT_A, PROT_B, p1,
+                                n_threads=2, gap_model="affine", mode="local", grad_mode="hard")
+    batch.set_params(p2)
     del p1, p2
     gc.collect()
 
-    batch.score_and_grad()      # workers read both params objects here
+    batch.score_and_grad()      # workers read the params here
     assert batch[0].score_valid
-    assert batch[len(PROT_A)].score_valid
+    ref, _keep = build_by_hand(PROT_A, PROT_B, prot_params(gap_extend=9.0), "affine", "local", "hard")
+    assert batch.score_and_grad() == pytest.approx(ref.score_and_grad())
 
 
 def test_batch_copies_params():
@@ -298,65 +275,21 @@ def test_standalone_pair_copies_params():
     assert nwgrad.SeqPairDouble(PROT_A[0], PROT_B[0], params).score_and_grad()[0] != s0
 
 
-@pytest.mark.filterwarnings("ignore:SeqPairBatch.add_many")   # appends: deprecated, removed in 0.8
-def test_two_add_many_calls_keep_their_own_params():
-    """A second add_many() must not replace the first call's params."""
-    p1 = prot_params(gap_extend=1.0)
-    p2 = prot_params(gap_extend=9.0)
-    batch = nwgrad.SeqPairBatch(n_threads=2, gap_model="affine", mode="local", grad_mode="hard")
-    batch.add_many(PROT_A, PROT_B, p1)
-    batch.add_many(PROT_A, PROT_B, p2)
-
-    # And the values are intact and distinct, so the halves really did use
-    # different params -- guarding against both being pinned but one ignored.
-    assert len(batch) == 2 * len(PROT_A)
-    ref1, _k1 = build_by_hand(PROT_A, PROT_B, p1, "affine", "local", "hard")
-    ref2, _k2 = build_by_hand(PROT_A, PROT_B, p2, "affine", "local", "hard")
-    ref1.score_and_grad()
-    ref2.score_and_grad()
-    batch.score_and_grad()
-    n = len(PROT_A)
-    for i in range(n):
-        assert batch[i].score == pytest.approx(ref1[i].score)
-        assert batch[n + i].score == pytest.approx(ref2[i].score)
-    assert [batch[i].score for i in range(n)] != \
-           pytest.approx([batch[n + i].score for i in range(n)])
-
-
-# ── failure modes leave the batch unchanged ───────────────────────────────────
+# ── failure modes ─────────────────────────────────────────────────────────────
 
 def test_length_mismatch_raises():
     with pytest.raises(Exception, match="equal length"):
         nwgrad.SeqPairBatch(PROT_A, PROT_B[:-1], prot_params(), n_threads=2)
 
 
-@pytest.mark.filterwarnings("ignore:SeqPairBatch.add_many")   # appends: deprecated, removed in 0.8
-def test_bad_character_raises_and_leaves_batch_unchanged():
-    """The throw happens on a worker thread, mid-construction.  The batch must
-    not be left half-filled behind it."""
+def test_bad_character_raises_from_a_worker():
+    """The throw happens on a worker thread, mid-construction: it must surface as an
+    exception naming the character, with nothing leaked behind it (ASan)."""
     params = dna_params()
-    batch = nwgrad.SeqPairBatch(n_threads=4, gap_model="affine", mode="local", grad_mode="hard")
-    batch.add_many(DNA_A, DNA_B, params)
-    assert len(batch) == len(DNA_A)
-
     bad_a = list(DNA_A) + ["ACGT"] * 50 + ["ACGZ"]     # 'Z' is not in ACGT
     bad_b = list(DNA_B) + ["ACGT"] * 50 + ["ACGT"]
     with pytest.raises(Exception, match="not in alphabet"):
-        batch.add_many(bad_a, bad_b, params)
-
-    assert len(batch) == len(DNA_A)          # nothing from the failed call stuck
-    batch.score_and_grad()                   # and the survivors still work
-    assert batch[0].score_valid
-
-
-@pytest.mark.filterwarnings("ignore:SeqPairBatch.add_many")   # appends: deprecated, removed in 0.8
-def test_alphabet_mismatch_raises_and_leaves_batch_unchanged():
-    batch = nwgrad.SeqPairBatch(n_threads=2, gap_model="affine", mode="local", grad_mode="hard")
-    batch.add_many(PROT_A, PROT_B, prot_params())
-    with pytest.raises(Exception, match="cannot join a batch over alphabet"):
-        batch.add_many(DNA_A, DNA_B, dna_params())
-    assert len(batch) == len(PROT_A)
-    batch.score_and_grad()
+        nwgrad.SeqPairBatch(bad_a, bad_b, params, n_threads=4, gap_model="affine", mode="local")
 
 
 def test_empty_batch():

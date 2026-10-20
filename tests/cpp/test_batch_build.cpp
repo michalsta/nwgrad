@@ -3,8 +3,7 @@
 //
 // The Python tests cover the API contract.  These exist for what only the
 // sanitizer build can see: construction runs on N threads, takes ownership,
-// and can throw out of a worker mid-construction.  The deprecated add_many()
-// (appending; removed in 0.8.0) is tested at the end.  Under ASan+UBSan a leaked
+// and can throw out of a worker mid-construction.  Under ASan+UBSan a leaked
 // staged pair, a double free, or a use-after-free on a partially built batch is
 // a hard failure here rather than a mystery in someone's training run.
 
@@ -189,66 +188,3 @@ TEST_CASE("batch build: empty is a no-op", "[batch_build]") {
     REQUIRE(batch.size() == 0);
     REQUIRE_THROWS(batch.compute_grad());     // empty batch has no alphabet
 }
-
-// ── the deprecated add_many(): appending (removed in 0.8.0) ──────────────────
-
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-
-TEST_CASE("add_many: appending keeps the problem type", "[add_many]") {
-    auto p = aa_params();
-    SeqPairBatch batch(views(AA_A), views(AA_B), p,
-                       GapModel::Affine, AlignMode::Local, GradMode::Hard, 2);
-    batch.add_many(views(AA_A), views(AA_B), p);
-    REQUIRE(batch.size() == 2 * AA_A.size());
-    REQUIRE(batch.gap_model() == GapModel::Affine);
-    batch.score_and_grad();
-    REQUIRE(batch[AA_A.size()].score() == batch[0].score());
-}
-
-TEST_CASE("add_many: length mismatch throws, batch unchanged", "[add_many]") {
-    auto p = aa_params();
-    SeqPairBatch batch(GapModel::Affine, AlignMode::Local, GradMode::Hard, 2);
-    std::vector<std::string> short_b(AA_B.begin(), AA_B.end() - 1);
-    REQUIRE_THROWS_AS(
-        batch.add_many(views(AA_A), views(short_b), p),
-        std::invalid_argument);
-    REQUIRE(batch.size() == 0);
-}
-
-TEST_CASE("add_many: bad character throws from a worker, batch unchanged", "[add_many]") {
-    auto p = dna_params();
-    std::vector<std::string> good_a = {"ACGT", "ACGTACGT", "GGGG"};
-    std::vector<std::string> good_b = {"ACGT", "ACGTTCGT", "GGAG"};
-    SeqPairBatch batch(views(good_a), views(good_b), p, GapModel::Affine, AlignMode::Local, GradMode::Hard, 4);
-    REQUIRE(batch.size() == 3);
-
-    // Enough pairs that several threads are mid-construction when one throws:
-    // the staged pairs built by the others must all be destroyed, not leaked.
-    std::vector<std::string> bad_a, bad_b;
-    for (int i = 0; i < 500; ++i) { bad_a.push_back("ACGTACGT"); bad_b.push_back("ACGTACGT"); }
-    bad_a[250] = "ACGZ";                      // 'Z' is not in ACGT
-    REQUIRE_THROWS_AS(
-        batch.add_many(views(bad_a), views(bad_b), p),
-        std::invalid_argument);
-
-    REQUIRE(batch.size() == 3);               // the failed call added nothing
-    batch.score_and_grad();                   // and the survivors still align
-    REQUIRE(batch[0].score_valid());
-}
-
-TEST_CASE("add_many: alphabet mismatch throws, batch unchanged", "[add_many]") {
-    auto aa = aa_params();
-    auto dna = dna_params();
-    SeqPairBatch batch(views(AA_A), views(AA_B), aa,
-                       GapModel::Affine, AlignMode::Local, GradMode::Hard, 2);
-
-    std::vector<std::string> da = {"ACGT"}, db = {"ACGT"};
-    REQUIRE_THROWS_AS(
-        batch.add_many(views(da), views(db), dna),
-        std::invalid_argument);
-    REQUIRE(batch.size() == AA_A.size());
-    batch.score_and_grad();
-}
-
-#pragma GCC diagnostic pop

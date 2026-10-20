@@ -134,7 +134,7 @@ def test_weighted_grad_is_independent_of_threads_and_schedule(cls):
     assert all(r == results[0] for r in results)
 
 
-def test_weighted_grad_after_align_full_and_compute_grad():
+def test_weighted_grad_after_stored_paths_and_compute_grad():
     batch, _ = make_batch(nwgrad.SeqPairBatchDouble)
     batch.score_and_grad(keep_paths=True)
     batch.compute_grad()

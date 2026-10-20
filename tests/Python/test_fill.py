@@ -196,23 +196,18 @@ def test_float32_and_linear_ignore_it():
             assert np.array_equal(x, y)
 
 
-@pytest.mark.filterwarnings("ignore:SeqPairBatch.add_many")   # appends: deprecated, removed in 0.8
-def test_interpair_plan_follows_set_params_and_add_many():
-    """The grouping is cached across calls: it must survive set_params() and be
-    rebuilt when pairs are added."""
+def test_interpair_plan_follows_set_params():
+    """The grouping is cached across calls: it must survive set_params()."""
     a, b = _seqs(150, 10, 30, 13), _fixed_len_b(range(150), 40, 14)
-    a2, b2 = _seqs(37, 5, 25, 15), _fixed_len_b(range(37), 40, 16)
     p1, p2 = _params("random"), _params("cheap_gaps")
     res = {}
     for fill in ("striped", "interpair"):
-        batch = nwgrad.SeqPairBatchDouble(n_threads=3, traceback="pointers", gap_model="affine", mode="local")
+        batch = nwgrad.SeqPairBatchDouble(a, b, p1, n_threads=3, traceback="pointers",
+                                          gap_model="affine", mode="local")
         batch.fill = fill
-        batch.add_many(a, b, p1)
         out = []
         batch.score_and_grad(); out.append((batch.scores(), *batch.grads()))
         batch.set_params(p2)
-        batch.score_and_grad(); out.append((batch.scores(), *batch.grads()))
-        batch.add_many(a2, b2, p2)
         batch.score_and_grad(); out.append((batch.scores(), *batch.grads()))
         res[fill] = out
     for x, y in zip(res["striped"], res["interpair"]):
@@ -438,10 +433,10 @@ def test_banded_interpair_needs_a_guide():
 @pytest.mark.parametrize("gm", ["affine", "linear"])
 @pytest.mark.parametrize("mode", ["local", "global"])
 @pytest.mark.parametrize("fill", ["striped", "interpair"])
-def test_banded_grad_guides_match_realign_banded(prec, gm, mode, fill):
+def test_banded_grad_guides_match_banded_align(prec, gm, mode, fill):
     """banded_grad() takes its new guide from the gradient's traceback walk (one walk
     for both); it must equal the separately extracted guide of a pair's own
-    realign_banded() around the same old guide, with the same score."""
+    banded_align() around the same old guide, with the same score."""
     A, B = _seqs(90, 5, 30, 41), _fixed_len_b(range(90), 35, 42)
     p = _params("ties")
     bcls, pcls = _CLS[prec]

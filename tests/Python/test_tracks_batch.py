@@ -276,37 +276,6 @@ def test_tracked_batch_validation():
     b.set_params(P3 * 2.0)
 
 
-@pytest.mark.filterwarnings("ignore:SeqPairBatch.add_many")   # appends: deprecated, removed in 0.8
-def test_tracked_batch_append_keeps_its_set_count():
-    P3 = to_params(np.zeros((3, N, N)), np.ones((3, 4)))
-    P2 = to_params(np.zeros((2, N, N)), np.ones((2, 4)))
-    b = nwgrad.SeqPairBatchDouble(["AC"], ["AC"], P3, n_threads=2, gap_model="linear", mode="local",
-                                  tracks=[[0, 2]])
-    with pytest.raises(ValueError, match="parameter sets cannot join"):
-        b.add_many(["AC"], ["AC"], P2)
-    assert len(b) == 1
-
-
-@pytest.mark.filterwarnings("ignore:SeqPairBatch.add_many")   # appends: deprecated, removed in 0.8
-def test_untracked_batch_becomes_tracked():
-    rng = np.random.default_rng(16)
-    mats, gaps = rng.normal(size=(1, N, N)), rng.uniform(0.5, 1.5, size=(1, 4))
-    P = to_params(mats, gaps)
-    b = BATCH["_double"](2, gap_model="affine", mode="local")
-    b.add_many(["ACGT", "AAC"], ["ACGG", "AC"], P)
-    b.score_and_grad()
-    s_before = b.scores()
-    assert not b.tracked
-    b.add_many(["GGT"], ["GCT"], P, tracks=[[0, 0, 0]])
-    assert b.tracked and b.num_sets == 1
-    with pytest.raises(RuntimeError):   # the earlier results were dropped with the switch
-        b.scores()
-    b.score_and_grad()
-    np.testing.assert_array_equal(b.scores()[:2], s_before)
-    assert b.grads()[0].shape == (3, 1, N, N)
-
-
-
 @pytest.mark.parametrize("case", CASES)
 @pytest.mark.parametrize("traceback", ["pointers", "hirschberg"])
 def test_long_gap_runs_replay(case, traceback):

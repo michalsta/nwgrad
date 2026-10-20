@@ -2,8 +2,9 @@
 """Differential fuzz: SeqPairBatch fill="interpair" against fill="striped".
 
 Each seed builds one random batch of one problem type (gap model, mode, grad mode --
-one per batch since 0.6) from several segments (the deprecated add_many()), each with its own
-parameters (ties, integer, real-valued; cheap and dear gaps),
+one per batch since 0.6) from several groups of pairs, each with its own parameters
+(ties, integer, real-valued; cheap and dear gaps): one group is an untracked batch,
+several are K stacked sets with each pair on its group's set (constant tracks),
 empty and one-residue sequences, lengths past hb_cutoff, shared and ragged len B, both
 precisions, every traceback -- and runs score_and_grad() and then banded_grad(bw) under
 both fills.  Hard scores and gradients must be bit-identical (the documented contract),
@@ -23,7 +24,6 @@ models; since 0.6 a batch holds one type, which removes that mix but not the bug
 import argparse
 import subprocess
 import sys
-import warnings
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -90,15 +90,17 @@ def make_case(seed):
 
 def run_fill(prec, tb, specs, fill, bw):
     _, _, _, gm, mode, gr = specs[0]
-    A, B, p = specs[0][:3]
-    b = CLS[prec](A, B, p, n_threads=3, traceback=tb, gap_model=gm, mode=mode, grad_mode=gr)
+    A = [a for spec in specs for a in spec[0]]
+    B = [b for spec in specs for b in spec[1]]
+    kw = dict(n_threads=3, traceback=tb, gap_model=gm, mode=mode, grad_mode=gr)
+    if len(specs) == 1:
+        b = CLS[prec](A, B, specs[0][2], **kw)
+    else:   # each group's params as one set; its pairs on that set throughout
+        p = nwgrad.AlignParams.stack([spec[2] for spec in specs])
+        tracks = [[k] * len(a) for k, spec in enumerate(specs) for a in spec[0]]
+        gap_tracks = [[k] * (len(a) + 1) for k, spec in enumerate(specs) for a in spec[0]]
+        b = CLS[prec](A, B, p, tracks=tracks, gap_tracks=gap_tracks, **kw)
     b.fill = fill
-    # Further segments (their own params) only through the deprecated add_many(), until
-    # its removal in 0.8 (TODO.md): then one segment per case, or K sets with tracks.
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", "SeqPairBatch.add_many", DeprecationWarning)
-        for A, B, p, _, _, _ in specs[1:]:
-            b.add_many(A, B, p)
     try:
         b.score_and_grad()
     except Exception as e:  # must match across fills, checked by the caller
@@ -123,8 +125,11 @@ def check_seed(seed):
            f"{[(len(s[0]), s[3], s[4], s[5]) for s in specs]}")
     s = run_fill(prec, tb, specs, "striped", bw)
     ip = run_fill(prec, tb, specs, "interpair", bw)
-    if isinstance(s[0], str) or isinstance(ip[0], str):
-        return None if s == ip else f"EXCEPTION MISMATCH {tag}: striped={s[:2]} interpair={ip[:2]}"
+    raised_s, raised_ip = isinstance(s[0], str), isinstance(ip[0], str)
+    if raised_s or raised_ip:
+        same = raised_s and raised_ip and s == ip
+        return None if same else (f"EXCEPTION MISMATCH {tag}: striped={s if raised_s else 'ok'} "
+                                  f"interpair={ip if raised_ip else 'ok'}")
     soft = np.array([spec[5] == "soft" for spec in specs for _ in spec[0]])
 
     def compare(what, x, y):
