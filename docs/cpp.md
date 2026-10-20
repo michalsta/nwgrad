@@ -24,7 +24,7 @@ std::vector<double> scores = batch.scores();
 ```
 
 `SeqPairBatchT(gm, am, gd, n_threads, tb)` without pairs is for streaming `align()`.
-`add_many()`, which appended pairs, is `[[deprecated]]` in 0.7.0 and removed in 0.8.0.
+`add_many()`, which appended pairs, was removed in 0.8.0.
 
 ## Building from source
 

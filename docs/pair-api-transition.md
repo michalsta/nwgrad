@@ -1,5 +1,8 @@
 # Pair API transition
 
+**Status:** done. Release N was 0.7.0; the N+1 removal is on `main` for 0.8.0
+(2026-10-20; see TODO.md).
+
 This plan covers the remaining `SeqPair` lifecycle API, for both precisions and
 for standalone pairs and batch views. Release N introduces the final API and
 deprecates the compatibility API. Release N+1 removes compatibility completely.

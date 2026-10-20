@@ -11,72 +11,31 @@ nighthaven, 12 threads): a whole hard training step (set_params + score_and_grad
 scores + weighted_grad) 0.76x the old time, a banded step 0.62x, resident memory
 385 -> 34 MB. See AGENTS.md "batch_engine.hpp".
 
-## Remove the 0.6.0-deprecated API — DONE
+## Remove the 0.6.0- and 0.7.0-deprecated APIs — DONE
 
-Removed the untyped batch state, per-add problem-type arguments, batch
-`alloc_dp` / `align_full` / `realign_banded` / `drop_dp`, and `SeqPair.alloc_dp`.
-Batches now own one settings store in an engine selected at construction. Batch
-computations publish gradients immediately, with no batch-wide holding pass.
-The remaining old pair lifecycle is deprecated in 0.7.0 and removed in 0.8.0.
-Use `align()`, `banded_align()`, `drop_paths()` and `stored_path_valid`; configured
-gradients are immediately available. Deferred visibility remains only in the
-compatibility helper and batch-view reduction bridge, with no separate `kHeld`
-flag. Delete `pair_api_compat.hpp`, the deprecated facade methods/bindings and
-reduction bridge in 0.8, keeping modern lifecycle regressions. DiscrimAlign's
-ported API is tested from PR #16, rather than modifying the old consumer checkout.
+0.7 removed the 0.6.0-deprecated batch API (untyped batches, per-add problem types, batch
+`alloc_dp` / `align_full` / `realign_banded` / `drop_dp`, `SeqPair.alloc_dp`).
 
-## Remove `SeqPairBatch.add_many()` in 0.8.0 — PLANNED
+0.8 (2026-10-20) removed what 0.7.0 deprecated, after DiscrimAlign's port (BioGeMT
+PR #18) was merged:
+- `SeqPairBatch.add_many()` (Python and C++; `BatchEngine::add_many()` became the
+  engine's pair constructor) and the 0.7 pair lifecycle `align_full()` /
+  `realign_banded()` / `compute_grad()` / `drop_dp()` / `dp_valid`, with
+  `pair_api_compat.hpp` and the batch `compute_grad()` bridge (it now checks every
+  gradient is published, as `weighted_grad()` does).
+- The engine: pairs set once, so no append bookkeeping (offsets from N0, the rollback
+  after a failed encode, incremental store growth, the alphabet / K checks against
+  existing pairs, `make_tracked_()`, `generation_`); no segments (`Segment`, `segs_`,
+  the per-pair `seg_`, `set_params_segment()`): one params (`params_`, an
+  `OwnedParams` holding the tracked prep too) and one kernel; no params store
+  (`own_params_` dedup, `params_idx_`, `params_same_`, `drop_unused_params_`, `prep_`);
+  the inter-pair plan has one backend for every group and no "same params" lane checks.
+- Tests: the append / segment / compatibility cases deleted, each one's non-append
+  coverage kept or ported (`test_pair_lifecycle.py`, `test_batch_constructor.py`
+  against streaming `align()`); `tools/fuzz_fill.py` builds several params as K stacked
+  sets with constant tracks, `tools/fuzz_ab.py` one params per case.
 
-0.7.0 gives the pairs to the constructor, `SeqPairBatch(seqs_a, seqs_b, params, ...)`,
-and deprecates `add_many()` (Python `DeprecationWarning`: "deprecated in nwgrad 0.7.0
-and will be removed in 0.8.0"). The pairless `SeqPairBatch(n_threads, ...)` stays, for
-streaming `align()`. What a batch can no longer do afterwards: append pairs, and hold
-several segments under different params or kernels. Different params per pair are K sets
-with a constant track per pair (`AlignParams.stack`); a per-segment kernel has no use
-outside tests and benchmarks.
-
-**C++ follows the same pattern in 0.7.0:** `SeqPairBatchT(seqs_a, seqs_b, params, gm, am,
-gd, n_threads, tb, kernel, tracks, gap_tracks)` takes the pairs; the pairless
-`SeqPairBatchT(gm, am, gd, n_threads, tb)` stays for streaming `align()`;
-`SeqPairBatchT::add_many()` is `[[deprecated]]` (removed in 0.8.0). Its callers: the
-Python `add_many` binding (`add_pairs()` in `py_exports.cpp`, warning suppressed) and the
-appending tests at the end of `tests/cpp/test_batch_build.cpp` (likewise).
-`BatchEngine::add_many()` (internal; `SeqPairBatchT`'s constructor and a few engine tests
-call it) is not deprecated: it becomes the engine's construction step in 0.8.
-
-**0.8.0, Python and C++:**
-- Delete `SeqPairBatchT::add_many()`, the `add_many` binding and its warning, and
-  `add_pairs()` in `py_exports.cpp`; the appending tests in `tests/cpp/test_batch_build.cpp`.
-- Delete the tests marked `filterwarnings("ignore:SeqPairBatch.add_many")` (appends,
-  segments, failed appends leaving the batch unchanged): `test_batch_build.py`,
-  `test_tracks_batch.py`, `test_fill.py`, `test_alphabet.py`, `test_removed_api.py`; the
-  `legacy()` comparisons and the `add_many` warning tests in `test_batch_constructor.py`;
-  the `filterwarnings` entry in `pyproject.toml`. Keep each test's non-append coverage.
-- `tools/fuzz_fill.py` and `tools/fuzz_ab.py` build several segments with their own
-  params: one segment per case, or K sets with constant tracks per pair.
-- Docs: drop the `add_many` row from `docs/api.md`, keep its line in the migration table.
-
-**0.8.0, engine** (`batch_engine.hpp`; est. 150-250 lines; no DP kernel changes, no
-speed claim without a measurement):
-- Pairs set once: the construction path loses the append bookkeeping (`N0` offsets, the
-  rollback after a failed encode, incremental `grow_tpaths_(from)`, the alphabet / K
-  checks against existing pairs) and `generation_` with the plan's check of it.
-- Segments go: `Segment`, `segs_`, the per-pair `seg_`; `params(i)` / `kernel(i)` become
-  one params pointer and one kernel. `set_params_segment()` (standalone `SeqPair`)
-  becomes `set_params()`. The pending-guide params (`gparams`) stay, as one pointer.
-- The params store shrinks to the current params plus the pending guides' params:
-  `own_params_` deduplication, `params_idx_`, `params_same_`, `drop_unused_params_` and
-  the `prep_` list go.
-- The inter-pair "same params" lane checks (`same_params` / `shared`, three places)
-  always hold; delete them.
-- `make_tracked_()` goes: a batch is tracked or not from construction.
-
-**Validation:** full C++ and Python suites, ASan/UBSan, forced kernels on every level
-(sse2/avx2/neon in CI, avx512 on solace), `tools/stress_tracks.py`; bit-identical scores
-and gradients before/after on the fuzzers' single-segment cases; the PosimiR
-`nwgrad-sklearn` tests and DiscrimAlign PR #16's acceptance fits, as in
-`docs/release-validation.md`. Do together with the pair-compatibility removal
-(`docs/pair-api-transition.md`) so 0.8.0 is validated once.
+Not measured: no speed claim (no DP kernel changed).
 
 ## Default thread count (`n_threads=0`): physical cores are wrong for short pairs
 

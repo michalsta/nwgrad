@@ -12,7 +12,8 @@ building from source, see [cpp.md](cpp.md).
   [parameter sets and tracks](#parameter-sets-and-tracks))
 - [`SeqPair`](#seqpair) · [`SeqPairBatch`](#seqpairbatch) · [`nwgrad.logistic`](#nwgradlogistic)
   · [`BatchResult`](#batchresult)
-- [Migrating from 0.5](#migrating-from-05)
+- [Migrating to 0.8](#migrating-to-08) · [to 0.7](#migrating-to-07-pairs-in-the-constructor)
+  · [from 0.5](#migrating-from-05)
 - [Single-pair convenience functions](#single-pair-convenience-functions)
 
 ## `Alphabet`
@@ -286,25 +287,20 @@ path on single pairs (AVX2, 1 thread): 1.2–3.1× affine Global, 3–6.5× affi
 
 ---
 
-### Pair compatibility: deprecated in 0.7.0, removed in 0.8.0
+### Pair API removed in 0.8.0
 
-Python calls emit `DeprecationWarning`; C++ methods are marked `[[deprecated]]`.
-During 0.7, old methods retain their deferred-gradient behavior. New computations
-publish gradients immediately, on standalone pairs and batch views alike.
+Deprecated in 0.7.0. Every computation publishes its gradient immediately, on
+standalone pairs and batch views alike; nothing is held back for a later call.
 
-| Deprecated pair API | Replacement |
+| Removed pair API | Replacement |
 |---|---|
 | `align_full()` | `align()` or `score_and_grad()` |
 | `realign_banded(bw)` | `banded_align(bw)` |
-| `compute_grad()` | Read `grad` after a modern computation |
+| `compute_grad()` | Read `grad` after `align()` / `banded_align()` |
 | `drop_dp()` | `drop_paths()` |
 | `dp_valid` | `stored_path_valid` |
 
-The old full/banded calls store paths and hide their cached gradients until
-`compute_grad()`. Dropping paths before release prevents release; dropping them
-after release preserves the gradient. Batch `compute_grad()` also releases
-results deferred by old calls on views. This bridge disappears in 0.8; batch
-`compute_grad()` itself remains supported as the cached-gradient reduction.
+Batch `compute_grad()` remains, as the cached-gradient reduction.
 
 ```python
 pair.align()                         # score and configured gradient are current
@@ -353,7 +349,6 @@ the logical count measured up to 1.44× slower. A negative `n_threads` raises
 
 | Method | Returns | Description |
 |---|---|---|
-| `add_many(seqs_a, seqs_b, params, kernel="auto", *, tracks=None, gap_tracks=None)` | — | **Deprecated in 0.7.0, removed in 0.8.0** (`DeprecationWarning`): give the pairs to the constructor. Appends the pairs `(seqs_a[i], seqs_b[i])` under `params`: one **segment**. With [tracks](#parameter-sets-and-tracks) (or K > 1 sets) the batch is **tracked**: every pair carries tracks and every segment's params must have the same K. Params may differ between calls (one alphabet); `set_params()` replaces them all. Sequences are validated and encoded in parallel; a bad character raises and adds nothing. The batch keeps a **copy** of `params` (calls with equal params share one); later changes to the object do not reach the batch — use `set_params()`. |
 | `set_params(params)` | — | Give every pair a copy of `params` (same alphabet; a mismatch raises without changing anything). Clears cached scores, gradients and stored paths; keeps the guides, for `banded_grad()`. |
 | `score_and_grad(keep_paths=False)` | `float` (sum of scores) | Full DP on every pair: score, guide and (unless `grad_mode="none"`) gradient, cached per pair. With `grad_mode="none"` and no `keep_paths`: [score only](#score-only), guides deferred. `keep_paths=True` also stores each alignment path, so `batch[i].aligned()` / `.coordinates()` work (a few bytes per alignment column). |
 | `banded_grad(bandwidth, keep_paths=False)` | `float` (sum of scores) | Banded re-align + gradient around each pair's cached guide. Run `score_and_grad()` once to establish the guides, then `set_params()` + `banded_grad(bw)` after each update; no full DP is run. |
@@ -549,6 +544,24 @@ score, grad = nwgrad.nw_affine_grad("PLEASANTLY", "MEANLY", params)
 
 ---
 
+## Migrating to 0.8
+
+0.8 removes what 0.7 deprecated:
+
+- `SeqPairBatch.add_many()`: give the pairs to the constructor (see the table below,
+  under 0.7). A batch can no longer grow, nor hold pairs under different params: it has
+  one params, which `set_params()` replaces. Different params per pair are K sets with a
+  constant track per pair.
+- The old pair lifecycle (`align_full()`, `realign_banded()`, `compute_grad()`,
+  `drop_dp()`, `dp_valid` on a `SeqPair`): see [Pair API removed in
+  0.8.0](#pair-api-removed-in-080).
+- C++: `SeqPairBatchT::add_many()` and `BatchEngine::add_many()` — the engine takes its
+  pairs in its constructor too — and `BatchEngine::params(i)` / `kernel(i)`, now
+  `params()` / `kernel()`.
+
+Batch `compute_grad()` raises, as `weighted_grad()` does, while any pair's gradient is
+not computed; in 0.7 it could publish gradients the old pair calls had held back.
+
 ## Migrating to 0.7: pairs in the constructor
 
 0.7 in short:
@@ -556,7 +569,7 @@ score, grad = nwgrad.nw_affine_grad("PLEASANTLY", "MEANLY", params)
 - **Removed:** the batch API deprecated in 0.6.0 (see [Migrating from 0.5](#migrating-from-05)).
 - **Deprecated, removed in 0.8.0:** `SeqPairBatch.add_many()` (below) and the old pair
   lifecycle, `align_full()` / `realign_banded()` / `compute_grad()` / `drop_dp()` /
-  `dp_valid` on a `SeqPair` (see [Pair compatibility](#pair-compatibility-deprecated-in-070-removed-in-080)).
+  `dp_valid` on a `SeqPair` (see [Pair API removed in 0.8.0](#pair-api-removed-in-080)).
   Both warn with a `DeprecationWarning`.
 - **New:** [parameter sets and tracks](#parameter-sets-and-tracks) (`track_storage`,
   tracks as one flat integer array) and the pairs-in-the-constructor batch.
