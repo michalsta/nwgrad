@@ -12,8 +12,9 @@
 //   integer          lowest()/2.  There is no infinity, and lowest() itself would wrap
 //                    on the first `- ge`.  Halving leaves |lowest|/2 on either side of
 //                    the sentinel.  set_problem() then refuses a problem whose a-priori
-//                    bound (m+n+2) * max step exceeds nw_int_cap = |lowest|/4 - 1, so
-//                    every value the DP can form stays within |lowest|/4 of EITHER zero
+//                    bound (m+n+2+64) * max step exceeds nw_int_cap = |lowest|/4 - 1 (the
+//                    64: a striped kernel's padding columns, see nw_pad), so every value
+//                    the DP can form stays within |lowest|/4 of EITHER zero
 //                    (a reachable score: a path has at most m+n+2 steps) OR the sentinel
 //                    (an unreachable value drifts by at most that many steps too).  Two
 //                    consequences carry the whole design: nothing wraps, and an
@@ -48,6 +49,30 @@ template <class T>
 inline constexpr T nw_int_cap = std::is_floating_point_v<T>
     ? std::numeric_limits<T>::infinity()
     : static_cast<T>(-(std::numeric_limits<T>::lowest() / 4) - 1);
+
+// The substitution score of a striped kernel's PADDING column (a column past the end of
+// B that fills out the last vector).  Floating T pads with -inf, which makes every
+// padding cell -inf whatever is added to it.  An integer T cannot: a padding cell would
+// be computed as sentinel + sentinel and wrap on the next penalty.  So an integer T pads
+// with 0 — the padding columns then behave as an imaginary tail of B that scores 0,
+// every one of their values an ordinary in-range DP value (which is why the bound above
+// allows 64 columns of padding: nw_int_pad_cols) — and every argmax that could read a
+// padding cell masks it (the Local row best, the score kernels, the endpoint scan).  The
+// padding can never feed a real cell: it lies to the right of every real column, and
+// the DP flows right and down.
+template <class T>
+inline constexpr T nw_pad = std::is_floating_point_v<T>
+    ? -std::numeric_limits<T>::infinity() : T(0);
+inline constexpr int nw_int_pad_cols = 64;
+
+// The scalar type's name, for messages and the Python surface.
+template <class T> constexpr const char* nw_type_name() noexcept {
+    if constexpr (std::is_same_v<T, double>)       return "double";
+    else if constexpr (std::is_same_v<T, float>)   return "float32";
+    else if constexpr (sizeof(T) == 2)             return "int16";
+    else if constexpr (sizeof(T) == 4)             return "int32";
+    else                                           return "int64";
+}
 
 // The unsigned integer of T's width, for bitwise equality / bit tricks on a T.
 template <class T>

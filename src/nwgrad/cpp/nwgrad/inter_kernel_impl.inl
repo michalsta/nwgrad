@@ -26,14 +26,22 @@
 inline constexpr int IW = KW;
 typedef double ivd __attribute__((vector_size(8 * IW)));
 typedef long long ivl __attribute__((vector_size(8 * IW)));
-// float32: the same register holds twice the lanes.
+// float32: the same register holds twice the lanes; the integer types likewise by width.
 typedef float ivf __attribute__((vector_size(8 * IW)));
 typedef int ivi __attribute__((vector_size(8 * IW)));
+typedef short ivs __attribute__((vector_size(8 * IW)));
+typedef int16_t ivi16 __attribute__((vector_size(8 * IW)));
+typedef int32_t ivi32 __attribute__((vector_size(8 * IW)));
+typedef int64_t ivi64 __attribute__((vector_size(8 * IW)));
 
-// Vector, mask and lane count per precision.
+// Vector, mask (a signed integer vector of the same lane width) and lane count per
+// scalar type.
 template <class T> struct IVT;
-template <> struct IVT<double> { using v = ivd; using l = ivl; static constexpr int W = IW; };
-template <> struct IVT<float>  { using v = ivf; using l = ivi; static constexpr int W = 2 * IW; };
+template <> struct IVT<double>  { using v = ivd;   using l = ivl;   static constexpr int W = IW; };
+template <> struct IVT<float>   { using v = ivf;   using l = ivi;   static constexpr int W = 2 * IW; };
+template <> struct IVT<int16_t> { using v = ivi16; using l = ivi16; static constexpr int W = 4 * IW; };
+template <> struct IVT<int32_t> { using v = ivi32; using l = ivi32; static constexpr int W = 2 * IW; };
+template <> struct IVT<int64_t> { using v = ivi64; using l = ivi64; static constexpr int W = IW; };
 
 // Lane-wise std::max(a, b), i.e. a < b ? b : a — the same choice on ties as the
 // scalar and row-wise kernels.  On 128-bit x86 vectors it is MAXPD/MAXPS(b, a), which
@@ -62,8 +70,9 @@ template <class L, class V> static inline V ivsel(L m, V a, V b) noexcept { retu
 // Every lane = x.  Not `ivd{} + x`: +0 + -0 is +0, so that idiom loses the sign of a
 // zero border (-0 when a gap extend is 0), which the scalar fill keeps.
 template <class V, class S> static inline V ivsplat(S x) noexcept {
-    V v;
-    for (unsigned l = 0; l < sizeof(V) / sizeof(S); ++l) v[l] = x;
+    using E = std::remove_cvref_t<decltype(V{}[0])>;   // the lane type, not S's (an int
+    V v;                                                // promotion would halve the count)
+    for (unsigned l = 0; l < sizeof(V) / sizeof(E); ++l) v[l] = static_cast<E>(x);
     return v;
 }
 
@@ -420,8 +429,8 @@ static void inter_fill_t(InterJobT<T>& J) noexcept {
     else      inter_fill_tr<T, false>(J);
 }
 
-static void inter_fill_entry(InterJob& J) noexcept { inter_fill_t<double>(J); }
-static void inter_fill_entry_f(InterJobT<float>& J) noexcept { inter_fill_t<float>(J); }
+template <class T>
+static void inter_fill_entry(InterJobT<T>& J) noexcept { inter_fill_t<T>(J); }
 
 // ── Inter-pair SCORE ONLY (Full): the fills above on one row, updated in place ──
 //
@@ -668,5 +677,5 @@ static void inter_score_t(InterJobT<T>& J) noexcept {
     if (J.tr) inter_score_tr<T, true>(J);
     else      inter_score_tr<T, false>(J);
 }
-static void inter_score_entry(InterJob& J) noexcept { inter_score_t<double>(J); }
-static void inter_score_entry_f(InterJobT<float>& J) noexcept { inter_score_t<float>(J); }
+template <class T>
+static void inter_score_entry(InterJobT<T>& J) noexcept { inter_score_t<T>(J); }

@@ -464,10 +464,14 @@ static void bind_convenience(nb::module_& m, const std::string& sfx) {
     NWG_HARD("sw_grad", Linear, Local,  "SW local: returns (score, AlignParams grad) — hard subgradient (linear gap).");
     NWG_HARD("nw_affine_grad", Affine, Global, "NW global: returns (score, AlignParams grad) — hard subgradient (affine gap).");
     NWG_HARD("sw_affine_grad", Affine, Local,  "SW local: returns (score, AlignParams grad) — hard subgradient (affine gap).");
+    // The soft path has no integer form (it is a computation in exp/log space), so an
+    // integer T binds no soft function at all rather than one that always raises.
+    if constexpr (std::is_floating_point_v<T>) {
     NWG_SOFT("nw_soft_grad", Linear, Global, "NW global: returns (log_Z, AlignParams grad) — soft gradient (linear gap).");
     NWG_SOFT("sw_soft_grad", Linear, Local,  "SW local: returns (log_Z, AlignParams grad) — soft gradient (linear gap).");
     NWG_SOFT("nw_affine_soft_grad", Affine, Global, "NW global: returns (log_Z, AlignParams grad) — soft gradient (affine gap).");
     NWG_SOFT("sw_affine_soft_grad", Affine, Local,  "SW local: returns (log_Z, AlignParams grad) — soft gradient (affine gap).");
+    }
 #undef NWG_SCORE
 #undef NWG_HARD
 #undef NWG_SOFT
@@ -1383,9 +1387,13 @@ NB_MODULE(nwgrad_ext, m) {
         "Returns a list of length m+1 where guide_j[i] = column j after consuming i\n"
         "characters of a.");
 
-    // ── Single-pair convenience functions (float32 default; _double variants) ──
+    // ── Single-pair convenience functions (float32 default; _double and the integer
+    //    variants: integral parameters only, no soft functions) ──
     bind_convenience<float >(m, "");
     bind_convenience<double>(m, "_double");
+    bind_convenience<int16_t>(m, "_int16");
+    bind_convenience<int32_t>(m, "_int32");
+    bind_convenience<int64_t>(m, "_int64");
 
     // ── BatchResult ──────────────────────────────────────────────────────────
     nb::class_<BatchResult>(m, "BatchResult")
@@ -1406,13 +1414,23 @@ NB_MODULE(nwgrad_ext, m) {
             nb::rv_policy::reference_internal,
             "Summed gradient over the batch as an AlignParams object.");
 
-    // ── SeqPair (float32 default) / SeqPairDouble ─────────────────────────────
+    // ── SeqPair (float32 default) / SeqPairDouble / SeqPairInt16, Int32, Int64 ─
     bind_seq_pair<float >(m, "SeqPair");
     bind_seq_pair<double>(m, "SeqPairDouble");
+    bind_seq_pair<int16_t>(m, "SeqPairInt16");
+    bind_seq_pair<int32_t>(m, "SeqPairInt32");
+    bind_seq_pair<int64_t>(m, "SeqPairInt64");
 
-    // ── SeqPairBatch (float32 default) / SeqPairBatchDouble ───────────────────
+    // ── SeqPairBatch (float32 default) / SeqPairBatchDouble / the integer three ──
+    // Integer batches: integral parameters only (a non-integral one raises ValueError
+    // at construction / set_params), a problem whose a-priori bound could overflow the
+    // type raises OverflowError, grad_mode "soft" raises ValueError.  Every hard-path
+    // result is bit-identical to the double batch's on the same integral parameters.
     bind_seq_pair_batch<float >(m, "SeqPairBatch");
     bind_seq_pair_batch<double>(m, "SeqPairBatchDouble");
+    bind_seq_pair_batch<int16_t>(m, "SeqPairBatchInt16");
+    bind_seq_pair_batch<int32_t>(m, "SeqPairBatchInt32");
+    bind_seq_pair_batch<int64_t>(m, "SeqPairBatchInt64");
 
     // ── logistic: a binary logistic link over batch scores (submodule) ────────
     bind_logistic(m);

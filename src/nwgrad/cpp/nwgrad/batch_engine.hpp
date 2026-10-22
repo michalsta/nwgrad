@@ -117,6 +117,11 @@ public:
 
     // No pairs: an engine for streaming align_stream() only.
     BatchEngine(BatchSettings s, GradMode gd) : s_(std::move(s)), grad_mode_(gd) {
+        if constexpr (nw_is_int<T>)
+            if (gd == GradMode::Soft)
+                throw std::invalid_argument(
+                    std::string("nwgrad: grad_mode \"soft\" (forward-backward) needs a floating-point "
+                                "scalar type; this batch's is ") + nw_type_name<T>());
         s_.set_n_threads(s_.n_threads);
         FullAl probe;   // what "auto" resolves to for this problem type
         probe.set_traceback(s_.traceback);
@@ -711,7 +716,7 @@ private:
         if (backend < 0) return -1;
         const LevelKernels& K = level_kernels(backend);
         if (grad_mode_ == GradMode::Soft)
-            return (K.inter_soft && K.inter_w > 0 && s_.soft_impl != SoftImpl::Log && !banded) ? backend : -1;
+            return (K.inter_soft && K.d.inter_w > 0 && s_.soft_impl != SoftImpl::Log && !banded) ? backend : -1;
         if (inter_w_(K) <= 0) return -1;
         if (GM == GapModel::Linear &&
             (banded || (AM == AlignMode::Global && (inter_w_(K) < 4 || params.matrix.size() > 8))))
@@ -728,14 +733,14 @@ private:
         const size_t N = problems.size();
         const LevelKernels& K = level_kernels(backend);
         const bool soft = grad_mode_ == GradMode::Soft;
-        const int W = soft ? K.inter_w : inter_w_(K);
+        const int W = soft ? K.d.inter_w : inter_w_(K);
         const bool hb_case = !soft && AB == AlignBand::Full && is_hirschberg(tb_resolved_);
         std::vector<size_t> other, elig;
         size_t maxa = 0, maxb = 0;
         for (size_t i = 0; i < N; ++i) {
             const size_t la = problems[i].seq_a.size(), lb = problems[i].seq_b.size();
             if (la == 0 || lb == 0 || (hb_case && la > static_cast<size_t>(s_.hb_cutoff)) ||
-                !inter_pair_fits(la, lb, GM == GapModel::Affine, soft, inter_w_(K), sizeof(T), K.inter_w)) {
+                !inter_pair_fits(la, lb, GM == GapModel::Affine, soft, inter_w_(K), sizeof(T), K.d.inter_w)) {
                 other.push_back(i); continue;
             }
             elig.push_back(i);
@@ -960,13 +965,22 @@ private:
     // once: its gap fields cast to T, 4 per set (setup_tracks_ reads them), and (float32,
     // K > 1) its whole matrix stack cast to T (the Aligner would otherwise cast K matrices
     // per pair).  Shared: the pending guides' params (gparams_) may be the current ones.
+    // An integer T prepares every params ONCE here (nw_int_prepare: checked casts of
+    // the whole stack and every set's gaps, and step_max), tracked or not, so a
+    // non-integral parameter raises at construction / set_params() and no pair repeats
+    // the checks.
     struct OwnedParams {
         AlignParams p;
         std::vector<T> stack, gaps;
+        T step_max = T(-1);   // integer T: the largest step (nw_int_prepare); -1 = not prepared
         const T* stack_or_null() const noexcept { return stack.empty() ? nullptr : stack.data(); }
     };
     std::shared_ptr<const OwnedParams> own_params_(const AlignParams& p) const {
-        auto o = std::make_shared<OwnedParams>(OwnedParams{p, {}, {}});
+        auto o = std::make_shared<OwnedParams>(OwnedParams{p, {}, {}, T(-1)});
+        if constexpr (nw_is_int<T>) {
+            nw_int_prepare<T>(p, p.num_sets(), o->stack, o->gaps, o->step_max);
+            return o;
+        }
         if (!tracked_) return o;   // untracked (and standalone SeqPair): no allocation
         const std::vector<double> all = p.all_gaps();
         o->gaps.assign(all.begin(), all.end());
@@ -1586,7 +1600,10 @@ private:
     [[gnu::always_inline]] inline void problem_(Al& al, size_t i, const OwnedParams& o, int band,
                                                 std::vector<int>&& guide) const {
         if (tracked_) al.set_problem(codes_a(i), codes_b(i), o.p, band, std::move(guide),
-                                     track(i), gap_track(i), o.stack_or_null(), o.gaps.data());
+                                     track(i), gap_track(i), o.stack_or_null(), o.gaps.data(), o.step_max);
+        else if constexpr (nw_is_int<T>)   // the prepared stack, gaps and step_max (no tracks)
+            al.set_problem(codes_a(i), codes_b(i), o.p, band, std::move(guide), {}, {},
+                           o.stack_or_null(), o.gaps.data(), o.step_max);
         else          al.set_problem(codes_a(i), codes_b(i), o.p, band, std::move(guide));
     }
     // The hard gradient and guide of the DP `al` just ran, into pair i, in one walk —
@@ -1841,8 +1858,8 @@ private:
     // ── Inter-pair plan ──────────────────────────────────────────────────────
 
     static int inter_w_(const LevelKernels& K) {
-        if constexpr (std::is_same_v<T, double>) return K.inter_fill ? K.inter_w : 0;
-        else                                     return K.inter_fill_f ? K.inter_w_f : 0;
+        const TypedKernels<T>& KT = K.template of<T>();
+        return KT.inter_fill ? KT.inter_w : 0;
     }
 
     // The pieces of an InterJob every inter-pair fill shares (score_and_grad_inter_,
@@ -1858,7 +1875,10 @@ private:
         const size_t nbk = static_cast<size_t>(P.matrix.size()) * P.matrix.size() *
                            static_cast<size_t>(P.num_sets());
         blkT.resize(nbk);
-        for (size_t k = 0; k < nbk; ++k) blkT[k] = static_cast<T>(P.matrix.data()[k]);
+        for (size_t k = 0; k < nbk; ++k) {
+            if constexpr (nw_is_int<T>) blkT[k] = nw_int_checked<T>(P.matrix.data()[k], "substitution score");
+            else                        blkT[k] = static_cast<T>(P.matrix.data()[k]);
+        }
     }
     // Tracked inter-pair lanes: lane l's aligner set up with its pair (the group's last
     // pair repeated in spare lanes) and its rows in w.tjobs[l], before the fill, so the
@@ -1972,18 +1992,15 @@ private:
         }
     }
     static void run_inter_fill_(const LevelKernels& K, InterJobT<T>& job) {
-        if constexpr (std::is_same_v<T, double>) K.inter_fill(job);
-        else                                     K.inter_fill_f(job);
+        K.template of<T>().inter_fill(job);
     }
     // Score only (grad_mode None, Full): the same lanes on ONE row per table, each lane's
     // score out in job.best; false when the level has no such kernel.
     static bool has_inter_score_(const LevelKernels& K) {
-        if constexpr (std::is_same_v<T, double>) return K.inter_score != nullptr;
-        else                                     return K.inter_score_f != nullptr;
+        return K.template of<T>().inter_score != nullptr;
     }
     static void run_inter_score_(const LevelKernels& K, InterJobT<T>& job) {
-        if constexpr (std::is_same_v<T, double>) K.inter_score(job);
-        else                                     K.inter_score_f(job);
+        K.template of<T>().inter_score(job);
     }
     // Linear Global's own fill is cheap: the shared one loses below 4 lanes (DNA, W=2:
     // 0.76x on SSE2) and for alphabets over 8 (protein, the per-row gather: 1.10-1.22x
@@ -2006,7 +2023,7 @@ private:
     bool inter_eligible_(size_t i, const LevelKernels& K) const {
         if (len_a(i) == 0 || len_b(i) == 0) return false;
         if (!inter_pair_fits(len_a(i), len_b(i), GM == GapModel::Affine,
-                             grad_mode_ == GradMode::Soft, inter_w_(K), sizeof(T), K.inter_w))
+                             grad_mode_ == GradMode::Soft, inter_w_(K), sizeof(T), K.d.inter_w))
             return false;
         // Hirschberg pairs past the cutoff split: no shared fill.
         return !(is_hirschberg(tb_resolved_) && len_a(i) > static_cast<size_t>(s_.hb_cutoff));
@@ -2151,7 +2168,7 @@ private:
                     if (fin) {
                         // The soft pass is double, K.inter_w lanes: a float32 group runs
                         // it in W / SW chunks.
-                        const int SW = K.inter_w;
+                        const int SW = K.d.inter_w;
                         slogz.resize(W); scnt.resize(W * ccnt); sgap.resize(W * cgap); sok.assign(W, 0);
                         cM_.assign(static_cast<size_t>(W), 0);
                         if (want_post) sgp.assign(static_cast<size_t>(M + 1) * W, 0);
@@ -2182,7 +2199,7 @@ private:
                     SoftLane lane{};
                     const bool use = soft_group && sok[l];
                     if (use && tracked_) {
-                        const int SW = K.inter_w, c = static_cast<int>(l) / SW * SW, Mc = cM_[l];
+                        const int SW = K.d.inter_w, c = static_cast<int>(l) / SW * SW, Mc = cM_[l];
                         const size_t na = alpha_->size();
                         lane = {slogz[l],
                                 scnt.data() + static_cast<size_t>(c) * static_cast<size_t>(M) * na +
@@ -2196,7 +2213,7 @@ private:
                     } else if (use) {
                         lane = {slogz[l], scnt.data() + l * nnk, sgap.data() + l * 4};
                         if (want_post) {
-                            const int SW = K.inter_w, c = static_cast<int>(l) / SW * SW;
+                            const int SW = K.d.inter_w, c = static_cast<int>(l) / SW * SW;
                             lane.gpost = sgp.data() + static_cast<size_t>(c) * (M + 1) + (l - c);
                             lane.gstride = SW;
                         }

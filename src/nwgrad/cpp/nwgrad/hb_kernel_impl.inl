@@ -67,12 +67,12 @@ struct HbRows {
     // Row t's striped profile row (built here: a tracked block keeps no shared profile).
     const T* profile(T* dst, const T* blk, int nalpha, const unsigned char* b, int b_start,
                      int b_step, int NC, int seg, int W, int t) const {
-        const T ninf = nw_ninf<T>;
+        const T padv = nw_pad<T>;
         const T* row = blk + (std::size_t)tr.rs[res(t)] * nalpha;
         for (int l = 0; l < W; ++l)
             for (int s = 0; s < seg; ++s) {
                 const int c = l * seg + s + 1;
-                dst[(std::size_t)s * W + l] = (c <= NC) ? row[b[b_start + (c - 1) * b_step]] : ninf;
+                dst[(std::size_t)s * W + l] = (c <= NC) ? row[b[b_start + (c - 1) * b_step]] : padv;
             }
         return dst;
     }
@@ -129,7 +129,7 @@ static void hb_sweep_striped(HbJob<T>& job) {
         r0M[c] = NINF;
         r0X[c] = NINF;
         const T open = (std::max(r0M[c - 1], r0X[c - 1]) - go_a) - ge_a;
-        r0Y[c] = std::max(open, r0Y[c - 1] - ge_a);
+        r0Y[c] = std::max<T>(open, r0Y[c - 1] - ge_a);
     }
     if (H == 0) return;                 // nothing to sweep: row 0 IS the answer, in place
 
@@ -160,7 +160,7 @@ static void hb_sweep_striped(HbJob<T>& job) {
             for (int s = 0; s < seg; ++s) {
                 const int c = l * seg + s + 1;
                 dst[(std::size_t)s * W + l] =
-                    (c <= NC) ? row[b[job.b_start + (c - 1) * job.b_step]] : NINF;
+                    (c <= NC) ? row[b[job.b_start + (c - 1) * job.b_step]] : nw_pad<T>;
             }
     }
 
@@ -302,11 +302,9 @@ static void hb_sweep_striped(HbJob<T>& job) {
         }
 }
 
-static void hb_sweep_entry_d(HbJob<double>& j) {
-    if (j.tr.on()) hb_sweep_striped<double, true>(j); else hb_sweep_striped<double>(j);
-}
-static void hb_sweep_entry_f(HbJob<float>&  j) {
-    if (j.tr.on()) hb_sweep_striped<float, true>(j); else hb_sweep_striped<float>(j);
+template <class T>
+static void hb_sweep_entry(HbJob<T>& j) {
+    if (j.tr.on()) hb_sweep_striped<T, true>(j); else hb_sweep_striped<T>(j);
 }
 
 // ── OPT-IN SIBLING: the same sweep with a CLOSED-FORM prefix-max carry ────────────
@@ -381,7 +379,7 @@ static void hb_sweep_striped_pmax(HbJob<T>& job) {
         r0M[c] = NINF;
         r0X[c] = NINF;
         const T open = (std::max(r0M[c - 1], r0X[c - 1]) - go_a) - ge_a;
-        r0Y[c] = std::max(open, r0Y[c - 1] - ge_a);
+        r0Y[c] = std::max<T>(open, r0Y[c - 1] - ge_a);
     }
     if (H == 0) return;                 // nothing to sweep: row 0 IS the answer, in place
 
@@ -418,7 +416,7 @@ static void hb_sweep_striped_pmax(HbJob<T>& job) {
             for (int s = 0; s < seg; ++s) {
                 const int c = l * seg + s + 1;
                 dst[(std::size_t)s * W + l] =
-                    (c <= NC) ? row[b[job.b_start + (c - 1) * job.b_step]] : NINF;
+                    (c <= NC) ? row[b[job.b_start + (c - 1) * job.b_step]] : nw_pad<T>;
             }
     }
 
@@ -535,11 +533,9 @@ static void hb_sweep_striped_pmax(HbJob<T>& job) {
         }
 }
 
-static void hb_sweep_pmax_entry_d(HbJob<double>& j) {
-    if (j.tr.on()) hb_sweep_striped_pmax<double, true>(j); else hb_sweep_striped_pmax<double>(j);
-}
-static void hb_sweep_pmax_entry_f(HbJob<float>&  j) {
-    if (j.tr.on()) hb_sweep_striped_pmax<float, true>(j); else hb_sweep_striped_pmax<float>(j);
+template <class T>
+static void hb_sweep_pmax_entry(HbJob<T>& j) {
+    if (j.tr.on()) hb_sweep_striped_pmax<T, true>(j); else hb_sweep_striped_pmax<T>(j);
 }
 
 // ── Hirschberg LOCAL endpoint scan: striped affine sweep that reports its argmax ──
@@ -618,7 +614,7 @@ static void hb_scan_impl(HbScanJob<T>& job) {
             for (int s = 0; s < seg; ++s) {
                 const int c = l * seg + s + 1;
                 dst[(std::size_t)s * W + l] =
-                    (c <= NC) ? row[b[job.b_start + (c - 1) * job.b_step]] : NINF;
+                    (c <= NC) ? row[b[job.b_start + (c - 1) * job.b_step]] : nw_pad<T>;
             }
     }
 
@@ -645,7 +641,7 @@ static void hb_scan_impl(HbScanJob<T>& job) {
             const T pm = (c == 1) ? T(0) : NINF;
             const T px = NINF;
             const T open = (std::max(pm, px) - go_a) - ge_a;
-            prevY = std::max(open, prevY - ge_a);
+            prevY = std::max<T>(open, prevY - ge_a);
             const int cc = c;
             const std::size_t k = (std::size_t)((cc - 1) % seg) * W + (cc - 1) / seg;
             pM[k] = NINF; pX[k] = NINF; pY[k] = prevY;
@@ -663,6 +659,17 @@ static void hb_scan_impl(HbScanJob<T>& job) {
     vd vgo_a(go_a), vge_a(ge_a), vgo_b(go_b), vge_b(ge_b);
     const vd vzero(T(0));
     const vd vlane([](int q) { return T(q); });   // [0,1,...,W-1] for per-lane column ids
+    // Integer T: the padding columns hold ordinary values (nw_pad), so the argmax below
+    // masks them — added, 0 for a real column and the sentinel for padding (a real value
+    // plus the sentinel cannot wrap, and lands below every real value).
+    const T* padm = nullptr;
+    if constexpr (nw_is_int<T>) {
+        fit(buf.spad, sw);
+        for (int l = 0; l < W; ++l)
+            for (int s = 0; s < seg; ++s)
+                buf.spad[(std::size_t)s * W + l] = (l * seg + s + 1 <= NC) ? T(0) : NINF;
+        padm = buf.spad.data();
+    }
 
     T gbest = T(0); int gi = 0, gj = 0;
 
@@ -790,7 +797,8 @@ static void hb_scan_impl(HbScanJob<T>& job) {
             vd mm; mm.copy_from(cM + (std::size_t)s * W, stdx::element_aligned);
             vd xx; xx.copy_from(cX + (std::size_t)s * W, stdx::element_aligned);
             vd yy; yy.copy_from(cY + (std::size_t)s * W, stdx::element_aligned);
-            const vd here = stdx::max(stdx::max(mm, xx), yy);
+            vd here = stdx::max(stdx::max(mm, xx), yy);
+            if constexpr (nw_is_int<T>) { vd pv; pv.copy_from(padm + (std::size_t)s * W, stdx::element_aligned); here = here + pv; }
             const vd colv = vlane * T(seg) + T(s + 1);     // column l*seg + s + 1, per lane
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
             if constexpr (std::is_same_v<T, double>) {
@@ -830,8 +838,8 @@ static void hb_scan_dispatch(HbScanJob<T>& j) {
     if (j.tr.on()) hb_scan_dispatch_tr<T, true>(j);
     else           hb_scan_dispatch_tr<T, false>(j);
 }
-static void hb_scan_entry_d(HbScanJob<double>& j) { hb_scan_dispatch(j); }
-static void hb_scan_entry_f(HbScanJob<float>& j)  { hb_scan_dispatch(j); }
+template <class T>
+static void hb_scan_entry(HbScanJob<T>& j) { hb_scan_dispatch(j); }
 
 // ── Hirschberg base case: striped fill that RECORDS direction bytes ───────────
 //
@@ -889,7 +897,7 @@ static void hb_base_striped(HbBaseJob<T>& job) {
         for (int l = 0; l < W; ++l)
             for (int s = 0; s < seg; ++s) {
                 const int c = l * seg + s + 1;
-                dst[(std::size_t)s * W + l] = (c <= NC) ? row[b[job.b_start + (c - 1) * job.b_step]] : NINF;
+                dst[(std::size_t)s * W + l] = (c <= NC) ? row[b[job.b_start + (c - 1) * job.b_step]] : nw_pad<T>;
             }
     }
 
@@ -1117,9 +1125,7 @@ static void hb_base_striped(HbBaseJob<T>& job) {
     }
 }
 
-static void hb_base_entry_d(HbBaseJob<double>& j) {
-    if (j.tr.on()) hb_base_striped<double, true>(j); else hb_base_striped<double>(j);
-}
-static void hb_base_entry_f(HbBaseJob<float>&  j) {
-    if (j.tr.on()) hb_base_striped<float, true>(j); else hb_base_striped<float>(j);
+template <class T>
+static void hb_base_entry(HbBaseJob<T>& j) {
+    if (j.tr.on()) hb_base_striped<T, true>(j); else hb_base_striped<T>(j);
 }

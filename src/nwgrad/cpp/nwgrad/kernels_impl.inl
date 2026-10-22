@@ -127,11 +127,13 @@ static constexpr double K_NINF = -std::numeric_limits<double>::infinity();
 // (vpermpd + blend).  The intrinsic form gets gcc the same; at AVX-512 it is one valign
 // (gcc 0.84-0.98 on the striped arms, clang unchanged).  A pure lane move, so the result
 // is identical; SSE2/SSE4/NEON (W=2) keep the generator.
+// The integer types (int16/int32/int64) take the same treatment: gcc assembled the
+// generator form lane by lane (vpinsrw / vpinsrd / vpunpck sequences) at AVX2.
 template <class V>
 static inline V lane_shift_in(V x, typename V::value_type b) {
+    using T = typename V::value_type;
 #if defined(__AVX512F__)
     // One valignq / valignd: (x : splat(b)) shifted right by W-1 lanes is [b, x0..x_{W-2}].
-    using T = typename V::value_type;
     if constexpr (std::is_same_v<T, double> && V::size() == 8) {
         const __m512i r = _mm512_alignr_epi64(_mm512_castpd_si512(static_cast<__m512d>(x)),
                                               _mm512_castpd_si512(_mm512_set1_pd(b)), 7);
@@ -140,9 +142,27 @@ static inline V lane_shift_in(V x, typename V::value_type b) {
         const __m512i r = _mm512_alignr_epi32(_mm512_castps_si512(static_cast<__m512>(x)),
                                               _mm512_castps_si512(_mm512_set1_ps(b)), 15);
         return V(_mm512_castsi512_ps(r));
+    } else if constexpr (std::is_same_v<T, int64_t> && V::size() == 8) {
+        using NV = __v8di;
+        const __m512i r = _mm512_alignr_epi64((__m512i)static_cast<NV>(x), _mm512_set1_epi64(b), 7);
+        return V((NV)r);
+    } else if constexpr (std::is_same_v<T, int32_t> && V::size() == 16) {
+        using NV = __v16si;
+        const __m512i r = _mm512_alignr_epi32((__m512i)static_cast<NV>(x), _mm512_set1_epi32(b), 15);
+        return V((NV)r);
+    } else if constexpr (std::is_same_v<T, int16_t> && V::size() == 32) {
+#if defined(__AVX512BW__)
+        using NV = __v32hi;
+        const __m512i idx = _mm512_set_epi16(30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15,
+                                             14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 0);
+        __m512i r = _mm512_permutexvar_epi16(idx, (__m512i)static_cast<NV>(x));
+        r = _mm512_mask_blend_epi16(__mmask32(1), r, _mm512_set1_epi16(b));
+        return V((NV)r);
+#else
+        return V([&](int q) { return q == 0 ? b : x[q - 1]; });
+#endif
     } else
 #elif defined(__AVX2__)
-    using T = typename V::value_type;
     if constexpr (std::is_same_v<T, double> && V::size() == 4) {
         const __m256d r = _mm256_permute4x64_pd(static_cast<__m256d>(x), 0x90);
         return V(_mm256_blend_pd(r, _mm256_set1_pd(b), 1));
@@ -150,21 +170,38 @@ static inline V lane_shift_in(V x, typename V::value_type b) {
         const __m256 r = _mm256_permutevar8x32_ps(static_cast<__m256>(x),
                                                   _mm256_setr_epi32(0, 0, 1, 2, 3, 4, 5, 6));
         return V(_mm256_blend_ps(r, _mm256_set1_ps(b), 1));
+    } else if constexpr (std::is_same_v<T, int64_t> && V::size() == 4) {
+        using NV = __v4di;
+        const __m256i r = _mm256_permute4x64_epi64((__m256i)static_cast<NV>(x), 0x90);
+        return V((NV)_mm256_blend_epi32(r, _mm256_set1_epi64x(b), 0x3));
+    } else if constexpr (std::is_same_v<T, int32_t> && V::size() == 8) {
+        using NV = __v8si;
+        const __m256i r = _mm256_permutevar8x32_epi32((__m256i)static_cast<NV>(x),
+                                                      _mm256_setr_epi32(0, 0, 1, 2, 3, 4, 5, 6));
+        return V((NV)_mm256_blend_epi32(r, _mm256_set1_epi32(b), 1));
+    } else if constexpr (std::is_same_v<T, int16_t> && V::size() == 16) {
+        // A 2-byte shift across the whole register: alignr works within 128-bit halves,
+        // so feed it the low half moved up (and zero below), then insert the border.
+        using NV = __v16hi;
+        const __m256i xi = (__m256i)static_cast<NV>(x);
+        const __m256i t = _mm256_permute2x128_si256(xi, xi, 0x08);   // [0 | x.low]
+        const __m256i r = _mm256_alignr_epi8(xi, t, 14);
+        return V((NV)_mm256_insert_epi16(r, b, 0));
     } else
 #endif
     return V([&](int q) { return q == 0 ? b : x[q - 1]; });
 }
 
 // ── Tracked rows: the striped query profile ───────────────────────────────────
-// One striped profile row: prof[s*W + l] = row[b[col(l,s)-1]], padding -> -inf.
+// One striped profile row: prof[s*W + l] = row[b[col(l,s)-1]], padding -> nw_pad.
 template <class T>
 static inline void striped_profile_row(T* dst, const T* row, const unsigned char* b,
                                        int n, int seg, int W) {
-    const T ninf = nw_ninf<T>;
+    const T padv = nw_pad<T>;   // -inf, or 0 for an integer T (scalar_traits.hpp)
     for (int l = 0; l < W; ++l)
         for (int s = 0; s < seg; ++s) {
             const int j = l * seg + s + 1;
-            dst[(std::size_t)s * W + l] = (j <= n) ? row[b[j - 1]] : ninf;
+            dst[(std::size_t)s * W + l] = (j <= n) ? row[b[j - 1]] : padv;
         }
 }
 // The profile rows a striped fill reads (see TrackJob): Tr with tr.ra builds one per

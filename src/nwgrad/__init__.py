@@ -30,6 +30,21 @@ from .nwgrad_ext import (
     nw_soft_grad_double, sw_soft_grad_double,
     nw_affine_soft_grad_double, sw_affine_soft_grad_double,
     SeqPairDouble, SeqPairBatchDouble,
+    # integer scalar types (explicit): integral parameters only, no soft path.  Every
+    # hard-path result equals the double one on the same parameters, bit for bit; the
+    # prefix-max Hirschberg carry is exact in integers, so it is their affine default.
+    # int16 refuses problems whose a-priori bound (m + n + 66) * max_step exceeds 8191,
+    # int32 2^30 - 1, int64 2^62 - 1 (OverflowError); a non-integral parameter raises
+    # ValueError.
+    nw_score_int16, sw_score_int16, nw_score_affine_int16, sw_score_affine_int16,
+    nw_grad_int16, sw_grad_int16, nw_affine_grad_int16, sw_affine_grad_int16,
+    nw_score_int32, sw_score_int32, nw_score_affine_int32, sw_score_affine_int32,
+    nw_grad_int32, sw_grad_int32, nw_affine_grad_int32, sw_affine_grad_int32,
+    nw_score_int64, sw_score_int64, nw_score_affine_int64, sw_score_affine_int64,
+    nw_grad_int64, sw_grad_int64, nw_affine_grad_int64, sw_affine_grad_int64,
+    SeqPairInt16, SeqPairBatchInt16,
+    SeqPairInt32, SeqPairBatchInt32,
+    SeqPairInt64, SeqPairBatchInt64,
 )
 from . import matrices
 

@@ -853,6 +853,73 @@ listed here was the boundary-state bug fixed above.)
   integral fixture), real alignment, `g·params == score`; a mutation forcing the middle
   split fails 10 of them.
 
+### Integer scalar types: int16 / int32 / int64 (branch `integer`, 2026-10-22)
+
+`Aligner<GM, AM, AB, T>` takes `T` = `int16_t`, `int32_t` or `int64_t` beside `double` and
+`float`, through every hard-path variant: linear and affine, Global and Local, Full and
+GuideBanded, Pointers / Scores / Hirschberg / `hirschberg_pmax`, score-only, the inter-pair
+fills and scores, tracks, streaming `align()`. Every leveled kernel is instantiated per type
+(the dispatch table is one `TypedKernels<T>` per type, `LevelKernels::of<T>()`, registered by
+`register_level_typed<T>` with bare pointers in baseline code, as before). Python:
+`SeqPairInt16/32/64`, `SeqPairBatchInt16/32/64`, `*_int16/_int32/_int64` functions (the `Double`
+convention). The decisions (2026-10-22): all three widths; every variant; the soft path
+THROWS on an integer type (it is a computation in exp/log space; the integer classes bind no
+soft function and `grad_mode="soft"` raises `ValueError`); integral parameters ONLY (a
+non-integral one raises `ValueError` — the user quantizes; a silent 0.5 -> 0 was the
+alternative); gradients stay double `AlignParams` of counts; `auto` resolves affine Full to
+`hirschberg_pmax` at every integer type, both modes.
+
+**The one contract: bit-identity with double.** Double arithmetic on integral parameters is
+exact below 2^53, so the double aligner is not a reference within a tolerance but the ground
+truth: every integer result — score, alignment, guide, hard gradient, weighted sum, banded
+step, streaming result, score-only — equals double's bit for bit, ties included, on every
+backend. Integer arithmetic is exact and associative, so everything the floating kernels
+guard (left association, no FMA, the pmax ramp's rounding) is moot: `hirschberg_pmax` is
+bit-identical to the exact sweep for an integer `T`, which is why it is their default and why
+its liveness test (pmax must differ from exact) is a floating-point statement only.
+`tests/cpp/test_integer.cpp` (`[integer][simd]`, so once per ISA level): 1500 random
+configurations per type against the double oracle; `tests/Python/test_integer.py`: the
+batch surface (every fill, traceback, tracks and both stores, banded, streaming, score-only,
+every ISA level), the guards, the absent soft path.
+
+**The sentinel and the overflow bound** (`scalar_traits.hpp`). An integer `T` has no `-inf`:
+the unreachable value is `nw_ninf<T> = lowest()/2`, and `set_problem()` refuses (an
+`OverflowError` in Python) any problem whose a-priori bound `(m + n + 2 + 64) * step_max`
+exceeds `nw_int_cap<T> = |lowest|/4 - 1`, `step_max` being the largest magnitude one move can
+add (max |s| over the matrix stack, |go| + |ge| per side). A QUARTER of the range, not a
+half: every value the DP can form is then within the cap of either zero (a reachable score:
+at most m+n+2 moves) or the sentinel (an unreachable value drifts by at most as many
+penalties), so nothing wraps, an unreachable value never outruns a reachable one, and two
+in-range values can be ADDED (the pmax ramp `g[k] + k*ge_a`, a Hirschberg join's forward +
+reverse) without wrapping. The 64 is the striped kernels' padding (`nw_int_pad_cols`).
+Reach: int16 (cap 8191) takes BLOSUM62 (step 11) pairs up to ~370 aa each and any miRNA /
+DNA fixture; int32 (2^30 - 1) everything realistic; int64 is headroom for huge parameters.
+A batch prepares each params once (`nw_int_prepare`: checked casts of the whole stack and
+every set's gaps, step_max) and hands them to every pair's `set_problem()`, so a bad
+parameter raises at construction / `set_params()` and no pair repeats the checks; the
+streaming `align()` prepares per worker (`cast_block_`) and otherwise per pair.
+
+**Padding columns score 0, not the sentinel** (`nw_pad<T>`). Found by the first oracle run: the
+Local Hirschberg reverse scan returned a start column left of 0 at `int16`. The striped
+kernels pad the query profile's spare columns with `-inf`; for an integer `T` a padding cell
+then computed as sentinel + sentinel and the next row's penalty subtraction wrapped to a
+huge positive value, which the scan's unmasked argmax picked. So an integer `T` pads with 0 —
+the padding is an imaginary tail of B that scores 0, every padding value an ordinary in-range
+DP value — and every argmax that can read a padding cell masks it additively (the Local row
+best already did; the score kernels' M-only form and the endpoint scan now do for an integer
+`T`; a real value plus the sentinel cannot wrap and lands below every real one). Padding
+never feeds a real cell: it lies right of every real column and the DP flows right and down.
+
+**Codegen.** gcc emits `vpmaxsw` / `vpmaxsd` for the integer maxima (`vpmaxsq` at AVX-512; at
+AVX2 int64 is `vpcmpgtq` + `vpblendvb`), but assembled the segment-boundary lane shift of
+integer lanes element by element (`vpinsrw` / `vpinsrd` sequences), the trap documented for
+double; `lane_shift_in` has intrinsic forms for the three integer widths at AVX2
+(`vpermd` / `vpermq` + `vpblendd`, `vperm2i128` + `vpalignr` + `vpinsrw` for int16) and
+AVX-512 (`valignd` / `valignq`, `vpermw` + a masked blend for int16). The inter-pair kernels
+use the GCC vector types per width (`IVT<T>`: int16 has 4x double's lanes).
+
+**Measured.** (to be filled: `tools/bench_int.py`, nighthaven / skynet / spot / solace.)
+
 ### The soft path: scaled probability space (2026-10-05)
 
 **The soft path is NOT bit-exact** — across `soft_impl`, ISA levels, compilers, `fill`,

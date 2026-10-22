@@ -25,6 +25,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 template <class T> struct DpBufferT;   // defined in dp_buffer.hpp; referenced by pointer
@@ -164,7 +165,7 @@ struct TrackJob {
 // Everything a forward pass needs, and everything it produces — no std::simd, no
 // Aligner: the only currency that crosses a level boundary.  Templated on the Viterbi
 // precision T (double or float32): the substitution block, gap penalties and DP buffer
-// are all T; the reported score stays double (a T score promotes to double exactly).
+// are all T, the reported score too.
 template <class T>
 struct ViterbiJob {
     // problem (sequences already encoded to alphabet indices)
@@ -181,16 +182,13 @@ struct ViterbiJob {
     DpBufferT<T>* buf;
 
     // results
-    double  score;                          // reported as double regardless of T
+    T       score;                          // in T (the aligner promotes it)
     int     best_i, best_j, best_tbl;       // best_tbl: 0=M 1=X 2=Y
     int     table_layout;                   // 0 = row-major VM/VX/VY, 1 = striped
     int     seg, width;                     // striping geometry (set when layout==1)
     TrackJob<T> tr;                         // tracked rows (tr.on()), else untracked
 };
 
-// One striped-Full entry per precision.  Both are registered by each level TU.
-using viterbi_fn   = void (*)(ViterbiJob<double>&);
-using viterbi_fn_f = void (*)(ViterbiJob<float>&);
 
 // ── Score only: the optimal alignment score, no table, no traceback ───────────
 //
@@ -209,11 +207,9 @@ struct ScoreJob {
     int local;                              // 0 = Global, 1 = Local
     int variant;                            // 0 auto, 1 two-pass, 2 fused three-state (measuring)
     DpBufferT<T>* buf;
-    double score;                           // out
+    T score;                                // out
     TrackJob<T> tr;                         // tracked rows (tr.on()), else untracked
 };
-using score_fn   = void (*)(ScoreJob<double>&);
-using score_fn_f = void (*)(ScoreJob<float>&);
 
 // ── Hirschberg linear-space sweep ─────────────────────────────────────────────
 //
@@ -242,8 +238,6 @@ struct HbJob {
     TrackJob<T> tr;                         // tracked rows (tr.on()), else untracked
 };
 
-using hb_fn   = void (*)(HbJob<double>&);
-using hb_fn_f = void (*)(HbJob<float>&);
 
 // ── Hirschberg LOCAL endpoint scan: a striped affine sweep that reports its argmax ─
 //
@@ -279,8 +273,6 @@ struct HbScanJob {
     TrackJob<T> tr;                         // tracked rows (tr.on()), else untracked
 };
 
-using hbscan_fn   = void (*)(HbScanJob<double>&);
-using hbscan_fn_f = void (*)(HbScanJob<float>&);
 
 // ── Hirschberg base case: striped fill that RECORDS direction bytes ───────────
 //
@@ -309,8 +301,6 @@ struct HbBaseJob {
     TrackJob<T> tr;                         // tracked rows (tr.on()), else untracked
 };
 
-using hbbase_fn   = void (*)(HbBaseJob<double>&);
-using hbbase_fn_f = void (*)(HbBaseJob<float>&);
 
 // Inter-pair affine Full fill, double: W pairs at once, one per vector lane (W = the
 // level's native double count, reported in LevelKernels::inter_w).  All W pairs share
@@ -358,8 +348,6 @@ struct InterJobT {
     const TrackJob<T>* tr = nullptr;
 };
 using InterJob = InterJobT<double>;
-using inter_fn   = void (*)(InterJobT<double>&);
-using inter_fn_f = void (*)(InterJobT<float>&);
 
 // Inter-pair SOFT pass (scaled forward-backward with the gradient fused), double: the
 // same W-lane grouping as InterJob, Full band, affine or linear gaps, nalpha <= 8.  Per lane it is
@@ -468,44 +456,64 @@ inline size_t inter_soft_scratch(int n, int M, int W) {
 // level's real -march.  Plain-typed, so it obeys the ODR rule (no std::simd crosses the
 // boundary).  Returns max3 for the Local entry; Global's return is ignored.  Bodies in
 // row_kernel_impl.inl.
-using banded_row_fn = double (*)(double* __restrict, double* __restrict, double* __restrict,
-                                 const double* __restrict, const double* __restrict,
-                                 const double* __restrict, const double* __restrict,
-                                 int, int, int, double, double, double, double);
+template <class T>
+using banded_row_fn_t = T (*)(T* __restrict, T* __restrict, T* __restrict,
+                              const T* __restrict, const T* __restrict,
+                              const T* __restrict, const T* __restrict,
+                              int, int, int, T, T, T, T);
+
+// ── The kernels of one scalar type T (double, float, int16_t, int32_t, int64_t) ──
+//
+// Every hard-path kernel is instantiated per T by each level TU and registered in the
+// level's TypedKernels<T> (LevelKernels::of<T>()).  A null entry means the level has no
+// kernel of that kind for that T, and the aligner runs its scalar fill instead — which
+// is what a header-only build (no level TU linked) sees for every entry.
+template <class T>
+struct TypedKernels {
+    using viterbi_fn = void (*)(ViterbiJob<T>&);
+    using hb_fn      = void (*)(HbJob<T>&);
+    using hbbase_fn  = void (*)(HbBaseJob<T>&);
+    using hbscan_fn  = void (*)(HbScanJob<T>&);
+    using score_fn   = void (*)(ScoreJob<T>&);
+    using inter_fn   = void (*)(InterJobT<T>&);
+    viterbi_fn         viterbi = nullptr;            // striped affine Full (Global + Local)
+    viterbi_fn         viterbi_ptr = nullptr;        // TracebackMode::Pointers
+    banded_row_fn_t<T> banded_row_global = nullptr;  // row-wise banded whole-row kernels
+    banded_row_fn_t<T> banded_row_local = nullptr;
+    hb_fn              hb_sweep = nullptr;           // Hirschberg linear-space sweep
+    // The prefix-max sibling of the sweep (TracebackMode::HirschbergPmax): same job, same
+    // output, a closed-form VY carry instead of the serial chain + lazy-F.  Bit-identical
+    // to hb_sweep only for an integer T; its own slot, never overwriting the sweep's.
+    hb_fn              hb_sweep_pmax = nullptr;
+    hbbase_fn          hb_base = nullptr;            // Hirschberg base case (records directions)
+    hbscan_fn          hb_scan = nullptr;            // Hirschberg local endpoint scan
+    score_fn           score = nullptr;              // score only (rolling rows)
+    inter_fn           inter_fill = nullptr;         // inter-pair Full fill, W pairs per call
+    inter_fn           inter_score = nullptr;        // inter-pair score only (Full)
+    int                inter_w = 0;                  // the inter-pair lane count (pairs per call)
+};
 
 struct LevelKernels {
-    viterbi_fn    viterbi = nullptr;            // striped affine Full, double (Global + Local)
-    viterbi_fn_f  viterbi_f = nullptr;          // striped affine Full, float32
-    viterbi_fn    viterbi_ptr = nullptr;          // TracebackMode::Pointers, double
-    viterbi_fn_f  viterbi_ptr_f = nullptr;        // TracebackMode::Pointers, float32
-    banded_row_fn banded_row_global = nullptr;  // row-wise banded whole-row kernels ↓ (double)
-    banded_row_fn banded_row_local  = nullptr;
-    hb_fn         hb_sweep = nullptr;           // Hirschberg linear-space sweep, double
-    hb_fn_f       hb_sweep_f = nullptr;         // ditto, float32
-    // The opt-in prefix-max sibling of the sweep (TracebackMode::HirschbergPmax): same
-    // job, same output, a closed-form VY carry instead of the serial chain + lazy-F.
-    // NOT interchangeable with the pair above — it is bit-identical only within its own
-    // family — so it gets its own slots rather than overwriting theirs.
-    hb_fn         hb_sweep_pmax = nullptr;      // prefix-max carry sweep, double
-    hb_fn_f       hb_sweep_pmax_f = nullptr;    // ditto, float32
-    hbbase_fn     hb_base = nullptr;            // Hirschberg base case (records directions), double
-    hbbase_fn_f   hb_base_f = nullptr;         // ditto, float32
-    hbscan_fn     hb_scan = nullptr;            // Hirschberg local endpoint scan, double
-    hbscan_fn_f   hb_scan_f = nullptr;          // ditto, float32
+    TypedKernels<double>  d;
+    TypedKernels<float>   f;
+    TypedKernels<int16_t> i16;
+    TypedKernels<int32_t> i32;
+    TypedKernels<int64_t> i64;
     int           row_block = 0;                // columns per interleaved block (per-µarch)
-    inter_fn      inter_fill = nullptr;         // inter-pair affine Full fill, double
-    int           inter_w = 0;                  // its lane count (pairs per call)
-    inter_fn_f    inter_fill_f = nullptr;       // ditto, float32
-    int           inter_w_f = 0;                // its lane count (2 * inter_w)
-    inter_soft_fn inter_soft = nullptr;         // inter-pair soft pass, double (same W)
+    inter_soft_fn inter_soft = nullptr;         // inter-pair soft pass, double (W = d.inter_w)
     soft_pair_fn  soft_pair_linear = nullptr;   // per-pair scaled forward-backward ↓
     soft_pair_fn  soft_pair_affine = nullptr;
-    score_fn      score = nullptr;              // score only (rolling rows), double
-    score_fn_f    score_f = nullptr;            // ditto, float32
-    // Inter-pair score only (Full): InterJobT with ONE-row VM/VX/VY ((n+1)*W each), the
-    // lanes' scores out in best[] (Global and Local).  Same lane counts as inter_fill.
-    inter_fn      inter_score = nullptr;
-    inter_fn_f    inter_score_f = nullptr;
+    // The kernels of scalar type T.
+    template <class T> const TypedKernels<T>& of() const noexcept {
+        if constexpr (std::is_same_v<T, double>)        return d;
+        else if constexpr (std::is_same_v<T, float>)    return f;
+        else if constexpr (std::is_same_v<T, int16_t>)  return i16;
+        else if constexpr (std::is_same_v<T, int32_t>)  return i32;
+        else { static_assert(std::is_same_v<T, int64_t>, "unsupported scalar type"); return i64; }
+    }
+    template <class T> TypedKernels<T>& of() noexcept {
+        return const_cast<TypedKernels<T>&>(static_cast<const LevelKernels*>(this)->of<T>());
+    }
 };
 
 // One slot per possible level; index by (int)SimdLevel.  Populated by the level TUs'
@@ -516,18 +524,18 @@ inline LevelKernels* level_table() {
 }
 
 // Register a level's kernels.  Deliberately takes the pointers *individually*, not a
-// LevelKernels by value, and is defined out-of-line in simd_levels.cpp — which is
-// compiled at the x86-64 baseline.  Both facts are load-bearing: the level TUs are
-// compiled with -mavx512 etc. and their registrars run at static init on EVERY CPU,
-// so any code they emit must be baseline-legal.  If they built a LevelKernels locally,
-// GCC would zero-init its 56 bytes with an AVX512 GPR-broadcast (vpbroadcastd) and the
-// program would SIGILL at load on a non-AVX512 box.  Passing bare pointers keeps the
-// registrar to scalar `lea`s; the struct is assembled and stored here, in baseline code.
-// The score-only kernels, registered separately (same baseline-code rule) right after
-// register_level by the same registrar, so they cannot be overwritten by it.
+// TypedKernels / LevelKernels by value, and is defined out-of-line in simd_levels.cpp —
+// which is compiled at the x86-64 baseline.  Both facts are load-bearing: the level TUs
+// are compiled with -mavx512 etc. and their registrars run at static init on EVERY CPU,
+// so any code they emit must be baseline-legal.  If they built a struct locally, GCC
+// would zero-init it with an AVX512 GPR-broadcast (vpbroadcastd) and the program would
+// SIGILL at load on a non-AVX512 box.  Passing bare pointers keeps the registrar to
+// scalar `lea`s; the struct is assembled and stored here, in baseline code.  One typed
+// call per scalar type (register_level_typed<T>, explicitly instantiated for the five)
+// and one for the type-free entries (register_level_common).
 // Out-of-line is not enough under LTO: the link-time inliner may put a baseline callee
 // into an AVX-512 caller (a callee with fewer target features is inlinable), and gcc
-// -flto did exactly that, SIGILLing at load (vinserti64x2) on an AVX2 CPU.  So the two
+// -flto did exactly that, SIGILLing at load (vinserti64x2) on an AVX2 CPU.  So the
 // registrars are never inlined or IPA-specialized into their callers.
 #if defined(__GNUC__) && !defined(__clang__)
 #define NWGRAD_BASELINE_ONLY __attribute__((noipa))
@@ -536,22 +544,23 @@ inline LevelKernels* level_table() {
 #else
 #define NWGRAD_BASELINE_ONLY
 #endif
+template <class T>
 NWGRAD_BASELINE_ONLY
-void register_level_score(SimdLevel l, score_fn score, score_fn_f score_f,
-                          inter_fn inter_score, inter_fn_f inter_score_f);
+void register_level_typed(SimdLevel l,
+                          typename TypedKernels<T>::viterbi_fn viterbi,
+                          typename TypedKernels<T>::viterbi_fn viterbi_ptr,
+                          banded_row_fn_t<T> banded_row_global, banded_row_fn_t<T> banded_row_local,
+                          typename TypedKernels<T>::hb_fn hb_sweep,
+                          typename TypedKernels<T>::hb_fn hb_sweep_pmax,
+                          typename TypedKernels<T>::hbbase_fn hb_base,
+                          typename TypedKernels<T>::hbscan_fn hb_scan,
+                          typename TypedKernels<T>::score_fn score,
+                          typename TypedKernels<T>::inter_fn inter_fill,
+                          typename TypedKernels<T>::inter_fn inter_score, int inter_w);
 
 NWGRAD_BASELINE_ONLY
-void register_level(SimdLevel l, viterbi_fn viterbi, viterbi_fn_f viterbi_f,
-                    viterbi_fn viterbi_ptr, viterbi_fn_f viterbi_ptr_f,
-                    banded_row_fn banded_row_global, banded_row_fn banded_row_local,
-                    hb_fn hb_sweep, hb_fn_f hb_sweep_f,
-                    hb_fn hb_sweep_pmax, hb_fn_f hb_sweep_pmax_f,
-                    hbbase_fn hb_base, hbbase_fn_f hb_base_f,
-                    hbscan_fn hb_scan, hbscan_fn_f hb_scan_f,
-                    int row_block, inter_fn inter_fill, int inter_w,
-                    inter_fn_f inter_fill_f, int inter_w_f,
-                    inter_soft_fn inter_soft,
-                    soft_pair_fn soft_pair_linear, soft_pair_fn soft_pair_affine);
+void register_level_common(SimdLevel l, int row_block, inter_soft_fn inter_soft,
+                           soft_pair_fn soft_pair_linear, soft_pair_fn soft_pair_affine);
 
 // ── The global default backend ────────────────────────────────────────────────
 //

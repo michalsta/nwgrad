@@ -49,9 +49,9 @@ static void score_affine_striped(ScoreJob<T>& job) {
     if (n == 0) {
         // No columns: Global ends in one gap run down column 0 (or is empty); Local is 0.
         // The fill's (m, 0) cell: VM = -inf (0 at m == 0), VX = -(go_b + m*ge_b), VY = -inf.
-        if constexpr (Local) job.score = 0.0;
-        else if constexpr (Tr) job.score = (m == 0) ? 0.0 : static_cast<double>(tr.bx0[m]);
-        else job.score = (m == 0) ? 0.0 : static_cast<double>(-(go_b + static_cast<T>(m) * ge_b));
+        if constexpr (Local) job.score = T(0);
+        else if constexpr (Tr) job.score = (m == 0) ? T(0) : tr.bx0[m];
+        else job.score = (m == 0) ? T(0) : static_cast<T>(-(go_b + static_cast<T>(m) * ge_b));
         return;
     }
 
@@ -240,11 +240,11 @@ static void score_affine_striped(ScoreJob<T>& job) {
     if constexpr (Local) {
         T best = 0;
         for (int q = 0; q < W; ++q) best = std::max(best, static_cast<T>(vbest[q]));
-        job.score = static_cast<double>(best);
+        job.score = best;
     } else {
         // (m, n) in the last row computed (row 0 when m == 0), striped
         const std::size_t k = (std::size_t)((n - 1) % seg) * W + (std::size_t)((n - 1) / seg);
-        job.score = static_cast<double>(std::max({pM[k], pX[k], pY[k]}));
+        job.score = std::max({pM[k], pX[k], pY[k]});
     }
 }
 
@@ -275,9 +275,9 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
     DpBufferT<T>& buf = *job.buf;
 
     if (n == 0) {
-        if constexpr (Local) job.score = 0.0;
-        else if constexpr (Tr) job.score = (m == 0) ? 0.0 : static_cast<double>(tr.bx0[m]);
-        else job.score = (m == 0) ? 0.0 : static_cast<double>(-(go_b + static_cast<T>(m) * ge_b));
+        if constexpr (Local) job.score = T(0);
+        else if constexpr (Tr) job.score = (m == 0) ? T(0) : tr.bx0[m];
+        else job.score = (m == 0) ? T(0) : static_cast<T>(-(go_b + static_cast<T>(m) * ge_b));
         return;
     }
 
@@ -286,7 +286,10 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
     for (auto* v : {&buf.rM, &buf.rX, &buf.rY, &buf.qM, &buf.qX})
         if (v->size() < sw) v->resize(sw);
     const T* pad = nullptr;
-    if constexpr (Local && !MOnly) {
+    // (MOnly's M padding is clamped to exactly 0 for floating T — the padding profile is
+    // -inf — but an integer T pads the profile with 0 (nw_pad), so its padding M is a
+    // real value and needs the mask too.)
+    if constexpr (Local && (!MOnly || nw_is_int<T>)) {
         if (buf.spad.size() < sw) buf.spad.resize(sw);
         for (int l = 0; l < W; ++l)
             for (int s = 0; s < seg; ++s)
@@ -366,8 +369,9 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
             vyv.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
             dn.copy_to(cD + (std::size_t)s * W, stdx::element_aligned);
             if constexpr (Local) {
-                if constexpr (MOnly) vbest = stdx::max(vbest, vmv);
-                else                 vbest = stdx::max(vbest, padded(dn, s));
+                if constexpr (MOnly && !nw_is_int<T>) vbest = stdx::max(vbest, vmv);
+                else if constexpr (MOnly)             vbest = stdx::max(vbest, padded(vmv, s));
+                else                                  vbest = stdx::max(vbest, padded(dn, s));
             }
             Oin = (mx - vgo_a) - vge_a;
             Yin = vyv;
@@ -405,10 +409,10 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
     if constexpr (Local) {
         T best = 0;
         for (int q = 0; q < W; ++q) best = std::max(best, static_cast<T>(vbest[q]));
-        job.score = static_cast<double>(best);
+        job.score = best;
     } else {
         const std::size_t k = (std::size_t)((n - 1) % seg) * W + (std::size_t)((n - 1) / seg);
-        job.score = static_cast<double>(pD[k]);
+        job.score = pD[k];
     }
 }
 

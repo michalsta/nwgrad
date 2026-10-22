@@ -99,6 +99,18 @@ no-SMT hosts) it cannot do harm.
 Until then, callers with short pairs should pass an explicit `n_threads`.
 DiscrimAlign does: it passes the logical core count.
 
+## Integer scalar types: what is left (branch `integer`, 2026-10-22)
+
+- The streaming `align()` validates integer params per pair (the aligner's `nw_int_prepare`
+  on the caller's params, O(K * nalpha^2) a pair); prepare once per call as the batch does.
+- `score()` / `scores()` stay double: exact below 2^53, so an int64 score above that
+  (parameters ~2^40) loses bits in the report.
+- int16 with saturating arithmetic would remove the (m + n + 66) * step bound (the sentinel
+  then self-preserving under `psubsw`); std::simd has no saturating ops, so intrinsics per
+  level. Not started; measure int16 first.
+- The clang + AVX-512 `std::simd` mask workaround (`avx512d_*`) covers double only; int64
+  lanes may hit the same libstdc++ assertion under clang. Unverified (solace off).
+
 ## Per-pair gradients stored contiguously (weighted_grad, grads)
 
 `weighted_grad()` and `grads()` read every pair's cached gradient from its own

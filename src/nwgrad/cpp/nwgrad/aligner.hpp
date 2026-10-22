@@ -165,6 +165,58 @@ static inline double lse3(double a, double b, double c) noexcept {
 // Runtime per-ISA-level dispatch table for the leveled affine kernels.
 #include "simd_levels.hpp"
 
+// ── Integer scalar types: checked parameter casts and the largest step ──────────
+//
+// An integer T takes integral parameters only (the user quantizes; a silent truncation
+// of 0.5 to 0 would be the alternative), each within +-nw_int_cap, and every problem's
+// a-priori bound (m + n + 2 + 64) * step_max must fit the cap (scalar_traits.hpp);
+// step_max is the largest magnitude one move can add — max |s| over the matrix stack,
+// |go| + |ge| per side over the sets.  nw_int_prepare casts K sets of `p` (the whole
+// stack, K*4 gaps) with those checks and reports step_max; a batch runs it once per
+// params and hands the results to every pair's set_problem(), a standalone aligner
+// runs it per problem.
+template <class T>
+T nw_int_checked(double x, const char* what) {
+    static_assert(nw_is_int<T>);
+    if (!(x == std::nearbyint(x)) || !(std::fabs(x) <= static_cast<double>(nw_int_cap<T>)))
+        throw std::invalid_argument(
+            "nwgrad: " + std::string(what) + " " + std::to_string(x) + " is not an integer within +-" +
+            std::to_string(static_cast<long long>(nw_int_cap<T>)) + " (the " + nw_type_name<T>() +
+            " scalar type takes integral parameters only; quantize them first)");
+    return static_cast<T>(x);
+}
+template <class T>
+void nw_int_prepare(const AlignParams& p, int K, std::vector<T>& stack, std::vector<T>& gaps,
+                    T& step_max) {
+    static_assert(nw_is_int<T>);
+    auto abs_t = [](T v) noexcept { return v < T(0) ? static_cast<T>(-v) : v; };
+    const std::size_t nn = static_cast<std::size_t>(p.matrix.size()) * p.matrix.size() *
+                           static_cast<std::size_t>(K);
+    stack.resize(nn);
+    T smax = T(0);
+    const double* src = p.matrix.data();
+    for (std::size_t k = 0; k < nn; ++k) {
+        const T v = nw_int_checked<T>(src[k], "substitution score");
+        stack[k] = v;
+        smax = std::max(smax, abs_t(v));
+    }
+    gaps.resize(4 * static_cast<std::size_t>(K));
+    const long long cap = static_cast<long long>(nw_int_cap<T>);
+    for (int k = 0; k < K; ++k) {
+        T* g = gaps.data() + 4 * static_cast<std::size_t>(k);
+        g[AlignParams::kOpenA]   = nw_int_checked<T>(p.gap(k, AlignParams::kOpenA), "gap_open_a");
+        g[AlignParams::kExtendA] = nw_int_checked<T>(p.gap(k, AlignParams::kExtendA), "gap_extend_a");
+        g[AlignParams::kOpenB]   = nw_int_checked<T>(p.gap(k, AlignParams::kOpenB), "gap_open_b");
+        g[AlignParams::kExtendB] = nw_int_checked<T>(p.gap(k, AlignParams::kExtendB), "gap_extend_b");
+        // |go| + |ge| <= 2 * cap fits a long long; clamped to the cap (the bound check
+        // then refuses all but the smallest problems).
+        const long long sa = static_cast<long long>(abs_t(g[0])) + abs_t(g[1]);
+        const long long sb = static_cast<long long>(abs_t(g[2])) + abs_t(g[3]);
+        smax = std::max(smax, static_cast<T>(std::min(cap, std::max(sa, sb))));
+    }
+    step_max = smax;
+}
+
 // The per-pair scaled soft kernels at the baseline ISA (scalar_fallback, header-only
 // builds, levels without their own copy).  The level TUs compile the same file again
 // with their -march; see soft_kernel_impl.inl.
@@ -293,16 +345,18 @@ struct Aligner {
                      const AlignParams& params,
                      int band = 0,
                      std::vector<int> guide_j = {}) {
-        problem_common_(a, b, params, band, std::move(guide_j), params.num_sets() > 1, nullptr);
+        problem_common_(a, b, params, band, std::move(guide_j), params.num_sets() > 1, nullptr, T(-1));
         if (tr_) setup_tracks_({}, {}, nullptr);
         problem_set_      = true;
     }
+    // `step_max` (integer T, with blkT and gapsT): the params' largest step, prepared by the
+    // batch with the casts; T(-1) = compute it here (floating T: ignored).
     void set_problem(std::span<const uint8_t> a, std::span<const uint8_t> b,
                      const AlignParams& params, int band, std::vector<int> guide_j,
                      std::span<const uint16_t> track, std::span<const uint16_t> gap_track,
-                     const T* blkT = nullptr, const T* gapsT = nullptr) {
+                     const T* blkT = nullptr, const T* gapsT = nullptr, T step_max = T(-1)) {
         problem_common_(a, b, params, band, std::move(guide_j),
-                        params.num_sets() > 1 || !track.empty() || !gap_track.empty(), blkT);
+                        params.num_sets() > 1 || !track.empty() || !gap_track.empty(), blkT, step_max);
         if (tr_) setup_tracks_(track, gap_track, gapsT);
         problem_set_      = true;
     }
@@ -525,9 +579,12 @@ struct Aligner {
     void compute_forward_back() {
         check_problem();
         check_own_buf_allocated();
-        run_fwdbwd(own_buf_);
-        fwdbwd_done_ = any_fwdbwd_done_ = true;
-        fwdbwd_is_newest_ = true;
+        if constexpr (nw_is_int<T>) throw_soft_int_();
+        else {
+            run_fwdbwd(own_buf_);
+            fwdbwd_done_ = any_fwdbwd_done_ = true;
+            fwdbwd_is_newest_ = true;
+        }
     }
 
     // Returns the score from whichever DP ran most recently (Viterbi score or log Z),
@@ -626,11 +683,7 @@ struct Aligner {
         } else {
             const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
             if (backend != kBackendScalar) {
-                const LevelKernels& K = level_kernels(backend);
-                auto fn = [&] {
-                    if constexpr (std::is_same_v<T, double>) return K.score;
-                    else                                     return K.score_f;
-                }();
+                const auto fn = level_kernels(backend).template of<T>().score;
                 if (fn) {
                     ScoreJob<T> job{};
                     job.a = a_idx_.data(); job.m = m_;
@@ -742,9 +795,12 @@ struct Aligner {
 
     void compute_forward_back(DpBuffer& buf) {
         check_problem();
-        run_fwdbwd(buf);
-        any_fwdbwd_done_ = true;
-        fwdbwd_is_newest_ = true;
+        if constexpr (nw_is_int<T>) throw_soft_int_();
+        else {
+            run_fwdbwd(buf);
+            any_fwdbwd_done_ = true;
+            fwdbwd_is_newest_ = true;
+        }
     }
 
     std::vector<int> guide_j_from_viterbi(const DpBuffer& buf) const {
@@ -868,7 +924,7 @@ private:
     [[gnu::always_inline]] inline void problem_common_(std::span<const uint8_t> a, std::span<const uint8_t> b,
                                                        const AlignParams& params, int band,
                                                        std::vector<int>&& guide_j, bool tracked,
-                                                       const T* blkT) {
+                                                       const T* blkT, T step_max) {
         // Invalidate first: a guide rejected below must not leave the previous
         // problem's results readable against this problem's sequences.
         problem_set_      = false;
@@ -887,9 +943,22 @@ private:
         // tracked).  T=double aliases the master (no copy); float32 converts once per
         // problem into blkT_storage_, unless the caller prepared it.
         if constexpr (std::is_same_v<T, double>) {
-            (void)blkT;
+            (void)blkT; (void)step_max;
             blkT_ = blk_;
+        } else if constexpr (nw_is_int<T>) {
+            // The batch prepared the stack, the gaps and step_max once per params
+            // (nw_int_prepare) and hands them to every pair, tracked or not; a standalone
+            // problem prepares its own (the sets it reads: K when tracked, else set 0).
+            if (blkT && step_max >= T(0)) {
+                blkT_ = blkT;
+                step_max_ = step_max;
+            } else {
+                nw_int_prepare<T>(params, tr_ ? params.num_sets() : 1, blkT_storage_,
+                                  int_gaps_scratch_, step_max_);
+                blkT_ = blkT_storage_.data();
+            }
         } else {
+            (void)step_max;
             if (tr_ && blkT) {
                 blkT_ = blkT;
             } else {
@@ -906,6 +975,7 @@ private:
         n_      = static_cast<int>(b.size());
         stride_ = static_cast<size_t>(n_ + 1);
         sz_     = static_cast<size_t>(m_ + 1) * stride_;
+        if constexpr (nw_is_int<T>) int_bound_check_();
         // Checked for Full too: the entry points pick GuideBanded only for band > 0, so
         // a negative band would otherwise slip through as a full DP.
         if (band_ < 0)
@@ -1204,11 +1274,15 @@ private:
     // and 2.8-3.6x / 3.7-5x on unrelated pairs, identical totals; pairs <= hb_cutoff run
     // AS Pointers.  Local double stays Pointers (exact Local Hirschberg loses there; pmax
     // at double is opt-in by the rule above).  Linear and banded resolve to Pointers.
+    //
+    // An INTEGER T resolves affine Full (both modes) to HirschbergPmax outright: integer
+    // arithmetic is exact and associative, so the prefix-max carry is bit-identical to the
+    // serial one there (scalar_traits.hpp) and the only difference left is its speed.
     static constexpr TracebackMode kDefaultTb =
         (GM == GapModel::Affine && AB == AlignBand::Full && AM == AlignMode::Global)
-            ? (std::is_same_v<T, float> ? TracebackMode::HirschbergPmax
-                                        : TracebackMode::Hirschberg)
-        : (GM == GapModel::Affine && AB == AlignBand::Full && std::is_same_v<T, float>)
+            ? ((std::is_same_v<T, float> || nw_is_int<T>) ? TracebackMode::HirschbergPmax
+                                                           : TracebackMode::Hirschberg)
+        : (GM == GapModel::Affine && AB == AlignBand::Full && (std::is_same_v<T, float> || nw_is_int<T>))
             ? TracebackMode::HirschbergPmax
             : TracebackMode::Pointers;
     TracebackMode tb_ = kDefaultTb;
@@ -1282,6 +1356,34 @@ private:
             throw std::logic_error("nwgrad: call compute_forward_back() first");
     }
 
+    // The soft path (forward-backward, log Z, expected counts) is a computation in
+    // exp/log space: it has no integer form.  An integer T throws here, and the
+    // `if constexpr` at the two call sites keeps the double-space body from being
+    // instantiated against integer tables at all.
+    [[noreturn]] static void throw_soft_int_() {
+        throw std::invalid_argument(
+            std::string("nwgrad: the soft path (forward-backward / soft gradient) needs a "
+                        "floating-point scalar type; this aligner's is ") + nw_type_name<T>());
+    }
+
+    // ── Integer T: parameter checks and the overflow bound (see scalar_traits.hpp) ──
+    //
+    // Every parameter must be an integer within ±nw_int_cap (the user quantizes; a
+    // silent truncation of 0.5 to 0 would be the alternative), and the problem's a-priori
+    // bound (m+n+2) * step_max_ must not exceed the cap, step_max_ being the largest
+    // magnitude any one move can add: max |s| over the block, |go| + |ge| per side.
+    T step_max_ = T(0);
+    mutable std::vector<T> int_gaps_scratch_;   // nw_int_prepare's gaps, when run here
+    void int_bound_check_() const {
+        if (step_max_ > T(0) &&
+            static_cast<long long>(m_) + n_ + 2 + nw_int_pad_cols > static_cast<long long>(nw_int_cap<T> / step_max_))
+            throw std::overflow_error(
+                "nwgrad: a " + std::to_string(m_) + " x " + std::to_string(n_) + " problem with a largest "
+                "step of " + std::to_string(static_cast<long long>(step_max_)) + " could overflow the " +
+                nw_type_name<T>() + " scalar type ((m + n + 2 + 64 padding columns) * step exceeds " +
+                std::to_string(static_cast<long long>(nw_int_cap<T>)) + "); use a wider type");
+    }
+
     // Throw if own buffer shell has never been allocated.
     void check_own_buf_allocated() const {
         if (!own_buf_allocated_)
@@ -1320,15 +1422,13 @@ private:
     }
 
     // Whether this run actually selects rowwise score tables. The preference
-    // alone is insufficient: splitting Hirschberg, float32 and scalar kernels
-    // ignore it. Share the predicate with dispatch so those paths keep their
+    // alone is insufficient: splitting Hirschberg and scalar kernels ignore it. Share the predicate with dispatch so those paths keep their
     // smaller memory bounds even when rowwise was requested.
     bool uses_rowwise_full() const {
-        if constexpr (GM == GapModel::Affine && AB == AlignBand::Full &&
-                      std::is_same_v<T, double>) {
+        if constexpr (GM == GapModel::Affine && AB == AlignBand::Full) {
             if (!rowwise_full_ || (is_hirschberg(tb_) && m_ > hb_cutoff_)) return false;
             const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
-            return backend >= 0 && level_kernels(backend).banded_row_local;
+            return backend >= 0 && level_kernels(backend).template of<T>().banded_row_local;
         }
         return false;
     }
@@ -1992,28 +2092,19 @@ private:
         // A simd level: its kernels.  If that level's TU was not linked (header-only
         // single-level build), every pointer is null and we fall through to scalar.
         const LevelKernels& K = level_kernels(backend);
+        const TypedKernels<T>& KT = K.template of<T>();
         if constexpr (AB == AlignBand::Full) {
             // Opt-in row-wise fill (set_rowwise_full): score tables, row-major, read back
             // by the Scores traceback whatever tb_ says — the paths are identical.
-            if constexpr (std::is_same_v<T, double>) {
-                if (uses_rowwise_full()) { viterbi_affine_simd(buf, K); return; }
-            }
-            // The striped Full kernel exists at both precisions (viterbi / viterbi_f).
-            if constexpr (std::is_same_v<T, double>) {
-                if (use_ptr && K.viterbi_ptr) { run_dispatched_affine(buf, K, true);  return; }
-                if (K.viterbi)             { run_dispatched_affine(buf, K, false); return; }
-            } else {
-                if (use_ptr && K.viterbi_ptr_f) { run_dispatched_affine(buf, K, true);  return; }
-                if (K.viterbi_f)             { run_dispatched_affine(buf, K, false); return; }
-            }
+            if (uses_rowwise_full()) { viterbi_affine_simd(buf, K); return; }
+            // The striped Full kernel, this level's instantiation for T.
+            if (use_ptr && KT.viterbi_ptr) { run_dispatched_affine(buf, K, true);  return; }
+            if (KT.viterbi)                { run_dispatched_affine(buf, K, false); return; }
             if (use_ptr) { viterbi_affine_ptr(buf); return; }   // level lacks the ptr kernel
         }
-        // The row-wise banded kernel is double-only for now; float banded falls back to the
-        // (T-templated) scalar fill.  Gated so viterbi_affine_simd — whose body is
-        // double-typed — is never instantiated for T=float.
-        if constexpr (std::is_same_v<T, double>) {
-            if (K.banded_row_local) { viterbi_affine_simd(buf, K); return; }
-        }
+        // The row-wise banded kernel (every T); a level without it falls back to the
+        // scalar fill.
+        if (KT.banded_row_local) { viterbi_affine_simd(buf, K); return; }
         viterbi_affine(buf);
     }
 
@@ -2034,8 +2125,8 @@ private:
         job.guide_j = nullptr; job.guide_len = 0;
         job.buf = &buf;
         if (tr_) fill_track_job_(job.tr, true, static_cast<size_t>(n_) + 16);
-        if constexpr (std::is_same_v<T, double>) { if (use_ptr) K.viterbi_ptr(job); else K.viterbi(job); }
-        else                                     { if (use_ptr) K.viterbi_ptr_f(job); else K.viterbi_f(job); }
+        const TypedKernels<T>& KT = K.template of<T>();
+        if (use_ptr) KT.viterbi_ptr(job); else KT.viterbi(job);
         pointers_ = use_ptr;   // Pointers leaves codes, not score tables
         // Adopt the layout the kernel produced (striped for the Full striped kernel).
         if (job.table_layout == 1) {
@@ -2064,7 +2155,7 @@ private:
     // full-width profile would outcost the banded DP.  Defined in aligner_simd.hpp.
     void build_profile(DpBuffer& buf);
     bool rw_prof_ = false;   // tracked row-wise Full: build_profile kept a compact profile
-    const double* subrow(DpBuffer& buf, int i, int lo, int hi) const;
+    const T* subrow(DpBuffer& buf, int i, int lo, int hi) const;
 
     // ═════════════════════════════════════════════════════════════════════════
     // Viterbi — Linear gap model
@@ -2489,9 +2580,8 @@ private:
         const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
         if (backend == kBackendScalar) return nullptr;
         const LevelKernels& K = level_kernels(backend);
-        const bool dbl = std::is_same_v<T, double>;
-        const bool have = hb_pmax() ? (dbl ? K.hb_sweep_pmax != nullptr : K.hb_sweep_pmax_f != nullptr)
-                                    : (dbl ? K.hb_sweep      != nullptr : K.hb_sweep_f      != nullptr);
+        const TypedKernels<T>& KT = K.template of<T>();
+        const bool have = hb_pmax() ? KT.hb_sweep_pmax != nullptr : KT.hb_sweep != nullptr;
         return have ? &K : nullptr;
     }
 
@@ -2513,11 +2603,8 @@ private:
         job.buf = &buf;
         job.outM = oM; job.outX = oX; job.outY = oY;
         if (tr_) { hb_reverse_rows_(); fill_track_job_(job.tr, false, 0); }
-        if constexpr (std::is_same_v<T, double>) {
-            if (hb_pmax()) K.hb_sweep_pmax(job); else K.hb_sweep(job);
-        } else {
-            if (hb_pmax()) K.hb_sweep_pmax_f(job); else K.hb_sweep_f(job);
-        }
+        const TypedKernels<T>& KT = K.template of<T>();
+        if (hb_pmax()) KT.hb_sweep_pmax(job); else KT.hb_sweep(job);
     }
 
     // Forward sweep of rows (i0, i1], keeping two rolling rows.  On return the three
@@ -2575,7 +2662,7 @@ private:
                     // exactly (subtracting a common value is order-preserving, so this is
                     // bit-identical to the three-way form the exact branch uses).
                     const T g = (std::max(cM[c-1], cX[c-1]) - go_a) - ge_a;
-                    P = std::max(g + rmp[c-1], P);
+                    P = std::max<T>(g + rmp[c-1], P);
                     cY[c] = P - rmp[c-1];
                 } else {
                     cY[c] = std::max({cM[c-1] - go_a - ge_a, cX[c-1] - go_a - ge_a, cY[c-1] - ge_a});
@@ -2630,7 +2717,7 @@ private:
                 cX[d] = std::max({pM[d] - go_b - ge_b, pX[d] - ge_b, pY[d] - go_b - ge_b});
                 if constexpr (Pmax) {
                     const T g = (std::max(cM[d-1], cX[d-1]) - go_a) - ge_a;
-                    P = std::max(g + rmp[d-1], P);
+                    P = std::max<T>(g + rmp[d-1], P);
                     cY[d] = P - rmp[d-1];
                 } else {
                     cY[d] = std::max({cM[d-1] - go_a - ge_a, cX[d-1] - go_a - ge_a, cY[d-1] - ge_a});
@@ -2652,9 +2739,7 @@ private:
         const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
         if (backend == kBackendScalar) return nullptr;
         const LevelKernels& K = level_kernels(backend);
-        const bool have = std::is_same_v<T, double> ? (K.hb_base != nullptr)
-                                                    : (K.hb_base_f != nullptr);
-        return have ? &K : nullptr;
+        return K.template of<T>().hb_base ? &K : nullptr;
     }
 
     // Vectorized base case: the striped kernel fills buf.hbD (3 direction planes, striped)
@@ -2674,8 +2759,7 @@ private:
         job.b_start = j0; job.b_step = 1;      // col c=1..NC pairs   b[j0 + (c-1)]
         job.H = H; job.ncols = NC; job.in_x = in_x ? 1 : 0; job.buf = &buf;
         if (tr_) fill_track_job_(job.tr, false, 0);
-        if constexpr (std::is_same_v<T, double>) K.hb_base(job);
-        else                                     K.hb_base_f(job);
+        K.template of<T>().hb_base(job);
 
         // Striped walk-back over buf.hbD.  Column c lives at slot (c==0 ? 0 : W+scol(c)).
         const int seg = job.seg, Wl = job.width;
@@ -2956,9 +3040,7 @@ private:
         const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
         if (backend == kBackendScalar) return nullptr;
         const LevelKernels& K = level_kernels(backend);
-        const bool have = std::is_same_v<T, double> ? (K.hb_scan != nullptr)
-                                                    : (K.hb_scan_f != nullptr);
-        return have ? &K : nullptr;
+        return K.template of<T>().hb_scan ? &K : nullptr;
     }
 
     // Run one endpoint scan over the sub-rectangle rows [i0, i1), cols [j0, j1): simd if
@@ -2984,8 +3066,7 @@ private:
             job.pmax = hb_pmax() ? 1 : 0;
             job.buf = &buf;
             if (tr_) { hb_reverse_rows_(); fill_track_job_(job.tr, false, 0); }
-            if constexpr (std::is_same_v<T, double>) K->hb_scan(job);
-            else                                     K->hb_scan_f(job);
+            K->template of<T>().hb_scan(job);
             best = job.best; bi = job.best_i; bj = job.best_j;
             return;
         }
@@ -3054,7 +3135,7 @@ private:
                 T y;
                 if (pmax) {
                     const T g = (std::max(cM[c-1], cX[c-1]) - go_a) - ge_a;
-                    P = std::max(g + rmp[c-1], P);
+                    P = std::max<T>(g + rmp[c-1], P);
                     y = P - rmp[c-1];
                 } else {
                     y = std::max(std::max((cM[c-1] - go_a) - ge_a, (cX[c-1] - go_a) - ge_a), cY[c-1] - ge_a);

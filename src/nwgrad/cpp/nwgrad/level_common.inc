@@ -48,40 +48,37 @@ namespace NWGRAD_LVL_NAME {
 
 namespace {
 struct NwgradLevelRegistrar {
+    // Pass bare function addresses (scalar `lea`s), never a locally-built struct: this
+    // constructor runs at static init on every CPU, and in a -mavx512 TU a local struct
+    // zero-init would emit an AVX512 broadcast that SIGILLs on non-AVX512 hardware.
+    // register_level_* assemble the structs in baseline code (simd_levels.cpp).
+    template <class T>
+    static void typed() {
+        register_level_typed<T>(NWGRAD_LVL_ENUM,
+                                &NWGRAD_LVL_NAME::striped_full_entry<T>,      // affine Full: G+L
+                                &NWGRAD_LVL_NAME::striped_full_ptr_entry<T>,  // TracebackMode::Pointers
+                                &NWGRAD_LVL_NAME::banded_row_global<T>,       // affine GuideBanded: whole-row
+                                &NWGRAD_LVL_NAME::banded_row_local<T>,
+                                &NWGRAD_LVL_NAME::hb_sweep_entry<T>,          // Hirschberg sweep
+                                &NWGRAD_LVL_NAME::hb_sweep_pmax_entry<T>,     // prefix-max carry sweep
+                                &NWGRAD_LVL_NAME::hb_base_entry<T>,           // Hirschberg base case
+                                &NWGRAD_LVL_NAME::hb_scan_entry<T>,           // Hirschberg local endpoint scan
+                                &NWGRAD_LVL_NAME::score_entry<T>,             // score only
+                                &NWGRAD_LVL_NAME::inter_fill_entry<T>,        // inter-pair Full fill
+                                &NWGRAD_LVL_NAME::inter_score_entry<T>,       // inter-pair score only
+                                NWGRAD_LVL_NAME::IVT<T>::W);
+    }
     NwgradLevelRegistrar() {
-        // Pass bare function addresses (scalar `lea`s), never a locally-built
-        // LevelKernels: this constructor runs at static init on every CPU, and in a
-        // -mavx512 TU a local struct zero-init would emit an AVX512 broadcast that
-        // SIGILLs on non-AVX512 hardware.  register_level assembles the struct in
-        // baseline code (simd_levels.cpp).
-        register_level(NWGRAD_LVL_ENUM,
-                       &NWGRAD_LVL_NAME::striped_full_entry<double>,  // affine Full double: G+L
-                       &NWGRAD_LVL_NAME::striped_full_entry<float>,   // affine Full float32: G+L
-                       &NWGRAD_LVL_NAME::striped_full_ptr_entry<double>, // TracebackMode::Pointers, double
-                       &NWGRAD_LVL_NAME::striped_full_ptr_entry<float>,  // TracebackMode::Pointers, float32
-                       &NWGRAD_LVL_NAME::banded_row_global,    // affine GuideBanded: whole-row ↓
-                       &NWGRAD_LVL_NAME::banded_row_local,
-                       &NWGRAD_LVL_NAME::hb_sweep_entry_d,     // Hirschberg sweep, double
-                       &NWGRAD_LVL_NAME::hb_sweep_entry_f,     // Hirschberg sweep, float32
-                       &NWGRAD_LVL_NAME::hb_sweep_pmax_entry_d, // prefix-max carry sweep, double
-                       &NWGRAD_LVL_NAME::hb_sweep_pmax_entry_f, // ditto, float32
-                       &NWGRAD_LVL_NAME::hb_base_entry_d,      // Hirschberg base case, double
-                       &NWGRAD_LVL_NAME::hb_base_entry_f,      // Hirschberg base case, float32
-                       &NWGRAD_LVL_NAME::hb_scan_entry_d,      // Hirschberg local endpoint scan, double
-                       &NWGRAD_LVL_NAME::hb_scan_entry_f,      // Hirschberg local endpoint scan, float32
-                       NWGRAD_LVL_NAME::ROW_BLOCK,
-                       &NWGRAD_LVL_NAME::inter_fill_entry,      // inter-pair affine Full, double
-                       NWGRAD_LVL_NAME::IW,
-                       &NWGRAD_LVL_NAME::inter_fill_entry_f,   // inter-pair Full, float32
-                       NWGRAD_LVL_NAME::IVT<float>::W,
-                       &NWGRAD_LVL_NAME::inter_soft_entry,     // inter-pair soft pass, double
-                       &NWGRAD_LVL_NAME::soft_pair_linear,     // per-pair soft, linear
-                       &NWGRAD_LVL_NAME::soft_pair_affine);    // per-pair soft, affine
-        register_level_score(NWGRAD_LVL_ENUM,
-                             &NWGRAD_LVL_NAME::score_entry<double>,
-                             &NWGRAD_LVL_NAME::score_entry<float>,
-                             &NWGRAD_LVL_NAME::inter_score_entry,
-                             &NWGRAD_LVL_NAME::inter_score_entry_f);
+        typed<double>();
+        typed<float>();
+        typed<int16_t>();
+        typed<int32_t>();
+        typed<int64_t>();
+        register_level_common(NWGRAD_LVL_ENUM,
+                              NWGRAD_LVL_NAME::ROW_BLOCK,
+                              &NWGRAD_LVL_NAME::inter_soft_entry,     // inter-pair soft pass, double
+                              &NWGRAD_LVL_NAME::soft_pair_linear,     // per-pair soft, linear
+                              &NWGRAD_LVL_NAME::soft_pair_affine);    // per-pair soft, affine
     }
 };
 const NwgradLevelRegistrar nwgrad_level_registrar_instance;

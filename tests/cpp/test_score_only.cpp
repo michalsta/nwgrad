@@ -227,7 +227,7 @@ void inter_check(const LevelKernels& K, int W, std::mt19937_64& rng, const Alpha
     std::vector<T> best(W);
     J.VM = vm.data(); J.VX = vx.data(); J.VY = vy.data(); J.best = best.data();
     if (ragged) J.nb = nbs.data();
-    if constexpr (std::is_same_v<T, double>) K.inter_score(J); else K.inter_score_f(J);
+    K.template of<T>().inter_score(J);
     for (int l = 0; l < W; ++l) {
         Aligner<GM, AM, AlignBand::Full, T> al;
         al.set_kernel(kBackendScalar);
@@ -253,7 +253,7 @@ TEST_CASE("inter-pair score: every lane equals its pair's compute_score", "[scor
     long n_checked = 0, n_levels = 0;
     for (SimdLevel lv : detect_available_levels()) {
         const LevelKernels& K = level_kernels(static_cast<int>(lv));
-        if (!K.inter_score || !K.inter_score_f) continue;
+        if (!K.d.inter_score || !K.f.inter_score) continue;
         ++n_levels;
         for (long it = 0; it < iters; ++it) {
             const Alphabet& A = ri(0, 2) == 0 ? Alphabet::protein() : Alphabet::dna();
@@ -272,14 +272,14 @@ TEST_CASE("inter-pair score: every lane equals its pair's compute_score", "[scor
                 default: break;
             }
             const bool rag = ri(0, 2) == 0;
-            inter_check<double, GapModel::Affine, AlignMode::Global>(K, K.inter_w, rng, A, p, rag, n_checked);
-            inter_check<double, GapModel::Affine, AlignMode::Local >(K, K.inter_w, rng, A, p, rag, n_checked);
-            inter_check<double, GapModel::Linear, AlignMode::Global>(K, K.inter_w, rng, A, p, rag, n_checked);
-            inter_check<double, GapModel::Linear, AlignMode::Local >(K, K.inter_w, rng, A, p, rag, n_checked);
-            inter_check<float,  GapModel::Affine, AlignMode::Global>(K, K.inter_w_f, rng, A, p, rag, n_checked);
-            inter_check<float,  GapModel::Affine, AlignMode::Local >(K, K.inter_w_f, rng, A, p, rag, n_checked);
-            inter_check<float,  GapModel::Linear, AlignMode::Global>(K, K.inter_w_f, rng, A, p, rag, n_checked);
-            inter_check<float,  GapModel::Linear, AlignMode::Local >(K, K.inter_w_f, rng, A, p, rag, n_checked);
+            inter_check<double, GapModel::Affine, AlignMode::Global>(K, K.d.inter_w, rng, A, p, rag, n_checked);
+            inter_check<double, GapModel::Affine, AlignMode::Local >(K, K.d.inter_w, rng, A, p, rag, n_checked);
+            inter_check<double, GapModel::Linear, AlignMode::Global>(K, K.d.inter_w, rng, A, p, rag, n_checked);
+            inter_check<double, GapModel::Linear, AlignMode::Local >(K, K.d.inter_w, rng, A, p, rag, n_checked);
+            inter_check<float,  GapModel::Affine, AlignMode::Global>(K, K.f.inter_w, rng, A, p, rag, n_checked);
+            inter_check<float,  GapModel::Affine, AlignMode::Local >(K, K.f.inter_w, rng, A, p, rag, n_checked);
+            inter_check<float,  GapModel::Linear, AlignMode::Global>(K, K.f.inter_w, rng, A, p, rag, n_checked);
+            inter_check<float,  GapModel::Linear, AlignMode::Local >(K, K.f.inter_w, rng, A, p, rag, n_checked);
         }
     }
     INFO(n_levels << " levels, " << n_checked << " lanes");
