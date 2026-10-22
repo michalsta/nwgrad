@@ -910,13 +910,48 @@ best already did; the score kernels' M-only form and the endpoint scan now do fo
 `T`; a real value plus the sentinel cannot wrap and lands below every real one). Padding
 never feeds a real cell: it lies right of every real column and the DP flows right and down.
 
-**Codegen.** gcc emits `vpmaxsw` / `vpmaxsd` for the integer maxima (`vpmaxsq` at AVX-512; at
+**Codegen, and the gcc / clang round (2026-10-22, `tools/bench_int_cc.sh`: both compilers
+built into throwaway venvs under release-wheel codegen, every arm timed in one process per
+build).** gcc emits `vpmaxsw` / `vpmaxsd` for the integer maxima (`vpmaxsq` at AVX-512; at
 AVX2 int64 is `vpcmpgtq` + `vpblendvb`), but assembled the segment-boundary lane shift of
 integer lanes element by element (`vpinsrw` / `vpinsrd` sequences), the trap documented for
 double; `lane_shift_in` has intrinsic forms for the three integer widths at AVX2
 (`vpermd` / `vpermq` + `vpblendd`, `vperm2i128` + `vpalignr` + `vpinsrw` for int16) and
 AVX-512 (`valignd` / `valignq`, `vpermw` + a masked blend for int16). The inter-pair kernels
-use the GCC vector types per width (`IVT<T>`: int16 has 4x double's lanes).
+use the GCC vector types per width (`IVT<T>`: int16 has 4x double's lanes). The first
+gcc-vs-clang run on nighthaven (every float32 and double arm within 3 %, so the harness is
+sound) found three stragglers, each read off the disassembly:
+- **gcc 20-25 % slower than clang on every int16 / int32 protein arm** (the per-pair striped
+  Pointers and score kernels, avx2 and sse4): there is no packed integer `>=`, and gcc built
+  each `stdx::where(a >= b, ...)` from `vpminsw` + `vpcmpeqw` where clang swaps the compare
+  and the blend operands; the Pointers kernel has eight per vector of cells, ~20 % of its
+  instructions. `pick_code` / `sel_ge` (kernels_pointers_impl.inl) now spell the three-way
+  code and the open/extend select with STRICT compares and inverted defaults for an integer
+  T (`(y > x ? 2 : 1)` is `(x >= y ? 1 : 2)`; "0 unless x > m or y > m" is "0 when m >= x
+  and m >= y"); the Local stop `vmv <= 0` is `vmv == 0` on the clamped value (one
+  `vpcmpeqw`). Floating T keeps its `vcmpleps` form, codegen untouched.
+- **clang 13-33 % slower than gcc on the int64 Pointers kernel**: it lowered the direction-
+  byte narrowing `static_simd_cast<fixed_size_simd<unsigned char, W>>` of 64-bit lanes to
+  one byte store per lane (`movb` x4 per vector); `store_codes` has intrinsic forms per
+  integer width at SSE2 / AVX2 (`vpackus*` + a permute) and AVX-512 (`vpmovqb` / `vpmovdb` /
+  `vpmovwb`).
+- gcc kept the per-row Local argmax (`striped_row_best`) out of line and reduced its 16 int16
+  lanes with scalar extracts (4.7 % of the Pointers kernel's samples): for an integer T it is
+  `stdx::hmax` + `find_first_set(lmax == rmax)` (floating T keeps the scalar loop, whose
+  `std::max` keeps the first of two equal values and so the sign of a zero).
+Then the structural one: **an integer T's VY carry is an exact prefix max** (`int_pmax_carry`,
+kernels_impl.inl, in the striped Pointers, Scores, both score-only forms and the Hirschberg
+base case; the sweeps and scans already had `hirschberg_pmax`). The serial chain + lazy-F
+fixpoint costs up to W data-dependent rounds per row, and W is 16-32 for int16; the prefix
+max is fixed work (a lane-local prefix max of `open + k*ge_a`, W scalar maxes across the
+lanes, one parallel pass) and in integers it is bit-identical to the chain — the Y code is
+the open's exactly when `open[c-1] + (c-1)*ge_a >= max(seed, Q[0..c-2])`, which is the
+chain's `O >= ext`. Verified: the oracle sweep at every level, the Python suite, ASan+UBSan.
+clang + AVX-512 + libstdc++: the `long` / `long long` mask assertion now also fires for
+int64 lanes (`operator>` / `==` on `simd<long>`), so every 64-bit-lane mask site goes through
+the `avx512d_*` helpers, which have int64 overloads (clang 22; clang 23 accepts the std::simd
+form). Also found by clang: the inter-pair lane initializer narrowed int to int16 (gcc waved
+it through); `ivlanes_` casts each lane.
 
 **Measured** (`tools/bench_int.py`, one process, every arm a runtime choice; control arm
 float32-vs-float32 0.97-1.06 unless noted; time / float32's time, below 1 = faster than the
