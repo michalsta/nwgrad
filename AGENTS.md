@@ -926,22 +926,29 @@ stream = `align()`):
 
 | host | level | thr | int16 hard / score / stream | int32 | int64 | double |
 |---|---|---|---|---|---|---|
+| **nighthaven (i5-12500)** | **avx2** | 1 | DNA 0.61 / 0.57 / 0.68; protein 0.63 / 0.65 / 0.65 | 0.96 / 0.96 / 1.03; 0.74 / 0.57 / 0.75 | 2.57 / 3.06 / 2.54; 1.81 / 1.44 / 1.82 | 1.73 / 1.87 / 1.69; 1.38 / 1.07 / 1.38 |
+| nighthaven | avx2 | 12 | DNA 0.61 / 0.60 / 0.69; protein 0.73 / 0.95 / 0.76 | 0.96 / 1.00 / 1.02; 0.95 / 0.93 / 0.96 | 2.41 / 2.77 / 2.34; 2.03 / 1.98 / 2.04 | 1.72 / 1.81 / 1.65; 1.46 / 1.12 / 1.47 |
+| nighthaven | sse4 | 1 | DNA 0.59 / 0.57 / 0.66; protein 0.50 / 0.53 / 0.51 | 0.96 / 1.02 / 1.01; 0.72 / 0.58 / 0.73 | 2.20 / 2.48 / 2.21; 1.66 / 1.16 / 1.67 | 1.84 / 2.12 / 1.85; 1.75 / 1.21 / 1.75 |
+| nighthaven | sse4 | 12 | DNA 0.58 / 0.57 / 0.65; protein 0.60 / 0.77 / 0.63 | 0.95 / 0.99 / 0.99; 0.93 / 0.97 / 0.93 | 2.12 / 2.28 / 2.08; 1.91 / 1.84 / 1.92 | 1.84 / 1.96 / 1.77; 1.78 / 1.30 / 1.77 |
 | skynet (Piledriver) | sse4 | 1 | DNA 0.56 / 0.53 / 0.61; protein 0.59 / 0.83 / 0.61 | 0.85 / 0.85 / 0.88; 0.83 / 0.88 / 0.86 | 1.85 / 1.95 / 1.83; 1.74 / 1.59 / 1.72 | 1.83 / 2.00 / 1.76; 1.80 / 1.37 / 1.73 |
 | skynet | sse2 | 1 | DNA 0.54 / 0.54 / 0.60; protein 0.63 / 0.79 / 0.65 | 1.25 / 1.19 / 1.29; 1.10 / 1.42 / 1.12 | **5.5 / 5.5 / 5.4**; 5.4 / 4.7 / 5.4 | 1.98 / 2.12 / 1.96; 1.87 / 1.31 / 1.89 |
 | spot (M1, Fedora) | neon | 1 | DNA 0.47 / 0.42 / 0.50; protein 0.54 / 0.85 / 0.54 | 0.77 / 0.78 / 0.79; 0.81 / 0.85 / 0.82 | 1.74 / 1.74 / 1.75; 1.51 / 1.44 / 1.51 | 1.87 / 1.88 / 1.84; 1.38 / 1.21 / 1.38 |
 | spot | neon | 4 | DNA 0.48 / 0.43 / 0.53; protein 0.54 / 0.85 / 0.55 | 0.81 / 0.80 / 0.84; 0.81 / 0.86 / 0.82 | 1.82 / 1.85 / 1.79; 1.52 / 1.44 / 1.52 | 1.86 / 1.86 / 1.79; 1.39 / 1.22 / 1.39 |
 
-(skynet at 16 threads: the same ordering, control up to 1.46 in one cell — a VM; not
-tabulated.)  The reading: **int16 is the fast type**, 0.42-0.63 of float32 on every host,
-level and arm except protein score-only (0.79-0.85: that kernel is already lazy-F-bound
-with 16-32 lanes); **int32 wins modestly where the ISA has a packed 32-bit max** (sse4,
-neon: 0.77-0.88) and loses at sse2 (1.1-1.4: `pmaxsd` is SSE4.1, so the max is a
-compare-and-blend triple); **int64 costs what double costs** where the ISA has a 64-bit
-compare (sse4 `pcmpgtq`, neon) and is a pathology at sse2 (5.4x: no 64-bit compare at all,
-gcc emulates it per lane; the scalar fallback is no better, 1.45x float32's scalar fill).
-The int64 type is headroom for enormous parameters, not a speed choice.  The scalar
-fallbacks of int32/int64 run 1.45x the float32 scalar fill (skynet) — gcc's codegen of
-the scalar integer max, not looked into.
+(nighthaven's 12-thread control arm sits at 0.91-0.96 in three cells: +-10 % noise there;
+skynet at 16 threads: the same ordering, control up to 1.46 in one cell — a VM; not
+tabulated.)  The reading: **int16 is the fast type**, 0.42-0.68 of float32 on every host,
+level and arm (the weakest cells are the protein score-only kernel with many lanes,
+0.77-0.95, already lazy-F-bound); **int32 ties float32 on short DNA pairs at AVX2 and
+wins on protein (0.57-0.75 at 1 thread), wins modestly at sse4 / neon (0.72-0.88) and loses
+at sse2** (1.1-1.4: `pmaxsd` is SSE4.1, so the max is a compare-and-blend triple);
+**int64 costs double's time or more** — AVX2 has no packed 64-bit max (`vpcmpgtq` +
+`vpblendvb`, 2.0-3.1x float32), sse4 / neon about double's, and sse2 is a pathology (5.4x:
+no 64-bit compare at all, gcc emulates it per lane; the scalar fallback is no better at
+1.45x float32's scalar fill).  The int64 type is headroom for enormous parameters, not a
+speed choice.  The scalar fallbacks of int32/int64 run 1.45x the float32 scalar fill
+(skynet) — gcc's codegen of the scalar integer max, not looked into.  AVX-512 (W=32 for
+int16, `vpmaxsq`) unmeasured and its integer kernels unexecuted: solace was off.
 
 ### The soft path: scaled probability space (2026-10-05)
 
