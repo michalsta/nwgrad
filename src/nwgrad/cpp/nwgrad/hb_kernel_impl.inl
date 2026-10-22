@@ -984,12 +984,10 @@ static void hb_base_striped(HbBaseJob<T>& job) {
                 km = avx512d_blend(avx512d_ge(dgX, dgY), km, vone);
                 km = avx512d_blend(avx512d_ge(dgM, dgX) & avx512d_ge(dgM, dgY), km, vzero);
             } else {
-                stdx::where(dgX >= dgY, km) = vone;
-                stdx::where((dgM >= dgX) && (dgM >= dgY), km) = vzero;
+                km = pick_code(dgM, dgX, dgY, vzero, vone, vtwo);
             }
 #else
-            stdx::where(dgX >= dgY, km) = vone;
-            stdx::where((dgM >= dgX) && (dgM >= dgY), km) = vzero;
+            km = pick_code(dgM, dgX, dgY, vzero, vone, vtwo);
 #endif
             vmv.copy_to(cM + off + (std::size_t)s * W, stdx::element_aligned);
             store_codes<T, W>(km, dM + (std::size_t)s * W);
@@ -1006,12 +1004,10 @@ static void hb_base_striped(HbBaseJob<T>& job) {
                 kx = avx512d_blend(avx512d_ge(bx, cx), kx, vone);
                 kx = avx512d_blend(avx512d_ge(ax, bx) & avx512d_ge(ax, cx), kx, vzero);
             } else {
-                stdx::where(bx >= cx, kx) = vone;
-                stdx::where((ax >= bx) && (ax >= cx), kx) = vzero;
+                kx = pick_code(ax, bx, cx, vzero, vone, vtwo);
             }
 #else
-            stdx::where(bx >= cx, kx) = vone;
-            stdx::where((ax >= bx) && (ax >= cx), kx) = vzero;
+            kx = pick_code(ax, bx, cx, vzero, vone, vtwo);
 #endif
             vxv.copy_to(cX + off + (std::size_t)s * W, stdx::element_aligned);
             store_codes<T, W>(kx, dX + (std::size_t)s * W);
@@ -1027,10 +1023,10 @@ static void hb_base_striped(HbBaseJob<T>& job) {
             if constexpr (sizeof(T) == 8) {
                 okv = avx512d_blend(avx512d_ge(om, ox), okv, vzero);
             } else {
-                stdx::where(om >= ox, okv) = vzero;
+                okv = sel_ge(om, ox, vone, vzero);
             }
 #else
-            stdx::where(om >= ox, okv) = vzero;
+            okv = sel_ge(om, ox, vone, vzero);
 #endif
             okv.copy_to(ok + (std::size_t)s * W, stdx::element_aligned);
         }
@@ -1056,10 +1052,10 @@ static void hb_base_striped(HbBaseJob<T>& job) {
             if constexpr (sizeof(T) == 8) {
                 ky = avx512d_blend(avx512d_ge(O, ext), ky, OK);
             } else {
-                stdx::where(O >= ext, ky) = OK;
+                ky = sel_ge(O, ext, vtwo, OK);
             }
 #else
-            stdx::where(O >= ext, ky) = OK;
+            ky = sel_ge(O, ext, vtwo, OK);
 #endif
             v.copy_to(cY + off + (std::size_t)s * W, stdx::element_aligned);
             ky.copy_to(yc + (std::size_t)s * W, stdx::element_aligned);

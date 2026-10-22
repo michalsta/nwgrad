@@ -25,9 +25,8 @@ namespace stdx = std::experimental;
 // For the AVX-512 mask-op workaround in kernels_impl.inl (clang + libstdc++ std::simd
 // bug).  Guarded identically to the workaround, and at global scope — intrinsics must
 // not be pulled into a namespace.  See the long note at that site.
-#if (defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)) \
-    || defined(__AVX2__)
-#  include <immintrin.h>   // also lane_shift_in's AVX2 form (kernels_impl.inl)
+#if defined(__x86_64__) || defined(__i386__)
+#  include <immintrin.h>   // lane_shift_in / store_codes intrinsic forms at every level
 #endif
 
 #include "dp_buffer.hpp"

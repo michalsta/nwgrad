@@ -119,11 +119,23 @@ static inline void striped_row_best(const T* cM, const T* cX, const T* cY, const
 #endif
         lmax = stdx::max(lmax, h);
     }
-    T rmax = lmax[0];
-    for (int l = 1; l < W; ++l) rmax = std::max(rmax, T(lmax[l]));
-    if (!(rmax > best)) return;
-    int l = 0;
-    while (!(lmax[l] == rmax)) ++l;
+    T rmax;
+    int l;
+    if constexpr (nw_is_int<T>) {
+        // A vector reduction and a mask search (gcc extracted the 16 int16 lanes one by
+        // one, ~5 % of the Pointers kernel's time).  Exact for integers; floating T keeps
+        // the scalar loop, whose std::max keeps the FIRST of two equal values and so the
+        // sign of a zero the reduction might swap.
+        rmax = stdx::hmax(lmax);
+        if (!(rmax > best)) return;
+        l = stdx::find_first_set(lmax == rmax);
+    } else {
+        rmax = lmax[0];
+        for (int q = 1; q < W; ++q) rmax = std::max(rmax, T(lmax[q]));
+        if (!(rmax > best)) return;
+        l = 0;
+        while (!(lmax[l] == rmax)) ++l;
+    }
     const int s = (int)ls[l];
     const std::size_t k = (std::size_t)s * W + (std::size_t)l;
     const T mm = cM[k], xx = cX[k], yy = cY[k];
@@ -134,7 +146,7 @@ static inline void striped_row_best(const T* cM, const T* cX, const T* cY, const
 // pad[s*W + l] = 0 for a real column (l*seg + s + 1 <= n), -inf for padding.
 template <class V>
 static inline const typename V::value_type* striped_pad(V& v, int n, int seg, int W) {
-    using T = typename V::value_type;
+    using T [[maybe_unused]] = typename V::value_type;   // unused at the W=2 levels
     const std::size_t sw = (std::size_t)seg * W;
     if (v.size() < sw) v.resize(sw);
     for (int l = 0; l < W; ++l)
@@ -158,7 +170,7 @@ static constexpr double K_NINF = -std::numeric_limits<double>::infinity();
 // generator form lane by lane (vpinsrw / vpinsrd / vpunpck sequences) at AVX2.
 template <class V>
 static inline V lane_shift_in(V x, typename V::value_type b) {
-    using T = typename V::value_type;
+    using T [[maybe_unused]] = typename V::value_type;   // unused at the W=2 levels
 #if defined(__AVX512F__)
     // One valignq / valignd: (x : splat(b)) shifted right by W-1 lanes is [b, x0..x_{W-2}].
     if constexpr (std::is_same_v<T, double> && V::size() == 8) {
