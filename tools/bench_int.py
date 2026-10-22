@@ -96,13 +96,16 @@ def main():
     ap.add_argument("--min-time", type=float, default=1.0)
     ap.add_argument("--quick", action="store_true")
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--json", metavar="FILE", help="also write every arm's best time (s/pair) here")
     args = ap.parse_args()
+    out = {"arms": {}}
     if args.quick:
         args.repeats, args.min_time = 2, 0.3
     os.environ.setdefault("LC_ALL", "C")
     import nwgrad
     isas = args.isa or [l for l in nwgrad.available_isa_levels() if l != "scalar_fallback"]
     print(f"nwgrad {nwgrad.__version__}  {nwgrad.compiled_with()}  levels {nwgrad.available_isa_levels()}")
+    out["compiler"] = nwgrad.compiled_with()
 
     for fx in args.fixture:
         n = args.n if fx == "dna" else args.n_protein
@@ -149,7 +152,12 @@ def main():
                     for k in range(3):
                         us = res[t][k] / n * 1e6
                         cells.append(f"{us:10.3f} ({res[t][k] / base[k]:5.2f}x)")
+                        out["arms"][f"{fx}/{isa}/{th}/{t}/{['hard', 'score', 'stream'][k]}"] = res[t][k] / n
                     print(f"   {t:8s} " + " ".join(f"{c:>22s}" for c in cells))
+    if args.json:
+        import json
+        with open(args.json, "w") as f:
+            json.dump(out, f, indent=1)
     return 0
 
 
