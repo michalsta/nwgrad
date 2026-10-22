@@ -947,6 +947,18 @@ max is fixed work (a lane-local prefix max of `open + k*ge_a`, W scalar maxes ac
 lanes, one parallel pass) and in integers it is bit-identical to the chain — the Y code is
 the open's exactly when `open[c-1] + (c-1)*ge_a >= max(seed, Q[0..c-2])`, which is the
 chain's `O >= ext`. Verified: the oracle sweep at every level, the Python suite, ASan+UBSan.
+Two gcc traps inside it, both read off `perf annotate` (skynet, sse4): (1) gcc lowered
+`copy_to` of an INTEGER simd — `vector_aligned` or not — to a memcpy through the value's
+address, kept the loop-carried P on the stack and folded it into `pmaxsd` from memory
+every step (40 % of the carry; the sse4 int32 score kernel ran 1.6x its lazy-F time), so
+the carry's row loads and stores go through the GCC vector type of the lane width
+(`nv_load` / `nv_store`, types spelled per width: gcc drops a dependent `vector_size` in an
+alias template to the scalar); (2) gcc outlined the carry as a constant-propagated clone in
+every integer score kernel, a call and a frame per row that cost more than the kernel
+body around it — now `always_inline` (int16 score at sse4 +22 %, int32 -7 %). **From 4
+lanes only**: at W = 2 (int64 at sse4 / sse2 / neon) the chain + lazy-F is cheaper (the
+carry made the sse4 int64 score arm 1.45x slower), so the gate is `nw_is_int<T> && W >= 4`
+at every site.
 clang + AVX-512 + libstdc++: the `long` / `long long` mask assertion now also fires for
 int64 lanes (`operator>` / `==` on `simd<long>`), so every 64-bit-lane mask site goes through
 the `avx512d_*` helpers, which have int64 overloads (clang 22; clang 23 accepts the std::simd
@@ -969,6 +981,26 @@ stream = `align()`):
 | skynet | sse2 | 1 | DNA 0.54 / 0.54 / 0.60; protein 0.63 / 0.79 / 0.65 | 1.25 / 1.19 / 1.29; 1.10 / 1.42 / 1.12 | **5.5 / 5.5 / 5.4**; 5.4 / 4.7 / 5.4 | 1.98 / 2.12 / 1.96; 1.87 / 1.31 / 1.89 |
 | spot (M1, Fedora) | neon | 1 | DNA 0.47 / 0.42 / 0.50; protein 0.54 / 0.85 / 0.54 | 0.77 / 0.78 / 0.79; 0.81 / 0.85 / 0.82 | 1.74 / 1.74 / 1.75; 1.51 / 1.44 / 1.51 | 1.87 / 1.88 / 1.84; 1.38 / 1.21 / 1.38 |
 | spot | neon | 4 | DNA 0.48 / 0.43 / 0.53; protein 0.54 / 0.85 / 0.55 | 0.81 / 0.80 / 0.84; 0.81 / 0.86 / 0.82 | 1.82 / 1.85 / 1.79; 1.52 / 1.44 / 1.52 | 1.86 / 1.86 / 1.79; 1.39 / 1.22 / 1.39 |
+
+**After the gcc / clang round** (the final state of the branch, nighthaven, `bench_int_cc.sh`,
+time / float32's time of the SAME build, gcc | clang; every float32 and double arm within 2 %
+of the first run, every integer arm at or below its first-run time except sse4 int64 hard at
+1.03):
+
+| arm (1 thread) | int16 | int32 | int64 |
+|---|---|---|---|
+| protein avx2 hard | **0.33** \| 0.29 (was 0.63) | 0.53 \| 0.43 (was 0.74) | 1.54 \| 1.58 (was 1.81) |
+| protein avx2 score | **0.27** \| 0.27 (was 0.65) | 0.38 \| 0.37 (was 0.57) | 1.34 \| 1.19 (was 1.44) |
+| protein sse4 hard | 0.36 \| 0.29 (was 0.50) | 0.65 \| 0.56 (was 0.72) | 1.70 \| 1.59 (was 1.66) |
+| protein sse4 score | 0.33 \| 0.27 (was 0.53) | 0.54 \| 0.52 (was 0.58) | 1.12 \| 0.99 (was 1.16) |
+| DNA avx2 hard / score | 0.61 / 0.57 (unchanged) | 0.96 / 0.95 (unchanged) | 2.57 / 3.05 (unchanged) |
+
+12 threads: the same picture a little compressed (protein avx2 int16 hard 0.42, int32 0.68).
+gcc against clang on the final state, protein: int16 0.88-0.96 at avx2 and 0.78-0.86 at
+sse4 (clang faster), int32 0.80-0.96 / 0.84-0.94, int64 0.86-1.03 — the remaining gap is
+clang's unrolling and scheduling of the striped loops, the same residue the float kernels
+show at W = 2 (AGENTS, "Toolchain"), not a specific instruction. The DNA (inter-pair)
+arms never changed: those kernels were not touched in this round.
 
 (nighthaven's 12-thread control arm sits at 0.91-0.96 in three cells: +-10 % noise there;
 skynet at 16 threads: the same ordering, control up to 1.46 in one cell — a VM; not
