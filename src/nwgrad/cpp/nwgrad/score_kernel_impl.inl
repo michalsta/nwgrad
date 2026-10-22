@@ -100,7 +100,7 @@ static void score_affine_striped(ScoreJob<T>& job) {
     vd vbest = vzero;                       // Local: running per-lane max (best starts at 0)
     T bM = 0, bX = NINF, bY = NINF;         // column 0 of the previous row
     [[maybe_unused]] T ramp_ge = ge_a; [[maybe_unused]] bool ramp_ok = false;   // integer T's ramp
-    if constexpr (nw_is_int<T>) if (buf.sopenv.size() < sw) buf.sopenv.resize(sw);
+    if constexpr (nw_is_int<T> && W >= 4) if (buf.sopenv.size() < sw) buf.sopenv.resize(sw);
 
     // Is any lane of a greater than b?  (The lazy-F early exit — the one mask op.)
     auto any_gt = [](const vd& x, const vd& y) -> bool {
@@ -155,7 +155,7 @@ static void score_affine_striped(ScoreJob<T>& job) {
                 vd vxv = stdx::max(stdx::max((uM - vgo_b) - vge_b, uX - vge_b), (uY - vgo_b) - vge_b);
                 vxv.copy_to(cX + (std::size_t)s * W, stdx::element_aligned);
 
-                if constexpr (nw_is_int<T>) {
+                if constexpr (nw_is_int<T> && W >= 4) {
                     // the opens to ov (int_pmax_carry reads them one segment back)
                     ((stdx::max(vmv, vxv) - vgo_a) - vge_a).copy_to(buf.sopenv.data() + (std::size_t)s * W, stdx::element_aligned);
                     if constexpr (Local) vbest = stdx::max(vbest, padded(stdx::max(vmv, vxv), s));
@@ -198,7 +198,7 @@ static void score_affine_striped(ScoreJob<T>& job) {
                 if constexpr (Local) vbest = stdx::max(vbest, padded(stdx::max(vmv, vxv), s));
                 ((stdx::max(vmv, vxv) - vgo_a) - vge_a).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
             }
-            if constexpr (!nw_is_int<T>) {
+            if constexpr (!(nw_is_int<T> && W >= 4)) {
             vd prev([&](int q) { return q == 0 ? bY : NINF; });
             for (int s = 0; s < seg; ++s) {
                 vd O;
@@ -221,7 +221,7 @@ static void score_affine_striped(ScoreJob<T>& job) {
         // column (seeded -inf above); later rounds, and every round of the two-pass form
         // (whose carry pass already saw the opens), carry the extension only.
         // (Integer T: the exact prefix-max carry instead, then Local's max over Y.)
-        if constexpr (nw_is_int<T>) {
+        if constexpr (nw_is_int<T> && W >= 4) {
             int_ramp_for<T>(buf.hramp, ge_a, seg, W, ramp_ge, ramp_ok);
             int_pmax_carry<T, W>(buf.sopenv.data(), nullptr, buf.hramp.data(), nbOpen, T(0), bY, ge_a,
                                  seg, cY, nullptr, nullptr);
@@ -344,7 +344,7 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
     vd vbest = vzero;
     T bD = 0;                               // D of column 0, previous row (M(0,0) = 0)
     [[maybe_unused]] T ramp_ge = ge_a; [[maybe_unused]] bool ramp_ok = false;   // integer T's ramp
-    if constexpr (nw_is_int<T>) if (buf.sopenv.size() < sw) buf.sopenv.resize(sw);
+    if constexpr (nw_is_int<T> && W >= 4) if (buf.sopenv.size() < sw) buf.sopenv.resize(sw);
 
     auto any_gt = [](const vd& x, const vd& y) -> bool {
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
@@ -387,7 +387,7 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
             const vd vxv = stdx::max((uD - vgo_b) - vge_b, uX - vge_b);
             const vd mx = stdx::max(vmv, vxv);
             vxv.copy_to(cX + (std::size_t)s * W, stdx::element_aligned);
-            if constexpr (nw_is_int<T>) {
+            if constexpr (nw_is_int<T> && W >= 4) {
                 // D without Y for now (the carry raises it below); the opens to ov
                 mx.copy_to(cD + (std::size_t)s * W, stdx::element_aligned);
                 ((mx - vgo_a) - vge_a).copy_to(buf.sopenv.data() + (std::size_t)s * W, stdx::element_aligned);
@@ -410,7 +410,7 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
         }
         const vd Olast = Oin;
 
-        if constexpr (nw_is_int<T>) {
+        if constexpr (nw_is_int<T> && W >= 4) {
             int_ramp_for<T>(buf.hramp, ge_a, seg, W, ramp_ge, ramp_ok);
             int_pmax_carry<T, W>(buf.sopenv.data(), nullptr, buf.hramp.data(), nbOpen, T(0), NINF, ge_a,
                                  seg, cY, nullptr, nullptr);

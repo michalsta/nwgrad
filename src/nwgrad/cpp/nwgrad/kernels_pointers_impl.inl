@@ -298,7 +298,7 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
 
             // ── the carry: VY, same-lane striped chain + lazy-F, codes tracked (integer
             // T: the exact prefix max with its codes, int_pmax_carry) ──
-            if constexpr (nw_is_int<T>) {
+            if constexpr (nw_is_int<T> && W >= 4) {
                 int_ramp_for<T>(buf.hramp, ge_a, seg, W, ramp_ge, ramp_ok);
                 int_pmax_carry<T, W>(ov, ok, buf.hramp.data(), nbOpen, nbOpenK, bY, ge_a, seg,
                                      cY + off, yc, qb);

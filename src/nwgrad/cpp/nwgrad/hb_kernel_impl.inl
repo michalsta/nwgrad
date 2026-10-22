@@ -1027,7 +1027,7 @@ static void hb_base_striped(HbBaseJob<T>& job) {
         }
 
         // ── VY carry: same-lane striped chain + exact lazy-F, codes tracked ──
-        if constexpr (nw_is_int<T>) {
+        if constexpr (nw_is_int<T> && W >= 4) {
             int_ramp_for<T>(buf.hramp, ge_a, seg, W, ramp_ge, ramp_ok);
             int_pmax_carry<T, W>(ov, ok, buf.hramp.data(), nbOpen, nbOpenK, bY, ge_a, seg,
                                  cY + off, yc, qb);
