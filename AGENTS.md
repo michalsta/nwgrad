@@ -997,11 +997,19 @@ of the first run, every integer arm at or below its first-run time except sse4 i
 
 | protein sse4 hard, **skynet** (Piledriver, clang 23) | 0.46 \| 0.42 (was 0.59) | 0.85 \| 0.81 (was 0.83) | 1.80 \| 1.63 (was 1.74) |
 | protein sse4 score, skynet | 0.62 \| 0.46 (was 0.83) | 1.06 \| 0.84 (was 0.88) | 1.51 \| 1.42 (was 1.59) |
+| protein neon hard, **spot** (M1, Fedora; gcc 16.2 \| clang 22.1) | 0.32 \| 0.29 (was 0.54) | 0.69 \| 0.54 (was 0.81) | 1.52 \| 1.49 (was 1.51) |
+| protein neon score, spot | 0.41 \| 0.27 (was 0.85) | 0.65 \| 0.45 (was 0.85) | 1.49 \| 1.08 (was 1.44) |
+| DNA neon hard / score, spot | 0.47 / 0.42 (unchanged) | 0.77 / 0.78 (unchanged) | 1.75 / 1.74 (unchanged) |
 
 12 threads: the same picture a little compressed (protein avx2 int16 hard 0.42, int32 0.68).
 On Piledriver the protein score arms kept the largest gcc-vs-clang residue (int16 0.70,
 int32 0.74: clang's unrolled 128-bit loops), and int32 score-only there ties float32 — the
 3-pass carry's row traffic costs what the 1-cycle max saves on a core that cracks every op.
+spot (NEON, W = 8 for int16, 4 for int32, 2 for int64) verified the final state green (ctest
+17/17, Python 4371 passed) and shows the same shape: the prefix-max carry took the protein
+int16 hard step from 0.54 to 0.32 of float32 and int32 from 0.81 to 0.69; int64 stays on the
+chain (the W >= 4 gate) and is unchanged; on the DNA inter-pair arms gcc beats clang there
+(clang/gcc 1.06-1.33), on the protein striped arms clang leads (0.80-0.94), as on x86.
 gcc against clang on the final state, protein: int16 0.88-0.96 at avx2 and 0.78-0.86 at
 sse4 (clang faster), int32 0.80-0.96 / 0.84-0.94, int64 0.86-1.03 — the remaining gap is
 clang's unrolling and scheduling of the striped loops, the same residue the float kernels

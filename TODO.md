@@ -113,10 +113,10 @@ DiscrimAlign does: it passes the logical core count.
   helpers and `int_pmax_carry<T, 16/32>` compile under gcc 16 and clang 22/23 but are
   untested and unmeasured there. First thing to run when solace is up: ctest, the Python
   suite, `tools/bench_int_cc.sh` at avx512.
-- spot (NEON) ran the first state green (ctest, Python suite) but went DOWN mid-way through
-  the clang build of `bench_int_cc.sh` (16 GB, every core on five-type level TUs: an OOM
-  by all signs); rerun there with `CMAKE_BUILD_PARALLEL_LEVEL=3`, detached (nohup), and
-  re-verify the final state (the `W >= 4` gate makes int64 keep the chain at NEON's W=2).
+- spot (NEON): the final state is verified (ctest 17/17, Python suite, `bench_int_cc.sh`
+  at neon, 2026-10-22; built with `CMAKE_BUILD_PARALLEL_LEVEL=3` after the first attempt
+  took the 16 GB laptop down). Note for long jobs there: take a `systemd-inhibit` (see
+  the fleet notes) — the laptop slept after this run finished.
 - gcc vs clang on the integer striped kernels, final state: clang still 4-20 % faster
   (nighthaven protein int16/int32: gcc at 0.80-0.96 of clang's time at avx2, 0.78-0.94 at
   sse4; Piledriver int16 score 0.70). What is left is clang's x2 unrolling and interleaved
