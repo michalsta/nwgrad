@@ -113,7 +113,8 @@ def main():
                 kw = dict(gap_model=args.gap_model, mode=args.mode, n_threads=th, kernel=isa)
                 # the arms, built up front (interleaved timing below)
                 arms = {}
-                for t in ["control"] + args.types:
+                # (the double arm is always built: it is the oracle for the check below)
+                for t in ["control"] + args.types + (["double"] if "double" not in args.types else []):
                     cls = batch_class(nwgrad, "float32" if t == "control" else t)
                     hard = cls(sa, sb, p, **kw)
                     none = cls(sa, sb, p, grad_mode="none", **kw)
@@ -131,9 +132,11 @@ def main():
                     for g, r in zip(got, ref):
                         if not np.array_equal(g, r):
                             raise SystemExit(f"{fx} {isa} {t}: results differ from double")
-                res = {t: [0.0, 0.0, 0.0] for t in arms}
+                timed = ["control"] + args.types
+                res = {t: [0.0, 0.0, 0.0] for t in timed}
                 for r in range(args.repeats):
-                    for t, (hard, none, stream) in arms.items():
+                    for t in timed:
+                        hard, none, stream = arms[t]
                         for k, fn in enumerate([lambda: hard.score_and_grad(), lambda: none.score_and_grad(),
                                                 lambda: stream.align(sa, sb, p, kernel=isa)]):
                             dt = timeit(fn, 1, args.min_time)
