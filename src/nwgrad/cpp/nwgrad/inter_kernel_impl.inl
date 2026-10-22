@@ -146,7 +146,7 @@ struct InterCommon {
     // of column j (-(go_a + j*ge_a) of each lane's row 0; linear: -j*ge_a).
     ivd border_x(int i) const {
         return ivlanes<ivd, IW>([&](int l) {
-            return (i <= J.m[l]) ? J.tr[l].bx0[i] : -std::numeric_limits<T>::infinity();
+            return (i <= J.m[l]) ? J.tr[l].bx0[i] : nw_ninf<T>;
         });
     }
     ivd border_y0(int j, bool linear) const {
@@ -211,7 +211,7 @@ struct InterCommon {
     ivd border_mask(ivd v, int k, const int* lim) const {
         ivd kv, limv;
         for (int l = 0; l < IW; ++l) { kv[l] = static_cast<T>(k); limv[l] = static_cast<T>(lim[l]); }
-        return ivsel(kv <= limv, v, ivd{} + (-std::numeric_limits<T>::infinity()));
+        return ivsel(kv <= limv, v, ivd{} + nw_ninf<T>);
     }
     // Local: the row's first strict best folded into the running best (row-major order).
     void best_out(const ivd& best, const ivd& bi, const ivd& bj) const {
@@ -246,7 +246,7 @@ static void inter_fill_linear(InterJobT<T>& J) noexcept {
     const int n = J.n, M = J.M, st = n + 1;
     const bool local = J.align_mode == 1;
     ivd* H = reinterpret_cast<ivd*>(J.VM);
-    const ivd z = {}, ninf = z + (-std::numeric_limits<T>::infinity()), one = z + T(1);
+    const ivd z = {}, ninf = z + nw_ninf<T>, one = z + T(1);
 
     if (local) {
         for (int j = 0; j <= n; ++j) H[j] = z;
@@ -321,7 +321,7 @@ static void inter_fill_affine(InterJobT<T>& J) noexcept {
     ivd* VM = reinterpret_cast<ivd*>(J.VM);
     ivd* VX = reinterpret_cast<ivd*>(J.VX);
     ivd* VY = reinterpret_cast<ivd*>(J.VY);
-    const ivd z = {}, ninf = z + (-std::numeric_limits<T>::infinity()), one = z + T(1);
+    const ivd z = {}, ninf = z + nw_ninf<T>, one = z + T(1);
 
     // Borders, as viterbi_affine_simd's Full path sets them.
     for (int j = 0; j <= n; ++j) { VM[j] = ninf; VX[j] = ninf; VY[j] = ninf; }
@@ -444,7 +444,7 @@ static void inter_score_affine(InterJobT<T>& J) noexcept {
     ivd* VM = reinterpret_cast<ivd*>(J.VM);
     ivd* VX = reinterpret_cast<ivd*>(J.VX);
     ivd* VY = reinterpret_cast<ivd*>(J.VY);
-    const ivd z = {}, ninf = z + (-std::numeric_limits<T>::infinity());
+    const ivd z = {}, ninf = z + nw_ninf<T>;
     ivd go_a = z + J.go_a, ge_a = z + J.ge_a, go_b = z + J.go_b, ge_b = z + J.ge_b;
 
     // row 0, as inter_fill_affine leaves it
@@ -581,7 +581,7 @@ static void inter_score_affine_pos(InterJobT<T>& J) noexcept {
     const bool local = J.align_mode == 1;
     ivd* D = reinterpret_cast<ivd*>(J.VM);
     ivd* X = reinterpret_cast<ivd*>(J.VX);
-    const ivd z = {}, ninf = z + (-std::numeric_limits<T>::infinity());
+    const ivd z = {}, ninf = z + nw_ninf<T>;
     ivd go_a = z + J.go_a, ge_a = z + J.ge_a, go_b = z + J.go_b, ge_b = z + J.ge_b;
 
     // row 0: D = max(M, X, Y) of inter_score_affine's row 0, X as there

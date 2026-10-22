@@ -67,7 +67,7 @@ struct HbRows {
     // Row t's striped profile row (built here: a tracked block keeps no shared profile).
     const T* profile(T* dst, const T* blk, int nalpha, const unsigned char* b, int b_start,
                      int b_step, int NC, int seg, int W, int t) const {
-        const T ninf = -std::numeric_limits<T>::infinity();
+        const T ninf = nw_ninf<T>;
         const T* row = blk + (std::size_t)tr.rs[res(t)] * nalpha;
         for (int l = 0; l < W; ++l)
             for (int s = 0; s < seg; ++s) {
@@ -88,8 +88,7 @@ static inline void hb_ramp(T* rmp, T ge_a, int seg, int W) {
 }
 template <class T>
 static inline bool same_bits(T x, T y) noexcept {
-    if constexpr (sizeof(T) == 8) return std::bit_cast<uint64_t>(x) == std::bit_cast<uint64_t>(y);
-    else                          return std::bit_cast<uint32_t>(x) == std::bit_cast<uint32_t>(y);
+    return std::bit_cast<nw_bits_t<T>>(x) == std::bit_cast<nw_bits_t<T>>(y);
 }
 
 // One half-sweep of a Hirschberg block.  Rows are walked by (a_start, a_step) and
@@ -99,7 +98,7 @@ template <class T, bool Tr = false>
 static void hb_sweep_striped(HbJob<T>& job) {
     using vd = stdx::native_simd<T>;
     const int W = (int)vd::size();
-    const T NINF = -std::numeric_limits<T>::infinity();
+    const T NINF = nw_ninf<T>;
 
     const int H = job.H, NC = job.ncols;
     T go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;
@@ -355,7 +354,7 @@ template <class T, bool Tr = false>
 static void hb_sweep_striped_pmax(HbJob<T>& job) {
     using vd = stdx::native_simd<T>;
     const int W = (int)vd::size();
-    const T NINF = -std::numeric_limits<T>::infinity();
+    const T NINF = nw_ninf<T>;
 
     const int H = job.H, NC = job.ncols;
     T go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;
@@ -575,7 +574,7 @@ template <class T, bool Local, bool Pmax, bool Tr = false>
 static void hb_scan_impl(HbScanJob<T>& job) {
     using vd = stdx::native_simd<T>;
     constexpr int W = (int)vd::size();
-    const T NINF = -std::numeric_limits<T>::infinity();
+    const T NINF = nw_ninf<T>;
 
     const int H = job.H, NC = job.ncols;
     T go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;
@@ -851,7 +850,7 @@ template <class T, bool Tr = false>
 static void hb_base_striped(HbBaseJob<T>& job) {
     using vd = stdx::native_simd<T>;
     const int W = (int)vd::size();
-    const T NINF = -std::numeric_limits<T>::infinity();
+    const T NINF = nw_ninf<T>;
 
     const int H = job.H, NC = job.ncols;
     T go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;

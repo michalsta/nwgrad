@@ -75,7 +75,7 @@ static inline void striped_row_best(const T* cM, const T* cX, const T* cY, const
                                     int seg, int i, T& best, int& bi, int& bj, int& btbl) {
     using vt = stdx::native_simd<T>;
     constexpr int W = (int)vt::size();
-    vt lmax(-std::numeric_limits<T>::infinity()), ls(T(0));
+    vt lmax(nw_ninf<T>), ls(T(0));
     for (int s = 0; s < seg; ++s) {
         const std::size_t o = (std::size_t)s * W;
         vt vm, vx, vy, vp;
@@ -112,7 +112,7 @@ static inline const typename V::value_type* striped_pad(V& v, int n, int seg, in
     if (v.size() < sw) v.resize(sw);
     for (int l = 0; l < W; ++l)
         for (int s = 0; s < seg; ++s)
-            v[(std::size_t)s * W + l] = (l * seg + s + 1 <= n) ? T(0) : -std::numeric_limits<T>::infinity();
+            v[(std::size_t)s * W + l] = (l * seg + s + 1 <= n) ? T(0) : nw_ninf<T>;
     return v.data();
 }
 
@@ -160,7 +160,7 @@ static inline V lane_shift_in(V x, typename V::value_type b) {
 template <class T>
 static inline void striped_profile_row(T* dst, const T* row, const unsigned char* b,
                                        int n, int seg, int W) {
-    const T ninf = -std::numeric_limits<T>::infinity();
+    const T ninf = nw_ninf<T>;
     for (int l = 0; l < W; ++l)
         for (int s = 0; s < seg; ++s) {
             const int j = l * seg + s + 1;
@@ -217,7 +217,7 @@ template <class T, bool Local, bool Tr = false>
 static void striped_affine_full(ViterbiJob<T>& job) {
     using vd = stdx::native_simd<T>;
     const int W = (int)vd::size();                       // native T-lane count for this level
-    const T K_NINF = -std::numeric_limits<T>::infinity();
+    const T K_NINF = nw_ninf<T>;
 
     const int m = job.m, n = job.n;
     const int nalpha = job.nalpha;

@@ -9,6 +9,8 @@
 #include <cstdlib>
 #include <new>
 #include <vector>
+
+#include "scalar_traits.hpp"
 #if defined(__linux__)
 #  include <sys/mman.h>
 #endif

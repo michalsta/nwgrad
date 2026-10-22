@@ -36,7 +36,7 @@ template <class T, bool Local, bool Tr = false>
 static void striped_affine_full_ptr(ViterbiJob<T>& job) {
     using vd = stdx::native_simd<T>;
     constexpr int W = (int)stdx::native_simd<T>::size();
-    const T K_NINF = -std::numeric_limits<T>::infinity();
+    const T K_NINF = nw_ninf<T>;
 
     const int m = job.m, n = job.n;
     const int nalpha = job.nalpha;

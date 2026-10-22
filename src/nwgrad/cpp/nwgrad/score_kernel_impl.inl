@@ -36,7 +36,7 @@ template <class T, bool Local, bool Fused, bool Tr = false>
 static void score_affine_striped(ScoreJob<T>& job) {
     using vd = stdx::native_simd<T>;
     const int W = (int)vd::size();
-    const T NINF = -std::numeric_limits<T>::infinity();
+    const T NINF = nw_ninf<T>;
 
     const int m = job.m, n = job.n, nalpha = job.nalpha;
     T go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;
@@ -264,7 +264,7 @@ template <class T, bool Local, bool MOnly, bool Tr = false>
 static void score_affine_striped_pos(ScoreJob<T>& job) {
     using vd = stdx::native_simd<T>;
     const int W = (int)vd::size();
-    const T NINF = -std::numeric_limits<T>::infinity();
+    const T NINF = nw_ninf<T>;
 
     const int m = job.m, n = job.n, nalpha = job.nalpha;
     T go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;

@@ -534,7 +534,7 @@ struct Aligner {
     // regardless of which buffer was used.
     double score() const {
         if (fwdbwd_is_newest_) return log_z_;
-        if (any_viterbi_done_) return viterbi_score_;
+        if (any_viterbi_done_) return static_cast<double>(viterbi_score_);
         throw std::logic_error(
             "nwgrad: call compute_viterbi() or compute_forward_back() before score()");
     }
@@ -646,7 +646,7 @@ struct Aligner {
                     job.buf = &buf;
                     if (tr_) fill_track_job_(job.tr, true, static_cast<size_t>(n_) + 16, lin);
                     fn(job);
-                    return job.score;
+                    return static_cast<double>(job.score);
                 }
             }
             if constexpr (GM == GapModel::Linear) return score_linear_scalar(buf);
@@ -703,7 +703,7 @@ struct Aligner {
     // `stride`: the group's row length (n+1 of its longest B) when B lengths are ragged
     // (InterJobT::nb); 0 = this problem's own n+1.
     void adopt_interleaved(const DpBuffer& buf, int W, int lane,
-                           double local_best, int best_i, int best_j, size_t stride = 0) {
+                           T local_best, int best_i, int best_j, size_t stride = 0) {
         check_problem();
         inter_stride_ = stride ? stride : stride_;
         tables_striped_ = false;
@@ -713,13 +713,13 @@ struct Aligner {
         if constexpr (GM == GapModel::Linear) {
             // Linear: H in buf.H's slot of the interleaved fill (InterJob.linear).
             if constexpr (AM == AlignMode::Local) {
-                viterbi_score_ = static_cast<T>(local_best);
+                viterbi_score_ = local_best;
                 best_i_ = best_i; best_j_ = best_j;
             } else {
                 viterbi_score_ = rat(buf.H, m_, n_);
             }
         } else if constexpr (AM == AlignMode::Local) {
-            viterbi_score_ = static_cast<T>(local_best);
+            viterbi_score_ = local_best;
             best_i_ = best_i; best_j_ = best_j; best_tbl_ = TBTable::M;
             if (best_i > 0) {
                 const T mv = rat(buf.VM, best_i, best_j), xv = rat(buf.VX, best_i, best_j),
@@ -840,7 +840,10 @@ struct Aligner {
     double soft_temperature() const noexcept { return soft_temp_; }
 
 private:
+    // The soft path's sentinel (always double) and the hard path's (in T; see
+    // scalar_traits.hpp: -inf for floating T, lowest()/2 for an integer T).
     static constexpr double NEG_INF = -std::numeric_limits<double>::infinity();
+    static constexpr T      NINF    = nw_ninf<T>;
 
     // ── Problem state ─────────────────────────────────────────────────────────
     std::span<const uint8_t> a_idx_, b_idx_;   // alphabet indices, not characters
@@ -1121,8 +1124,7 @@ private:
         T csum = static_cast<T>(0);     // C_{s-1}: the sum over rows before the current run
         size_t s = 1;                   // the current run's first row
         for (size_t i = 1; i <= m; ++i) {
-            if (i > 1 && std::bit_cast<std::conditional_t<sizeof(T) == 8, uint64_t, uint32_t>>(tgeb_[i]) !=
-                         std::bit_cast<std::conditional_t<sizeof(T) == 8, uint64_t, uint32_t>>(tgeb_[i - 1])) {
+            if (i > 1 && std::bit_cast<nw_bits_t<T>>(tgeb_[i]) != std::bit_cast<nw_bits_t<T>>(tgeb_[i - 1])) {
                 // close the run [s, i-1]
                 csum = (s == 1) ? static_cast<T>(i - 1) * tgeb_[i - 1]
                                 : csum + static_cast<T>(i - s) * tgeb_[i - 1];
@@ -1225,7 +1227,7 @@ private:
     bool fwdbwd_is_newest_  = false; // true if forward-back ran more recently than viterbi
 
     // ── Scalar results (written by every compute_viterbi / compute_forward_back)
-    double viterbi_score_ = 0.0;
+    T      viterbi_score_ = T(0);   // in T; score() promotes (exact below 2^53)
     double log_z_         = 0.0;
     int    best_i_ = 0, best_j_ = 0;
 
@@ -1585,24 +1587,22 @@ private:
             for (int i = 0; i <= m_; ++i) {
                 int lo, hi; band_row_span(i, lo, hi);
                 auto* row = vec.data() + static_cast<size_t>(i) * stride_;
-                std::fill(row + lo, row + hi + 1, NEG_INF);
+                std::fill(row + lo, row + hi + 1, nw_ninf<typename V::value_type>);
             }
         }
     }
 
     // Fill `vec` with `value`.  Full: the whole (m+1)×(n+1) table.  GuideBanded:
-    // only the band region (O(m·band)).  Element-generic; `value` is passed as double
-    // and std::fill converts it to the table's element type (NEG_INF stays -inf).
-    template <class V> void band_fill(V& vec, double value) const {
+    // only the band region (O(m·band)).  Element-generic: `value` is the table's own
+    // element type (NINF for the T tables, NEG_INF for the double soft tables).
+    template <class V> void band_fill(V& vec, typename V::value_type value) const {
         if constexpr (AB == AlignBand::Full) {
-            std::fill(vec.begin(), vec.begin() + static_cast<ptrdiff_t>(sz_),
-                      static_cast<typename V::value_type>(value));
+            std::fill(vec.begin(), vec.begin() + static_cast<ptrdiff_t>(sz_), value);
         } else {
             for (int i = 0; i <= m_; ++i) {
                 int lo, hi; band_row_span(i, lo, hi);
                 auto* row = vec.data() + static_cast<size_t>(i) * stride_;
-                std::fill(row + lo, row + hi + 1,
-                          static_cast<typename V::value_type>(value));
+                std::fill(row + lo, row + hi + 1, value);
             }
         }
     }
@@ -2103,7 +2103,7 @@ private:
         }
 
         best_i_ = 0; best_j_ = 0;
-        double best_local = 0.0;
+        T best_local = T(0);
         // Row pointers, not rat()/at(): run_viterbi cleared the layout flags, so H is
         // row-major here, and cell_index()'s layout switch inside the loop is dead weight
         // that gcc unswitches and clang does not (clang/gcc 1.77x on this fill).  The
@@ -2180,7 +2180,7 @@ private:
         }
         int bi = 0, bj = 0;   // locals: best_i_/best_j_ are members (see below)
         const int n = n_;     // ditto: a member bound is reloaded after every byte store
-        double best_local = 0.0;
+        T best_local = T(0);
         const unsigned char* __restrict bcode = b_idx_.data();
         for (int i = 1; i <= m_; ++i) {
             unsigned char* __restrict d = D + static_cast<size_t>(i) * st;
@@ -2220,6 +2220,7 @@ private:
                 if constexpr (local) {
                     v = std::max(v, static_cast<T>(0));
 #if defined(__GNUC__) && !defined(__clang__) && defined(__aarch64__)
+                  if constexpr (std::is_floating_point_v<T>) {
                     // gcc on AArch64 turned every form of the float stop compare into a
                     // branch around the code (out of line, mispredicted where many cells
                     // clamp to 0) and branched on the best cell too: 1.8x clang.  So: stop
@@ -2227,13 +2228,17 @@ private:
                     // without the sign are 0", an integer test; the best cell as selects,
                     // its row taken once after the row (0.53x).  x86 keeps the plain form:
                     // this one was 5-7 % slower there under both compilers.
-                    using U = std::conditional_t<sizeof(T) == 8, std::uint64_t, std::uint32_t>;
+                    using U = nw_bits_t<T>;
                     const unsigned z = static_cast<unsigned>((std::bit_cast<U>(v) << 1) == 0);
                     c = static_cast<unsigned char>(c | (3u * z));
                     const bool up = v > best_local;
-                    best_local = up ? static_cast<double>(v) : best_local;
+                    best_local = up ? v : best_local;
                     bj = up ? j : bj;
                     hit |= static_cast<int>(up);
+                  } else {   // integer T: the plain form (a `v <= 0` on an int is one compare)
+                    c = static_cast<unsigned char>(c | (3u * static_cast<unsigned>(v <= static_cast<T>(0))));
+                    if (v > best_local) { best_local = v; bi = i; bj = j; }
+                  }
 #else
                     // c is 0..2: OR-ing 3 sets the stop code without the branch gcc made
                     c = static_cast<unsigned char>(c | (3u * static_cast<unsigned>(v <= static_cast<T>(0))));
@@ -2366,11 +2371,11 @@ private:
 
         // ── row 0 ────────────────────────────────────────────────────────────
         for (std::size_t j = 0; j <= static_cast<std::size_t>(n_); ++j) {
-            if constexpr (AM == AlignMode::Local) { pM[j] = 0; pX[j] = NEG_INF; pY[j] = NEG_INF; }
+            if constexpr (AM == AlignMode::Local) { pM[j] = 0; pX[j] = NINF; pY[j] = NINF; }
             else {
-                pM[j] = (j == 0) ? static_cast<T>(0) : NEG_INF;
-                pX[j] = NEG_INF;
-                pY[j] = (j == 0) ? NEG_INF : -(go_a + static_cast<T>(j) * ge_a);
+                pM[j] = (j == 0) ? static_cast<T>(0) : NINF;
+                pX[j] = NINF;
+                pY[j] = (j == 0) ? NINF : -(go_a + static_cast<T>(j) * ge_a);
             }
             dM[j] = (AM == AlignMode::Local || j == 0) ? 3 : 3;   // row 0 is a start
             dX[j] = 0;
@@ -2391,10 +2396,10 @@ private:
                 srow = blkT_ + static_cast<size_t>(rs_[static_cast<size_t>(i) - 1]) * static_cast<size_t>(nalpha_);
             }
             // column 0 of this row
-            if constexpr (AM == AlignMode::Local) { cM[0] = 0; cX[0] = NEG_INF; }
-            else if constexpr (Tr) { cM[0] = NEG_INF; cX[0] = tbx0_[static_cast<size_t>(i)]; }
-            else { cM[0] = NEG_INF; cX[0] = -(go_b + static_cast<T>(i) * ge_b); }
-            cY[0] = NEG_INF;
+            if constexpr (AM == AlignMode::Local) { cM[0] = 0; cX[0] = NINF; }
+            else if constexpr (Tr) { cM[0] = NINF; cX[0] = tbx0_[static_cast<size_t>(i)]; }
+            else { cM[0] = NINF; cX[0] = -(go_b + static_cast<T>(i) * ge_b); }
+            cY[0] = NINF;
             dM[rb] = 3;
             dX[rb] = (i <= 1) ? 0 : 1;    // (1,0) opens from M(0,0); deeper rows extend X
             dY[rb] = 0;
@@ -2537,14 +2542,14 @@ private:
         const int W = j1 - j0;
 
         // Row i0: the block's origin, then Y moves rightward along it.
-        pM[0] = in_x ? static_cast<T>(NEG_INF) : static_cast<T>(0);
+        pM[0] = in_x ? NINF : static_cast<T>(0);
         // An inherited X run (in_x) may only CONTINUE: the origin feeds nothing but the
         // first row's column-0 X (below) — see hb_solve's note on boundary states.
-        pX[0] = static_cast<T>(NEG_INF);
-        pY[0] = static_cast<T>(NEG_INF);
+        pX[0] = NINF;
+        pY[0] = NINF;
         for (int c = 1; c <= W; ++c) {
-            pM[c] = static_cast<T>(NEG_INF);
-            pX[c] = static_cast<T>(NEG_INF);
+            pM[c] = NINF;
+            pX[c] = NINF;
             pY[c] = std::max({pM[c-1] - go_a - ge_a, pX[c-1] - go_a - ge_a, pY[c-1] - ge_a});
         }
 
@@ -2554,10 +2559,10 @@ private:
                 go_a = hb_go_a(r); ge_a = hb_ge_a(r); go_b = hb_go_b(r, false); ge_b = hb_ge_b(r, false);
                 if constexpr (Pmax) for (int k = 0; k <= W; ++k) rr[k] = static_cast<T>(k) * ge_a;
             }
-            cM[0] = static_cast<T>(NEG_INF);
+            cM[0] = NINF;
             cX[0] = std::max({pM[0] - go_b - ge_b, pX[0] - ge_b, pY[0] - go_b - ge_b});
             if (in_x && r == i0 + 1) cX[0] = static_cast<T>(0) - ge_b;   // the run continues
-            cY[0] = static_cast<T>(NEG_INF);
+            cY[0] = NINF;
             // The running prefix max over Q[k] = g[k] + k*ge_a, seeded with the column-0
             // border folded in as k = -1.  Unused (and cold) when Pmax is false.
             T P = cY[0] - ge_a;
@@ -2597,14 +2602,14 @@ private:
         const int W = j1 - j0;
 
         // Reversed column offset d = j1 - j, so d grows leftward from the block's end.
-        pM[0] = out_x ? static_cast<T>(NEG_INF) : static_cast<T>(0);
+        pM[0] = out_x ? NINF : static_cast<T>(0);
         // A run continuing past the corner (out_x) must ENTER it vertically: the corner
         // feeds nothing but the first reversed row's column-0 X (below).
-        pX[0] = static_cast<T>(NEG_INF);
-        pY[0] = static_cast<T>(NEG_INF);
+        pX[0] = NINF;
+        pY[0] = NINF;
         for (int d = 1; d <= W; ++d) {
-            pM[d] = static_cast<T>(NEG_INF);
-            pX[d] = static_cast<T>(NEG_INF);
+            pM[d] = NINF;
+            pX[d] = NINF;
             pY[d] = std::max({pM[d-1] - go_a - ge_a, pX[d-1] - go_a - ge_a, pY[d-1] - ge_a});
         }
 
@@ -2614,10 +2619,10 @@ private:
                 go_a = hb_go_a(r); ge_a = hb_ge_a(r); go_b = hb_go_b(r + 1, true); ge_b = hb_ge_b(r + 1, true);
                 if constexpr (Pmax) for (int k = 0; k <= W; ++k) rr[k] = static_cast<T>(k) * ge_a;
             }
-            cM[0] = static_cast<T>(NEG_INF);
+            cM[0] = NINF;
             cX[0] = std::max({pM[0] - go_b - ge_b, pX[0] - ge_b, pY[0] - go_b - ge_b});
             if (out_x && r == i1 - 1) cX[0] = static_cast<T>(0) - ge_b;   // enters the corner vertically
-            cY[0] = static_cast<T>(NEG_INF);
+            cY[0] = NINF;
             T P = cY[0] - ge_a;
             for (int d = 1; d <= W; ++d) {
                 // Mirrored diagonal: this step pairs a[r] with b[j1-d], i.e. subT(r+1, j1-d+1).
@@ -2731,13 +2736,13 @@ private:
             return (vx >= vy) ? 1 : 2;
         };
 
-        pM[0] = in_x ? static_cast<T>(NEG_INF) : static_cast<T>(0);
-        pX[0] = static_cast<T>(NEG_INF);   // in_x: only the first row's column-0 X continues it
-        pY[0] = static_cast<T>(NEG_INF);
+        pM[0] = in_x ? NINF : static_cast<T>(0);
+        pX[0] = NINF;   // in_x: only the first row's column-0 X continues it
+        pY[0] = NINF;
         dM[0] = 3; dX[0] = 3; dY[0] = 3;
         for (int c = 1; c <= W; ++c) {
-            pM[c] = static_cast<T>(NEG_INF);
-            pX[c] = static_cast<T>(NEG_INF);
+            pM[c] = NINF;
+            pX[c] = NINF;
             const T uy = pM[c-1] - go_a - ge_a, vy = pX[c-1] - go_a - ge_a, wy = pY[c-1] - ge_a;
             pY[c] = std::max({uy, vy, wy});
             dM[c] = 3; dX[c] = 3; dY[static_cast<std::size_t>(c)] = pick(uy, vy, wy);
@@ -2750,9 +2755,9 @@ private:
                 go_b = hb_go_b(i0 + r, false); ge_b = hb_ge_b(i0 + r, false);
             }
             const T ux0 = pM[0] - go_b - ge_b, vx0 = pX[0] - ge_b, wx0 = pY[0] - go_b - ge_b;
-            cM[0] = static_cast<T>(NEG_INF);
+            cM[0] = NINF;
             cX[0] = std::max({ux0, vx0, wx0});
-            cY[0] = static_cast<T>(NEG_INF);
+            cY[0] = NINF;
             dM[rb] = 3; dX[rb] = pick(ux0, vx0, wx0); dY[rb] = 3;
             if (in_x && r == 1) { cX[0] = static_cast<T>(0) - ge_b; dX[rb] = 1; }   // continues the run
             for (int c = 1; c <= W; ++c) {
@@ -2882,7 +2887,7 @@ private:
         // Tracked: the open refunded is that of the first row below the cut, DP row p+1
         // (see hb_reverse_rows_).
         const T go_b = tr_ ? tgob_[static_cast<size_t>(p) + 1] : static_cast<T>(params_->gap_open_b);
-        T best = static_cast<T>(NEG_INF);
+        T best = NINF;
         int cstar = 0;
         bool span = false;
         for (int c = 0; c <= W; ++c) {
@@ -2891,7 +2896,7 @@ private:
             const T g = std::max({rM[d], rX[d], rY[d]});
             const T plain = f + g;
             if (plain > best) { best = plain; cstar = c; span = false; }
-            if (FX[c] > static_cast<T>(NEG_INF) && rX[d] > static_cast<T>(NEG_INF)) {
+            if (FX[c] > NINF && rX[d] > NINF) {
                 const T joined = FX[c] + rX[d] + go_b;
                 if (joined > best) { best = joined; cstar = c; span = true; }
             }
@@ -2935,7 +2940,7 @@ private:
             }
             prev = op;
         }
-        viterbi_score_ = static_cast<double>(s);
+        viterbi_score_ = s;
         best_i_ = m_; best_j_ = n_;
         best_tbl_ = hops_.empty() ? TBTable::M
                   : (hops_.back() == 1 ? TBTable::X
@@ -3019,11 +3024,11 @@ private:
 
         // Row 0.  Local: M = 0 for every column (fresh start anywhere).  Global: the
         // Y-gap-open series, so the reverse pass computes the suffixes' global alignment.
-        pM[0] = static_cast<T>(0); pX[0] = static_cast<T>(NEG_INF); pY[0] = static_cast<T>(NEG_INF);
+        pM[0] = static_cast<T>(0); pX[0] = NINF; pY[0] = NINF;
         for (int c = 1; c <= NC; ++c) {
-            if (local) { pM[c] = static_cast<T>(0); pX[c] = static_cast<T>(NEG_INF); pY[c] = static_cast<T>(NEG_INF); }
+            if (local) { pM[c] = static_cast<T>(0); pX[c] = NINF; pY[c] = NINF; }
             else {
-                pM[c] = static_cast<T>(NEG_INF); pX[c] = static_cast<T>(NEG_INF);
+                pM[c] = NINF; pX[c] = NINF;
                 pY[c] = std::max((std::max(pM[c-1], pX[c-1]) - go_a) - ge_a, pY[c-1] - ge_a);
             }
         }
@@ -3037,9 +3042,9 @@ private:
                 go_b = hb_go_b(arow + 1, reverse); ge_b = hb_ge_b(arow + 1, reverse);
                 if (pmax) for (int k = 0; k < NC; ++k) rmp[k] = static_cast<T>(k) * ge_a;
             }
-            cM[0] = local ? static_cast<T>(0) : static_cast<T>(NEG_INF);
+            cM[0] = local ? static_cast<T>(0) : NINF;
             cX[0] = std::max(std::max((pM[0] - go_b) - ge_b, pX[0] - ge_b), (pY[0] - go_b) - ge_b);
-            cY[0] = static_cast<T>(NEG_INF);
+            cY[0] = NINF;
             T P = cY[0] - ge_a;   // Pmax: the running prefix max, the border as its seed
             for (int c = 1; c <= NC; ++c) {
                 const int bcol = b_start + (c - 1) * b_step;       // 0-based sequence col
@@ -3078,7 +3083,7 @@ private:
 
         // No positive-scoring local alignment: the empty alignment (score 0) is optimal.
         if (s_fwd <= static_cast<T>(0) || ie <= 0 || je <= 0) {
-            viterbi_score_ = 0.0;
+            viterbi_score_ = T(0);
             best_i_ = 0; best_j_ = 0; best_tbl_ = TBTable::M;
             hirschberg_ = true;
             return;
@@ -3103,7 +3108,7 @@ private:
             else              { if (prev != 2) s -= row_go_a(i); s -= row_ge_a(i); ++j; }
             prev = op;
         }
-        viterbi_score_ = static_cast<double>(s);
+        viterbi_score_ = s;
         best_i_ = ie; best_j_ = je;
         best_tbl_ = hops_.empty() ? TBTable::M
                   : (hops_.back() == 1 ? TBTable::X
@@ -3221,7 +3226,7 @@ private:
         lhb_sweep(buf, false, i0, p, j0, j1, buf.hsM.data());
         lhb_sweep(buf, true, p, i1, j0, j1, buf.hra.data());
         const T* F = buf.hsM.data(); const T* R = buf.hra.data();
-        T best = static_cast<T>(NEG_INF);
+        T best = NINF;
         int cstar = 0;
         for (int c = 0; c <= W; ++c) {
             const T v = F[c] + R[W - c];
@@ -3262,7 +3267,7 @@ private:
                 }
             }
             if (!(best > static_cast<T>(0))) {
-                viterbi_score_ = 0.0; best_i_ = 0; best_j_ = 0; hirschberg_ = true; return;
+                viterbi_score_ = T(0); best_i_ = 0; best_j_ = 0; hirschberg_ = true; return;
             }
             // Unclamped global-suffix scan over [0, ie) x [0, je): the start maximizing
             // the box's global score (any argmax scores the local optimum).
@@ -3303,7 +3308,7 @@ private:
             else if (op == 1) { ++i; sc -= gb(i); }
             else              { sc -= ga(i); ++j; }
         }
-        viterbi_score_ = static_cast<double>(sc);
+        viterbi_score_ = sc;
         best_i_ = i_end; best_j_ = j_end;
         hirschberg_ = true;
     }
@@ -3431,7 +3436,7 @@ private:
         T* pM = buf.qM.data(); T* pX = buf.qX.data(); T* pY = buf.qY.data();
         T* cM = buf.rM.data(); T* cX = buf.rX.data(); T* cY = buf.rY.data();
         constexpr bool local = AM == AlignMode::Local;
-        const T ninf = static_cast<T>(NEG_INF);
+        const T ninf = NINF;
         pM[0] = static_cast<T>(0); pX[0] = ninf; pY[0] = ninf;
         for (int j = 1; j <= n_; ++j) {
             pM[j] = local ? static_cast<T>(0) : ninf;
@@ -3546,9 +3551,9 @@ private:
     }
     template <bool Tr>
     void viterbi_affine_impl(DpBuffer& buf) {
-        band_fill(buf.VM, NEG_INF);
-        band_fill(buf.VX, NEG_INF);
-        band_fill(buf.VY, NEG_INF);
+        band_fill(buf.VM, NINF);
+        band_fill(buf.VX, NINF);
+        band_fill(buf.VY, NINF);
 
         // Gap penalties in the Viterbi precision T.  Converting once, up front, is what
         // makes this scalar fill bit-exact with the T-typed simd kernel: both then do
