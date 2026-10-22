@@ -995,7 +995,13 @@ of the first run, every integer arm at or below its first-run time except sse4 i
 | protein sse4 score | 0.33 \| 0.27 (was 0.53) | 0.54 \| 0.52 (was 0.58) | 1.12 \| 0.99 (was 1.16) |
 | DNA avx2 hard / score | 0.61 / 0.57 (unchanged) | 0.96 / 0.95 (unchanged) | 2.57 / 3.05 (unchanged) |
 
+| protein sse4 hard, **skynet** (Piledriver, clang 23) | 0.46 \| 0.42 (was 0.59) | 0.85 \| 0.81 (was 0.83) | 1.80 \| 1.63 (was 1.74) |
+| protein sse4 score, skynet | 0.62 \| 0.46 (was 0.83) | 1.06 \| 0.84 (was 0.88) | 1.51 \| 1.42 (was 1.59) |
+
 12 threads: the same picture a little compressed (protein avx2 int16 hard 0.42, int32 0.68).
+On Piledriver the protein score arms kept the largest gcc-vs-clang residue (int16 0.70,
+int32 0.74: clang's unrolled 128-bit loops), and int32 score-only there ties float32 — the
+3-pass carry's row traffic costs what the 1-cycle max saves on a core that cracks every op.
 gcc against clang on the final state, protein: int16 0.88-0.96 at avx2 and 0.78-0.86 at
 sse4 (clang faster), int32 0.80-0.96 / 0.84-0.94, int64 0.86-1.03 — the remaining gap is
 clang's unrolling and scheduling of the striped loops, the same residue the float kernels

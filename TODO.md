@@ -108,8 +108,23 @@ DiscrimAlign does: it passes the logical core count.
 - int16 with saturating arithmetic would remove the (m + n + 66) * step bound (the sentinel
   then self-preserving under `psubsw`); std::simd has no saturating ops, so intrinsics per
   level. Not started; measure int16 first.
-- The clang + AVX-512 `std::simd` mask workaround (`avx512d_*`) covers double only; int64
-  lanes may hit the same libstdc++ assertion under clang. Unverified (solace off).
+- AVX-512 has never EXECUTED the integer kernels (solace off through both sessions): the
+  int16 W=32 `vpermw` lane shift, `vpmovqb/db/wb` code narrowing, the int64 clang mask
+  helpers and `int_pmax_carry<T, 16/32>` compile under gcc 16 and clang 22/23 but are
+  untested and unmeasured there. First thing to run when solace is up: ctest, the Python
+  suite, `tools/bench_int_cc.sh` at avx512.
+- spot (NEON) ran the first state green (ctest, Python suite) but went DOWN mid-way through
+  the clang build of `bench_int_cc.sh` (16 GB, every core on five-type level TUs: an OOM
+  by all signs); rerun there with `CMAKE_BUILD_PARALLEL_LEVEL=3`, detached (nohup), and
+  re-verify the final state (the `W >= 4` gate makes int64 keep the chain at NEON's W=2).
+- gcc vs clang on the integer striped kernels, final state: clang still 4-20 % faster
+  (nighthaven protein int16/int32: gcc at 0.80-0.96 of clang's time at avx2, 0.78-0.94 at
+  sse4; Piledriver int16 score 0.70). What is left is clang's x2 unrolling and interleaved
+  scheduling of the segment loops, the same residue the float kernels show at W=2
+  (AGENTS "Toolchain"); `#pragma GCC unroll` did not close it there either. Not pursued.
+- int64 at AVX2 costs 1.5-2.6x float32 (no packed 64-bit max: `vpcmpgtq` + `vpblendvb`,
+  the same 4 lanes as double) and 4-5x at sse2 (no 64-bit compare at all). It is headroom
+  for huge parameters, not a speed type; nothing cheap left to do for it.
 
 ## Per-pair gradients stored contiguously (weighted_grad, grads)
 
