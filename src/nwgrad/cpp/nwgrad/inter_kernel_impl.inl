@@ -78,8 +78,13 @@ template <class V, class S> static inline V ivsplat(S x) noexcept {
 
 // A vector of f(0), f(1), ... f(W-1), as a braced initializer: built in registers (lane
 // by lane into a local, then read back whole, it stalls on store forwarding).
+// Each lane cast to the element type: an int16 lane's value arrives as an int (the
+// promotion of -T(j) * ge), which a braced initializer narrows — clang refuses it.
 template <class V, class F, std::size_t... I>
-static inline V ivlanes_(F& f, std::index_sequence<I...>) noexcept { return V{f(static_cast<int>(I))...}; }
+static inline V ivlanes_(F& f, std::index_sequence<I...>) noexcept {
+    using E = std::remove_cvref_t<decltype(V{}[0])>;
+    return V{static_cast<E>(f(static_cast<int>(I)))...};
+}
 template <class V, int W, class F>
 static inline V ivlanes(F f) noexcept { return ivlanes_<V>(f, std::make_index_sequence<static_cast<std::size_t>(W)>{}); }
 

@@ -151,7 +151,7 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                 // M code: same >= chain as the scalar pick(), M last so it wins ties
                 vd km = vtwo;
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
-                if constexpr (std::is_same_v<T, double>) {
+                if constexpr (sizeof(T) == 8) {
                     km = avx512d_blend(avx512d_ge(dgX, dgY), km, vone);
                     km = avx512d_blend(avx512d_ge(dgM, dgX) & avx512d_ge(dgM, dgY), km, vzero);
                 } else {
@@ -165,7 +165,7 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                 if constexpr (Local) {
                     vmv = stdx::max(vmv, vzero);
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
-                    if constexpr (std::is_same_v<T, double>) {
+                    if constexpr (sizeof(T) == 8) {
                         // vmv <= vzero  <=>  vzero >= vmv
                         km = avx512d_blend(avx512d_ge(vzero, vmv), km, vthree);
                     } else {
@@ -186,7 +186,7 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                 vd vxv = stdx::max(stdx::max(ax, bx), cx);
                 vd kx = vtwo;
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
-                if constexpr (std::is_same_v<T, double>) {
+                if constexpr (sizeof(T) == 8) {
                     kx = avx512d_blend(avx512d_ge(bx, cx), kx, vone);
                     kx = avx512d_blend(avx512d_ge(ax, bx) & avx512d_ge(ax, cx), kx, vzero);
                 } else {
@@ -208,7 +208,7 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                 stdx::max(om, ox).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
                 vd okv = vone;
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
-                if constexpr (std::is_same_v<T, double>) {
+                if constexpr (sizeof(T) == 8) {
                     okv = avx512d_blend(avx512d_ge(om, ox), okv, vzero);
                 } else {
                     stdx::where(om >= ox, okv) = vzero;
@@ -237,7 +237,7 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                 vd v = stdx::max(O, ext);
                 vd ky = vtwo;                       // extension
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
-                if constexpr (std::is_same_v<T, double>) {
+                if constexpr (sizeof(T) == 8) {
                     ky = avx512d_blend(avx512d_ge(O, ext), ky, OK);   // open: M or X, ties go to open
                 } else {
                     stdx::where(O >= ext, ky) = OK;     // open: M or X, ties go to open
@@ -257,16 +257,8 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                 for (int s = 0; s < seg; ++s) {
                     vd v; v.copy_from(cY + off + (std::size_t)s * W, stdx::element_aligned);
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
-                    if constexpr (std::is_same_v<T, double>) {
-                        alignas(64) double fa[8], va[8];
-                        F.copy_to(fa, stdx::element_aligned);
-                        v.copy_to(va, stdx::element_aligned);
-                        if (_mm512_cmp_pd_mask(_mm512_load_pd(fa),
-                                               _mm512_load_pd(va), _CMP_GT_OQ) == 0)
-                            break;
-                    } else {
-                        if (!stdx::any_of(F > v)) break;
-                    }
+                    if constexpr (sizeof(T) == 8) { if (!avx512d_any_gt(F, v)) break; }
+                    else { if (!stdx::any_of(F > v)) break; }
 #else
                     if (!stdx::any_of(F > v)) break;
 #endif
@@ -275,7 +267,7 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                     // correction exists to fix.
                     vd k; k.copy_from(yc + (std::size_t)s * W, stdx::element_aligned);
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
-                    if constexpr (std::is_same_v<T, double>) {
+                    if constexpr (sizeof(T) == 8) {
                         k = avx512d_blend(avx512d_gt(F, v), k, vtwo);
                     } else {
                         stdx::where(F > v, k) = vtwo;

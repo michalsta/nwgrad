@@ -60,6 +60,33 @@ static inline stdx::native_simd<double> avx512d_blend(__mmask8 k, stdx::native_s
     res.copy_from(out, stdx::element_aligned);
     return res;
 }
+// The int64 lane hits the same assertion (its mask is the same 64-bit lane type), so the
+// same three helpers exist for it over the epi64 intrinsics.
+static inline __mmask8 avx512d_ge(stdx::native_simd<int64_t> a, stdx::native_simd<int64_t> b) {
+    alignas(64) int64_t aa[8], bb[8];
+    a.copy_to(aa, stdx::element_aligned);
+    b.copy_to(bb, stdx::element_aligned);
+    return _mm512_cmpge_epi64_mask(_mm512_load_si512(aa), _mm512_load_si512(bb));
+}
+static inline __mmask8 avx512d_gt(stdx::native_simd<int64_t> a, stdx::native_simd<int64_t> b) {
+    alignas(64) int64_t aa[8], bb[8];
+    a.copy_to(aa, stdx::element_aligned);
+    b.copy_to(bb, stdx::element_aligned);
+    return _mm512_cmpgt_epi64_mask(_mm512_load_si512(aa), _mm512_load_si512(bb));
+}
+static inline stdx::native_simd<int64_t> avx512d_blend(__mmask8 k, stdx::native_simd<int64_t> dest,
+                                                        stdx::native_simd<int64_t> value) {
+    alignas(64) int64_t da[8], va[8], out[8];
+    dest.copy_to(da, stdx::element_aligned);
+    value.copy_to(va, stdx::element_aligned);
+    _mm512_store_si512(out, _mm512_mask_blend_epi64(k, _mm512_load_si512(da), _mm512_load_si512(va)));
+    stdx::native_simd<int64_t> res;
+    res.copy_from(out, stdx::element_aligned);
+    return res;
+}
+// The lazy-F early exit (any lane of F above v), for both 8-byte lane types.
+template <class V>
+static inline bool avx512d_any_gt(const V& F, const V& v) { return avx512d_gt(F, v) != 0; }
 #endif
 
 // ── Local: the best cell of one striped row, vectorized ──────────────────────
@@ -85,7 +112,7 @@ static inline void striped_row_best(const T* cM, const T* cX, const T* cY, const
         vp.copy_from(pad + o, stdx::element_aligned);
         const vt h = stdx::max(stdx::max(vm, vx), vy) + vp;
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
-        if constexpr (std::is_same_v<T, double>) ls = avx512d_blend(avx512d_gt(h, lmax), ls, vt(T(s)));
+        if constexpr (sizeof(T) == 8) ls = avx512d_blend(avx512d_gt(h, lmax), ls, vt(T(s)));
         else                                      stdx::where(h > lmax, ls) = vt(T(s));
 #else
         stdx::where(h > lmax, ls) = vt(T(s));
@@ -416,16 +443,8 @@ static void striped_affine_full(ViterbiJob<T>& job) {
                     // early-exit gate.  -DNWGRAD_STD_SIMD_AVX512_MASK_OK forces the std::simd
                     // form back if a future clang compiles it.
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
-                    if constexpr (std::is_same_v<T, double>) {
-                        alignas(64) double fa[8], va[8];
-                        F.copy_to(fa, stdx::element_aligned);
-                        v.copy_to(va, stdx::element_aligned);
-                        if (_mm512_cmp_pd_mask(_mm512_load_pd(fa),
-                                               _mm512_load_pd(va), _CMP_GT_OQ) == 0)
-                            break;
-                    } else {
-                        if (!stdx::any_of(F > v)) break;
-                    }
+                    if constexpr (sizeof(T) == 8) { if (!avx512d_any_gt(F, v)) break; }
+                    else { if (!stdx::any_of(F > v)) break; }
 #else
                     if (!stdx::any_of(F > v)) break;
 #endif

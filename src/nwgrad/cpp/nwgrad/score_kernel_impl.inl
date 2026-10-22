@@ -103,7 +103,7 @@ static void score_affine_striped(ScoreJob<T>& job) {
     // Is any lane of a greater than b?  (The lazy-F early exit — the one mask op.)
     auto any_gt = [](const vd& x, const vd& y) -> bool {
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
-        if constexpr (std::is_same_v<T, double>) return avx512d_gt(x, y) != 0;
+        if constexpr (sizeof(T) == 8) return avx512d_gt(x, y) != 0;
         else                                     return stdx::any_of(x > y);
 #else
         return stdx::any_of(x > y);
@@ -325,7 +325,7 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
 
     auto any_gt = [](const vd& x, const vd& y) -> bool {
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
-        if constexpr (std::is_same_v<T, double>) return avx512d_gt(x, y) != 0;
+        if constexpr (sizeof(T) == 8) return avx512d_gt(x, y) != 0;
         else                                     return stdx::any_of(x > y);
 #else
         return stdx::any_of(x > y);
