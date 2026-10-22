@@ -30,7 +30,7 @@
 // Pointers kernel), gcc the int16/int32 ones to vpshufb sequences; a pack or a vpmov is
 // one or two instructions.  The codes are 0..3, so saturating packs are exact.
 template <class T, int W>
-static inline void store_codes(const stdx::native_simd<T>& code, unsigned char* dst) {
+[[gnu::always_inline]] static inline void store_codes(const stdx::native_simd<T>& code, unsigned char* dst) {
     using bvec = stdx::fixed_size_simd<unsigned char, W>;
 #if defined(__AVX512F__) && defined(__AVX512BW__)
     if constexpr (std::is_same_v<T, int64_t> && W == 8) {
@@ -82,8 +82,10 @@ static inline void store_codes(const stdx::native_simd<T>& code, unsigned char* 
 // cells, ~20 % of its instructions.  Same codes: (y > x ? 2 : 1) is (x >= y ? 1 : 2),
 // and "0 unless x > m or y > m" is "0 when m >= x and m >= y".  Floating T keeps the
 // form it always had (vcmpleps exists), so its codegen is untouched.
+// (always_inline: at AVX-512 gcc called these out of line for the 32-lane int16 vectors,
+// four and two calls per segment, each returning 64 bytes through memory.)
 template <class V>
-static inline V pick_code(const V& m, const V& x, const V& y, const V& vzero, const V& vone, const V& vtwo) {
+[[gnu::always_inline]] static inline V pick_code(const V& m, const V& x, const V& y, const V& vzero, const V& vone, const V& vtwo) {
     using T = typename V::value_type;
     if constexpr (nw_is_int<T>) {
         V k = vone;
@@ -101,7 +103,7 @@ static inline V pick_code(const V& m, const V& x, const V& y, const V& vzero, co
 // `dest` where a >= b takes `value`: strict form for integer lanes (the default and the
 // value swapped), the >= form for floating.
 template <class V>
-static inline V sel_ge(const V& a, const V& b, const V& dest, const V& value) {
+[[gnu::always_inline]] static inline V sel_ge(const V& a, const V& b, const V& dest, const V& value) {
     using T = typename V::value_type;
     if constexpr (nw_is_int<T>) { V r = value; stdx::where(b > a, r) = dest; return r; }
     else                        { V r = dest;  stdx::where(a >= b, r) = value; return r; }

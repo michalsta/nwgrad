@@ -176,7 +176,7 @@ static constexpr double K_NINF = -std::numeric_limits<double>::infinity();
 // The integer types (int16/int32/int64) take the same treatment: gcc assembled the
 // generator form lane by lane (vpinsrw / vpinsrd / vpunpck sequences) at AVX2.
 template <class V>
-static inline V lane_shift_in(V x, typename V::value_type b) {
+[[gnu::always_inline]] static inline V lane_shift_in(V x, typename V::value_type b) {
     using T [[maybe_unused]] = typename V::value_type;   // unused at the W=2 levels
 #if defined(__AVX512F__)
     // One valignq / valignd: (x : splat(b)) shifted right by W-1 lanes is [b, x0..x_{W-2}].
@@ -278,11 +278,11 @@ NWGRAD_NV(int16_t, 16) NWGRAD_NV(int16_t, 32) NWGRAD_NV(int16_t, 64)
 NWGRAD_NV(int32_t, 16) NWGRAD_NV(int32_t, 32) NWGRAD_NV(int32_t, 64)
 NWGRAD_NV(int64_t, 16) NWGRAD_NV(int64_t, 32) NWGRAD_NV(int64_t, 64)
 #undef NWGRAD_NV
-template <class V> static inline V nv_load(const typename V::value_type* p) {
+template <class V> [[gnu::always_inline]] static inline V nv_load(const typename V::value_type* p) {
     using NV = typename NVecOf<typename V::value_type, (int)(sizeof(typename V::value_type) * V::size())>::type;
     return V(*reinterpret_cast<const NV*>(p));
 }
-template <class V> static inline void nv_store(typename V::value_type* p, const V& x) {
+template <class V> [[gnu::always_inline]] static inline void nv_store(typename V::value_type* p, const V& x) {
     using NV = typename NVecOf<typename V::value_type, (int)(sizeof(typename V::value_type) * V::size())>::type;
     *reinterpret_cast<NV*>(p) = static_cast<NV>(x);
 }
