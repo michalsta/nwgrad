@@ -30,16 +30,30 @@ does the same.  Both choices are printed; on the fleet they coincide (sse41 ~ ss
 Each arm runs in its OWN process (arms sharing one contaminate each other's allocator
 and caches: the repo's rule), repeats interleaved, the minimum kept.  A control arm
 (the nwgrad float32 score arm run twice, two processes) is reported first: if it is not
-~1.00x the numbers are noise.  Threads: nwgrad n_threads=N; parasail through a
-ThreadPoolExecutor of N (the ctypes calls release the GIL).
+~1.00x the numbers are noise.
+
+DRIVER.  parasail runs through tools/bench_parasail_driver.c by default (--driver c):
+a small C program compiled once per run against the wheel's own headers and
+libparasail.so, one pair after another with real threads (spawned per pass, as nwgrad's
+batch spawns its workers per call).  The Python bindings are NOT the kernels: measured
+on skynet, a one-residue pair costs ~10 us per call (ctypes, result object, profile
+build), which is most of a 22x50 DNA pair's time and a quarter of an L200 protein
+pair's, and the bindings' threads share the GIL, so a 12-thread Python run measured the
+lock (parasail 10-800x "slower").  --driver python keeps that path, as what a Python
+caller of parasail actually gets; it is labelled as such.  "trace" arms walk the
+traceback (the CIGAR) on every pair in both drivers, as nwgrad's path arm walks its own.
+nwgrad runs from Python either way: one call per batch, so the binding costs nothing
+per pair.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -102,17 +116,48 @@ def arm_list(types):
             arms += [f"ps/{mode}/{gm}/diag32/score",
                      f"nw/{mode}/{gm}/float32/score", f"nw/{mode}/{gm}/float32/grad"]
     if types:
-        arms = [a for a in arms if a == "control" or any(f"/{t}/" in a for t in types)]
+        arms = [a for a in arms if a == "control" or a == "nw/global/affine/float32/score"   # the control's reference
+                or any(f"/{t}/" in a for t in types)]
     return arms
+
+
+def ps_name(mode, variant, kind):
+    base = "nw" if mode == "global" else "sw"
+    algo = "".join(c for c in variant if not c.isdigit())      # striped16 -> striped, 16
+    width = "".join(c for c in variant if c.isdigit())
+    return f"{base}_{'trace_' if kind == 'trace' else ''}{algo}_{width}"
 
 
 def ps_fn(mode, variant, kind):
     import parasail
-    base = "nw" if mode == "global" else "sw"
-    algo = "".join(c for c in variant if not c.isdigit())      # striped16 -> striped, 16
-    width = "".join(c for c in variant if c.isdigit())
-    name = f"{base}_{'trace_' if kind == 'trace' else ''}{algo}_{width}"
-    return getattr(parasail, name)
+    return getattr(parasail, ps_name(mode, variant, kind))
+
+
+def build_driver(out_dir):
+    """Compile tools/bench_parasail_driver.c against the installed parasail wheel."""
+    import parasail
+    pkg = os.path.dirname(os.path.abspath(parasail.__file__))
+    inc = os.path.join(pkg, "include")
+    sos = [os.path.join(pkg, f) for f in os.listdir(pkg) if f.startswith("libparasail") and ".so" in f]
+    if not os.path.isfile(os.path.join(inc, "parasail.h")) or not sos:
+        raise SystemExit(f"the parasail package at {pkg} ships no headers / shared library; "
+                         "install the parasail wheel (pip install parasail) or use --driver python")
+    cc = os.environ.get("CC") or shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
+    if not cc:
+        raise SystemExit("no C compiler found (CC, cc, gcc, clang): install one, or use --driver python")
+    src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bench_parasail_driver.c")
+    exe = os.path.join(out_dir, "bench_parasail_driver")
+    cmd = [cc, "-O2", "-std=c11", "-pthread", "-I", inc, src, sos[0], "-Wl,-rpath,$ORIGIN", "-o", exe]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode:
+        raise SystemExit("compiling the parasail driver failed:\n" + " ".join(cmd) + "\n" + r.stderr)
+    # the wheel's library carries a versioned SONAME (libparasail.so.8) but is shipped
+    # under the unversioned name: give the loader the name it will ask for, next to the exe
+    needed = subprocess.run([shutil.which("objdump") or "objdump", "-p", exe], capture_output=True, text=True).stdout
+    for line in needed.splitlines():
+        if "NEEDED" in line and "parasail" in line:
+            os.symlink(sos[0], os.path.join(out_dir, line.split()[-1]))
+    return exe
 
 
 def run_arm(arm, fx, length, n, seed, threads, reps, min_time):
@@ -158,9 +203,38 @@ def run_arm(arm, fx, length, n, seed, threads, reps, min_time):
         isa = nwgrad.simd_isa()
     else:
         import parasail
+        isa = ("avx512" if getattr(parasail, "can_use_avx512bw", lambda: False)() else
+               "avx2" if parasail.can_use_avx2() else "sse41" if parasail.can_use_sse41() else
+               "sse2" if parasail.can_use_sse2() else "neon" if parasail.can_use_neon() else "?")
+        driver = os.environ.get("BENCH_PARASAIL_DRIVER")
+        if driver:
+            # the C driver: fixture to a file, one process, timing inside
+            with tempfile.NamedTemporaryFile("w", suffix=".pairs", delete=False) as pf:
+                for a, bb in zip(A, B):
+                    pf.write(f"{a}\t{bb}\n")
+            try:
+                mat = "blosum62" if alpha == "protein" else "dna:2:-3"
+                cmd = [driver, "parasail_" + ps_name(mode, variant, kind), mat, str(ps_open), str(ps_ext),
+                       str(threads), str(reps), str(min_time), "1" if kind == "trace" else "0", pf.name]
+                r = subprocess.run(cmd, capture_output=True, text=True)
+            finally:
+                os.unlink(pf.name)
+            if r.returncode:
+                print(json.dumps({"arm": arm, "error": "driver failed: " + r.stderr.strip()[-300:]})); return
+            d = json.loads(r.stdout)
+            if d["saturated"]:
+                print(json.dumps({"arm": arm, "error": "parasail saturated at this width"})); return
+            scores = np.array(d["scores"], dtype=float)
+            cells = float(sum(len(a) * len(b) for a, b in zip(A, B)))
+            print(json.dumps({"arm": arm, "secs": d["secs"], "us_per_pair": d["secs"] / n * 1e6,
+                              "mcells": cells / d["secs"] / 1e6, "isa": isa, "driver": "c",
+                              "scores": [float(s) for s in scores]}))
+            return
         f = ps_fn(mode, variant, kind)
         def one(a, bb):
             r = f(a, bb, ps_open, ps_ext, ps_matrix)
+            if kind == "trace":
+                r.cigar          # the walk, as the C driver and nwgrad's path arm do it
             return r.score, r.saturated
         def run_all():
             if threads == 1:
@@ -173,8 +247,6 @@ def run_arm(arm, fx, length, n, seed, threads, reps, min_time):
         scores = np.array([s for s, _ in res], dtype=float)
         def once():
             run_all()
-        isa = ("avx2" if parasail.can_use_avx2() else "sse41" if parasail.can_use_sse41() else
-               "sse2" if parasail.can_use_sse2() else "neon" if parasail.can_use_neon() else "?")
 
     best = float("inf")
     for _ in range(reps):
@@ -185,7 +257,7 @@ def run_arm(arm, fx, length, n, seed, threads, reps, min_time):
             if dt >= min_time: break
         best = min(best, dt / k)
     out = {"arm": arm, "secs": best, "us_per_pair": best / n * 1e6, "mcells": cells / best / 1e6,
-           "isa": isa, "scores": [float(s) for s in scores]}
+           "isa": isa, "driver": "python" if side == "ps" else "nwgrad", "scores": [float(s) for s in scores]}
     print(json.dumps(out))
 
 
@@ -201,6 +273,8 @@ def main():
     ap.add_argument("--quick", action="store_true")
     ap.add_argument("--seed", type=int, default=3)
     ap.add_argument("--json", metavar="FILE")
+    ap.add_argument("--driver", default="c", choices=["c", "python"],
+                    help="how parasail is called: the C driver (its kernels) or its Python bindings")
     ap.add_argument("--_worker", nargs=8, help=argparse.SUPPRESS)
     args = ap.parse_args()
     if args._worker:
@@ -210,9 +284,19 @@ def main():
     if args.quick:
         args.reps, args.min_time = 2, 0.4
     os.environ.setdefault("LC_ALL", "C")
+    for v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+        os.environ.setdefault(v, "1")     # numpy's BLAS pool otherwise spins up every core at import
     import nwgrad, parasail
     print(f"nwgrad {nwgrad.__version__} ({nwgrad.compiled_with()}, levels {nwgrad.available_isa_levels()}); "
           f"parasail {parasail.__version__}, can_use: sse41={parasail.can_use_sse41()} avx2={parasail.can_use_avx2()} neon={parasail.can_use_neon()}")
+    os.environ.pop("BENCH_PARASAIL_DRIVER", None)
+    tmpdir = None
+    if args.driver == "c":
+        tmpdir = tempfile.mkdtemp(prefix="bench_parasail_")
+        os.environ["BENCH_PARASAIL_DRIVER"] = build_driver(tmpdir)
+        print(f"parasail driver: C ({os.environ['BENCH_PARASAIL_DRIVER']}), threads are pthreads")
+    else:
+        print("parasail driver: PYTHON BINDINGS (~10 us per call, GIL-bound threads): measures the binding, not the kernels")
     results = {}
     for fx in args.fixture:
         for length in (args.len if fx == "protein" else [50]):
@@ -277,6 +361,8 @@ def main():
     if args.json:
         with open(args.json, "w") as f:
             json.dump(results, f, indent=1)
+    if tmpdir:
+        shutil.rmtree(tmpdir, ignore_errors=True)
     return 0
 
 
