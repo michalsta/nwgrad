@@ -121,7 +121,14 @@ static inline void striped_row_best(const T* cM, const T* cX, const T* cY, const
     }
     T rmax;
     int l;
-    if constexpr (nw_is_int<T>) {
+    // (clang + AVX-512: the 64-bit lane's equality mask hits the libstdc++ assertion the
+    // file's workaround describes; int64 keeps the scalar reduction there.)
+#if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
+    constexpr bool vec_reduce = nw_is_int<T> && sizeof(T) != 8;
+#else
+    constexpr bool vec_reduce = nw_is_int<T>;
+#endif
+    if constexpr (vec_reduce) {
         // A vector reduction and a mask search (gcc extracted the 16 int16 lanes one by
         // one, ~5 % of the Pointers kernel's time).  Exact for integers; floating T keeps
         // the scalar loop, whose std::max keeps the FIRST of two equal values and so the
@@ -229,6 +236,98 @@ static inline V lane_shift_in(V x, typename V::value_type b) {
     } else
 #endif
     return V([&](int q) { return q == 0 ? b : x[q - 1]; });
+}
+
+// ── The gap ramp k*ge_a, striped: slot (s, l) carries the ABSOLUTE column index k =
+// l*seg + s times ge_a (the prefix-max carries below and in hb_kernel_impl.inl).  A
+// scalar loop, loaded and never multiplied in a hot loop (no FMA for floating T; for an
+// integer T the product is exact anyway).
+template <class T>
+static inline void hb_ramp(T* rmp, T ge_a, int seg, int W) {
+    for (int l = 0; l < W; ++l)
+        for (int s = 0; s < seg; ++s)
+            rmp[(std::size_t)s * W + l] = static_cast<T>(l * seg + s) * ge_a;
+}
+
+// ── Integer T: the VY carry as an EXACT prefix max, no lazy-F ─────────────────────
+//
+// VY[c] = max over k <= c-1 of (open[k] + k*ge_a) minus (c-1)*ge_a (hb_sweep_striped_pmax,
+// hb_kernel_impl.inl), with the column-0 border folded in as the seed bY - ge_a.  In
+// floating point the ramp's round trip costs a rounding, which is why that carry is a
+// sibling mode there; in integer arithmetic it is exact, so every striped integer kernel
+// takes it in place of the serial chain + lazy-F fixpoint: fixed work per row (a lane-
+// local prefix max, W scalar maxes across the lanes, one parallel pass) instead of up to W
+// data-dependent correction rounds — which grow with the lane count, and int16 has 4x
+// double's lanes.  Bit-identical to the chain by construction (tested against the double
+// oracle at every level).  `ov` holds the opens per segment slot, read one segment back as
+// the chain reads them (the lane shift at s == 0 with the border's open); `rmp` the ramp;
+// Y lands in cY (+off), and P (the prefix maxima) rides in cY between the two passes.
+// Codes (`ok`, `yc` non-null): the Y code is the open's (ok, shifted like ov) when the
+// open at column c-1 is at least the prefix before it — Q[c-1] >= max(seed, Q[0..c-2]) —
+// else 2 (extension): exactly `O >= ext` of the chain, since ext = that prefix - (c-1)*ge.
+template <class T, int W>
+static inline void int_pmax_carry(const T* ov, const T* ok, const T* rmp, T nbOpen, T nbOpenK,
+                                  T bY, T ge_a, int seg, T* cY, T* yc, T* qbuf) {
+    using vd = stdx::native_simd<T>;
+    const vd vtwo(T(2));
+    vd P(nw_ninf<T>);
+    for (int s = 0; s < seg; ++s) {
+        vd O;
+        if (s == 0) {
+            vd lo; lo.copy_from(ov + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+            O = lane_shift_in(lo, nbOpen);
+        } else {
+            O.copy_from(ov + (std::size_t)(s - 1) * W, stdx::element_aligned);
+        }
+        vd rq; rq.copy_from(rmp + (std::size_t)s * W, stdx::element_aligned);
+        const vd Q = O + rq;
+        if (yc) Q.copy_to(qbuf + (std::size_t)s * W, stdx::element_aligned);
+        P = stdx::max(Q, P);
+        P.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
+    }
+    T tot[64], cin[64];
+    P.copy_to(tot, stdx::element_aligned);
+    T run = static_cast<T>(bY - ge_a);
+    for (int l = 0; l < W; ++l) { cin[l] = run; run = std::max(run, tot[l]); }
+    vd vcin; vcin.copy_from(cin, stdx::element_aligned);
+    vd before = vcin;                       // the prefix before this segment's open
+    for (int s = 0; s < seg; ++s) {
+        vd p; p.copy_from(cY + (std::size_t)s * W, stdx::element_aligned);
+        vd rq; rq.copy_from(rmp + (std::size_t)s * W, stdx::element_aligned);
+        const vd pc = stdx::max(p, vcin);
+        (pc - rq).copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
+        if (yc) {
+            vd OK, q;
+            if (s == 0) {
+                vd lk; lk.copy_from(ok + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                OK = lane_shift_in(lk, nbOpenK);
+            } else {
+                OK.copy_from(ok + (std::size_t)(s - 1) * W, stdx::element_aligned);
+            }
+            q.copy_from(qbuf + (std::size_t)s * W, stdx::element_aligned);
+            vd ky = OK;                           // strict: q >= before keeps the open
+#if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
+            if constexpr (sizeof(T) == 8) ky = avx512d_blend(avx512d_gt(before, q), ky, vtwo);
+            else                          stdx::where(before > q, ky) = vtwo;
+#else
+            stdx::where(before > q, ky) = vtwo;
+#endif
+            ky.copy_to(yc + (std::size_t)s * W, stdx::element_aligned);
+            before = pc;
+        }
+    }
+}
+// Build the ramp for this problem's ge_a once (untracked), or whenever a tracked row's
+// ge_a differs from the last (same_bits).
+template <class T>
+static inline void int_ramp_for(typename DpBufferT<T>::TVec& hramp, T ge_a, int seg, int W,
+                                T& ramp_ge, bool& ramp_ok) {
+    const std::size_t sw = (std::size_t)seg * W;
+    if (hramp.size() < sw) hramp.resize(sw);
+    if (!ramp_ok || std::bit_cast<nw_bits_t<T>>(ramp_ge) != std::bit_cast<nw_bits_t<T>>(ge_a)) {
+        hb_ramp(hramp.data(), ge_a, seg, W);
+        ramp_ge = ge_a; ramp_ok = true;
+    }
 }
 
 // ── Tracked rows: the striped query profile ───────────────────────────────────
@@ -358,6 +457,7 @@ static void striped_affine_full(ViterbiJob<T>& job) {
 
     T best_local = 0; int best_i = 0, best_j = 0, best_tbl = 0;
     const T* pad = Local ? striped_pad(buf.spad, n, seg, W) : nullptr;
+    [[maybe_unused]] T ramp_ge = ge_a; [[maybe_unused]] bool ramp_ok = false;   // integer T's ramp
 
     for (int i = 1; i <= m; ++i) {
         if constexpr (Tr) {
@@ -415,7 +515,13 @@ static void striped_affine_full(ViterbiJob<T>& job) {
                 ((stdx::max(vmv, vxv) - vgo_a) - vge_a).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
             }
 
-            // ── the carry: VY, same-lane striped chain + lazy-F ──
+            // ── the carry: VY, same-lane striped chain + lazy-F (integer T: the exact
+            // prefix max, int_pmax_carry) ──
+            if constexpr (nw_is_int<T>) {
+                int_ramp_for<T>(buf.hramp, ge_a, seg, W, ramp_ge, ramp_ok);
+                int_pmax_carry<T, W>(ov, nullptr, buf.hramp.data(), nbOpen, T(0), bY, ge_a, seg,
+                                     cY, nullptr, nullptr);
+            } else {
             vd prev([&](int q) { return q == 0 ? bY : K_NINF; });
             for (int s = 0; s < seg; ++s) {
                 vd O;
@@ -467,6 +573,7 @@ static void striped_affine_full(ViterbiJob<T>& job) {
                 }
                 if (!changed) break;
             }
+            }   // integer / floating carry
 
             // ── Local: argmax over this row, j ascending, reading the striped cells,
             // with the scalar kernel's M>X>Y tie-break and strict > (bit-exact path) ──

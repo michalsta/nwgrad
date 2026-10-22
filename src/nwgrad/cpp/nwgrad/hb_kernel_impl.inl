@@ -77,15 +77,8 @@ struct HbRows {
         return dst;
     }
 };
-// The pmax ramp k*ge_a, striped, for the row's ge_a — rebuilt only when it changes (a
-// tracked sweep's rows may differ), a scalar loop either way: loaded, never multiplied
-// in the hot loop (no FMA), so bit-identical with the scalar reference's per-row ramp.
-template <class T>
-static inline void hb_ramp(T* rmp, T ge_a, int seg, int W) {
-    for (int l = 0; l < W; ++l)
-        for (int s = 0; s < seg; ++s)
-            rmp[(std::size_t)s * W + l] = static_cast<T>(l * seg + s) * ge_a;
-}
+// (hb_ramp, the pmax ramp k*ge_a striped for a row's ge_a, lives in kernels_impl.inl now:
+// every striped integer kernel builds it.)
 template <class T>
 static inline bool same_bits(T x, T y) noexcept {
     return std::bit_cast<nw_bits_t<T>>(x) == std::bit_cast<nw_bits_t<T>>(y);
@@ -875,7 +868,7 @@ static void hb_base_striped(HbBaseJob<T>& job) {
     fit(buf.hprof, (std::size_t)(Tr ? 1 : nalpha) * sw);
     fit(buf.hfa, rowsz); fit(buf.hfb, rowsz); fit(buf.hfc, rowsz);
     fit(buf.hfd, rowsz); fit(buf.hfe, rowsz); fit(buf.hff, rowsz);
-    fit(buf.hov, 2 * sw);
+    fit(buf.hov, 3 * sw);                               // ov | ok | Q (integer T)
     fit(buf.hsX, sw);                                   // y-code scratch
 
     auto scol = [seg](int c) -> std::size_t {
@@ -898,6 +891,8 @@ static void hb_base_striped(HbBaseJob<T>& job) {
     unsigned char* D2 = D1 + plane;
     T* ov = buf.hov.data();
     T* ok = buf.hov.data() + sw;
+    T* qb = buf.hov.data() + 2 * sw;   // integer T: the Q scratch
+    [[maybe_unused]] T ramp_ge = ge_a; [[maybe_unused]] bool ramp_ok = false;
     T* yc = buf.hsX.data();
 
     T* pM = buf.hfa.data(); T* pX = buf.hfb.data(); T* pY = buf.hfc.data();
@@ -1032,6 +1027,11 @@ static void hb_base_striped(HbBaseJob<T>& job) {
         }
 
         // ── VY carry: same-lane striped chain + exact lazy-F, codes tracked ──
+        if constexpr (nw_is_int<T>) {
+            int_ramp_for<T>(buf.hramp, ge_a, seg, W, ramp_ge, ramp_ok);
+            int_pmax_carry<T, W>(ov, ok, buf.hramp.data(), nbOpen, nbOpenK, bY, ge_a, seg,
+                                 cY + off, yc, qb);
+        } else {
         vd prev([&](int q) { return q == 0 ? bY : NINF; });
         for (int s = 0; s < seg; ++s) {
             vd O, OK;
@@ -1092,6 +1092,7 @@ static void hb_base_striped(HbBaseJob<T>& job) {
             }
             if (!changed) break;
         }
+        }   // integer / floating carry
         for (int s = 0; s < seg; ++s) {
             vd k; k.copy_from(yc + (std::size_t)s * W, stdx::element_aligned);
             store_codes<T, W>(k, dY + (std::size_t)s * W);

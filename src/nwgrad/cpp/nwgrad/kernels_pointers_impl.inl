@@ -129,7 +129,7 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
     const std::size_t rowsz = (std::size_t)(seg + 1) * W;
     const std::size_t off   = (std::size_t)W;
 
-    if (buf.sopenv.size() < 2 * sw) buf.sopenv.resize(2 * sw);   // ov | openk
+    if (buf.sopenv.size() < 3 * sw) buf.sopenv.resize(3 * sw);   // ov | openk | Q (integer T)
     const std::size_t dsz = (std::size_t)(m + 1) * rowsz;
     // Each vector is checked on its own: a linear pointer fill sharing this buffer grows
     // DM, rM and qM alone, so one size no longer speaks for the group.
@@ -147,7 +147,9 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
 
     T* ov = buf.sopenv.data();
     T* ok = buf.sopenv.data() + sw;
+    T* qb = buf.sopenv.data() + 2 * sw;
     T* yc = buf.subbuf.data();
+    [[maybe_unused]] T ramp_ge = ge_a; [[maybe_unused]] bool ramp_ok = false;   // integer T's ramp
 
     T* pM = buf.qM.data(); T* pX = buf.qX.data(); T* pY = buf.qY.data();
     T* cM = buf.rM.data(); T* cX = buf.rX.data(); T* cY = buf.rY.data();
@@ -294,7 +296,13 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                 okv.copy_to(ok + (std::size_t)s * W, stdx::element_aligned);
             }
 
-            // ── the carry: VY, same-lane striped chain + lazy-F, codes tracked ──
+            // ── the carry: VY, same-lane striped chain + lazy-F, codes tracked (integer
+            // T: the exact prefix max with its codes, int_pmax_carry) ──
+            if constexpr (nw_is_int<T>) {
+                int_ramp_for<T>(buf.hramp, ge_a, seg, W, ramp_ge, ramp_ok);
+                int_pmax_carry<T, W>(ov, ok, buf.hramp.data(), nbOpen, nbOpenK, bY, ge_a, seg,
+                                     cY + off, yc, qb);
+            } else {
             vd prev([&](int q) { return q == 0 ? bY : K_NINF; });
             for (int s = 0; s < seg; ++s) {
                 vd O, OK;
@@ -358,6 +366,7 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                 }
                 if (!changed) break;
             }
+            }   // integer / floating carry
             for (int s = 0; s < seg; ++s) {
                 vd k; k.copy_from(yc + (std::size_t)s * W, stdx::element_aligned);
                 store_codes<T, W>(k, dY + (std::size_t)s * W);
