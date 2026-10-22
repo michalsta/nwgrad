@@ -336,4 +336,13 @@ if (NWGRAD_BUILD_BENCHMARKS)
         target_compile_options(bench_f32 PRIVATE -O3 -Wall -Wextra)
     endif()
     target_link_libraries(bench_f32 PRIVATE Threads::Threads)
+
+    # ── score-only kernel benchmark (every scalar type, the integer arms included) ───
+    add_executable(bench_score tests/cpp/bench_score.cpp ${NWGRAD_LEVEL_SOURCES})
+    target_include_directories(bench_score PRIVATE src/nwgrad/cpp/nwgrad)
+    target_compile_features(bench_score PRIVATE cxx_std_20)
+    if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(bench_score PRIVATE -O3 -Wall -Wextra)
+    endif()
+    target_link_libraries(bench_score PRIVATE Threads::Threads)
 endif()

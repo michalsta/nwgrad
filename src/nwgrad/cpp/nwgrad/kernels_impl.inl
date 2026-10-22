@@ -265,8 +265,33 @@ static inline void hb_ramp(T* rmp, T ge_a, int seg, int W) {
 // Codes (`ok`, `yc` non-null): the Y code is the open's (ok, shifted like ov) when the
 // open at column c-1 is at least the prefix before it — Q[c-1] >= max(seed, Q[0..c-2]) —
 // else 2 (extension): exactly `O >= ext` of the chain, since ext = that prefix - (c-1)*ge.
+// Loads and stores of a std::simd through the GCC vector type of its width.  gcc lowered
+// `copy_to` of an INTEGER simd (vector_aligned or not) to a memcpy through the value's
+// address: the loop-carried prefix max below was kept on the stack and copied into the
+// row through two general-purpose registers per vector (40 % of the sse4 int32 carry,
+// the score kernel at 1.6x its lazy-F time).  A store through the native vector type is
+// one instruction under both compilers.  (The types are spelled per width: gcc drops a
+// dependent `vector_size` in an alias template to the scalar.)
+template <class T, int Bytes> struct NVecOf;
+#define NWGRAD_NV(T, B) template <> struct NVecOf<T, B> { typedef T type __attribute__((vector_size(B))); };
+NWGRAD_NV(int16_t, 16) NWGRAD_NV(int16_t, 32) NWGRAD_NV(int16_t, 64)
+NWGRAD_NV(int32_t, 16) NWGRAD_NV(int32_t, 32) NWGRAD_NV(int32_t, 64)
+NWGRAD_NV(int64_t, 16) NWGRAD_NV(int64_t, 32) NWGRAD_NV(int64_t, 64)
+#undef NWGRAD_NV
+template <class V> static inline V nv_load(const typename V::value_type* p) {
+    using NV = typename NVecOf<typename V::value_type, (int)(sizeof(typename V::value_type) * V::size())>::type;
+    return V(*reinterpret_cast<const NV*>(p));
+}
+template <class V> static inline void nv_store(typename V::value_type* p, const V& x) {
+    using NV = typename NVecOf<typename V::value_type, (int)(sizeof(typename V::value_type) * V::size())>::type;
+    *reinterpret_cast<NV*>(p) = static_cast<NV>(x);
+}
+
+// Always inlined: gcc outlined it as a constant-propagated clone in every integer score
+// kernel (a call, its own frame and the lane arrays per row), where it then cost more
+// than the kernel body around it.
 template <class T, int W>
-static inline void int_pmax_carry(const T* ov, const T* ok, const T* rmp, T nbOpen, T nbOpenK,
+[[gnu::always_inline]] static inline void int_pmax_carry(const T* ov, const T* ok, const T* rmp, T nbOpen, T nbOpenK,
                                   T bY, T ge_a, int seg, T* cY, T* yc, T* qbuf) {
     using vd = stdx::native_simd<T>;
     const vd vtwo(T(2));
@@ -274,37 +299,37 @@ static inline void int_pmax_carry(const T* ov, const T* ok, const T* rmp, T nbOp
     for (int s = 0; s < seg; ++s) {
         vd O;
         if (s == 0) {
-            vd lo; lo.copy_from(ov + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+            vd lo; lo = nv_load<vd>(ov + (std::size_t)(seg - 1) * W);
             O = lane_shift_in(lo, nbOpen);
         } else {
-            O.copy_from(ov + (std::size_t)(s - 1) * W, stdx::element_aligned);
+            O = nv_load<vd>(ov + (std::size_t)(s - 1) * W);
         }
-        vd rq; rq.copy_from(rmp + (std::size_t)s * W, stdx::element_aligned);
+        vd rq; rq = nv_load<vd>(rmp + (std::size_t)s * W);
         const vd Q = O + rq;
-        if (yc) Q.copy_to(qbuf + (std::size_t)s * W, stdx::element_aligned);
+        if (yc) nv_store(qbuf + (std::size_t)s * W, Q);
         P = stdx::max(Q, P);
-        P.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
+        nv_store(cY + (std::size_t)s * W, P);
     }
-    T tot[64], cin[64];
+    alignas(64) T tot[64], cin[64];
     P.copy_to(tot, stdx::element_aligned);
     T run = static_cast<T>(bY - ge_a);
     for (int l = 0; l < W; ++l) { cin[l] = run; run = std::max(run, tot[l]); }
     vd vcin; vcin.copy_from(cin, stdx::element_aligned);
     vd before = vcin;                       // the prefix before this segment's open
     for (int s = 0; s < seg; ++s) {
-        vd p; p.copy_from(cY + (std::size_t)s * W, stdx::element_aligned);
-        vd rq; rq.copy_from(rmp + (std::size_t)s * W, stdx::element_aligned);
+        vd p; p = nv_load<vd>(cY + (std::size_t)s * W);
+        vd rq; rq = nv_load<vd>(rmp + (std::size_t)s * W);
         const vd pc = stdx::max(p, vcin);
-        (pc - rq).copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
+        nv_store(cY + (std::size_t)s * W, pc - rq);
         if (yc) {
             vd OK, q;
             if (s == 0) {
-                vd lk; lk.copy_from(ok + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                vd lk; lk = nv_load<vd>(ok + (std::size_t)(seg - 1) * W);
                 OK = lane_shift_in(lk, nbOpenK);
             } else {
-                OK.copy_from(ok + (std::size_t)(s - 1) * W, stdx::element_aligned);
+                OK = nv_load<vd>(ok + (std::size_t)(s - 1) * W);
             }
-            q.copy_from(qbuf + (std::size_t)s * W, stdx::element_aligned);
+            q = nv_load<vd>(qbuf + (std::size_t)s * W);
             vd ky = OK;                           // strict: q >= before keeps the open
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
             if constexpr (sizeof(T) == 8) ky = avx512d_blend(avx512d_gt(before, q), ky, vtwo);
@@ -312,7 +337,7 @@ static inline void int_pmax_carry(const T* ov, const T* ok, const T* rmp, T nbOp
 #else
             stdx::where(before > q, ky) = vtwo;
 #endif
-            ky.copy_to(yc + (std::size_t)s * W, stdx::element_aligned);
+            nv_store(yc + (std::size_t)s * W, ky);
             before = pc;
         }
     }
