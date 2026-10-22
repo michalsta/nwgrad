@@ -1000,11 +1000,24 @@ of the first run, every integer arm at or below its first-run time except sse4 i
 | protein neon hard, **spot** (M1, Fedora; gcc 16.2 \| clang 22.1) | 0.32 \| 0.29 (was 0.54) | 0.69 \| 0.54 (was 0.81) | 1.52 \| 1.49 (was 1.51) |
 | protein neon score, spot | 0.41 \| 0.27 (was 0.85) | 0.65 \| 0.45 (was 0.85) | 1.49 \| 1.08 (was 1.44) |
 | DNA neon hard / score, spot | 0.47 / 0.42 (unchanged) | 0.77 / 0.78 (unchanged) | 1.75 / 1.74 (unchanged) |
+| protein **avx512** hard, **solace** (Tiger Lake under WSL; gcc 15.2 \| clang 21.1) | 0.38 \| 0.31 | 0.46 \| 0.39 | 1.15 \| **0.70** |
+| protein avx512 score, solace | 0.27 \| 0.25 | 0.29 \| 0.29 | 0.47 \| 0.39 |
+| protein avx2 hard / score, solace (same box) | 0.37 / 0.31 \| 0.29 / 0.25 | 0.53 / 0.42 \| 0.46 / 0.35 | 1.36 / 1.26 \| 1.38 / 0.97 |
+| DNA avx512 hard / score, solace | 0.67 / 0.63 | 0.84 / 0.82 | 1.26 / 1.40 |
 
 12 threads: the same picture a little compressed (protein avx2 int16 hard 0.42, int32 0.68).
 On Piledriver the protein score arms kept the largest gcc-vs-clang residue (int16 0.70,
 int32 0.74: clang's unrolled 128-bit loops), and int32 score-only there ties float32 — the
 3-pass carry's row traffic costs what the 1-cycle max saves on a core that cracks every op.
+**AVX-512 (solace, 2026-10-22, the first execution of the integer kernels there)**: green
+under gcc 15.2 and clang 21.1 (the integer cases at avx512, ctest 17/17, Python 4557
+passed; the int16 `vpermw` shift, the `vpmovqb/db/wb` narrowing, the int64 clang mask
+helpers and `int_pmax_carry<T, 16/32>` all exercised).  avx512 over avx2 on the same box,
+1 thread, gcc: float32 hard 0.91, int16 hard 0.93 / score 0.94, int32 0.78 / 0.76, int64
+0.77 / 0.41 — AVX-512 is where int64 finally has a packed max (`vpmaxsq`), and under clang
+its hard step beats float32 (0.70).  DNA (inter-pair, 16 lanes of int32, 32 of int16):
+0.65-0.88 of avx2.  gcc against clang at avx512: the score kernels tie (0.92-1.01) but the
+Pointers kernels straggle under gcc — int16 0.77, int32 0.79, int64 0.56 — see the TODO.
 spot (NEON, W = 8 for int16, 4 for int32, 2 for int64) verified the final state green (ctest
 17/17, Python 4371 passed) and shows the same shape: the prefix-max carry took the protein
 int16 hard step from 0.54 to 0.32 of float32 and int32 from 0.81 to 0.69; int64 stays on the

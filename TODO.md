@@ -108,11 +108,11 @@ DiscrimAlign does: it passes the logical core count.
 - int16 with saturating arithmetic would remove the (m + n + 66) * step bound (the sentinel
   then self-preserving under `psubsw`); std::simd has no saturating ops, so intrinsics per
   level. Not started; measure int16 first.
-- AVX-512 has never EXECUTED the integer kernels (solace off through both sessions): the
-  int16 W=32 `vpermw` lane shift, `vpmovqb/db/wb` code narrowing, the int64 clang mask
-  helpers and `int_pmax_carry<T, 16/32>` compile under gcc 16 and clang 22/23 but are
-  untested and unmeasured there. First thing to run when solace is up: ctest, the Python
-  suite, `tools/bench_int_cc.sh` at avx512.
+- AVX-512: verified and measured 2026-10-22 (solace under WSL, gcc 15.2 / clang 21.1; AGENTS
+  "Integer scalar types"). Open there: **gcc's AVX-512 integer Pointers kernels straggle**
+  (int64 at 1.8x clang's time, int16 / int32 at 1.3x; the score kernels tie), the largest
+  compiler gap left anywhere. The local Release binaries have the code (lvl_avx512 in
+  build-rel / build-rel-clang): read the int64 `striped_affine_full_ptr` mix first.
 - spot (NEON): the final state is verified (ctest 17/17, Python suite, `bench_int_cc.sh`
   at neon, 2026-10-22; built with `CMAKE_BUILD_PARALLEL_LEVEL=3` after the first attempt
   took the 16 GB laptop down). Note for long jobs there: take a `systemd-inhibit` (see
