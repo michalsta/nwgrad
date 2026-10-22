@@ -15,7 +15,8 @@ FLAGS="-fcf-protection=none -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-pro
 case "$(uname -m)" in x86_64) FLAGS="$FLAGS -mtls-dialect=gnu";; esac
 
 build () {
-    local tag="$1" cc="$2" cxx="$3" venv="$OUT/venv-$tag"
+    local tag="$1" cc="$2" cxx="$3"
+    local venv="$OUT/venv-$tag"
     [ -x "$venv/bin/python" ] || python3 -m venv "$venv"
     "$venv/bin/pip" install -q numpy >/dev/null
     CC="$cc" CXX="$cxx" "$venv/bin/pip" install -q --no-cache-dir --force-reinstall \
