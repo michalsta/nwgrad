@@ -150,7 +150,10 @@ def run_arm(arm, fx, length, n, seed, threads, reps, min_time):
         keep = kind in ("path", "grad")
         def once():
             b.score_and_grad(keep_paths=keep)
-        once()
+        try:
+            once()
+        except OverflowError as e:   # the integer type's a-priori bound refused the fixture
+            print(json.dumps({"arm": arm, "error": "refused: " + str(e).split("(")[0].strip()})); return
         scores = b.scores()
         isa = nwgrad.simd_isa()
     else:
@@ -238,8 +241,9 @@ def main():
                     if "error" in d or not arm.startswith("ps/"): continue
                     _, mode, gm, variant, kind = arm.split("/")
                     w = "".join(c for c in variant if c.isdigit())
-                    ref = res.get(f"nw/{mode}/{gm}/int{w}/score") or res.get(f"nw/{mode}/{gm}/int32/score")
-                    if ref and d["scores"] != ref["scores"]:
+                    ref = res.get(f"nw/{mode}/{gm}/int{w}/score")
+                    if not ref or "error" in ref: ref = res.get(f"nw/{mode}/{gm}/int32/score")
+                    if ref and "error" not in ref and d["scores"] != ref["scores"]:
                         bad = sum(1 for x, y in zip(d["scores"], ref["scores"]) if x != y)
                         below = all(x <= y for x, y in zip(d["scores"], ref["scores"]))
                         # parasail's striped 16/32-bit kernels score BELOW the optimum when
@@ -267,6 +271,7 @@ def main():
                     refk = f"nw/{mode}/{gm}/int{w}/{'score' if kind == 'score' else 'path'}"
                     ref = res.get(refk)
                     rel = f"{d['secs'] / ref['secs']:13.2f}x" if ref and "secs" in ref and arm != refk else ""
+                    if ref and "error" in ref: rel = "(int ref refused)"
                     print(f"   {arm:36s} {d['us_per_pair']:10.3f} {d['mcells']:9.0f} {rel:>14s}  {d.get('note', '')}")
                 results[f"{tag}/{th}"] = {a: {k: v for k, v in d.items() if k != "scores"} for a, d in res.items()}
     if args.json:
