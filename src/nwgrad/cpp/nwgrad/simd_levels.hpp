@@ -453,12 +453,27 @@ inline constexpr size_t kInterLinearF64GatherCells = size_t(8000);
 inline constexpr size_t kInterLinearF32GatherCells = 0;
 inline constexpr size_t kInterLinearF64GatherCells = 0;
 #endif
-// The gather cap for a linear hard pair of T over an alphabet over 8 letters, or 0.
-template <class T>
+// Global linear, alphabets over 8 (admitted to the shared fill 2026-10-23): it wins L20-80
+// for every type, but at 12 threads (nighthaven AVX2, inter / own, hard) loses for the
+// integers at L80-100 (1.04-1.20; 1 thread 0.82-1.01) and for float32 at L160-200
+// (1.02-1.11; 1 thread 0.80-0.87) — the threaded case is a batch's default, so those
+// bands are capped: ~L75 and ~L140.  double wins through L200 (0.77-0.93).
+inline constexpr size_t kInterGlobalLinearIntCells = size_t(6000);
+inline constexpr size_t kInterGlobalLinearF32Cells = size_t(20000);
+// The gather cap for a linear hard pair of T over an alphabet over 8 letters, or 0: the
+// smallest of the caps that apply (the mode's, the type's, AArch64's for floats).
+template <class T, bool Global>
 inline constexpr size_t inter_linear_gather_cap() {
-    if constexpr (std::is_integral_v<T>) return kInterLinearIntGatherCells;
-    else if constexpr (std::is_same_v<T, float>) return kInterLinearF32GatherCells;
-    else return kInterLinearF64GatherCells;
+    size_t cap = 0;
+    auto take = [&cap](size_t c) { if (c > 0 && (cap == 0 || c < cap)) cap = c; };
+    if constexpr (std::is_integral_v<T>) take(kInterLinearIntGatherCells);
+    else if constexpr (std::is_same_v<T, float>) take(kInterLinearF32GatherCells);
+    else take(kInterLinearF64GatherCells);
+    if constexpr (Global) {
+        if constexpr (std::is_integral_v<T>) take(kInterGlobalLinearIntCells);
+        else if constexpr (std::is_same_v<T, float>) take(kInterGlobalLinearF32Cells);
+    }
+    return cap;
 }
 inline bool inter_score_ok(size_t nalpha, int M, int n) {
     return nalpha <= 8 ||

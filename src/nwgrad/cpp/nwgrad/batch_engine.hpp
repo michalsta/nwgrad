@@ -745,9 +745,9 @@ private:
             }
             // the integer linear gather gate of inter_eligible_ (hard fills only; score-only
             // groups are gated by inter_score_ok in the loop)
-            if constexpr (GM == GapModel::Linear && inter_linear_gather_cap<T>() > 0)
+            if constexpr (GM == GapModel::Linear && inter_linear_gather_cap<T, AM == AlignMode::Global>() > 0)
                 if (grad_mode_ == GradMode::Hard && params.matrix.size() > 8 &&
-                    (la + 1) * (lb + 1) > inter_linear_gather_cap<T>()) {
+                    (la + 1) * (lb + 1) > inter_linear_gather_cap<T, AM == AlignMode::Global>()) {
                     other.push_back(i); continue;
                 }
             elig.push_back(i);
@@ -2013,12 +2013,14 @@ private:
     static void run_inter_score_(const LevelKernels& K, InterJobT<T>& job) {
         K.template of<T>().inter_score(job);
     }
-    // Linear Global's own fill is cheap: the shared one loses below 4 lanes (DNA, W=2:
-    // 0.76x on SSE2) and for alphabets over 8 (protein, the per-row gather: 1.10-1.22x
-    // at 12 threads on AVX2).  Soft pairs still take the soft pass and skip the fill.
+    // Linear Global takes the shared fill only from 4 lanes: below that (DNA, W=2) the own
+    // fill wins (0.76x on SSE2).  Alphabets over 8 used to be excluded too, on a 1.10-1.22x
+    // measured against the old baseline-compiled own fill; re-measured 2026-10-23 against the
+    // leveled striped linear kernel (nighthaven AVX2, protein, inter / own): hard L20-80
+    // 0.54-0.85 at 1 thread and 0.67-0.87 at 12 for every type, score-only 0.09-0.78 — so the
+    // exclusion is gone, and the per-pair caps in inter_eligible_ take the bands that lose.
     bool linear_fill_ok_(const LevelKernels& K) const {
-        return !(GM == GapModel::Linear && AM == AlignMode::Global &&
-                 (inter_w_(K) < 4 || alpha_->size() > 8));
+        return !(GM == GapModel::Linear && AM == AlignMode::Global && inter_w_(K) < 4);
     }
     // The vector backend the batch's inter-pair fills run on, or -1 (every pair its own
     // fill).
@@ -2043,9 +2045,9 @@ private:
         // through L200 (0.63-0.84), and the NEON loss there (1.08-1.18 from L150) does not
         // justify costing the primary target.
         // (floating T: capped on AArch64 only, inter_linear_gather_cap — simd_levels.hpp)
-        if constexpr (GM == GapModel::Linear && inter_linear_gather_cap<T>() > 0)
+        if constexpr (GM == GapModel::Linear && inter_linear_gather_cap<T, AM == AlignMode::Global>() > 0)
             if (alpha_->size() > 8 && grad_mode_ != GradMode::Soft &&
-                (len_a(i) + 1) * (len_b(i) + 1) > inter_linear_gather_cap<T>())
+                (len_a(i) + 1) * (len_b(i) + 1) > inter_linear_gather_cap<T, AM == AlignMode::Global>())
                 return false;
         // Hirschberg pairs past the cutoff split: no shared fill.
         return !(is_hirschberg(tb_resolved_) && len_a(i) > static_cast<size_t>(s_.hb_cutoff));
