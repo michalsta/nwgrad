@@ -1017,7 +1017,15 @@ helpers and `int_pmax_carry<T, 16/32>` all exercised).  avx512 over avx2 on the 
 0.77 / 0.41 — AVX-512 is where int64 finally has a packed max (`vpmaxsq`), and under clang
 its hard step beats float32 (0.70).  DNA (inter-pair, 16 lanes of int32, 32 of int16):
 0.65-0.88 of avx2.  gcc against clang at avx512: the score kernels tie (0.92-1.01) but the
-Pointers kernels straggle under gcc — int16 0.77, int32 0.79, int64 0.56 — see the TODO.
+Pointers kernels straggle under gcc — int16 0.77, int32 0.79, int64 0.56. Half of that was
+gcc OUTLINING `pick_code` / `sel_ge` (and `store_codes`, `lane_shift_in`, `nv_load/store`)
+for 64-byte vectors — a call per vector of cells; `[[gnu::always_inline]]` on them (114d3a5;
+the disassembly audit then shows no per-cell call left in any leveled integer kernel at
+any level) re-measured on solace, clang/gcc time at avx512, 1 thread: int16 hard 0.77 →
+0.91, stream 0.73 → 0.88; int32 hard 0.79 → 0.86, stream 0.74 → 0.92; int64 hard 0.56 →
+0.60, stream 0.59 → 0.61 (score kernels unchanged, 0.86-0.95; float32 / double within 3 %).
+int64 is the one left: clang's AVX-512 int64 Pointers fill runs in 42.7 µs a pair, within
+30 % of float32's, gcc's in 71 — see the TODO.
 spot (NEON, W = 8 for int16, 4 for int32, 2 for int64) verified the final state green (ctest
 17/17, Python 4371 passed) and shows the same shape: the prefix-max carry took the protein
 int16 hard step from 0.54 to 0.32 of float32 and int32 from 0.81 to 0.69; int64 stays on the
