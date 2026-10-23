@@ -1000,10 +1000,10 @@ of the first run, every integer arm at or below its first-run time except sse4 i
 | protein neon hard, **spot** (M1, Fedora; gcc 16.2 \| clang 22.1) | 0.32 \| 0.29 (was 0.54) | 0.69 \| 0.54 (was 0.81) | 1.52 \| 1.49 (was 1.51) |
 | protein neon score, spot | 0.41 \| 0.27 (was 0.85) | 0.65 \| 0.45 (was 0.85) | 1.49 \| 1.08 (was 1.44) |
 | DNA neon hard / score, spot | 0.47 / 0.42 (unchanged) | 0.77 / 0.78 (unchanged) | 1.75 / 1.74 (unchanged) |
-| protein **avx512** hard, **solace** (Tiger Lake under WSL; gcc 15.2 \| clang 21.1) | 0.38 \| 0.31 | 0.46 \| 0.39 | 1.15 \| **0.70** |
-| protein avx512 score, solace | 0.27 \| 0.25 | 0.29 \| 0.29 | 0.47 \| 0.39 |
+| protein **avx512** hard, **solace** (Tiger Lake under WSL; gcc 15.2 \| clang 21.1; final state, after the always_inline and row-argmax fixes of 2026-10-23 — before them gcc read 0.38 / 0.46 / 1.15) | 0.33 \| 0.30 | 0.41 \| 0.37 | **0.75** \| **0.68** |
+| protein avx512 score, solace | 0.27 \| 0.24 | 0.28 \| 0.26 | 0.45 \| 0.40 |
 | protein avx2 hard / score, solace (same box) | 0.37 / 0.31 \| 0.29 / 0.25 | 0.53 / 0.42 \| 0.46 / 0.35 | 1.36 / 1.26 \| 1.38 / 0.97 |
-| DNA avx512 hard / score, solace | 0.67 / 0.63 | 0.84 / 0.82 | 1.26 / 1.40 |
+| DNA avx512 hard / score, solace (final state) | 0.66 / 0.64 | 0.84 / 0.84 | 1.27 / 1.42 |
 
 12 threads: the same picture a little compressed (protein avx2 int16 hard 0.42, int32 0.68).
 On Piledriver the protein score arms kept the largest gcc-vs-clang residue (int16 0.70,
@@ -1034,7 +1034,11 @@ chain per segment that the blend then waited on (int16 / int32 got one broadcast
 index is now a vector carried through the loop and incremented by a splat of one
 (`vs += one`). gcc Local int64 72.1 → 49.4 µs a pair (clang 42.8 at the same moment), the
 argmax 14.6 % of the run; Global unchanged (38.8 vs clang's 31.6). The 1.15–1.23× left is
-the striped loops' scheduling residue every integer type shows under gcc.
+the striped loops' scheduling residue every integer type shows under gcc. The final
+campaign on solace (b52b6d8, `bench_int_cc.sh`, avx512, 1 and 8 threads): gcc at 0.87–0.95
+of clang on every integer protein arm, int64 included (hard 47.2 vs 41.5 µs a pair at 1
+thread, 8.9 vs 7.7 at 8); DNA (inter-pair) arms within ±5 % either way; float32 and
+double within 3 %.
 spot (NEON, W = 8 for int16, 4 for int32, 2 for int64) verified the final state green (ctest
 17/17, Python 4371 passed) and shows the same shape: the prefix-max carry took the protein
 int16 hard step from 0.54 to 0.32 of float32 and int32 from 0.81 to 0.69; int64 stays on the
