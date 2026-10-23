@@ -690,7 +690,8 @@ skynet (Piledriver, W=2, 1 thread, 200k pairs): rowwise 12.4 µs/pair, interpair
   `trow`, scattered into the counts per lane after the row. Measured (AVX2, random
   protein pairs, µs/pair interpair/striped): 10–30 aa 0.28–0.37×, 30–60 aa 0.21–0.44×,
   60–120 aa 0.21–0.50× (affine, 1 thread); soft 0.40–0.67× up to 60 aa. Linear Global over 8 letters
-  keeps its own Viterbi fill (1.10–1.22× at 12 threads).
+  kept its own Viterbi fill (1.10–1.22× at 12 threads) until 2026-10-23 — re-measured against
+  the leveled linear kernel it now joins (see "Versus parasail").
 - **The size cap** (`inter_pair_fits`, `kInterGroupBytes` 1.25 MiB / `kInterSoftBytes`
   512 KiB): without it protein pairs of 150–600 aa ran 1.6–11.5× SLOWER at 12 threads
   (W pairs' tables past L2 while the per-pair fills keep 3 B/cell pointers). Affine won
@@ -1229,6 +1230,23 @@ score-only arm, which ran 1.5× slower than Local AFFINE's:
   keep the shared values. Parasail at avx2 on the same box (its wheel has no AVX-512):
   nwgrad's linear path 2.3–3.4× parasail's trace on int16 / int32, parasail's 64-bit
   kernels 18–26× slower than nwgrad's int64.
+- **Global linear protein pairs join the inter-pair fill (2026-10-23).** `linear_fill_ok_`
+  had kept every Global linear pair over an alphabet above 8 on its own fill (hard and
+  score-only), on a 1.10–1.22× measured against the old baseline own fill. Re-measured
+  against the leveled linear kernel (nighthaven AVX2, protein L10–200, a probe build that
+  lifted the exclusion, both arms in one process): the shared fill wins L20–80 for every
+  type, hard 0.54–0.85 at 1 thread and 0.67–0.87 at 12, score-only 0.09–0.78. It lost in two
+  bands, both at 12 threads: integers L80–100 (1.04–1.20; 1 thread 0.82–1.01) and float32
+  L160–200 (1.02–1.11; 1 thread 0.80–0.87). So the exclusion is gone (only W < 4 remains)
+  and those bands are capped per pair (`kInterGlobalLinearIntCells` 6000 ≈ L75,
+  `kInterGlobalLinearF32Cells` 20000 ≈ L140, folded into `inter_linear_gather_cap<T,
+  Global>()` with the Local and AArch64 caps): a batch's default is one thread per core.
+  Shipped routing, default / own fill: hard L20–80 int16 0.57–0.76 (1 thread) / 0.68–0.86
+  (12), int32 0.68–0.84 / 0.73–0.81, float32 0.54–0.84 / 0.71–0.81, double 0.69–1.00 /
+  0.82–0.89; score-only 0.09–0.62; the capped bands now 0.98–1.00; worst cell L10 1.03–1.08
+  (tiny pairs, not gated). The integer cap also returns score-only integers at L80 to the own
+  kernel (0.78 at 1 thread given up to avoid 1.04 at 12). AVX-512 and NEON not re-measured
+  (solace busy, spot off).
 
 **The two regressions that were not explained above, run down on nighthaven (2026-10-23).**
 (a) At L1000 parasail's scan32 edges nwgrad's int32 score-only (0.92 at AVX2, 0.82 on
