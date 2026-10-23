@@ -557,6 +557,9 @@ struct Aligner {
         hb_cutoff_ = rows;
     }
     int hb_cutoff() const noexcept { return hb_cutoff_; }
+    // Whether the retained Viterbi tables (or direction bytes) are in the striped layout
+    // of a leveled kernel — i.e. one ran, not the scalar fill.  For tests' liveness checks.
+    bool tables_striped() const noexcept { return tables_striped_; }
     int  kernel() const noexcept { return backend_; }
     // Which simd fill the Full band uses at double precision: the striped kernel (false,
     // the default) or the row-wise one the guide-banded path uses (true).  Both write
@@ -2072,9 +2075,23 @@ private:
         // (the pointer kernels are chosen after the backend is resolved, below: every
         // simd level has its own, and only the scalar path falls back here.)
         if constexpr (GM == GapModel::Linear) {
-            // No simd per-pair linear kernel: every backend is scalar here.  The pointer
-            // fill keeps direction bytes, not H, where linear_ptr_fill() says so.
-            if (linear_ptr_fill()) { viterbi_linear_ptr(buf); return; }
+            // The pointer fill keeps direction bytes, not H, where linear_ptr_fill() says
+            // so.  Full: the leveled striped linear kernel (kernels_linear_impl.inl) when
+            // the backend has one — bit-exact with the scalar fills below, which remain
+            // the scalar backend's, the banded path's and the header-only build's.
+            const bool lin_ptr = linear_ptr_fill();
+            if constexpr (AB == AlignBand::Full) {
+                const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
+                if (backend != kBackendScalar) {
+                    const LevelKernels& K = level_kernels(backend);
+                    const TypedKernels<T>& KT = K.template of<T>();
+                    if (lin_ptr ? KT.linear_ptr != nullptr : KT.linear != nullptr) {
+                        run_dispatched_linear(buf, K, lin_ptr);
+                        return;
+                    }
+                }
+            }
+            if (lin_ptr) { viterbi_linear_ptr(buf); return; }
             viterbi_linear(buf);
             return;
         }
@@ -2139,6 +2156,34 @@ private:
         best_i_ = job.best_i; best_j_ = job.best_j;
         best_tbl_ = (job.best_tbl == 0) ? TBTable::M
                   : (job.best_tbl == 1) ? TBTable::X : TBTable::Y;
+    }
+
+    // The leveled linear kernel (Full): H in STRIPED layout (or direction bytes in it),
+    // read back through cell_index like the affine tables.  No gap opens in the job.
+    void run_dispatched_linear(DpBuffer& buf, const LevelKernels& K, bool use_ptr) {
+        ViterbiJob<T> job{};
+        job.a = a_idx_.data(); job.m = m_;
+        job.b = b_idx_.data(); job.n = n_;
+        job.blk = blkT_;       job.nalpha = nalpha_;
+        job.go_a = static_cast<T>(0); job.ge_a = static_cast<T>(params_->gap_extend_a);
+        job.go_b = static_cast<T>(0); job.ge_b = static_cast<T>(params_->gap_extend_b);
+        job.align_mode = (AM == AlignMode::Local) ? 1 : 0;
+        job.align_band = 0; job.band = 0;
+        job.guide_j = nullptr; job.guide_len = 0;
+        job.buf = &buf;
+        if (tr_) fill_track_job_(job.tr, true, static_cast<size_t>(n_) + 16, true);
+        const TypedKernels<T>& KT = K.template of<T>();
+        if (use_ptr) KT.linear_ptr(job); else KT.linear(job);
+        pointers_ = use_ptr;
+        if (job.table_layout == 1) {
+            tables_striped_ = true;
+            striped_seg_ = job.seg; striped_w_ = job.width;
+        } else {
+            tables_striped_ = false;
+        }
+        viterbi_score_ = job.score;
+        best_i_ = job.best_i; best_j_ = job.best_j;
+        best_tbl_ = TBTable::M;
     }
 
     // ── Simd kernel — defined out-of-line in aligner_simd.hpp ─────────────────

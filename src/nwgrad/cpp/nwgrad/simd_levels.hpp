@@ -490,6 +490,8 @@ struct TypedKernels {
     using inter_fn   = void (*)(InterJobT<T>&);
     viterbi_fn         viterbi = nullptr;            // striped affine Full (Global + Local)
     viterbi_fn         viterbi_ptr = nullptr;        // TracebackMode::Pointers
+    viterbi_fn         linear = nullptr;             // striped LINEAR Full, H table (kernels_linear_impl.inl)
+    viterbi_fn         linear_ptr = nullptr;         // ... recording direction bytes
     banded_row_fn_t<T> banded_row_global = nullptr;  // row-wise banded whole-row kernels
     banded_row_fn_t<T> banded_row_local = nullptr;
     hb_fn              hb_sweep = nullptr;           // Hirschberg linear-space sweep
@@ -561,6 +563,8 @@ NWGRAD_BASELINE_ONLY
 void register_level_typed(SimdLevel l,
                           typename TypedKernels<T>::viterbi_fn viterbi,
                           typename TypedKernels<T>::viterbi_fn viterbi_ptr,
+                          typename TypedKernels<T>::viterbi_fn linear,
+                          typename TypedKernels<T>::viterbi_fn linear_ptr,
                           banded_row_fn_t<T> banded_row_global, banded_row_fn_t<T> banded_row_local,
                           typename TypedKernels<T>::hb_fn hb_sweep,
                           typename TypedKernels<T>::hb_fn hb_sweep_pmax,
