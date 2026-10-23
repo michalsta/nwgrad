@@ -561,7 +561,14 @@ struct Aligner {
     // of a leveled kernel — i.e. one ran, not the scalar fill.  For tests' liveness checks.
     bool tables_striped() const noexcept { return tables_striped_; }
     // The B length from which the linear Full fill takes the leveled striped kernel.
-    static constexpr int linear_striped_min_n() noexcept { return kLinearStripedMinN; }
+    // ... on `backend` (a level id): AVX-512's lanes move some crossovers later.
+    static int linear_striped_min_n(int backend) noexcept {
+#if !(defined(__aarch64__) || defined(_M_ARM64))
+        if (backend == static_cast<int>(SimdLevel::Avx512)) return kLinearStripedMinN512;
+#endif
+        (void)backend;
+        return kLinearStripedMinN;
+    }
     int  kernel() const noexcept { return backend_; }
     // Which simd fill the Full band uses at double precision: the striped kernel (false,
     // the default) or the row-wise one the guide-banded path uses (true).  Both write
@@ -2084,7 +2091,7 @@ private:
             const bool lin_ptr = linear_ptr_fill();
             if constexpr (AB == AlignBand::Full) {
                 const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
-                if (backend != kBackendScalar && n_ >= kLinearStripedMinN) {
+                if (backend != kBackendScalar && n_ >= linear_striped_min_n(backend)) {
                     const LevelKernels& K = level_kernels(backend);
                     const TypedKernels<T>& KT = K.template of<T>();
                     if (lin_ptr ? KT.linear_ptr != nullptr : KT.linear != nullptr) {
@@ -2173,6 +2180,16 @@ private:
             ? (std::is_same_v<T, int16_t> ? 48 : std::is_same_v<T, int32_t> ? 64
                : std::is_same_v<T, float> ? 80 : 96)
             : (std::is_same_v<T, int16_t> ? 32 : std::is_same_v<T, int32_t> ? 40 : 24);
+    // AVX-512 (solace, Tiger Lake, gcc 15.2, 2026-10-23): the lanes double AVX2's and some
+    // crossovers move a step later — striped / scalar at the shared thresholds: int16 Global
+    // n 48 1.13, Local 32 1.18; float32 Local 24 1.36; int64 Local 24 1.50, 32 1.20 — each
+    // winning a step later (int16 Global 64 0.79, Local 48 0.84; float32 Local 32 0.89;
+    // int64 Local 48 0.88).  The rest keep the shared values (crossing at or before them).
+    static constexpr int kLinearStripedMinN512 =
+        (AM == AlignMode::Global)
+            ? (std::is_same_v<T, int16_t> ? 56 : kLinearStripedMinN)
+            : (std::is_same_v<T, int16_t> ? 40 : std::is_same_v<T, float> ? 30
+               : std::is_same_v<T, int64_t> ? 44 : kLinearStripedMinN);
 
     // The leveled linear kernel (Full): H in STRIPED layout (or direction bytes in it),
     // read back through cell_index like the affine tables.  No gap opens in the job.
@@ -3281,9 +3298,9 @@ private:
     // fallback, and the two are bit-identical, so the choice moves no path.
     using lhb_fn_t = void (*)(LhbJob<T>&);
     lhb_fn_t lhb_kernel_(int ncols) const {
-        if (ncols < kLinearStripedMinN) return nullptr;
         const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
         if (backend == kBackendScalar) return nullptr;
+        if (ncols < linear_striped_min_n(backend)) return nullptr;
         return level_kernels(backend).template of<T>().lhb;
     }
     uint32_t lhb_srow_(int i) const noexcept {   // DP row i's stacked substitution row

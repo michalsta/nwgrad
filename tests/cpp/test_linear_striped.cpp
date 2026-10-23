@@ -134,7 +134,7 @@ void sweep(uint64_t seed, int rounds, int& mismatches, int& cases, int& kernel_r
             ++cases;
             kernel_runs += kH.layout + kP.layout;
             const bool has = level_kernels(level).template of<T>().linear != nullptr;
-            const int min_n = Aligner<GapModel::Linear, AM, AlignBand::Full, T>::linear_striped_min_n();
+            const int min_n = Aligner<GapModel::Linear, AM, AlignBand::Full, T>::linear_striped_min_n(level);
             expected_runs += (has && lb >= min_n) ? 2 : 0;
             const bool ok = same(sH, kH) && same(sP, kP) && same(kH, kP);
             if (!ok) {
