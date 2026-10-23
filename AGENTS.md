@@ -1188,6 +1188,34 @@ score-only arm, which ran 1.5× slower than Local AFFINE's:
   (0.63–0.84); on NEON it loses from L150 (1.08–1.18), recorded in `TODO.md`.
   (An explicit `traceback="pointers"` on linear is the byte form: past the 2 MiB H limit
   `auto` takes it too. The tool's nwgrad linear arms run `auto`, as a user does.)
+  **The NEON float residue of (c), FIXED**: on AArch64 builds (where NEON is the only
+  simd level) floating linear pairs over alphabets above 8 leave the inter-pair fill too,
+  past 15000 cells (float32) / 8000 (double) — `inter_linear_gather_cap<T>()`, 0 on x86.
+  spot: float32 Local L150 inter 33.5 → 29.0 µs (= own), L200 56.4 → 47.7; nighthaven
+  unchanged (float32 Local L200 still the faster inter-pair 26.1 vs own 31.8).
+- **Linear Hirschberg, leveled (2026-10-23, `kernels_linear_impl.inl::lhb_striped`).** One
+  kernel for the four O(m·n) loops of `viterbi_linear_hirschberg`: both sweeps, the base
+  case (direction codes, striped, walked back by the aligner) and the Local forward
+  clamped / reverse global-suffix endpoint scans. The aligner hands it the B codes and the
+  rows in sweep order, each row's extends and the row-0 / column-0 borders, computed in
+  scalar exactly as the scalar loops compute them (`LhbJob`), so the kernel has no border
+  or direction logic and its rows are the scalar rows bit for bit — the join's argmax,
+  hence the path, cannot move with the level; argmax order as the scalar scans (strict
+  `>`, rows in order, column 0 first, then left to right; the reverse scan in mirrored
+  coordinates, seeded with its row 0). The same gates as the fill (`kLinearStripedMinN`;
+  no int64 below 8 lanes). Tested (`test_linear_striped.cpp`, second case): scalar vs
+  every level under `hirschberg` and `hirschberg_pmax`, cutoffs 1–8, all five types, both
+  modes, tracked rows; liveness by a kernel-call count. Planted bugs: left codes on
+  equality (caught, 3 of 5 types), a row-offset in the reverse-scan extends (caught, every
+  type, tracked Local); column 0 winning ties in the reverse scan PASSES, an equivalent
+  mutant (column 0 is a vertical gap run, ≤ 0, and the scan's maximum is the local optimum
+  S > 0, so it can only tie a running best of 0 that a later cell overwrites). Measured,
+  kernel vs the scalar loops in one binary (`kernel=` only), hard, 1 thread, L1000–2000,
+  Global and Local: nighthaven AVX2 int32 3.2–4.0×, float32 3.2–3.8×, double 1.8–1.9×;
+  spot NEON 2.3–2.7×, 3.0–3.1×, 1.6–1.7×; int64 1.00 (scalar by the gate). Linear
+  Hirschberg now matches linear Pointers at L2000 Global (AVX2 int32 2.02 vs 2.08 ms) and
+  beats it at double (5.76 vs 6.10), in O(n) memory. C++ suite at NEON (spot): 38 cases
+  green.
 
 **The two regressions that were not explained above, run down on nighthaven (2026-10-23).**
 (a) At L1000 parasail's scan32 edges nwgrad's int32 score-only (0.92 at AVX2, 0.82 on
