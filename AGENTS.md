@@ -1179,7 +1179,7 @@ score-only arm, which ran 1.5× slower than Local AFFINE's:
   (b) **int64 has no linear kernel below 8 lanes** (`linear_kernel_pays`, registered null):
   AVX2 emulates the 64-bit max with `vpcmpgtq` + `vpblendvb` and NEON / SSE run 2 lanes,
   against one `cmov` in the scalar fill — striped / scalar 1.3–2.6× at every length.
-  AVX-512 (`vpmaxsq`, 8 lanes) keeps it, UNMEASURED (solace was off).
+  AVX-512 (`vpmaxsq`, 8 lanes) keeps it, and it pays there (measured below).
   (c) **integer linear pairs over 15000 cells leave the inter-pair gather fill**
   (`kInterLinearIntGatherCells`, `inter_eligible_` and streaming `align()`): the inter-pair
   kernel's per-lane-cell gather on a 20-letter alphabet now costs more than the integer
@@ -1216,6 +1216,19 @@ score-only arm, which ran 1.5× slower than Local AFFINE's:
   Hirschberg now matches linear Pointers at L2000 Global (AVX2 int32 2.02 vs 2.08 ms) and
   beats it at double (5.76 vs 6.10), in O(n) memory. C++ suite at NEON (spot): 38 cases
   green.
+- **AVX-512 (solace under WSL, gcc 15.2, 2026-10-23), the linear work's first execution
+  there**: the C++ suite at avx512 green (42 cases, 82,504 assertions). Linear Hirschberg,
+  kernel vs the scalar loops, L1000–2000: int32 4.6–5.4×, float32 4.3–6.4×, double
+  2.8–3.3×, and **int64 2.1–2.5×** — its linear kernels exist only at this level
+  (`vpmaxsq`, 8 lanes) and pay here. The length gate is PER LEVEL
+  (`linear_striped_min_n(backend)`): with twice AVX2's lanes some crossovers move a step
+  later — at the shared thresholds striped / scalar read int16 Global n 48 1.13, Local 32
+  1.18, float32 Local 24 1.36, int64 Local 24 1.50 / 32 1.20 — so AVX-512 takes its own
+  (`kLinearStripedMinN512`: int16 Global 56, Local 40; float32 Local 30; int64 Local 44;
+  the rest shared), after which the worst cell of the sweep is 1.04 (noise). AVX2 and NEON
+  keep the shared values. Parasail at avx2 on the same box (its wheel has no AVX-512):
+  nwgrad's linear path 2.3–3.4× parasail's trace on int16 / int32, parasail's 64-bit
+  kernels 18–26× slower than nwgrad's int64.
 
 **The two regressions that were not explained above, run down on nighthaven (2026-10-23).**
 (a) At L1000 parasail's scan32 edges nwgrad's int32 score-only (0.92 at AVX2, 0.82 on

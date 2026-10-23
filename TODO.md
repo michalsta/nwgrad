@@ -101,13 +101,12 @@ DiscrimAlign does: it passes the logical core count.
 
 ## Integer scalar types: what is left (branch `integer`, 2026-10-22)
 
-- **Linear kernels: what is left** (the leveled striped linear kernels landed 2026-10-23,
-  AGENTS "Versus parasail"). (1) AVX-512: the int64 linear kernel is registered there only
-  (8 lanes, `vpmaxsq`) and nothing linear is measured at avx512 — solace was off; run
-  `lin_cross.py`-style striped / scalar, `lhb_bench.py` and the parasail linear arms there.
-  (2) Global linear protein pairs stay out of the inter-pair fill (`linear_fill_ok_`, a
-  double-era measurement); re-measure against the new own fill. (Done 2026-10-23: the NEON
-  float inter-pair cap and the leveled linear Hirschberg — AGENTS "Versus parasail".)
+- **Linear kernels: what is left** (the leveled striped linear fill, linear Hirschberg, the
+  NEON float inter-pair cap and the AVX-512 gate all landed and were measured on AVX2,
+  AVX-512 and NEON, 2026-10-23: AGENTS "Versus parasail"). Global linear protein pairs stay
+  out of the inter-pair fill (`linear_fill_ok_`, a double-era measurement); re-measure
+  against the new own fill. The per-level thresholds come from one host per ISA — re-derive
+  them on another AVX-512 CPU (Zen 4 splits 512-bit ops) before trusting them there.
 - **The integer score kernel's working set** (2026-10-23, AGENTS "Versus parasail", the
   run-down): the prefix-max carry scratches three extra rows (`sopenv`, 3·sw) beside the six
   rolling rows, so int32 score-only leaves L1D (48 KB) at L1300 instead of L2000 — 0.28 →
