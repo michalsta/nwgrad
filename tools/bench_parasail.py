@@ -24,8 +24,11 @@ EQUAL the nwgrad integer score on every pair of the fixture, exactly (integers),
 run aborts — which also makes this an independent oracle for the integer kernels.
 
 ISA.  The Python bindings expose parasail's runtime dispatcher only (nw_striped_16 picks
-the best ISA the library was built with: sse41 / avx2 / avx512); nwgrad kernel="auto"
-does the same.  Both choices are printed; on the fleet they coincide (sse41 ~ sse4, avx2).
+the best ISA the library was BUILT with); nwgrad kernel="auto" does the same.  Both
+choices are printed.  The PyPI wheel (1.3.4) carries sse2 / sse41 / avx2 / neon kernels
+and NO AVX-512 ones (nm: 0 `avx512_512` symbols), so on an AVX-512 host the comparison
+is parasail's 256-bit kernels against nwgrad's 512-bit ones -- what a pip user gets; for
+an ISA-matched row set NWGRAD_ISA=avx2 in the environment (nwgrad's level override).
 
 Each arm runs in its OWN process (arms sharing one contaminate each other's allocator
 and caches: the repo's rule), repeats interleaved, the minimum kept.  A control arm
