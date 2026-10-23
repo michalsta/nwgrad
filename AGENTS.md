@@ -1190,6 +1190,184 @@ is to shrink them (one scratch row: opens and flags in one, Q in place over it),
 Not a kernel-speed loss: below the cliff nwgrad int32 is 1.0–1.3× parasail's scan32 and
 1.7–1.8× its striped32 at every length.
 
+**The fleet, one table per architecture (2026-10-23, every host on the same commit and
+tool; parasail time / nwgrad time, above 1 = nwgrad faster; cells: parasail striped /
+parasail scan over nwgrad score-only, then parasail trace + CIGAR over nwgrad path;
+`*` = parasail's striped linear kernel, which scores below the optimum at open == extend;
+L200 = 2000 30 %-mutated BLOSUM62 pairs, L1000 = 200, DNA = 20k related 22×50 pairs).**
+
+*nighthaven — i5-12500, **AVX2** vs parasail avx2 (gcc 16.2; 1 and 12 threads).*
+
+**protein L200, 1 thread**
+
+| algorithm | int16 striped / scan / trace | int32 striped / scan / trace | int64 striped / scan / trace |
+|---|---|---|---|
+| global affine | 3.11 / 1.38 / 4.98 | 1.76 / 1.19 / 3.05 | 16.50 / 9.04 / 10.88 |
+| global linear | 0.92* / 1.38 / 1.36 | 0.93* / 1.18 / 1.81 | 11.22 / 9.04 / 21.36 |
+| local affine | 2.22 / 1.47 / 3.15 | 1.52 / 1.31 / 2.02 | 10.26 / 10.29 / 6.37 |
+| local linear | 0.78* / 1.44 / 2.26 | 0.82* / 1.29 / 2.15 | 7.49 / 10.33 / 10.01 |
+
+**protein L200, 12 threads**
+
+| algorithm | int16 striped / scan / trace | int32 striped / scan / trace | int64 striped / scan / trace |
+|---|---|---|---|
+| global affine | 2.87 / 1.10 / 5.42 | 1.60 / 0.99 / 3.34 | 12.21 / 6.81 / 7.61 |
+| global linear | 0.80* / 1.10 / 1.65 | 0.77* / 0.99 / 2.12 | 8.12 / 6.68 / 15.10 |
+| local affine | 1.85 / 1.15 / 3.17 | 1.32 / 1.07 / 2.08 | 7.43 / 7.63 / 4.46 |
+| local linear | 0.75* / 1.20 / 2.18 | 0.68* / 1.07 / 2.03 | 5.39 / 7.62 / 8.00 |
+
+**protein L1000, 1 thread**
+
+| algorithm | int16 striped / scan / trace | int32 striped / scan / trace | int64 striped / scan / trace |
+|---|---|---|---|
+| global affine | refused (int16 bound) | 1.59 / 0.92 / 2.61 | 14.82 / 8.05 / 10.44 |
+| global linear | refused (int16 bound) | 0.62* / 0.92 / 0.56 | 10.11 / 8.04 / 10.38 |
+| local affine | refused (int16 bound) | 1.12 / 1.04 / 1.62 | 9.67 / 9.94 / 6.18 |
+| local linear | refused (int16 bound) | 0.52* / 1.04 / 0.30 | 7.18 / 9.91 / 5.02 |
+
+**dna 22x50, 1 thread**
+
+| algorithm | int16 striped / scan / trace | int32 striped / scan / trace | int64 striped / scan / trace |
+|---|---|---|---|
+| global affine | 7.36 / 8.01 / 5.23 | 3.32 / 3.32 / 3.14 | 19.62 / 14.42 / 14.34 |
+| global linear | 3.46* / 9.70 / 2.74 | 2.21* / 4.27 / 2.03 | 17.62 / 15.24 / 12.84 |
+| local affine | 3.43 / 7.74 / 4.26 | 3.82 / 3.34 / 2.68 | 11.84 / 14.72 / 8.35 |
+| local linear | 3.21* / 9.09 / 4.59 | 2.00* / 4.09 / 3.37 | 11.34 / 16.45 / 11.49 |
+
+*solace — Tiger Lake under WSL, **nwgrad AVX-512 vs parasail AVX2** (the PyPI wheel has no AVX-512 kernels: what a pip user gets; gcc 15.2; 1 and 8 threads).*
+
+**protein L200, 1 thread**
+
+| algorithm | int16 striped / scan / trace | int32 striped / scan / trace | int64 striped / scan / trace |
+|---|---|---|---|
+| global affine | 2.66 / 1.23 / 4.74 | 2.31 / 1.43 / 4.17 | 38.76 / 21.43 / 23.91 |
+| global linear | 0.83* / 1.23 / 1.23 | 1.12* / 1.46 / 1.41 | 26.34 / 21.64 / 17.46 |
+| local affine | 1.90 / 1.32 / 3.17 | 2.02 / 1.59 / 2.72 | 25.19 / 25.88 / 14.55 |
+| local linear | 0.72* / 1.30 / 0.64 | 0.97* / 1.58 / 0.92 | 18.49 / 26.13 / 10.37 |
+
+**protein L200, 8 threads**
+
+| algorithm | int16 striped / scan / trace | int32 striped / scan / trace | int64 striped / scan / trace |
+|---|---|---|---|
+| global affine | 2.48 / 1.19 / 4.76 | 2.19 / 1.46 / 4.24 | 33.18 / 18.48 / 21.56 |
+| global linear | 0.84* / 1.19 / 1.22 | 1.07* / 1.40 / 1.39 | 22.30 / 18.04 / 15.99 |
+| local affine | 1.81 / 1.29 / 3.21 | 1.96 / 1.56 / 2.73 | 21.76 / 22.36 / 13.07 |
+| local linear | 0.77* / 1.31 / 0.67 | 0.98* / 1.55 / 0.97 | 16.38 / 22.94 / 9.71 |
+
+**protein L1000, 1 thread**
+
+| algorithm | int16 striped / scan / trace | int32 striped / scan / trace | int64 striped / scan / trace |
+|---|---|---|---|
+| global affine | refused (int16 bound) | 2.59 / 1.41 / 3.62 | 24.27 / 13.47 / 15.09 |
+| global linear | refused (int16 bound) | 0.91* / 1.42 / 0.46 | 16.27 / 13.12 / 8.50 |
+| local affine | refused (int16 bound) | 1.80 / 1.54 / 2.22 | 15.93 / 16.82 / 10.74 |
+| local linear | refused (int16 bound) | 0.71* / 1.48 / 0.30 | 11.84 / 16.75 / 4.97 |
+
+**dna 22x50, 1 thread**
+
+| algorithm | int16 striped / scan / trace | int32 striped / scan / trace | int64 striped / scan / trace |
+|---|---|---|---|
+| global affine | 8.21 / 8.85 / 5.15 | 4.61 / 4.33 / 3.50 | 46.80 / 34.59 / 22.19 |
+| global linear | 3.58* / 9.73 / 2.46 | 3.00* / 5.40 / 1.96 | 46.02 / 40.32 / 14.84 |
+| local affine | 4.01 / 8.70 / 4.61 | 5.65 / 4.87 / 3.42 | 32.46 / 40.31 / 17.96 |
+| local linear | 3.73* / 9.94 / 4.34 | 3.09* / 6.15 / 3.79 | 34.12 / 50.29 / 20.87 |
+
+*solace — the same box with **nwgrad pinned to AVX2** (`NWGRAD_ISA=avx2`): the ISA-matched row.*
+
+**protein L200, 1 thread**
+
+| algorithm | int16 striped / scan / trace | int32 striped / scan / trace | int64 striped / scan / trace |
+|---|---|---|---|
+| global affine | 2.59 / 1.19 / 4.20 | 1.69 / 1.05 / 3.01 | 16.38 / 9.09 / 12.15 |
+| global linear | 0.82* / 1.21 / 1.21 | 0.81* / 1.04 / 1.42 | 10.90 / 9.05 / 17.20 |
+| local affine | 1.86 / 1.31 / 2.70 | 1.55 / 1.22 / 1.89 | 10.01 / 10.41 / 7.56 |
+| local linear | 0.74* / 1.31 / 1.81 | 0.73* / 1.20 / 1.91 | 7.44 / 10.26 / 11.08 |
+
+**protein L1000, 1 thread**
+
+| algorithm | int16 striped / scan / trace | int32 striped / scan / trace | int64 striped / scan / trace |
+|---|---|---|---|
+| global affine | refused (int16 bound) | 1.48 / 0.82 / 2.57 | 14.76 / 8.06 / 10.48 |
+| global linear | refused (int16 bound) | 0.52* / 0.81 / 0.46 | 9.99 / 8.13 / 8.39 |
+| local affine | refused (int16 bound) | 1.01 / 0.85 / 1.57 | 9.21 / 9.65 / 6.53 |
+| local linear | refused (int16 bound) | 0.42* / 0.85 / 0.30 | 7.14 / 10.09 / 5.14 |
+
+**dna 22x50, 1 thread**
+
+| algorithm | int16 striped / scan / trace | int32 striped / scan / trace | int64 striped / scan / trace |
+|---|---|---|---|
+| global affine | 6.32 / 6.66 / 4.64 | 3.07 / 2.92 / 2.78 | 19.19 / 14.11 / 12.90 |
+| global linear | 2.91* / 7.91 / 2.38 | 1.98* / 3.57 / 1.80 | 18.19 / 16.65 / 11.80 |
+| local affine | 2.82 / 6.24 / 3.88 | 3.21 / 2.78 / 2.50 | 12.41 / 15.51 / 8.34 |
+| local linear | 2.67* / 7.19 / 3.99 | 1.73* / 3.36 / 2.80 | 12.31 / 18.20 / 11.58 |
+
+*spot — Apple M1 under Fedora Asahi, **NEON** vs parasail neon (gcc 16.2; pinned to the 4 performance cores; 1 and 4 threads).*
+
+**protein L200, 1 thread**
+
+| algorithm | int16 striped / scan / trace | int32 striped / scan / trace | int64 striped / scan / trace |
+|---|---|---|---|
+| global affine | 2.85 / 1.35 / 2.83 | 1.96 / 1.25 / 1.29 | 1.84 / 1.51 / 1.19 |
+| global linear | 0.97* / 1.35 / 0.76 | 1.01* / 1.25 / 1.38 | 2.01 / 1.97 / 3.31 |
+| local affine | 2.28 / 1.61 / 2.00 | 1.95 / 1.55 / 0.96 | 1.91 / 2.13 / 0.90 |
+| local linear | 0.96* / 1.58 / 1.53 | 1.17* / 1.54 / 1.31 | 1.97 / 2.58 / 1.53 |
+
+**protein L200, 4 threads**
+
+| algorithm | int16 striped / scan / trace | int32 striped / scan / trace | int64 striped / scan / trace |
+|---|---|---|---|
+| global affine | 3.74 / 1.96 / 3.35 | 2.56 / 1.78 / 1.52 | 2.06 / 1.76 / 1.30 |
+| global linear | 1.67* / 1.93 / 0.99 | 1.51* / 1.79 / 1.74 | 2.35 / 2.30 / 3.71 |
+| local affine | 3.08 / 2.36 / 2.40 | 2.47 / 2.05 / 1.17 | 2.18 / 2.40 / 1.01 |
+| local linear | 1.48* / 2.27 / 1.99 | 1.61* / 2.03 / 1.69 | 2.30 / 2.93 / 1.74 |
+
+**protein L1000, 1 thread**
+
+| algorithm | int16 striped / scan / trace | int32 striped / scan / trace | int64 striped / scan / trace |
+|---|---|---|---|
+| global affine | refused (int16 bound) | 1.82 / 1.13 / 1.30 | 1.89 / 1.55 / 1.16 |
+| global linear | refused (int16 bound) | 0.90* / 1.13 / 0.54 | 2.26 / 2.19 / 1.83 |
+| local affine | refused (int16 bound) | 1.72 / 1.51 / 0.94 | 1.90 / 2.22 / 0.88 |
+| local linear | refused (int16 bound) | 1.07* / 1.52 / 0.38 | 2.14 / 2.83 / 1.30 |
+
+**dna 22x50, 1 thread**
+
+| algorithm | int16 striped / scan / trace | int32 striped / scan / trace | int64 striped / scan / trace |
+|---|---|---|---|
+| global affine | 7.00 / 6.58 / 3.47 | 4.10 / 3.32 / 2.52 | 3.04 / 2.91 / 2.50 |
+| global linear | 3.13* / 6.75 / 2.03 | 3.02* / 3.35 / 1.80 | 1.53 / 1.68 / 2.38 |
+| local affine | 3.73 / 6.66 / 3.49 | 3.77 / 3.65 / 2.54 | 2.86 / 3.27 / 2.12 |
+| local linear | 3.73* / 7.37 / 3.87 | 3.31* / 4.07 / 2.97 | 2.07 / 2.78 / 2.32 |
+
+*skynet — Piledriver VM, **sse4** vs parasail sse41 (gcc 16.2; 1 and 16 threads). CAVEAT: the host wloczykij went busy again during the run (load 6.8 at its end); the L200 and DNA controls held (0.97–1.03) but the L1000 score-only cells (0.06–0.21) repeat the 3× drift of the discarded run and are NOT to be read as kernel numbers.*
+
+**protein L200, 1 thread**
+
+| algorithm | int16 striped / scan / trace | int32 striped / scan / trace | int64 striped / scan / trace |
+|---|---|---|---|
+| global affine | 1.74 / 1.00 / 2.64 | 1.17 / 0.91 / 1.54 | 13.87 / 10.28 / 17.68 |
+| global linear | 0.75* / 0.98 / 1.14 | 0.70* / 0.90 / 1.60 | 13.98 / 12.65 / 46.40 |
+| local affine | 1.33 / 1.08 / 1.75 | 0.93 / 0.99 / 1.09 | 9.86 / 12.50 / 6.01 |
+| local linear | 0.66* / 1.07 / 1.71 | 0.66* / 1.01 / 1.75 | 8.87 / 13.53 / 14.38 |
+
+**protein L200, 16 threads**
+
+| algorithm | int16 striped / scan / trace | int32 striped / scan / trace | int64 striped / scan / trace |
+|---|---|---|---|
+| global affine | 1.70 / 1.01 / 2.59 | 1.24 / 0.98 / 1.65 | 14.31 / 10.43 / 18.30 |
+| global linear | 0.85* / 1.06 / 1.16 | 0.78* / 0.98 / 1.64 | 14.16 / 12.71 / 45.47 |
+| local affine | 1.39 / 1.12 / 1.79 | 1.06 / 1.12 / 1.18 | 10.10 / 12.94 / 6.40 |
+| local linear | 0.73* / 1.09 / 1.60 | 0.66* / 1.01 / 1.54 | 6.79 / 9.98 / 14.71 |
+
+**dna 22x50, 1 thread**
+
+| algorithm | int16 striped / scan / trace | int32 striped / scan / trace | int64 striped / scan / trace |
+|---|---|---|---|
+| global affine | 2.84 / 2.25 / 2.59 | 1.71 / 1.47 / 1.92 | 10.86 / 9.15 / 21.27 |
+| global linear | 1.71* / 2.58 / 1.82 | 1.55* / 2.02 / 1.73 | 11.00 / 9.82 / 27.40 |
+| local affine | 1.58 / 2.29 / 2.11 | 1.51 / 1.67 / 1.65 | 8.18 / 12.70 / 9.81 |
+| local linear | 1.80* / 3.06 / 2.57 | 1.36* / 2.03 / 2.14 | 8.16 / 14.05 / 13.44 |
+
 ### The soft path: scaled probability space (2026-10-05)
 
 **The soft path is NOT bit-exact** — across `soft_impl`, ISA levels, compilers, `fill`,
