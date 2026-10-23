@@ -61,6 +61,8 @@ struct NwgradLevelRegistrar {
                                     ? &NWGRAD_LVL_NAME::striped_linear_entry<T> : nullptr,
                                 NWGRAD_LVL_NAME::linear_kernel_pays<T>()       // linear Full: direction bytes
                                     ? &NWGRAD_LVL_NAME::striped_linear_ptr_entry<T> : nullptr,
+                                NWGRAD_LVL_NAME::linear_kernel_pays<T>()       // linear Hirschberg
+                                    ? &NWGRAD_LVL_NAME::lhb_striped<T> : nullptr,
                                 &NWGRAD_LVL_NAME::banded_row_global<T>,       // affine GuideBanded: whole-row
                                 &NWGRAD_LVL_NAME::banded_row_local<T>,
                                 &NWGRAD_LVL_NAME::hb_sweep_entry<T>,          // Hirschberg sweep

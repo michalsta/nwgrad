@@ -3274,8 +3274,69 @@ private:
     // Forward sweep from (i0, j0), Global borders, to row i1: out[c] = best score of
     // A[i0..i1) x B[j0..j0+c).  Reverse (rev): from (i1, j1) back to row i0, out[d] =
     // best score of A[i0..i1) x B[j1-d..j1).
+    // The leveled linear Hirschberg kernel (kernels_linear_impl.inl, lhb_striped) for a
+    // loop of `ncols` columns, or null: the scalar backend, a level without it (int64
+    // below 8 lanes), a header-only build, or a row too short to pay (the linear fill's
+    // measured gate, kLinearStripedMinN).  Every caller keeps its scalar loop as the
+    // fallback, and the two are bit-identical, so the choice moves no path.
+    using lhb_fn_t = void (*)(LhbJob<T>&);
+    lhb_fn_t lhb_kernel_(int ncols) const {
+        if (ncols < kLinearStripedMinN) return nullptr;
+        const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
+        if (backend == kBackendScalar) return nullptr;
+        return level_kernels(backend).template of<T>().lhb;
+    }
+    uint32_t lhb_srow_(int i) const noexcept {   // DP row i's stacked substitution row
+        return static_cast<uint32_t>((sub_row_(i) - blkT_) / nalpha_);
+    }
+    std::vector<unsigned char> lhb_b_;
+    std::vector<uint32_t> lhb_rows_;
+    std::vector<T> lhb_ga_, lhb_gb_, lhb_r0_, lhb_c0_;
+    int lhb_runs_ = 0;   // kernel calls, for the tests' liveness check
+    LhbJob<T> lhb_job_(DpBuffer& buf, int ncols, int nrows) {
+        LhbJob<T> job{};
+        job.b = lhb_b_.data(); job.n = ncols;
+        job.blk = blkT_; job.nalpha = nalpha_;
+        job.srow = lhb_rows_.data(); job.h = nrows;
+        job.ga = lhb_ga_.data(); job.gb = lhb_gb_.data();
+        job.row0 = lhb_r0_.data(); job.col0 = lhb_c0_.data();
+        job.by_symbol = (!tr_ && nrows >= nalpha_) ? 1 : 0;
+        job.buf = &buf;
+        return job;
+    }
+public:
+    int lhb_kernel_runs() const noexcept { return lhb_runs_; }
+private:
+
     void lhb_sweep(DpBuffer& buf, bool rev, int i0, int i1, int j0, int j1, T* out) {
         const int W = j1 - j0;
+        if (const lhb_fn_t fn = lhb_kernel_(W); fn && i1 > i0 && W > 0) {
+            // the scalar sweep's arrays, in its order and with its expressions
+            const int Hh = i1 - i0;
+            lhb_b_.resize(static_cast<size_t>(W));
+            for (int c = 1; c <= W; ++c)
+                lhb_b_[static_cast<size_t>(c) - 1] = rev ? b_idx_[static_cast<size_t>(j1 - c)]
+                                                         : b_idx_[static_cast<size_t>(j0 + c - 1)];
+            lhb_rows_.resize(static_cast<size_t>(Hh));
+            lhb_ga_.resize(static_cast<size_t>(Hh)); lhb_gb_.resize(static_cast<size_t>(Hh));
+            T ga = hb_ge_a(rev ? i1 : i0), gb = static_cast<T>(params_->gap_extend_b);
+            lhb_r0_.resize(static_cast<size_t>(W) + 1); lhb_c0_.resize(static_cast<size_t>(Hh) + 1);
+            lhb_r0_[0] = static_cast<T>(0);
+            for (int c = 1; c <= W; ++c) lhb_r0_[static_cast<size_t>(c)] = lhb_r0_[static_cast<size_t>(c) - 1] - ga;
+            lhb_c0_[0] = lhb_r0_[0];
+            for (int r = 1; r <= Hh; ++r) {
+                const int i = rev ? i1 - r + 1 : i0 + r;
+                if (tr_) { gb = tgeb_[static_cast<size_t>(i)]; ga = hb_ge_a(rev ? i - 1 : i); }
+                lhb_rows_[static_cast<size_t>(r) - 1] = lhb_srow_(i);
+                lhb_ga_[static_cast<size_t>(r) - 1] = ga; lhb_gb_[static_cast<size_t>(r) - 1] = gb;
+                lhb_c0_[static_cast<size_t>(r)] = lhb_c0_[static_cast<size_t>(r) - 1] - gb;
+            }
+            LhbJob<T> job = lhb_job_(buf, W, Hh);
+            job.out = out;
+            fn(job);
+            ++lhb_runs_;
+            return;
+        }
         hb_fit(buf.hfa, static_cast<std::size_t>(W) + 1);
         T* row = buf.hfa.data();
         // Tracked: no opens in linear, so the mirror needs no rewritten rows — only the
@@ -3321,6 +3382,47 @@ private:
     // (i1, j1) to (i0, j0); the moves appended to hops_ in forward order.
     void lhb_base(DpBuffer& buf, int i0, int i1, int j0, int j1) {
         const int H = i1 - i0, W = j1 - j0;
+        if (const lhb_fn_t fn = lhb_kernel_(W); fn && H > 0 && W > 0) {
+            lhb_b_.resize(static_cast<size_t>(W));
+            for (int c = 1; c <= W; ++c) lhb_b_[static_cast<size_t>(c) - 1] = b_idx_[static_cast<size_t>(j0 + c - 1)];
+            lhb_rows_.resize(static_cast<size_t>(H));
+            lhb_ga_.resize(static_cast<size_t>(H)); lhb_gb_.resize(static_cast<size_t>(H));
+            T ga = hb_ge_a(i0), gb = static_cast<T>(params_->gap_extend_b);
+            lhb_r0_.resize(static_cast<size_t>(W) + 1); lhb_c0_.resize(static_cast<size_t>(H) + 1);
+            lhb_r0_[0] = static_cast<T>(0);
+            for (int c = 1; c <= W; ++c) lhb_r0_[static_cast<size_t>(c)] = lhb_r0_[static_cast<size_t>(c) - 1] - ga;
+            lhb_c0_[0] = lhb_r0_[0];
+            for (int r = 1; r <= H; ++r) {
+                if (tr_) { ga = tgea_[static_cast<size_t>(i0 + r)]; gb = tgeb_[static_cast<size_t>(i0 + r)]; }
+                lhb_rows_[static_cast<size_t>(r) - 1] = lhb_srow_(i0 + r);
+                lhb_ga_[static_cast<size_t>(r) - 1] = ga; lhb_gb_[static_cast<size_t>(r) - 1] = gb;
+                lhb_c0_[static_cast<size_t>(r)] = lhb_c0_[static_cast<size_t>(r) - 1] - gb;
+            }
+            // rowsz = (seg + 1) * lanes <= W + 2 * 64 for every level's lane count
+            const std::size_t cap = (static_cast<std::size_t>(H) + 1) * (static_cast<std::size_t>(W) + 130);
+            if (buf.hbD.size() < cap) buf.hbD.resize(cap);
+            LhbJob<T> job = lhb_job_(buf, W, H);
+            job.codes = buf.hbD.data();
+            fn(job);
+            ++lhb_runs_;
+            const std::size_t lw = static_cast<std::size_t>(job.width), sg = static_cast<std::size_t>(job.seg);
+            const std::size_t rs = (sg + 1) * lw;
+            auto at = [&](int r, int c) -> std::size_t {
+                if (c == 0) return static_cast<std::size_t>(r) * rs;
+                const std::size_t cc = static_cast<std::size_t>(c) - 1;
+                return static_cast<std::size_t>(r) * rs + lw + (cc % sg) * lw + cc / sg;
+            };
+            const unsigned char* D = buf.hbD.data();
+            const std::size_t at0 = hops_.size();
+            int r = H, c = W;
+            while (r > 0 || c > 0) {
+                const unsigned char k = D[at(r, c)];
+                hops_.push_back(k);
+                if (k == 0) { --r; --c; } else if (k == 1) --r; else --c;
+            }
+            std::reverse(hops_.begin() + static_cast<std::ptrdiff_t>(at0), hops_.end());
+            return;
+        }
         const std::size_t st = static_cast<std::size_t>(W) + 1;
         if (buf.DM.size() < (static_cast<std::size_t>(H) + 1) * st)
             buf.DM.resize((static_cast<std::size_t>(H) + 1) * st);
@@ -3394,7 +3496,25 @@ private:
             T* row = buf.hfa.data();
             std::fill(row, row + n_ + 1, static_cast<T>(0));
             T best = static_cast<T>(0); int ie = 0, je = 0;
-            for (int i = 1; i <= m_; ++i) {
+            const lhb_fn_t fscan = lhb_kernel_(n_);
+            if (fscan && m_ > 0 && n_ > 0) {
+                lhb_b_.assign(b_idx_.begin(), b_idx_.begin() + n_);
+                lhb_rows_.resize(static_cast<size_t>(m_));
+                lhb_ga_.resize(static_cast<size_t>(m_)); lhb_gb_.resize(static_cast<size_t>(m_));
+                for (int i = 1; i <= m_; ++i) {
+                    lhb_rows_[static_cast<size_t>(i) - 1] = lhb_srow_(i);
+                    lhb_ga_[static_cast<size_t>(i) - 1] = ga(i); lhb_gb_[static_cast<size_t>(i) - 1] = gb(i);
+                }
+                lhb_r0_.assign(static_cast<size_t>(n_) + 1, static_cast<T>(0));
+                lhb_c0_.assign(static_cast<size_t>(m_) + 1, static_cast<T>(0));
+                LhbJob<T> job = lhb_job_(buf, n_, m_);
+                job.clamp = 1; job.argmax = 1;
+                job.best = static_cast<T>(0); job.bi = 0; job.bj = 0;
+                fscan(job);
+                ++lhb_runs_;
+                best = job.best; ie = job.bi; je = job.bj;
+            }
+            for (int i = 1; i <= (fscan && m_ > 0 && n_ > 0 ? 0 : m_); ++i) {
                 T diag = row[0];
                 const T ge_a = ga(i), ge_b = gb(i);
                 for (int j = 1; j <= n_; ++j) {
@@ -3419,7 +3539,35 @@ private:
             for (int q = je - 1; q >= 0; --q) g[q] = g[q + 1] - ga(ie);
             T sbest = g[0]; int is = ie, js = 0;
             for (int q = 0; q <= je; ++q) if (g[q] > sbest) { sbest = g[q]; js = q; }
-            for (int pi = ie - 1; pi >= 0; --pi) {
+            // Leveled: the suffix scan is a reverse sweep in mirrored coordinates (row r =
+            // DP row pi = ie - r, column c = je - q), its row 0 the g just computed; the
+            // scalar argmax order (rows pi descending; in each, q = je first, then q
+            // descending; strict >) is the kernel's (rows ascending, column 0 first, then
+            // columns ascending), seeded with row 0's best.
+            const lhb_fn_t rscan = lhb_kernel_(je);
+            const bool rk = rscan && ie > 0 && je > 0;
+            if (rk) {
+                lhb_b_.resize(static_cast<size_t>(je));
+                for (int c = 1; c <= je; ++c) lhb_b_[static_cast<size_t>(c) - 1] = b_idx_[static_cast<size_t>(je - c)];
+                lhb_rows_.resize(static_cast<size_t>(ie));
+                lhb_ga_.resize(static_cast<size_t>(ie)); lhb_gb_.resize(static_cast<size_t>(ie));
+                lhb_r0_.resize(static_cast<size_t>(je) + 1); lhb_c0_.resize(static_cast<size_t>(ie) + 1);
+                for (int c = 0; c <= je; ++c) lhb_r0_[static_cast<size_t>(c)] = g[je - c];
+                lhb_c0_[0] = g[je];
+                for (int r = 1; r <= ie; ++r) {
+                    const int pi = ie - r;
+                    lhb_rows_[static_cast<size_t>(r) - 1] = lhb_srow_(pi + 1);
+                    lhb_ga_[static_cast<size_t>(r) - 1] = ga(pi); lhb_gb_[static_cast<size_t>(r) - 1] = gb(pi + 1);
+                    lhb_c0_[static_cast<size_t>(r)] = lhb_c0_[static_cast<size_t>(r) - 1] - gb(pi + 1);
+                }
+                LhbJob<T> job = lhb_job_(buf, je, ie);
+                job.argmax = 2;
+                job.best = sbest; job.bi = 0; job.bj = je - js;
+                rscan(job);
+                ++lhb_runs_;
+                sbest = job.best; is = ie - job.bi; js = je - job.bj;
+            }
+            for (int pi = (rk ? -1 : ie - 1); pi >= 0; --pi) {
                 // the suffix from DP row pi: its first move down is into row pi+1, its
                 // gaps in A lie in row pi
                 const T ge_a = ga(pi), ge_b = gb(pi + 1);

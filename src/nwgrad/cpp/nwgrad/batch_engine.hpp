@@ -745,9 +745,9 @@ private:
             }
             // the integer linear gather gate of inter_eligible_ (hard fills only; score-only
             // groups are gated by inter_score_ok in the loop)
-            if constexpr (GM == GapModel::Linear && nw_is_int<T>)
+            if constexpr (GM == GapModel::Linear && inter_linear_gather_cap<T>() > 0)
                 if (grad_mode_ == GradMode::Hard && params.matrix.size() > 8 &&
-                    (la + 1) * (lb + 1) > kInterLinearIntGatherCells) {
+                    (la + 1) * (lb + 1) > inter_linear_gather_cap<T>()) {
                     other.push_back(i); continue;
                 }
             elig.push_back(i);
@@ -2042,9 +2042,10 @@ private:
         // AVX2 and spot NEON agree).  Floating T keeps the shared fill: on AVX2 it still wins
         // through L200 (0.63-0.84), and the NEON loss there (1.08-1.18 from L150) does not
         // justify costing the primary target.
-        if constexpr (GM == GapModel::Linear && nw_is_int<T>)
-            if (alpha_->size() > 8 &&
-                (len_a(i) + 1) * (len_b(i) + 1) > kInterLinearIntGatherCells)
+        // (floating T: capped on AArch64 only, inter_linear_gather_cap — simd_levels.hpp)
+        if constexpr (GM == GapModel::Linear && inter_linear_gather_cap<T>() > 0)
+            if (alpha_->size() > 8 && grad_mode_ != GradMode::Soft &&
+                (len_a(i) + 1) * (len_b(i) + 1) > inter_linear_gather_cap<T>())
                 return false;
         // Hirschberg pairs past the cutoff split: no shared fill.
         return !(is_hirschberg(tb_resolved_) && len_a(i) > static_cast<size_t>(s_.hb_cutoff));

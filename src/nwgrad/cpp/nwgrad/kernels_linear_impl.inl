@@ -328,3 +328,188 @@ static void striped_linear_ptr_entry(ViterbiJob<T>& job) {
     if (job.align_mode) striped_linear_full<T, true, true, false>(job);
     else                striped_linear_full<T, false, true, false>(job);
 }
+
+// ── Linear Hirschberg: the sweeps, the base case and the Local endpoint scans ──────
+//
+// One kernel for the four O(m*n) loops of Aligner::viterbi_linear_hirschberg (see LhbJob):
+// the recurrence of striped_linear_full over rows the aligner lists in sweep order, with
+// the borders it computed in scalar.  Row r: U = max(H[r-1][c-1] + s, H[r-1][c] - gb[r])
+// (Local scan: max(U, 0)), the Y carry from column 0 with a zero open, H = max(U, Y) —
+// bit for bit the scalar `v = d; if (v < u) v = u; if (v < l) v = l` (rounding is monotone),
+// so the sweep's last row, hence the join's argmax and the path, cannot move with the
+// level.  Codes as the base case records them: 0 diagonal, 1 up where u > d strictly,
+// 2 left where Y strictly exceeds U.  Argmax as the scalar scans run it: strict `>`, rows
+// in order, column 0 first (argmax == 2), then columns left to right.
+template <class T>
+static void lhb_striped(LhbJob<T>& job) {
+    using vd = stdx::native_simd<T>;
+    constexpr int W = (int)vd::size();
+    const T K_NINF = nw_ninf<T>;
+    const int n = job.n, h = job.h, nalpha = job.nalpha;
+    const unsigned char* b = job.b;
+    DpBufferT<T>& buf = *job.buf;
+
+    const int seg = (n + W - 1) / W;
+    const std::size_t sw = (std::size_t)seg * W;
+    const std::size_t rowsz = (std::size_t)(seg + 1) * W;
+    const std::size_t off = (std::size_t)W;
+    auto scol = [seg](int j) -> std::size_t {
+        return (std::size_t)((j - 1) % seg) * W + (j - 1) / seg;
+    };
+
+    // profile: one row per symbol (untracked, enough rows to pay for it) or per DP row
+    const bool by_symbol = job.by_symbol != 0;
+    {
+        const std::size_t need = by_symbol ? (std::size_t)nalpha * sw : sw;
+        if (buf.hprof.size() < need) buf.hprof.resize(need);
+        if (by_symbol)
+            for (int c = 0; c < nalpha; ++c)
+                striped_profile_row(buf.hprof.data() + (std::size_t)c * sw, job.blk + (std::size_t)c * nalpha,
+                                    b, n, seg, W);
+    }
+    if (buf.sopenv.size() < 2 * sw) buf.sopenv.resize(2 * sw);
+    T* ov = buf.sopenv.data();
+    T* yv = buf.sopenv.data() + sw;
+    if (buf.subbuf.size() < sw) buf.subbuf.resize(sw);
+    T* kc = buf.subbuf.data();
+    if (buf.rM.size() < rowsz) buf.rM.resize(rowsz);
+    if (buf.qM.size() < rowsz) buf.qM.resize(rowsz);
+    T* pH = buf.qM.data(); T* cH = buf.rM.data();
+    unsigned char* D = job.codes;
+    const T* pad = job.argmax ? striped_pad(buf.spad, n, seg, W) : nullptr;
+    [[maybe_unused]] T ramp_ge = T(0); [[maybe_unused]] bool ramp_ok = false;
+
+    // row 0
+    pH[0] = job.row0[0];
+    for (int l = 0; l < W; ++l)
+        for (int s = 0; s < seg; ++s) {
+            const int j = l * seg + s + 1;
+            pH[off + (std::size_t)s * W + l] = (j <= n) ? job.row0[j] : K_NINF;
+        }
+    if (D) {
+        D[0] = 3;
+        for (std::size_t k = 0; k < sw; ++k) D[off + k] = 2;
+    }
+
+    const vd vzero(static_cast<T>(0)), vone(static_cast<T>(1)), vtwo(static_cast<T>(2));
+    const vd vninf(K_NINF);
+    T best = job.best; int bi = job.bi, bj = job.bj;
+
+    for (int r = 1; r <= h; ++r) {
+        const T ga = job.ga[r - 1], gb = job.gb[r - 1];
+        const vd vga(ga), vgb(gb);
+        const T c0 = job.col0[r];
+        const T bprev = pH[0];
+        cH[0] = c0;
+        const T nbOpen = c0 - ga;
+        const T* sub;
+        if (by_symbol) {
+            sub = buf.hprof.data() + (std::size_t)job.srow[r - 1] * sw;
+        } else {
+            striped_profile_row(buf.hprof.data(), job.blk + (std::size_t)job.srow[r - 1] * nalpha, b, n, seg, W);
+            sub = buf.hprof.data();
+        }
+        unsigned char* dM = nullptr;
+        if (D) { dM = D + (std::size_t)r * rowsz; dM[0] = 1; dM += off; }
+        if (job.argmax == 2 && c0 > best) { best = c0; bi = r; bj = 0; }
+
+        if (seg > 0) {
+            for (int s = 0; s < seg; ++s) {
+                vd dg;
+                if (s == 0) {
+                    vd last; last.copy_from(pH + off + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                    dg = lane_shift_in(last, bprev);
+                } else {
+                    dg.copy_from(pH + off + (std::size_t)(s - 1) * W, stdx::element_aligned);
+                }
+                vd up; up.copy_from(pH + off + (std::size_t)s * W, stdx::element_aligned);
+                vd sb; sb.copy_from(sub + (std::size_t)s * W, stdx::element_aligned);
+                const vd d0 = dg + sb;
+                const vd u = up - vgb;
+                vd t = stdx::max(d0, u);
+                if (D) {
+                    vd k = vzero;
+#if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
+                    if constexpr (sizeof(T) == 8) k = avx512d_blend(avx512d_gt(u, d0), k, vone);
+                    else                          stdx::where(u > d0, k) = vone;
+#else
+                    stdx::where(u > d0, k) = vone;
+#endif
+                    k.copy_to(kc + (std::size_t)s * W, stdx::element_aligned);
+                }
+                if (job.clamp) t = stdx::max(t, vzero);
+                t.copy_to(cH + off + (std::size_t)s * W, stdx::element_aligned);
+                (t - vga).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
+            }
+
+            if constexpr (nw_is_int<T> && W >= 4) {
+                int_ramp_for<T>(buf.hramp, ga, seg, W, ramp_ge, ramp_ok);
+                int_pmax_carry<T, W>(ov, nullptr, buf.hramp.data(), nbOpen, static_cast<T>(0),
+                                     K_NINF, ga, seg, yv, nullptr, nullptr);
+            } else {
+                vd prev = vninf;
+                for (int s = 0; s < seg; ++s) {
+                    vd O;
+                    if (s == 0) {
+                        vd lo; lo.copy_from(ov + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                        O = lane_shift_in(lo, nbOpen);
+                    } else {
+                        O.copy_from(ov + (std::size_t)(s - 1) * W, stdx::element_aligned);
+                    }
+                    const vd v = stdx::max(O, prev - vga);
+                    v.copy_to(yv + (std::size_t)s * W, stdx::element_aligned);
+                    prev = v;
+                }
+                for (int rr = 0; rr < W; ++rr) {
+                    vd last; last.copy_from(yv + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                    vd F = lane_shift_in(last, K_NINF) - vga;
+                    bool changed = false;
+                    for (int s = 0; s < seg; ++s) {
+                        vd v; v.copy_from(yv + (std::size_t)s * W, stdx::element_aligned);
+#if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
+                        if constexpr (sizeof(T) == 8) { if (!avx512d_any_gt(F, v)) break; }
+                        else { if (!stdx::any_of(F > v)) break; }
+#else
+                        if (!stdx::any_of(F > v)) break;
+#endif
+                        v = stdx::max(v, F);
+                        v.copy_to(yv + (std::size_t)s * W, stdx::element_aligned);
+                        F = v - vga;
+                        changed = true;
+                    }
+                    if (!changed) break;
+                }
+            }
+
+            for (int s = 0; s < seg; ++s) {
+                vd u; u.copy_from(cH + off + (std::size_t)s * W, stdx::element_aligned);
+                vd y; y.copy_from(yv + (std::size_t)s * W, stdx::element_aligned);
+                stdx::max(u, y).copy_to(cH + off + (std::size_t)s * W, stdx::element_aligned);
+                if (D) {
+                    vd k; k.copy_from(kc + (std::size_t)s * W, stdx::element_aligned);
+#if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
+                    if constexpr (sizeof(T) == 8) k = avx512d_blend(avx512d_gt(y, u), k, vtwo);
+                    else                          stdx::where(y > u, k) = vtwo;
+#else
+                    stdx::where(y > u, k) = vtwo;
+#endif
+                    store_codes<T, W>(k, dM + (std::size_t)s * W);
+                }
+            }
+            if (job.argmax) {
+                int ri = 0, rj = 0;
+                const T before = best;
+                striped_row_best1<T>(cH + off, pad, seg, r, best, ri, rj);
+                if (best > before) { bi = ri; bj = rj; }
+            }
+        }
+        std::swap(pH, cH);
+    }
+
+    if (job.out) {
+        job.out[0] = pH[0];
+        for (int c = 1; c <= n; ++c) job.out[c] = pH[off + scol(c)];
+    }
+    job.best = best; job.bi = bi; job.bj = bj;
+    job.seg = seg; job.width = W;
+}

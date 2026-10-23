@@ -441,6 +441,25 @@ inline constexpr size_t kInterSoftBytes  = size_t(1) << 19;   // 512 KiB
 inline constexpr size_t kInterScoreGatherCells = size_t(8192);   // (M + 1) * (n + 1) of the group
 // Hard fills, linear, integer T, alphabets over 8 (batch_engine.hpp, inter_eligible_): ~L120.
 inline constexpr size_t kInterLinearIntGatherCells = size_t(15000);
+// The same for FLOATING T on AArch64 (NEON, the only simd level there): the inter-pair
+// gather loses to the leveled linear kernel from ~L120 (float32) / ~L90 (double) on the
+// M1 (inter / own, Local protein, hard: float32 L100 0.87, L150 1.14, L200 1.18; double
+// L60 0.95, L100 1.02, L150 1.11), while on AVX2 it still wins through L200 (0.63-0.84),
+// so x86 keeps no cap.  0 = no cap.
+#if defined(__aarch64__) || defined(_M_ARM64)
+inline constexpr size_t kInterLinearF32GatherCells = size_t(15000);
+inline constexpr size_t kInterLinearF64GatherCells = size_t(8000);
+#else
+inline constexpr size_t kInterLinearF32GatherCells = 0;
+inline constexpr size_t kInterLinearF64GatherCells = 0;
+#endif
+// The gather cap for a linear hard pair of T over an alphabet over 8 letters, or 0.
+template <class T>
+inline constexpr size_t inter_linear_gather_cap() {
+    if constexpr (std::is_integral_v<T>) return kInterLinearIntGatherCells;
+    else if constexpr (std::is_same_v<T, float>) return kInterLinearF32GatherCells;
+    else return kInterLinearF64GatherCells;
+}
 inline bool inter_score_ok(size_t nalpha, int M, int n) {
     return nalpha <= 8 ||
            static_cast<size_t>(M + 1) * static_cast<size_t>(n + 1) <= kInterScoreGatherCells;
@@ -482,6 +501,32 @@ using banded_row_fn_t = T (*)(T* __restrict, T* __restrict, T* __restrict,
 // level's TypedKernels<T> (LevelKernels::of<T>()).  A null entry means the level has no
 // kernel of that kind for that T, and the aligner runs its scalar fill instead — which
 // is what a header-only build (no level TU linked) sees for every entry.
+// ── Linear Hirschberg, one striped kernel for its four O(m*n) loops ─────────────
+// (kernels_linear_impl.inl, lhb_striped.)  The aligner hands over everything that
+// differs between the forward / reverse sweeps, the base case and the two Local
+// endpoint scans — the B codes and the rows in SWEEP order, each row's extends, and the
+// row-0 and column-0 borders, computed in scalar exactly as the scalar loops compute
+// them — so the kernel holds no border or direction logic of its own and its rows are
+// bit for bit the scalar loops' rows.  Rows r = 1..h; columns c = 1..n.
+template <class T>
+struct LhbJob {
+    const unsigned char* b; int n;          // B codes in sweep order (column c: b[c-1])
+    const T* blk; int nalpha;               // substitution stack
+    const uint32_t* srow; int h;            // row r: stacked substitution row srow[r-1]
+    const T* ga; const T* gb;               // row r: extend of a gap in A / into the row (index r-1)
+    const T* row0;                          // n+1 values: row 0
+    const T* col0;                          // h+1 values: column 0 (col0[0] == row0[0])
+    int by_symbol;                          // srow < nalpha for every row: one profile per symbol
+    int clamp;                              // Local: max(., 0) after the diagonal/up maximum
+    int argmax;                             // 0 none; 1 columns 1..n; 2 column 0 too (first)
+    T best; int bi, bj;                     // in: the seed; out: the best cell (strict >,
+                                            //   topmost row, then leftmost column)
+    unsigned char* codes;                   // non-null: (h+1) x rowsz direction codes, striped
+    T* out;                                 // non-null: row h, de-striped, n+1 values
+    int seg, width;                         // out: striping geometry (for codes)
+    DpBufferT<T>* buf;
+};
+
 template <class T>
 struct TypedKernels {
     using viterbi_fn = void (*)(ViterbiJob<T>&);
@@ -494,6 +539,8 @@ struct TypedKernels {
     viterbi_fn         viterbi_ptr = nullptr;        // TracebackMode::Pointers
     viterbi_fn         linear = nullptr;             // striped LINEAR Full, H table (kernels_linear_impl.inl)
     viterbi_fn         linear_ptr = nullptr;         // ... recording direction bytes
+    using lhb_fn = void (*)(LhbJob<T>&);
+    lhb_fn             lhb = nullptr;                // linear Hirschberg sweeps / base / scans
     banded_row_fn_t<T> banded_row_global = nullptr;  // row-wise banded whole-row kernels
     banded_row_fn_t<T> banded_row_local = nullptr;
     hb_fn              hb_sweep = nullptr;           // Hirschberg linear-space sweep
@@ -567,6 +614,7 @@ void register_level_typed(SimdLevel l,
                           typename TypedKernels<T>::viterbi_fn viterbi_ptr,
                           typename TypedKernels<T>::viterbi_fn linear,
                           typename TypedKernels<T>::viterbi_fn linear_ptr,
+                          void (*lhb)(LhbJob<T>&),
                           banded_row_fn_t<T> banded_row_global, banded_row_fn_t<T> banded_row_local,
                           typename TypedKernels<T>::hb_fn hb_sweep,
                           typename TypedKernels<T>::hb_fn hb_sweep_pmax,

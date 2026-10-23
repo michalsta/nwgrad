@@ -16,6 +16,7 @@ void register_level_typed(SimdLevel l,
                           typename TypedKernels<T>::viterbi_fn viterbi_ptr,
                           typename TypedKernels<T>::viterbi_fn linear,
                           typename TypedKernels<T>::viterbi_fn linear_ptr,
+                          void (*lhb)(LhbJob<T>&),
                           banded_row_fn_t<T> banded_row_global, banded_row_fn_t<T> banded_row_local,
                           typename TypedKernels<T>::hb_fn hb_sweep,
                           typename TypedKernels<T>::hb_fn hb_sweep_pmax,
@@ -29,6 +30,7 @@ void register_level_typed(SimdLevel l,
     k.viterbi_ptr       = viterbi_ptr;
     k.linear            = linear;
     k.linear_ptr        = linear_ptr;
+    k.lhb               = lhb;
     k.banded_row_global = banded_row_global;
     k.banded_row_local  = banded_row_local;
     k.hb_sweep          = hb_sweep;
@@ -44,7 +46,7 @@ void register_level_typed(SimdLevel l,
 #define NWGRAD_INSTANTIATE_REGISTER(T) \
     template void register_level_typed<T>(SimdLevel, TypedKernels<T>::viterbi_fn, \
         TypedKernels<T>::viterbi_fn, TypedKernels<T>::viterbi_fn, TypedKernels<T>::viterbi_fn, \
-        banded_row_fn_t<T>, banded_row_fn_t<T>, \
+        void (*)(LhbJob<T>&), banded_row_fn_t<T>, banded_row_fn_t<T>, \
         TypedKernels<T>::hb_fn, TypedKernels<T>::hb_fn, TypedKernels<T>::hbbase_fn, \
         TypedKernels<T>::hbscan_fn, TypedKernels<T>::score_fn, TypedKernels<T>::inter_fn, \
         TypedKernels<T>::inter_fn, int);

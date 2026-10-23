@@ -31,7 +31,7 @@ struct Rng {
 // Integer-valued for an integer T (small, tie-heavy); real-valued for a floating T, with
 // extends drawn from {0.1 k}, zero and negative ones included (the exact modes take them).
 template <class T>
-AlignParams make_params(Rng& rng, const Alphabet& alpha, int sets) {
+AlignParams make_params(Rng& rng, const Alphabet& alpha, int sets, bool nonneg = false) {
     const int n = alpha.size();
     std::vector<double> stack(static_cast<size_t>(n) * n * sets);
     for (int k = 0; k < sets; ++k)
@@ -44,8 +44,9 @@ AlignParams make_params(Rng& rng, const Alphabet& alpha, int sets) {
     AlignParams p(SubstMatrix(stack.data(), alpha, sets));
     for (int k = 0; k < sets; ++k) {
         double ea, eb;
-        if constexpr (nw_is_int<T>) { ea = rng.in(-1, 3); eb = rng.in(-1, 3); }
-        else { ea = 0.1 * rng.in(-5, 30); eb = 0.1 * rng.in(-5, 30); if (rng.in(0, 4) == 0) ea = 0; }
+        const int lo = nonneg ? 0 : -1;
+        if constexpr (nw_is_int<T>) { ea = rng.in(lo, 3); eb = rng.in(lo, 3); }
+        else { ea = 0.1 * rng.in(5 * lo, 30); eb = 0.1 * rng.in(5 * lo, 30); if (rng.in(0, 4) == 0) ea = 0; }
         p.gap_ref(k, AlignParams::kOpenA) = 0; p.gap_ref(k, AlignParams::kExtendA) = ea;
         p.gap_ref(k, AlignParams::kOpenB) = 0; p.gap_ref(k, AlignParams::kExtendB) = eb;
     }
@@ -68,11 +69,13 @@ struct Result {
 
 template <AlignMode AM, class T>
 Result run_one(const std::vector<uint8_t>& ea, const std::vector<uint8_t>& eb, const AlignParams& p,
-               const std::vector<uint16_t>& track, int backend, TracebackMode tb) {
+               const std::vector<uint16_t>& track, int backend, TracebackMode tb, int cutoff = 0,
+               int* lhb_runs = nullptr) {
     Result r{0, {}, {}, AlignParams::zeros_like(p), 0};
     Aligner<GapModel::Linear, AM, AlignBand::Full, T> al;
     al.set_kernel(backend);
     al.set_traceback(tb);
+    if (cutoff > 0) al.set_hb_cutoff(cutoff);
     DpBufferT<T> buf;
     if (track.empty()) al.set_problem(ea, eb, p, 0);
     else               al.set_problem(ea, eb, p, 0, {}, track, {});
@@ -82,6 +85,7 @@ Result run_one(const std::vector<uint8_t>& ea, const std::vector<uint8_t>& eb, c
     r.guide = al.guide_j_from_viterbi(buf);
     al.hard_grad(buf, r.grad);
     r.layout = al.tables_striped() ? 1 : 0;
+    if (lhb_runs) *lhb_runs += al.lhb_kernel_runs();
     return r;
 }
 
@@ -164,4 +168,68 @@ TEMPLATE_TEST_CASE("striped linear kernels equal the scalar linear fills bit for
     // routing would too
     CHECK(kernel_runs == expected_runs);
     if (!std::is_same_v<TestType, int64_t>) CHECK(expected_runs > cases / 2);
+}
+
+// The linear Hirschberg kernel (lhb_striped: both sweeps, the base case, the Local
+// forward and reverse endpoint scans) against the scalar loops it replaces, at every
+// level: Hirschberg may pick another optimal path than Pointers at ties, but the SAME
+// algorithm on two backends must not — score, path, guide and gradient bit for bit.
+// Small cutoffs keep the recursion splitting; B spans the length gate.
+template <class T>
+void sweep_hb(uint64_t seed, int rounds, int& mismatches, int& cases, int& kernel_calls, std::string& first) {
+    Rng rng(seed);
+    const Alphabet* alphas[] = {&Alphabet::get("ACGT"), &Alphabet::get("ACDEFGHIKLMNPQRSTVWY"), &Alphabet::get("AB")};
+    std::vector<int> levels;
+    for (SimdLevel l : detect_available_levels()) levels.push_back(static_cast<int>(l));
+    if (levels.empty()) return;
+    for (int r = 0; r < rounds; ++r) {
+        const Alphabet& alpha = *alphas[rng.in(0, 2)];
+        const int sets = rng.in(0, 3) == 0 ? rng.in(2, 4) : 1;
+        const AlignParams p = make_params<T>(rng, alpha, sets, true);
+        const int la = rng.in(0, 4) == 0 ? rng.in(0, 6) : rng.in(10, 70);
+        const int lb = rng.in(0, 4) == 0 ? rng.in(0, 30) : rng.in(90, 220);
+        const std::string A = random_seq(rng, alpha, la), B = random_seq(rng, alpha, lb);
+        std::vector<uint16_t> track;
+        if (sets > 1) { track.resize(static_cast<size_t>(la)); for (auto& t : track) t = static_cast<uint16_t>(rng.in(0, sets - 1)); }
+        const int level = levels[static_cast<size_t>(rng.in(0, static_cast<int>(levels.size()) - 1))];
+        const int cutoff = rng.in(1, 8);
+        const TracebackMode tb = rng.in(0, 1) ? TracebackMode::Hirschberg : TracebackMode::HirschbergPmax;
+        const auto ea = alpha.encode(A), eb = alpha.encode(B);
+        auto one = [&](auto am_tag) {
+            constexpr AlignMode AM = decltype(am_tag)::value;
+            int runs = 0;
+            const Result sc = run_one<AM, T>(ea, eb, p, track, kBackendScalar, tb, cutoff);
+            const Result kv = run_one<AM, T>(ea, eb, p, track, level, tb, cutoff, &runs);
+            ++cases;
+            kernel_calls += runs;
+            if (!same(sc, kv)) {
+                ++mismatches;
+                if (first.empty())
+                    first = std::string(nw_type_name<T>()) + (AM == AlignMode::Global ? " global" : " local") +
+                            " level " + std::to_string(level) + " cutoff " + std::to_string(cutoff) +
+                            " |A|=" + std::to_string(la) + " |B|=" + std::to_string(lb) + " sets " + std::to_string(sets) +
+                            " scalar " + std::to_string(sc.score) + " kernel " + std::to_string(kv.score) +
+                            " (" + sc.aligned.first + " / " + kv.aligned.first + ")";
+            }
+        };
+        if (rng.in(0, 1)) one(std::integral_constant<AlignMode, AlignMode::Global>{});
+        else              one(std::integral_constant<AlignMode, AlignMode::Local>{});
+    }
+}
+
+TEMPLATE_TEST_CASE("linear Hirschberg kernel equals the scalar linear Hirschberg bit for bit", "[linear][simd]",
+                   double, float, int16_t, int32_t, int64_t) {
+    int mismatches = 0, cases = 0, kernel_calls = 0;
+    std::string first;
+    sweep_hb<TestType>(0x0b5e55ed, 500, mismatches, cases, kernel_calls, first);
+    INFO("first mismatch: " << first);
+    CHECK(mismatches == 0);
+    CHECK(cases == 500);
+    // liveness: unless this type has no kernel on any level here (int64 below 8 lanes),
+    // the kernel must have run — a silent fallback would pass the comparison vacuously
+    bool any = false;
+    for (SimdLevel l : detect_available_levels())
+        any |= level_kernels(static_cast<int>(l)).template of<TestType>().lhb != nullptr;
+    if (any) CHECK(kernel_calls > cases);
+    else     CHECK(kernel_calls == 0);
 }
