@@ -1245,8 +1245,13 @@ score-only arm, which ran 1.5× slower than Local AFFINE's:
   (12), int32 0.68–0.84 / 0.73–0.81, float32 0.54–0.84 / 0.71–0.81, double 0.69–1.00 /
   0.82–0.89; score-only 0.09–0.62; the capped bands now 0.98–1.00; worst cell L10 1.03–1.08
   (tiny pairs, not gated). The integer cap also returns score-only integers at L80 to the own
-  kernel (0.78 at 1 thread given up to avoid 1.04 at 12). AVX-512 and NEON not re-measured
-  (solace busy, spot off).
+  kernel (0.78 at 1 thread given up to avoid 1.04 at 12). **AVX-512 (solace, 1 / 8
+  threads) confirms the caps**: uncapped, the integers lose where the cap cuts them off
+  (int32 L80–100 1.08–1.12 at 8 threads; both integer types L130 1.21–1.54), shipped those
+  cells read 0.95–1.01; float32 wins uncapped through L130 and ties from L160; double ties
+  past L130 without a cap. Shipped L20–80: hard 0.49–0.89, score-only 0.06–0.78 (larger
+  wins than AVX2 at 1 thread). Highest shipped cells 1.04–1.07, at lengths where both arms
+  run the same own kernel: solace's noise floor under WSL. NEON not re-measured (spot off).
 
 **The two regressions that were not explained above, run down on nighthaven (2026-10-23).**
 (a) At L1000 parasail's scan32 edges nwgrad's int32 score-only (0.92 at AVX2, 0.82 on

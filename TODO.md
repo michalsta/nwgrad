@@ -104,8 +104,8 @@ DiscrimAlign does: it passes the logical core count.
 - **Linear kernels: what is left** (the leveled striped linear fill, linear Hirschberg, the
   NEON float inter-pair cap and the AVX-512 gate all landed and were measured on AVX2,
   AVX-512 and NEON, 2026-10-23: AGENTS "Versus parasail"). Global linear protein pairs now join the
-  inter-pair fill (done 2026-10-23, measured on AVX2 only): re-check the caps at AVX-512
-  and NEON. The per-level thresholds come from one host per ISA — re-derive
+  inter-pair fill (done 2026-10-23; caps confirmed on AVX2 and AVX-512): re-check them at
+  NEON. The per-level thresholds come from one host per ISA — re-derive
   them on another AVX-512 CPU (Zen 4 splits 512-bit ops) before trusting them there.
 - **The integer score kernel's working set** (2026-10-23, AGENTS "Versus parasail", the
   run-down): the prefix-max carry scratches three extra rows (`sopenv`, 3·sw) beside the six
