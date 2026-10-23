@@ -882,6 +882,10 @@ private:
             }
             if constexpr (AB == AlignBand::Full) {
                 if (grad_mode_ == GradMode::None && has_inter_score_(K)) {
+                    if (!inter_score_ok(na, M, n)) {   // the gather: short pairs only
+                        for (size_t l = 0; l < real; ++l) own(elig[s + l]);
+                        continue;
+                    }
                     // Score only: one row per table, no adopt / traceback.
                     InterJobT<T> job{};
                     job.a = a.data(); job.m = m.data(); job.b = b.data(); job.n = n; job.M = M;
@@ -2403,6 +2407,10 @@ private:
                     M = std::max(M, m[l]);
                     n = std::max(n, nb[l]);
                     ragged |= nb[l] != nb[0];
+                }
+                if (!inter_score_ok(alpha_->size(), M, n)) {   // the gather: short pairs only
+                    for (size_t l = 0; l < real; ++l) own(plan_.elig[s + l]);
+                    continue;
                 }
                 InterJobT<T> job{};
                 job.a = a.data(); job.m = m.data(); job.b = b.data(); job.n = n; job.M = M;

@@ -1044,6 +1044,99 @@ speed choice.  The scalar fallbacks of int32/int64 run 1.45x the float32 scalar 
 (skynet) — gcc's codegen of the scalar integer max, not looked into.  AVX-512 (W=32 for
 int16, `vpmaxsq`) unmeasured and its integer kernels unexecuted: solace was off.
 
+**Versus parasail (2026-10-23, `tools/bench_parasail.py`).** parasail (Daily 2016) is the
+reference striped integer aligner: Farrar striped, Farrar/Rognes scan (a prefix-max gap
+carry, the closest relative of nwgrad's integer carry) and Wozniak diagonal kernels, in
+8/16/32/64-bit saturating integers, score-only or with a traceback. Apples to apples: the
+SAME integer matrix and gaps (parasail open = go + ge, extend = ge: a gap of k costs
+open + (k-1)·extend), the same algorithm (nw / sw), the same width (parasail `_16` vs
+`SeqPairBatchInt16`), score-only against `grad_mode="none"`, parasail's trace kernels PLUS
+the CIGAR walk against nwgrad's `keep_paths` (and nwgrad's hard gradient beside it, which
+costs 1 % over the path). Every parasail score must equal nwgrad's integer score on every
+pair, exactly, before anything is timed — which also made parasail an independent oracle
+of the integer kernels (it agreed on every pair, with ONE exception that is parasail's: its
+striped 16/32-bit kernels score BELOW the optimum when open == extend — 238 of 2000 L200
+protein pairs, 15–32 of 20k DNA pairs — while its scan, diag and 64-bit kernels agree with
+nwgrad on all of them; a lazy-F defect in that degenerate case, flagged and still timed).
+Each arm in its own process, interleaved repeats, a control arm (two float32 processes).
+
+**parasail's Python bindings are not parasail** — the first run measured them and was
+thrown away. A one-residue pair costs ~10 µs per call through them (ctypes, the result
+object, a profile build per call), which is most of a 22×50 DNA pair's time and a quarter
+of an L200 protein pair's, and their threads share the GIL, so a 12-thread run measured the
+lock: parasail came out 10–15× slower on L200 at 12 threads and 400–970× on DNA. The tool
+therefore drives parasail through `tools/bench_parasail_driver.c`, compiled per run against
+the wheel's own headers and `libparasail.so` (whose SONAME, `libparasail.so.8`, is not the
+shipped file name: the driver gets a symlink next to it), pthreads spawned per pass as
+nwgrad's batch spawns its workers; `--driver python` keeps the bindings, labelled. On skynet
+the driver brought parasail's 22×50 pair from 13–20 µs to 2–3 µs.
+
+Measured (nighthaven, AVX2, gcc, release-wheel codegen; parasail time / nwgrad time, so
+above 1 = nwgrad faster; 1 thread; L200 = 2000 30 %-mutated BLOSUM62 pairs with 11/1 gaps,
+L1000 = 200, DNA = 20k related 22×50 pairs; control 1.00):
+
+| arm | int16 | int32 | int64 |
+|---|---|---|---|
+| L200 Global affine, score: striped / scan | 3.12 / 1.38 | 1.76 / 1.18 | 16.5 / 9.0 |
+| L200 Local affine, score: striped / scan | 2.21 / 1.47 | 1.52 / 1.31 | 10.3 / 10.3 |
+| L200 Global affine, trace + CIGAR / path | 5.03 | 3.08 | 10.9 |
+| L200 Local affine, trace + CIGAR / path | 3.18 | 2.04 | 6.4 |
+| L200 Global linear, score: striped* / scan | 0.92 / 1.37 | 0.93 / 1.19 | 11.2 / 9.0 |
+| L200 Local linear, score: striped* / scan | 0.52 / 0.96 | 0.65 / 1.04 | 7.6 / 10.5 |
+| L1000 Global affine, score: striped / scan | refused | 1.58 / 0.92 | 14.9 / 8.1 |
+| L1000 Local affine, score: striped / scan | refused | 1.12 / 1.04 | 9.7 / 9.9 |
+| DNA Global affine, score: striped / scan | 7.3 / 8.0 | 3.3 / 3.3 | 19.8 / 14.5 |
+| DNA Local linear, score: striped* / scan | 3.2 / 9.1 | 2.0 / 4.1 | 11.4 / 16.5 |
+
+(* parasail's striped linear arms are the sub-optimal ones.) Absolute: L200 Global affine
+int16 score-only 8.7 µs a pair (4.5 Gcell/s) against parasail striped16 27.3 and scan16
+12.1; path 18.3 against trace 92.3. At 12 threads the same picture (nwgrad scales as
+parasail does). skynet (sse4 vs parasail's sse41) ran the same campaign, but its numbers
+are NOT recorded: during the run its host wloczykij carried two foreign 90 %-CPU processes
+and a CI runner, and the guest's single-thread throughput on one arm wandered 122 → 456 →
+320 Mcell/s between repeats (the tool's control arm, two processes at the SAME moment,
+cannot see a slowly varying host load). Rerun it on a quiet host. The readings: (1) on affine protein nwgrad's integer kernels beat
+parasail's at the same width, 1.2–1.5× its scan and 1.5–3.1× its striped, and 2–5× with a
+traceback; (2) parasail's 64-bit kernels are 7–20× slower than nwgrad's int64 — int64 is
+no speed choice in nwgrad either, but it is a usable one; (3) on 22×50 pairs nwgrad is 2–8×
+faster through the C driver too (the inter-pair kernels, and parasail's per-call profile
+build and result allocation — it has no batch API); (4) **at L1000 parasail's int16 wins**:
+nwgrad's a-priori bound refuses int16 there (`(1000 + 998 + 66) · 15 > 8191`) where parasail
+saturates and reports, and its scan16 (145 µs) is 1.8× faster than nwgrad's best, int32
+(261 µs) — the saturating-int16 item in `TODO.md`, now with a number; (5) **nwgrad's linear
+arms were its weak ones**, for two reasons found by `perf` on the Local linear int16
+score-only arm, which ran 1.5× slower than Local AFFINE's:
+
+- **The inter-pair score kernel's gate was a byte cap** (`inter_pair_fits`, 1.25 MiB of
+  tables at `sizeof(T)`), so 16 lanes of 2-byte int16 cells let a 200-residue Local linear
+  pair through (1.22 MiB) that the affine one (three tables) and Global linear (its own
+  `linear_fill_ok_` gate) did not, and on a 20-letter alphabet that kernel GATHERS one
+  scalar load per lane-cell where the striped per-pair score kernel loads 1/W of a profile
+  row per cell. Measured, inter / striped, score-only, BLOSUM62, 1 thread, L30 / 60 / 100 /
+  150 / 200: int16 0.25 / 0.46 / 0.91 / 1.28 / 1.57, int32 0.35 / 0.65 / 1.02 / 1.20 / 1.25,
+  float32 0.32 / 0.54 / 0.80 / 1.13 / 1.30, double 0.55 / 0.83 / 1.12 / 1.38 / 1.51 — a
+  crossover near L100 for every type (a pre-existing loss for float32 and double too, which
+  the cap admitted up to L200 and L290). FIXED: `inter_score_ok` (`kInterScoreGatherCells` =
+  8192 cells of the group, ~L90; alphabets ≤ 8 keep the blend tree and the byte cap) in
+  the batch's score-only pass and the streaming one. Hard fills are NOT gated by it: there
+  the shared fill replaces the own LINEAR fill, which it beats at every length (next item).
+- **The linear fills are not leveled.** `viterbi_linear` (the H fill `auto` keeps while H
+  ≤ 2 MiB) and `viterbi_linear_ptr` are header functions compiled at baseline, so at AVX2
+  they run SSE2 code while the affine striped kernel runs the full width, and the integer
+  types gain nothing from their narrower lanes. Hard, 1 thread, µs a pair at L200, own
+  linear under `auto` / under `pointers` / inter-pair / affine striped Pointers: Local
+  int16 67.6 / 84.0 / 17.0 / 21.7, int32 36.0 / 84.9 / 19.2 / 35.5, float32 118 / 129 / 26.2
+  / 65.5, double 119 / 129 / 38.8 / 90.5; Global int16 35.6 / 51.5 / — / 17.4, int32 27.5 /
+  51.4 / — / 28.4, float32 54.4 / 82.4 / — / 61.9, double 54.3 / 83.0 / — / 79.7. So for
+  float32 and double the own Global linear H fill ties affine and the Local one loses
+  1.3–1.8×; for int16 both lose 2–3×; the inter-pair fill rescues Local linear up to the
+  byte cap. A leveled striped linear kernel (Pointers, H and the Hirschberg sweeps) is the
+  largest integer-path item left (`TODO.md`); so is re-measuring Global linear protein
+  pairs in the inter-pair fill, which `linear_fill_ok_` excludes on a measurement made
+  when the own fill was the H one at double. (An explicit `traceback="pointers"` on linear
+  is the byte-recording loop, 1.5–3× slower than the H fill below 2 MiB: the tool's nwgrad
+  linear arms now run `auto`, as a user does.)
+
 ### The soft path: scaled probability space (2026-10-05)
 
 **The soft path is NOT bit-exact** — across `soft_impl`, ISA levels, compilers, `fill`,

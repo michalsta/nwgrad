@@ -431,6 +431,18 @@ using soft_pair_fn = void (*)(SoftPairJob&);
 // tables of Ws lanes are capped at 512 KiB.
 inline constexpr size_t kInterGroupBytes = size_t(5) << 18;   // 1.25 MiB
 inline constexpr size_t kInterSoftBytes  = size_t(1) << 19;   // 512 KiB
+// Score only, alphabets over 8 (the gather): the inter-pair score kernel loads one scalar
+// per lane-cell where the striped per-pair score kernel loads 1/W of a profile row per
+// cell, so the shared score pays only for short pairs — measured on nighthaven (AVX2,
+// BLOSUM62, 1 thread, inter / striped): L60 0.46-0.85, L100 0.80-1.14, L150 1.13-1.38,
+// L200 1.25-1.57, for int16, int32, float32 and double alike (the crossover ~L100 is
+// independent of the type and the lane count).  Hard fills are not gated by this: there
+// the shared fill replaces the own LINEAR fill, which is slower at every length.
+inline constexpr size_t kInterScoreGatherCells = size_t(8192);   // (M + 1) * (n + 1) of the group
+inline bool inter_score_ok(size_t nalpha, int M, int n) {
+    return nalpha <= 8 ||
+           static_cast<size_t>(M + 1) * static_cast<size_t>(n + 1) <= kInterScoreGatherCells;
+}
 inline bool inter_pair_fits(size_t la, size_t lb, bool affine, bool soft, int W,
                             size_t tsize, int Ws) {
     const size_t cells = (la + 1) * (lb + 1);

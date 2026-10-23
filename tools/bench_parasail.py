@@ -190,7 +190,12 @@ def run_arm(arm, fx, length, n, seed, threads, reps, min_time):
         cls = {"float32": nwgrad.SeqPairBatch, "int16": nwgrad.SeqPairBatchInt16,
                "int32": nwgrad.SeqPairBatchInt32, "int64": nwgrad.SeqPairBatchInt64}[variant]
         gmode = "hard" if kind == "grad" else "none"
-        tb = "pointers"   # the exact fill: what parasail's traceback computes too
+        # the exact full-table fill, as parasail's traceback: affine = Pointers (what `auto`
+        # runs below hb_cutoff anyway); linear = `auto`, which keeps the H table while it is
+        # <= 2 MiB (the vectorized fill) and records bytes past that.  An explicit "pointers"
+        # on linear forces the byte-recording loop, a header-only (baseline) fill that is
+        # 3-5x slower than the H fill at these sizes and would misreport nwgrad.
+        tb = "auto" if lin else "pointers"
         b = cls(A, B, params, gap_model=gm, mode=mode, grad_mode=gmode, n_threads=threads, traceback=tb)
         keep = kind in ("path", "grad")
         def once():

@@ -101,6 +101,19 @@ DiscrimAlign does: it passes the logical core count.
 
 ## Integer scalar types: what is left (branch `integer`, 2026-10-22)
 
+- **Leveled linear kernels** (found 2026-10-23 by the parasail comparison, AGENTS
+  "Versus parasail"): `viterbi_linear` / `viterbi_linear_ptr` / the linear Hirschberg
+  sweeps are header functions at baseline codegen; at AVX2 the own Local linear fill is
+  2-3x the affine striped Pointers kernel at int16 (67.6 vs 21.7 us a pair at L200) and
+  1.3-1.8x at float32 / double; Global linear 2x at int16, a tie at float/double. A
+  striped linear kernel per level (one table or one byte per cell; the carry is the
+  affine kernel's with zero opens, so the integer prefix-max applies) would bring linear
+  to about half of affine's time. Until then the inter-pair fill carries Local linear up
+  to the byte cap, and Global linear protein pairs (excluded by `linear_fill_ok_` on a
+  double-era measurement) should be re-measured in it.
+- **int16 saturating arithmetic, with a number**: at L1000 BLOSUM62 nwgrad refuses int16
+  and runs int32 (261 us a pair, score-only, AVX2) where parasail's saturating scan16 takes
+  145 us — the one fixture in the comparison parasail wins.
 - The streaming `align()` validates integer params per pair (the aligner's `nw_int_prepare`
   on the caller's params, O(K * nalpha^2) a pair); prepare once per call as the batch does.
 - `score()` / `scores()` stay double: exact below 2^53, so an int64 score above that
