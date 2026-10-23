@@ -226,10 +226,13 @@ TEMPLATE_TEST_CASE("linear Hirschberg kernel equals the scalar linear Hirschberg
     CHECK(mismatches == 0);
     CHECK(cases == 500);
     // liveness: unless this type has no kernel on any level here (int64 below 8 lanes),
-    // the kernel must have run — a silent fallback would pass the comparison vacuously
+    // the kernel must have run — a silent fallback would pass the comparison vacuously.
+    // A floor, not a count: the level is drawn per case, the recursion's call count varies,
+    // and a level's length gate sends short rows to the scalar loops (int64 on an AVX-512
+    // host has its kernel at one level in four: 318 calls in 500 cases on solace).
     bool any = false;
     for (SimdLevel l : detect_available_levels())
         any |= level_kernels(static_cast<int>(l)).template of<TestType>().lhb != nullptr;
-    if (any) CHECK(kernel_calls > cases);
+    if (any) CHECK(kernel_calls >= cases / 10);
     else     CHECK(kernel_calls == 0);
 }
