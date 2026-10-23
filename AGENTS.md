@@ -1082,13 +1082,18 @@ L1000 = 200, DNA = 20k related 22×50 pairs; control 1.00):
 | L200 Global affine, trace + CIGAR / path | 5.03 | 3.08 | 10.9 |
 | L200 Local affine, trace + CIGAR / path | 3.18 | 2.04 | 6.4 |
 | L200 Global linear, score: striped* / scan | 0.92 / 1.37 | 0.93 / 1.19 | 11.2 / 9.0 |
-| L200 Local linear, score: striped* / scan | 0.52 / 0.96 | 0.65 / 1.04 | 7.6 / 10.5 |
+| L200 Local linear, score: striped* / scan | 0.78 / 1.45 | 0.82 / 1.30 | 7.6 / 10.5 |
+| L200 Global / Local linear, trace + CIGAR / path | 1.36 / 2.30 | 1.80 / 2.14 | — |
 | L1000 Global affine, score: striped / scan | refused | 1.58 / 0.92 | 14.9 / 8.1 |
 | L1000 Local affine, score: striped / scan | refused | 1.12 / 1.04 | 9.7 / 9.9 |
 | DNA Global affine, score: striped / scan | 7.3 / 8.0 | 3.3 / 3.3 | 19.8 / 14.5 |
 | DNA Local linear, score: striped* / scan | 3.2 / 9.1 | 2.0 / 4.1 | 11.4 / 16.5 |
 
-(* parasail's striped linear arms are the sub-optimal ones.) Absolute: L200 Global affine
+(* parasail's striped linear arms are the sub-optimal ones. The linear rows are the rerun
+after the two fixes below: nwgrad linear under `auto`, the score-only gate in place — the
+Local linear int16 score arm went 14.65 → 9.31 µs, and the Global linear int16 path 53.0 →
+37.5 µs; before them the Local linear score row read 0.52 / 0.96 and the linear path rows
+0.95–2.3.) Absolute: L200 Global affine
 int16 score-only 8.7 µs a pair (4.5 Gcell/s) against parasail striped16 27.3 and scan16
 12.1; path 18.3 against trace 92.3. At 12 threads the same picture (nwgrad scales as
 parasail does). skynet (sse4 vs parasail's sse41) ran the same campaign, but its numbers
@@ -1118,7 +1123,10 @@ score-only arm, which ran 1.5× slower than Local AFFINE's:
   crossover near L100 for every type (a pre-existing loss for float32 and double too, which
   the cap admitted up to L200 and L290). FIXED: `inter_score_ok` (`kInterScoreGatherCells` =
   8192 cells of the group, ~L90; alphabets ≤ 8 keep the blend tree and the byte cap) in
-  the batch's score-only pass and the streaming one. Hard fills are NOT gated by it: there
+  the batch's score-only pass and the streaming one; verified on nighthaven: default fill /
+  striped, score-only, L60 / 100 / 200: int16 0.46 / 0.99 / 1.00, float32 0.54 / 1.01 / 1.00
+  (inter-pair kept where it wins, the striped kernel where it did not). Hard fills are NOT
+  gated by it: there
   the shared fill replaces the own LINEAR fill, which it beats at every length (next item).
 - **The linear fills are not leveled.** `viterbi_linear` (the H fill `auto` keeps while H
   ≤ 2 MiB) and `viterbi_linear_ptr` are header functions compiled at baseline, so at AVX2
