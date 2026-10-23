@@ -122,12 +122,12 @@ DiscrimAlign does: it passes the logical core count.
   then self-preserving under `psubsw`); std::simd has no saturating ops, so intrinsics per
   level. Not started; measure int16 first.
 - AVX-512: verified and measured 2026-10-22 (solace under WSL, gcc 15.2 / clang 21.1; AGENTS
-  "Integer scalar types"). Open there: **gcc's AVX-512 int64 Pointers kernel at 1.66x
-  clang's time** (71 vs 42.7 us a pair, L200; was 1.8x before the always_inline round of
-  2026-10-23, which took int16 / int32 from 1.3x to 1.1-1.16x; the score kernels tie). The
-  largest compiler gap left anywhere. Release builds with symbols on solace
-  (~/cc/nwgrad-int/build-rel-gcc, build-rel-clang: bench_score): perf (cpu-clock under WSL)
-  + annotate `lvl_avx512::striped_affine_full_ptr<long, ...>` under both.
+  "Integer scalar types"). gcc's AVX-512 integer Pointers kernels: after the always_inline
+  round and the row-argmax broadcast fix (both 2026-10-23) gcc is at 1.10-1.23x clang on
+  them (int64 Local 49.4 vs 42.8 us a pair, Global 38.8 vs 31.6; int16 / int32 1.1-1.16x),
+  the striped loops' scheduling residue (AGENTS "Toolchain"); the score kernels tie.
+  Nothing specific left to read there; perf setup on solace: RelWithDebInfo venvs under
+  ~/cc/bench-int-inline, `perf record -e cpu-clock` works under WSL.
 - spot (NEON): the final state is verified (ctest 17/17, Python suite, `bench_int_cc.sh`
   at neon, 2026-10-22; built with `CMAKE_BUILD_PARALLEL_LEVEL=3` after the first attempt
   took the 16 GB laptop down). Note for long jobs there: take a `systemd-inhibit` (see

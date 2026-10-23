@@ -1024,8 +1024,17 @@ the disassembly audit then shows no per-cell call left in any leveled integer ke
 any level) re-measured on solace, clang/gcc time at avx512, 1 thread: int16 hard 0.77 →
 0.91, stream 0.73 → 0.88; int32 hard 0.79 → 0.86, stream 0.74 → 0.92; int64 hard 0.56 →
 0.60, stream 0.59 → 0.61 (score kernels unchanged, 0.86-0.95; float32 / double within 3 %).
-int64 is the one left: clang's AVX-512 int64 Pointers fill runs in 42.7 µs a pair, within
-30 % of float32's, gcc's in 71 — see the TODO.
+int64 was then the one left: clang's AVX-512 int64 Pointers fill ran in 42.7 µs a pair,
+within 30 % of float32's, gcc's in 71. **Found by perf on solace (2026-10-23): 45.9 % of
+gcc's Local int64 run was `striped_row_best<long>`**, the once-per-row Local argmax, as much
+as the whole fill (Global, which has no row argmax, was a diffuse 1.19×). In its loop the
+broadcast of the segment index, `vt(T(s))`, was lowered by gcc for 64-bit lanes at AVX-512 to
+EIGHT merge-masked `vpbroadcastq`, one per lane and each dependent on the last — an 8-deep
+chain per segment that the blend then waited on (int16 / int32 got one broadcast). The
+index is now a vector carried through the loop and incremented by a splat of one
+(`vs += one`). gcc Local int64 72.1 → 49.4 µs a pair (clang 42.8 at the same moment), the
+argmax 14.6 % of the run; Global unchanged (38.8 vs clang's 31.6). The 1.15–1.23× left is
+the striped loops' scheduling residue every integer type shows under gcc.
 spot (NEON, W = 8 for int16, 4 for int32, 2 for int64) verified the final state green (ctest
 17/17, Python 4371 passed) and shows the same shape: the prefix-max carry took the protein
 int16 hard step from 0.54 to 0.32 of float32 and int32 from 0.81 to 0.69; int64 stays on the

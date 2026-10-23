@@ -103,7 +103,14 @@ static inline void striped_row_best(const T* cM, const T* cX, const T* cY, const
     using vt = stdx::native_simd<T>;
     constexpr int W = (int)vt::size();
     vt lmax(nw_ninf<T>), ls(T(0));
-    for (int s = 0; s < seg; ++s) {
+    // The segment index as a vector, carried and incremented — NOT `vt(T(s))` in the loop:
+    // for 64-bit lanes at AVX-512 gcc lowered that broadcast to eight merge-masked
+    // `vpbroadcastq`, one per lane and each dependent on the last, an 8-deep chain per
+    // segment that the blend then waited on; the Local int64 Pointers fill spent 46 % of
+    // its time here (perf, solace, gcc 15.2), 72 vs clang's 43 µs a pair at L200.
+    vt vs(T(0));
+    const vt one(T(1));
+    for (int s = 0; s < seg; ++s, vs += one) {
         const std::size_t o = (std::size_t)s * W;
         vt vm, vx, vy, vp;
         vm.copy_from(cM + o, stdx::element_aligned);
@@ -112,10 +119,10 @@ static inline void striped_row_best(const T* cM, const T* cX, const T* cY, const
         vp.copy_from(pad + o, stdx::element_aligned);
         const vt h = stdx::max(stdx::max(vm, vx), vy) + vp;
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
-        if constexpr (sizeof(T) == 8) ls = avx512d_blend(avx512d_gt(h, lmax), ls, vt(T(s)));
-        else                                      stdx::where(h > lmax, ls) = vt(T(s));
+        if constexpr (sizeof(T) == 8) ls = avx512d_blend(avx512d_gt(h, lmax), ls, vs);
+        else                                      stdx::where(h > lmax, ls) = vs;
 #else
-        stdx::where(h > lmax, ls) = vt(T(s));
+        stdx::where(h > lmax, ls) = vs;
 #endif
         lmax = stdx::max(lmax, h);
     }
