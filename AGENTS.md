@@ -1149,22 +1149,45 @@ score-only arm, which ran 1.5× slower than Local AFFINE's:
   (inter-pair kept where it wins, the striped kernel where it did not). Hard fills are NOT
   gated by it: there
   the shared fill replaces the own LINEAR fill, which it beats at every length (next item).
-- **The linear fills are not leveled.** `viterbi_linear` (the H fill `auto` keeps while H
-  ≤ 2 MiB) and `viterbi_linear_ptr` are header functions compiled at baseline, so at AVX2
-  they run SSE2 code while the affine striped kernel runs the full width, and the integer
-  types gain nothing from their narrower lanes. Hard, 1 thread, µs a pair at L200, own
-  linear under `auto` / under `pointers` / inter-pair / affine striped Pointers: Local
-  int16 67.6 / 84.0 / 17.0 / 21.7, int32 36.0 / 84.9 / 19.2 / 35.5, float32 118 / 129 / 26.2
-  / 65.5, double 119 / 129 / 38.8 / 90.5; Global int16 35.6 / 51.5 / — / 17.4, int32 27.5 /
-  51.4 / — / 28.4, float32 54.4 / 82.4 / — / 61.9, double 54.3 / 83.0 / — / 79.7. So for
-  float32 and double the own Global linear H fill ties affine and the Local one loses
-  1.3–1.8×; for int16 both lose 2–3×; the inter-pair fill rescues Local linear up to the
-  byte cap. A leveled striped linear kernel (Pointers, H and the Hirschberg sweeps) is the
-  largest integer-path item left (`TODO.md`); so is re-measuring Global linear protein
-  pairs in the inter-pair fill, which `linear_fill_ok_` excludes on a measurement made
-  when the own fill was the H one at double. (An explicit `traceback="pointers"` on linear
-  is the byte-recording loop, 1.5–3× slower than the H fill below 2 MiB: the tool's nwgrad
-  linear arms now run `auto`, as a user does.)
+- **The linear fills were not leveled — FIXED (2026-10-23, `kernels_linear_impl.inl`).**
+  `viterbi_linear` (the H fill `auto` keeps while H ≤ 2 MiB) and `viterbi_linear_ptr` were
+  header functions compiled at baseline, so at AVX2 they ran SSE2 code while the affine
+  striped kernel ran the full width. Now a leveled striped linear kernel, per ISA level and
+  scalar type, in both forms (H table; direction bytes on two rolling rows), Global and
+  Local, tracked or not: the query profile and striped layout of the affine kernels, the
+  horizontal gap as the affine VY carry with a ZERO open (`Y[c] = max(U[c-1] - ge_a,
+  Y[c-1] - ge_a)`, U the row's diagonal-or-up maximum, Local clamped first: the clamp
+  commutes), so the integer prefix max (`int_pmax_carry`, from 4 lanes) and lazy-F
+  otherwise; codes 0 diagonal unless up STRICTLY larger, 2 left where Y strictly exceeds
+  U, 3 stop where Local ≤ 0 — the scalar fill's first-largest order. Bit-exact with the
+  scalar fills (`tests/cpp/test_linear_striped.cpp`, `[linear][simd]`: every level, all
+  five types, both modes and tracebacks, tracked rows, B spanning the gate; a liveness
+  count requires the kernel to have run exactly where the level has it and the gate admits
+  the pair). Measured, hard, 1 thread, µs a pair, own fill under `auto`, nighthaven AVX2,
+  before → after: Local L200 int16 67.6 → 12.8, int32 36.0 → 16.9, float32 118 → 31.3;
+  Global L200 int16 35.6 → 10.1, int32 27.5 → 13.3, float32 54.4 → 24.4 — now 1.7–2.1×
+  FASTER than the affine striped Pointers kernel (one table against three). Parasail
+  trace + CIGAR over nwgrad's linear path: L200 Global int16 1.36 → 4.05, int32 1.81 →
+  3.42; L1000 Global int32 0.56 → 2.30 (nwgrad's worst cell in the comparison).
+  Three gates, each measured (nighthaven AVX2 and spot NEON agreeing):
+  (a) **short rows run the scalar fill** (`Aligner::kLinearStripedMinN`): a row pays a fixed
+  cost (two passes, the carry's cross-lane step, the profile row) that few columns cannot
+  amortize — without the gate Global L30 regressed 1.7–2.1× (int16 0.96 → 1.74 µs). The
+  crossover is a B LENGTH, nearly ISA-independent (22 × 50 DNA cells fall on the protein
+  lines): Global n 48 int16, 64 int32, 80 float32, 96 double; Local 32, 40, 24, 24. After
+  the gate the worst striped-or-scalar choice is 1.01–1.07× the faster fill on both hosts.
+  (b) **int64 has no linear kernel below 8 lanes** (`linear_kernel_pays`, registered null):
+  AVX2 emulates the 64-bit max with `vpcmpgtq` + `vpblendvb` and NEON / SSE run 2 lanes,
+  against one `cmov` in the scalar fill — striped / scalar 1.3–2.6× at every length.
+  AVX-512 (`vpmaxsq`, 8 lanes) keeps it, UNMEASURED (solace was off).
+  (c) **integer linear pairs over 15000 cells leave the inter-pair gather fill**
+  (`kInterLinearIntGatherCells`, `inter_eligible_` and streaming `align()`): the inter-pair
+  kernel's per-lane-cell gather on a 20-letter alphabet now costs more than the integer
+  kernel's whole cell — inter / own, Local protein, L100 0.85–0.99, L150 1.12–1.22, L200
+  1.14–1.33. Floating T keeps the shared fill: it still wins on AVX2 through L200
+  (0.63–0.84); on NEON it loses from L150 (1.08–1.18), recorded in `TODO.md`.
+  (An explicit `traceback="pointers"` on linear is the byte form: past the 2 MiB H limit
+  `auto` takes it too. The tool's nwgrad linear arms run `auto`, as a user does.)
 
 **The two regressions that were not explained above, run down on nighthaven (2026-10-23).**
 (a) At L1000 parasail's scan32 edges nwgrad's int32 score-only (0.92 at AVX2, 0.82 on

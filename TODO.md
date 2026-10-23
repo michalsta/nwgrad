@@ -101,16 +101,15 @@ DiscrimAlign does: it passes the logical core count.
 
 ## Integer scalar types: what is left (branch `integer`, 2026-10-22)
 
-- **Leveled linear kernels** (found 2026-10-23 by the parasail comparison, AGENTS
-  "Versus parasail"): `viterbi_linear` / `viterbi_linear_ptr` / the linear Hirschberg
-  sweeps are header functions at baseline codegen; at AVX2 the own Local linear fill is
-  2-3x the affine striped Pointers kernel at int16 (67.6 vs 21.7 us a pair at L200) and
-  1.3-1.8x at float32 / double; Global linear 2x at int16, a tie at float/double. A
-  striped linear kernel per level (one table or one byte per cell; the carry is the
-  affine kernel's with zero opens, so the integer prefix-max applies) would bring linear
-  to about half of affine's time. Until then the inter-pair fill carries Local linear up
-  to the byte cap, and Global linear protein pairs (excluded by `linear_fill_ok_` on a
-  double-era measurement) should be re-measured in it.
+- **Linear kernels: what is left** (the leveled striped linear kernels landed 2026-10-23,
+  AGENTS "Versus parasail"). (1) AVX-512: the int64 linear kernel is registered there only
+  (8 lanes, `vpmaxsq`) and nothing linear is measured at avx512 — solace was off; run
+  `lin_cross.py`-style striped / scalar and the parasail linear arms there. (2) NEON float:
+  the inter-pair fill loses to the new own kernel from L150 (1.08-1.18) while AVX2 keeps
+  winning (0.63-0.84); a per-level inter-pair cap would take it without costing v3.
+  (3) The linear Hirschberg sweeps (`lhb_sweep`, `lhb_base`) are still scalar header code.
+  (4) Global linear protein pairs stay out of the inter-pair fill (`linear_fill_ok_`, a
+  double-era measurement); re-measure against the new own fill.
 - **The integer score kernel's working set** (2026-10-23, AGENTS "Versus parasail", the
   run-down): the prefix-max carry scratches three extra rows (`sopenv`, 3·sw) beside the six
   rolling rows, so int32 score-only leaves L1D (48 KB) at L1300 instead of L2000 — 0.28 →
