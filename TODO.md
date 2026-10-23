@@ -111,6 +111,15 @@ DiscrimAlign does: it passes the logical core count.
   to about half of affine's time. Until then the inter-pair fill carries Local linear up
   to the byte cap, and Global linear protein pairs (excluded by `linear_fill_ok_` on a
   double-era measurement) should be re-measured in it.
+- **The integer score kernel's working set** (2026-10-23, AGENTS "Versus parasail", the
+  run-down): the prefix-max carry scratches three extra rows (`sopenv`, 3·sw) beside the six
+  rolling rows, so int32 score-only leaves L1D (48 KB) at L1300 instead of L2000 — 0.28 →
+  0.40 ns/cell, and 1.9x parasail's scan32 at L2000 — and two SMT siblings share one L1D, so
+  12 threads on nighthaven score LESS than 6 (15.1 vs 19.7 Gcell/s). Shrink the scratch to
+  one row (opens and flags in one word, the prefix max Q in place over it), or compute the
+  carry's prefix per segment vector without materializing Q; then re-sweep lengths and the
+  sibling placement. The same rows exist in the Pointers / Scores / hb_base kernels, which
+  write tables anyway (less to gain, but check the 12-thread L1000 drop there too).
 - **int16 saturating arithmetic, with a number**: at L1000 BLOSUM62 nwgrad refuses int16
   and runs int32 (261 us a pair, score-only, AVX2) where parasail's saturating scan16 takes
   145 us — the one fixture in the comparison parasail wins.

@@ -1166,6 +1166,30 @@ score-only arm, which ran 1.5× slower than Local AFFINE's:
   is the byte-recording loop, 1.5–3× slower than the H fill below 2 MiB: the tool's nwgrad
   linear arms now run `auto`, as a user does.)
 
+**The two regressions that were not explained above, run down on nighthaven (2026-10-23).**
+(a) At L1000 parasail's scan32 edges nwgrad's int32 score-only (0.92 at AVX2, 0.82 on
+solace pinned to avx2), though nwgrad leads 1.2–1.3× at L200; (b) every L1000 ratio on
+nighthaven drops at 12 threads (int32 score vs scan32 0.92 → 0.71). One cause. Length sweep,
+ns/cell, 1 thread: nwgrad int32 0.40 (L100) → 0.26 (L600–1000) → 0.36 (L1500) → 0.43
+(L2000); parasail scan32 0.54 → 0.24 → 0.23 → 0.22. Counters (perf stat, L200 → L1000):
+nwgrad's L1-dcache misses per cell 0.0005 → 0.041 (80×), parasail's 0.03 at L1000; branch
+misses 13× per cell but only ~3 a row — the misses are the cost. Threads at L1000, Gcell/s,
+nwgrad int32 score | parasail scan32: 1 thread 3.83 | 4.16; 6 threads on six distinct cores
+19.7 | 18.4 (nwgrad ahead); 6 threads on three cores' SIBLING pairs 8.5 | 12.3; 12 threads
+15.1 | 18.8 — nwgrad's 12-thread total is BELOW its own 6-thread one: two threads on a core
+share its 48 KB L1D. Per-type sweep (score-only, ns/cell, L200 … L2500): int32 0.30, 0.28,
+0.34, 0.31, 0.26, 0.28, **0.40**, 0.44, 0.44 (cliff between L1300 and L1600); double 1.07 …
+0.99 (L1000), **1.12** (L1300) …; float32 flat 0.86–1.03 to L2500 (compute-bound on lazy-F,
+the misses hidden). The cliffs sit where the working sets cross 48 KB: double keeps six
+rolling rows of 8 B (48 KB at L1000); the int32 kernel keeps those six PLUS the three rows
+the integer prefix-max carry scratches in (`sopenv`, 3·sw: opens, flags, Q) — nine rows of
+4 B, 48 KB at L1333 — where six would cross at L2000. The kernel runs ~1.2 cycles a cell,
+so it has nothing to hide a miss behind. So: **the integer carry's scratch rows cost int32
+its L1 residency from L1300 on one thread and from L1000 with SMT siblings**; the remedy
+is to shrink them (one scratch row: opens and flags in one, Q in place over it), `TODO.md`.
+Not a kernel-speed loss: below the cliff nwgrad int32 is 1.0–1.3× parasail's scan32 and
+1.7–1.8× its striped32 at every length.
+
 ### The soft path: scaled probability space (2026-10-05)
 
 **The soft path is NOT bit-exact** — across `soft_impl`, ISA levels, compilers, `fill`,
