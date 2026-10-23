@@ -299,6 +299,15 @@ static void striped_linear_full(ViterbiJob<T>& job) {
     job.width = W;
 }
 
+// Whether this level registers the linear kernels for T.  int64 below eight lanes: no —
+// AVX2 has no packed 64-bit max (vpcmpgtq + vpblendvb) and NEON / SSE run two lanes, while
+// the scalar fill's 64-bit max is one cmov; measured striped / scalar 1.3-2.6x at every
+// length on nighthaven (AVX2) and spot (NEON), DNA 40 x 200 and protein L128 included.
+template <class T>
+static constexpr bool linear_kernel_pays() {
+    return !(nw_is_int<T> && sizeof(T) == 8 && stdx::native_simd<T>::size() < 8);
+}
+
 template <class T>
 static void striped_linear_entry(ViterbiJob<T>& job) {
     if (job.tr.on()) {

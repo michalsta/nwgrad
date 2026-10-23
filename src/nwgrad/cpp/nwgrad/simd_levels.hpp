@@ -439,6 +439,8 @@ inline constexpr size_t kInterSoftBytes  = size_t(1) << 19;   // 512 KiB
 // independent of the type and the lane count).  Hard fills are not gated by this: there
 // the shared fill replaces the own LINEAR fill, which is slower at every length.
 inline constexpr size_t kInterScoreGatherCells = size_t(8192);   // (M + 1) * (n + 1) of the group
+// Hard fills, linear, integer T, alphabets over 8 (batch_engine.hpp, inter_eligible_): ~L120.
+inline constexpr size_t kInterLinearIntGatherCells = size_t(15000);
 inline bool inter_score_ok(size_t nalpha, int M, int n) {
     return nalpha <= 8 ||
            static_cast<size_t>(M + 1) * static_cast<size_t>(n + 1) <= kInterScoreGatherCells;

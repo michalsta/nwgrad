@@ -560,6 +560,8 @@ struct Aligner {
     // Whether the retained Viterbi tables (or direction bytes) are in the striped layout
     // of a leveled kernel — i.e. one ran, not the scalar fill.  For tests' liveness checks.
     bool tables_striped() const noexcept { return tables_striped_; }
+    // The B length from which the linear Full fill takes the leveled striped kernel.
+    static constexpr int linear_striped_min_n() noexcept { return kLinearStripedMinN; }
     int  kernel() const noexcept { return backend_; }
     // Which simd fill the Full band uses at double precision: the striped kernel (false,
     // the default) or the row-wise one the guide-banded path uses (true).  Both write
@@ -2082,7 +2084,7 @@ private:
             const bool lin_ptr = linear_ptr_fill();
             if constexpr (AB == AlignBand::Full) {
                 const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
-                if (backend != kBackendScalar) {
+                if (backend != kBackendScalar && n_ >= kLinearStripedMinN) {
                     const LevelKernels& K = level_kernels(backend);
                     const TypedKernels<T>& KT = K.template of<T>();
                     if (lin_ptr ? KT.linear_ptr != nullptr : KT.linear != nullptr) {
@@ -2157,6 +2159,20 @@ private:
         best_tbl_ = (job.best_tbl == 0) ? TBTable::M
                   : (job.best_tbl == 1) ? TBTable::X : TBTable::Y;
     }
+
+    // Below these B lengths the scalar linear fill beats the striped kernel: each row pays
+    // a fixed cost (two passes, the carry's cross-lane step, the profile row) that few
+    // columns cannot amortize.  Measured, striped / scalar time reaching 1.0, own fill,
+    // hard, 1 thread, protein and DNA, nighthaven (AVX2) and spot (NEON) agreeing within
+    // one fixture step (2026-10-23): Global n ~48 int16, ~64 int32, ~80 float32, ~96
+    // double; Local ~32, ~40, ~24, ~24.  A column count, nearly independent of the ISA:
+    // the 22 x 50 DNA cells fall on the same lines.  (int64 has no striped linear kernel
+    // below AVX-512 at all: kernels_linear_impl.inl, linear_kernel_pays.)
+    static constexpr int kLinearStripedMinN =
+        (AM == AlignMode::Global)
+            ? (std::is_same_v<T, int16_t> ? 48 : std::is_same_v<T, int32_t> ? 64
+               : std::is_same_v<T, float> ? 80 : 96)
+            : (std::is_same_v<T, int16_t> ? 32 : std::is_same_v<T, int32_t> ? 40 : 24);
 
     // The leveled linear kernel (Full): H in STRIPED layout (or direction bytes in it),
     // read back through cell_index like the affine tables.  No gap opens in the job.

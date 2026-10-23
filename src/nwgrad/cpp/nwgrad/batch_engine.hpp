@@ -743,6 +743,13 @@ private:
                 !inter_pair_fits(la, lb, GM == GapModel::Affine, soft, inter_w_(K), sizeof(T), K.d.inter_w)) {
                 other.push_back(i); continue;
             }
+            // the integer linear gather gate of inter_eligible_ (hard fills only; score-only
+            // groups are gated by inter_score_ok in the loop)
+            if constexpr (GM == GapModel::Linear && nw_is_int<T>)
+                if (grad_mode_ == GradMode::Hard && params.matrix.size() > 8 &&
+                    (la + 1) * (lb + 1) > kInterLinearIntGatherCells) {
+                    other.push_back(i); continue;
+                }
             elig.push_back(i);
             maxa = std::max(maxa, la); maxb = std::max(maxb, lb);
         }
@@ -2029,6 +2036,16 @@ private:
         if (!inter_pair_fits(len_a(i), len_b(i), GM == GapModel::Affine,
                              grad_mode_ == GradMode::Soft, inter_w_(K), sizeof(T), K.d.inter_w))
             return false;
+        // Linear, integer T, alphabet over 8: the inter-pair fill gathers per lane-cell,
+        // and the leveled striped linear kernel now beats it past ~L120 (inter / own, Local
+        // protein, hard, 1 thread: L100 0.85-0.99, L150 1.12-1.22, L200 1.14-1.33; nighthaven
+        // AVX2 and spot NEON agree).  Floating T keeps the shared fill: on AVX2 it still wins
+        // through L200 (0.63-0.84), and the NEON loss there (1.08-1.18 from L150) does not
+        // justify costing the primary target.
+        if constexpr (GM == GapModel::Linear && nw_is_int<T>)
+            if (alpha_->size() > 8 &&
+                (len_a(i) + 1) * (len_b(i) + 1) > kInterLinearIntGatherCells)
+                return false;
         // Hirschberg pairs past the cutoff split: no shared fill.
         return !(is_hirschberg(tb_resolved_) && len_a(i) > static_cast<size_t>(s_.hb_cutoff));
     }

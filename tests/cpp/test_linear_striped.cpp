@@ -100,7 +100,8 @@ bool same(const Result& a, const Result& b) {
 }
 
 template <class T>
-void sweep(uint64_t seed, int rounds, int& mismatches, int& cases, int& kernel_runs, std::string& first) {
+void sweep(uint64_t seed, int rounds, int& mismatches, int& cases, int& kernel_runs, int& expected_runs,
+           std::string& first) {
     Rng rng(seed);
     const Alphabet* alphas[] = {&Alphabet::get("ACGT"), &Alphabet::get("ACDEFGHIKLMNPQRSTVWY"), &Alphabet::get("AB")};
     std::vector<int> levels;
@@ -111,8 +112,9 @@ void sweep(uint64_t seed, int rounds, int& mismatches, int& cases, int& kernel_r
         const int sets = rng.in(0, 3) == 0 ? rng.in(2, 4) : 1;
         const AlignParams p = make_params<T>(rng, alpha, sets);
         const int pick = rng.in(0, 3);
+        // B spans the gate (kLinearStripedMinN, 24-96) so both sides run; A short or long
         const int la = pick == 0 ? rng.in(0, 3) : pick == 1 ? rng.in(1, 20) : rng.in(1, 90);
-        const int lb = pick == 0 ? rng.in(0, 3) : pick == 1 ? rng.in(1, 20) : rng.in(1, 90);
+        const int lb = pick == 0 ? rng.in(0, 3) : pick == 1 ? rng.in(1, 40) : rng.in(90, 200);
         const std::string A = random_seq(rng, alpha, la), B = random_seq(rng, alpha, lb);
         std::vector<uint16_t> track;
         if (sets > 1) { track.resize(static_cast<size_t>(la)); for (auto& t : track) t = static_cast<uint16_t>(rng.in(0, sets - 1)); }
@@ -127,6 +129,9 @@ void sweep(uint64_t seed, int rounds, int& mismatches, int& cases, int& kernel_r
             const Result kP = run_one<AM, T>(ea, eb, p, track, level, TracebackMode::Pointers);
             ++cases;
             kernel_runs += kH.layout + kP.layout;
+            const bool has = level_kernels(level).template of<T>().linear != nullptr;
+            const int min_n = Aligner<GapModel::Linear, AM, AlignBand::Full, T>::linear_striped_min_n();
+            expected_runs += (has && lb >= min_n) ? 2 : 0;
             const bool ok = same(sH, kH) && same(sP, kP) && same(kH, kP);
             if (!ok) {
                 ++mismatches;
@@ -147,13 +152,16 @@ void sweep(uint64_t seed, int rounds, int& mismatches, int& cases, int& kernel_r
 
 TEMPLATE_TEST_CASE("striped linear kernels equal the scalar linear fills bit for bit", "[linear][simd]",
                    double, float, int16_t, int32_t, int64_t) {
-    int mismatches = 0, cases = 0, kernel_runs = 0;
+    int mismatches = 0, cases = 0, kernel_runs = 0, expected_runs = 0;
     std::string first;
-    sweep<TestType>(0x5eedf00d, 800, mismatches, cases, kernel_runs, first);
+    sweep<TestType>(0x5eedf00d, 800, mismatches, cases, kernel_runs, expected_runs, first);
     INFO("first mismatch: " << first);
     CHECK(mismatches == 0);
     CHECK(cases == 800);
-    // liveness: the leveled kernel must actually have run (striped layout reported) — a
-    // silent fallback to the scalar fill would pass every comparison above vacuously
-    CHECK(kernel_runs == 2 * cases);
+    // liveness: the leveled kernel must have run exactly where the level has it and the
+    // length gate admits the pair (striped layout reported) — a silent fallback to the
+    // scalar fill would pass every comparison above vacuously, and a gate that stopped
+    // routing would too
+    CHECK(kernel_runs == expected_runs);
+    if (!std::is_same_v<TestType, int64_t>) CHECK(expected_runs > cases / 2);
 }
