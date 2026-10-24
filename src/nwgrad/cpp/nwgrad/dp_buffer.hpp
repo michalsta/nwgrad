@@ -136,6 +136,7 @@ struct DpBufferT {
     // regime — see the sorted-scheduler notes.
     BVec DM, DX, DY;
     TVec rM, rX, rY, qM, qX, qY;   // rolling current/previous rows (O(n), not O(mn))
+    TVec srows;                    // the score kernels' rolling rows, one block (score_rows)
 
     // ── TracebackMode::Hirschberg: no table at all above the base case ────────
     //
@@ -185,6 +186,7 @@ struct DpBufferT {
         auto clrB = [](BVec& v) noexcept { v.clear(); v.shrink_to_fit(); };
         clrB(DM); clrB(DX); clrB(DY);
         clrT(rM); clrT(rX); clrT(rY); clrT(qM); clrT(qX); clrT(qY);
+        clrT(srows);
         clrT(hfa); clrT(hfb); clrT(hfc); clrT(hfd); clrT(hfe); clrT(hff);
         clrT(hra); clrT(hrb); clrT(hrc); clrT(hrd); clrT(hre); clrT(hrf);
         clrT(hsM); clrT(hsX); clrT(hsY);

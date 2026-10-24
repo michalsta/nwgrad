@@ -30,6 +30,22 @@
 #  error "score_kernel_impl.inl must be included inside a level namespace by a level TU"
 #endif
 
+// The rolling rows as ONE block, at a stride of r cache lines with r odd and 9 <= r mod 64 <= 55.
+// Separately allocated rows of ~4000-4080 B came out exactly 4096 B apart, so the rows walked
+// in lockstep shared one L1 set; a 4-way 16 KB L1D (Piledriver) thrashed: int32 L1000 4-11x
+// the time of L996 / L1024, double L500 1.36x (wloczykij, 2026-10-24).  Odd r puts row k in
+// set k*r mod 64, distinct for every row; r odd but 1 mod 64 (rows 64 B apart mod 4096) was
+// 1.04-1.12x slower at clean lengths, so the rows are also kept >= 9 lines apart mod 4096.
+template <class T>
+static inline T* score_rows(DpBufferT<T>& buf, std::size_t sw, int nrows, std::size_t& stride) {
+    constexpr std::size_t line = 64 / sizeof(T);
+    std::size_t lines = (sw + line - 1) / line;
+    while (lines % 2 == 0 || lines % 64 < 9 || lines % 64 > 55) ++lines;
+    stride = lines * line;
+    if (buf.srows.size() < stride * nrows) buf.srows.resize(stride * nrows);
+    return buf.srows.data();
+}
+
 // Tr: a tracked problem (job.tr; see striped_affine_full) — each row's penalties,
 // border and profile row from the track arrays.
 template <class T, bool Local, bool Fused, bool Tr = false>
@@ -57,8 +73,7 @@ static void score_affine_striped(ScoreJob<T>& job) {
 
     const int seg = (n + W - 1) / W;
     const std::size_t sw = (std::size_t)seg * W;
-    for (auto* v : {&buf.rM, &buf.rX, &buf.rY, &buf.qM, &buf.qX, &buf.qY})
-        if (v->size() < sw) v->resize(sw);
+    std::size_t rs; T* const rows = score_rows(buf, sw, 6, rs);
     if constexpr (!Fused) if (buf.sopenv.size() < sw) buf.sopenv.resize(sw);
     // Local: the padding slots (columns > n) must not reach the maximum.  With a negative
     // gap extend a gap run GAINS score along the padding, so they can exceed every real
@@ -80,8 +95,8 @@ static void score_affine_striped(ScoreJob<T>& job) {
     // striped query profile, padding columns -inf (as striped_affine_full)
     striped_profile_build<T, Tr>(buf.sprof, job.blk, nalpha, b, n, seg, W, tr);
 
-    T* pM = buf.qM.data(); T* pX = buf.qX.data(); T* pY = buf.qY.data();   // row i-1
-    T* cM = buf.rM.data(); T* cX = buf.rX.data(); T* cY = buf.rY.data();   // row i
+    T* pM = rows + 3 * rs; T* pX = rows + 4 * rs; T* pY = rows + 5 * rs;   // row i-1
+    T* cM = rows;          T* cX = rows + rs;     T* cY = rows + 2 * rs;   // row i
 
     // row 0 (columns 1..n, striped); padding -inf, as the fill leaves it
     for (std::size_t k = 0; k < sw; ++k) { pM[k] = NINF; pX[k] = NINF; pY[k] = NINF; }
@@ -317,8 +332,7 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
 
     const int seg = (n + W - 1) / W;
     const std::size_t sw = (std::size_t)seg * W;
-    for (auto* v : {&buf.rM, &buf.rX, &buf.rY, &buf.qM, &buf.qX})
-        if (v->size() < sw) v->resize(sw);
+    std::size_t rs; T* const rows = score_rows(buf, sw, 5, rs);
     const T* pad = nullptr;
     // (MOnly's M padding is clamped to exactly 0 for floating T — the padding profile is
     // -inf — but an integer T pads the profile with 0 (nw_pad), so its padding M is a
@@ -337,8 +351,8 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
 
     striped_profile_build<T, Tr>(buf.sprof, job.blk, nalpha, b, n, seg, W, tr);
 
-    T* pD = buf.qM.data(); T* pX = buf.qX.data();                          // row i-1
-    T* cD = buf.rM.data(); T* cX = buf.rX.data(); T* cY = buf.rY.data();   // row i
+    T* pD = rows + 3 * rs; T* pX = rows + 4 * rs;                          // row i-1
+    T* cD = rows;          T* cX = rows + rs;     T* cY = rows + 2 * rs;   // row i
 
     // row 0: D = max(M, X, Y) of the three-state row 0, X = -inf; padding -inf
     for (std::size_t k = 0; k < sw; ++k) { pD[k] = NINF; pX[k] = NINF; }
