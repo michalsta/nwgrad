@@ -107,15 +107,17 @@ DiscrimAlign does: it passes the logical core count.
   inter-pair fill (done 2026-10-23; caps confirmed on AVX2, AVX-512 and NEON — on NEON
   they forgo int L80-100 and float32 L130 wins of 3-23 %, accepted). The per-level thresholds come from one host per ISA — re-derive
   them on another AVX-512 CPU (Zen 4 splits 512-bit ops) before trusting them there.
-- **The integer score kernel's working set** (2026-10-23, AGENTS "Versus parasail", the
-  run-down): the prefix-max carry scratches three extra rows (`sopenv`, 3·sw) beside the six
-  rolling rows, so int32 score-only leaves L1D (48 KB) at L1300 instead of L2000 — 0.28 →
-  0.40 ns/cell, and 1.9x parasail's scan32 at L2000 — and two SMT siblings share one L1D, so
-  12 threads on nighthaven score LESS than 6 (15.1 vs 19.7 Gcell/s). Shrink the scratch to
-  one row (opens and flags in one word, the prefix max Q in place over it), or compute the
-  carry's prefix per segment vector without materializing Q; then re-sweep lengths and the
-  sibling placement. The same rows exist in the Pointers / Scores / hb_base kernels, which
-  write tables anyway (less to gain, but check the 12-thread L1000 drop there too).
+- **The integer score kernel's working set: DONE for the score kernel** (2026-10-24, AGENTS
+  "Versus parasail": the carry fused into the row pass, 0.45–0.9 of the separate carry's
+  time on every host and type measured). Left: the same separate carry (opens / flags / Q
+  rows) in the Pointers, Scores and hb_base kernels, which write tables anyway — less to
+  gain, but check their 12-thread L1000 drop on nighthaven; the Pointers kernel needs the
+  open codes, so the fusion does not transfer one to one.
+- **4 KB set aliasing of the rolling rows on 4-way L1Ds** (found 2026-10-24, skynet;
+  investigation on wloczykij in progress): rows of ~4000–4080 B are allocated exactly 4096 B
+  apart and thrash a 16 KB 4-way L1D (int32 L1000 4–9× slower than L960). Remedy candidates:
+  carve the rolling rows from one block with a row stride that is not a multiple of 4096
+  (pad by a cache line where it is), so the streams fall in distinct sets.
 - **int16 saturating arithmetic, with a number**: at L1000 BLOSUM62 nwgrad refuses int16
   and runs int32 (261 us a pair, score-only, AVX2) where parasail's saturating scan16 takes
   145 us — the one fixture in the comparison parasail wins.

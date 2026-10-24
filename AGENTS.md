@@ -1275,12 +1275,44 @@ share its 48 KB L1D. Per-type sweep (score-only, ns/cell, L200 … L2500): int32
 0.34, 0.31, 0.26, 0.28, **0.40**, 0.44, 0.44 (cliff between L1300 and L1600); double 1.07 …
 0.99 (L1000), **1.12** (L1300) …; float32 flat 0.86–1.03 to L2500 (compute-bound on lazy-F,
 the misses hidden). The cliffs sit where the working sets cross 48 KB: double keeps six
-rolling rows of 8 B (48 KB at L1000); the int32 kernel keeps those six PLUS the three rows
-the integer prefix-max carry scratches in (`sopenv`, 3·sw: opens, flags, Q) — nine rows of
-4 B, 48 KB at L1333 — where six would cross at L2000. The kernel runs ~1.2 cycles a cell,
+rows of 8 B (the five rolling rows of the D/X form and the profile row: 48 KB at L1000);
+the int32 kernel kept those six PLUS the two rows its integer prefix-max carry scratched in
+(`sopenv`, the opens; `hramp`, the ramp) — eight rows of 4 B, 48 KB at ~L1500 — where six
+cross at L2000. (An earlier account here said nine rows and L1333, counting the Pointers
+kernel's three-row scratch; the score kernel's is two.) The kernel runs ~1.2 cycles a cell,
 so it has nothing to hide a miss behind. So: **the integer carry's scratch rows cost int32
-its L1 residency from L1300 on one thread and from L1000 with SMT siblings**; the remedy
-is to shrink them (one scratch row: opens and flags in one, Q in place over it), `TODO.md`.
+its L1 residency from ~L1500 on one thread and earlier with SMT siblings.**
+
+**FIXED (2026-10-24): the carry fused into the row pass** (`score_affine_striped_pos`, the
+D/X form every non-negative-opens integer score runs). The opens never reach memory: the
+running prefix max of `open(s-1) + ramp(s)` stays in a register and is stored to Y's row,
+the ramp is a per-lane base `l·seg·ge_a` plus one add a segment; after the row one pass
+applies the lanes' carry-in, subtracts the ramp and folds Y into D. Two passes over the row
+instead of four, six rows instead of eight; bit-identical (max is exact and associative).
+Two forms were prototyped behind a switch and measured in separate processes, interleaved,
+best of three (score-only, ns/cell, 1 thread, BLOSUM62 11/1, 30 %-mutated pairs); fused /
+separate:
+
+| host | int32 inside L1 | int32 at the old cliff | threads | int16 | int64 (≥ 4 lanes) |
+|---|---|---|---|---|---|
+| nighthaven AVX2 | 0.73–0.84 | 0.49 (Global L1600: 0.388 → 0.191) | 6 one per core L1600 0.49; 12 L1000 0.66 | 0.91–0.93 | 0.59–0.78 |
+| solace AVX-512 | 0.75–0.90 | 0.45 (Global L1600: 0.287 → 0.128) | 8 one per core L1600 0.47; 16 0.66–0.72 | 0.92 | 0.56–0.82 |
+| spot NEON (M1, 128 KB L1D) | 0.70–0.79 at every length to L3000 | 0.64–0.70 at L4000 (the separate form's cliff) | 4 P cores 0.75–0.80 | 0.74–0.76 | (2 lanes: chain, untouched) |
+| skynet sse4 (Piledriver) | 0.60–0.76 (L500 0.90–0.95) | — | — | 0.81–0.83 | (2 lanes) |
+
+Fused, the AVX2 / AVX-512 cliff moves to ~L2000 (Global L2000 0.43 → 0.27 on nighthaven,
+0.33 → 0.18 on solace), and 12 / 16 threads still score below 6 / 8 one per core, but by
+less (nighthaven L1000 12 threads 0.066 → 0.044 ns/cell). Against parasail's scan32
+(~0.23 ns/cell at L1600–2000 on nighthaven): nwgrad int32 0.19 at L1600 (was 0.39), 0.27 at
+L2000 (was 0.43). The middle form — the ramp in registers, the opens row kept — moved the
+cliff only, and lost 3–10 % on NEON; dropped.
+
+**Found beside it on Piledriver: 4 KB set aliasing of the rolling rows** (TODO.md). At row
+sizes of ~4000–4080 B (int32 / float32 L997–1020, double / int64 L500–510) the allocator
+places consecutive rows exactly 4096 B apart, so `rM`, `rX`, `rY`, `qM` share one L1 set
+offset; with the profile row and `qX` that is more streams than a 4-way set holds, and a
+16 KB 4-way L1D (Bulldozer / Piledriver) thrashes: skynet int32 L1000 4–9× the time of
+L960 / L1100, in every carry form. Alder Lake's 12-way L1 does not show it.
 Not a kernel-speed loss: below the cliff nwgrad int32 is 1.0–1.3× parasail's scan32 and
 1.7–1.8× its striped32 at every length.
 

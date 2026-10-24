@@ -281,6 +281,19 @@ static void score_affine_striped(ScoreJob<T>& job) {
 // slower than the fill (1.03x) before it was moved back.  MOnly (extends >= 0 too): no
 // gap cell exceeds the cell it extends from, so the Local maximum is over M alone — and
 // M's padding slots are clamped to exactly 0, so they need no mask.
+// An integer T (from 4 lanes) takes Y by the exact prefix max, FUSED into the row pass:
+// the opens never reach memory (the running prefix max of open(s-1) + ramp(s) is kept in
+// a register and stored to Y's row; the per-lane ramp base l*seg*ge_a plus one add per
+// segment replaces the ramp row), and after the row one pass applies the lanes' carry-in,
+// subtracts the ramp and folds Y into D.  Two passes over the row, six rows of working set,
+// where the separate int_pmax_carry took four passes and eight rows (opens and ramp
+// scratch).  Measured 2026-10-24, score-only, int32 ns/cell, fused / separate: AVX2
+// (nighthaven) 0.73-0.84 inside L1 and 0.5 at L1400-1600 (the separate form's L1 cliff:
+// eight rows of 4 B cross 48 KB at ~L1500, six at ~L2000), 6 threads L1600 0.49; AVX-512
+// (solace) 0.75-0.9 and 0.45 at L1600; NEON (spot) 0.70-0.79 at every length; sse4
+// (skynet) 0.60-0.95; int64 (AVX2 / AVX-512) 0.56-0.82; int16 0.74-0.93.  Bit-identical:
+// max is exact and associative, so Y is the separate carry's.  (A middle form, the ramp
+// in registers but the opens row kept, moved the cliff only and lost 3-10 % on NEON.)
 template <class T, bool Local, bool MOnly, bool Tr = false>
 static void score_affine_striped_pos(ScoreJob<T>& job) {
     using vd = stdx::native_simd<T>;
@@ -343,8 +356,6 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
     const vd vzero(static_cast<T>(0)), vninf(NINF);
     vd vbest = vzero;
     T bD = 0;                               // D of column 0, previous row (M(0,0) = 0)
-    [[maybe_unused]] T ramp_ge = ge_a; [[maybe_unused]] bool ramp_ok = false;   // integer T's ramp
-    if constexpr (nw_is_int<T> && W >= 4) if (buf.sopenv.size() < sw) buf.sopenv.resize(sw);
 
     auto any_gt = [](const vd& x, const vd& y) -> bool {
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
@@ -370,6 +381,12 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
 
         vd Oin([&](int q) { return q == 0 ? nbOpen : NINF; });
         vd Yin = vninf;
+        // integer carry: running prefix max, the previous segment's opens, the ramp
+        [[maybe_unused]] vd fP = vninf, fOprev = vninf, fR, fBase;
+        if constexpr (nw_is_int<T> && W >= 4) {
+            fBase = vd([&](int l) { return static_cast<T>(static_cast<T>(l * seg) * ge_a); });
+            fR = fBase;
+        }
         for (int s = 0; s < seg; ++s) {
             vd dD;
             if (s == 0) {
@@ -388,9 +405,14 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
             const vd mx = stdx::max(vmv, vxv);
             vxv.copy_to(cX + (std::size_t)s * W, stdx::element_aligned);
             if constexpr (nw_is_int<T> && W >= 4) {
-                // D without Y for now (the carry raises it below); the opens to ov
+                // D without Y for now (the carry raises it below).  Q(s) = open(s-1) +
+                // ramp(s) into the running prefix max (s >= 1; segment 0's Q needs the
+                // LAST segment's open, shifted a lane, and is folded in after the row)
                 mx.copy_to(cD + (std::size_t)s * W, stdx::element_aligned);
-                ((mx - vgo_a) - vge_a).copy_to(buf.sopenv.data() + (std::size_t)s * W, stdx::element_aligned);
+                if (s > 0) fP = stdx::max(fP, fOprev + fR);
+                nv_store(cY + (std::size_t)s * W, fP);
+                fOprev = (mx - vgo_a) - vge_a;
+                fR += vge_a;
                 if constexpr (Local) {
                     if constexpr (MOnly) vbest = stdx::max(vbest, padded(vmv, s));
                     else                 vbest = stdx::max(vbest, padded(mx, s));
@@ -411,15 +433,23 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
         const vd Olast = Oin;
 
         if constexpr (nw_is_int<T> && W >= 4) {
-            int_ramp_for<T>(buf.hramp, ge_a, seg, W, ramp_ge, ramp_ok);
-            int_pmax_carry<T, W>(buf.sopenv.data(), nullptr, buf.hramp.data(), nbOpen, T(0), NINF, ge_a,
-                                 seg, cY, nullptr, nullptr);
+            // segment 0's term, then the lane carry-in, then ONE pass: Y = max(P', cin') - ramp
+            // folded straight into D.  max is exact and associative, so Y is int_pmax_carry's.
+            const vd Q0 = lane_shift_in(fOprev, nbOpen) + fBase;
+            alignas(64) T tot[64], cin[64];
+            stdx::max(Q0, fP).copy_to(tot, stdx::element_aligned);
+            T run = static_cast<T>(NINF - ge_a);
+            for (int l = 0; l < W; ++l) { cin[l] = run; run = std::max(run, tot[l]); }
+            vd vcin; vcin.copy_from(cin, stdx::element_aligned);
+            vcin = stdx::max(vcin, Q0);
+            vd rq = fBase;
             for (int s = 0; s < seg; ++s) {
-                vd y; y.copy_from(cY + (std::size_t)s * W, stdx::element_aligned);
+                const vd y = stdx::max(nv_load<vd>(cY + (std::size_t)s * W), vcin) - rq;
                 vd d; d.copy_from(cD + (std::size_t)s * W, stdx::element_aligned);
                 d = stdx::max(d, y);
                 d.copy_to(cD + (std::size_t)s * W, stdx::element_aligned);
                 if constexpr (Local && !MOnly) vbest = stdx::max(vbest, padded(y, s));
+                rq += vge_a;
             }
         } else
         for (int r = 0; r < W; ++r) {
