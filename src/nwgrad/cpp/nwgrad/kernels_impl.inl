@@ -158,15 +158,20 @@ static inline void striped_row_best(const T* cM, const T* cX, const T* cY, const
 }
 
 // pad[s*W + l] = 0 for a real column (l*seg + s + 1 <= n), -inf for padding.
-template <class V>
-static inline const typename V::value_type* striped_pad(V& v, int n, int seg, int W) {
-    using T [[maybe_unused]] = typename V::value_type;   // unused at the W=2 levels
-    const std::size_t sw = (std::size_t)seg * W;
-    if (v.size() < sw) v.resize(sw);
+// The same mask into a row the caller owns (a spread_rows row: dp_buffer.hpp).
+template <class T>
+static inline const T* striped_pad_into(T* v, int n, int seg, int W) {
     for (int l = 0; l < W; ++l)
         for (int s = 0; s < seg; ++s)
             v[(std::size_t)s * W + l] = (l * seg + s + 1 <= n) ? T(0) : nw_ninf<T>;
-    return v.data();
+    return v;
+}
+
+template <class V>
+static inline const typename V::value_type* striped_pad(V& v, int n, int seg, int W) {
+    const std::size_t sw = (std::size_t)seg * W;
+    if (v.size() < sw) v.resize(sw);
+    return striped_pad_into(v.data(), n, seg, W);
 }
 
 using vd = stdx::native_simd<double>;
@@ -352,14 +357,18 @@ template <class T, int W>
 // Build the ramp for this problem's ge_a once (untracked), or whenever a tracked row's
 // ge_a differs from the last (same_bits).
 template <class T>
+static inline void int_ramp_into(T* hramp, T ge_a, int seg, int W, T& ramp_ge, bool& ramp_ok) {
+    if (!ramp_ok || std::bit_cast<nw_bits_t<T>>(ramp_ge) != std::bit_cast<nw_bits_t<T>>(ge_a)) {
+        hb_ramp(hramp, ge_a, seg, W);
+        ramp_ge = ge_a; ramp_ok = true;
+    }
+}
+template <class T>
 static inline void int_ramp_for(typename DpBufferT<T>::TVec& hramp, T ge_a, int seg, int W,
                                 T& ramp_ge, bool& ramp_ok) {
     const std::size_t sw = (std::size_t)seg * W;
     if (hramp.size() < sw) hramp.resize(sw);
-    if (!ramp_ok || std::bit_cast<nw_bits_t<T>>(ramp_ge) != std::bit_cast<nw_bits_t<T>>(ge_a)) {
-        hb_ramp(hramp.data(), ge_a, seg, W);
-        ramp_ge = ge_a; ramp_ok = true;
-    }
+    int_ramp_into<T>(hramp.data(), ge_a, seg, W, ramp_ge, ramp_ok);
 }
 
 // ── Tracked rows: the striped query profile ───────────────────────────────────

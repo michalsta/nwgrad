@@ -131,15 +131,15 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
     const std::size_t rowsz = (std::size_t)(seg + 1) * W;
     const std::size_t off   = (std::size_t)W;
 
-    if (buf.sopenv.size() < 3 * sw) buf.sopenv.resize(3 * sw);   // ov | openk | Q (integer T)
     const std::size_t dsz = (std::size_t)(m + 1) * rowsz;
     // Each vector is checked on its own: a linear pointer fill sharing this buffer grows
     // DM, rM and qM alone, so one size no longer speaks for the group.
     for (auto* d : {&buf.DM, &buf.DX, &buf.DY}) if (d->size() < dsz) d->resize(dsz);
-    // rolling score rows: 2 x rowsz instead of (m+1) x rowsz -- the whole point
-    for (auto* r : {&buf.rM, &buf.rX, &buf.rY, &buf.qM, &buf.qX, &buf.qY})
-        if (r->size() < rowsz) r->resize(rowsz);
-    if (buf.subbuf.size() < sw) buf.subbuf.resize(sw);           // y-code scratch
+    // rolling score rows: 2 x rowsz instead of (m+1) x rowsz -- the whole point; with the
+    // opens, open codes, Q (integer T), y-code scratch, the integer carry's ramp and Local's
+    // padding mask, twelve rows of one block (spread_rows, dp_buffer.hpp: no two in one L1
+    // set, and none in the set of another stream read every row)
+    std::size_t rs; T* const rows = spread_rows<T>(buf.prows, rowsz, 12, rs);
 
     auto scol = [seg](int j) -> std::size_t {
         return (std::size_t)((j - 1) % seg) * W + (j - 1) / seg;
@@ -147,14 +147,14 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
 
     striped_profile_build<T, Tr>(buf.sprof, blk, nalpha, b, n, seg, W, tr);
 
-    T* ov = buf.sopenv.data();
-    T* ok = buf.sopenv.data() + sw;
-    T* qb = buf.sopenv.data() + 2 * sw;
-    T* yc = buf.subbuf.data();
+    T* ov = rows + 6 * rs;
+    T* ok = rows + 7 * rs;
+    T* qb = rows + 8 * rs;
+    T* yc = rows + 9 * rs;
     [[maybe_unused]] T ramp_ge = ge_a; [[maybe_unused]] bool ramp_ok = false;   // integer T's ramp
 
-    T* pM = buf.qM.data(); T* pX = buf.qX.data(); T* pY = buf.qY.data();
-    T* cM = buf.rM.data(); T* cX = buf.rX.data(); T* cY = buf.rY.data();
+    T* pM = rows + 3 * rs; T* pX = rows + 4 * rs; T* pY = rows + 5 * rs;
+    T* cM = rows;          T* cX = rows + rs;     T* cY = rows + 2 * rs;
 
     // ── row 0: scores into the rolling "previous" row, codes into the tables ──
     {
@@ -186,7 +186,7 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
     const vd vthree(static_cast<T>(3));
     T bM = 0, bX = K_NINF, bY = K_NINF;
     T best_local = 0; int best_i = 0, best_j = 0, best_tbl = 0;
-    const T* pad = Local ? striped_pad(buf.spad, n, seg, W) : nullptr;
+    const T* pad = Local ? striped_pad_into(rows + 11 * rs, n, seg, W) : nullptr;
 
     for (int i = 1; i <= m; ++i) {
         if constexpr (Tr) {
@@ -301,8 +301,8 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
             // ── the carry: VY, same-lane striped chain + lazy-F, codes tracked (integer
             // T: the exact prefix max with its codes, int_pmax_carry) ──
             if constexpr (nw_is_int<T> && W >= 4) {
-                int_ramp_for<T>(buf.hramp, ge_a, seg, W, ramp_ge, ramp_ok);
-                int_pmax_carry<T, W>(ov, ok, buf.hramp.data(), nbOpen, nbOpenK, bY, ge_a, seg,
+                int_ramp_into<T>(rows + 10 * rs, ge_a, seg, W, ramp_ge, ramp_ok);
+                int_pmax_carry<T, W>(ov, ok, rows + 10 * rs, nbOpen, nbOpenK, bY, ge_a, seg,
                                      cY + off, yc, qb);
             } else {
             vd prev([&](int q) { return q == 0 ? bY : K_NINF; });

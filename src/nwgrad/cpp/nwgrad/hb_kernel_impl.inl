@@ -132,14 +132,13 @@ static void hb_sweep_striped(HbJob<T>& job) {
     auto fit = [](typename DpBufferT<T>::TVec& v, std::size_t k) {
         if (v.size() < k) v.resize(k);
     };
-    fit(buf.hfa, sw); fit(buf.hfb, sw); fit(buf.hfc, sw);
-    fit(buf.hfd, sw); fit(buf.hfe, sw); fit(buf.hff, sw);
-    fit(buf.hov, sw);
+    // six rolling rows and the opens, one block (spread_rows, dp_buffer.hpp)
+    std::size_t rs; T* const rows = spread_rows<T>(buf.hrows, sw, 7, rs);
     fit(buf.hprof, (std::size_t)(Tr ? 1 : nalpha) * sw);
 
-    T* pM = buf.hfa.data(); T* pX = buf.hfb.data(); T* pY = buf.hfc.data();
-    T* cM = buf.hfd.data(); T* cX = buf.hfe.data(); T* cY = buf.hff.data();
-    T* ov = buf.hov.data();
+    T* pM = rows + 3 * rs; T* pX = rows + 4 * rs; T* pY = rows + 5 * rs;
+    T* cM = rows;          T* cX = rows + rs;     T* cY = rows + 2 * rs;
+    T* ov = rows + 6 * rs;
 
     // Striped query profile over the block's column slice.  prof[sym][s*W+l] is the
     // score of `sym` against the residue in column l*seg+s+1.  Built per block because
@@ -332,7 +331,7 @@ static void hb_sweep_entry(HbJob<T>& j) {
 // serial one exactly.  pmax-scalar == pmax-sse2 == pmax-avx2 == pmax-avx512 == pmax-neon,
 // bit for bit, which is what keeps NWGRAD_ISA a speed knob here as everywhere else.
 //
-// The ramp k*ge_a is precomputed into buf.hramp by a scalar loop, once per sweep, for
+// The ramp k*ge_a is precomputed into a row of the block by a scalar loop, once per sweep, for
 // two reasons: it depends on the column and not the row, and a multiply adjacent to the
 // add in the hot loop is exactly what a compiler contracts into an FMA — which would
 // round differently in the -mfma level TUs than in the baseline one and shatter the
@@ -377,15 +376,14 @@ static void hb_sweep_striped_pmax(HbJob<T>& job) {
     auto fit = [](typename DpBufferT<T>::TVec& v, std::size_t k) {
         if (v.size() < k) v.resize(k);
     };
-    fit(buf.hfa, sw); fit(buf.hfb, sw); fit(buf.hfc, sw);
-    fit(buf.hfd, sw); fit(buf.hfe, sw); fit(buf.hff, sw);
-    fit(buf.hov, sw); fit(buf.hramp, sw);
+    // six rolling rows, the opens and the ramp, one block (spread_rows, dp_buffer.hpp)
+    std::size_t rs; T* const rows = spread_rows<T>(buf.hrows, sw, 8, rs);
     fit(buf.hprof, (std::size_t)(Tr ? 1 : nalpha) * sw);
 
-    T* pM = buf.hfa.data(); T* pX = buf.hfb.data(); T* pY = buf.hfc.data();
-    T* cM = buf.hfd.data(); T* cX = buf.hfe.data(); T* cY = buf.hff.data();
-    T* ov = buf.hov.data();
-    T* rmp = buf.hramp.data();
+    T* pM = rows + 3 * rs; T* pX = rows + 4 * rs; T* pY = rows + 5 * rs;
+    T* cM = rows;          T* cX = rows + rs;     T* cY = rows + 2 * rs;
+    T* ov = rows + 6 * rs;
+    T* rmp = rows + 7 * rs;
 
     // The gap ramp, striped: slot (s,l) carries k*ge_a for the ABSOLUTE column index
     // k = l*seg + s.  Scalar, so it is bit-identical to the scalar reference's
@@ -580,16 +578,15 @@ static void hb_scan_impl(HbScanJob<T>& job) {
     auto fit = [](typename DpBufferT<T>::TVec& v, std::size_t k) {
         if (v.size() < k) v.resize(k);
     };
-    fit(buf.hfa, sw); fit(buf.hfb, sw); fit(buf.hfc, sw);
-    fit(buf.hfd, sw); fit(buf.hfe, sw); fit(buf.hff, sw);
-    fit(buf.hov, sw);
+    // six rolling rows, the opens, the ramp (Pmax) and the padding mask (integer T), one
+    // block (spread_rows, dp_buffer.hpp)
+    std::size_t rs; T* const rows = spread_rows<T>(buf.hrows, sw, 9, rs);
     fit(buf.hprof, (std::size_t)(Tr ? 1 : nalpha) * sw);
-    if constexpr (Pmax) fit(buf.hramp, sw);
 
-    T* pM = buf.hfa.data(); T* pX = buf.hfb.data(); T* pY = buf.hfc.data();
-    T* cM = buf.hfd.data(); T* cX = buf.hfe.data(); T* cY = buf.hff.data();
-    T* ov = buf.hov.data();
-    T* rmp = buf.hramp.data();
+    T* pM = rows + 3 * rs; T* pX = rows + 4 * rs; T* pY = rows + 5 * rs;
+    T* cM = rows;          T* cX = rows + rs;     T* cY = rows + 2 * rs;
+    T* ov = rows + 6 * rs;
+    T* rmp = rows + 7 * rs;
     T ramp_ge = ge_a;
     bool ramp_ok = false;
     if constexpr (Pmax && !Tr) { hb_ramp(rmp, ge_a, seg, W); ramp_ok = true; }   // loaded never multiplied (no FMA)
@@ -653,11 +650,7 @@ static void hb_scan_impl(HbScanJob<T>& job) {
     // plus the sentinel cannot wrap, and lands below every real value).
     const T* padm = nullptr;
     if constexpr (nw_is_int<T>) {
-        fit(buf.spad, sw);
-        for (int l = 0; l < W; ++l)
-            for (int s = 0; s < seg; ++s)
-                buf.spad[(std::size_t)s * W + l] = (l * seg + s + 1 <= NC) ? T(0) : NINF;
-        padm = buf.spad.data();
+        padm = striped_pad_into(rows + 8 * rs, NC, seg, W);
     }
 
     T gbest = T(0); int gi = 0, gj = 0;
@@ -866,10 +859,9 @@ static void hb_base_striped(HbBaseJob<T>& job) {
     auto fit = [](typename DpBufferT<T>::TVec& v, std::size_t k) { if (v.size() < k) v.resize(k); };
     if (buf.hbD.size() < 3 * plane) buf.hbD.resize(3 * plane);
     fit(buf.hprof, (std::size_t)(Tr ? 1 : nalpha) * sw);
-    fit(buf.hfa, rowsz); fit(buf.hfb, rowsz); fit(buf.hfc, rowsz);
-    fit(buf.hfd, rowsz); fit(buf.hfe, rowsz); fit(buf.hff, rowsz);
-    fit(buf.hov, 3 * sw);                               // ov | ok | Q (integer T)
-    fit(buf.hsX, sw);                                   // y-code scratch
+    // six rolling rows, ov | ok | Q (integer T), the y-code scratch and the integer carry's
+    // ramp: eleven rows of one block (spread_rows, dp_buffer.hpp)
+    std::size_t rs; T* const rows = spread_rows<T>(buf.prows, rowsz, 11, rs);
 
     auto scol = [seg](int c) -> std::size_t {
         return (std::size_t)((c - 1) % seg) * W + (c - 1) / seg;
@@ -889,14 +881,14 @@ static void hb_base_striped(HbBaseJob<T>& job) {
     unsigned char* D0 = buf.hbD.data();
     unsigned char* D1 = D0 + plane;
     unsigned char* D2 = D1 + plane;
-    T* ov = buf.hov.data();
-    T* ok = buf.hov.data() + sw;
-    T* qb = buf.hov.data() + 2 * sw;   // integer T: the Q scratch
+    T* ov = rows + 6 * rs;
+    T* ok = rows + 7 * rs;
+    T* qb = rows + 8 * rs;             // integer T: the Q scratch
     [[maybe_unused]] T ramp_ge = ge_a; [[maybe_unused]] bool ramp_ok = false;
-    T* yc = buf.hsX.data();
+    T* yc = rows + 9 * rs;
 
-    T* pM = buf.hfa.data(); T* pX = buf.hfb.data(); T* pY = buf.hfc.data();
-    T* cM = buf.hfd.data(); T* cX = buf.hfe.data(); T* cY = buf.hff.data();
+    T* pM = rows + 3 * rs; T* pX = rows + 4 * rs; T* pY = rows + 5 * rs;
+    T* cM = rows;          T* cX = rows + rs;     T* cY = rows + 2 * rs;
 
     // ── row 0: origin seed (in_x), Y series rightward ────────────────────────
     pM[0] = job.in_x ? NINF : T(0);
@@ -906,7 +898,7 @@ static void hb_base_striped(HbBaseJob<T>& job) {
     {
         // scalar row-0 Y series (serial, O(NC), once) — kept scalar to match hb_base bit
         // for bit; then stripe it into pY and record its codes.
-        buf.hfd[0] = pM[0]; buf.hfe[0] = pX[0]; buf.hff[0] = pY[0];  // temp scalars via cM/cX/cY[0]
+        cM[0] = pM[0]; cX[0] = pX[0]; cY[0] = pY[0];  // temp scalars via cM/cX/cY[0]
         T prevM = pM[0], prevX = pX[0], prevY = pY[0];
         for (int c = 1; c <= NC; ++c) {
             const T uy = prevM - go_a - ge_a, vy = prevX - go_a - ge_a, wy = prevY - ge_a;
@@ -1028,8 +1020,8 @@ static void hb_base_striped(HbBaseJob<T>& job) {
 
         // ── VY carry: same-lane striped chain + exact lazy-F, codes tracked ──
         if constexpr (nw_is_int<T> && W >= 4) {
-            int_ramp_for<T>(buf.hramp, ge_a, seg, W, ramp_ge, ramp_ok);
-            int_pmax_carry<T, W>(ov, ok, buf.hramp.data(), nbOpen, nbOpenK, bY, ge_a, seg,
+            int_ramp_into<T>(rows + 10 * rs, ge_a, seg, W, ramp_ge, ramp_ok);
+            int_pmax_carry<T, W>(ov, ok, rows + 10 * rs, nbOpen, nbOpenK, bY, ge_a, seg,
                                  cY + off, yc, qb);
         } else {
         vd prev([&](int q) { return q == 0 ? bY : NINF; });

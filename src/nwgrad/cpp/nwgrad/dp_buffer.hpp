@@ -136,7 +136,10 @@ struct DpBufferT {
     // regime — see the sorted-scheduler notes.
     BVec DM, DX, DY;
     TVec rM, rX, rY, qM, qX, qY;   // rolling current/previous rows (O(n), not O(mn))
-    TVec srows;                    // the score kernels' rolling rows, one block (score_rows)
+    // Rolling rows of the leveled kernels, each family's carved from ONE block by
+    // spread_rows (below): srows score-only, prows striped Pointers and hb_base_striped,
+    // hrows the Hirschberg sweeps and endpoint scans, lrows the linear kernels.
+    TVec srows, prows, hrows, lrows;
 
     // ── TracebackMode::Hirschberg: no table at all above the base case ────────
     //
@@ -186,7 +189,7 @@ struct DpBufferT {
         auto clrB = [](BVec& v) noexcept { v.clear(); v.shrink_to_fit(); };
         clrB(DM); clrB(DX); clrB(DY);
         clrT(rM); clrT(rX); clrT(rY); clrT(qM); clrT(qX); clrT(qY);
-        clrT(srows);
+        clrT(srows); clrT(prows); clrT(hrows); clrT(lrows);
         clrT(hfa); clrT(hfb); clrT(hfc); clrT(hfd); clrT(hfe); clrT(hff);
         clrT(hra); clrT(hrb); clrT(hrc); clrT(hrd); clrT(hre); clrT(hrf);
         clrT(hsM); clrT(hsX); clrT(hsY);
@@ -196,6 +199,40 @@ struct DpBufferT {
         sexp.clear(); sexp.shrink_to_fit();
     }
 };
+
+// nrows (<= 13) rolling rows of len elements each, carved from one block at a stride of r
+// cache lines such that r is not a multiple of 4 and every pair of rows, k*r lines apart
+// (k < nrows), sits >= 4 lines from a multiple of 4096 B.  Rows allocated one by one came out
+// exactly 4096 B apart at row sizes of ~4000-4080 B (and near multiples), so the rows a kernel
+// walks in lockstep shared an L1 set, and a 16 KB 4-way L1D (Bulldozer / Piledriver) thrashed:
+// up to 10x the time of the neighbouring lengths.  Forcing r mod 64 (skynet; AGENTS.md,
+// "FIXED beside it"), ns/cell:
+// - score kernel, int32 Local L1024 (1.48 clean): k*r = 0 -> 6.5 (L1 misses 6x); r = 32
+//   (three rows on one 4 KB offset) -> 2.3, misses unchanged (a 12-bit address match in the
+//   load/store unit); a row one line BEHIND another (r = 63; r = 21, 3r = -1) -> 2.4, 1.76;
+//   -2 lines 1.55; r = 1 (+1 line, every pair) 1.60.
+// - striped Pointers int32 Local L1000 (4.65-4.86 clean), linear H / byte fills int32 L1908
+//   (2.38-2.45 / 2.76-2.90): r = 4 mod 8 -> 5.0-5.5 / 2.5 / 2.9, 8 mod 16 -> 4.9 / 2.8 / 3.2,
+//   16 and 48 -> 5.8 / 2.9-3.0 / 3.4-3.5, 32 -> 7.7 / 3.2 / 3.7, with FEWER L1 misses: a
+//   structural hazard at strides of 256 B multiples, not capacity.  Odd r and r = 2 mod 4 clean.
+// At most 9 lines of padding a row.  The block keeps the allocator's 64-byte alignment.
+template <class T, class Vec>
+inline T* spread_rows(Vec& block, std::size_t len, int nrows, std::size_t& stride) {
+    constexpr std::size_t line = 64 / sizeof(T);
+    std::size_t lines = (len + line - 1) / line;
+    auto spread = [nrows](std::size_t r) {
+        if (r % 4 == 0) return false;
+        for (int k = 1; k < nrows; ++k) {
+            const std::size_t d = (std::size_t(k) * r) % 64;
+            if (d < 4 || d > 60) return false;
+        }
+        return true;
+    };
+    while (!spread(lines)) ++lines;
+    stride = lines * line;
+    if (block.size() < stride * nrows) block.resize(stride * nrows);
+    return block.data();
+}
 
 // The default (and, for the soft path, only) buffer type.  Aliasing rather than
 // renaming keeps every existing `DpBuffer` reference and the double build untouched.

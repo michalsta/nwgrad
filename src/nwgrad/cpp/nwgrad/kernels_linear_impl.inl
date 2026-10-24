@@ -112,23 +112,22 @@ static void striped_linear_full(ViterbiJob<T>& job) {
 
     // Scratch: the opens (U - ge_a) and the carry Y, one striped row each; the byte
     // form keeps the vertical code (0 / 1) per slot in subbuf until the carry is known.
-    if (buf.sopenv.size() < 2 * sw) buf.sopenv.resize(2 * sw);
-    T* ov = buf.sopenv.data();
-    T* yv = buf.sopenv.data() + sw;
+    // The byte form's two rolling rows ride in the same block (spread_rows, dp_buffer.hpp:
+    // no two rows in one L1 set).
+    // Rows: opens, carry, the integer carry's ramp, Local's padding mask, then (byte form)
+    // the vertical codes and the two rolling rows.
+    std::size_t rs; T* const rows = spread_rows<T>(buf.lrows, rowsz, Ptr ? 7 : 4, rs);
+    T* ov = rows;
+    T* yv = rows + rs;
+    T* const ramp = rows + 2 * rs;
     T* kc = nullptr;
-    if constexpr (Ptr) {
-        if (buf.subbuf.size() < sw) buf.subbuf.resize(sw);
-        kc = buf.subbuf.data();
-    }
+    if constexpr (Ptr) kc = rows + 4 * rs;
 
     T* pH; T* cH;
     if constexpr (Ptr) {
         const std::size_t dsz = (std::size_t)(m + 1) * rowsz;
         if (buf.DM.size() < dsz) buf.DM.resize(dsz);
-        // each rolling row checked on its own (see the affine kernel)
-        if (buf.rM.size() < rowsz) buf.rM.resize(rowsz);
-        if (buf.qM.size() < rowsz) buf.qM.resize(rowsz);
-        pH = buf.qM.data(); cH = buf.rM.data();
+        pH = rows + 5 * rs; cH = rows + 6 * rs;
     } else {
         const std::size_t hsz = (std::size_t)(m + 1) * rowsz;
         if (buf.H.size() < hsz) buf.H.resize(hsz);
@@ -156,7 +155,7 @@ static void striped_linear_full(ViterbiJob<T>& job) {
     const vd vthree(static_cast<T>(3));
     const vd vninf(K_NINF);
     T best_local = static_cast<T>(0); int best_i = 0, best_j = 0;
-    const T* pad = Local ? striped_pad(buf.spad, n, seg, W) : nullptr;
+    const T* pad = Local ? striped_pad_into(rows + 3 * rs, n, seg, W) : nullptr;
 
     for (int i = 1; i <= m; ++i) {
         if constexpr (Tr) {
@@ -210,8 +209,8 @@ static void striped_linear_full(ViterbiJob<T>& job) {
 
             // ── the carry: Y[c] = max(open[c-1], Y[c-1] - ge_a) along each lane ──
             if constexpr (nw_is_int<T> && W >= 4) {
-                int_ramp_for<T>(buf.hramp, ge_a, seg, W, ramp_ge, ramp_ok);
-                int_pmax_carry<T, W>(ov, nullptr, buf.hramp.data(), nbOpen, static_cast<T>(0),
+                int_ramp_into<T>(ramp, ge_a, seg, W, ramp_ge, ramp_ok);
+                int_pmax_carry<T, W>(ov, nullptr, ramp, nbOpen, static_cast<T>(0),
                                      K_NINF, ge_a, seg, yv, nullptr, nullptr);
             } else {
                 vd prev = vninf;                         // column 0 holds no Y
@@ -367,16 +366,16 @@ static void lhb_striped(LhbJob<T>& job) {
                 striped_profile_row(buf.hprof.data() + (std::size_t)c * sw, job.blk + (std::size_t)c * nalpha,
                                     b, n, seg, W);
     }
-    if (buf.sopenv.size() < 2 * sw) buf.sopenv.resize(2 * sw);
-    T* ov = buf.sopenv.data();
-    T* yv = buf.sopenv.data() + sw;
-    if (buf.subbuf.size() < sw) buf.subbuf.resize(sw);
-    T* kc = buf.subbuf.data();
-    if (buf.rM.size() < rowsz) buf.rM.resize(rowsz);
-    if (buf.qM.size() < rowsz) buf.qM.resize(rowsz);
-    T* pH = buf.qM.data(); T* cH = buf.rM.data();
+    // opens, carry, vertical codes, the two rolling rows, the integer carry's ramp and the
+    // argmax padding mask: one block (spread_rows)
+    std::size_t rs; T* const rows = spread_rows<T>(buf.lrows, rowsz, 7, rs);
+    T* ov = rows;
+    T* yv = rows + rs;
+    T* kc = rows + 2 * rs;
+    T* pH = rows + 3 * rs; T* cH = rows + 4 * rs;
+    T* const ramp = rows + 5 * rs;
     unsigned char* D = job.codes;
-    const T* pad = job.argmax ? striped_pad(buf.spad, n, seg, W) : nullptr;
+    const T* pad = job.argmax ? striped_pad_into(rows + 6 * rs, n, seg, W) : nullptr;
     [[maybe_unused]] T ramp_ge = T(0); [[maybe_unused]] bool ramp_ok = false;
 
     // row 0
@@ -443,8 +442,8 @@ static void lhb_striped(LhbJob<T>& job) {
             }
 
             if constexpr (nw_is_int<T> && W >= 4) {
-                int_ramp_for<T>(buf.hramp, ga, seg, W, ramp_ge, ramp_ok);
-                int_pmax_carry<T, W>(ov, nullptr, buf.hramp.data(), nbOpen, static_cast<T>(0),
+                int_ramp_into<T>(ramp, ga, seg, W, ramp_ge, ramp_ok);
+                int_pmax_carry<T, W>(ov, nullptr, ramp, nbOpen, static_cast<T>(0),
                                      K_NINF, ga, seg, yv, nullptr, nullptr);
             } else {
                 vd prev = vninf;

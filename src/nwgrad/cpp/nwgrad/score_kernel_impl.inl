@@ -30,32 +30,6 @@
 #  error "score_kernel_impl.inl must be included inside a level namespace by a level TU"
 #endif
 
-// The rolling rows as ONE block, at a stride of r cache lines such that every pair of rows,
-// k*r lines apart (k < nrows), sits >= 4 lines from a multiple of 4096 B.  Separately allocated
-// rows of ~4000-4080 B came out exactly 4096 B apart, so the rows walked in lockstep shared
-// one L1 set, and a 4-way 16 KB L1D (Piledriver) thrashed: int32 L1000 4-11x the time of
-// L996 / L1024, double L500 1.36x (wloczykij, 2026-10-24).  Forcing the residue (skynet, int32
-// Local L1024, ns/cell; 1.48 clean): k*r = 0 -> 6.5 (L1 misses 6x); rows 2048 B apart, three
-// rows on one 4 KB offset (r = 32) -> 2.3 with misses unchanged (the load/store unit's 12-bit
-// address match); k*r = -1 line (r = 63, 21) -> 2.4, 1.76; -2 (r = 31) 1.55; +1 (r = 1) 1.60;
-// k*r >= 2 lines either way, clean.
-template <class T>
-static inline T* score_rows(DpBufferT<T>& buf, std::size_t sw, int nrows, std::size_t& stride) {
-    constexpr std::size_t line = 64 / sizeof(T);
-    std::size_t lines = (sw + line - 1) / line;
-    auto spread = [nrows](std::size_t r) {
-        for (int k = 1; k < nrows; ++k) {
-            const std::size_t d = (std::size_t(k) * r) % 64;
-            if (d < 4 || d > 60) return false;
-        }
-        return true;
-    };
-    while (!spread(lines)) ++lines;
-    stride = lines * line;
-    if (buf.srows.size() < stride * nrows) buf.srows.resize(stride * nrows);
-    return buf.srows.data();
-}
-
 // Tr: a tracked problem (job.tr; see striped_affine_full) — each row's penalties,
 // border and profile row from the track arrays.
 template <class T, bool Local, bool Fused, bool Tr = false>
@@ -83,20 +57,16 @@ static void score_affine_striped(ScoreJob<T>& job) {
 
     const int seg = (n + W - 1) / W;
     const std::size_t sw = (std::size_t)seg * W;
-    std::size_t rs; T* const rows = score_rows(buf, sw, 6, rs);
-    if constexpr (!Fused) if (buf.sopenv.size() < sw) buf.sopenv.resize(sw);
+    // six rolling rows, the opens, the integer carry's ramp and Local's padding mask: one
+    // block (spread_rows, dp_buffer.hpp)
+    std::size_t rs; T* const rows = spread_rows<T>(buf.srows, sw, 9, rs);
+    T* const opens = rows + 6 * rs;
     // Local: the padding slots (columns > n) must not reach the maximum.  With a negative
     // gap extend a gap run GAINS score along the padding, so they can exceed every real
     // cell (the fill's argmax scans real columns only).  Added, not selected: x + 0 = x
     // exactly, x + -inf = -inf, and no mask op (see kernels_impl.inl's AVX-512/clang note).
     const T* pad = nullptr;
-    if constexpr (Local) {
-        if (buf.spad.size() < sw) buf.spad.resize(sw);
-        for (int l = 0; l < W; ++l)
-            for (int s = 0; s < seg; ++s)
-                buf.spad[(std::size_t)s * W + l] = (l * seg + s + 1 <= n) ? T(0) : NINF;
-        pad = buf.spad.data();
-    }
+    if constexpr (Local) pad = striped_pad_into(rows + 8 * rs, n, seg, W);
     auto padded = [&](const vd& v, int s) {
         vd p; p.copy_from(pad + (std::size_t)s * W, stdx::element_aligned);
         return v + p;
@@ -125,7 +95,6 @@ static void score_affine_striped(ScoreJob<T>& job) {
     vd vbest = vzero;                       // Local: running per-lane max (best starts at 0)
     T bM = 0, bX = NINF, bY = NINF;         // column 0 of the previous row
     [[maybe_unused]] T ramp_ge = ge_a; [[maybe_unused]] bool ramp_ok = false;   // integer T's ramp
-    if constexpr (nw_is_int<T> && W >= 4) if (buf.sopenv.size() < sw) buf.sopenv.resize(sw);
 
     // Is any lane of a greater than b?  (The lazy-F early exit — the one mask op.)
     auto any_gt = [](const vd& x, const vd& y) -> bool {
@@ -182,7 +151,7 @@ static void score_affine_striped(ScoreJob<T>& job) {
 
                 if constexpr (nw_is_int<T> && W >= 4) {
                     // the opens to ov (int_pmax_carry reads them one segment back)
-                    ((stdx::max(vmv, vxv) - vgo_a) - vge_a).copy_to(buf.sopenv.data() + (std::size_t)s * W, stdx::element_aligned);
+                    ((stdx::max(vmv, vxv) - vgo_a) - vge_a).copy_to(opens + (std::size_t)s * W, stdx::element_aligned);
                     if constexpr (Local) vbest = stdx::max(vbest, padded(stdx::max(vmv, vxv), s));
                 } else {
                 vd vyv = stdx::max(Oin, Yin - vge_a);
@@ -194,7 +163,7 @@ static void score_affine_striped(ScoreJob<T>& job) {
             }
             Olast = Oin;
         } else {
-            T* ov = buf.sopenv.data();
+            T* ov = opens;
             for (int s = 0; s < seg; ++s) {
                 vd dM, dX, dY;
                 if (s == 0) {
@@ -247,8 +216,8 @@ static void score_affine_striped(ScoreJob<T>& job) {
         // (whose carry pass already saw the opens), carry the extension only.
         // (Integer T: the exact prefix-max carry instead, then Local's max over Y.)
         if constexpr (nw_is_int<T> && W >= 4) {
-            int_ramp_for<T>(buf.hramp, ge_a, seg, W, ramp_ge, ramp_ok);
-            int_pmax_carry<T, W>(buf.sopenv.data(), nullptr, buf.hramp.data(), nbOpen, T(0), bY, ge_a,
+            int_ramp_into<T>(rows + 7 * rs, ge_a, seg, W, ramp_ge, ramp_ok);
+            int_pmax_carry<T, W>(opens, nullptr, rows + 7 * rs, nbOpen, T(0), bY, ge_a,
                                  seg, cY, nullptr, nullptr);
             if constexpr (Local)
                 for (int s = 0; s < seg; ++s) {
@@ -342,18 +311,13 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
 
     const int seg = (n + W - 1) / W;
     const std::size_t sw = (std::size_t)seg * W;
-    std::size_t rs; T* const rows = score_rows(buf, sw, 5, rs);
+    // five rolling rows and Local's padding mask: one block (spread_rows, dp_buffer.hpp)
+    std::size_t rs; T* const rows = spread_rows<T>(buf.srows, sw, 6, rs);
     const T* pad = nullptr;
     // (MOnly's M padding is clamped to exactly 0 for floating T — the padding profile is
     // -inf — but an integer T pads the profile with 0 (nw_pad), so its padding M is a
     // real value and needs the mask too.)
-    if constexpr (Local && (!MOnly || nw_is_int<T>)) {
-        if (buf.spad.size() < sw) buf.spad.resize(sw);
-        for (int l = 0; l < W; ++l)
-            for (int s = 0; s < seg; ++s)
-                buf.spad[(std::size_t)s * W + l] = (l * seg + s + 1 <= n) ? T(0) : NINF;
-        pad = buf.spad.data();
-    }
+    if constexpr (Local && (!MOnly || nw_is_int<T>)) pad = striped_pad_into(rows + 5 * rs, n, seg, W);
     auto padded = [&](const vd& v, int s) {
         vd p; p.copy_from(pad + (std::size_t)s * W, stdx::element_aligned);
         return v + p;
