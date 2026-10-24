@@ -1251,7 +1251,14 @@ score-only arm, which ran 1.5× slower than Local AFFINE's:
   cells read 0.95–1.01; float32 wins uncapped through L130 and ties from L160; double ties
   past L130 without a cap. Shipped L20–80: hard 0.49–0.89, score-only 0.06–0.78 (larger
   wins than AVX2 at 1 thread). Highest shipped cells 1.04–1.07, at lengths where both arms
-  run the same own kernel: solace's noise floor under WSL. NEON not re-measured (spot off).
+  run the same own kernel: solace's noise floor under WSL. **NEON (spot, M1, 1 / 4 threads,
+  P cores) clean too**: worst shipped cell 1.01; shipped / own, hard L10–60 int16
+  0.52–0.75, int32 0.69–0.88, float32 0.50–0.80 (the shared fill wins even at L10 there),
+  score-only 0.13–0.93; double runs two lanes, never routed (1.00). Uncapped, the integers
+  lose only from L130 on the M1 (1.13–1.40, against L80 on AVX2), so the AVX2-set cap gives
+  up int16 0.77–0.85 / int32 0.89–0.97 at L80–100, and the AArch64 float cap float32 0.93 at
+  L130 — kept: v3 sets the default, and one band on a secondary target does not pay for a
+  per-level table.
 
 **The two regressions that were not explained above, run down on nighthaven (2026-10-23).**
 (a) At L1000 parasail's scan32 edges nwgrad's int32 score-only (0.92 at AVX2, 0.82 on
