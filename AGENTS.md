@@ -1307,12 +1307,36 @@ less (nighthaven L1000 12 threads 0.066 → 0.044 ns/cell). Against parasail's s
 L2000 (was 0.43). The middle form — the ramp in registers, the opens row kept — moved the
 cliff only, and lost 3–10 % on NEON; dropped.
 
-**Found beside it on Piledriver: 4 KB set aliasing of the rolling rows** (TODO.md). At row
-sizes of ~4000–4080 B (int32 / float32 L997–1020, double / int64 L500–510) the allocator
-places consecutive rows exactly 4096 B apart, so `rM`, `rX`, `rY`, `qM` share one L1 set
-offset; with the profile row and `qX` that is more streams than a 4-way set holds, and a
-16 KB 4-way L1D (Bulldozer / Piledriver) thrashes: skynet int32 L1000 4–9× the time of
-L960 / L1100, in every carry form. Alder Lake's 12-way L1 does not show it.
+**FIXED beside it (2026-10-24): 4 KB aliasing of the score kernels' rolling rows on 4-way
+L1Ds.** The rows (five in the D/X form, six in the three-state one) were separate `DpBuffer`
+vectors (`rM` .. `qY`); at row sizes of ~4000–4080 B (int32 / float32 L997–1020, double /
+int64 L500–510, and their multiples) the allocator placed them exactly 4096 B apart. Rows
+walked in lockstep then compete for one L1 set at every segment; a 16 KB 4-way L1D
+(Bulldozer / Piledriver) thrashes. Alder Lake / Tiger Lake (12-way) and the M1 never showed
+it. Now one block (`DpBufferT::srows`, `score_rows` in `score_kernel_impl.inl`) at a stride
+of r cache lines with every row difference k·r (k < nrows) at least 4 lines from a
+multiple of 4096 B (at most 7 lines of padding a row). NOT `buf.rM`: the scalar linear
+pointer fill grows `qM` only when `rM` is short (`aligner.hpp`), so a borrowed `rM` left
+`qM` small — a segfault in the tests. Forcing the residue r mod 64 (skynet, int32 Local
+L1024, ns/cell, 1.48 clean; L1D load misses / cell 0.09):
+- k·r ≡ 0 (the old layout): 6.5, misses 0.55 — the set conflict.
+- r = 32 (rows 0/2/4 on one 4 KB offset, two rows a set: no conflict): 2.3 with misses
+  0.10, unchanged — the load/store unit's false dependency on a 12-bit address match.
+- a row one line BEHIND another mod 4096 (r = 63; r = 21, where 3r ≡ -1 puts `pD` one line
+  behind `cD`): 2.4 / 1.76, misses up to 3x — each stream's next line falls in the set its
+  neighbour is still using. -2 lines (r = 31) 1.55; +1 line (r = 1) 1.60 (misses +30 %);
+  +1 for only one pair (r = 13, 43) clean; every k·r >= 2 lines either way clean.
+A first fix kept r odd and r itself in [9, 55]: it missed r = 21 / 31 / 51 (the multiples),
+and its odd-only predecessor (r = 1) cost 1.04–1.12 at clean lengths. Measured, final rule /
+old layout, bare metal (wloczykij, one process a length, best of 2-3), 109 lengths L100–2700:
+int32 Local L1000 / L1020 / L2030 0.10 / 0.09 / 0.10 (15.3-15.7 -> 1.47-1.51 ns/cell), int32
+Global L1000-1020 0.18-0.24, L1006 0.53, double Local L500-504 0.73-0.74, L1278 0.54,
+float32 Local L1000 0.25, and a scatter of milder victims the old layout had paid all along
+(int32 L505 / L749 / L1786 0.80-0.85, Global L715 0.79, double L348 / L627 0.86-0.87); every
+other length 0.91-1.06 (median 1.00). Bit-identical (only the addresses change): ctest at
+sse2 / sse4 (skynet), avx2 (nighthaven), avx512 (solace), neon (spot, macOS, g++-16), the
+Python suite on skynet. The other kernels with rolling rows (striped Pointers / Scores, the
+Hirschberg sweeps, the linear kernels) are not yet checked (TODO.md).
 Not a kernel-speed loss: below the cliff nwgrad int32 is 1.0–1.3× parasail's scan32 and
 1.7–1.8× its striped32 at every length.
 

@@ -113,11 +113,13 @@ DiscrimAlign does: it passes the logical core count.
   rows) in the Pointers, Scores and hb_base kernels, which write tables anyway — less to
   gain, but check their 12-thread L1000 drop on nighthaven; the Pointers kernel needs the
   open codes, so the fusion does not transfer one to one.
-- **4 KB set aliasing of the rolling rows on 4-way L1Ds** (found 2026-10-24, skynet;
-  investigation on wloczykij in progress): rows of ~4000–4080 B are allocated exactly 4096 B
-  apart and thrash a 16 KB 4-way L1D (int32 L1000 4–9× slower than L960). Remedy candidates:
-  carve the rolling rows from one block with a row stride that is not a multiple of 4096
-  (pad by a cache line where it is), so the streams fall in distinct sets.
+- **4 KB aliasing of rolling rows on 4-way L1Ds**: FIXED for the score kernels (2026-10-24,
+  `score_rows`: one block, every row difference >= 4 lines from a multiple of 4096 B; AGENTS
+  "FIXED beside it"). Left: the other kernels that keep rolling rows in separately allocated
+  vectors — striped Pointers / Scores (its rolling rows and the carry scratch), the
+  Hirschberg sweeps and `hb_base`, the linear kernels — check their row addresses at the
+  aliased lengths (the `rowaddr` replay) and time them on wloczykij across L100–2700 as the
+  score kernel was; it can show only where an L1D has fewer ways than the streams.
 - **int16 saturating arithmetic, with a number**: at L1000 BLOSUM62 nwgrad refuses int16
   and runs int32 (261 us a pair, score-only, AVX2) where parasail's saturating scan16 takes
   145 us — the one fixture in the comparison parasail wins.
