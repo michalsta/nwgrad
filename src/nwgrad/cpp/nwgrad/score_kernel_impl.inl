@@ -30,17 +30,27 @@
 #  error "score_kernel_impl.inl must be included inside a level namespace by a level TU"
 #endif
 
-// The rolling rows as ONE block, at a stride of r cache lines with r odd and 9 <= r mod 64 <= 55.
-// Separately allocated rows of ~4000-4080 B came out exactly 4096 B apart, so the rows walked
-// in lockstep shared one L1 set; a 4-way 16 KB L1D (Piledriver) thrashed: int32 L1000 4-11x
-// the time of L996 / L1024, double L500 1.36x (wloczykij, 2026-10-24).  Odd r puts row k in
-// set k*r mod 64, distinct for every row; r odd but 1 mod 64 (rows 64 B apart mod 4096) was
-// 1.04-1.12x slower at clean lengths, so the rows are also kept >= 9 lines apart mod 4096.
+// The rolling rows as ONE block, at a stride of r cache lines such that every pair of rows,
+// k*r lines apart (k < nrows), sits >= 4 lines from a multiple of 4096 B.  Separately allocated
+// rows of ~4000-4080 B came out exactly 4096 B apart, so the rows walked in lockstep shared
+// one L1 set, and a 4-way 16 KB L1D (Piledriver) thrashed: int32 L1000 4-11x the time of
+// L996 / L1024, double L500 1.36x (wloczykij, 2026-10-24).  Forcing the residue (skynet, int32
+// Local L1024, ns/cell; 1.48 clean): k*r = 0 -> 6.5 (L1 misses 6x); rows 2048 B apart, three
+// rows on one 4 KB offset (r = 32) -> 2.3 with misses unchanged (the load/store unit's 12-bit
+// address match); k*r = -1 line (r = 63, 21) -> 2.4, 1.76; -2 (r = 31) 1.55; +1 (r = 1) 1.60;
+// k*r >= 2 lines either way, clean.
 template <class T>
 static inline T* score_rows(DpBufferT<T>& buf, std::size_t sw, int nrows, std::size_t& stride) {
     constexpr std::size_t line = 64 / sizeof(T);
     std::size_t lines = (sw + line - 1) / line;
-    while (lines % 2 == 0 || lines % 64 < 9 || lines % 64 > 55) ++lines;
+    auto spread = [nrows](std::size_t r) {
+        for (int k = 1; k < nrows; ++k) {
+            const std::size_t d = (std::size_t(k) * r) % 64;
+            if (d < 4 || d > 60) return false;
+        }
+        return true;
+    };
+    while (!spread(lines)) ++lines;
     stride = lines * line;
     if (buf.srows.size() < stride * nrows) buf.srows.resize(stride * nrows);
     return buf.srows.data();
