@@ -113,13 +113,17 @@ DiscrimAlign does: it passes the logical core count.
   rows) in the Pointers, Scores and hb_base kernels, which write tables anyway — less to
   gain, but check their 12-thread L1000 drop on nighthaven; the Pointers kernel needs the
   open codes, so the fusion does not transfer one to one.
-- **4 KB aliasing of rolling rows on 4-way L1Ds**: FIXED for the score kernels (2026-10-24,
-  `score_rows`: one block, every row difference >= 4 lines from a multiple of 4096 B; AGENTS
-  "FIXED beside it"). Left: the other kernels that keep rolling rows in separately allocated
-  vectors — striped Pointers / Scores (its rolling rows and the carry scratch), the
-  Hirschberg sweeps and `hb_base`, the linear kernels — check their row addresses at the
-  aliased lengths (the `rowaddr` replay) and time them on wloczykij across L100–2700 as the
-  score kernel was; it can show only where an L1D has fewer ways than the streams.
+- **4 KB aliasing of rolling rows on 4-way L1Ds**: FIXED for every leveled kernel that keeps
+  rolling rows (2026-10-24, `spread_rows`; AGENTS "FIXED beside it"). Left: (1) the Scores
+  kernel (`traceback="scores"`, opt-in): its rows are rows of the VM/VX/VY tables, 2 MiB-
+  aligned above 2 MiB, so row i of the three shares a 4 KB offset at every length, and
+  rows i-1 join it where a table row is near a 4 KB multiple — int32 Local L1020 18.5 vs
+  ~5.3 ns/cell, double L1542 1.43x (wloczykij). A fix needs a per-table base offset that
+  every `cell_index` / `rat` access carries, or padded `seg` (which meets the integer bound's
+  64 padding columns). (2) The mechanism of the r = 0 mod 4 hazard (bank conflicts?) is
+  unidentified; Piledriver has no named event for it. (3) v3: the linear int32 fills at
+  L1970–2007 are 1.09–1.10 of the old layout (L1 capacity edge, placement luck); a
+  set-balancing choice of r among the admissible ones could take it back.
 - **int16 saturating arithmetic, with a number**: at L1000 BLOSUM62 nwgrad refuses int16
   and runs int32 (261 us a pair, score-only, AVX2) where parasail's saturating scan16 takes
   145 us — the one fixture in the comparison parasail wins.
