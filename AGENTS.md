@@ -101,6 +101,9 @@ Build dependencies: `scikit-build-core`, `nanobind>=3.0` (the bindings call its 
   repeated call at len 50 (stores the path eagerly). Batches are faster; only loops over
   standalone pairs pay it.
 - Default thread count for short pairs: see `TODO.md`.
+- **Per-ISA fill gates**: every threshold was measured on nighthaven (AVX2), with spot as a check,
+  and does not carry over (Piledriver float32 score-only L100 loses 1.5x to its gate). The sweep
+  is in `TODO.md`; the knob is `nwgrad._tuning` ("Every fill gate is runtime-overridable" below).
 - **Soft path: what is left** (see "The soft path" below). Done since the last list:
   the guide without a Viterbi (`soft_guide="posterior"`), the inter-pair soft pass for
   alphabets > 8 and for mixed B lengths, float32 batches sharing the soft pass.
@@ -725,6 +728,29 @@ skynet (Piledriver, W=2, 1 thread, 200k pairs): rowwise 12.4 µs/pair, interpair
   Linux and CI's ARM64 (Linux) job never saw it; the hard kernel's `thread_local`
   buffers (`InterCommon`) work on macOS. Test on spot before trusting new
   `thread_local` state in a kernel.
+- **Every fill gate is runtime-overridable** (`nwgrad._tuning`, `543fb1f`, 2026-10-25), for
+  the per-ISA gate sweep in `TODO.md`. `simd_levels.hpp` holds one process-wide table
+  (`Gate`, `kGateNames`, `gate_value(g, default)`): -1 = the compiled default,
+  `kGateOff` = the cap never rejects. It covers the nine gates `inter_pair_fits` (two
+  byte caps), `inter_score_ok`, the five linear gather caps and
+  `Aligner::linear_striped_min_n` (off = 0, striped at any length). Things to know:
+  (1) `inter_linear_gather_cap` is no longer `constexpr` and returns SIZE_MAX for no cap.
+  Under `if constexpr (... > 0)` the x86 float caps (default 0) compiled the check away, so
+  an override would have been silently ignored. (2) Every override bumps `gate_epoch()`,
+  and `InterPlan` rebuilds when the epoch moves (it used to rebuild only on an ISA or
+  `hb_cutoff` change). (3) Only baseline TUs call the gate code (the level TUs include
+  the header and nothing else from it), so the static table never gets a level's
+  `-march`. `SeqPairBatch._inter_plan()` returns [shared, own, groups] from the plan; it
+  does not see `inter_score_ok`, which acts per group inside the call. Verified: the
+  Python suite on skynet (sse4, gcc), 4456 passed, plus `tests/Python/test_tuning.py`.
+  That test checks every gate off and every gate forcing the own fill, all five types,
+  both modes and gap models, score-only and hard + path, bit-identical to the default.
+  NOT yet run: ctest (`test_linear_striped.cpp` calls `linear_striped_min_n`) and any
+  other level (avx2, avx512, neon: AArch64 is where the float gather caps are non-zero).
+  First reading (skynet, rough, the test suite running alongside): score-only L100
+  BLOSUM62, 1 thread, `inter_score_gather_cells=None`, default / off: float32 28.0 /
+  18.2 ms (the gate costs 1.54x; wloczykij 1.5x), int16 13.4 / 18.5 ms (the gate is right).
+  So on Piledriver the score gate's crossover depends on the type, not only the level.
 
 ### Score only: `compute_score` and the inter-pair score kernel (2026-10-08)
 
