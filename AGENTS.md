@@ -1391,8 +1391,16 @@ the L1 capacity edge. nighthaven AVX2, int32, ramp / row ramp: linear H fill L16
 0.79-0.90 (the L1970-2007 band above: 0.83), linear byte fill 0.88-0.95, Pointers L1000
 0.90-0.93, inside L1 (L200-700) 0.98-1.02; Scores int32 Local L2030 0.75 (medians of 9).
 wloczykij: linear 0.91-0.98 median, Pointers 1.00, Scores unchanged against the placed
-layout. NOT YET MEASURED on NEON or AVX-512 — the score kernel's "middle form" (the ramp in
-registers, the opens row kept) lost 3-10 % on NEON inside L1 (TODO.md).
+layout. On NEON the one-ramp form LOST 1.04-1.07 (spot, M1 under macOS, g++-16, medians
+of 5-9 alternating launches, A/A control 1.000): int32 linear H / byte fills and Scores
+from L1000 on, against the row ramp. Read off the assembly: the carry's second pass had
+no loop-carried value with the ramp loaded, and `rq += vge` gave it one — a 2-cycle
+integer add on the M1 (1 cycle on x86, under the loop's throughput). That pass now
+steps two segments a trip with two ramps advanced by 2*ge_a (bit-identical; a planted
+rq1 = rq fails 3 of 7 `[integer]` cases): spot, ramp / row ramp, linear H fill L500-3000
+0.96-0.99, byte fill 0.98-0.99, Scores 0.96-0.98, Pointers 0.97-0.98, int16 0.98-1.00,
+L200 1.00; nighthaven AVX2, two ramps / one, 0.99-1.00 (every cell outside that range
+matched by its own B'/B launch control). AVX-512 not measured (solace asleep).
 Not a kernel-speed loss: below the cliff nwgrad int32 is 1.0–1.3× parasail's scan32 and
 1.7–1.8× its striped32 at every length.
 

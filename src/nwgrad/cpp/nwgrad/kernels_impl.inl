@@ -337,11 +337,15 @@ template <class T, int W>
     for (int l = 0; l < W; ++l) { cin[l] = run; run = std::max(run, tot[l]); }
     vd vcin; vcin.copy_from(cin, stdx::element_aligned);
     vd before = vcin;                       // the prefix before this segment's open
-    for (int s = 0; s < seg; ++s) {
+    // Two ramps a step apart, each advanced by 2*ge_a: this pass has no other loop-carried
+    // value, and one ramp's add chain bound it on NEON (2-cycle integer add: 1.04-1.07x the
+    // row ramp on the M1; an x86 add is 1 cycle, under the loop's throughput).
+    const vd vge2 = vge + vge;
+    vd rq1 = rq + vge;
+    auto step = [&](int s, const vd& r) __attribute__((always_inline)) {
         vd p; p = nv_load<vd>(cY + (std::size_t)s * W);
         const vd pc = stdx::max(p, vcin);
-        nv_store(cY + (std::size_t)s * W, pc - rq);
-        rq += vge;
+        nv_store(cY + (std::size_t)s * W, pc - r);
         if (yc) {
             vd OK, q;
             if (s == 0) {
@@ -361,7 +365,10 @@ template <class T, int W>
             nv_store(yc + (std::size_t)s * W, ky);
             before = pc;
         }
-    }
+    };
+    int s = 0;
+    for (; s + 1 < seg; s += 2) { step(s, rq); step(s + 1, rq1); rq += vge2; rq1 += vge2; }
+    if (s < seg) step(s, rq);
 }
 
 // ── Tracked rows: the striped query profile ───────────────────────────────────
