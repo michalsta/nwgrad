@@ -1496,12 +1496,24 @@ contiguous window of (f, x): four `ext` + four `smax` on NEON, `vperm2i128 $0x21
 `vpalignr` on AVX2 (was `vpshufb` pairs + `vpermq` + `vpor`), AVX-512 unchanged. Bit-
 identical (suite at neon, avx2, avx512, sse4). v3, new / old indices: 0.988-1.004 over
 the seven cells (controls 1.00); NEON the column above. No AArch64 opt-out remains.
-**The row ramp back (tried with it, DROPPED):** a `RowRamp` carry loading `hb_ramp`'s row,
-wired into the Scores kernel only. On v3 int16 it composed better than independently
-(Scores with both / scan alone: L100 0.852 / 0.891, L140 0.826 / 0.891, L200 0.812 / 0.895;
-alone 0.97-1.01), but it cost int32 there (L300 0.944 vs 0.910, L1000 0.988 vs 0.965),
-AVX-512 int16 (L140 0.783 vs 0.750, L200 0.794 vs 0.773) and NEON (1.023-1.046): one cell
-family on one level, not worth an ISA-and-width gate.
+**The row ramp back, for int16 Global Scores on AVX2 only (`int_row_ramp`, `IntRampRow`).**
+A `RowRamp` carry loading `hb_ramp`'s row. Prototyped in the Scores kernel: on v3 int16 it
+composed better than independently (Global Scores with both / scan alone: L100 0.852 / 0.891,
+L140 0.826 / 0.891, L200 0.812 / 0.895; alone 0.97-1.01), but it cost int32 there (L300
+0.944 vs 0.910, L1000 0.988 vs 0.965), AVX-512 int16 (L140 0.783 vs 0.750, L200 0.794 vs
+0.773) and NEON (1.023-1.046). The gate `sizeof(T) == 2 && W == 16` is exactly int16 on
+AVX2, a compile-time constant. Wired then into all six carry users (Global and Local
+Scores, Pointers, both linear fills, hb_base, the three-state score kernel) and timed
+against HEAD (nighthaven, `ext` indices, medians of 9, controls 0.993-1.018), row / register:
+Global Scores L100 0.975, L140 0.943, L200 **0.910**; Local Scores L200 1.002; Pointers L200
+Local 0.993 / Global 0.984 (in the noise); linear L300 Global 1.014 / Local 1.007. So it is on
+in the GLOBAL Scores kernel only (`int_row_ramp<T, W> && !Local`); every other site keeps the
+register ramp (hb_base and the score-only kernels untimed). The ramp row lives in
+`DpBuffer::iramp` (not `hramp`, which the Hirschberg sweeps hold), rebuilt only when ge_a or
+the segment count changes. int16 rows are short by the overflow bound (BLOSUM62 11/1:
+~L300), so the extra stream never meets the L1 capacity edge that put the ramp in registers.
+Tested: C++ suite at avx2 / sse4 (nighthaven, 191 cases), Python suite at avx2 (4518
+passed), skynet gcc / clang.
 Not a kernel-speed loss: below the cliff nwgrad int32 is 1.0–1.3× parasail's scan32 and
 1.7–1.8× its striped32 at every length.
 
