@@ -227,7 +227,9 @@ static void score_affine_striped(ScoreJob<T>& job) {
                 v = stdx::max(v, F);
                 v.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
                 if constexpr (Local) vbest = stdx::max(vbest, padded(v, s));
-                F = v - vge_a;
+                // F - g, not v - g: the same stored maxima and exit test, one subtraction
+                // on the chain (see score_affine_striped_pos's lazy-F)
+                F = F - vge_a;
                 changed = true;
             }
             if (!changed) break;
@@ -260,6 +262,8 @@ static void score_affine_striped(ScoreJob<T>& job) {
 // slower than the fill (1.03x) before it was moved back.  MOnly (extends >= 0 too): no
 // gap cell exceeds the cell it extends from, so the Local maximum is over M alone — and
 // M's padding slots are clamped to exactly 0, so they need no mask.
+// The row is stored as max(M, X), X and Y (D formed on reading); Y's carry steps two
+// segments at a time and lazy-F's carry is a bare subtraction — see the notes in the body.
 template <class T, bool Local, bool MOnly, bool Tr = false>
 static void score_affine_striped_pos(ScoreJob<T>& job) {
     using vd = stdx::native_simd<T>;
@@ -283,7 +287,7 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
 
     const int seg = (n + W - 1) / W;
     const std::size_t sw = (std::size_t)seg * W;
-    for (auto* v : {&buf.rM, &buf.rX, &buf.rY, &buf.qM, &buf.qX})
+    for (auto* v : {&buf.rM, &buf.rX, &buf.rY, &buf.qM, &buf.qX, &buf.qY})
         if (v->size() < sw) v->resize(sw);
     const T* pad = nullptr;
     if constexpr (Local && !MOnly) {
@@ -300,18 +304,21 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
 
     striped_profile_build<T, Tr>(buf.sprof, job.blk, nalpha, b, n, seg, W, tr);
 
-    T* pD = buf.qM.data(); T* pX = buf.qX.data();                          // row i-1
-    T* cD = buf.rM.data(); T* cX = buf.rX.data(); T* cY = buf.rY.data();   // row i
+    // The rows keep A = max(M, X), X and Y; D = max(A, Y) is formed where a row is read
+    // (max is exact, so that is D bit for bit).  Lazy-F then raises Y alone: one load and
+    // one store per visit instead of two each.
+    T* pA = buf.qM.data(); T* pX = buf.qX.data(); T* pY = buf.qY.data();   // row i-1
+    T* cA = buf.rM.data(); T* cX = buf.rX.data(); T* cY = buf.rY.data();   // row i
 
-    // row 0: D = max(M, X, Y) of the three-state row 0, X = -inf; padding -inf
-    for (std::size_t k = 0; k < sw; ++k) { pD[k] = NINF; pX[k] = NINF; }
+    // row 0 (three-state: Global M = X = -inf, Y = -(go + j*ge); Local M = 0); padding -inf
+    for (std::size_t k = 0; k < sw; ++k) { pA[k] = NINF; pX[k] = NINF; pY[k] = NINF; }
     for (int l = 0; l < W; ++l)
         for (int s = 0; s < seg; ++s) {
             const int j = l * seg + s + 1;
             if (j <= n) {
                 const std::size_t k = (std::size_t)s * W + l;
-                if constexpr (Local) pD[k] = 0;
-                else                 pD[k] = -(go_a + j * ge_a);
+                if constexpr (Local) pA[k] = 0;
+                else                 pY[k] = -(go_a + j * ge_a);
             }
         }
 
@@ -328,6 +335,7 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
         return stdx::any_of(x > y);
 #endif
     };
+    auto ld = [](const T* p) { vd v; v.copy_from(p, stdx::element_aligned); return v; };
 
     for (int i = 1; i <= m; ++i) {
         if constexpr (Tr) {
@@ -342,63 +350,82 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
         const T nbOpen = (nbD - go_a) - ge_a;
         const T* sub = striped_row_profile<T, Tr>(buf.sprof.data(), job.blk, nalpha, a, b, n, seg, W, i, tr);
 
-        vd Oin([&](int q) { return q == 0 ? nbOpen : NINF; });
-        vd Yin = vninf;
-        for (int s = 0; s < seg; ++s) {
-            vd dD;
-            if (s == 0) {
-                vd lD; lD.copy_from(pD + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                dD = lane_shift_in(lD, bD);
-            } else {
-                dD.copy_from(pD + (std::size_t)(s - 1) * W, stdx::element_aligned);
-            }
-            vd sb; sb.copy_from(sub + (std::size_t)s * W, stdx::element_aligned);
-            vd vmv = dD + sb;
+        vd Oin([&](int q) { return q == 0 ? nbOpen : NINF; });   // Y's open from the column before
+        vd Yin = vninf;                                           // Y of the column before
+        vd dD = lane_shift_in(stdx::max(ld(pA + (std::size_t)(seg - 1) * W),
+                                        ld(pY + (std::size_t)(seg - 1) * W)), bD);
+        // One segment's carry-free part: X stored, max(M, X) returned; dD moves on.
+        auto cell = [&](int s, vd& vmv) NWGRAD_ALWAYS_INLINE_LAMBDA {
+            const std::size_t o = (std::size_t)s * W;
+            const vd uD = stdx::max(ld(pA + o), ld(pY + o));
+            vmv = dD + ld(sub + o);
             if constexpr (Local) vmv = stdx::max(vmv, vzero);
-            vd uD, uX;
-            uD.copy_from(pD + (std::size_t)s * W, stdx::element_aligned);
-            uX.copy_from(pX + (std::size_t)s * W, stdx::element_aligned);
-            const vd vxv = stdx::max((uD - vgo_b) - vge_b, uX - vge_b);
-            const vd vyv = stdx::max(Oin, Yin - vge_a);
-            const vd mx = stdx::max(vmv, vxv);
-            const vd dn = stdx::max(mx, vyv);
-            vxv.copy_to(cX + (std::size_t)s * W, stdx::element_aligned);
-            vyv.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
-            dn.copy_to(cD + (std::size_t)s * W, stdx::element_aligned);
+            const vd vxv = stdx::max((uD - vgo_b) - vge_b, ld(pX + o) - vge_b);
+            vxv.copy_to(cX + o, stdx::element_aligned);
+            dD = uD;
+            return stdx::max(vmv, vxv);
+        };
+        auto finish = [&](int s, const vd& vmv, const vd& mx, const vd& vyv) NWGRAD_ALWAYS_INLINE_LAMBDA {
+            const std::size_t o = (std::size_t)s * W;
+            vyv.copy_to(cY + o, stdx::element_aligned);
+            mx.copy_to(cA + o, stdx::element_aligned);
             if constexpr (Local) {
                 if constexpr (MOnly) vbest = stdx::max(vbest, vmv);
-                else                 vbest = stdx::max(vbest, padded(dn, s));
+                else                 vbest = stdx::max(vbest, padded(stdx::max(mx, vyv), s));
             }
-            Oin = (mx - vgo_a) - vge_a;
-            Yin = vyv;
+        };
+        // Y(s) = max(O(s-1), Y(s-1) - ge): the loop-carried chain.  Two segments per step:
+        // rounding is monotone, so max(a, b) - g == max(a - g, b - g) bit for bit, and
+        //   Y(s+1) = max(O(s), Y(s) - g) = max(max(O(s), O(s-1) - g), (Y(s-1) - g) - g)
+        // whose chain is two subtractions and ONE max per two segments (was two of each);
+        // the inner max is off it (pinned: gcc re-associates it back otherwise).
+        int s = 0;
+        for (; s + 1 < seg; s += 2) {
+            vd vm0, vm1;
+            const vd mx0 = cell(s, vm0);
+            const vd mx1 = cell(s + 1, vm1);
+            const vd O0 = (mx0 - vgo_a) - vge_a;
+            const vd t = Yin - vge_a;
+            const vd y0 = stdx::max(Oin, t);
+            const vd y1 = stdx::max(carry_pin(stdx::max(O0, Oin - vge_a)), t - vge_a);
+            finish(s, vm0, mx0, y0);
+            finish(s + 1, vm1, mx1, y1);
+            Oin = (mx1 - vgo_a) - vge_a;
+            Yin = y1;
+        }
+        if (s < seg) {
+            vd vm0;
+            const vd mx0 = cell(s, vm0);
+            const vd y0 = stdx::max(Oin, Yin - vge_a);
+            finish(s, vm0, mx0, y0);
+            Oin = (mx0 - vgo_a) - vge_a;
+            Yin = y0;
         }
         const vd Olast = Oin;
 
+        // ── lazy-F: carry the gap-in-A run across the lane boundaries ──
+        // The carry into segment s+1 is max(c(s), F) - g; it is taken as F - g.  The row
+        // satisfies Y(s+1) >= Y(s) - g in every lane (the main pass computed it so, and a
+        // raised cell is followed by a visit to the next), so where c(s) wins, c(s) - g <=
+        // c(s+1) and neither form raises s+1: the stored maxima and the exit test are the
+        // same, and the chain is one subtraction per segment, no max.
         for (int r = 0; r < W; ++r) {
-            vd last; last.copy_from(cY + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-            vd F = lane_shift_in(last, NINF);
-            F = F - vge_a;
-            if (r == 0) {
-                vd Os = lane_shift_in(Olast, NINF);
-                F = stdx::max(Os, F);
-            }
+            vd F = lane_shift_in(ld(cY + (std::size_t)(seg - 1) * W), NINF) - vge_a;
+            if (r == 0) F = stdx::max(lane_shift_in(Olast, NINF), F);
             bool changed = false;
-            for (int s = 0; s < seg; ++s) {
-                vd v; v.copy_from(cY + (std::size_t)s * W, stdx::element_aligned);
+            for (int s2 = 0; s2 < seg; ++s2) {
+                vd v = ld(cY + (std::size_t)s2 * W);
                 if (!any_gt(F, v)) break;
                 v = stdx::max(v, F);
-                v.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
-                vd d; d.copy_from(cD + (std::size_t)s * W, stdx::element_aligned);
-                d = stdx::max(d, v);
-                d.copy_to(cD + (std::size_t)s * W, stdx::element_aligned);
-                if constexpr (Local && !MOnly) vbest = stdx::max(vbest, padded(v, s));
-                F = v - vge_a;
+                v.copy_to(cY + (std::size_t)s2 * W, stdx::element_aligned);
+                if constexpr (Local && !MOnly) vbest = stdx::max(vbest, padded(v, s2));
+                F = F - vge_a;
                 changed = true;
             }
             if (!changed) break;
         }
 
-        std::swap(pD, cD); std::swap(pX, cX);
+        std::swap(pA, cA); std::swap(pX, cX); std::swap(pY, cY);
         bD = nbD;
     }
 
@@ -408,7 +435,7 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
         job.score = static_cast<double>(best);
     } else {
         const std::size_t k = (std::size_t)((n - 1) % seg) * W + (std::size_t)((n - 1) / seg);
-        job.score = static_cast<double>(pD[k]);
+        job.score = static_cast<double>(std::max(pA[k], pY[k]));
     }
 }
 

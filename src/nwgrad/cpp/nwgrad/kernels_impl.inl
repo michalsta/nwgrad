@@ -155,6 +155,46 @@ static inline V lane_shift_in(V x, typename V::value_type b) {
     return V([&](int q) { return q == 0 ? b : x[q - 1]; });
 }
 
+// An empty asm on a value: the compiler must treat it as opaque.  gcc re-associates a
+// max of maxes (max is exact, so it may), and in the two-segment gap carry it turned the
+// off-chain max(P, chain) back into max(max(chain, a), b) -- two maxes on the
+// loop-carried chain again (nighthaven, gcc 16: the carry's gain fell from ~30% to ~12%).
+// clang keeps the order written, so gcc only.  x86 only: on AArch64 the pin is a no-op
+// (exact either way; the gcc/NEON speed is unmeasured).
+#ifndef NWGRAD_CARRY_PIN_DEFINED
+#  define NWGRAD_CARRY_PIN_DEFINED
+#  if defined(__GNUC__) && !defined(__clang__)
+#    define NWGRAD_ALWAYS_INLINE_LAMBDA __attribute__((always_inline))
+#  else
+#    define NWGRAD_ALWAYS_INLINE_LAMBDA
+#  endif
+#endif
+template <class V>
+static inline V carry_pin(V v) {
+#if defined(__GNUC__) && !defined(__clang__) && defined(__x86_64__)
+    using T = typename V::value_type;
+    constexpr std::size_t B = V::size() * sizeof(T);
+    if constexpr (std::is_same_v<T, float> && B == 16) {
+        __m128 r = static_cast<__m128>(v); __asm__("" : "+v"(r)); return V(r);
+    } else if constexpr (std::is_same_v<T, double> && B == 16) {
+        __m128d r = static_cast<__m128d>(v); __asm__("" : "+v"(r)); return V(r);
+#  if defined(__AVX__)
+    } else if constexpr (std::is_same_v<T, float> && B == 32) {
+        __m256 r = static_cast<__m256>(v); __asm__("" : "+v"(r)); return V(r);
+    } else if constexpr (std::is_same_v<T, double> && B == 32) {
+        __m256d r = static_cast<__m256d>(v); __asm__("" : "+v"(r)); return V(r);
+#  endif
+#  if defined(__AVX512F__)
+    } else if constexpr (std::is_same_v<T, float> && B == 64) {
+        __m512 r = static_cast<__m512>(v); __asm__("" : "+v"(r)); return V(r);
+    } else if constexpr (std::is_same_v<T, double> && B == 64) {
+        __m512d r = static_cast<__m512d>(v); __asm__("" : "+v"(r)); return V(r);
+#  endif
+    }
+#endif
+    return v;
+}
+
 // ── Tracked rows: the striped query profile ───────────────────────────────────
 // One striped profile row: prof[s*W + l] = row[b[col(l,s)-1]], padding -> -inf.
 template <class T>
