@@ -172,8 +172,9 @@ Sweep every gate per ISA level (sse2, sse4, avx2, avx512, neon) on the fleet, ov
 length, every scalar type, mode, gap model and output (score / path / hard grad), at
 1 thread and all cores. Then make the thresholds per level, with a table instead of one
 constant. The integer types pass the same score-only gate; check whether they are
-penalised the same way. Python cannot force them past it, so the sweep needs a knob
-(an env override or a C++ bench).
+penalised the same way. The knob exists now: `nwgrad._tuning` overrides every gate at
+runtime (docs/tuning.md "Fill gates"), and `SeqPairBatch._inter_plan()` shows where the
+plan routed the pairs.
 
 ## Per-pair gradients stored contiguously (weighted_grad, grads)
 

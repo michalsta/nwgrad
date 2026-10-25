@@ -745,7 +745,7 @@ private:
             }
             // the integer linear gather gate of inter_eligible_ (hard fills only; score-only
             // groups are gated by inter_score_ok in the loop)
-            if constexpr (GM == GapModel::Linear && inter_linear_gather_cap<T, AM == AlignMode::Global>() > 0)
+            if constexpr (GM == GapModel::Linear)
                 if (grad_mode_ == GradMode::Hard && params.matrix.size() > 8 &&
                     (la + 1) * (lb + 1) > inter_linear_gather_cap<T, AM == AlignMode::Global>()) {
                     other.push_back(i); continue;
@@ -2045,7 +2045,7 @@ private:
         // through L200 (0.63-0.84), and the NEON loss there (1.08-1.18 from L150) does not
         // justify costing the primary target.
         // (floating T: capped on AArch64 only, inter_linear_gather_cap — simd_levels.hpp)
-        if constexpr (GM == GapModel::Linear && inter_linear_gather_cap<T, AM == AlignMode::Global>() > 0)
+        if constexpr (GM == GapModel::Linear)
             if (alpha_->size() > 8 && grad_mode_ != GradMode::Soft &&
                 (len_a(i) + 1) * (len_b(i) + 1) > inter_linear_gather_cap<T, AM == AlignMode::Global>())
                 return false;
@@ -2059,25 +2059,37 @@ public:
     static bool ragged_ok(size_t shortest, size_t len_b) {
         return len_b * 4 <= shortest * 5 + 16;   // <= 1.25x + 4 columns
     }
+    // The inter-pair plan as the next "interpair" call runs it, rebuilt if stale:
+    // {pairs in shared groups, pairs on their own fill, groups}.  For nwgrad._tuning
+    // sweeps, to see where the gates routed the pairs.  (The score-only gather gate,
+    // inter_score_ok, acts per group inside the call and is not reflected here.)
+    std::array<size_t, 3> inter_plan_counts() {
+        ensure_plan_();
+        return {plan_.elig.size(), plan_.other.size(), plan_.groups.size()};
+    }
 private:
     struct InterPlan {
         int default_backend = -1000, hb_cutoff = -1;   // what it was built for
+        unsigned gate_epoch = ~0u;                      // ... and under which gate overrides
         int backend = -1;                               // every group's vector backend
         std::vector<size_t> elig, other;
         std::vector<std::pair<size_t, size_t>> groups;   // [start, end) into elig
     };
     InterPlan plan_;
 
-    // Built once and reused until the default ISA changes or the Hirschberg cutoff moves:
+    // Built once and reused until the default ISA changes, the Hirschberg cutoff moves or
+    // a fill gate is overridden (nwgrad._tuning):
     // re-sorting 2.5M pairs every training iteration was ~0.9 s of serial work per call.
     // Groups: len B runs of len-A-sorted pairs, cut every W and wherever len B outgrows
     // the group's shortest past ragged_ok().
     void ensure_plan_() {
         const int def_backend = global_default_backend();
-        if (plan_.default_backend == def_backend && plan_.hb_cutoff == s_.hb_cutoff) return;
+        const unsigned epoch = gate_epoch();
+        if (plan_.default_backend == def_backend && plan_.hb_cutoff == s_.hb_cutoff &&
+            plan_.gate_epoch == epoch) return;
         const size_t N = size();
         InterPlan P;
-        P.default_backend = def_backend; P.hb_cutoff = s_.hb_cutoff;
+        P.default_backend = def_backend; P.hb_cutoff = s_.hb_cutoff; P.gate_epoch = epoch;
         P.backend = inter_backend_();
         if (P.backend < 0) {
             P.other.resize(N);

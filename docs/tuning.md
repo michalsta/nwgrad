@@ -70,6 +70,27 @@ Module-level controls: `nwgrad.simd_isa()` reports the active level,
 or the `NWGRAD_ISA` environment variable force the level that `"auto"` dispatches to. `nwgrad.compiled_with()` names the compiler the extension was built
 with.
 
+## Fill gates
+
+Which fill a pair runs (shared inter-pair groups or its own fill, striped or scalar
+linear kernel) is decided by thresholds measured on one host per ISA level. Results
+never depend on them, since every fill is bit-identical; only speed and memory do.
+For measuring them on other hardware, `nwgrad._tuning` overrides them at runtime,
+process-wide. It is **unstable**, not part of the API:
+
+```python
+from nwgrad import _tuning
+_tuning.GATES                     # the gate names
+_tuning.defaults()                # compiled defaults (None = no cap)
+with _tuning.override(inter_score_gather_cells=None):    # gate off
+    batch.score_and_grad()
+_tuning.set_gate("inter_group_bytes", 2 << 20); _tuning.reset_gates()
+batch._inter_plan()               # [pairs in shared groups, pairs on their own fill, groups]
+```
+
+An `int` is the threshold, `None` turns the gate off, and `"default"` removes the
+override. A batch regroups on its next call after any change.
+
 ## Performance notes
 
 - With `traceback="pointers"`, a hard-gradient alignment keeps 3 bytes per DP cell; `"scores"` keeps 12. The default for affine global alignment is Hirschberg, which keeps O(m+n) — so the per-thread buffer described below applies to the pointer modes and to the Hirschberg base case (≤ `hb_cutoff` rows).
