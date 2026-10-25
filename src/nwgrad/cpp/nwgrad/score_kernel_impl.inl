@@ -57,16 +57,16 @@ static void score_affine_striped(ScoreJob<T>& job) {
 
     const int seg = (n + W - 1) / W;
     const std::size_t sw = (std::size_t)seg * W;
-    // six rolling rows, the opens, the integer carry's ramp and Local's padding mask: one
-    // block (spread_rows, dp_buffer.hpp)
-    std::size_t rs; T* const rows = spread_rows<T>(buf.srows, sw, 9, rs);
+    // six rolling rows, the opens and Local's padding mask: one block (spread_rows,
+    // dp_buffer.hpp)
+    std::size_t rs; T* const rows = spread_rows<T>(buf.srows, sw, 8, rs);
     T* const opens = rows + 6 * rs;
     // Local: the padding slots (columns > n) must not reach the maximum.  With a negative
     // gap extend a gap run GAINS score along the padding, so they can exceed every real
     // cell (the fill's argmax scans real columns only).  Added, not selected: x + 0 = x
     // exactly, x + -inf = -inf, and no mask op (see kernels_impl.inl's AVX-512/clang note).
     const T* pad = nullptr;
-    if constexpr (Local) pad = striped_pad_into(rows + 8 * rs, n, seg, W);
+    if constexpr (Local) pad = striped_pad_into(rows + 7 * rs, n, seg, W);
     auto padded = [&](const vd& v, int s) {
         vd p; p.copy_from(pad + (std::size_t)s * W, stdx::element_aligned);
         return v + p;
@@ -94,7 +94,6 @@ static void score_affine_striped(ScoreJob<T>& job) {
     const vd vzero(static_cast<T>(0)), vninf(NINF);
     vd vbest = vzero;                       // Local: running per-lane max (best starts at 0)
     T bM = 0, bX = NINF, bY = NINF;         // column 0 of the previous row
-    [[maybe_unused]] T ramp_ge = ge_a; [[maybe_unused]] bool ramp_ok = false;   // integer T's ramp
 
     // Is any lane of a greater than b?  (The lazy-F early exit — the one mask op.)
     auto any_gt = [](const vd& x, const vd& y) -> bool {
@@ -216,8 +215,7 @@ static void score_affine_striped(ScoreJob<T>& job) {
         // (whose carry pass already saw the opens), carry the extension only.
         // (Integer T: the exact prefix-max carry instead, then Local's max over Y.)
         if constexpr (nw_is_int<T> && W >= 4) {
-            int_ramp_into<T>(rows + 7 * rs, ge_a, seg, W, ramp_ge, ramp_ok);
-            int_pmax_carry<T, W>(opens, nullptr, rows + 7 * rs, nbOpen, T(0), bY, ge_a,
+            int_pmax_carry<T, W>(opens, nullptr, nbOpen, T(0), bY, ge_a,
                                  seg, cY, nullptr, nullptr);
             if constexpr (Local)
                 for (int s = 0; s < seg; ++s) {

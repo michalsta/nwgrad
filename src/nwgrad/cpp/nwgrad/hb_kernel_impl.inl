@@ -859,9 +859,9 @@ static void hb_base_striped(HbBaseJob<T>& job) {
     auto fit = [](typename DpBufferT<T>::TVec& v, std::size_t k) { if (v.size() < k) v.resize(k); };
     if (buf.hbD.size() < 3 * plane) buf.hbD.resize(3 * plane);
     fit(buf.hprof, (std::size_t)(Tr ? 1 : nalpha) * sw);
-    // six rolling rows, ov | ok | Q (integer T), the y-code scratch and the integer carry's
-    // ramp: eleven rows of one block (spread_rows, dp_buffer.hpp)
-    std::size_t rs; T* const rows = spread_rows<T>(buf.prows, rowsz, 11, rs);
+    // six rolling rows, ov | ok | Q (integer T) and the y-code scratch: ten rows of one
+    // block (spread_rows, dp_buffer.hpp)
+    std::size_t rs; T* const rows = spread_rows<T>(buf.prows, rowsz, 10, rs);
 
     auto scol = [seg](int c) -> std::size_t {
         return (std::size_t)((c - 1) % seg) * W + (c - 1) / seg;
@@ -884,7 +884,6 @@ static void hb_base_striped(HbBaseJob<T>& job) {
     T* ov = rows + 6 * rs;
     T* ok = rows + 7 * rs;
     T* qb = rows + 8 * rs;             // integer T: the Q scratch
-    [[maybe_unused]] T ramp_ge = ge_a; [[maybe_unused]] bool ramp_ok = false;
     T* yc = rows + 9 * rs;
 
     T* pM = rows + 3 * rs; T* pX = rows + 4 * rs; T* pY = rows + 5 * rs;
@@ -1020,8 +1019,7 @@ static void hb_base_striped(HbBaseJob<T>& job) {
 
         // ── VY carry: same-lane striped chain + exact lazy-F, codes tracked ──
         if constexpr (nw_is_int<T> && W >= 4) {
-            int_ramp_into<T>(rows + 10 * rs, ge_a, seg, W, ramp_ge, ramp_ok);
-            int_pmax_carry<T, W>(ov, ok, rows + 10 * rs, nbOpen, nbOpenK, bY, ge_a, seg,
+            int_pmax_carry<T, W>(ov, ok, nbOpen, nbOpenK, bY, ge_a, seg,
                                  cY + off, yc, qb);
         } else {
         vd prev([&](int q) { return q == 0 ? bY : NINF; });

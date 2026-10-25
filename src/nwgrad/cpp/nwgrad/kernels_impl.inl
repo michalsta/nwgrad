@@ -272,8 +272,13 @@ static inline void hb_ramp(T* rmp, T ge_a, int seg, int W) {
 // data-dependent correction rounds — which grow with the lane count, and int16 has 4x
 // double's lanes.  Bit-identical to the chain by construction (tested against the double
 // oracle at every level).  `ov` holds the opens per segment slot, read one segment back as
-// the chain reads them (the lane shift at s == 0 with the border's open); `rmp` the ramp;
-// Y lands in cY (+off), and P (the prefix maxima) rides in cY between the two passes.
+// the chain reads them (the lane shift at s == 0 with the border's open); the ramp k*ge_a
+// is formed in a register (a lane base l*seg*ge_a, plus ge_a a segment: exact in integers,
+// and never past the ramp's last value), not read from a row — one stream fewer, which
+// moved the L1 capacity edge of the kernels that run it (nighthaven AVX2, int32: linear H
+// fill 0.79-0.90 of the row-ramp time over L1600-2400, Scores L2030 0.75, Pointers L1000
+// 0.90-0.93, 0.98-1.02 inside L1); Y lands in cY (+off), and P (the prefix maxima) rides in
+// cY between the two passes.
 // Codes (`ok`, `yc` non-null): the Y code is the open's (ok, shifted like ov) when the
 // open at column c-1 is at least the prefix before it — Q[c-1] >= max(seed, Q[0..c-2]) —
 // else 2 (extension): exactly `O >= ext` of the chain, since ext = that prefix - (c-1)*ge.
@@ -303,10 +308,13 @@ template <class V> [[gnu::always_inline]] static inline void nv_store(typename V
 // kernel (a call, its own frame and the lane arrays per row), where it then cost more
 // than the kernel body around it.
 template <class T, int W>
-[[gnu::always_inline]] static inline void int_pmax_carry(const T* ov, const T* ok, const T* rmp, T nbOpen, T nbOpenK,
+[[gnu::always_inline]] static inline void int_pmax_carry(const T* ov, const T* ok, T nbOpen, T nbOpenK,
                                   T bY, T ge_a, int seg, T* cY, T* yc, T* qbuf) {
     using vd = stdx::native_simd<T>;
     const vd vtwo(T(2));
+    const vd vge(ge_a);
+    const vd rbase([&](int l) { return static_cast<T>(static_cast<T>(l * seg) * ge_a); });
+    vd rq = rbase;                          // k*ge_a for k = l*seg + s
     vd P(nw_ninf<T>);
     for (int s = 0; s < seg; ++s) {
         vd O;
@@ -316,12 +324,13 @@ template <class T, int W>
         } else {
             O = nv_load<vd>(ov + (std::size_t)(s - 1) * W);
         }
-        vd rq; rq = nv_load<vd>(rmp + (std::size_t)s * W);
         const vd Q = O + rq;
+        rq += vge;
         if (yc) nv_store(qbuf + (std::size_t)s * W, Q);
         P = stdx::max(Q, P);
         nv_store(cY + (std::size_t)s * W, P);
     }
+    rq = rbase;
     alignas(64) T tot[64], cin[64];
     P.copy_to(tot, stdx::element_aligned);
     T run = static_cast<T>(bY - ge_a);
@@ -330,9 +339,9 @@ template <class T, int W>
     vd before = vcin;                       // the prefix before this segment's open
     for (int s = 0; s < seg; ++s) {
         vd p; p = nv_load<vd>(cY + (std::size_t)s * W);
-        vd rq; rq = nv_load<vd>(rmp + (std::size_t)s * W);
         const vd pc = stdx::max(p, vcin);
         nv_store(cY + (std::size_t)s * W, pc - rq);
+        rq += vge;
         if (yc) {
             vd OK, q;
             if (s == 0) {
@@ -353,22 +362,6 @@ template <class T, int W>
             before = pc;
         }
     }
-}
-// Build the ramp for this problem's ge_a once (untracked), or whenever a tracked row's
-// ge_a differs from the last (same_bits).
-template <class T>
-static inline void int_ramp_into(T* hramp, T ge_a, int seg, int W, T& ramp_ge, bool& ramp_ok) {
-    if (!ramp_ok || std::bit_cast<nw_bits_t<T>>(ramp_ge) != std::bit_cast<nw_bits_t<T>>(ge_a)) {
-        hb_ramp(hramp, ge_a, seg, W);
-        ramp_ge = ge_a; ramp_ok = true;
-    }
-}
-template <class T>
-static inline void int_ramp_for(typename DpBufferT<T>::TVec& hramp, T ge_a, int seg, int W,
-                                T& ramp_ge, bool& ramp_ok) {
-    const std::size_t sw = (std::size_t)seg * W;
-    if (hramp.size() < sw) hramp.resize(sw);
-    int_ramp_into<T>(hramp.data(), ge_a, seg, W, ramp_ge, ramp_ok);
 }
 
 // ── Tracked rows: the striped query profile ───────────────────────────────────
@@ -447,20 +440,36 @@ static void striped_affine_full(ViterbiJob<T>& job) {
 
     const int seg = (n + W - 1) / W;
     const std::size_t sw = (std::size_t)seg * W;
-    // VM/VX/VY hold the tables in STRIPED layout — one row of rowsz = (seg+1)*W scalars
+    // VM/VX/VY hold the tables in STRIPED layout — one row of (seg+1)*W scalars
     // per i, written in place, so the traceback/hard-gradient read them striped with no
     // per-row de-stripe copy.  Slot 0 is column 0 (the gap border); slots [W, W+sw) are
     // the striped columns 1..n (started at W so every W-wide access is aligned given the
     // 64-byte allocator — see dp_buffer.hpp), column j at W + ((j-1)%seg)*W + (j-1)/seg;
     // slots 1..W-1 pad.  aligner.hpp's cell_index() computes the identical index — the
     // two must stay in lockstep.
-    const std::size_t rowsz = (std::size_t)(seg + 1) * W;
+    // On a narrow L1D (table_spread, dp_buffer.hpp) the row STRIDE is padded past (seg+1)*W
+    // (spread_stride) and the three tables start at chosen lines of a 4 KB page
+    // (table_lines), so rows i and i-1 of VM, VX and VY sit in six distinct L1 sets:
+    // unplaced, a 4-way L1D thrashed (wloczykij int32 Local L1020 3.5x its neighbours).  The
+    // stride reaches the aligner as job.rstride.
+    const bool spread = table_spread();
+    const std::size_t rowsz = spread ? spread_stride<T>((std::size_t)(seg + 1) * W, 2)
+                                     : (std::size_t)(seg + 1) * W;
     const std::size_t off   = (std::size_t)W;   // striped columns start here (col 0 at 0)
     if (buf.sopenv.size() < sw)     buf.sopenv.resize(sw);
     const std::size_t vsz = (std::size_t)(m + 1) * rowsz;
+    {
+        if (spread) {
+            const TableLines tl = table_lines(rowsz * sizeof(T) / 64);
+            buf.VM.place(0); buf.VX.place(tl.a); buf.VY.place(tl.b);
+        } else {
+            buf.VM.place(-1); buf.VX.place(-1); buf.VY.place(-1);
+        }
+    }
     // Per vector, never keyed on one (see kernels_pointers_impl.inl): a fill that grows
-    // only part of a group must not leave the rest short for the next one.
-    for (auto* v : {&buf.VM, &buf.VX, &buf.VY}) if (v->size() < vsz) v->resize(vsz);
+    // only part of a group must not leave the rest short for the next one.  resize() also
+    // applies the placement, so it runs even when the size suffices.
+    for (auto* v : {&buf.VM, &buf.VX, &buf.VY}) v->resize(std::max(v->size(), vsz));
     // striped slot within a row (offset past slot 0) for DP column j in 1..n
     auto scol = [seg](int j) -> std::size_t {
         return (std::size_t)((j - 1) % seg) * W + (j - 1) / seg;
@@ -498,7 +507,6 @@ static void striped_affine_full(ViterbiJob<T>& job) {
 
     T best_local = 0; int best_i = 0, best_j = 0, best_tbl = 0;
     const T* pad = Local ? striped_pad(buf.spad, n, seg, W) : nullptr;
-    [[maybe_unused]] T ramp_ge = ge_a; [[maybe_unused]] bool ramp_ok = false;   // integer T's ramp
 
     for (int i = 1; i <= m; ++i) {
         if constexpr (Tr) {
@@ -559,8 +567,7 @@ static void striped_affine_full(ViterbiJob<T>& job) {
             // ── the carry: VY, same-lane striped chain + lazy-F (integer T: the exact
             // prefix max, int_pmax_carry) ──
             if constexpr (nw_is_int<T> && W >= 4) {
-                int_ramp_for<T>(buf.hramp, ge_a, seg, W, ramp_ge, ramp_ok);
-                int_pmax_carry<T, W>(ov, nullptr, buf.hramp.data(), nbOpen, T(0), bY, ge_a, seg,
+                int_pmax_carry<T, W>(ov, nullptr, nbOpen, T(0), bY, ge_a, seg,
                                      cY, nullptr, nullptr);
             } else {
             vd prev([&](int q) { return q == 0 ? bY : K_NINF; });
@@ -640,6 +647,7 @@ static void striped_affine_full(ViterbiJob<T>& job) {
     job.table_layout = 1;   // striped (seg/width below tell the traceback how to index)
     job.seg = seg;
     job.width = W;
+    job.rstride = rowsz;
 }
 
 // The registered entry for a level, per precision: dispatch Full by mode.  GuideBanded

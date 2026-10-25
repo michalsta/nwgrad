@@ -136,10 +136,10 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
     // DM, rM and qM alone, so one size no longer speaks for the group.
     for (auto* d : {&buf.DM, &buf.DX, &buf.DY}) if (d->size() < dsz) d->resize(dsz);
     // rolling score rows: 2 x rowsz instead of (m+1) x rowsz -- the whole point; with the
-    // opens, open codes, Q (integer T), y-code scratch, the integer carry's ramp and Local's
-    // padding mask, twelve rows of one block (spread_rows, dp_buffer.hpp: no two in one L1
-    // set, and none in the set of another stream read every row)
-    std::size_t rs; T* const rows = spread_rows<T>(buf.prows, rowsz, 12, rs);
+    // opens, open codes, Q (integer T), y-code scratch and Local's padding mask, eleven rows
+    // of one block (spread_rows, dp_buffer.hpp: no two in one L1 set, and none in the set of
+    // another stream read every row)
+    std::size_t rs; T* const rows = spread_rows<T>(buf.prows, rowsz, 11, rs);
 
     auto scol = [seg](int j) -> std::size_t {
         return (std::size_t)((j - 1) % seg) * W + (j - 1) / seg;
@@ -151,7 +151,6 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
     T* ok = rows + 7 * rs;
     T* qb = rows + 8 * rs;
     T* yc = rows + 9 * rs;
-    [[maybe_unused]] T ramp_ge = ge_a; [[maybe_unused]] bool ramp_ok = false;   // integer T's ramp
 
     T* pM = rows + 3 * rs; T* pX = rows + 4 * rs; T* pY = rows + 5 * rs;
     T* cM = rows;          T* cX = rows + rs;     T* cY = rows + 2 * rs;
@@ -186,7 +185,7 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
     const vd vthree(static_cast<T>(3));
     T bM = 0, bX = K_NINF, bY = K_NINF;
     T best_local = 0; int best_i = 0, best_j = 0, best_tbl = 0;
-    const T* pad = Local ? striped_pad_into(rows + 11 * rs, n, seg, W) : nullptr;
+    const T* pad = Local ? striped_pad_into(rows + 10 * rs, n, seg, W) : nullptr;
 
     for (int i = 1; i <= m; ++i) {
         if constexpr (Tr) {
@@ -301,8 +300,7 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
             // ── the carry: VY, same-lane striped chain + lazy-F, codes tracked (integer
             // T: the exact prefix max with its codes, int_pmax_carry) ──
             if constexpr (nw_is_int<T> && W >= 4) {
-                int_ramp_into<T>(rows + 10 * rs, ge_a, seg, W, ramp_ge, ramp_ok);
-                int_pmax_carry<T, W>(ov, ok, rows + 10 * rs, nbOpen, nbOpenK, bY, ge_a, seg,
+                int_pmax_carry<T, W>(ov, ok, nbOpen, nbOpenK, bY, ge_a, seg,
                                      cY + off, yc, qb);
             } else {
             vd prev([&](int q) { return q == 0 ? bY : K_NINF; });

@@ -186,6 +186,7 @@ struct ViterbiJob {
     int     best_i, best_j, best_tbl;       // best_tbl: 0=M 1=X 2=Y
     int     table_layout;                   // 0 = row-major VM/VX/VY, 1 = striped
     int     seg, width;                     // striping geometry (set when layout==1)
+    std::size_t rstride;                    // striped row stride in T; 0 = (seg+1)*width
     TrackJob<T> tr;                         // tracked rows (tr.on()), else untracked
 };
 

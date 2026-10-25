@@ -1229,7 +1229,8 @@ private:
     // to skip a per-row de-stripe copy.  When tables_striped_ is set, rat/at index those
     // tables striped (cell_index); every row-major fill clears it.  striped_seg_ and
     // striped_w_ come straight from the kernel (ViterbiJob.seg / .width); a striped row
-    // is striped_seg_*striped_w_ + 1 doubles, slot 0 being column 0.
+    // is striped_seg_*striped_w_ + 1 doubles, slot 0 being column 0, at a stride of
+    // striped_rs_ (ViterbiJob.rstride: the Scores and linear H kernels pad it, dp_buffer.hpp).
     bool   tables_striped_ = false;
     bool   rowwise_full_   = false;   // see set_rowwise_full()
     // Set by adopt_interleaved(): VM/VX/VY hold inter_w_ pairs' tables interleaved per
@@ -1301,6 +1302,7 @@ private:
     bool          tb_auto_ = true;   // tb_ came from "auto" (see linear_ptr_fill)
     int    striped_seg_    = 0;
     int    striped_w_      = 1;
+    size_t striped_rs_     = 0;   // a striped row's stride (>= (seg+1)*W: a kernel may pad it)
 
     int backend_ = kBackendAuto;  // which Viterbi backend fills the tables (default: auto)
 
@@ -1511,7 +1513,7 @@ private:
             // address, given the 64-byte-aligned allocator), slots 1..W-1 pad.  Column j
             // is at W + ((j-1)%seg)*W + (j-1)/seg.  Must match kernels_impl.inl exactly.
             const size_t W = static_cast<size_t>(striped_w_);
-            const size_t rowsz = (static_cast<size_t>(striped_seg_) + 1) * W;
+            const size_t rowsz = striped_rs_;   // (seg+1)*W, or a kernel's padded stride
             if (j == 0) return static_cast<size_t>(i) * rowsz;
             const int jj = j - 1;
             return static_cast<size_t>(i) * rowsz + W +
@@ -2158,6 +2160,8 @@ private:
         if (job.table_layout == 1) {
             tables_striped_ = true;
             striped_seg_ = job.seg; striped_w_ = job.width;
+            striped_rs_ = job.rstride ? job.rstride
+                                      : (static_cast<size_t>(job.seg) + 1) * static_cast<size_t>(job.width);
         } else {
             tables_striped_ = false;
         }
@@ -2211,6 +2215,8 @@ private:
         if (job.table_layout == 1) {
             tables_striped_ = true;
             striped_seg_ = job.seg; striped_w_ = job.width;
+            striped_rs_ = job.rstride ? job.rstride
+                                      : (static_cast<size_t>(job.seg) + 1) * static_cast<size_t>(job.width);
         } else {
             tables_striped_ = false;
         }

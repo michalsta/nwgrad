@@ -114,26 +114,29 @@ static void striped_linear_full(ViterbiJob<T>& job) {
     // form keeps the vertical code (0 / 1) per slot in subbuf until the carry is known.
     // The byte form's two rolling rows ride in the same block (spread_rows, dp_buffer.hpp:
     // no two rows in one L1 set).
-    // Rows: opens, carry, the integer carry's ramp, Local's padding mask, then (byte form)
-    // the vertical codes and the two rolling rows.
-    std::size_t rs; T* const rows = spread_rows<T>(buf.lrows, rowsz, Ptr ? 7 : 4, rs);
+    // Rows: opens, carry, Local's padding mask, then (byte form) the vertical codes and the
+    // two rolling rows.
+    std::size_t rs; T* const rows = spread_rows<T>(buf.lrows, rowsz, Ptr ? 6 : 3, rs);
     T* ov = rows;
     T* yv = rows + rs;
-    T* const ramp = rows + 2 * rs;
     T* kc = nullptr;
-    if constexpr (Ptr) kc = rows + 4 * rs;
+    if constexpr (Ptr) kc = rows + 3 * rs;
 
+    // The H table's row stride, on a narrow L1D (table_spread, dp_buffer.hpp) padded past
+    // rowsz (spread_stride) so rows i and i-1 never share an L1 set or a 4 KB offset; it
+    // reaches the aligner as job.rstride.  The byte form's D table keeps rowsz (bytes,
+    // written once a cell).
+    const std::size_t hstride = (Ptr || !table_spread()) ? rowsz : spread_stride<T>(rowsz, 2);
     T* pH; T* cH;
     if constexpr (Ptr) {
         const std::size_t dsz = (std::size_t)(m + 1) * rowsz;
         if (buf.DM.size() < dsz) buf.DM.resize(dsz);
-        pH = rows + 5 * rs; cH = rows + 6 * rs;
+        pH = rows + 4 * rs; cH = rows + 5 * rs;
     } else {
-        const std::size_t hsz = (std::size_t)(m + 1) * rowsz;
+        const std::size_t hsz = (std::size_t)(m + 1) * hstride;
         if (buf.H.size() < hsz) buf.H.resize(hsz);
-        pH = buf.H.data(); cH = pH + rowsz;
+        pH = buf.H.data(); cH = pH + hstride;
     }
-    [[maybe_unused]] T ramp_ge = ge_a; [[maybe_unused]] bool ramp_ok = false;   // integer T's ramp
 
     // ── row 0 ──  H[0][0] = 0; H[0][j] = -(j * ge_a) (Global) or 0 (Local); pads NINF.
     pH[0] = static_cast<T>(0);
@@ -155,7 +158,7 @@ static void striped_linear_full(ViterbiJob<T>& job) {
     const vd vthree(static_cast<T>(3));
     const vd vninf(K_NINF);
     T best_local = static_cast<T>(0); int best_i = 0, best_j = 0;
-    const T* pad = Local ? striped_pad_into(rows + 3 * rs, n, seg, W) : nullptr;
+    const T* pad = Local ? striped_pad_into(rows + 2 * rs, n, seg, W) : nullptr;
 
     for (int i = 1; i <= m; ++i) {
         if constexpr (Tr) {
@@ -209,8 +212,7 @@ static void striped_linear_full(ViterbiJob<T>& job) {
 
             // ── the carry: Y[c] = max(open[c-1], Y[c-1] - ge_a) along each lane ──
             if constexpr (nw_is_int<T> && W >= 4) {
-                int_ramp_into<T>(ramp, ge_a, seg, W, ramp_ge, ramp_ok);
-                int_pmax_carry<T, W>(ov, nullptr, ramp, nbOpen, static_cast<T>(0),
+                int_pmax_carry<T, W>(ov, nullptr, nbOpen, static_cast<T>(0),
                                      K_NINF, ge_a, seg, yv, nullptr, nullptr);
             } else {
                 vd prev = vninf;                         // column 0 holds no Y
@@ -280,7 +282,7 @@ static void striped_linear_full(ViterbiJob<T>& job) {
         }
 
         if constexpr (Ptr) std::swap(pH, cH);
-        else { pH = cH; cH += rowsz; }
+        else { pH = cH; cH += hstride; }
     }
 
     if constexpr (Local) {
@@ -296,6 +298,7 @@ static void striped_linear_full(ViterbiJob<T>& job) {
     job.table_layout = 1;
     job.seg = seg;
     job.width = W;
+    job.rstride = hstride;
 }
 
 // Whether this level registers the linear kernels for T.  int64 below eight lanes: no —
@@ -366,17 +369,15 @@ static void lhb_striped(LhbJob<T>& job) {
                 striped_profile_row(buf.hprof.data() + (std::size_t)c * sw, job.blk + (std::size_t)c * nalpha,
                                     b, n, seg, W);
     }
-    // opens, carry, vertical codes, the two rolling rows, the integer carry's ramp and the
-    // argmax padding mask: one block (spread_rows)
-    std::size_t rs; T* const rows = spread_rows<T>(buf.lrows, rowsz, 7, rs);
+    // opens, carry, vertical codes, the two rolling rows and the argmax padding mask: one
+    // block (spread_rows)
+    std::size_t rs; T* const rows = spread_rows<T>(buf.lrows, rowsz, 6, rs);
     T* ov = rows;
     T* yv = rows + rs;
     T* kc = rows + 2 * rs;
     T* pH = rows + 3 * rs; T* cH = rows + 4 * rs;
-    T* const ramp = rows + 5 * rs;
     unsigned char* D = job.codes;
-    const T* pad = job.argmax ? striped_pad_into(rows + 6 * rs, n, seg, W) : nullptr;
-    [[maybe_unused]] T ramp_ge = T(0); [[maybe_unused]] bool ramp_ok = false;
+    const T* pad = job.argmax ? striped_pad_into(rows + 5 * rs, n, seg, W) : nullptr;
 
     // row 0
     pH[0] = job.row0[0];
@@ -442,8 +443,7 @@ static void lhb_striped(LhbJob<T>& job) {
             }
 
             if constexpr (nw_is_int<T> && W >= 4) {
-                int_ramp_into<T>(ramp, ga, seg, W, ramp_ge, ramp_ok);
-                int_pmax_carry<T, W>(ov, nullptr, ramp, nbOpen, static_cast<T>(0),
+                int_pmax_carry<T, W>(ov, nullptr, nbOpen, static_cast<T>(0),
                                      K_NINF, ga, seg, yv, nullptr, nullptr);
             } else {
                 vd prev = vninf;
