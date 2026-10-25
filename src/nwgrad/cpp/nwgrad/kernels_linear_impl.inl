@@ -182,17 +182,18 @@ static void striped_linear_full(ViterbiJob<T>& job) {
 
         if (seg > 0) {
             // ── pass 1: U = max(diag + s, up - ge_b) (Local: and 0), its code, the open ──
+            // the diagonal: the previous iteration's up vector, rotated in a register (each
+            // previous-row vector loaded once); at s = 0 the last segment, shifted one lane in
+            vd dg(nw_ninf<T>);
+            if (seg > 0) {
+                vd last; last.copy_from(pH + off + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                dg = lane_shift_in(last, bprev);
+            }
             for (int s = 0; s < seg; ++s) {
-                vd dg;
-                if (s == 0) {
-                    vd last; last.copy_from(pH + off + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                    dg = lane_shift_in(last, bprev);
-                } else {
-                    dg.copy_from(pH + off + (std::size_t)(s - 1) * W, stdx::element_aligned);
-                }
                 vd up; up.copy_from(pH + off + (std::size_t)s * W, stdx::element_aligned);
                 vd sb; sb.copy_from(sub + (std::size_t)s * W, stdx::element_aligned);
                 const vd d0 = dg + sb;
+                dg = up;                             // the next segment's diagonal
                 const vd u  = up - vge_b;
                 vd t = stdx::max(d0, u);
                 if constexpr (Ptr) {
@@ -414,17 +415,18 @@ static void lhb_striped(LhbJob<T>& job) {
         if (job.argmax == 2 && c0 > best) { best = c0; bi = r; bj = 0; }
 
         if (seg > 0) {
+            // the diagonal: the previous iteration's up vector, rotated in a register (each
+            // previous-row vector loaded once); at s = 0 the last segment, shifted one lane in
+            vd dg(nw_ninf<T>);
+            if (seg > 0) {
+                vd last; last.copy_from(pH + off + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                dg = lane_shift_in(last, bprev);
+            }
             for (int s = 0; s < seg; ++s) {
-                vd dg;
-                if (s == 0) {
-                    vd last; last.copy_from(pH + off + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                    dg = lane_shift_in(last, bprev);
-                } else {
-                    dg.copy_from(pH + off + (std::size_t)(s - 1) * W, stdx::element_aligned);
-                }
                 vd up; up.copy_from(pH + off + (std::size_t)s * W, stdx::element_aligned);
                 vd sb; sb.copy_from(sub + (std::size_t)s * W, stdx::element_aligned);
                 const vd d0 = dg + sb;
+                dg = up;                             // the next segment's diagonal
                 const vd u = up - vgb;
                 vd t = stdx::max(d0, u);
                 if (D) {

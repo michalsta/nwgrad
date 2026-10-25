@@ -121,21 +121,20 @@ static void score_affine_striped(ScoreJob<T>& job) {
         if constexpr (Fused) {
             vd Oin([&](int q) { return q == 0 ? nbOpen : NINF; });
             vd Yin = vninf;                 // column 0's VY is -inf; lanes 1.. by lazy-F
+            // The diagonal predecessors: the previous iteration's up vectors, rotated in
+            // registers (each previous-row vector loaded once, not twice); at s = 0 the last
+            // segment, shifted one lane in.
+            vd dM(nw_ninf<T>), dX(nw_ninf<T>), dY(nw_ninf<T>);
+            if (seg > 0) {
+                vd lM, lX, lY;
+                lM.copy_from(pM + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                lX.copy_from(pX + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                lY.copy_from(pY + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                dM = lane_shift_in(lM, bM);
+                dX = lane_shift_in(lX, bX);
+                dY = lane_shift_in(lY, bY);
+            }
             for (int s = 0; s < seg; ++s) {
-                vd dM, dX, dY;
-                if (s == 0) {
-                    vd lM, lX, lY;
-                    lM.copy_from(pM + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                    lX.copy_from(pX + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                    lY.copy_from(pY + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                    dM = lane_shift_in(lM, bM);
-                    dX = lane_shift_in(lX, bX);
-                    dY = lane_shift_in(lY, bY);
-                } else {
-                    dM.copy_from(pM + (std::size_t)(s - 1) * W, stdx::element_aligned);
-                    dX.copy_from(pX + (std::size_t)(s - 1) * W, stdx::element_aligned);
-                    dY.copy_from(pY + (std::size_t)(s - 1) * W, stdx::element_aligned);
-                }
                 vd sb; sb.copy_from(sub + (std::size_t)s * W, stdx::element_aligned);
                 vd vmv = stdx::max(stdx::max(dM, dX), dY) + sb;
                 if constexpr (Local) vmv = stdx::max(vmv, vzero);
@@ -145,6 +144,7 @@ static void score_affine_striped(ScoreJob<T>& job) {
                 uM.copy_from(pM + (std::size_t)s * W, stdx::element_aligned);
                 uX.copy_from(pX + (std::size_t)s * W, stdx::element_aligned);
                 uY.copy_from(pY + (std::size_t)s * W, stdx::element_aligned);
+                dM = uM; dX = uX; dY = uY;   // the next segment's diagonal
                 vd vxv = stdx::max(stdx::max((uM - vgo_b) - vge_b, uX - vge_b), (uY - vgo_b) - vge_b);
                 vxv.copy_to(cX + (std::size_t)s * W, stdx::element_aligned);
 
@@ -163,21 +163,20 @@ static void score_affine_striped(ScoreJob<T>& job) {
             Olast = Oin;
         } else {
             T* ov = opens;
+            // The diagonal predecessors: the previous iteration's up vectors, rotated in
+            // registers (each previous-row vector loaded once, not twice); at s = 0 the last
+            // segment, shifted one lane in.
+            vd dM(nw_ninf<T>), dX(nw_ninf<T>), dY(nw_ninf<T>);
+            if (seg > 0) {
+                vd lM, lX, lY;
+                lM.copy_from(pM + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                lX.copy_from(pX + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                lY.copy_from(pY + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                dM = lane_shift_in(lM, bM);
+                dX = lane_shift_in(lX, bX);
+                dY = lane_shift_in(lY, bY);
+            }
             for (int s = 0; s < seg; ++s) {
-                vd dM, dX, dY;
-                if (s == 0) {
-                    vd lM, lX, lY;
-                    lM.copy_from(pM + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                    lX.copy_from(pX + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                    lY.copy_from(pY + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                    dM = lane_shift_in(lM, bM);
-                    dX = lane_shift_in(lX, bX);
-                    dY = lane_shift_in(lY, bY);
-                } else {
-                    dM.copy_from(pM + (std::size_t)(s - 1) * W, stdx::element_aligned);
-                    dX.copy_from(pX + (std::size_t)(s - 1) * W, stdx::element_aligned);
-                    dY.copy_from(pY + (std::size_t)(s - 1) * W, stdx::element_aligned);
-                }
                 vd sb; sb.copy_from(sub + (std::size_t)s * W, stdx::element_aligned);
                 vd vmv = stdx::max(stdx::max(dM, dX), dY) + sb;
                 if constexpr (Local) vmv = stdx::max(vmv, vzero);
@@ -186,6 +185,7 @@ static void score_affine_striped(ScoreJob<T>& job) {
                 uM.copy_from(pM + (std::size_t)s * W, stdx::element_aligned);
                 uX.copy_from(pX + (std::size_t)s * W, stdx::element_aligned);
                 uY.copy_from(pY + (std::size_t)s * W, stdx::element_aligned);
+                dM = uM; dX = uX; dY = uY;   // the next segment's diagonal
                 vd vxv = stdx::max(stdx::max((uM - vgo_b) - vge_b, uX - vge_b), (uY - vgo_b) - vge_b);
                 vxv.copy_to(cX + (std::size_t)s * W, stdx::element_aligned);
                 if constexpr (Local) vbest = stdx::max(vbest, padded(stdx::max(vmv, vxv), s));
