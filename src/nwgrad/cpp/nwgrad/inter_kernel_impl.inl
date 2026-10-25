@@ -59,14 +59,6 @@ template <class V> static inline V ivmax(V a, V b) noexcept {
     return a < b ? b : a;
 }
 template <class L, class V> static inline V ivsel(L m, V a, V b) noexcept { return m ? a : b; }
-// carry_pin (kernels_impl.inl) for the vector-extension types: keeps gcc from re-associating
-// an off-chain max back onto the two-column gap carry below.
-template <class V> static inline V ivpin(V v) noexcept {
-#if defined(__GNUC__) && !defined(__clang__) && defined(__x86_64__)
-    __asm__("" : "+v"(v));
-#endif
-    return v;
-}
 // Every lane = x.  Not `ivd{} + x`: +0 + -0 is +0, so that idiom loses the sign of a
 // zero border (-0 when a gap extend is 0), which the scalar fill keeps.
 template <class V, class S> static inline V ivsplat(S x) noexcept {
@@ -484,47 +476,7 @@ static void inter_score_affine(InterJobT<T>& J) noexcept {
         else lx = local ? ninf : ivsplat<ivd>(-(J.go_b + static_cast<T>(i) * J.ge_b));
         ivd ly = ninf;
         VM[0] = lm; VX[0] = lx; VY[0] = ly;
-        auto keep_at = [&](int j) NWGRAD_ALWAYS_INLINE_LAMBDA {
-            ivl keep = live;
-            if constexpr (Ragged) keep &= (z + static_cast<T>(j)) <= cm.nbv;
-            return keep;
-        };
-        // Two columns per step: Y(j+1) = max(open(j+1), Y(j) - ge) and, rounding being
-        // monotone, Y(j) - ge = max(open(j) - ge, Y(j-1) - ge - ge) bit for bit; so the
-        // loop-carried chain is two subtractions and ONE max per two columns (was two of
-        // each), the other max off it (pinned against gcc's re-association).
-        int j = 1;
-        for (; j + 1 <= n; j += 2) {
-            const ivd s0 = cm.s(P, j), s1 = cm.s(P, j + 1);
-            const ivd um0 = VM[j], ux0 = VX[j], uy0 = VY[j];
-            const ivd um1 = VM[j + 1], ux1 = VX[j + 1], uy1 = VY[j + 1];
-            ivd d0 = dm; d0 = ivmax(d0, dx); d0 = ivmax(d0, dy);
-            ivd mv0 = d0 + s0;
-            if (local) mv0 = ivmax(mv0, z);
-            ivd x0 = (um0 - go_b) - ge_b;
-            x0 = ivmax(x0, ux0 - ge_b);
-            x0 = ivmax(x0, (uy0 - go_b) - ge_b);
-            ivd d1 = um0; d1 = ivmax(d1, ux0); d1 = ivmax(d1, uy0);
-            ivd mv1 = d1 + s1;
-            if (local) mv1 = ivmax(mv1, z);
-            ivd x1 = (um1 - go_b) - ge_b;
-            x1 = ivmax(x1, ux1 - ge_b);
-            x1 = ivmax(x1, (uy1 - go_b) - ge_b);
-            const ivd open0 = (ivmax(lm, lx) - go_a) - ge_a;
-            const ivd open1 = (ivmax(mv0, x0) - go_a) - ge_a;
-            const ivd t = ly - ge_a;
-            const ivd y0 = ivmax(open0, t);
-            const ivd y1 = ivmax(ivpin(ivmax(open1, open0 - ge_a)), t - ge_a);
-            VM[j] = mv0; VX[j] = x0; VY[j] = y0;
-            VM[j + 1] = mv1; VX[j + 1] = x1; VY[j + 1] = y1;
-            dm = um1; dx = ux1; dy = uy1;
-            lm = mv1; lx = x1; ly = y1;
-            if (local) {
-                vbest = ivmax(vbest, ivsel(keep_at(j), ivmax(mv0, ivmax(x0, y0)), z));
-                vbest = ivmax(vbest, ivsel(keep_at(j + 1), ivmax(mv1, ivmax(x1, y1)), z));
-            }
-        }
-        for (; j <= n; ++j) {
+        for (int j = 1; j <= n; ++j) {
             const ivd s = cm.s(P, j);
             const ivd um = VM[j], ux = VX[j], uy = VY[j];   // row i-1, column j
             ivd d = dm;
@@ -584,35 +536,7 @@ static void inter_score_linear(InterJobT<T>& J) noexcept {
         if constexpr (Tr) lh = local ? z : cm.border_x(i);
         else lh = local ? z : ivsplat<ivd>(-static_cast<T>(i) * J.ge_b);
         H[0] = lh;
-        auto keep_at = [&](int j) NWGRAD_ALWAYS_INLINE_LAMBDA {
-            ivl keep = live;
-            if constexpr (Ragged) keep &= (z + static_cast<T>(j)) <= cm.nbv;
-            return keep;
-        };
-        // Two columns per step, as inter_score_affine: H(j+1) = max(q(j+1), H(j) - ge_a
-        // [, 0]) with H(j) - ge_a = max(q(j) - ge_a [, 0 - ge_a], H(j-1) - ge_a - ge_a);
-        // the Local clamp joins the off-chain operand, so the chain is two subtractions
-        // and one max per two columns.
-        int j = 1;
-        for (; j + 1 <= n; j += 2) {
-            const ivd up0 = H[j], up1 = H[j + 1];
-            const ivd q0 = ivmax(d + cm.s(P, j), up0 - ge_b);
-            const ivd q1 = ivmax(up0 + cm.s(P, j + 1), up1 - ge_b);
-            const ivd t = lh - ge_a;
-            ivd v0 = ivmax(q0, t);
-            if (local) v0 = ivmax(v0, z);
-            ivd p = ivmax(q1, q0 - ge_a);
-            if (local) p = ivmax(ivmax(p, z - ge_a), z);
-            const ivd v1 = ivmax(ivpin(p), t - ge_a);
-            H[j] = v0; H[j + 1] = v1;
-            d = up1;
-            lh = v1;
-            if (local) {
-                vbest = ivmax(vbest, ivsel(keep_at(j), v0, z));
-                vbest = ivmax(vbest, ivsel(keep_at(j + 1), v1, z));
-            }
-        }
-        for (; j <= n; ++j) {
+        for (int j = 1; j <= n; ++j) {
             const ivd up = H[j];
             ivd v = d + cm.s(P, j);
             v = ivmax(v, up - ge_b);
@@ -685,38 +609,7 @@ static void inter_score_affine_pos(InterJobT<T>& J) noexcept {
         ivd lmx = local ? z : x0;                                // max(M, X)(i, 0)
         ivd ly = ninf;                                           // Y(i, 0)
         D[0] = lmx; X[0] = x0;                                   // D(i, 0): Y(i, 0) is -inf
-        auto keep_at = [&](int j) NWGRAD_ALWAYS_INLINE_LAMBDA {
-            ivl keep = live;
-            if constexpr (Ragged) keep &= (z + static_cast<T>(j)) <= cm.nbv;
-            return keep;
-        };
-        // Two columns per step, as inter_score_affine.
-        int j = 1;
-        for (; j + 1 <= n; j += 2) {
-            const ivd s0 = cm.s(P, j), s1 = cm.s(P, j + 1);
-            const ivd du0 = D[j], xu0 = X[j], du1 = D[j + 1], xu1 = X[j + 1];
-            ivd mv0 = dd + s0;
-            if (local) mv0 = ivmax(mv0, z);
-            const ivd xa = ivmax((du0 - go_b) - ge_b, xu0 - ge_b);
-            const ivd mx0 = ivmax(mv0, xa);
-            ivd mv1 = du0 + s1;
-            if (local) mv1 = ivmax(mv1, z);
-            const ivd xb = ivmax((du1 - go_b) - ge_b, xu1 - ge_b);
-            const ivd mx1 = ivmax(mv1, xb);
-            const ivd open0 = (lmx - go_a) - ge_a;
-            const ivd open1 = (mx0 - go_a) - ge_a;
-            const ivd t = ly - ge_a;
-            const ivd y0 = ivmax(open0, t);
-            const ivd y1 = ivmax(ivpin(ivmax(open1, open0 - ge_a)), t - ge_a);
-            const ivd dn0 = ivmax(mx0, y0), dn1 = ivmax(mx1, y1);
-            D[j] = dn0; X[j] = xa; D[j + 1] = dn1; X[j + 1] = xb;
-            dd = du1; lmx = mx1; ly = y1;
-            if (local) {
-                vbest = ivmax(vbest, ivsel(keep_at(j), MOnly ? mv0 : dn0, z));
-                vbest = ivmax(vbest, ivsel(keep_at(j + 1), MOnly ? mv1 : dn1, z));
-            }
-        }
-        for (; j <= n; ++j) {
+        for (int j = 1; j <= n; ++j) {
             const ivd s = cm.s(P, j);
             const ivd du = D[j], xu = X[j];                      // row i-1, column j
             ivd mv = dd + s;
