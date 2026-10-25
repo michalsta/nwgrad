@@ -1,5 +1,36 @@
 # TODO
 
+## Denser direction codes for the multithreaded memory wall (requested 2026-10-25)
+
+Wanted: BOTH variants below prototyped, tested bit-exact, and added as variants of the
+Pointers fill, selected by a gate only in the scenarios where they measure faster —
+never a blanket switch.
+
+Why: with one byte a cell (branch `packed-codes`, PR #8) the Pointers kernel is
+compute-bound single-threaded and in cache, but long pairs with several threads per
+memory channel still hit the wall. nighthaven, per-thread time vs 1 thread (12 threads
+= 6 cores x SMT, so ~2x there is SMT alone): float32 L2000 6t 1.29x / 12t 2.35x (6 x 4 MB
+of codes > 18 MB L3); double L6000 1.33x / 2.65x; L8000 1.56x / 3.28x (where Hirschberg
+wins; `auto` now splits above 2^25 cells). float32 linear Pointers L2000 12t 2.5x. The
+code stream (written once, read back by the walk) is the dominant DRAM stream there.
+
+1. **Affine: four cells in three bytes (6-bit codes, 0.75 B/cell).** A 6-bit code does not
+   fit byte boundaries in the striped layout: each 4-lane group packs into 3 bytes (a
+   shuffle per group), the walk extracts bits. Expected: 25 % less code traffic, a gain
+   perhaps 10-20 % at L2000-5800 with >= 6 threads (a guess); a likely loss in cache.
+2. **Linear: four cells per byte (2-bit codes, 0.25 B/cell).** Cheaper packing (2 bits
+   divide a byte), 4x less traffic — probably the more promising of the two; prototype
+   it first.
+
+How to decide (as for the packed codes): measure the premise first — per-thread scaling
+at L1000-6000, 1 / half / all physical cores, LLC-miss bytes per cell — on nighthaven
+(decides), solace, spot, wloczykij. A/B in alternating processes with a control arm,
+release-wheel flags. Gate on what the data supports: cells per pair x threads against
+the LLC (as the inter-pair fills' L2 gate), probably per ISA; in-cache cases keep the
+1 B/cell fill. Bit-identity required against the 1 B/cell fill (paths, gradients, guides,
+every level, both compilers, tracked problems), plus the cross-build hasher and planted
+mutants; the walk, `hb_base` and every path consumer must read the new format.
+
 ## Batch-wide walks over SeqPair objects were memory-bound — DONE in the 0.6 restructure
 
 Measured 2026-10-02 on nighthaven, 2.5M Manakov pairs: `set_params()` 56 ms at 12
