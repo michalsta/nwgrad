@@ -820,6 +820,51 @@ Global with negative extends and opens >= 0 happens to be correct, but stays gua
 one rule, nothing gained by carving out the case. (The 0.5 float32 Local shortfall once
 listed here was the boundary-state bug fixed above.)
 
+**The gap carry, shortened (branch `cc/score-carry`, 2026-10-26).** Both striped score
+kernels spent most of their time on the loop-carried gap-in-A chain, not on the cells:
+perf on nighthaven put ~60% of the D/X kernel's float32 time in lazy-F. In a Global
+alignment the cells right of the diagonal are dominated by gap runs from the alignment,
+so nearly every row's carry crosses ~W/2 lanes, one lane per round: 4.3 rounds and ~3
+extra row sweeps per row at W = 8, 8 rounds and ~6.4 sweeps at W = 16. Lazy-F's work per
+row is therefore ~0.4 n vector visits at ANY width, and each visit was a sub + max on the
+chain. Three changes, all bit-identical (the [score] fuzz at every level and both
+variants, plus mutation checks that the tests catch a wrong carry):
+- **Lazy-F carries F - ge, not max(c, F) - ge.** The row already satisfies
+  Y(s+1) >= Y(s) - ge in every lane (the main pass computes it so; a raised cell is always
+  followed by a visit to the next), so where c(s) wins, c(s) - ge <= c(s+1) and neither form
+  raises s+1: the same stored maxima and exit test, one subtraction per segment on the
+  chain. Both kernels (D/X and three-state).
+- **D/X main pass: two segments per carry step.** Rounding is monotone, so
+  max(a, b) - g == max(a - g, b - g) bit for bit and Y(s+1) = max(max(O(s), O(s-1) - g),
+  (Y(s-1) - g) - g): two subtractions and ONE max per two segments. gcc re-associates the
+  off-chain max back onto the chain (max is exact, so it may); `carry_pin` (an empty asm,
+  gcc on x86 only) stops it. Without the pin the gain fell from ~30% to ~12% (prototype,
+  nighthaven).
+- **D/X rows store max(M, X), X and Y;** D = max(A, Y) is formed where a row is read, so
+  lazy-F raises Y alone (one load and one store per visit instead of two each). Neutral
+  on its own; it pays once the chain is short. It also removes the pattern clang compiled to
+  `vmaskmovps` (a masked store, reported slow on AMD Zen).
+Not kept: the two-column carry in the inter-pair score kernels (1.03-1.05x slower on
+Manakov 22 x 50 pairs, nighthaven: with W pairs per vector the column loop is not
+chain-bound). Measured with `tools/bench_score_ab.py` (main `0f1f00b` vs the branch,
+release-wheel flags, best of 5, control arm 0.98-1.02; B/A):
+
+| host | thr | prot_align (f32) | prot_align64 | conv | mk_align / mk_step / mk_align_f32 |
+|---|---|---|---|---|---|
+| nighthaven avx2 | 1 | **0.42** | **0.59** | **0.46** | 0.99 / 0.99 / 1.01 |
+| nighthaven avx2 | 12 | 0.70 | 0.79 | 0.47 | 1.00 / 1.00 / 1.01 |
+| solace avx512 | 1 | 0.70 | 0.75 | 0.72 | 1.01 / 0.98 / 1.00 |
+| solace avx512 | 16 | 0.80 | 0.85 | 0.72 | 1.02 / 1.00 / 1.01 |
+| skynet sse4 | 1 | 0.89 | 1.00 | 0.87 | 1.00 / 0.99 / 1.00 |
+
+(skynet's 12-thread arms were noisy, control 0.94-1.13, and are omitted.) AVX-512 gains least,
+because lazy-F's visits per row do not shrink with the width while the main pass halves. The
+prototype measured the 8-lane kernel faster than the 16-lane one on solace itself, for
+float32: the W = 8 float kernel on AVX-512 (Open TODO O1(b)) is the next step there.
+Unmeasured: NEON (spot was off; `carry_pin` is a no-op on AArch64, so gcc may re-associate
+there). The Viterbi fills' lazy-F loops (striped Scores/Pointers, Hirschberg sweeps) have the
+same carry and are not changed yet.
+
 ### Linear gaps: Pointers and Hirschberg (2026-10-05)
 
 - **`traceback="pointers"` for linear** (`viterbi_linear_ptr`): one direction byte per
