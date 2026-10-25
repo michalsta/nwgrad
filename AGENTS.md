@@ -1444,6 +1444,31 @@ whose inlined attribution is blurred, and the instruction-level profiles have th
 shape (the post-scan `cin` reload 7.0 vs 7.3-8.1 %; C's kernel compiles larger, 2520 vs
 1976 annotated lines). Mechanism on v3 unidentified. An in-register scan remains worth
 trying (it removes a stall both arms pay), but is not established as the fix.
+**FIXED: the carry's cross-lane scan in registers (`int_lane_carry_in`, 2026-10-25).** The
+exclusive prefix max across lanes is log2(W) `__builtin_shufflevector` shift + max steps
+(gcc 15 at AVX2 int16: `vpshufb`/`vpermq`/`vpermd`/`vpblendd`/`vperm2i128` + `vpmaxsw`, no
+`vpextrw`, no stack round trip). Bit-identical (C++ suite at sse2 / sse4 skynet, avx2 /
+avx512 solace, neon spot; gcc and clang). Measured against the scalar scan (HEAD), medians
+of 9 (spot 7), one source tree, `-DNWGRAD_SCALAR_LANE_SCAN` the control build:
+
+| cell | nighthaven AVX2 | solace AVX-512 (screen) | spot NEON (macOS, g++-16) |
+|---|---|---|---|
+| int16 Global Scores L100 / L140 / L200 | 0.891 / 0.891 / 0.895 | 0.819 / 0.750 / 0.773 | 1.026 / 1.016 / 1.016 |
+| int16 Local Pointers L200 | 0.946 | 0.867 | 0.977 |
+| int16 Global linear L300 | 0.848 | 0.733 | 1.015 |
+| int32 Global linear L300 / L1000 | 0.868 / 1.007 | 0.766 / - | 0.849 / - |
+| int32 Global Scores L300 / L1000 | 0.910 / 0.965 | 0.896 / 0.986 | 1.005 / 1.004 |
+
+(controls 0.98-1.02; solace with a mostly idle Windows game, Windows 3-4 % CPU before and
+after.) On v3 it more than cancels the register ramp's regression: int16 Scores 0.85-0.95 of
+the old row ramp. AArch64 int16 keeps the scalar scan (`#if defined(__aarch64__)`, sizeof 2):
+the one measured loss, cause unexamined (spot went offline before its disassembly).
+**The row ramp back (tried with it, DROPPED):** a `RowRamp` carry loading `hb_ramp`'s row,
+wired into the Scores kernel only. On v3 int16 it composed better than independently
+(Scores with both / scan alone: L100 0.852 / 0.891, L140 0.826 / 0.891, L200 0.812 / 0.895;
+alone 0.97-1.01), but it cost int32 there (L300 0.944 vs 0.910, L1000 0.988 vs 0.965),
+AVX-512 int16 (L140 0.783 vs 0.750, L200 0.794 vs 0.773) and NEON (1.023-1.046): one cell
+family on one level, not worth an ISA-and-width gate.
 Not a kernel-speed loss: below the cliff nwgrad int32 is 1.0–1.3× parasail's scan32 and
 1.7–1.8× its striped32 at every length.
 
