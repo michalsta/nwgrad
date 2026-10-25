@@ -181,3 +181,29 @@ TEST_CASE("traceback=pointers handles the degenerate shapes", "[traceback]") {
         REQUIRE(mismatches == 0);
     }
 }
+
+// `auto` with a pointer budget (aligner.hpp, hb_splits / kAutoPointerBudget): which pairs
+// split.  Compile-time, so a moved budget or flag fails here first.
+TEST_CASE("auto pointer budget: which pairs split", "[traceback][hirschberg]") {
+    using TM = TracebackMode;
+    constexpr std::size_t big = 6000;   // 6001^2 > 2^25 cells
+    // explicit modes and unbudgeted types: past the cutoff, always
+    STATIC_REQUIRE(hb_splits(TM::Hirschberg, false, 512, 600, 700));
+    STATIC_REQUIRE(hb_splits(TM::HirschbergPmax, false, 512, 600, 700));
+    STATIC_REQUIRE(!hb_splits(TM::Hirschberg, false, 512, 512, 100000));
+    STATIC_REQUIRE(!hb_splits(TM::Pointers, true, 512, big, big));
+    // budgeted `auto`: not within the budget, past the cutoff or not; above it, yes
+    STATIC_REQUIRE(!hb_splits(TM::Hirschberg, true, 512, 600, 700));
+    STATIC_REQUIRE(!hb_splits(TM::HirschbergPmax, true, 512, 5000, 5000));
+    STATIC_REQUIRE(hb_splits(TM::Hirschberg, true, 512, big, big));
+    STATIC_REQUIRE(hb_splits(TM::HirschbergPmax, true, 512, 513, kAutoHbPointerCells));
+    // which types have the budget
+    STATIC_REQUIRE(Aligner<GapModel::Affine, AlignMode::Global, AlignBand::Full, double>::kAutoPointerBudget);
+    STATIC_REQUIRE(Aligner<GapModel::Affine, AlignMode::Local, AlignBand::Full, float>::kAutoPointerBudget);
+    STATIC_REQUIRE(!Aligner<GapModel::Affine, AlignMode::Global, AlignBand::Full, float>::kAutoPointerBudget);
+    STATIC_REQUIRE(!Aligner<GapModel::Affine, AlignMode::Local, AlignBand::Full, double>::kAutoPointerBudget);
+    STATIC_REQUIRE(!Aligner<GapModel::Affine, AlignMode::Global, AlignBand::Full, int32_t>::kAutoPointerBudget);
+    STATIC_REQUIRE(Aligner<GapModel::Affine, AlignMode::Local, AlignBand::Full, int32_t>::kAutoPointerBudget);
+    STATIC_REQUIRE(Aligner<GapModel::Affine, AlignMode::Global, AlignBand::Full, int64_t>::kAutoPointerBudget);
+    STATIC_REQUIRE(!Aligner<GapModel::Linear, AlignMode::Global, AlignBand::Full, double>::kAutoPointerBudget);
+}

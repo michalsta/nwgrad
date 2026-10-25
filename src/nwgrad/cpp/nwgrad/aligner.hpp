@@ -25,9 +25,9 @@ enum class AlignBand { Full,   GuideBanded };
 //
 //   Scores    retain VM/VX/VY for the whole DP and RE-DERIVE the argmax by repeating
 //             the forward pass's comparison chain.  12 B/cell (float32).
-//   Pointers  record the predecessor as one byte per cell per state during the fill
-//             and simply FOLLOW it; scores then need only two rolling rows.
-//             3 B/cell — and measured 1.4-2.2x faster, because the footprint is what
+//   Pointers  record the predecessors in one byte per cell (the three states' codes
+//             packed) during the fill and simply FOLLOW them; scores then need only two
+//             rolling rows.  1 B/cell (3 until 2026-10-25) — and measured 1.4-2.2x faster, because the footprint is what
 //             drives the page-fault cost that dominates the memory-bound regime.
 //
 // The two are bit-identical — same score, alignment, guide_j and gradient, ties
@@ -102,6 +102,22 @@ enum class SoftImpl { Scaled, ScaledOrLog, Log };
 // Everything structural therefore asks this rather than naming one of them.
 inline constexpr bool is_hirschberg(TracebackMode t) noexcept {
     return t == TracebackMode::Hirschberg || t == TracebackMode::HirschbergPmax;
+}
+
+// Where `auto` resolves to a Hirschberg mode with a pointer budget (Aligner::
+// kAutoPointerBudget), a pair of up to this many cells runs as Pointers -- the same fill,
+// table and traceback as traceback="pointers", so bit-exact with it -- and splits only
+// above it, where the 1 B/cell code table grows past what a thread should hold.
+inline constexpr std::size_t kAutoHbPointerCells = std::size_t(1) << 25;
+
+// Whether a pair splits -- runs the Hirschberg recursion -- rather than the Pointers fill:
+// every Hirschberg mode splits past hb_cutoff rows, except, under `auto` for a type with a
+// pointer budget (auto_budget), a pair within kAutoHbPointerCells.  The aligner's dispatch
+// and the batch engine's planning (which pairs may share a fill) ask the same question.
+inline constexpr bool hb_splits(TracebackMode tb, bool auto_budget, int cutoff,
+                                std::size_t la, std::size_t lb) noexcept {
+    if (!is_hirschberg(tb) || la <= static_cast<std::size_t>(cutoff)) return false;
+    return !(auto_budget && (la + 1) * (lb + 1) <= kAutoHbPointerCells);
 }
 
 // Which Viterbi backend fills the DP tables is a runtime field (backend_, below), one of
@@ -540,6 +556,21 @@ struct Aligner {
     // Default resolves to this Aligner's compile-time kDefaultTb (Hirschberg for the
     // affine+global+full case, Pointers elsewhere) — so a caller can pass the sentinel
     // through without knowing the problem type.
+    // Under `auto`, these types run a pair of up to kAutoHbPointerCells cells as Pointers
+    // and split only above it (hb_splits): affine Global Full at T=double (exact
+    // Hirschberg above the budget) and int64 (hirschberg_pmax above it), and affine Local
+    // Full at T=float and the integer types (hirschberg_pmax above it).  Measured
+    // 2026-10-25 with one-byte codes (AGENTS.md, "`auto` with a pointer budget"): Global
+    // double, Pointers beat the exact recursion at every length and thread count within
+    // the budget (nighthaven, wloczykij 64 cores); Global int64, Pointers beat pmax on both
+    // fixtures; Local, Pointers beat pmax 1.5-3x on homologous pairs and lose 0-14 %
+    // (float32) / 6-37 % (integers) on unrelated ones.  Local double keeps plain Pointers
+    // (kDefaultTb); Global float32 / int16 / int32 keep hirschberg_pmax past hb_cutoff,
+    // which won there (homologous float32, both int32 fixtures).
+    static constexpr bool kAutoPointerBudget =
+        GM == GapModel::Affine && AB == AlignBand::Full &&
+        ((AM == AlignMode::Global && (std::is_same_v<T, double> || std::is_same_v<T, int64_t>)) ||
+         (AM == AlignMode::Local && (std::is_same_v<T, float> || nw_is_int<T>)));
     void set_traceback(TracebackMode t) noexcept {
         tb_auto_ = (t == TracebackMode::Default);
         tb_ = tb_auto_ ? kDefaultTb : t;
@@ -1440,7 +1471,7 @@ private:
     // smaller memory bounds even when rowwise was requested.
     bool uses_rowwise_full() const {
         if constexpr (GM == GapModel::Affine && AB == AlignBand::Full) {
-            if (!rowwise_full_ || (is_hirschberg(tb_) && m_ > hb_cutoff_)) return false;
+            if (!rowwise_full_ || hb_splits(tb_, tb_auto_ && kAutoPointerBudget, hb_cutoff_, m_, n_)) return false;
             const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
             return backend >= 0 && level_kernels(backend).template of<T>().banded_row_local;
         }
@@ -2048,7 +2079,7 @@ private:
                 throw std::logic_error(
                     "nwgrad: traceback=\"hirschberg\" is implemented for full DP only; a "
                     "guide band already bounds memory, which is the only thing Hirschberg buys");
-            else if (m_ > hb_cutoff_ && !hb_penalties_ok_()) {
+            else if (hb_splits(tb_, tb_auto_ && kAutoPointerBudget, hb_cutoff_, m_, n_) && !hb_penalties_ok_()) {
                 // A NEGATIVE gap penalty breaks the recursion (characterized 2026-10-11,
                 // after the boundary-state fix):
                 //  * a negative OPEN (either sequence): the join's plain form adds a prefix
@@ -2069,7 +2100,7 @@ private:
                         "nwgrad: traceback=\"hirschberg\" / \"hirschberg_pmax\" needs non-negative "
                         "gap penalties (got a negative one); use traceback=\"pointers\" or \"auto\"");
             }
-            else if (m_ > hb_cutoff_) {
+            else if (hb_splits(tb_, tb_auto_ && kAutoPointerBudget, hb_cutoff_, m_, n_)) {
                 // Linear: one exact sweep for both "hirschberg" and "hirschberg_pmax" —
                 // the prefix-max carry exists to remove affine's lazy-F fixpoint, and the
                 // scalar linear sweep has none.
@@ -2087,7 +2118,7 @@ private:
             // short pairs differed from Pointers.  Same memory (the base case kept
             // a Pointers-sized table too) and the same speed (measured 0.99-1.04x).
         }
-        // Variant B: direction pointers + rolling rows, 3 B/cell instead of 12/24.
+        // Variant B: direction pointers + rolling rows, 1 B/cell instead of 12/24.
         // Full affine only; the banded and linear paths keep their score tables.
         // (the pointer kernels are chosen after the backend is resolved, below: every
         // simd level has its own, and only the scalar path falls back here.)
