@@ -304,10 +304,15 @@ template <class V> [[gnu::always_inline]] static inline void nv_store(typename V
     *reinterpret_cast<NV*>(p) = static_cast<NV>(x);
 }
 
-// Lane I of the result is f[I] for I < K, else x[I - K]: x moved K lanes up, f filling in.
+// x moved K lanes up, the low K lanes filled from f.  f is a SPLAT at every call, so the fill
+// is taken from f's TOP lanes (f[W-K+I]), which spells the shuffle as one contiguous window
+// of the pair (f, x): AArch64 `ext`, AVX2 `vperm2i128` + `vpalignr`.  Filling from f[I] (the
+// same values) compiled under gcc 16 on NEON to a two-register `tbl` whose operands went
+// through the stack, three round trips in the carry, and an index load per row (int16 1.015-
+// 1.026 of the scalar scan on the M1; 0.906-0.950 this way).
 template <class NV, int W, int K, std::size_t... I>
 [[gnu::always_inline]] static inline NV nv_shift_up_(NV x, NV f, std::index_sequence<I...>) {
-    return __builtin_shufflevector(x, f, (I < (std::size_t)K ? W + (int)I : (int)I - K)...);
+    return __builtin_shufflevector(x, f, (I < (std::size_t)K ? 2 * W - K + (int)I : (int)I - K)...);
 }
 template <class NV, int W, int K>
 [[gnu::always_inline]] static inline NV nv_shift_up(NV x, NV f) {
@@ -318,11 +323,10 @@ template <class NV, int W, int K>
 // walked the lanes through a cmov chain and read cin back as one vector from W narrow
 // stores (a load no store can forward).  Integer max is exact and associative, so the
 // lanes carry the same values either way.  Time / scalar form (2026-10-25, medians of 9,
-// controls 0.98-1.02): nighthaven AVX2 0.85-0.95 at L100-300 (int16 / int32 Scores,
-// Pointers, linear), 0.97-1.01 at L1000; solace AVX-512 0.73-0.90, L1000 0.99; spot
-// NEON int32 0.85 (linear) to 1.00, but int16 1.015-1.026 (Scores, linear; Pointers 0.98),
-// so AArch64 int16 keeps the scalar form (cause unexamined: TODO.md).
-// NWGRAD_SCALAR_LANE_SCAN forces the scalar form everywhere.
+// controls 0.98-1.02): nighthaven AVX2 0.84-0.95 at L100-300 (int16 / int32 Scores,
+// Pointers, linear), 0.97-1.01 at L1000; solace AVX-512 0.73-0.90, L1000 0.99; spot NEON
+// (M1, g++-16) 0.85-0.98, int16 Scores 0.91-0.95.
+// NWGRAD_SCALAR_LANE_SCAN forces the scalar form.
 #if !defined(NWGRAD_SCALAR_LANE_SCAN) && defined(__has_builtin)
 #if __has_builtin(__builtin_shufflevector)
 #define NWGRAD_LANE_SCAN_REG 1
@@ -332,10 +336,6 @@ template <class vd, int W>
 [[gnu::always_inline]] static inline vd int_lane_carry_in(const vd& P, typename vd::value_type seed) {
     using T = typename vd::value_type;
 #ifdef NWGRAD_LANE_SCAN_REG
-#if defined(__aarch64__)
-    if constexpr (sizeof(T) != 2)
-#endif
-    {
     using NV = typename NVecOf<T, (int)(sizeof(T) * W)>::type;
     const NV ninf = static_cast<NV>(vd(nw_ninf<T>));
     NV x = static_cast<NV>(P);
@@ -348,14 +348,14 @@ template <class vd, int W>
     static_assert(W <= 32, "int_lane_carry_in: more lanes than steps");
     const NV vs = static_cast<NV>(vd(seed));
     return vd(mx(nv_shift_up<NV, W, 1>(x, vs), vs));
-    }
-#endif
+#else
     alignas(64) T tot[64], cin[64];
     P.copy_to(tot, stdx::element_aligned);
     T run = seed;
     for (int l = 0; l < W; ++l) { cin[l] = run; run = std::max(run, tot[l]); }
     vd vcin; vcin.copy_from(cin, stdx::element_aligned);
     return vcin;
+#endif
 }
 
 // Always inlined: gcc outlined it as a constant-propagated clone in every integer score
