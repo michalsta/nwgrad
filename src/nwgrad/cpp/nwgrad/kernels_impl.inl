@@ -358,13 +358,41 @@ template <class vd, int W>
 #endif
 }
 
+// Where the ramp is LOADED from a row instead of formed in registers: int16 at 16 lanes
+// (AVX2), in the GLOBAL striped Scores kernel only.  nighthaven, with the lane scan, row /
+// register: Global Scores L100 0.975, L140 0.943, L200 0.910; flat or worse everywhere else
+// tried — Local Scores 1.002, Pointers 0.98-0.99 (in the noise), linear H fill 1.007-1.014,
+// int16 at 32 lanes (AVX-512) 0.98-1.04, int32 (AVX2) 1.02-1.04, NEON 1.006-1.007.  int16
+// rows are short by the overflow bound (BLOSUM62 11/1: ~L300), so the extra stream never
+// meets the L1 capacity edge that put the ramp in registers (int32 L1600+).
+template <class T, int W> inline constexpr bool int_row_ramp = sizeof(T) == 2 && W == 16;
+// The ramp row of one kernel call, rebuilt only when ge_a or the segment count changes
+// (tracked rows, Hirschberg blocks).  hb_ramp's striped layout: slot (s, l) = (l*seg + s)*ge_a.
+template <class T> struct IntRampRow {
+    typename DpBufferT<T>::TVec& v;
+    T ge = T(0);
+    int seg = -1;
+    const T* get(T ge_a, int sg, int W) {
+        if (sg != seg || ge_a != ge) {
+            const std::size_t need = (std::size_t)sg * W;
+            if (v.size() < need) v.resize(need);
+            hb_ramp(v.data(), ge_a, sg, W);
+            ge = ge_a; seg = sg;
+        }
+        return v.data();
+    }
+};
+
 // Always inlined: gcc outlined it as a constant-propagated clone in every integer score
 // kernel (a call, its own frame and the lane arrays per row), where it then cost more
-// than the kernel body around it.
-template <class T, int W>
+// than the kernel body around it.  RowRamp: the ramp loaded from `rr`'s row (int_row_ramp).
+template <class T, int W, bool RowRamp = false>
 [[gnu::always_inline]] static inline void int_pmax_carry(const T* ov, const T* ok, T nbOpen, T nbOpenK,
-                                  T bY, T ge_a, int seg, T* cY, T* yc, T* qbuf) {
+                                  T bY, T ge_a, int seg, T* cY, T* yc, T* qbuf,
+                                  IntRampRow<T>* rr = nullptr) {
     using vd = stdx::native_simd<T>;
+    [[maybe_unused]] const T* rmp = nullptr;
+    if constexpr (RowRamp) rmp = rr->get(ge_a, seg, W);
     const vd vtwo(T(2));
     const vd vge(ge_a);
     const vd rbase([&](int l) { return static_cast<T>(static_cast<T>(l * seg) * ge_a); });
@@ -378,8 +406,9 @@ template <class T, int W>
         } else {
             O = nv_load<vd>(ov + (std::size_t)(s - 1) * W);
         }
-        const vd Q = O + rq;
-        rq += vge;
+        vd Q;
+        if constexpr (RowRamp) { Q = O + nv_load<vd>(rmp + (std::size_t)s * W); }
+        else                   { Q = O + rq; rq += vge; }
         if (yc) nv_store(qbuf + (std::size_t)s * W, Q);
         P = stdx::max(Q, P);
         nv_store(cY + (std::size_t)s * W, P);
@@ -416,9 +445,13 @@ template <class T, int W>
             before = pc;
         }
     };
-    int s = 0;
-    for (; s + 1 < seg; s += 2) { step(s, rq); step(s + 1, rq1); rq += vge2; rq1 += vge2; }
-    if (s < seg) step(s, rq);
+    if constexpr (RowRamp) {
+        for (int s = 0; s < seg; ++s) step(s, nv_load<vd>(rmp + (std::size_t)s * W));
+    } else {
+        int s = 0;
+        for (; s + 1 < seg; s += 2) { step(s, rq); step(s + 1, rq1); rq += vge2; rq1 += vge2; }
+        if (s < seg) step(s, rq);
+    }
 }
 
 // ── Tracked rows: the striped query profile ───────────────────────────────────
@@ -494,6 +527,7 @@ static void striped_affine_full(ViterbiJob<T>& job) {
     const unsigned char* a = job.a;
     const unsigned char* b = job.b;
     DpBufferT<T>& buf = *job.buf;
+    [[maybe_unused]] IntRampRow<T> irr{buf.iramp};   // int_row_ramp's row
 
     const int seg = (n + W - 1) / W;
     const std::size_t sw = (std::size_t)seg * W;
@@ -624,8 +658,8 @@ static void striped_affine_full(ViterbiJob<T>& job) {
             // ── the carry: VY, same-lane striped chain + lazy-F (integer T: the exact
             // prefix max, int_pmax_carry) ──
             if constexpr (nw_is_int<T> && W >= 4) {
-                int_pmax_carry<T, W>(ov, nullptr, nbOpen, T(0), bY, ge_a, seg,
-                                     cY, nullptr, nullptr);
+                int_pmax_carry<T, W, int_row_ramp<T, W> && !Local>(ov, nullptr, nbOpen, T(0), bY,
+                                     ge_a, seg, cY, nullptr, nullptr, &irr);
             } else {
             vd prev([&](int q) { return q == 0 ? bY : K_NINF; });
             for (int s = 0; s < seg; ++s) {
