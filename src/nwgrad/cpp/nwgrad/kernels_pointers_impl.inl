@@ -228,21 +228,20 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
         buf.DM.data()[(std::size_t)i * rowsz] = (i <= 1) ? 3 : 3 | 1 << 2;
 
         if (seg > 0) {
+            // The diagonal predecessors: segment s-1 of the previous row, i.e. the up vectors
+            // of the previous iteration, rotated in registers (each previous-row vector is
+            // loaded once, not twice); at s = 0 the last segment, shifted one lane in.
+            vd dgM, dgX, dgY;
+            {
+                vd lM, lX, lY;
+                lM.copy_from(pM + off + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                lX.copy_from(pX + off + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                lY.copy_from(pY + off + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                dgM = lane_shift_in(lM, bM);
+                dgX = lane_shift_in(lX, bX);
+                dgY = lane_shift_in(lY, bY);
+            }
             for (int s = 0; s < seg; ++s) {
-                vd dgM, dgX, dgY;
-                if (s == 0) {
-                    vd lM, lX, lY;
-                    lM.copy_from(pM + off + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                    lX.copy_from(pX + off + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                    lY.copy_from(pY + off + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                    dgM = lane_shift_in(lM, bM);
-                    dgX = lane_shift_in(lX, bX);
-                    dgY = lane_shift_in(lY, bY);
-                } else {
-                    dgM.copy_from(pM + off + (std::size_t)(s - 1) * W, stdx::element_aligned);
-                    dgX.copy_from(pX + off + (std::size_t)(s - 1) * W, stdx::element_aligned);
-                    dgY.copy_from(pY + off + (std::size_t)(s - 1) * W, stdx::element_aligned);
-                }
                 vd sb; sb.copy_from(sub + (std::size_t)s * W, stdx::element_aligned);
                 const vd mx3 = stdx::max(stdx::max(dgM, dgX), dgY);
                 vd vmv = mx3 + sb;
@@ -281,6 +280,7 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                 uM.copy_from(pM + off + (std::size_t)s * W, stdx::element_aligned);
                 uX.copy_from(pX + off + (std::size_t)s * W, stdx::element_aligned);
                 uY.copy_from(pY + off + (std::size_t)s * W, stdx::element_aligned);
+                dgM = uM; dgX = uX; dgY = uY;   // the next segment's diagonal
                 const vd ax = (uM - vgo_b) - vge_b, bx = uX - vge_b, cx = (uY - vgo_b) - vge_b;
                 vd vxv = stdx::max(stdx::max(ax, bx), cx);
                 vd kx = veight;                     // X's code, already shifted: 0 / 4 / 8

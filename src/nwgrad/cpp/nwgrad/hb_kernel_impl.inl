@@ -943,21 +943,20 @@ static void hb_base_striped(HbBaseJob<T>& job) {
         const T nbOpen = (std::max(nbM, nbX) - go_a) - ge_a;
         const T nbOpenK = ((nbM - go_a) - ge_a >= (nbX - go_a) - ge_a) ? T(0) : T(1);
 
+        // The diagonal predecessors: segment s-1 of the previous row, i.e. the up vectors
+        // of the previous iteration, rotated in registers (each previous-row vector is
+        // loaded once, not twice); at s = 0 the last segment, shifted one lane in.
+        vd dgM(NINF), dgX(NINF), dgY(NINF);
+        if (seg > 0) {   // NC == 0: no segment, nothing to load
+            vd lM, lX, lY;
+            lM.copy_from(pM + off + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+            lX.copy_from(pX + off + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+            lY.copy_from(pY + off + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+            dgM = lane_shift_in(lM, bM);
+            dgX = lane_shift_in(lX, bX);
+            dgY = lane_shift_in(lY, bY);
+        }
         for (int s = 0; s < seg; ++s) {
-            vd dgM, dgX, dgY;
-            if (s == 0) {
-                vd lM, lX, lY;
-                lM.copy_from(pM + off + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                lX.copy_from(pX + off + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                lY.copy_from(pY + off + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                dgM = lane_shift_in(lM, bM);
-                dgX = lane_shift_in(lX, bX);
-                dgY = lane_shift_in(lY, bY);
-            } else {
-                dgM.copy_from(pM + off + (std::size_t)(s - 1) * W, stdx::element_aligned);
-                dgX.copy_from(pX + off + (std::size_t)(s - 1) * W, stdx::element_aligned);
-                dgY.copy_from(pY + off + (std::size_t)(s - 1) * W, stdx::element_aligned);
-            }
             vd sb; sb.copy_from(sub + (std::size_t)s * W, stdx::element_aligned);
             const vd mx3 = stdx::max(stdx::max(dgM, dgX), dgY);
             vd vmv = mx3 + sb;
@@ -978,6 +977,7 @@ static void hb_base_striped(HbBaseJob<T>& job) {
             uM.copy_from(pM + off + (std::size_t)s * W, stdx::element_aligned);
             uX.copy_from(pX + off + (std::size_t)s * W, stdx::element_aligned);
             uY.copy_from(pY + off + (std::size_t)s * W, stdx::element_aligned);
+            dgM = uM; dgX = uX; dgY = uY;   // the next segment's diagonal
             const vd ax = (uM - vgo_b) - vge_b, bx = uX - vge_b, cx = (uY - vgo_b) - vge_b;
             vd vxv = stdx::max(stdx::max(ax, bx), cx);
             vd kx = veight;                     // X's code, already shifted: 0 / 4 / 8
