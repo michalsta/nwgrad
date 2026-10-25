@@ -1417,6 +1417,18 @@ short rows with clean controls: int16 Global Scores L200 1.038, int16 Global lin
 second register-ramp cell: int16 Global Scores, two ramps / row ramp 1.035-1.043 at avx2
 L100 / L200 and avx512 L140 (avx512 L200 1.02, L300 0.98; control 1.00-1.01) -- not the ramp
 base, which the patch removed without moving it.
+Run down on solace at avx2 (int16 Global Scores L200, 600 fixed steps, symbolized builds of
+55bedee = row ramp vs c0ac8b6 = two ramps; timed 1.044): cycles +4.5 %, instructions -0.8 %,
+`ld_blocks.store_forward` 2.92 -> 3.03 a DP row. The excess is in `striped_affine_full`
+(+338 of +449 samples), and there not in the passes the ramp rewrote (net -152) but in the
+carry's CROSS-LANE SCAN, compiled near-identically in both: `P.copy_to(tot)`, 16 `vpextrw`
++ a serial `cmov` chain with stack round-trips, `cin` written as two 16-byte halves and
+read back as one 32-byte vector (`vmovdqa 0xc0(%rsp),%ymm12`), a load no store can forward.
+Its stall sites hold ~16 % of the kernel's samples in A and ~22 % in C (+631): the same
+stalls, waited longer (why longer is unproven: the ramp-free first pass reaching the scan
+with more stores in flight is the likely story). The lever is the scan, in both forms: an
+in-register exclusive prefix max across the lanes (log2 W shift + max steps, a cross-half
+permute at 256 bits) would remove the chain and both forwarding stalls, bit-identically.
 Not a kernel-speed loss: below the cliff nwgrad int32 is 1.0–1.3× parasail's scan32 and
 1.7–1.8× its striped32 at every length.
 
