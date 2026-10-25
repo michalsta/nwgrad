@@ -124,9 +124,11 @@ DiscrimAlign does: it passes the logical core count.
   Local affine Pointers L200 1.04 (7 segments: the two-step pass's tail?), and int16 Global
   Scores 1.035-1.043 at avx2 L100 / L200 and avx512 L140. Not the per-lane ramp base: built
   without the generator it moved neither cell and lost up to 1.038 on short rows (AGENTS).
-  Found (AGENTS): the cost is the carry's scalar cross-lane scan and the store-forward stall
-  of reading `cin` back (~16-22 % of the int16 Scores kernel at L200, both ramp forms). Next:
-  an in-register lane prefix max in `int_pmax_carry` (and the fused score carry), measured.
+  **A v3 regression** (nighthaven, AGENTS): int16 Global Scores two ramps / row ramp L100
+  1.040, L140 1.061, L200 1.018; in the fill kernel, cause unidentified (store-forward
+  blocks DROP 19 % on v3; the solace stall story does not carry over). Candidates: the
+  in-register lane prefix max (removes the `cin` reload stall both forms pay), or the
+  row ramp back for short int16 rows. Measure on nighthaven.
 - **int16 saturating arithmetic, with a number**: at L1000 BLOSUM62 nwgrad refuses int16
   and runs int32 (261 us a pair, score-only, AVX2) where parasail's saturating scan16 takes
   145 us — the one fixture in the comparison parasail wins.

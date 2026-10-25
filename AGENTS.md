@@ -1433,6 +1433,17 @@ CAVEAT: a Windows game (~0.4-0.9 core, invisible to WSL's load average) ran on s
 18:58 that day, i.e. through most of the patch rerun above and all of this profiling; the
 A/A' controls held (0.96-1.01) but the single-run `perf stat` pair is exposed. Re-measure
 on a quiet host (Windows side checked) before acting on the cycle counts.
+RE-MEASURED on nighthaven (v3, quiet, gcc 16.2, same two commits, 2026-10-25): the excess is
+REAL ON v3 and larger, int16 Global Scores two ramps / row ramp, medians of 9: L100 1.040,
+L140 **1.061**, L200 1.018 (A'/A 0.995-1.003). Counters, L200, 600 steps, 10 runs an arm
+(A spread ~2 %): cycles 1.042, instructions 1.005, `ld_blocks.store_forward` **0.81** — C
+blocks LESS, so the solace reading (same stalls waited longer) does NOT carry to v3. The
+excess is in `striped_affine_full<short>` (L140: 4499 -> 4804 samples, +6.8 %; walk flat)
+but spread thin: the scalar scan's lines take ~130 of the +305, the rest vector lines
+whose inlined attribution is blurred, and the instruction-level profiles have the same
+shape (the post-scan `cin` reload 7.0 vs 7.3-8.1 %; C's kernel compiles larger, 2520 vs
+1976 annotated lines). Mechanism on v3 unidentified. An in-register scan remains worth
+trying (it removes a stall both arms pay), but is not established as the fix.
 Not a kernel-speed loss: below the cliff nwgrad int32 is 1.0–1.3× parasail's scan32 and
 1.7–1.8× its striped32 at every length.
 
