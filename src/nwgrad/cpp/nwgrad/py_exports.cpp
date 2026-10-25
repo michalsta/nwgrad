@@ -721,7 +721,7 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             "     scores); banded uses score tables.  The prefix-max carry is\n"
             "     1.5-3.9x faster on homologous data, with measured float32 shortfall\n"
             "     ~5e-4.  Ask for \"hirschberg\" to use the exact carry.\n"
-            "     \"pointers\" records 1 byte/cell/state during the fill (3 B/cell);\n"
+            "     \"pointers\" records the predecessors in 1 byte/cell during the fill;\n"
             "     \"scores\" keeps VM/VX/VY and re-derives the argmax (12 B/cell).  Those\n"
             "     two are bit-identical; pointers is smaller and 1.4-2.2x faster.\n"
             "     \"hirschberg\" is divide-and-conquer in O(n) memory at ~2x the cell\n"

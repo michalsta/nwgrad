@@ -66,7 +66,7 @@ Not verified.)
 Choose by whether the batch's DP working set is cache-resident, computed per
 call from the batch's actual contents:
 
-1. Per-pair working set for the traceback mode in use: about 3 B/cell × m·n
+1. Per-pair working set for the traceback mode in use: about 1 B/cell × m·n
    (pointers), 12/24 B/cell (scores), O(n) rows (Hirschberg); soft mode holds
    both directions' tables.
 2. Weight by work (cells): the fraction of the batch's total cells in pairs

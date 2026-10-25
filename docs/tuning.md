@@ -26,7 +26,7 @@ what the DP retains in order to recover the alignment path:
 
 | `traceback` | Memory | Notes |
 |---|---|---|
-| `"pointers"` | 3 B/cell (affine), 1 B/cell (linear) | Records a predecessor byte per cell (per state). |
+| `"pointers"` | 1 B/cell | Records each cell's predecessors in one byte (affine: the M, X and Y states' choices packed together). |
 | `"scores"` | 12 B/cell (affine, float32) | Keeps the score tables and re-derives the path. Bit-identical to `"pointers"`; for table introspection. |
 | `"hirschberg"` | O(m+n) | Linear-space divide-and-conquer, affine or linear gaps, full DP (global or local). Pairs no longer than `hb_cutoff` (default 512) never split and are bit-exact with `"pointers"`; longer pairs get an optimal path, but where alignments tie it may be a *different* optimal path (a different valid subgradient). |
 | `"hirschberg_pmax"` | O(m+n) | As `"hirschberg"`, with the affine gap carry computed as a closed-form prefix max — in the recursion and, for local alignment, in the endpoint scans: 1.5–3.9× faster than `"hirschberg"` on related sequences. The **only mode that can return a slightly suboptimal path** — measured worst case 4.9e-4 at float32, below float32's own error. Bit-identical across ISA levels. For linear gaps it is `"hirschberg"` (there is no gap-open chain to replace). |
@@ -72,7 +72,7 @@ with.
 
 ## Performance notes
 
-- With `traceback="pointers"`, a hard-gradient alignment keeps 3 bytes per DP cell; `"scores"` keeps 12. The default for affine global alignment is Hirschberg, which keeps O(m+n) — so the per-thread buffer described below applies to the pointer modes and to the Hirschberg base case (≤ `hb_cutoff` rows).
+- With `traceback="pointers"`, a hard-gradient alignment keeps 1 byte per DP cell; `"scores"` keeps 12. The default for affine global alignment is Hirschberg, which keeps O(m+n) — so the per-thread buffer described below applies to the pointer modes and to the Hirschberg base case (≤ `hb_cutoff` rows).
 - `SeqPairBatch.score_and_grad()` allocates one `DpBuffer` per thread (sized to the largest sequence pair in the batch) and reuses it across all assigned pairs. Pair-owned DP tables are never allocated, keeping peak memory at `n_threads × max(m×n)` rather than `N × max(m×n)`.
 - Work is distributed via a shared `std::atomic` counter — no per-task mutex, no work-stealing queue.
 - Stored-batch gradients are summed in fixed blocks of 4096 pairs, with each block

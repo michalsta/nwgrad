@@ -89,8 +89,8 @@ struct AlignedAllocator {
 using DVec = std::vector<double, AlignedAllocator<double>>;
 
 // Direction-pointer storage for the variant-B Viterbi (see aligner.hpp).  One byte
-// per cell per state instead of a retained score table: 3 B/cell against 12 (float32)
-// or 24 (double), which is the whole point of B.
+// per cell (the three states' codes packed) instead of a retained score table: 1 B/cell
+// against 12 (float32) or 24 (double), which is the whole point of B.
 using BVec = std::vector<unsigned char, AlignedAllocator<unsigned char>>;
 
 // A vector whose data() starts at a chosen cache line of its 4 KB page (address mod 4096 =
