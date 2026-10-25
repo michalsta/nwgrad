@@ -918,7 +918,7 @@ static void hb_base_striped(HbBaseJob<T>& job) {
 
     vd vgo_a(go_a), vge_a(ge_a), vgo_b(go_b), vge_b(ge_b);
     const vd vzero(T(0)), vone(T(1)), vtwo(T(2)), vthree(T(3));
-    const vd vfour(T(4)), veight(T(8)), vsixteen(T(16));
+    const vd vfour(T(4)), veight(T(8)), vsixteen(T(16)), vthirtytwo(T(32));
     T bM = pM[0], bX = pX[0], bY = pY[0];
 
     for (int r = 1; r <= H; ++r) {
@@ -942,7 +942,7 @@ static void hb_base_striped(HbBaseJob<T>& job) {
         cM[0] = nbM; cX[0] = nbX; cY[0] = nbY;
         D[(std::size_t)r * rowsz] = static_cast<unsigned char>(3 | cx0code << 2 | 3 << 4);
         const T nbOpen = (std::max(nbM, nbX) - go_a) - ge_a;
-        const T nbOpenK = ((nbM - go_a) - ge_a >= (nbX - go_a) - ge_a) ? T(0) : T(1);
+        const T nbOpenK = ((nbM - go_a) - ge_a >= (nbX - go_a) - ge_a) ? T(0) : T(16);   // Y's open codes, pre-shifted
 
         // The diagonal predecessors: segment s-1 of the previous row, i.e. the up vectors
         // of the previous iteration, rotated in registers (each previous-row vector is
@@ -1001,22 +1001,22 @@ static void hb_base_striped(HbBaseJob<T>& job) {
             // max(om, ox) is bitwise max(vmv, vxv) - go - ge: rounding is monotone.
             const vd om = (vmv - vgo_a) - vge_a, ox = (vxv - vgo_a) - vge_a;
             stdx::max(om, ox).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
-            vd okv = vone;
+            vd okv = vsixteen;                  // open from X: Y's code 1, shifted
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
             if constexpr (sizeof(T) == 8) {
                 okv = avx512d_blend(avx512d_ge(om, ox), okv, vzero);
             } else {
-                okv = sel_ge(om, ox, vone, vzero);
+                okv = sel_ge(om, ox, vsixteen, vzero);
             }
 #else
-            okv = sel_ge(om, ox, vone, vzero);
+            okv = sel_ge(om, ox, vsixteen, vzero);
 #endif
             okv.copy_to(ok + (std::size_t)s * W, stdx::element_aligned);
         }
 
         // ── VY carry: same-lane striped chain + exact lazy-F, codes tracked ──
         if constexpr (nw_is_int<T> && W >= 4) {
-            int_pmax_carry<T, W>(ov, ok, nbOpen, nbOpenK, bY, ge_a, seg,
+            int_pmax_carry<T, W, 32>(ov, ok, nbOpen, nbOpenK, bY, ge_a, seg,
                                  cY + off, yc, qb);
         } else {
         vd prev([&](int q) { return q == 0 ? bY : NINF; });
@@ -1034,15 +1034,15 @@ static void hb_base_striped(HbBaseJob<T>& job) {
             }
             const vd ext = prev - vge_a;
             vd v = stdx::max(O, ext);
-            vd ky = vtwo;
+            vd ky = vthirtytwo;
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
             if constexpr (sizeof(T) == 8) {
                 ky = avx512d_blend(avx512d_ge(O, ext), ky, OK);
             } else {
-                ky = sel_ge(O, ext, vtwo, OK);
+                ky = sel_ge(O, ext, vthirtytwo, OK);
             }
 #else
-            ky = sel_ge(O, ext, vtwo, OK);
+            ky = sel_ge(O, ext, vthirtytwo, OK);
 #endif
             v.copy_to(cY + off + (std::size_t)s * W, stdx::element_aligned);
             ky.copy_to(yc + (std::size_t)s * W, stdx::element_aligned);
@@ -1064,12 +1064,12 @@ static void hb_base_striped(HbBaseJob<T>& job) {
                 vd k; k.copy_from(yc + (std::size_t)s * W, stdx::element_aligned);
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
                 if constexpr (sizeof(T) == 8) {
-                    k = avx512d_blend(avx512d_gt(F, v), k, vtwo);
+                    k = avx512d_blend(avx512d_gt(F, v), k, vthirtytwo);
                 } else {
-                    stdx::where(F > v, k) = vtwo;
+                    stdx::where(F > v, k) = vthirtytwo;
                 }
 #else
-                stdx::where(F > v, k) = vtwo;
+                stdx::where(F > v, k) = vthirtytwo;
 #endif
                 k.copy_to(yc + (std::size_t)s * W, stdx::element_aligned);
                 v = stdx::max(v, F);
@@ -1084,7 +1084,7 @@ static void hb_base_striped(HbBaseJob<T>& job) {
             vd k, kmx;
             k.copy_from(yc + (std::size_t)s * W, stdx::element_aligned);
             kmx.copy_from(mx + (std::size_t)s * W, stdx::element_aligned);
-            store_codes<T, W>(kmx + k * vsixteen, dP + (std::size_t)s * W);
+            store_codes<T, W>(kmx + k, dP + (std::size_t)s * W);
         }
 
         bM = nbM; bX = nbX; bY = nbY;

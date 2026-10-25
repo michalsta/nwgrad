@@ -319,11 +319,13 @@ template <class V> [[gnu::always_inline]] static inline void nv_store(typename V
 // Always inlined: gcc outlined it as a constant-propagated clone in every integer score
 // kernel (a call, its own frame and the lane arrays per row), where it then cost more
 // than the kernel body around it.
-template <class T, int W>
+// Ext: the code recorded for an extension (the Pointers kernels pass 32, Y's field of the
+// packed byte already shifted; the open codes in `ok` are then 0 / 16).
+template <class T, int W, int Ext = 2>
 [[gnu::always_inline]] static inline void int_pmax_carry(const T* ov, const T* ok, T nbOpen, T nbOpenK,
                                   T bY, T ge_a, int seg, T* cY, T* yc, T* qbuf) {
     using vd = stdx::native_simd<T>;
-    const vd vtwo(T(2));
+    const vd vtwo(static_cast<T>(Ext));
     const vd vge(ge_a);
     const vd rbase([&](int l) { return static_cast<T>(static_cast<T>(l * seg) * ge_a); });
     vd rq = rbase;                          // k*ge_a for k = l*seg + s
