@@ -860,9 +860,9 @@ static void hb_base_striped(HbBaseJob<T>& job) {
     auto fit = [](typename DpBufferT<T>::TVec& v, std::size_t k) { if (v.size() < k) v.resize(k); };
     if (buf.hbD.size() < plane) buf.hbD.resize(plane);
     fit(buf.hprof, (std::size_t)(Tr ? 1 : nalpha) * sw);
-    // six rolling rows, ov | ok | Q (integer T), the y-code and M+X-code scratch: eleven
-    // rows of one block (spread_rows, dp_buffer.hpp)
-    std::size_t rs; T* const rows = spread_rows<T>(buf.prows, rowsz, 11, rs);
+    // six rolling rows, ov | ok | Q (integer T) and the y-code scratch: ten rows of one
+    // block (spread_rows, dp_buffer.hpp)
+    std::size_t rs; T* const rows = spread_rows<T>(buf.prows, rowsz, 10, rs);
 
     auto scol = [seg](int c) -> std::size_t {
         return (std::size_t)((c - 1) % seg) * W + (c - 1) / seg;
@@ -884,7 +884,6 @@ static void hb_base_striped(HbBaseJob<T>& job) {
     T* ok = rows + 7 * rs;
     T* qb = rows + 8 * rs;             // integer T: the Q scratch
     T* yc = rows + 9 * rs;
-    T* mx = rows + 10 * rs;            // M's code + X's (0 / 4 / 8), waiting for Y's
 
     T* pM = rows + 3 * rs; T* pX = rows + 4 * rs; T* pY = rows + 5 * rs;
     T* cM = rows;          T* cX = rows + rs;     T* cY = rows + 2 * rs;
@@ -992,7 +991,7 @@ static void hb_base_striped(HbBaseJob<T>& job) {
             kx = pick_code(ax, bx, cx, vzero, vfour, veight);
 #endif
             vxv.copy_to(cX + off + (std::size_t)s * W, stdx::element_aligned);
-            (km + kx).copy_to(mx + (std::size_t)s * W, stdx::element_aligned);
+            store_codes<T, W>(km + kx, dP + (std::size_t)s * W);   // Y's ORed in below
 
             // The open's source is chosen on the ROUNDED candidates, as the scalar pick(uy, vy, wy)
             // does: M and X values that differ can round to the same open, and then M wins.
@@ -1080,10 +1079,8 @@ static void hb_base_striped(HbBaseJob<T>& job) {
         }
         }   // integer / floating carry
         for (int s = 0; s < seg; ++s) {   // M | X << 2 | Y << 4
-            vd k, kmx;
-            k.copy_from(yc + (std::size_t)s * W, stdx::element_aligned);
-            kmx.copy_from(mx + (std::size_t)s * W, stdx::element_aligned);
-            store_codes<T, W>(kmx + k * vsixteen, dP + (std::size_t)s * W);
+            vd k; k.copy_from(yc + (std::size_t)s * W, stdx::element_aligned);
+            or_codes<T, W>(k * vsixteen, dP + (std::size_t)s * W);
         }
 
         bM = nbM; bX = nbX; bY = nbY;

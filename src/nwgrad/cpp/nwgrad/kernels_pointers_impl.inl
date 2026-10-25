@@ -9,8 +9,9 @@
 //
 // The byte packs the three states' codes, `M | X << 2 | Y << 4` (M 0..3, 3 = Local stop;
 // X and Y 0..2).  Y's code is final only after the carry, so M's and X's wait for it in a
-// T-typed scratch row (`mx`, already summed: X's code is picked as 0 / 4 / 8) and the
-// last per-row loop stores `mx + 16 * y` -- one byte stream instead of three.
+// The first pass stores `M + X` (X's code picked as 0 / 4 / 8) into the row's bytes, and
+// the last per-row loop ORs `16 * Y` into them (or_codes) -- one byte stream instead of
+// three, and no extra T-typed row.
 //
 // The traceback then reads a recorded predecessor instead of re-deriving it from
 // the tables.  Bit-exactness is preserved because the codes are produced by the
@@ -80,6 +81,29 @@ template <class T, int W>
     stdx::static_simd_cast<bvec>(code).copy_to(dst, stdx::element_aligned);
 }
 
+// OR a code vector's bytes into W bytes already stored (the packed table's row, still in
+// L1): narrowed through store_codes into a scratch, then OR-ed as at most 8-byte words.
+template <class T, int W>
+[[gnu::always_inline]] static inline void or_codes(const stdx::native_simd<T>& code, unsigned char* dst) {
+    alignas(64) unsigned char t[W];
+    store_codes<T, W>(code, t);
+    if constexpr (W == 2 || W == 4 || W == 8) {
+        using U = std::conditional_t<W == 2, uint16_t, std::conditional_t<W == 4, uint32_t, uint64_t>>;
+        U x, y;
+        std::memcpy(&x, dst, W); std::memcpy(&y, t, W);
+        x |= y;
+        std::memcpy(dst, &x, W);
+    } else {
+        static_assert(W % 8 == 0);
+        for (int k = 0; k < W; k += 8) {
+            uint64_t x, y;
+            std::memcpy(&x, dst + k, 8); std::memcpy(&y, t + k, 8);
+            x |= y;
+            std::memcpy(dst + k, &x, 8);
+        }
+    }
+}
+
 // The three-way argmax code of the scalar pick(): 0 when m >= x && m >= y, else 1 when
 // x >= y, else 2.  For an integer T it is written with STRICT compares and the blends
 // inverted — there is no packed integer >=, and gcc built each one from vpminsw +
@@ -139,10 +163,10 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
     const std::size_t dsz = (std::size_t)(m + 1) * rowsz;
     if (buf.DM.size() < dsz) buf.DM.resize(dsz);   // the packed codes (the linear fill's table too)
     // rolling score rows: 2 x rowsz instead of (m+1) x rowsz -- the whole point; with the
-    // opens, open codes, Q (integer T), y-code and M+X-code scratch and Local's padding
-    // mask, twelve rows of one block (spread_rows, dp_buffer.hpp: no two in one L1 set,
-    // and none in the set of another stream read every row)
-    std::size_t rs; T* const rows = spread_rows<T>(buf.prows, rowsz, 12, rs);
+    // opens, open codes, Q (integer T), y-code scratch and Local's padding mask, eleven rows
+    // of one block (spread_rows, dp_buffer.hpp: no two in one L1 set, and none in the set of
+    // another stream read every row)
+    std::size_t rs; T* const rows = spread_rows<T>(buf.prows, rowsz, 11, rs);
 
     auto scol = [seg](int j) -> std::size_t {
         return (std::size_t)((j - 1) % seg) * W + (j - 1) / seg;
@@ -154,7 +178,6 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
     T* ok = rows + 7 * rs;
     T* qb = rows + 8 * rs;
     T* yc = rows + 9 * rs;
-    T* mx = rows + 11 * rs;
 
     T* pM = rows + 3 * rs; T* pX = rows + 4 * rs; T* pY = rows + 5 * rs;
     T* cM = rows;          T* cX = rows + rs;     T* cY = rows + 2 * rs;
@@ -275,7 +298,7 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                 kx = pick_code(ax, bx, cx, vzero, vfour, veight);
 #endif
                 vxv.copy_to(cX + off + (std::size_t)s * W, stdx::element_aligned);
-                (km + kx).copy_to(mx + (std::size_t)s * W, stdx::element_aligned);
+                store_codes<T, W>(km + kx, dP + (std::size_t)s * W);
 
                 // The open's source is chosen on the ROUNDED candidates, as the scalar pick(uy, vy, wy)
                 // does: M and X values that differ can round to the same open, and then M wins.
@@ -366,11 +389,9 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                 if (!changed) break;
             }
             }   // integer / floating carry
-            for (int s = 0; s < seg; ++s) {   // M | X << 2 | Y << 4 (<= 63: the packs stay exact)
-                vd k, kmx;
-                k.copy_from(yc + (std::size_t)s * W, stdx::element_aligned);
-                kmx.copy_from(mx + (std::size_t)s * W, stdx::element_aligned);
-                store_codes<T, W>(kmx + k * vsixteen, dP + (std::size_t)s * W);
+            for (int s = 0; s < seg; ++s) {   // | Y << 4 (<= 32: the packs stay exact)
+                vd k; k.copy_from(yc + (std::size_t)s * W, stdx::element_aligned);
+                or_codes<T, W>(k * vsixteen, dP + (std::size_t)s * W);
             }
 
             if constexpr (Local)
