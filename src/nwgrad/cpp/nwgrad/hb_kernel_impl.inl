@@ -836,7 +836,8 @@ static void hb_scan_entry(HbScanJob<T>& j) { hb_scan_dispatch(j); }
 template <class T, bool Tr = false>
 static void hb_base_striped(HbBaseJob<T>& job) {
     using vd = stdx::native_simd<T>;
-    const int W = (int)vd::size();
+    constexpr int W = (int)vd::size();
+    constexpr bool kOpenRows = nw_is_int<T> && W >= 4;   // see striped_affine_full_ptr
     const T NINF = nw_ninf<T>;
 
     const int H = job.H, NC = job.ncols;
@@ -999,38 +1000,57 @@ static void hb_base_striped(HbBaseJob<T>& job) {
             // does: M and X values that differ can round to the same open, and then M wins.
             // Comparing vmv >= vxv before subtracting picked X there (float32, a path moved).
             // max(om, ox) is bitwise max(vmv, vxv) - go - ge: rounding is monotone.
-            const vd om = (vmv - vgo_a) - vge_a, ox = (vxv - vgo_a) - vge_a;
-            stdx::max(om, ox).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
-            vd okv = vsixteen;                  // open from X: Y's code 1, shifted
+            // (Floating T: the carry recomputes both from cM / cX instead -- the same bits --
+            // which saves two T-typed rows, a store and a load each, per segment.)
+            if constexpr (kOpenRows) {
+                const vd om = (vmv - vgo_a) - vge_a, ox = (vxv - vgo_a) - vge_a;
+                stdx::max(om, ox).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
+                vd okv = vsixteen;                  // open from X: Y's code 1, shifted
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
-            if constexpr (sizeof(T) == 8) {
-                okv = avx512d_blend(avx512d_ge(om, ox), okv, vzero);
-            } else {
-                okv = sel_ge(om, ox, vsixteen, vzero);
-            }
+                if constexpr (sizeof(T) == 8) {
+                    okv = avx512d_blend(avx512d_ge(om, ox), okv, vzero);
+                } else {
+                    okv = sel_ge(om, ox, vsixteen, vzero);
+                }
 #else
-            okv = sel_ge(om, ox, vsixteen, vzero);
+                okv = sel_ge(om, ox, vsixteen, vzero);
 #endif
-            okv.copy_to(ok + (std::size_t)s * W, stdx::element_aligned);
+                okv.copy_to(ok + (std::size_t)s * W, stdx::element_aligned);
+            }
         }
 
         // ── VY carry: same-lane striped chain + exact lazy-F, codes tracked ──
-        if constexpr (nw_is_int<T> && W >= 4) {
+        if constexpr (kOpenRows) {
             int_pmax_carry<T, W, 32>(ov, ok, nbOpen, nbOpenK, bY, ge_a, seg,
                                  cY + off, yc, qb);
         } else {
+        // The open into Y and its source, from segment q of this row's M and X: what pass 1
+        // once stored as ov / ok, recomputed with the same operations in the same order.
+        // The open's source is chosen on the ROUNDED candidates (see pass 1).
+        auto open_from = [&](int q, vd& O, vd& OK) __attribute__((always_inline)) {
+            vd vm, vx;
+            vm.copy_from(cM + off + (std::size_t)q * W, stdx::element_aligned);
+            vx.copy_from(cX + off + (std::size_t)q * W, stdx::element_aligned);
+            const vd om = (vm - vgo_a) - vge_a, ox = (vx - vgo_a) - vge_a;
+            O = stdx::max(om, ox);
+            OK = vsixteen;
+#if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
+            if constexpr (sizeof(T) == 8) OK = avx512d_blend(avx512d_ge(om, ox), OK, vzero);
+            else                          OK = sel_ge(om, ox, vsixteen, vzero);
+#else
+            OK = sel_ge(om, ox, vsixteen, vzero);
+#endif
+        };
         vd prev([&](int q) { return q == 0 ? bY : NINF; });
         for (int s = 0; s < seg; ++s) {
             vd O, OK;
             if (s == 0) {
                 vd lo, lk;
-                lo.copy_from(ov + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                lk.copy_from(ok + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                open_from(seg - 1, lo, lk);
                 O  = lane_shift_in(lo, nbOpen);
                 OK = lane_shift_in(lk, nbOpenK);
             } else {
-                O.copy_from(ov + (std::size_t)(s - 1) * W, stdx::element_aligned);
-                OK.copy_from(ok + (std::size_t)(s - 1) * W, stdx::element_aligned);
+                open_from(s - 1, O, OK);
             }
             const vd ext = prev - vge_a;
             vd v = stdx::max(O, ext);
