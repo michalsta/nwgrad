@@ -125,10 +125,8 @@ DiscrimAlign does: it passes the logical core count.
   Scores 1.035-1.043 at avx2 L100 / L200 and avx512 L140. Not the per-lane ramp base: built
   without the generator it moved neither cell and lost up to 1.038 on short rows (AGENTS).
   The v3 regression this caused (int16 Global Scores 1.02-1.06) is FIXED by the
-  in-register lane scan (AGENTS). Left: AArch64 int16 runs the scalar scan, because the
-  register form measured 1.015-1.026 there (Scores, linear; Pointers 0.977) under g++-16 on
-  macOS. Disassemble the NEON int16 carry (`level_neon.cpp`, 8 lanes: `ext` or `tbl`?) and
-  re-time on Fedora Asahi too.
+  in-register lane scan (AGENTS), on every level (NEON int16 too, once its shifts compiled
+  as `ext`). Not yet timed on spot under Fedora Asahi (macOS only).
 - **int16 saturating arithmetic, with a number**: at L1000 BLOSUM62 nwgrad refuses int16
   and runs int32 (261 us a pair, score-only, AVX2) where parasail's saturating scan16 takes
   145 us — the one fixture in the comparison parasail wins.
