@@ -304,6 +304,60 @@ template <class V> [[gnu::always_inline]] static inline void nv_store(typename V
     *reinterpret_cast<NV*>(p) = static_cast<NV>(x);
 }
 
+// Lane I of the result is f[I] for I < K, else x[I - K]: x moved K lanes up, f filling in.
+template <class NV, int W, int K, std::size_t... I>
+[[gnu::always_inline]] static inline NV nv_shift_up_(NV x, NV f, std::index_sequence<I...>) {
+    return __builtin_shufflevector(x, f, (I < (std::size_t)K ? W + (int)I : (int)I - K)...);
+}
+template <class NV, int W, int K>
+[[gnu::always_inline]] static inline NV nv_shift_up(NV x, NV f) {
+    return nv_shift_up_<NV, W, K>(x, f, std::make_index_sequence<W>{});
+}
+// The carry-in of every lane: cin[l] = max(seed, P[0..l-1]), an exclusive prefix max across
+// the lanes.  In registers, log2(W) shift + max steps, where the scalar form stored P,
+// walked the lanes through a cmov chain and read cin back as one vector from W narrow
+// stores (a load no store can forward).  Integer max is exact and associative, so the
+// lanes carry the same values either way.  Time / scalar form (2026-10-25, medians of 9,
+// controls 0.98-1.02): nighthaven AVX2 0.85-0.95 at L100-300 (int16 / int32 Scores,
+// Pointers, linear), 0.97-1.01 at L1000; solace AVX-512 0.73-0.90, L1000 0.99; spot
+// NEON int32 0.85 (linear) to 1.00, but int16 1.015-1.026 (Scores, linear; Pointers 0.98),
+// so AArch64 int16 keeps the scalar form (cause unexamined: TODO.md).
+// NWGRAD_SCALAR_LANE_SCAN forces the scalar form everywhere.
+#if !defined(NWGRAD_SCALAR_LANE_SCAN) && defined(__has_builtin)
+#if __has_builtin(__builtin_shufflevector)
+#define NWGRAD_LANE_SCAN_REG 1
+#endif
+#endif
+template <class vd, int W>
+[[gnu::always_inline]] static inline vd int_lane_carry_in(const vd& P, typename vd::value_type seed) {
+    using T = typename vd::value_type;
+#ifdef NWGRAD_LANE_SCAN_REG
+#if defined(__aarch64__)
+    if constexpr (sizeof(T) != 2)
+#endif
+    {
+    using NV = typename NVecOf<T, (int)(sizeof(T) * W)>::type;
+    const NV ninf = static_cast<NV>(vd(nw_ninf<T>));
+    NV x = static_cast<NV>(P);
+    auto mx = [](NV a, NV b) __attribute__((always_inline)) { return a > b ? a : b; };
+    x = mx(x, nv_shift_up<NV, W, 1>(x, ninf));
+    if constexpr (W > 2)  x = mx(x, nv_shift_up<NV, W, 2>(x, ninf));
+    if constexpr (W > 4)  x = mx(x, nv_shift_up<NV, W, 4>(x, ninf));
+    if constexpr (W > 8)  x = mx(x, nv_shift_up<NV, W, 8>(x, ninf));
+    if constexpr (W > 16) x = mx(x, nv_shift_up<NV, W, 16>(x, ninf));
+    static_assert(W <= 32, "int_lane_carry_in: more lanes than steps");
+    const NV vs = static_cast<NV>(vd(seed));
+    return vd(mx(nv_shift_up<NV, W, 1>(x, vs), vs));
+    }
+#endif
+    alignas(64) T tot[64], cin[64];
+    P.copy_to(tot, stdx::element_aligned);
+    T run = seed;
+    for (int l = 0; l < W; ++l) { cin[l] = run; run = std::max(run, tot[l]); }
+    vd vcin; vcin.copy_from(cin, stdx::element_aligned);
+    return vcin;
+}
+
 // Always inlined: gcc outlined it as a constant-propagated clone in every integer score
 // kernel (a call, its own frame and the lane arrays per row), where it then cost more
 // than the kernel body around it.
@@ -331,11 +385,7 @@ template <class T, int W>
         nv_store(cY + (std::size_t)s * W, P);
     }
     rq = rbase;
-    alignas(64) T tot[64], cin[64];
-    P.copy_to(tot, stdx::element_aligned);
-    T run = static_cast<T>(bY - ge_a);
-    for (int l = 0; l < W; ++l) { cin[l] = run; run = std::max(run, tot[l]); }
-    vd vcin; vcin.copy_from(cin, stdx::element_aligned);
+    const vd vcin = int_lane_carry_in<vd, W>(P, static_cast<T>(bY - ge_a));
     vd before = vcin;                       // the prefix before this segment's open
     // Two ramps a step apart, each advanced by 2*ge_a: this pass has no other loop-carried
     // value, and one ramp's add chain bound it on NEON (2-cycle integer add: 1.04-1.07x the
