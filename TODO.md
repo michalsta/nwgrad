@@ -113,17 +113,15 @@ DiscrimAlign does: it passes the logical core count.
   rows) in the Pointers, Scores and hb_base kernels, which write tables anyway — less to
   gain, but check their 12-thread L1000 drop on nighthaven; the Pointers kernel needs the
   open codes, so the fusion does not transfer one to one.
-- **4 KB aliasing of rolling rows on 4-way L1Ds**: FIXED for every leveled kernel that keeps
-  rolling rows (2026-10-24, `spread_rows`; AGENTS "FIXED beside it"). Left: (1) the Scores
-  kernel (`traceback="scores"`, opt-in): its rows are rows of the VM/VX/VY tables, 2 MiB-
-  aligned above 2 MiB, so row i of the three shares a 4 KB offset at every length, and
-  rows i-1 join it where a table row is near a 4 KB multiple — int32 Local L1020 18.5 vs
-  ~5.3 ns/cell, double L1542 1.43x (wloczykij). A fix needs a per-table base offset that
-  every `cell_index` / `rat` access carries, or padded `seg` (which meets the integer bound's
-  64 padding columns). (2) The mechanism of the r = 0 mod 4 hazard (bank conflicts?) is
-  unidentified; Piledriver has no named event for it. (3) v3: the linear int32 fills at
-  L1970–2007 are 1.09–1.10 of the old layout (L1 capacity edge, placement luck); a
-  set-balancing choice of r among the admissible ones could take it back.
+- **4 KB aliasing on 4-way L1Ds**: FIXED for every leveled rolling-row kernel (2026-10-24)
+  and, on a narrow L1 only (`table_spread()`), the Scores tables and the linear H table
+  (2026-10-25; AGENTS "FIXED beside it" and the two paragraphs after it). Left: (1) a
+  residual toll on SHORT int32 Scores pairs on Piledriver (medians of 9: Local L322 1.09,
+  Global L444 1.04): placement or padding, unseparated (the knob build for it ran while
+  skynet was loaded); (2) the mechanism of the r = 0 mod 4 hazard (bank conflicts?);
+  (3) the register ramp of `int_pmax_carry` is unmeasured on NEON and AVX-512 (measured: AVX2
+  0.79-1.02, Piledriver 0.91-1.00) — the score kernel's middle form (ramp in registers) lost
+  3-10 % on NEON inside L1, so measure spot before trusting it there.
 - **int16 saturating arithmetic, with a number**: at L1000 BLOSUM62 nwgrad refuses int16
   and runs int32 (261 us a pair, score-only, AVX2) where parasail's saturating scan16 takes
   145 us — the one fixture in the comparison parasail wins.

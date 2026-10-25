@@ -1322,7 +1322,7 @@ with every row difference k·r (k < nrows <= 13) at least 4 lines from a multipl
 (at most 9 lines of padding a row); the ramp and pad rows are built per call into their
 rows (`int_ramp_into`, `striped_pad_into`). NOT `buf.rM` for the score rows: the scalar
 linear pointer fill grows `qM` only when `rM` is short (`aligner.hpp`) — a segfault in the
-tests. The Scores kernel's tables (whole tables, 2 MiB-aligned) are NOT covered (TODO.md).
+tests. The Scores kernel's tables are whole tables: see the next paragraph.
 Three hazards, each measured by forcing r mod 64 (skynet; ns/cell):
 - score kernel, int32 Local L1024 (1.48 clean; L1D load misses 0.09 / cell): k·r ≡ 0 (the
   old layout) 6.5, misses 0.55 — the set conflict; r = 32 (rows 0/2/4 on one 4 KB offset,
@@ -1355,9 +1355,44 @@ on AVX2 at L1970–2007 read 1.09–1.10 (fine sweep L1600–2400 step 37: 0.97�
 with 10–13 % more L1 replacements and FEWER 4K-alias blocks (`ld_blocks.address_alias`) —
 their seven ~8 KB streams just exceed the 48 KB L1 there, and which sets overflow depends
 on where the row tails fall: the old layout was lucky there, from L2044 both overflow.
+(RESOLVED the next day by the register ramp, below: the band now reads 0.83 of the old
+layout.)
 Bit-identical (only addresses change): C++ suite at sse2 / sse4 (skynet), avx2
 (nighthaven), avx512 (solace), neon (spot, macOS, g++-16), ctest everywhere, the Python
 suite on skynet.
+
+**The Scores tables and the linear H table, on a narrow L1 only (2026-10-25).** The striped
+Scores kernel (`traceback="scores"`) keeps whole VM / VX / VY tables, separately allocated,
+2 MiB-aligned above 2 MiB: row i of the three shared one 4 KB offset at every length, and
+row i-1 joined it where a row is near a 4 KB multiple (wloczykij int32 Local L1020 20.6 vs
+~5.9 ns/cell). The tables are now `PlacedVec` (dp_buffer.hpp: `data()` at a chosen line of
+its 4 KB page, 4 KB of slack, contents kept across re-placement), placed at lines 0 / a / b
+(`table_lines`: rows i and i-1 of the three >= 4 lines apart, at most two per line class
+mod 4), with the row stride padded by `spread_stride` and reported as `ViterbiJob::rstride`,
+which `cell_index` uses (`striped_rs_`). The linear H table's stride is padded the same way.
+BOTH ONLY WHERE THE L1D IS NARROW (`table_spread()`: glibc's `_SC_LEVEL1_DCACHE_ASSOC` <= 4;
+`NWGRAD_TABLE_SPREAD=0/1`; tests force both and require identical results): ungated, the
+placement cost the 12-way L1s — nighthaven AVX2 Scores float32 Global L2030 1.58x, int32 /
+double L1000 1.22-1.25x (best of 3; HEAD itself is bimodal there across launches, 0.77 vs
+0.90 ns/cell, so judge such cells on medians of >= 9 launches), solace 1.06-1.13x. Gated,
+nighthaven reads HEAD (medians of 9: 0.98-1.00). wloczykij (gate on), over L200-2700: Scores
+int32 Local median 0.91 (L1020 0.29), Global 0.93 (L1020 0.24), double Local 0.88 (L505
+0.64, L1542 0.72); a residual toll on short int32 Scores pairs (medians of 9: Local L322
+1.09, Global L444 1.04, L505 1.01). Pointers' direction tables (bytes, written once a cell)
+are not placed.
+
+**The integer carry's ramp in registers (2026-10-25).** `int_pmax_carry` read the ramp k*ge_a
+from a row (`hramp`, then a block row) in both of its passes; it is now a lane base
+l*seg*ge_a plus ge_a a segment — exact in integers, never past the ramp's last value, so
+bit-identical — and the ramp rows are gone from every block (Pointers 11 rows, hb_base 10,
+the linear fills 3 / 6, lhb_striped 6, the score kernel's three-state form 8; the floating
+pmax sweeps and scans keep theirs, whose rounding is the contract). One stream fewer moves
+the L1 capacity edge. nighthaven AVX2, int32, ramp / row ramp: linear H fill L1600-2400
+0.79-0.90 (the L1970-2007 band above: 0.83), linear byte fill 0.88-0.95, Pointers L1000
+0.90-0.93, inside L1 (L200-700) 0.98-1.02; Scores int32 Local L2030 0.75 (medians of 9).
+wloczykij: linear 0.91-0.98 median, Pointers 1.00, Scores unchanged against the placed
+layout. NOT YET MEASURED on NEON or AVX-512 — the score kernel's "middle form" (the ramp in
+registers, the opens row kept) lost 3-10 % on NEON inside L1 (TODO.md).
 Not a kernel-speed loss: below the cliff nwgrad int32 is 1.0–1.3× parasail's scan32 and
 1.7–1.8× its striped32 at every length.
 
