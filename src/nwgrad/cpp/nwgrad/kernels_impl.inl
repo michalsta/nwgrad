@@ -582,8 +582,13 @@ static void striped_affine_full(ViterbiJob<T>& job) {
                 dM = uM; dX = uX; dY = uY;   // the next segment's diagonal
                 vd vxv = stdx::max(stdx::max((uM - vgo_b) - vge_b, uX - vge_b), (uY - vgo_b) - vge_b);
                 vxv.copy_to(cX + (std::size_t)s * W, stdx::element_aligned);
-                if constexpr (nw_is_int<T> && W >= 4)   // the integer carry reads the opens; the floating one recomputes them
-                    ((stdx::max(vmv, vxv) - vgo_a) - vge_a).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
+                // The opens stay a row of their own here (buf.sopenv), unlike
+                // the Pointers / Hirschberg / linear kernels, which recompute them from M and X:
+                // this kernel's cM / cX / cY are rows of whole tables, which on a wide-L1 host
+                // (table_spread() off) share one 4 KB offset, and a carry loading cM[s-1] /
+                // cX[s-1] right after storing cY[s-1] hit the store-to-load 4 KB alias on every
+                // segment -- 2.05-2.26x the time (nighthaven AVX2, double, 1 thread, 2026-10-25).
+                ((stdx::max(vmv, vxv) - vgo_a) - vge_a).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
             }
 
             // ── the carry: VY, same-lane striped chain + lazy-F (integer T: the exact
@@ -592,23 +597,14 @@ static void striped_affine_full(ViterbiJob<T>& job) {
                 int_pmax_carry<T, W>(ov, nullptr, nbOpen, T(0), bY, ge_a, seg,
                                      cY, nullptr, nullptr);
             } else {
-            // The open into Y at segment q: what pass 1 stores in `ov` for the integer carry,
-            // recomputed from the stored M and X with the same operations in the same order
-            // (the same bits), one stream fewer per segment.
-            auto open_at = [&](int q) __attribute__((always_inline)) {
-                vd vm, vx;
-                vm.copy_from(cM + (std::size_t)q * W, stdx::element_aligned);
-                vx.copy_from(cX + (std::size_t)q * W, stdx::element_aligned);
-                return vd((stdx::max(vm, vx) - vgo_a) - vge_a);
-            };
             vd prev([&](int q) { return q == 0 ? bY : K_NINF; });
             for (int s = 0; s < seg; ++s) {
                 vd O;
                 if (s == 0) {
-                    const vd lo = open_at(seg - 1);
+                    vd lo; lo.copy_from(ov + (std::size_t)(seg - 1) * W, stdx::element_aligned);
                     O = lane_shift_in(lo, nbOpen);
                 } else {
-                    O = open_at(s - 1);
+                    O.copy_from(ov + (std::size_t)(s - 1) * W, stdx::element_aligned);
                 }
                 vd v = stdx::max(O, prev - vge_a);
                 v.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
