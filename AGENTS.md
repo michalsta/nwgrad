@@ -1400,7 +1400,13 @@ steps two segments a trip with two ramps advanced by 2*ge_a (bit-identical; a pl
 rq1 = rq fails 3 of 7 `[integer]` cases): spot, ramp / row ramp, linear H fill L500-3000
 0.96-0.99, byte fill 0.98-0.99, Scores 0.96-0.98, Pointers 0.97-0.98, int16 0.98-1.00,
 L200 1.00; nighthaven AVX2, two ramps / one, 0.99-1.00 (every cell outside that range
-matched by its own B'/B launch control). AVX-512 not measured (solace asleep).
+matched by its own B'/B launch control). AVX-512 (solace under WSL, gcc 15.2, taskset, medians
+of 9, A'/A control 0.99-1.02 but 1.06 in one cell), int32, two ramps / row ramp: linear H fill
+L700-2400 0.86-0.92 (L1600-2000 0.86), byte fill 0.86-0.96, Pointers 0.90-0.99, Scores and
+Hirschberg 0.99-1.03 (in the noise), L300 0.98-1.02; two ramps / one ramp 0.95-1.03. One
+cell above the noise: int16 Local affine Pointers L200 1.04 of the row ramp (1.03 of one
+ramp; 7 segments of 32 lanes, so the two-step loop runs 3 trips and a tail), L300 1.01.
+Suite at avx512 and avx2 green (191 cases), ctest 17/17.
 Not a kernel-speed loss: below the cliff nwgrad int32 is 1.0–1.3× parasail's scan32 and
 1.7–1.8× its striped32 at every length.
 

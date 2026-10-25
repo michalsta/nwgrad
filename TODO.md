@@ -119,8 +119,9 @@ DiscrimAlign does: it passes the logical core count.
   residual toll on SHORT int32 Scores pairs on Piledriver (medians of 9: Local L322 1.09,
   Global L444 1.04): placement or padding, unseparated (the knob build for it ran while
   skynet was loaded); (2) the mechanism of the r = 0 mod 4 hazard (bank conflicts?);
-  (3) the register ramp of `int_pmax_carry` is unmeasured on AVX-512 (AVX2 0.79-1.02,
-  Piledriver 0.91-1.00, NEON 0.96-1.00 once its second pass took two ramps: AGENTS).
+  (3) the register ramp of `int_pmax_carry` (AVX2 0.79-1.02, Piledriver 0.91-1.00, NEON
+  0.96-1.00, AVX-512 0.86-1.03: AGENTS) leaves one AVX-512 cell above the noise, int16
+  Local affine Pointers L200 1.04 (7 segments: the two-step pass's tail?), unexamined.
 - **int16 saturating arithmetic, with a number**: at L1000 BLOSUM62 nwgrad refuses int16
   and runs int32 (261 us a pair, score-only, AVX2) where parasail's saturating scan16 takes
   145 us — the one fixture in the comparison parasail wins.
