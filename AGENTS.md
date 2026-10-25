@@ -468,6 +468,42 @@ The key that unlocked all of them was **striping** (Farrar's layout). Lane `l` o
 
 **Selection rule:** A when `threads × 24 × (m+1)(n+1)` fits L3, B otherwise. On the M1, always A.
 
+**Packed direction codes: one byte a cell, not three (branch `packed-codes`, 2026-10-25).** I went down into the striped Pointers kernel expecting a lean thing and found three byte tables, `DM` / `DX` / `DY`, laid down in parallel — 3 B/cell carrying six bits. They are one table now: `buf.DM` holds `M | X << 2 | Y << 4` per cell (M 0..3, 3 = the Local stop; X, Y 0..2), written by the striped kernel (`kernels_pointers_impl.inl`), the scalar reference (`viterbi_affine_ptr_impl`), both Hirschberg base cases (`hb_base_striped` into `hbD`, scalar `hb_base`), and read by `walk_affine` and the two base-case walk-backs — one byte read per step, not one per state. `DX` / `DY` are gone; the linear Pointers fills keep their 0..3 move in the same `DM`. Nothing is recomputed to pack: every code is the same `>=` M>X>Y choice it always was, only produced already shifted into its field (X picked as 0 / 4 / 8, Y carried as 0 / 16 / 32 — `int_pmax_carry` takes the extension code as a template parameter), M + X waiting in a T-typed scratch row (`mx`, `prows` now 12 rows) until the carry and lazy-F have finished revising Y, and the last per-row loop storing `mx + y` through `store_codes`.
+
+The premise did not survive as written. Step 0 (old build, nighthaven, Local double Pointers, L 500–2000): throughput did *not* fall from 6 to 12 threads (L2000 ~2875 → ~2990 Mcell/s), LLC-miss traffic was 1.5–1.9 B/cell, and most of the 1 → 6 thread per-thread slowdown (+12 %) was already there at L500, inside cache — frequency, not DRAM. At double the wall is weak. **At float32 and int32 it is not**: there the old kernel's thread-ns/cell went from 0.83 (1 thread) to 3.85 (12 threads) at L2000, and that is where one byte a cell buys the most. The rest of the gain is compute, found in the assembly on the way down:
+- **(a) packing** (`a8a4a4b`): three narrow-and-store sequences a segment become one.
+- **(b) M + X stored as bytes in the first pass, Y OR-ed in** (`or_codes`; no T row): *slower* than (a) in cache (L200 1.000 vs 0.946), a tie at L2000 — two narrows cost more than the T row's L1 traffic. Reverted (`6199097`).
+- **(c) the codes read off the three-way max** (`db2607e`, `pick_code_mx`): `m >= x && m >= y` is exactly `max(max(m, x), y) == m` (max is exact, no NaN, `==` ignores the sign of zero), and the kernel computes that max anyway — one compare where the chain took two and an AND (or two and an OR for integers). clang + AVX-512 + 64-bit lanes: `avx512d_eq`.
+- **(d) the previous row's up vectors rotated into the next segment's diagonal** (`6ce7645`): each previous-row vector loaded once, not twice.
+- **(f) Y's codes carried pre-shifted** (`23fcb73`): the packing loop is one add.
+- **(g) floating T: the carry recomputes the opens and their sources from `cM` / `cX`** (`38a3921`) instead of reading the `ov` / `ok` rows pass 1 wrote — the same operations in the same order, so the same bits; two T-typed streams (a store and a load each, a segment) gone. The integer carry (`int_pmax_carry`) still reads the rows. This was the largest single step on AVX-512 and NEON.
+
+Measured (`bench_ptr.py`-style A/B: alternating processes, best of 3, release-wheel flags verified on the compile lines, control arm = the old build again; explicit `traceback="pointers"`, proteome pairs within ±10 % of L, BLOSUM62 11/1; thread-ns/cell, new/old), gcc unless noted:
+
+| host | case | 1 thread, L200–500 | 1 thread, L1000–2000 | all threads, L1000–2000 |
+|---|---|---|---|---|
+| nighthaven AVX2 (12t) | double Local | 0.80–0.82 | 0.81–0.83 | 0.75–0.79 |
+| | double Global | 0.79–0.81 | 0.78–0.79 | 0.71–0.75 |
+| | float32 Local / Global | 0.80–0.86 | 0.76–0.78 | **0.40–0.46** (L2000), 0.60–0.69 (L1000) |
+| | int32 Local / Global | 0.86–0.89 | 0.91–0.96 | **0.51–0.61** (L2000), 0.80–0.84 (L1000) |
+| solace AVX-512 (16t, WSL) | double Local | 0.82–0.83 | 0.69–0.73 | 0.79 |
+| | float32 Local | 0.84–0.87 | 0.71–0.82 | **0.45** (L2000) |
+| | int32 Local / Global | 0.87–0.89 | 0.84–0.89 | 0.51–0.58 (L2000) |
+| spot NEON (M1, 8t, macOS g++-16) | double Local | 0.78–0.79 | 0.77 | 0.76–0.80 |
+| | float32 Local | 0.67–0.68 | 0.65–0.66 | 0.66–0.69 |
+| | double Global | 0.73 | 0.71 | 0.71 |
+| | float32 Global | 0.67 | 0.64 | 0.64–0.66 |
+| | int32 Local / Global | 0.82–0.83 | 0.82 | 0.83–0.87 |
+| wloczykij sse4 (1t, exact L, the 4 KB-aliasing lengths) | int32 L993–2030 | — | 0.91–0.96 | — |
+| | float32 L993–2030 | — | 0.83–0.86 | — |
+| | double L497–1298 | 0.80–0.83 | 0.80–0.82 | — |
+
+Controls 0.98–1.02 except a few laptop cells (solace 8 threads 0.91–1.06, thermals; nighthaven one 0.935). No cell regressed on any host; L100 (the inter-pair fill, untouched) reads 1.00. The aliasing lengths stay clean with the twelfth row in `prows`. clang (solace, clang 21.1 vs gcc 15.2): new/old under clang tracks gcc's, a little better on Global double (L2000 1t 0.69 vs 0.82); wheels stay gcc.
+
+Bit-identity, not tolerance: the C++ suite at sse2/sse4 (skynet), avx512 (solace, gcc and clang), ASan+UBSan (gcc, clang) and TSan (gcc) on skynet; the Python suite (4433 passed); `tools/fuzz_ab.py` old vs new 0/600 (skynet), 0/300 at avx512 under gcc and under clang; a cross-build hasher (scores, gradients, aligned strings, coordinates, guides; all five scalar types × Local/Global × pointers / Hirschberg base cases at cutoffs 8 and 37 / pmax × untracked / tracked K=3) 0 of 640 configurations differ on skynet, 0 of 480 at five levels on solace and at neon on spot, every level equal to `scalar_fallback`. Two planted mutants — lazy-F's Y-code revision dropped, the walk reading X's field with Y's shift — were each caught by the C++ suite (15 and 14 failing cases).
+
+Not done, deliberately: re-measuring `hb_cutoff` and the Local `auto` = Pointers choice under the smaller table (a separate decision; float32 Pointers now beats its old self 2.2× under the wall, which may move both); four cells in three bytes (step 2: the time no longer tracks bytes moved anywhere but float32 / int32 at high thread counts, and there one byte already halves it); the linear fill's four-cells-a-byte; the same load rotation and max-equality pick in the Scores kernel and the Hirschberg sweeps, which have the identical double-load pattern.
+
 **Hirschberg (linear-space) — SHIPPED, and now the DEFAULT for affine+global+full** (via the `traceback="auto"` sentinel; see below). Not bit-exact above its cutoff, bit-exact at or below it. (This paragraph once read "prototyped, and deliberately not adopted," then "opt-in"; both are superseded. What changed: the memory wall above the physical-core count made it win at scale, then vectorizing the base case made a large cutoff cheap, which made it degrade to exact Pointers for short pairs — safe as a default.)
 
 Myers-Miller, not plain Hirschberg: the affine gap state is carried across each row cut by two boundary flags (`in_x`/`out_x` in `aligner.hpp`), seeded by putting a block's origin in M or X. **Only X can straddle a row cut** — a Y run lives entirely within one row, and the cut is between rows — which is why there is no `in_y`. The join adds one `+go_b` refund where an X run spans the cut, because both halves otherwise charge the open. Getting that refund wrong does not crash and does not produce an invalid path; it silently returns a *suboptimal* one. The base case is a **vectorized** striped fill that records direction bytes (`hb_kernel_impl.inl::hb_base_striped`, leveled like the sweeps) — the striped Pointers kernel restricted to a sub-rectangle with the `in_x` seed and a carried (not closed-form) left edge; the aligner walks its striped direction tables back. Bit-exact with the scalar `hb_base` at every ISA width and both precisions (verified sse2/avx2/avx512/neon). This is what lets the cutoff be large without the base case dominating.
