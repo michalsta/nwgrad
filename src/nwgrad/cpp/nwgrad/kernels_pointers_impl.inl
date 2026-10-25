@@ -105,29 +105,25 @@ template <class T, int W>
 }
 
 // The three-way argmax code of the scalar pick(): 0 when m >= x && m >= y, else 1 when
-// x >= y, else 2.  For an integer T it is written with STRICT compares and the blends
-// inverted — there is no packed integer >=, and gcc built each one from vpminsw +
-// vpcmpeqw (clang swaps the operands instead); the kernel has eight per vector of
-// cells, ~20 % of its instructions.  Same codes: (y > x ? 2 : 1) is (x >= y ? 1 : 2),
-// and "0 unless x > m or y > m" is "0 when m >= x and m >= y".  Floating T keeps the
-// form it always had (vcmpleps exists), so its codegen is untouched.
+// x >= y, else 2 -- read off the three-way max the kernel computes anyway,
+// mx = max(max(m, x), y): m >= x && m >= y is exactly mx == m (max is exact, -inf
+// equals itself, there is no NaN, and == ignores the sign of a zero, so the order the
+// max ran in cannot matter).  One compare where the chain took two and an AND (floating)
+// or two and an OR (integer).  For an integer T the x/y choice is STRICT with the blend
+// inverted -- there is no packed integer >=, and gcc built each one from vpminsw +
+// vpcmpeqw (clang swaps the operands instead): (y > x ? 2 : 1) is (x >= y ? 1 : 2).
+// `vone` / `vtwo` are the codes of x / y (X's are passed pre-shifted, 4 and 8).
 // (always_inline: at AVX-512 gcc called these out of line for the 32-lane int16 vectors,
 // four and two calls per segment, each returning 64 bytes through memory.)
 template <class V>
-[[gnu::always_inline]] static inline V pick_code(const V& m, const V& x, const V& y, const V& vzero, const V& vone, const V& vtwo) {
+[[gnu::always_inline]] static inline V pick_code_mx(const V& mx, const V& m, const V& x, const V& y,
+                                                   const V& vzero, const V& vone, const V& vtwo) {
     using T = typename V::value_type;
-    if constexpr (nw_is_int<T>) {
-        V k = vone;
-        stdx::where(y > x, k) = vtwo;
-        V r = vzero;
-        stdx::where((x > m) || (y > m), r) = k;
-        return r;
-    } else {
-        V k = vtwo;
-        stdx::where(x >= y, k) = vone;
-        stdx::where((m >= x) && (m >= y), k) = vzero;
-        return k;
-    }
+    V k;
+    if constexpr (nw_is_int<T>) { k = vone; stdx::where(y > x, k) = vtwo; }
+    else                        { k = vtwo; stdx::where(x >= y, k) = vone; }
+    stdx::where(mx == m, k) = vzero;
+    return k;
 }
 // `dest` where a >= b takes `value`: strict form for integer lanes (the default and the
 // value swapped), the >= form for floating.
@@ -248,19 +244,20 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                     dgY.copy_from(pY + off + (std::size_t)(s - 1) * W, stdx::element_aligned);
                 }
                 vd sb; sb.copy_from(sub + (std::size_t)s * W, stdx::element_aligned);
-                vd vmv = stdx::max(stdx::max(dgM, dgX), dgY) + sb;
+                const vd mx3 = stdx::max(stdx::max(dgM, dgX), dgY);
+                vd vmv = mx3 + sb;
 
                 // M code: same >= chain as the scalar pick(), M last so it wins ties
                 vd km = vtwo;
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
                 if constexpr (sizeof(T) == 8) {
                     km = avx512d_blend(avx512d_ge(dgX, dgY), km, vone);
-                    km = avx512d_blend(avx512d_ge(dgM, dgX) & avx512d_ge(dgM, dgY), km, vzero);
+                    km = avx512d_blend(avx512d_eq(mx3, dgM), km, vzero);
                 } else {
-                    km = pick_code(dgM, dgX, dgY, vzero, vone, vtwo);
+                    km = pick_code_mx(mx3, dgM, dgX, dgY, vzero, vone, vtwo);
                 }
 #else
-                km = pick_code(dgM, dgX, dgY, vzero, vone, vtwo);
+                km = pick_code_mx(mx3, dgM, dgX, dgY, vzero, vone, vtwo);
 #endif
                 if constexpr (Local) {
                     vmv = stdx::max(vmv, vzero);
@@ -290,12 +287,12 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
                 if constexpr (sizeof(T) == 8) {
                     kx = avx512d_blend(avx512d_ge(bx, cx), kx, vfour);
-                    kx = avx512d_blend(avx512d_ge(ax, bx) & avx512d_ge(ax, cx), kx, vzero);
+                    kx = avx512d_blend(avx512d_eq(vxv, ax), kx, vzero);
                 } else {
-                    kx = pick_code(ax, bx, cx, vzero, vfour, veight);
+                    kx = pick_code_mx(vxv, ax, bx, cx, vzero, vfour, veight);
                 }
 #else
-                kx = pick_code(ax, bx, cx, vzero, vfour, veight);
+                kx = pick_code_mx(vxv, ax, bx, cx, vzero, vfour, veight);
 #endif
                 vxv.copy_to(cX + off + (std::size_t)s * W, stdx::element_aligned);
                 store_codes<T, W>(km + kx, dP + (std::size_t)s * W);

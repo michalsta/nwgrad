@@ -959,17 +959,18 @@ static void hb_base_striped(HbBaseJob<T>& job) {
                 dgY.copy_from(pY + off + (std::size_t)(s - 1) * W, stdx::element_aligned);
             }
             vd sb; sb.copy_from(sub + (std::size_t)s * W, stdx::element_aligned);
-            vd vmv = stdx::max(stdx::max(dgM, dgX), dgY) + sb;
+            const vd mx3 = stdx::max(stdx::max(dgM, dgX), dgY);
+            vd vmv = mx3 + sb;
             vd km = vtwo;
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
             if constexpr (sizeof(T) == 8) {
                 km = avx512d_blend(avx512d_ge(dgX, dgY), km, vone);
-                km = avx512d_blend(avx512d_ge(dgM, dgX) & avx512d_ge(dgM, dgY), km, vzero);
+                km = avx512d_blend(avx512d_eq(mx3, dgM), km, vzero);
             } else {
-                km = pick_code(dgM, dgX, dgY, vzero, vone, vtwo);
+                km = pick_code_mx(mx3, dgM, dgX, dgY, vzero, vone, vtwo);
             }
 #else
-            km = pick_code(dgM, dgX, dgY, vzero, vone, vtwo);
+            km = pick_code_mx(mx3, dgM, dgX, dgY, vzero, vone, vtwo);
 #endif
             vmv.copy_to(cM + off + (std::size_t)s * W, stdx::element_aligned);
 
@@ -983,12 +984,12 @@ static void hb_base_striped(HbBaseJob<T>& job) {
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
             if constexpr (sizeof(T) == 8) {
                 kx = avx512d_blend(avx512d_ge(bx, cx), kx, vfour);
-                kx = avx512d_blend(avx512d_ge(ax, bx) & avx512d_ge(ax, cx), kx, vzero);
+                kx = avx512d_blend(avx512d_eq(vxv, ax), kx, vzero);
             } else {
-                kx = pick_code(ax, bx, cx, vzero, vfour, veight);
+                kx = pick_code_mx(vxv, ax, bx, cx, vzero, vfour, veight);
             }
 #else
-            kx = pick_code(ax, bx, cx, vzero, vfour, veight);
+            kx = pick_code_mx(vxv, ax, bx, cx, vzero, vfour, veight);
 #endif
             vxv.copy_to(cX + off + (std::size_t)s * W, stdx::element_aligned);
             store_codes<T, W>(km + kx, dP + (std::size_t)s * W);   // Y's ORed in below

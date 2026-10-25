@@ -84,6 +84,18 @@ static inline stdx::native_simd<int64_t> avx512d_blend(__mmask8 k, stdx::native_
     res.copy_from(out, stdx::element_aligned);
     return res;
 }
+static inline __mmask8 avx512d_eq(stdx::native_simd<double> a, stdx::native_simd<double> b) {
+    alignas(64) double aa[8], bb[8];
+    a.copy_to(aa, stdx::element_aligned);
+    b.copy_to(bb, stdx::element_aligned);
+    return _mm512_cmp_pd_mask(_mm512_load_pd(aa), _mm512_load_pd(bb), _CMP_EQ_OQ);
+}
+static inline __mmask8 avx512d_eq(stdx::native_simd<int64_t> a, stdx::native_simd<int64_t> b) {
+    alignas(64) int64_t aa[8], bb[8];
+    a.copy_to(aa, stdx::element_aligned);
+    b.copy_to(bb, stdx::element_aligned);
+    return _mm512_cmpeq_epi64_mask(_mm512_load_si512(aa), _mm512_load_si512(bb));
+}
 // The lazy-F early exit (any lane of F above v), for both 8-byte lane types.
 template <class V>
 static inline bool avx512d_any_gt(const V& F, const V& v) { return avx512d_gt(F, v) != 0; }
