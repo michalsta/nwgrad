@@ -1407,6 +1407,16 @@ Hirschberg 0.99-1.03 (in the noise), L300 0.98-1.02; two ramps / one ramp 0.95-1
 cell above the noise: int16 Local affine Pointers L200 1.04 of the row ramp (1.03 of one
 ramp; 7 segments of 32 lanes, so the two-step loop runs 3 trips and a tail), L300 1.01.
 Suite at avx512 and avx2 green (191 cases), ctest 17/17.
+Tried for that cell and REJECTED (2026-10-25, same harness and box, + one arm): the
+per-lane ramp base `l*seg*ge_a` built as a lane-index vector times one splat instead of the
+generator constructor (in `int_pmax_carry` and the fused score carry). Bit-exact (suite at
+avx512 / avx2, sse2 / sse4), but no readable gain anywhere, patch / two ramps: int16 Local
+Pointers L96-288 0.99-1.01 (L200 0.990: the 1.03-1.04 stayed), avx2 0.98-1.00; and losses on
+short rows with clean controls: int16 Global Scores L200 1.038, int16 Global linear L300
+1.020, int32 Global linear L300 1.035; long rows (L1000-2000) noise. The same run found a
+second register-ramp cell: int16 Global Scores, two ramps / row ramp 1.035-1.043 at avx2
+L100 / L200 and avx512 L140 (avx512 L200 1.02, L300 0.98; control 1.00-1.01) -- not the ramp
+base, which the patch removed without moving it.
 Not a kernel-speed loss: below the cliff nwgrad int32 is 1.0–1.3× parasail's scan32 and
 1.7–1.8× its striped32 at every length.
 
