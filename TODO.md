@@ -159,6 +159,22 @@ DiscrimAlign does: it passes the logical core count.
   the same 4 lanes as double) and 4-5x at sse2 (no 64-bit compare at all). It is headroom
   for huge parameters, not a speed type; nothing cheap left to do for it.
 
+## Per-ISA default gates: a large benchmark sweep
+
+The fill gates are thresholds measured on one host per ISA. `inter_score_ok` /
+`kInterScoreGatherCells` (8192 cells, ~L90), `kInterLinearIntGatherCells`, the
+`inter_pair_fits` byte caps and `kLinearStripedMinN` all come from nighthaven (AVX2),
+with spot (NEON) as a check. They do not carry over. On wloczykij (Piledriver, sse4 level,
+2026-10-25, nwgrad vs SeqAn3 run, `integer` 1f48c1e), float32 Global affine score-only
+at L100 runs striped at 55.5 ms a batch (2000 pairs, 1 thread). Forced through
+`interpair` on `main` (no gate there), it takes 36.5 ms: the gate costs 1.5x on that host.
+Sweep every gate per ISA level (sse2, sse4, avx2, avx512, neon) on the fleet, over
+length, every scalar type, mode, gap model and output (score / path / hard grad), at
+1 thread and all cores. Then make the thresholds per level, with a table instead of one
+constant. The integer types pass the same score-only gate; check whether they are
+penalised the same way. Python cannot force them past it, so the sweep needs a knob
+(an env override or a C++ bench).
+
 ## Per-pair gradients stored contiguously (weighted_grad, grads)
 
 `weighted_grad()` and `grads()` read every pair's cached gradient from its own
