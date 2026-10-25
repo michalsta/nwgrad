@@ -138,7 +138,8 @@ static void hb_sweep_striped(HbJob<T>& job) {
 
     T* pM = rows + 3 * rs; T* pX = rows + 4 * rs; T* pY = rows + 5 * rs;
     T* cM = rows;          T* cX = rows + rs;     T* cY = rows + 2 * rs;
-    T* ov = rows + 6 * rs;
+    // row 6 held the opens (ov); the carry recomputes them from cM / cX now -- the row stays
+    // in the block so the spread layout (strides, 4 KB offsets) is the one measured
 
     // Striped query profile over the block's column slice.  prof[sym][s*W+l] is the
     // score of `sym` against the residue in column l*seg+s+1.  Built per block because
@@ -219,10 +220,16 @@ static void hb_sweep_striped(HbJob<T>& job) {
             const vd vxv = stdx::max(stdx::max((uM - vgo_b) - vge_b, uX - vge_b),
                                      (uY - vgo_b) - vge_b);
             vxv.copy_to(cX + (std::size_t)s * W, stdx::element_aligned);
-            // The value a new Y-gap would open with, for the carry pass below.
-            ((stdx::max(vmv, vxv) - vgo_a) - vge_a)
-                .copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
         }
+        // The open into Y at segment q: what pass 1 once stored in `ov`, recomputed from the
+        // stored M and X with the same operations in the same order (the same bits), one
+        // stream fewer per segment.
+        auto open_at = [&](int q) __attribute__((always_inline)) {
+            vd vm, vx;
+            vm.copy_from(cM + (std::size_t)q * W, stdx::element_aligned);
+            vx.copy_from(cX + (std::size_t)q * W, stdx::element_aligned);
+            return vd((stdx::max(vm, vx) - vgo_a) - vge_a);
+        };
 
         // ── the carry: VY, same-lane striped chain, then lazy-F ──────────────
         // The base sweep assumes each lane's chain starts fresh; a gap that runs past a
@@ -234,10 +241,10 @@ static void hb_sweep_striped(HbJob<T>& job) {
         for (int s = 0; s < seg; ++s) {
             vd O;
             if (s == 0) {
-                vd lo; lo.copy_from(ov + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                const vd lo = open_at(seg - 1);
                 O = lane_shift_in(lo, nbOpen);
             } else {
-                O.copy_from(ov + (std::size_t)(s - 1) * W, stdx::element_aligned);
+                O = open_at(s - 1);
             }
             const vd v = stdx::max(O, prev - vge_a);
             v.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
@@ -382,7 +389,8 @@ static void hb_sweep_striped_pmax(HbJob<T>& job) {
 
     T* pM = rows + 3 * rs; T* pX = rows + 4 * rs; T* pY = rows + 5 * rs;
     T* cM = rows;          T* cX = rows + rs;     T* cY = rows + 2 * rs;
-    T* ov = rows + 6 * rs;
+    // row 6 held the opens (ov); the carry recomputes them from cM / cX now -- the row stays
+    // in the block so the spread layout (strides, 4 KB offsets) is the one measured
     T* rmp = rows + 7 * rs;
 
     // The gap ramp, striped: slot (s,l) carries k*ge_a for the ABSOLUTE column index
@@ -464,9 +472,16 @@ static void hb_sweep_striped_pmax(HbJob<T>& job) {
             const vd vxv = stdx::max(stdx::max((uM - vgo_b) - vge_b, uX - vge_b),
                                      (uY - vgo_b) - vge_b);
             vxv.copy_to(cX + (std::size_t)s * W, stdx::element_aligned);
-            ((stdx::max(vmv, vxv) - vgo_a) - vge_a)
-                .copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
         }
+        // The open into Y at segment q: what pass 1 once stored in `ov`, recomputed from the
+        // stored M and X with the same operations in the same order (the same bits), one
+        // stream fewer per segment.
+        auto open_at = [&](int q) __attribute__((always_inline)) {
+            vd vm, vx;
+            vm.copy_from(cM + (std::size_t)q * W, stdx::element_aligned);
+            vx.copy_from(cX + (std::size_t)q * W, stdx::element_aligned);
+            return vd((stdx::max(vm, vx) - vgo_a) - vge_a);
+        };
 
         // ── pass 1: Q[k] = g[k] + k*ge_a, then a LANE-LOCAL prefix max ───────
         // The `O` vector is built exactly as in the exact sweep (segment s of lane l
@@ -477,10 +492,10 @@ static void hb_sweep_striped_pmax(HbJob<T>& job) {
         for (int s = 0; s < seg; ++s) {
             vd O;
             if (s == 0) {
-                vd lo; lo.copy_from(ov + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                const vd lo = open_at(seg - 1);
                 O = lane_shift_in(lo, nbOpen);
             } else {
-                O.copy_from(ov + (std::size_t)(s - 1) * W, stdx::element_aligned);
+                O = open_at(s - 1);
             }
             vd rq; rq.copy_from(rmp + (std::size_t)s * W, stdx::element_aligned);
             P = stdx::max(O + rq, P);
@@ -585,7 +600,8 @@ static void hb_scan_impl(HbScanJob<T>& job) {
 
     T* pM = rows + 3 * rs; T* pX = rows + 4 * rs; T* pY = rows + 5 * rs;
     T* cM = rows;          T* cX = rows + rs;     T* cY = rows + 2 * rs;
-    T* ov = rows + 6 * rs;
+    // row 6 held the opens (ov); the carry recomputes them from cM / cX now -- the row stays
+    // in the block so the spread layout (strides, 4 KB offsets) is the one measured
     T* rmp = rows + 7 * rs;
     T ramp_ge = ge_a;
     bool ramp_ok = false;
@@ -703,9 +719,16 @@ static void hb_scan_impl(HbScanJob<T>& job) {
             const vd vxv = stdx::max(stdx::max((uM - vgo_b) - vge_b, uX - vge_b),
                                      (uY - vgo_b) - vge_b);
             vxv.copy_to(cX + (std::size_t)s * W, stdx::element_aligned);
-            ((stdx::max(vmv, vxv) - vgo_a) - vge_a)
-                .copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
         }
+        // The open into Y at segment q: what pass 1 once stored in `ov`, recomputed from the
+        // stored M and X with the same operations in the same order (the same bits), one
+        // stream fewer per segment.
+        auto open_at = [&](int q) __attribute__((always_inline)) {
+            vd vm, vx;
+            vm.copy_from(cM + (std::size_t)q * W, stdx::element_aligned);
+            vx.copy_from(cX + (std::size_t)q * W, stdx::element_aligned);
+            return vd((stdx::max(vm, vx) - vgo_a) - vge_a);
+        };
 
         if constexpr (Pmax) {
             // ── the carry as a prefix max (hb_sweep_striped_pmax, verbatim) ──────
@@ -713,10 +736,10 @@ static void hb_scan_impl(HbScanJob<T>& job) {
             for (int s = 0; s < seg; ++s) {
                 vd O;
                 if (s == 0) {
-                    vd lo; lo.copy_from(ov + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                    const vd lo = open_at(seg - 1);
                     O = lane_shift_in(lo, nbOpen);
                 } else {
-                    O.copy_from(ov + (std::size_t)(s - 1) * W, stdx::element_aligned);
+                    O = open_at(s - 1);
                 }
                 vd rq; rq.copy_from(rmp + (std::size_t)s * W, stdx::element_aligned);
                 P = stdx::max(O + rq, P);
@@ -738,10 +761,10 @@ static void hb_scan_impl(HbScanJob<T>& job) {
         for (int s = 0; s < seg; ++s) {
             vd O;
             if (s == 0) {
-                vd lo; lo.copy_from(ov + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                const vd lo = open_at(seg - 1);
                 O = lane_shift_in(lo, nbOpen);
             } else {
-                O.copy_from(ov + (std::size_t)(s - 1) * W, stdx::element_aligned);
+                O = open_at(s - 1);
             }
             const vd v = stdx::max(O, prev - vge_a);
             v.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);

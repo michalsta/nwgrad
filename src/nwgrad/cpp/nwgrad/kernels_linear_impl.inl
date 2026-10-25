@@ -208,7 +208,8 @@ static void striped_linear_full(ViterbiJob<T>& job) {
                 }
                 if constexpr (Local) t = stdx::max(t, vzero);
                 t.copy_to(cH + off + (std::size_t)s * W, stdx::element_aligned);
-                (t - vge_a).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
+                if constexpr (nw_is_int<T> && W >= 4)   // the integer carry reads the opens; the floating one recomputes them
+                    (t - vge_a).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
             }
 
             // ── the carry: Y[c] = max(open[c-1], Y[c-1] - ge_a) along each lane ──
@@ -216,14 +217,20 @@ static void striped_linear_full(ViterbiJob<T>& job) {
                 int_pmax_carry<T, W>(ov, nullptr, nbOpen, static_cast<T>(0),
                                      K_NINF, ge_a, seg, yv, nullptr, nullptr);
             } else {
+                // The open into Y at segment q: `t - ge_a`, t still in cH until pass 2 -- the same
+                // bits pass 1 stores in `ov` for the integer carry; one stream fewer per segment.
+                auto open_at = [&](int q) __attribute__((always_inline)) {
+                    vd t; t.copy_from(cH + off + (std::size_t)q * W, stdx::element_aligned);
+                    return vd(t - vge_a);
+                };
                 vd prev = vninf;                         // column 0 holds no Y
                 for (int s = 0; s < seg; ++s) {
                     vd O;
                     if (s == 0) {
-                        vd lo; lo.copy_from(ov + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                        const vd lo = open_at(seg - 1);
                         O = lane_shift_in(lo, nbOpen);
                     } else {
-                        O.copy_from(ov + (std::size_t)(s - 1) * W, stdx::element_aligned);
+                        O = open_at(s - 1);
                     }
                     const vd v = stdx::max(O, prev - vge_a);
                     v.copy_to(yv + (std::size_t)s * W, stdx::element_aligned);
@@ -441,21 +448,28 @@ static void lhb_striped(LhbJob<T>& job) {
                 }
                 if (job.clamp) t = stdx::max(t, vzero);
                 t.copy_to(cH + off + (std::size_t)s * W, stdx::element_aligned);
-                (t - vga).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
+                if constexpr (nw_is_int<T> && W >= 4)   // the integer carry reads the opens; the floating one recomputes them
+                    (t - vga).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
             }
 
             if constexpr (nw_is_int<T> && W >= 4) {
                 int_pmax_carry<T, W>(ov, nullptr, nbOpen, static_cast<T>(0),
                                      K_NINF, ga, seg, yv, nullptr, nullptr);
             } else {
+                // The open into Y at segment q: `t - ge_a`, t still in cH until pass 2 -- the same
+                // bits pass 1 stores in `ov` for the integer carry; one stream fewer per segment.
+                auto open_at = [&](int q) __attribute__((always_inline)) {
+                    vd t; t.copy_from(cH + off + (std::size_t)q * W, stdx::element_aligned);
+                    return vd(t - vga);
+                };
                 vd prev = vninf;
                 for (int s = 0; s < seg; ++s) {
                     vd O;
                     if (s == 0) {
-                        vd lo; lo.copy_from(ov + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                        const vd lo = open_at(seg - 1);
                         O = lane_shift_in(lo, nbOpen);
                     } else {
-                        O.copy_from(ov + (std::size_t)(s - 1) * W, stdx::element_aligned);
+                        O = open_at(s - 1);
                     }
                     const vd v = stdx::max(O, prev - vga);
                     v.copy_to(yv + (std::size_t)s * W, stdx::element_aligned);
