@@ -1429,6 +1429,10 @@ stalls, waited longer (why longer is unproven: the ramp-free first pass reaching
 with more stores in flight is the likely story). The lever is the scan, in both forms: an
 in-register exclusive prefix max across the lanes (log2 W shift + max steps, a cross-half
 permute at 256 bits) would remove the chain and both forwarding stalls, bit-identically.
+CAVEAT: a Windows game (~0.4-0.9 core, invisible to WSL's load average) ran on solace from
+18:58 that day, i.e. through most of the patch rerun above and all of this profiling; the
+A/A' controls held (0.96-1.01) but the single-run `perf stat` pair is exposed. Re-measure
+on a quiet host (Windows side checked) before acting on the cycle counts.
 Not a kernel-speed loss: below the cliff nwgrad int32 is 1.0–1.3× parasail's scan32 and
 1.7–1.8× its striped32 at every length.
 
