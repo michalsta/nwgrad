@@ -175,17 +175,19 @@ struct DpBufferT {
 
     // ── TracebackMode::Pointers: predecessors instead of retained score tables ─
     //
-    // DM/DX/DY hold, for every cell, which predecessor state the forward pass chose
-    // — 0=M, 1=X, 2=Y — recorded with exactly the traceback's own `>=` M>X>Y
-    // tie-break, which is what makes B bit-exact and not merely correct.  DM also
-    // carries the sentinel 3 = "VM <= 0 here", reproducing Local's traceback stop
-    // condition without keeping a single VM value around.
+    // DM holds, for every cell, which predecessor state each state's forward pass chose
+    // — 0=M, 1=X, 2=Y — packed into one byte, M | X << 2 | Y << 4, recorded with exactly
+    // the traceback's own `>=` M>X>Y tie-break, which is what makes B bit-exact and not
+    // merely correct.  M's field also carries the sentinel 3 = "VM <= 0 here",
+    // reproducing Local's traceback stop condition without keeping a single VM value
+    // around.  (The linear Pointers fills keep their move, 0..3, in the same table.)
     //
     // With these, the score tables collapse to two rolling rows (rM/rX/rY below),
-    // so the retained footprint is 3 B/cell instead of 12.  That footprint is the
+    // so the retained footprint is 1 B/cell instead of 12.  That footprint is the
     // thing measured to drive the page-fault cost that dominates the memory-bound
-    // regime — see the sorted-scheduler notes.
-    BVec DM, DX, DY;
+    // regime — see the sorted-scheduler notes.  (Until 2026-10-25 it was three tables,
+    // DM/DX/DY, 3 B/cell.)
+    BVec DM;
     TVec rM, rX, rY, qM, qX, qY;   // rolling current/previous rows (O(n), not O(mn))
     // Rolling rows of the leveled kernels, each family's carved from ONE block by
     // spread_rows (below): srows score-only, prows striped Pointers and hb_base_striped,
@@ -204,7 +206,7 @@ struct DpBufferT {
     TVec hfa, hfb, hfc, hfd, hfe, hff;   // forward rolling rows (M,X,Y) x (prev,cur)
     TVec hra, hrb, hrc, hrd, hre, hrf;   // reverse rolling rows (M,X,Y) x (prev,cur)
     TVec hsM, hsX, hsY;                  // forward half's split row, saved
-    BVec hbD;                            // base-case direction table (3 x block)
+    BVec hbD;                            // base-case direction table (packed, as DM)
     BVec hops;                           // the path: 0=M(diag) 1=X(gap in b) 2=Y(gap in a)
     // Striped simd sweep only: the block's query profile in striped order, and one
     // striped row of VM/VX open values feeding the VY carry.  Both O(block width).
@@ -239,7 +241,7 @@ struct DpBufferT {
         clrT(prof); clrT(subbuf);
         clrT(sopenv); clrT(sprof); clrT(spad);
         auto clrB = [](BVec& v) noexcept { v.clear(); v.shrink_to_fit(); };
-        clrB(DM); clrB(DX); clrB(DY);
+        clrB(DM);
         clrT(rM); clrT(rX); clrT(rY); clrT(qM); clrT(qX); clrT(qY);
         clrT(srows); clrT(prows); clrT(hrows); clrT(lrows);
         clrT(hfa); clrT(hfb); clrT(hfc); clrT(hfd); clrT(hfe); clrT(hff);

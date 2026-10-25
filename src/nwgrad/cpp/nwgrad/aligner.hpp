@@ -1240,7 +1240,7 @@ private:
     std::vector<int> post_rows_;
     int    inter_w_ = 0, inter_lane_ = 0;
     size_t inter_stride_ = 0;   // the interleaved tables' row length (>= stride_ if ragged)
-    // Pointers mode: DM/DX/DY hold predecessor codes, VM/VX/VY are NOT retained.
+    // Pointers mode: DM holds predecessor codes, VM/VX/VY are NOT retained.
     bool        pointers_ = false;
     // Hirschberg mode: no tables at all survive the fill.  The recursion recovers the
     // path directly, so hops_ IS the result — every consumer (gradient, alignment,
@@ -1811,6 +1811,7 @@ private:
     // Directions (Pointers, variant B) live in whatever layout the fill used -- row-major
     // from the scalar B fill, striped from the leveled B kernel -- so index them through
     // the same cell_index() the score tables use.  One copy of the striping arithmetic.
+    // Affine: one byte per cell, M | X << 2 | Y << 4; linear: the move, 0..3.
     unsigned char dcode(const BVec& d, int i, int j) const noexcept {
         return d[cell_index(i, j)];
     }
@@ -1876,28 +1877,33 @@ private:
         TBTable tbl = best_tbl_;
         while (true) {
             if (i == 0 && j == 0) break;
+            // Ptr: the cell's packed byte, read once for whichever state the walk is in
+            // (Global: past the border, which is emitted without reading the codes)
+            unsigned char c = 0;
             if constexpr (AM == AlignMode::Local) {
+                if constexpr (Ptr) c = dcode(buf.DM, i, j);
                 if (tbl == TBTable::M) {
-                    if constexpr (Ptr) { if (dcode(buf.DM, i, j) == 3) break; }
+                    if constexpr (Ptr) { if ((c & 3) == 3) break; }
                     else               { if (rat(buf.VM, i, j) <= 0.0) break; }
                 }
             } else {
                 if (i == 0) { for (; j > 0; --j) emit(TBTable::Y, 0, j, j == 1); break; }
                 if (j == 0) { for (; i > 0; --i) emit(TBTable::X, i, 0, i == 1); break; }
+                if constexpr (Ptr) c = dcode(buf.DM, i, j);
             }
             if      (i == 0) tbl = TBTable::Y;   // row 0: only leftward moves remain
             else if (j == 0) tbl = TBTable::X;   // col 0: only upward moves remain
 
             TBTable prev;
             if (tbl == TBTable::M) {
-                if constexpr (Ptr) prev = from_code(dcode(buf.DM, i, j));
+                if constexpr (Ptr) prev = from_code(c & 3);
                 else { const size_t k = cell_index(i-1, j-1);
                        prev = argmax(buf.VM[k], buf.VX[k], buf.VY[k]); }
                 emit(TBTable::M, i, j, false);
                 --i; --j;
             } else if (tbl == TBTable::X) {   // gap in B: advance i, gap_b penalties
                 if constexpr (Tr) { go_b = tgob_[static_cast<size_t>(i)]; ge_b = tgeb_[static_cast<size_t>(i)]; }
-                if constexpr (Ptr) prev = from_code(dcode(buf.DX, i, j));
+                if constexpr (Ptr) prev = from_code((c >> 2) & 3);
                 else { const size_t k = cell_index(i-1, j);
                        prev = argmax(buf.VM[k] - go_b - ge_b,
                                      buf.VX[k]        - ge_b,
@@ -1906,7 +1912,7 @@ private:
                 --i;
             } else {                          // gap in A: advance j, gap_a penalties
                 if constexpr (Tr) { go_a = tgoa_[static_cast<size_t>(i)]; ge_a = tgea_[static_cast<size_t>(i)]; }
-                if constexpr (Ptr) prev = from_code(dcode(buf.DY, i, j));
+                if constexpr (Ptr) prev = from_code(c >> 4);
                 else { const size_t k = cell_index(i, j-1);
                        prev = argmax(buf.VM[k] - go_a - ge_a,
                                      buf.VX[k] - go_a - ge_a,
@@ -2494,9 +2500,9 @@ private:
     // ── TracebackMode::Pointers: affine Viterbi, scalar reference ─────────────
     //
     // Computes the same DP as viterbi_affine() but retains, instead of three score
-    // tables, one byte per cell per state naming the predecessor the forward pass
-    // chose.  Scores live in two rolling rows, so the retained footprint is
-    // 3 B/cell against 12 (float32) / 24 (double).
+    // tables, one byte per cell naming the predecessor each state's forward pass chose,
+    // packed `M | X << 2 | Y << 4` (buf.DM).  Scores live in two rolling rows, so the
+    // retained footprint is 1 B/cell against 12 (float32) / 24 (double).
     //
     // BIT-EXACTNESS is the whole contract, and it holds for a specific reason: the
     // codes below are produced by the *identical* comparison chain the traceback
@@ -2524,15 +2530,13 @@ private:
 
         const std::size_t stride = stride_;   // row-major, matches cell_index()
         const std::size_t dsz    = static_cast<std::size_t>(m_ + 1) * stride;
-        // Per vector, not keyed on DM / rM: viterbi_linear_ptr grows only DM, rM and qM.
-        for (auto* d : {&buf.DM, &buf.DX, &buf.DY}) if (d->size() < dsz) d->resize(dsz);
+        if (buf.DM.size() < dsz) buf.DM.resize(dsz);
+        // Per vector, not keyed on rM: viterbi_linear_ptr grows only rM and qM.
         for (auto* r : {&buf.rM, &buf.rX, &buf.rY, &buf.qM, &buf.qX, &buf.qY})
             if (r->size() < stride) r->resize(stride);
         T* pM = buf.qM.data(); T* pX = buf.qX.data(); T* pY = buf.qY.data();  // row i-1
         T* cM = buf.rM.data(); T* cX = buf.rX.data(); T* cY = buf.rY.data();  // row i
-        unsigned char* dM = buf.DM.data();
-        unsigned char* dX = buf.DX.data();
-        unsigned char* dY = buf.DY.data();
+        unsigned char* D = buf.DM.data();   // M | X << 2 | Y << 4 per cell
 
         // Same three-way argmax the traceback runs, in one place so the two cannot drift.
         // Selects between constants on one compare each (the values are finite or -inf,
@@ -2552,12 +2556,10 @@ private:
                 pX[j] = NINF;
                 pY[j] = (j == 0) ? NINF : -(go_a + static_cast<T>(j) * ge_a);
             }
-            dM[j] = (AM == AlignMode::Local || j == 0) ? 3 : 3;   // row 0 is a start
-            dX[j] = 0;
-            // Y along row 0 extends leftward: (0,1) opens from M(0,0), the rest extend Y.
-            dY[j] = (j <= 1) ? 0 : 2;
+            // row 0 is a start (M 3, X 0); Y along it extends leftward: (0,1) opens from
+            // M(0,0), the rest extend Y.
+            D[j] = (j <= 1) ? 3 : 3 | 2 << 4;
         }
-        if constexpr (AM == AlignMode::Global) dM[0] = 3;
 
         best_i_ = 0; best_j_ = 0; best_tbl_ = TBTable::M;
         T best_local = static_cast<T>(0);
@@ -2575,9 +2577,7 @@ private:
             else if constexpr (Tr) { cM[0] = NINF; cX[0] = tbx0_[static_cast<size_t>(i)]; }
             else { cM[0] = NINF; cX[0] = -(go_b + static_cast<T>(i) * ge_b); }
             cY[0] = NINF;
-            dM[rb] = 3;
-            dX[rb] = (i <= 1) ? 0 : 1;    // (1,0) opens from M(0,0); deeper rows extend X
-            dY[rb] = 0;
+            D[rb] = (i <= 1) ? 3 : 3 | 1 << 2;   // M 3, Y 0; X: (1,0) opens from M(0,0), deeper rows extend
             T rowmax = static_cast<T>(0);   // Local: see local_row_best_
 
             for (int j = 1; j <= n_; ++j) {
@@ -2605,7 +2605,7 @@ private:
                 }
 
                 cM[k] = m_val; cX[k] = x_val; cY[k] = y_val;
-                dM[rb + k] = km; dX[rb + k] = kx; dY[rb + k] = ky;
+                D[rb + k] = static_cast<unsigned char>(km | kx << 2 | ky << 4);
             }
             if constexpr (AM == AlignMode::Local)
                 if (rowmax > best_local) local_row_best_(cM, cX, cY, 1, rowmax, i, best_local);
@@ -2826,7 +2826,7 @@ private:
         return K.template of<T>().hb_base ? &K : nullptr;
     }
 
-    // Vectorized base case: the striped kernel fills buf.hbD (3 direction planes, striped)
+    // Vectorized base case: the striped kernel fills buf.hbD (packed codes, striped)
     // and returns seg/width + the final-cell scores; the walk-back below reads them
     // striped.  Bit-identical to the scalar fill, so which one runs is a speed choice.
     void hb_base_striped_run(const LevelKernels& K, DpBuffer& buf,
@@ -2849,10 +2849,7 @@ private:
         const int seg = job.seg, Wl = job.width;
         const std::size_t rowsz = (std::size_t)(seg + 1) * Wl;
         const std::size_t off   = (std::size_t)Wl;
-        const std::size_t plane = (std::size_t)(H + 1) * rowsz;
-        const unsigned char* dM = buf.hbD.data();
-        const unsigned char* dX = dM + plane;
-        const unsigned char* dY = dX + plane;
+        const unsigned char* D = buf.hbD.data();   // M | X << 2 | Y << 4
         auto idx = [&](int r, int c) -> std::size_t {
             return (std::size_t)r * rowsz + (c == 0 ? 0 : off + (std::size_t)((c - 1) % seg) * Wl + (c - 1) / seg);
         };
@@ -2863,11 +2860,11 @@ private:
                  : ((job.fX >= job.fY) ? TBTable::X : TBTable::Y);
         const std::size_t first = hops_.size();
         while (r > 0 || c > 0) {
-            const std::size_t k = idx(r, c);
+            const unsigned char p = D[idx(r, c)];
             unsigned char code;
-            if (tbl == TBTable::M)      { code = dM[k]; hops_.push_back(0); --r; --c; }
-            else if (tbl == TBTable::X) { code = dX[k]; hops_.push_back(1); --r; }
-            else                        { code = dY[k]; hops_.push_back(2); --c; }
+            if (tbl == TBTable::M)      { code = p & 3;        hops_.push_back(0); --r; --c; }
+            else if (tbl == TBTable::X) { code = (p >> 2) & 3; hops_.push_back(1); --r; }
+            else                        { code = p >> 4;       hops_.push_back(2); --c; }
             tbl = (code == 1) ? TBTable::X : (code == 2 ? TBTable::Y : TBTable::M);
         }
         std::reverse(hops_.begin() + static_cast<std::ptrdiff_t>(first), hops_.end());
@@ -2886,11 +2883,11 @@ private:
         }
 
         const std::size_t stride = static_cast<std::size_t>(W) + 1;
-        const std::size_t plane  = static_cast<std::size_t>(H + 1) * stride;
-        hb_fit_b(buf.hbD, 3 * plane);
-        unsigned char* dM = buf.hbD.data();
-        unsigned char* dX = dM + plane;
-        unsigned char* dY = dX + plane;
+        hb_fit_b(buf.hbD, static_cast<std::size_t>(H + 1) * stride);
+        unsigned char* D = buf.hbD.data();   // M | X << 2 | Y << 4, as the striped kernel's
+        auto pack = [](unsigned km, unsigned kx, unsigned ky) {
+            return static_cast<unsigned char>(km | kx << 2 | ky << 4);
+        };
 
         // Score rows: two rolling is not enough here because Y reads the current row,
         // but M/X read only the row above — the same shape as the Pointers fill.
@@ -2907,13 +2904,13 @@ private:
         pM[0] = in_x ? NINF : static_cast<T>(0);
         pX[0] = NINF;   // in_x: only the first row's column-0 X continues it
         pY[0] = NINF;
-        dM[0] = 3; dX[0] = 3; dY[0] = 3;
+        D[0] = pack(3, 3, 3);
         for (int c = 1; c <= W; ++c) {
             pM[c] = NINF;
             pX[c] = NINF;
             const T uy = pM[c-1] - go_a - ge_a, vy = pX[c-1] - go_a - ge_a, wy = pY[c-1] - ge_a;
             pY[c] = std::max({uy, vy, wy});
-            dM[c] = 3; dX[c] = 3; dY[static_cast<std::size_t>(c)] = pick(uy, vy, wy);
+            D[c] = pack(3, 3, pick(uy, vy, wy));
         }
 
         for (int r = 1; r <= H; ++r) {
@@ -2926,8 +2923,8 @@ private:
             cM[0] = NINF;
             cX[0] = std::max({ux0, vx0, wx0});
             cY[0] = NINF;
-            dM[rb] = 3; dX[rb] = pick(ux0, vx0, wx0); dY[rb] = 3;
-            if (in_x && r == 1) { cX[0] = static_cast<T>(0) - ge_b; dX[rb] = 1; }   // continues the run
+            D[rb] = pack(3, pick(ux0, vx0, wx0), 3);
+            if (in_x && r == 1) { cX[0] = static_cast<T>(0) - ge_b; D[rb] = pack(3, 1, 3); }   // continues the run
             for (int c = 1; c <= W; ++c) {
                 const T dgM = pM[c-1], dgX = pX[c-1], dgY = pY[c-1];
                 cM[c] = std::max({dgM, dgX, dgY}) + (tr_ ? subT(i0 + r, j0 + c) : subTu(i0 + r, j0 + c));
@@ -2935,9 +2932,7 @@ private:
                 cX[c] = std::max({ux, vx, wx});
                 const T uy = cM[c-1] - go_a - ge_a, vy = cX[c-1] - go_a - ge_a, wy = cY[c-1] - ge_a;
                 cY[c] = std::max({uy, vy, wy});
-                dM[rb + c] = pick(dgM, dgX, dgY);
-                dX[rb + c] = pick(ux, vx, wx);
-                dY[rb + c] = pick(uy, vy, wy);
+                D[rb + c] = pack(pick(dgM, dgX, dgY), pick(ux, vx, wx), pick(uy, vy, wy));
             }
             std::swap(pM, cM); std::swap(pX, cX); std::swap(pY, cY);
         }
@@ -2954,11 +2949,11 @@ private:
         // Walk back, emitting moves; reverse at the end since we produce them backwards.
         const std::size_t first = hops_.size();
         while (r > 0 || c > 0) {
-            const std::size_t k = static_cast<std::size_t>(r) * stride + static_cast<std::size_t>(c);
+            const unsigned char p = D[static_cast<std::size_t>(r) * stride + static_cast<std::size_t>(c)];
             unsigned char code;
-            if (tbl == TBTable::M)      { code = dM[k]; hops_.push_back(0); --r; --c; }
-            else if (tbl == TBTable::X) { code = dX[k]; hops_.push_back(1); --r; }
-            else                        { code = dY[k]; hops_.push_back(2); --c; }
+            if (tbl == TBTable::M)      { code = p & 3;        hops_.push_back(0); --r; --c; }
+            else if (tbl == TBTable::X) { code = (p >> 2) & 3; hops_.push_back(1); --r; }
+            else                        { code = p >> 4;       hops_.push_back(2); --c; }
             tbl = (code == 1) ? TBTable::X : (code == 2 ? TBTable::Y : TBTable::M);
         }
         std::reverse(hops_.begin() + static_cast<std::ptrdiff_t>(first), hops_.end());

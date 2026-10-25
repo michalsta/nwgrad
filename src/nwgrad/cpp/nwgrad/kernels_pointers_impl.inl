@@ -5,7 +5,12 @@
 // recurrence, same lazy-F.  The difference is what it retains:
 //
 //   Scores     three T score tables, (m+1)*rowsz each   12 B/cell (float32)
-//   Pointers   three BYTE predecessor tables + two rolling score rows  3 B/cell
+//   Pointers   one BYTE predecessor table + two rolling score rows     1 B/cell
+//
+// The byte packs the three states' codes, `M | X << 2 | Y << 4` (M 0..3, 3 = Local stop;
+// X and Y 0..2).  Y's code is final only after the carry, so M's and X's wait for it in a
+// T-typed scratch row (`mx`, already summed: X's code is picked as 0 / 4 / 8) and the
+// last per-row loop stores `mx + 16 * y` -- one byte stream instead of three.
 //
 // The traceback then reads a recorded predecessor instead of re-deriving it from
 // the tables.  Bit-exactness is preserved because the codes are produced by the
@@ -22,13 +27,13 @@
 #  error "kernels_pointers_impl.inl must be included inside a level namespace by a level TU"
 #endif
 
-// Narrow a T-typed lane-code vector (values 0..3) to one byte per lane.
+// Narrow a T-typed lane-code vector (values 0..63) to one byte per lane.
 // Deliberately a single static_simd_cast, not a per-lane loop: writing direction
 // bytes scalar-per-lane measured ~2x slower than the vectorized narrow.
 // For the integer lane types the narrow is spelled in intrinsics: clang lowered the
 // int64 cast to one byte store per lane (movb x4 per vector, 1.13-1.33x gcc's time on the
 // Pointers kernel), gcc the int16/int32 ones to vpshufb sequences; a pack or a vpmov is
-// one or two instructions.  The codes are 0..3, so saturating packs are exact.
+// one or two instructions.  The codes are 0..63 (a packed byte), so saturating packs are exact.
 template <class T, int W>
 [[gnu::always_inline]] static inline void store_codes(const stdx::native_simd<T>& code, unsigned char* dst) {
     using bvec = stdx::fixed_size_simd<unsigned char, W>;
@@ -132,14 +137,12 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
     const std::size_t off   = (std::size_t)W;
 
     const std::size_t dsz = (std::size_t)(m + 1) * rowsz;
-    // Each vector is checked on its own: a linear pointer fill sharing this buffer grows
-    // DM, rM and qM alone, so one size no longer speaks for the group.
-    for (auto* d : {&buf.DM, &buf.DX, &buf.DY}) if (d->size() < dsz) d->resize(dsz);
+    if (buf.DM.size() < dsz) buf.DM.resize(dsz);   // the packed codes (the linear fill's table too)
     // rolling score rows: 2 x rowsz instead of (m+1) x rowsz -- the whole point; with the
-    // opens, open codes, Q (integer T), y-code scratch and Local's padding mask, eleven rows
-    // of one block (spread_rows, dp_buffer.hpp: no two in one L1 set, and none in the set of
-    // another stream read every row)
-    std::size_t rs; T* const rows = spread_rows<T>(buf.prows, rowsz, 11, rs);
+    // opens, open codes, Q (integer T), y-code and M+X-code scratch and Local's padding
+    // mask, twelve rows of one block (spread_rows, dp_buffer.hpp: no two in one L1 set,
+    // and none in the set of another stream read every row)
+    std::size_t rs; T* const rows = spread_rows<T>(buf.prows, rowsz, 12, rs);
 
     auto scol = [seg](int j) -> std::size_t {
         return (std::size_t)((j - 1) % seg) * W + (j - 1) / seg;
@@ -151,6 +154,7 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
     T* ok = rows + 7 * rs;
     T* qb = rows + 8 * rs;
     T* yc = rows + 9 * rs;
+    T* mx = rows + 11 * rs;
 
     T* pM = rows + 3 * rs; T* pX = rows + 4 * rs; T* pY = rows + 5 * rs;
     T* cM = rows;          T* cX = rows + rs;     T* cY = rows + 2 * rs;
@@ -161,9 +165,8 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
         for (std::size_t k = 0; k < sw; ++k) {
             pM[off + k] = K_NINF; pX[off + k] = K_NINF; pY[off + k] = K_NINF;
         }
-        unsigned char* d0M = buf.DM.data(); unsigned char* d0X = buf.DX.data();
-        unsigned char* d0Y = buf.DY.data();
-        d0M[0] = 3; d0X[0] = 0; d0Y[0] = 0;
+        unsigned char* d0 = buf.DM.data();
+        d0[0] = 3;                                     // M 3, X 0, Y 0
         for (int l = 0; l < W; ++l)
             for (int s = 0; s < seg; ++s) {
                 const int j = l * seg + s + 1;
@@ -171,11 +174,10 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                 if (j <= n) {
                     if constexpr (Local) pM[off + k] = 0;
                     else                 pY[off + k] = -(go_a + j * ge_a);
-                    d0M[off + k] = 3;                  // row 0 is a start
-                    d0X[off + k] = 0;
-                    d0Y[off + k] = (j <= 1) ? 0 : 2;   // (0,1) opens from M; rest extend
+                    // row 0 is a start (M 3, X 0); Y: (0,1) opens from M, the rest extend
+                    d0[off + k] = (j <= 1) ? 3 : 3 | 2 << 4;
                 } else {
-                    d0M[off + k] = 3; d0X[off + k] = 0; d0Y[off + k] = 2;
+                    d0[off + k] = 3 | 2 << 4;
                 }
             }
     }
@@ -183,6 +185,7 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
     vd vgo_a(go_a), vge_a(ge_a), vgo_b(go_b), vge_b(ge_b);
     const vd vzero(static_cast<T>(0)), vone(static_cast<T>(1)), vtwo(static_cast<T>(2));
     const vd vthree(static_cast<T>(3));
+    const vd vfour(static_cast<T>(4)), veight(static_cast<T>(8)), vsixteen(static_cast<T>(16));
     T bM = 0, bX = K_NINF, bY = K_NINF;
     T best_local = 0; int best_i = 0, best_j = 0, best_tbl = 0;
     const T* pad = Local ? striped_pad_into(rows + 10 * rs, n, seg, W) : nullptr;
@@ -200,13 +203,10 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
         const T nbOpenK = ((nbM - go_a) - ge_a >= (nbX - go_a) - ge_a) ? T(0) : T(1);
         const T* sub = striped_row_profile<T, Tr>(buf.sprof.data(), blk, nalpha, a, b, n, seg, W, i, tr);
 
-        unsigned char* dM = buf.DM.data() + (std::size_t)i * rowsz + off;
-        unsigned char* dX = buf.DX.data() + (std::size_t)i * rowsz + off;
-        unsigned char* dY = buf.DY.data() + (std::size_t)i * rowsz + off;
+        unsigned char* dP = buf.DM.data() + (std::size_t)i * rowsz + off;
         cM[0] = nbM; cX[0] = nbX; cY[0] = K_NINF;
-        buf.DM.data()[(std::size_t)i * rowsz] = 3;
-        buf.DX.data()[(std::size_t)i * rowsz] = (i <= 1) ? 0 : 1;
-        buf.DY.data()[(std::size_t)i * rowsz] = 0;
+        // column 0: M 3, Y 0; X opens from M(0,0) at (1,0), extends below
+        buf.DM.data()[(std::size_t)i * rowsz] = (i <= 1) ? 3 : 3 | 1 << 2;
 
         if (seg > 0) {
             for (int s = 0; s < seg; ++s) {
@@ -256,7 +256,6 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
 #endif
                 }
                 vmv.copy_to(cM + off + (std::size_t)s * W, stdx::element_aligned);
-                store_codes<T, W>(km, dM + (std::size_t)s * W);
 
                 vd uM, uX, uY;
                 uM.copy_from(pM + off + (std::size_t)s * W, stdx::element_aligned);
@@ -264,19 +263,19 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                 uY.copy_from(pY + off + (std::size_t)s * W, stdx::element_aligned);
                 const vd ax = (uM - vgo_b) - vge_b, bx = uX - vge_b, cx = (uY - vgo_b) - vge_b;
                 vd vxv = stdx::max(stdx::max(ax, bx), cx);
-                vd kx = vtwo;
+                vd kx = veight;                     // X's code, already shifted: 0 / 4 / 8
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
                 if constexpr (sizeof(T) == 8) {
-                    kx = avx512d_blend(avx512d_ge(bx, cx), kx, vone);
+                    kx = avx512d_blend(avx512d_ge(bx, cx), kx, vfour);
                     kx = avx512d_blend(avx512d_ge(ax, bx) & avx512d_ge(ax, cx), kx, vzero);
                 } else {
-                    kx = pick_code(ax, bx, cx, vzero, vone, vtwo);
+                    kx = pick_code(ax, bx, cx, vzero, vfour, veight);
                 }
 #else
-                kx = pick_code(ax, bx, cx, vzero, vone, vtwo);
+                kx = pick_code(ax, bx, cx, vzero, vfour, veight);
 #endif
                 vxv.copy_to(cX + off + (std::size_t)s * W, stdx::element_aligned);
-                store_codes<T, W>(kx, dX + (std::size_t)s * W);
+                (km + kx).copy_to(mx + (std::size_t)s * W, stdx::element_aligned);
 
                 // The open's source is chosen on the ROUNDED candidates, as the scalar pick(uy, vy, wy)
                 // does: M and X values that differ can round to the same open, and then M wins.
@@ -367,9 +366,11 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                 if (!changed) break;
             }
             }   // integer / floating carry
-            for (int s = 0; s < seg; ++s) {
-                vd k; k.copy_from(yc + (std::size_t)s * W, stdx::element_aligned);
-                store_codes<T, W>(k, dY + (std::size_t)s * W);
+            for (int s = 0; s < seg; ++s) {   // M | X << 2 | Y << 4 (<= 63: the packs stay exact)
+                vd k, kmx;
+                k.copy_from(yc + (std::size_t)s * W, stdx::element_aligned);
+                kmx.copy_from(mx + (std::size_t)s * W, stdx::element_aligned);
+                store_codes<T, W>(kmx + k * vsixteen, dP + (std::size_t)s * W);
             }
 
             if constexpr (Local)

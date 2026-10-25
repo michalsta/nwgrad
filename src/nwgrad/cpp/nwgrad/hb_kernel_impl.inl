@@ -822,8 +822,9 @@ static void hb_scan_entry(HbScanJob<T>& j) { hb_scan_dispatch(j); }
 // ── Hirschberg base case: striped fill that RECORDS direction bytes ───────────
 //
 // This is striped_affine_full_ptr (Global) restricted to a sub-rectangle with an affine
-// boundary seed.  It records the whole block's direction tables (3 B/cell, striped, in
-// buf.hbD) so the aligner walks the path back; that is what vectorizes the base case,
+// boundary seed.  It records the whole block's direction codes (1 B/cell, packed
+// M | X << 2 | Y << 4 as the pointer kernel's, striped, in buf.hbD) so the aligner walks
+// the path back; that is what vectorizes the base case,
 // which began life as the scalar fill in aligner.hpp::hb_base.  Bit-exact with that
 // scalar fill by construction — same recurrence, same M>X>Y pick, same left-association,
 // same exact lazy-F carry — which the pointer kernel already proves for the full problem.
@@ -857,11 +858,11 @@ static void hb_base_striped(HbBaseJob<T>& job) {
     const std::size_t plane = (std::size_t)(H + 1) * rowsz;
 
     auto fit = [](typename DpBufferT<T>::TVec& v, std::size_t k) { if (v.size() < k) v.resize(k); };
-    if (buf.hbD.size() < 3 * plane) buf.hbD.resize(3 * plane);
+    if (buf.hbD.size() < plane) buf.hbD.resize(plane);
     fit(buf.hprof, (std::size_t)(Tr ? 1 : nalpha) * sw);
-    // six rolling rows, ov | ok | Q (integer T) and the y-code scratch: ten rows of one
-    // block (spread_rows, dp_buffer.hpp)
-    std::size_t rs; T* const rows = spread_rows<T>(buf.prows, rowsz, 10, rs);
+    // six rolling rows, ov | ok | Q (integer T), the y-code and M+X-code scratch: eleven
+    // rows of one block (spread_rows, dp_buffer.hpp)
+    std::size_t rs; T* const rows = spread_rows<T>(buf.prows, rowsz, 11, rs);
 
     auto scol = [seg](int c) -> std::size_t {
         return (std::size_t)((c - 1) % seg) * W + (c - 1) / seg;
@@ -878,13 +879,12 @@ static void hb_base_striped(HbBaseJob<T>& job) {
             }
     }
 
-    unsigned char* D0 = buf.hbD.data();
-    unsigned char* D1 = D0 + plane;
-    unsigned char* D2 = D1 + plane;
+    unsigned char* D = buf.hbD.data();
     T* ov = rows + 6 * rs;
     T* ok = rows + 7 * rs;
     T* qb = rows + 8 * rs;             // integer T: the Q scratch
     T* yc = rows + 9 * rs;
+    T* mx = rows + 10 * rs;            // M's code + X's (0 / 4 / 8), waiting for Y's
 
     T* pM = rows + 3 * rs; T* pX = rows + 4 * rs; T* pY = rows + 5 * rs;
     T* cM = rows;          T* cX = rows + rs;     T* cY = rows + 2 * rs;
@@ -893,7 +893,7 @@ static void hb_base_striped(HbBaseJob<T>& job) {
     pM[0] = job.in_x ? NINF : T(0);
     pX[0] = NINF;   // in_x: only the first row's column-0 X continues the run (below)
     pY[0] = NINF;
-    D0[0] = 3; D1[0] = 3; D2[0] = 3;
+    D[0] = 63;                         // 3 in all three: never read
     {
         // scalar row-0 Y series (serial, O(NC), once) — kept scalar to match hb_base bit
         // for bit; then stripe it into pY and record its codes.
@@ -905,7 +905,7 @@ static void hb_base_striped(HbBaseJob<T>& job) {
             const unsigned char code = (uy >= vy && uy >= wy) ? 0 : ((vy >= wy) ? 1 : 2);
             const std::size_t k = off + scol(c);
             pM[k] = NINF; pX[k] = NINF; pY[k] = y;
-            D0[k] = 3; D1[k] = 3; D2[k] = code;
+            D[k] = static_cast<unsigned char>(15 | code << 4);   // M 3, X 3, Y code
             prevM = NINF; prevX = NINF; prevY = y;
         }
     }
@@ -918,6 +918,7 @@ static void hb_base_striped(HbBaseJob<T>& job) {
 
     vd vgo_a(go_a), vge_a(ge_a), vgo_b(go_b), vge_b(ge_b);
     const vd vzero(T(0)), vone(T(1)), vtwo(T(2)), vthree(T(3));
+    const vd vfour(T(4)), veight(T(8)), vsixteen(T(16));
     T bM = pM[0], bX = pX[0], bY = pY[0];
 
     for (int r = 1; r <= H; ++r) {
@@ -929,9 +930,7 @@ static void hb_base_striped(HbBaseJob<T>& job) {
         } else {
             sub = buf.hprof.data() + (std::size_t)a[job.a_start + (r - 1) * job.a_step] * sw;
         }
-        unsigned char* dM = D0 + (std::size_t)r * rowsz + off;
-        unsigned char* dX = D1 + (std::size_t)r * rowsz + off;
-        unsigned char* dY = D2 + (std::size_t)r * rowsz + off;
+        unsigned char* dP = D + (std::size_t)r * rowsz + off;
 
         // column 0 of this row: carried X gap down the left edge
         const T ax0 = (bM - go_b) - ge_b, bx0 = bX - ge_b, cx0 = (bY - go_b) - ge_b;
@@ -941,9 +940,7 @@ static void hb_base_striped(HbBaseJob<T>& job) {
         unsigned char cx0code = (ax0 >= bx0 && ax0 >= cx0) ? 0 : ((bx0 >= cx0) ? 1 : 2);
         if (job.in_x && r == 1) { nbX = T(0) - ge_b; cx0code = 1; }   // the inherited run continues
         cM[0] = nbM; cX[0] = nbX; cY[0] = nbY;
-        D0[(std::size_t)r * rowsz] = 3;
-        D1[(std::size_t)r * rowsz] = cx0code;
-        D2[(std::size_t)r * rowsz] = 3;
+        D[(std::size_t)r * rowsz] = static_cast<unsigned char>(3 | cx0code << 2 | 3 << 4);
         const T nbOpen = (std::max(nbM, nbX) - go_a) - ge_a;
         const T nbOpenK = ((nbM - go_a) - ge_a >= (nbX - go_a) - ge_a) ? T(0) : T(1);
 
@@ -976,7 +973,6 @@ static void hb_base_striped(HbBaseJob<T>& job) {
             km = pick_code(dgM, dgX, dgY, vzero, vone, vtwo);
 #endif
             vmv.copy_to(cM + off + (std::size_t)s * W, stdx::element_aligned);
-            store_codes<T, W>(km, dM + (std::size_t)s * W);
 
             vd uM, uX, uY;
             uM.copy_from(pM + off + (std::size_t)s * W, stdx::element_aligned);
@@ -984,19 +980,19 @@ static void hb_base_striped(HbBaseJob<T>& job) {
             uY.copy_from(pY + off + (std::size_t)s * W, stdx::element_aligned);
             const vd ax = (uM - vgo_b) - vge_b, bx = uX - vge_b, cx = (uY - vgo_b) - vge_b;
             vd vxv = stdx::max(stdx::max(ax, bx), cx);
-            vd kx = vtwo;
+            vd kx = veight;                     // X's code, already shifted: 0 / 4 / 8
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
             if constexpr (sizeof(T) == 8) {
-                kx = avx512d_blend(avx512d_ge(bx, cx), kx, vone);
+                kx = avx512d_blend(avx512d_ge(bx, cx), kx, vfour);
                 kx = avx512d_blend(avx512d_ge(ax, bx) & avx512d_ge(ax, cx), kx, vzero);
             } else {
-                kx = pick_code(ax, bx, cx, vzero, vone, vtwo);
+                kx = pick_code(ax, bx, cx, vzero, vfour, veight);
             }
 #else
-            kx = pick_code(ax, bx, cx, vzero, vone, vtwo);
+            kx = pick_code(ax, bx, cx, vzero, vfour, veight);
 #endif
             vxv.copy_to(cX + off + (std::size_t)s * W, stdx::element_aligned);
-            store_codes<T, W>(kx, dX + (std::size_t)s * W);
+            (km + kx).copy_to(mx + (std::size_t)s * W, stdx::element_aligned);
 
             // The open's source is chosen on the ROUNDED candidates, as the scalar pick(uy, vy, wy)
             // does: M and X values that differ can round to the same open, and then M wins.
@@ -1083,9 +1079,11 @@ static void hb_base_striped(HbBaseJob<T>& job) {
             if (!changed) break;
         }
         }   // integer / floating carry
-        for (int s = 0; s < seg; ++s) {
-            vd k; k.copy_from(yc + (std::size_t)s * W, stdx::element_aligned);
-            store_codes<T, W>(k, dY + (std::size_t)s * W);
+        for (int s = 0; s < seg; ++s) {   // M | X << 2 | Y << 4
+            vd k, kmx;
+            k.copy_from(yc + (std::size_t)s * W, stdx::element_aligned);
+            kmx.copy_from(mx + (std::size_t)s * W, stdx::element_aligned);
+            store_codes<T, W>(kmx + k * vsixteen, dP + (std::size_t)s * W);
         }
 
         bM = nbM; bX = nbX; bY = nbY;
