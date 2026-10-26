@@ -134,7 +134,9 @@ def test_unknown_traceback_still_rejected():
 
 
 def test_default_is_split_by_precision(params):
-    """`auto` resolves to pmax at float32 and to the exact carry at double.
+    """`auto` resolves to grid for affine Global (both precisions, since 2026-10-26); where
+    grid does not apply (here: tracks) the run takes the old split, pmax at float32 and the
+    exact carry at double, which is what this test pins through the explicit modes.
 
     The split is the whole safety argument for defaulting to a mode that can return a
     suboptimal path: at float32 the ramp costs ~5e-4 against the ~8e-3 the precision
@@ -142,8 +144,8 @@ def test_default_is_split_by_precision(params):
     it would be the LARGEST error term in the computation, and double is chosen by people
     who want exactness.  If this test ever has to be relaxed, the argument has changed."""
     a, b = _seqs(2, 600, 700, 1)
-    assert _pair(a, b, params, "auto", dtype="float").traceback == "hirschberg_pmax"
-    assert _pair(a, b, params, "auto", dtype="double").traceback == "hirschberg"
+    assert _pair(a, b, params, "auto", dtype="float").traceback == "grid"
+    assert _pair(a, b, params, "auto", dtype="double").traceback == "grid"
 
 
 def test_default_split_does_not_leak_to_other_problem_types(params):

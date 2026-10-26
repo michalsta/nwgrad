@@ -1411,10 +1411,16 @@ private:
     // An INTEGER T resolves affine Full (both modes) to HirschbergPmax outright: integer
     // arithmetic is exact and associative, so the prefix-max carry is bit-identical to the
     // serial one there (scalar_traits.hpp) and the only difference left is its speed.
+    // Affine Global Full at floating T: Grid (2026-10-26) — Pointers' result at ~1-1.5x a
+    // score-only pass, against 2-3.5x for the Hirschberg modes it replaced (AGENTS.md, "Grid
+    // traceback").  Where Grid does not apply, `auto` runs kGridFallbackTb instead (see
+    // run_viterbi), so a tracked or scalar-backend pair keeps Hirschberg's O(m+n) memory.
+    static constexpr TracebackMode kGridFallbackTb =
+        std::is_same_v<T, float> ? TracebackMode::HirschbergPmax : TracebackMode::Hirschberg;
     static constexpr TracebackMode kDefaultTb =
         (GM == GapModel::Affine && AB == AlignBand::Full && AM == AlignMode::Global)
-            ? ((std::is_same_v<T, float> || nw_is_int<T>) ? TracebackMode::HirschbergPmax
-                                                           : TracebackMode::Hirschberg)
+            ? (nw_is_int<T> ? TracebackMode::HirschbergPmax
+                            : TracebackMode::Grid)
         : (GM == GapModel::Affine && AB == AlignBand::Full && (std::is_same_v<T, float> || nw_is_int<T>))
             ? TracebackMode::HirschbergPmax
             : TracebackMode::Pointers;
@@ -2197,6 +2203,18 @@ private:
     // vectorize linear ACROSS pairs instead — SeqPairBatch fill="interpair", one pair per
     // lane, bit-identical — which sidesteps the chain.)
     void run_viterbi(DpBuffer& buf) {
+        // `auto` resolved to Grid where Grid does not apply: this run takes the previous
+        // default (kGridFallbackTb) — its memory bound — and tb_ is restored after it.
+        struct TbRestore {
+            TracebackMode& t; TracebackMode saved;
+            ~TbRestore() { t = saved; }
+        } tb_restore{tb_, tb_};
+        if constexpr (GM == GapModel::Affine && AM == AlignMode::Global && AB == AlignBand::Full &&
+                      std::is_floating_point_v<T>)
+            if (tb_ == TracebackMode::Grid && tb_auto_) {
+                const int be = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
+                if (be == kBackendScalar || !grid_ok_(level_kernels(be))) tb_ = kGridFallbackTb;
+            }
         // Default to row-major; only the striped Full kernel (run_dispatched_affine) flips
         // this back on.  Every other fill here writes VM/VX/VY row-major.
         tables_striped_ = false;
