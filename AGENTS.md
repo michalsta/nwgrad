@@ -1081,13 +1081,19 @@ fill, best of 3, ns/cell and x score-only; L = 300 runs as Pointers, below hb_cu
 | | f64 | 1 | | 0.80 / 0.82 / 0.79 | 1.95 / 2.23 / 2.48x | 2.45 / 2.87 / 2.98x | 1.70 / 1.64 / 1.78x | **1.28 / 1.24 / 1.11x** |
 | | f32 | 8 | | | 1.48 / 3.36 / 3.12x | 2.31 / 3.13 / 3.03x | 1.25 / 1.14 / 1.15x | **1.24 / 1.24 / 1.13x** |
 | | f64 | 8 | | | 1.93 / 3.26 / 2.95x | 2.39 / 2.94 / 2.97x | 1.63 / 1.68 / 1.76x | **1.26 / 1.36 / 1.13x** |
+| spot neon (macOS, Homebrew gcc 16) | f32 | 1 | | 0.71 / 0.67 / 0.71 | 2.97 / 3.16 / 3.11x | 3.30 / 3.54 / 3.35x | 2.35 / 1.93 / 1.80x | **1.26 / 1.10 / 0.95x** |
+| | f64 | 1 | | 0.90 / 1.06 / 1.12 | 3.14 / 2.91 / 2.80x | 3.47 / 3.23 / 3.22x | 2.80 / 2.36 / 2.39x | **1.22 / 0.93 / 0.82x** |
+| | f32 | 4 | | | 2.97 / 3.34 / 3.25x | 3.28 / 3.53 / 3.35x | 2.34 / 1.93 / 1.81x | **1.26 / 1.11 / 0.95x** |
+| | f64 | 4 | | | 3.14 / 3.02 / 2.89x | 3.46 / 3.21 / 3.18x | 2.79 / 2.40 / 2.46x | **1.22 / 0.95 / 0.84x** |
 
 Against the `auto` defaults (f32 `hirschberg_pmax`, f64 `hirschberg`): nighthaven 1 thread
 1.8-2.4x (f32) and 2.5-3.5x (f64) faster, 12 threads 1.6-1.9x / 1.9-2.2x; solace roughly even
 with `hirschberg_pmax` at f32 (0.95-1.06) and 1.9-2.7x faster than `hirschberg` at f64.  The grid
 is exact where `hirschberg_pmax` is not, and Pointers' path where `hirschberg` is not.  Below
 score-only at 1 thread, L >= 3000 on nighthaven: the grid kernel keeps six rolling rows to the
-score kernel's seven.  NEON not measured yet (spot unreachable).
+score kernel's seven.  NEON (spot, the user at its desktop, ~0.5 core of WindowServer during the
+run): 1.9-2.7x faster than the f32 default, 2.9-3.9x than the f64 one; `tests/Python/test_grid.py`
+passes there.
 
 ### Linear gaps: Pointers and Hirschberg (2026-10-05)
 
