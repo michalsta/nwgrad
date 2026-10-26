@@ -304,34 +304,38 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                                      cY + off, yc, qb);
             } else {
             vd prev([&](int q) { return q == 0 ? bY : K_NINF; });
-            for (int s = 0; s < seg; ++s) {
-                vd O, OK;
-                if (s == 0) {
-                    vd lo, lk;
-                    lo.copy_from(ov + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                    lk.copy_from(ok + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                    O  = lane_shift_in(lo, nbOpen);
-                    OK = lane_shift_in(lk, nbOpenK);
-                } else {
-                    O.copy_from(ov + (std::size_t)(s - 1) * W, stdx::element_aligned);
-                    OK.copy_from(ok + (std::size_t)(s - 1) * W, stdx::element_aligned);
-                }
-                const vd ext = prev - vge_a;
-                vd v = stdx::max(O, ext);
-                vd ky = vtwo;                       // extension
+            prev = carry_pass(seg, prev, vge_a,
+                [&](int s) NWGRAD_ALWAYS_INLINE_LAMBDA {
+                    vd O;
+                    if (s == 0) {
+                        vd lo; lo.copy_from(ov + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                        O = lane_shift_in(lo, nbOpen);
+                    } else {
+                        O.copy_from(ov + (std::size_t)(s - 1) * W, stdx::element_aligned);
+                    }
+                    return O;
+                },
+                [&](int s, const vd& O, const vd& ext, const vd& v) NWGRAD_ALWAYS_INLINE_LAMBDA {
+                    vd OK;
+                    if (s == 0) {
+                        vd lk; lk.copy_from(ok + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                        OK = lane_shift_in(lk, nbOpenK);
+                    } else {
+                        OK.copy_from(ok + (std::size_t)(s - 1) * W, stdx::element_aligned);
+                    }
+                    vd ky = vtwo;                       // extension
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
-                if constexpr (sizeof(T) == 8) {
-                    ky = avx512d_blend(avx512d_ge(O, ext), ky, OK);   // open: M or X, ties go to open
-                } else {
-                    ky = sel_ge(O, ext, vtwo, OK);      // open: M or X, ties go to open
-                }
+                    if constexpr (sizeof(T) == 8) {
+                        ky = avx512d_blend(avx512d_ge(O, ext), ky, OK);   // open: M or X, ties go to open
+                    } else {
+                        ky = sel_ge(O, ext, vtwo, OK);      // open: M or X, ties go to open
+                    }
 #else
-                ky = sel_ge(O, ext, vtwo, OK);      // open: M or X, ties go to open
+                    ky = sel_ge(O, ext, vtwo, OK);      // open: M or X, ties go to open
 #endif
-                v.copy_to(cY + off + (std::size_t)s * W, stdx::element_aligned);
-                ky.copy_to(yc + (std::size_t)s * W, stdx::element_aligned);
-                prev = v;
-            }
+                    v.copy_to(cY + off + (std::size_t)s * W, stdx::element_aligned);
+                    ky.copy_to(yc + (std::size_t)s * W, stdx::element_aligned);
+                });
             for (int r = 0; r < W; ++r) {
                 vd last; last.copy_from(cY + off + (std::size_t)(seg - 1) * W, stdx::element_aligned);
                 vd F = lane_shift_in(last, bY);

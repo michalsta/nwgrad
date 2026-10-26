@@ -231,18 +231,20 @@ static void hb_sweep_striped(HbJob<T>& job) {
         // precisely the chain the scalar loop walks, so the fixpoint is identical
         // rather than merely close.
         vd prev([&](int q) { return q == 0 ? bY : NINF; });
-        for (int s = 0; s < seg; ++s) {
-            vd O;
-            if (s == 0) {
-                vd lo; lo.copy_from(ov + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                O = lane_shift_in(lo, nbOpen);
-            } else {
-                O.copy_from(ov + (std::size_t)(s - 1) * W, stdx::element_aligned);
-            }
-            const vd v = stdx::max(O, prev - vge_a);
-            v.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
-            prev = v;
-        }
+        prev = carry_pass(seg, prev, vge_a,
+            [&](int s) NWGRAD_ALWAYS_INLINE_LAMBDA {
+                vd O;
+                if (s == 0) {
+                    vd lo; lo.copy_from(ov + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                    O = lane_shift_in(lo, nbOpen);
+                } else {
+                    O.copy_from(ov + (std::size_t)(s - 1) * W, stdx::element_aligned);
+                }
+                return O;
+            },
+            [&](int s, const vd&, const vd&, const vd& v) NWGRAD_ALWAYS_INLINE_LAMBDA {
+                v.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
+            });
         // seg == 0 means NC == 0 — a zero-width block, which hb_solve DOES produce when
         // the optimal path crosses at a column extreme.  The carry-free and carry loops
         // above are already `for s<seg` no-ops then, but the lazy-F sweep below runs W
@@ -735,18 +737,20 @@ static void hb_scan_impl(HbScanJob<T>& job) {
         } else {
         // ── the carry: VY, same-lane striped chain, then lazy-F (exact) ──────────
         vd prev([&](int q) { return q == 0 ? bY : NINF; });
-        for (int s = 0; s < seg; ++s) {
-            vd O;
-            if (s == 0) {
-                vd lo; lo.copy_from(ov + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                O = lane_shift_in(lo, nbOpen);
-            } else {
-                O.copy_from(ov + (std::size_t)(s - 1) * W, stdx::element_aligned);
-            }
-            const vd v = stdx::max(O, prev - vge_a);
-            v.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
-            prev = v;
-        }
+        prev = carry_pass(seg, prev, vge_a,
+            [&](int s) NWGRAD_ALWAYS_INLINE_LAMBDA {
+                vd O;
+                if (s == 0) {
+                    vd lo; lo.copy_from(ov + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                    O = lane_shift_in(lo, nbOpen);
+                } else {
+                    O.copy_from(ov + (std::size_t)(s - 1) * W, stdx::element_aligned);
+                }
+                return O;
+            },
+            [&](int s, const vd&, const vd&, const vd& v) NWGRAD_ALWAYS_INLINE_LAMBDA {
+                v.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
+            });
         for (int r = 0; r < W; ++r) {
             vd last; last.copy_from(cY + (std::size_t)(seg - 1) * W, stdx::element_aligned);
             vd F = lane_shift_in(last, bY);
@@ -1023,34 +1027,38 @@ static void hb_base_striped(HbBaseJob<T>& job) {
                                  cY + off, yc, qb);
         } else {
         vd prev([&](int q) { return q == 0 ? bY : NINF; });
-        for (int s = 0; s < seg; ++s) {
-            vd O, OK;
-            if (s == 0) {
-                vd lo, lk;
-                lo.copy_from(ov + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                lk.copy_from(ok + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                O  = lane_shift_in(lo, nbOpen);
-                OK = lane_shift_in(lk, nbOpenK);
-            } else {
-                O.copy_from(ov + (std::size_t)(s - 1) * W, stdx::element_aligned);
-                OK.copy_from(ok + (std::size_t)(s - 1) * W, stdx::element_aligned);
-            }
-            const vd ext = prev - vge_a;
-            vd v = stdx::max(O, ext);
-            vd ky = vtwo;
+        prev = carry_pass(seg, prev, vge_a,
+            [&](int s) NWGRAD_ALWAYS_INLINE_LAMBDA {
+                vd O;
+                if (s == 0) {
+                    vd lo; lo.copy_from(ov + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                    O = lane_shift_in(lo, nbOpen);
+                } else {
+                    O.copy_from(ov + (std::size_t)(s - 1) * W, stdx::element_aligned);
+                }
+                return O;
+            },
+            [&](int s, const vd& O, const vd& ext, const vd& v) NWGRAD_ALWAYS_INLINE_LAMBDA {
+                vd OK;
+                if (s == 0) {
+                    vd lk; lk.copy_from(ok + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                    OK = lane_shift_in(lk, nbOpenK);
+                } else {
+                    OK.copy_from(ok + (std::size_t)(s - 1) * W, stdx::element_aligned);
+                }
+                vd ky = vtwo;
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
-            if constexpr (sizeof(T) == 8) {
-                ky = avx512d_blend(avx512d_ge(O, ext), ky, OK);
-            } else {
-                ky = sel_ge(O, ext, vtwo, OK);
-            }
+                if constexpr (sizeof(T) == 8) {
+                    ky = avx512d_blend(avx512d_ge(O, ext), ky, OK);
+                } else {
+                    ky = sel_ge(O, ext, vtwo, OK);
+                }
 #else
-            ky = sel_ge(O, ext, vtwo, OK);
+                ky = sel_ge(O, ext, vtwo, OK);
 #endif
-            v.copy_to(cY + off + (std::size_t)s * W, stdx::element_aligned);
-            ky.copy_to(yc + (std::size_t)s * W, stdx::element_aligned);
-            prev = v;
-        }
+                v.copy_to(cY + off + (std::size_t)s * W, stdx::element_aligned);
+                ky.copy_to(yc + (std::size_t)s * W, stdx::element_aligned);
+            });
         if (seg > 0) for (int rr = 0; rr < W; ++rr) {   // seg==0 (NC==0): nothing to correct
             vd last; last.copy_from(cY + off + (std::size_t)(seg - 1) * W, stdx::element_aligned);
             vd F = lane_shift_in(last, bY);

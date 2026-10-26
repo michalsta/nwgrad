@@ -216,18 +216,20 @@ static void striped_linear_full(ViterbiJob<T>& job) {
                                      K_NINF, ge_a, seg, yv, nullptr, nullptr);
             } else {
                 vd prev = vninf;                         // column 0 holds no Y
-                for (int s = 0; s < seg; ++s) {
-                    vd O;
-                    if (s == 0) {
-                        vd lo; lo.copy_from(ov + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                        O = lane_shift_in(lo, nbOpen);
-                    } else {
-                        O.copy_from(ov + (std::size_t)(s - 1) * W, stdx::element_aligned);
-                    }
-                    const vd v = stdx::max(O, prev - vge_a);
-                    v.copy_to(yv + (std::size_t)s * W, stdx::element_aligned);
-                    prev = v;
-                }
+                prev = carry_pass(seg, prev, vge_a,
+                    [&](int s) NWGRAD_ALWAYS_INLINE_LAMBDA {
+                        vd O;
+                        if (s == 0) {
+                            vd lo; lo.copy_from(ov + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                            O = lane_shift_in(lo, nbOpen);
+                        } else {
+                            O.copy_from(ov + (std::size_t)(s - 1) * W, stdx::element_aligned);
+                        }
+                        return O;
+                    },
+                    [&](int s, const vd&, const vd&, const vd& v) NWGRAD_ALWAYS_INLINE_LAMBDA {
+                        v.copy_to(yv + (std::size_t)s * W, stdx::element_aligned);
+                    });
                 for (int r = 0; r < W; ++r) {            // lazy-F: extend across the lane boundary
                     vd last; last.copy_from(yv + (std::size_t)(seg - 1) * W, stdx::element_aligned);
                     vd F = lane_shift_in(last, K_NINF) - vge_a;
@@ -447,18 +449,20 @@ static void lhb_striped(LhbJob<T>& job) {
                                      K_NINF, ga, seg, yv, nullptr, nullptr);
             } else {
                 vd prev = vninf;
-                for (int s = 0; s < seg; ++s) {
-                    vd O;
-                    if (s == 0) {
-                        vd lo; lo.copy_from(ov + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                        O = lane_shift_in(lo, nbOpen);
-                    } else {
-                        O.copy_from(ov + (std::size_t)(s - 1) * W, stdx::element_aligned);
-                    }
-                    const vd v = stdx::max(O, prev - vga);
-                    v.copy_to(yv + (std::size_t)s * W, stdx::element_aligned);
-                    prev = v;
-                }
+                prev = carry_pass(seg, prev, vga,
+                    [&](int s) NWGRAD_ALWAYS_INLINE_LAMBDA {
+                        vd O;
+                        if (s == 0) {
+                            vd lo; lo.copy_from(ov + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                            O = lane_shift_in(lo, nbOpen);
+                        } else {
+                            O.copy_from(ov + (std::size_t)(s - 1) * W, stdx::element_aligned);
+                        }
+                        return O;
+                    },
+                    [&](int s, const vd&, const vd&, const vd& v) NWGRAD_ALWAYS_INLINE_LAMBDA {
+                        v.copy_to(yv + (std::size_t)s * W, stdx::element_aligned);
+                    });
                 for (int rr = 0; rr < W; ++rr) {
                     vd last; last.copy_from(yv + (std::size_t)(seg - 1) * W, stdx::element_aligned);
                     vd F = lane_shift_in(last, K_NINF) - vga;
