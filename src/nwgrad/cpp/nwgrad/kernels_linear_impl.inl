@@ -273,7 +273,12 @@ static void striped_linear_full(ViterbiJob<T>& job) {
 
             // ── pass 2: H = max(U, Y); codes: left where Y > U, stop where Local <= 0 ──
             vd acc = vzero;                              // Dense: this group's codes so far
-            for (int s = 0; s < seg; ++s) {
+            // Dense: in groups of four segments, a group's byte stored after it -- no branch in
+            // the segment loop (one-byte codes and the H form: one group, the whole row).
+            constexpr int G = Dense ? 4 : (1 << 30);
+            for (int s0 = 0; s0 < seg; s0 += G) {
+            const int s1 = std::min(seg - s0, G) + s0;
+            for (int s = s0; s < s1; ++s) {
                 vd u; u.copy_from(cH + off + (std::size_t)s * W, stdx::element_aligned);
                 vd y; y.copy_from(yv + (std::size_t)s * W, stdx::element_aligned);
                 const vd h = stdx::max(u, y);
@@ -300,15 +305,16 @@ static void striped_linear_full(ViterbiJob<T>& job) {
 #endif
                     if constexpr (Dense) {
                         acc = acc + acc; acc = acc + acc; acc = acc + k;   // 4*acc + k: exact in every T
-                        if ((s & 3) == 3 || s == seg - 1) {
-                            store_codes_nt<T, W>(acc, dM + (std::size_t)(s >> 2) * W, nt);   // <= 255
-                            acc = vzero;
-                        }
                     } else {
                         store_codes<T, W>(k, dM + (std::size_t)s * W);
                     }
                 }
             }
+            if constexpr (Dense) {
+                store_codes_nt<T, W>(acc, dM + (std::size_t)(s0 >> 2) * W, nt);   // <= 255
+                acc = vzero;
+            }
+            }   // groups
             if constexpr (Local) striped_row_best1<T>(cH + off, pad, seg, i, best_local, best_i, best_j);
         }
 

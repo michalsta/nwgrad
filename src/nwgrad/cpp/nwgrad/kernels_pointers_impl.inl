@@ -262,7 +262,12 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                 dgY = lane_shift_in(lY, bY);
             }
             vd accM = vzero, accX = vzero;   // Dense: this group's M / X codes so far
-            for (int s = 0; s < seg; ++s) {
+            // Dense: in groups of four segments, the group's planes stored after it -- no branch
+            // in the segment loop (one-byte codes: one group, the whole row).
+            constexpr int G = Dense ? 4 : (1 << 30);
+            for (int s0 = 0; s0 < seg; s0 += G) {
+            const int s1 = std::min(seg - s0, G) + s0;
+            for (int s = s0; s < s1; ++s) {
                 vd sb; sb.copy_from(sub + (std::size_t)s * W, stdx::element_aligned);
                 const vd mx3 = stdx::max(stdx::max(dgM, dgX), dgY);
                 vd vmv = mx3 + sb;
@@ -319,11 +324,6 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                 if constexpr (Dense) {   // M and X are final: their planes now (4*acc + k)
                     accM = accM + accM; accM = accM + accM; accM = accM + km;
                     accX = accX + accX; accX = accX + accX; accX = accX + kx;
-                    if ((s & 3) == 3 || s == seg - 1) {
-                        unsigned char* g = dP + (std::size_t)(s >> 2) * 3 * W;
-                        store_codes_nt<T, W>(accM, g, nt); store_codes_nt<T, W>(accX, g + W, nt);
-                        accM = vzero; accX = vzero;
-                    }
                 } else {
                     (km + kx).copy_to(mx + (std::size_t)s * W, stdx::element_aligned);
                 }
@@ -350,6 +350,12 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                     okv.copy_to(ok + (std::size_t)s * W, stdx::element_aligned);
                 }
             }
+            if constexpr (Dense) {
+                unsigned char* g = dP + (std::size_t)(s0 >> 2) * 3 * W;
+                store_codes_nt<T, W>(accM, g, nt); store_codes_nt<T, W>(accX, g + W, nt);
+                accM = vzero; accX = vzero;
+            }
+            }   // groups
 
             // ── the carry: VY, same-lane striped chain + lazy-F, codes tracked (integer
             // T: the exact prefix max with its codes, int_pmax_carry) ──
@@ -437,14 +443,14 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
             }
             }   // integer / floating carry
             if constexpr (Dense) {           // Y's plane
-                vd accY = vzero;
-                for (int s = 0; s < seg; ++s) {
-                    vd k; k.copy_from(yc + (std::size_t)s * W, stdx::element_aligned);
-                    accY = accY + accY; accY = accY + accY; accY = accY + k;
-                    if ((s & 3) == 3 || s == seg - 1) {
-                        store_codes_nt<T, W>(accY, dP + (std::size_t)(s >> 2) * 3 * W + 2 * W, nt);
-                        accY = vzero;
+                for (int s0 = 0; s0 < seg; s0 += 4) {
+                    vd accY = vzero;
+                    const int s1 = std::min(seg - s0, 4) + s0;
+                    for (int s = s0; s < s1; ++s) {
+                        vd k; k.copy_from(yc + (std::size_t)s * W, stdx::element_aligned);
+                        accY = accY + accY; accY = accY + accY; accY = accY + k;
                     }
+                    store_codes_nt<T, W>(accY, dP + (std::size_t)(s0 >> 2) * 3 * W + 2 * W, nt);
                 }
             } else
             for (int s = 0; s < seg; ++s) {   // M | X << 2 | Y << 4 (<= 43: the packs stay exact)
