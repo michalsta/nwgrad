@@ -194,9 +194,6 @@ struct ViterbiJob {
     // 0.75 B/cell affine).  Out: 1 if the kernel wrote them, 0 if it wrote one byte a cell
     // (it clears the request it cannot honour: int16 lanes).
     int dense = 0;
-    // Dense only, x86: 1 writes the codes with non-temporal stores (written once a fill, read
-    // only by the walk afterwards -- no reason to pull their lines into the cache).
-    int nt = 0;
 };
 
 // The dense direction codes' geometry, shared by the kernels and the walks.  Per DP row:

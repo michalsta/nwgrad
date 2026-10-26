@@ -82,27 +82,6 @@ template <class T, int W>
     stdx::static_simd_cast<bvec>(code).copy_to(dst, stdx::element_aligned);
 }
 
-// store_codes, or (nt, x86) the same W bytes through non-temporal stores: narrowed into a
-// scratch, then movnti in 4- / 8-byte words (W = 2 lanes: a plain 2-byte store).  The
-// caller fences (_mm_sfence) once the table is complete.
-template <class T, int W>
-[[gnu::always_inline]] static inline void store_codes_nt(const stdx::native_simd<T>& code, unsigned char* dst, bool nt) {
-#if defined(__SSE2__) && defined(__x86_64__)
-    if (nt && W >= 4) {
-        alignas(64) unsigned char t[W];
-        store_codes<T, W>(code, t);
-        if constexpr (W == 4) { int v; std::memcpy(&v, t, 4); _mm_stream_si32(reinterpret_cast<int*>(dst), v); }
-        else for (int k = 0; k < W; k += 8) {
-            long long v; std::memcpy(&v, t + k, 8);
-            _mm_stream_si64(reinterpret_cast<long long*>(dst + k), v);
-        }
-        return;
-    }
-#endif
-    (void)nt;
-    store_codes<T, W>(code, dst);
-}
-
 // The three-way argmax code of the scalar pick(): 0 when m >= x && m >= y, else 1 when
 // x >= y, else 2 -- read off the three-way max the kernel computes anyway,
 // mx = max(max(m, x), y): m >= x && m >= y is exactly mx == m (max is exact, -inf
@@ -141,7 +120,6 @@ template <class V>
 template <class T, bool Local, bool Tr = false, bool Dense = false>
 static void striped_affine_full_ptr(ViterbiJob<T>& job) {
     static_assert(!Dense || sizeof(T) >= 4, "dense codes: lanes >= 32 bits");
-    const bool nt = Dense && job.nt;   // non-temporal code stores (store_codes_nt)
     using vd = stdx::native_simd<T>;
     constexpr int W = (int)stdx::native_simd<T>::size();
     // the integer carry (int_pmax_carry) reads the opens and their codes from rows; the
@@ -352,7 +330,7 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
             }
             if constexpr (Dense) {
                 unsigned char* g = dP + (std::size_t)(s0 >> 2) * 3 * W;
-                store_codes_nt<T, W>(accM, g, nt); store_codes_nt<T, W>(accX, g + W, nt);
+                store_codes<T, W>(accM, g); store_codes<T, W>(accX, g + W);
                 accM = vzero; accX = vzero;
             }
             }   // groups
@@ -450,7 +428,7 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                         vd k; k.copy_from(yc + (std::size_t)s * W, stdx::element_aligned);
                         accY = accY + accY; accY = accY + accY; accY = accY + k;
                     }
-                    store_codes_nt<T, W>(accY, dP + (std::size_t)(s0 >> 2) * 3 * W + 2 * W, nt);
+                    store_codes<T, W>(accY, dP + (std::size_t)(s0 >> 2) * 3 * W + 2 * W);
                 }
             } else
             for (int s = 0; s < seg; ++s) {   // M | X << 2 | Y << 4 (<= 43: the packs stay exact)
@@ -478,9 +456,6 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
         job.best_i = m; job.best_j = n;
         job.best_tbl = (fm >= fx && fm >= fy) ? 0 : ((fx >= fy) ? 1 : 2);
     }
-#if defined(__SSE2__) && defined(__x86_64__)
-    if (nt) _mm_sfence();   // the non-temporal code stores complete before the walk reads them
-#endif
     job.table_layout = 1;
     job.seg = seg;
     job.width = W;

@@ -1925,11 +1925,6 @@ private:
         if (env >= 0) return env == 1;
         return dense_gate_();
     }
-    // Non-temporal stores for the dense codes: NWGRAD_NT_CODES=1 (measuring; off otherwise).
-    static bool want_nt_() noexcept {
-        static const bool on = [] { const char* e = std::getenv("NWGRAD_NT_CODES"); return e && std::atoi(e) != 0; }();
-        return on;
-    }
     // The auto choice: the dense codes from kDenseFromCells{Avx2,Neon} cells a pair, by the
     // level the fill runs at (0 = never).  On AVX2 they cost 2-13 % in cache (more shifting
     // a segment) and win once a thread's code table presses on L2 / L3 -- from a size that
@@ -2300,7 +2295,6 @@ private:
         if (tr_) fill_track_job_(job.tr, true, static_cast<size_t>(n_) + 16);
         const TypedKernels<T>& KT = K.template of<T>();
         job.dense = (use_ptr && want_dense_()) ? 1 : 0;
-        job.nt = want_nt_() ? 1 : 0;
         if (use_ptr) KT.viterbi_ptr(job); else KT.viterbi(job);
         pointers_ = use_ptr;   // Pointers leaves codes, not score tables
         dense_ = use_ptr && job.dense;
@@ -2359,7 +2353,6 @@ private:
         if (tr_) fill_track_job_(job.tr, true, static_cast<size_t>(n_) + 16, true);
         const TypedKernels<T>& KT = K.template of<T>();
         job.dense = (use_ptr && want_dense_()) ? 1 : 0;
-        job.nt = want_nt_() ? 1 : 0;
         if (use_ptr) KT.linear_ptr(job); else KT.linear(job);
         pointers_ = use_ptr;
         dense_ = use_ptr && job.dense;
