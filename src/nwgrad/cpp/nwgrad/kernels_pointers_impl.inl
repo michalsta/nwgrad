@@ -179,7 +179,7 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                 unsigned char* g = d0 + off + (std::size_t)q * 3 * W;
                 std::memset(g, 0xFF, W); std::memset(g + W, 0, W); std::memset(g + 2 * W, 0xAA, W);
             }
-            if (seg > 0) d0[off + 2 * W] &= (unsigned char)~(3u << (2 * (std::min(4, seg) - 1)));
+            if (seg > 0) d0[off + 2 * W] &= (unsigned char)~(3u << 6);   // segment 0 at shift 2*(3-0)
         }
         for (int l = 0; l < W; ++l)
             for (int s = 0; s < seg; ++s) {
@@ -240,42 +240,43 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                 dgY = lane_shift_in(lY, bY);
             }
             vd accM = vzero, accX = vzero;   // Dense: this group's M / X codes so far
-            // Dense: in groups of four segments, the group's planes stored after it -- no branch
-            // in the segment loop (one-byte codes: one group, the whole row).
-            constexpr int G = Dense ? 4 : (1 << 30);
-            for (int s0 = 0; s0 < seg; s0 += G) {
-            const int s1 = std::min(seg - s0, G) + s0;
-            for (int s = s0; s < s1; ++s) {
+            // One segment of pass 1.  R: its place in a dense group -- the codes come out already
+            // weighted for the group's byte (segment R at shift 2*(3-R), dense_code_at), so
+            // accumulating costs one add a plane where 4*acc + k cost three.
+            auto seg_body = [&](int s, auto R) __attribute__((always_inline)) {
+                constexpr T wt = Dense ? static_cast<T>(1 << (2 * (3 - decltype(R)::value))) : T(1);
+                const vd cM1(Dense ? wt : T(1)), cM2(Dense ? 2 * wt : T(2)), cM3(Dense ? 3 * wt : T(3));
+                const vd cX1 = Dense ? cM1 : kX1, cX2 = Dense ? cM2 : kX2;
                 vd sb; sb.copy_from(sub + (std::size_t)s * W, stdx::element_aligned);
                 const vd mx3 = stdx::max(stdx::max(dgM, dgX), dgY);
                 vd vmv = mx3 + sb;
 
                 // M code: same >= chain as the scalar pick(), M last so it wins ties
-                vd km = vtwo;
+                vd km = cM2;
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
                 if constexpr (sizeof(T) == 8) {
-                    km = avx512d_blend(avx512d_ge(dgX, dgY), km, vone);
+                    km = avx512d_blend(avx512d_ge(dgX, dgY), km, cM1);
                     km = avx512d_blend(avx512d_eq(mx3, dgM), km, vzero);
                 } else {
-                    km = pick_code_mx(mx3, dgM, dgX, dgY, vzero, vone, vtwo);
+                    km = pick_code_mx(mx3, dgM, dgX, dgY, vzero, cM1, cM2);
                 }
 #else
-                km = pick_code_mx(mx3, dgM, dgX, dgY, vzero, vone, vtwo);
+                km = pick_code_mx(mx3, dgM, dgX, dgY, vzero, cM1, cM2);
 #endif
                 if constexpr (Local) {
                     vmv = stdx::max(vmv, vzero);
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
                     if constexpr (sizeof(T) == 8) {
                         // vmv <= vzero  <=>  vzero >= vmv
-                        km = avx512d_blend(avx512d_ge(vzero, vmv), km, vthree);
+                        km = avx512d_blend(avx512d_ge(vzero, vmv), km, cM3);
                     } else if constexpr (nw_is_int<T>) {
-                        stdx::where(vmv == vzero, km) = vthree;   // clamped >= 0: <= 0 is == 0
+                        stdx::where(vmv == vzero, km) = cM3;   // clamped >= 0: <= 0 is == 0
                     } else {
-                        stdx::where(vmv <= vzero, km) = vthree;   // traceback stops here
+                        stdx::where(vmv <= vzero, km) = cM3;   // traceback stops here
                     }
 #else
-                    if constexpr (nw_is_int<T>) stdx::where(vmv == vzero, km) = vthree;   // clamped >= 0
-                    else                        stdx::where(vmv <= vzero, km) = vthree;   // traceback stops here
+                    if constexpr (nw_is_int<T>) stdx::where(vmv == vzero, km) = cM3;   // clamped >= 0
+                    else                        stdx::where(vmv <= vzero, km) = cM3;   // traceback stops here
 #endif
                 }
                 vmv.copy_to(cM + off + (std::size_t)s * W, stdx::element_aligned);
@@ -287,21 +288,21 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                 dgM = uM; dgX = uX; dgY = uY;   // the next segment's diagonal
                 const vd ax = (uM - vgo_b) - vge_b, bx = uX - vge_b, cx = (uY - vgo_b) - vge_b;
                 vd vxv = stdx::max(stdx::max(ax, bx), cx);
-                vd kx = kX2;                        // X's code: 0 / 4 / 8 (Dense 0 / 1 / 2)
+                vd kx = cX2;                        // X's code: 0 / 4 / 8 (Dense: 0 / 1 / 2, times 4^R)
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
                 if constexpr (sizeof(T) == 8) {
-                    kx = avx512d_blend(avx512d_ge(bx, cx), kx, kX1);
+                    kx = avx512d_blend(avx512d_ge(bx, cx), kx, cX1);
                     kx = avx512d_blend(avx512d_eq(vxv, ax), kx, vzero);
                 } else {
-                    kx = pick_code_mx(vxv, ax, bx, cx, vzero, kX1, kX2);
+                    kx = pick_code_mx(vxv, ax, bx, cx, vzero, cX1, cX2);
                 }
 #else
-                kx = pick_code_mx(vxv, ax, bx, cx, vzero, kX1, kX2);
+                kx = pick_code_mx(vxv, ax, bx, cx, vzero, cX1, cX2);
 #endif
                 vxv.copy_to(cX + off + (std::size_t)s * W, stdx::element_aligned);
-                if constexpr (Dense) {   // M and X are final: their planes now (4*acc + k)
-                    accM = accM + accM; accM = accM + accM; accM = accM + km;
-                    accX = accX + accX; accX = accX + accX; accX = accX + kx;
+                if constexpr (Dense) {   // M and X are final: their planes now (codes already x 4^(3-R))
+                    accM += km;
+                    accX += kx;
                 } else {
                     (km + kx).copy_to(mx + (std::size_t)s * W, stdx::element_aligned);
                 }
@@ -327,13 +328,25 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
 #endif
                     okv.copy_to(ok + (std::size_t)s * W, stdx::element_aligned);
                 }
-            }
+            };
             if constexpr (Dense) {
-                unsigned char* g = dP + (std::size_t)(s0 >> 2) * 3 * W;
-                store_codes<T, W>(accM, g); store_codes<T, W>(accX, g + W);
-                accM = vzero; accX = vzero;
+                // groups of four segments, unrolled so R is a constant; a group's planes stored
+                // after it (a short last group leaves its missing fields 0)
+                using I0 = std::integral_constant<int, 0>; using I1 = std::integral_constant<int, 1>;
+                using I2 = std::integral_constant<int, 2>; using I3 = std::integral_constant<int, 3>;
+                for (int s0 = 0; s0 < seg; s0 += 4) {
+                    const int n = seg - s0;
+                    seg_body(s0, I0{});
+                    if (n > 1) seg_body(s0 + 1, I1{});
+                    if (n > 2) seg_body(s0 + 2, I2{});
+                    if (n > 3) seg_body(s0 + 3, I3{});
+                    unsigned char* g = dP + (std::size_t)(s0 >> 2) * 3 * W;
+                    store_codes<T, W>(accM, g); store_codes<T, W>(accX, g + W);
+                    accM = vzero; accX = vzero;
+                }
+            } else {
+                for (int s = 0; s < seg; ++s) seg_body(s, std::integral_constant<int, 0>{});
             }
-            }   // groups
 
             // ── the carry: VY, same-lane striped chain + lazy-F, codes tracked (integer
             // T: the exact prefix max with its codes, int_pmax_carry) ──
@@ -428,6 +441,7 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                         vd k; k.copy_from(yc + (std::size_t)s * W, stdx::element_aligned);
                         accY = accY + accY; accY = accY + accY; accY = accY + k;
                     }
+                    for (int s = s1; s < s0 + 4; ++s) { accY = accY + accY; accY = accY + accY; }   // short group: fixed shifts
                     store_codes<T, W>(accY, dP + (std::size_t)(s0 >> 2) * 3 * W + 2 * W);
                 }
             } else

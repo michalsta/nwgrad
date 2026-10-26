@@ -310,6 +310,7 @@ static void striped_linear_full(ViterbiJob<T>& job) {
                 }
             }
             if constexpr (Dense) {
+                for (int s = s1; s < s0 + 4; ++s) { acc = acc + acc; acc = acc + acc; }   // short group: fixed shifts
                 store_codes<T, W>(acc, dM + (std::size_t)(s0 >> 2) * W);   // <= 255
                 acc = vzero;
             }
