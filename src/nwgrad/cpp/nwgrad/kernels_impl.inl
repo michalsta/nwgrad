@@ -109,21 +109,26 @@ static inline bool avx512d_any_gt(const V& F, const V& v) { return avx512d_gt(F,
 // scalar form compiled under gcc to compare-and-branch on every cell, mispredicted
 // (~30% of a Local Pointers fill).  pad[k] = 0 for a real column, -inf for padding: with
 // a negative gap extend a Y run GAINS score into the padding, so it must be masked.
-// The scan's two halves, so a kernel can fold the per-segment step into a loop it runs
-// anyway (the Pointers kernel's last per-row loop: cY is final there and cM / cX hot):
-// step() per segment in order, then finish().
 template <class T>
-struct RowBest {
+static inline void striped_row_best(const T* cM, const T* cX, const T* cY, const T* pad,
+                                    int seg, int i, T& best, int& bi, int& bj, int& btbl) {
     using vt = stdx::native_simd<T>;
-    static constexpr int W = (int)vt::size();
-    vt lmax{nw_ninf<T>}, ls{T(0)};
+    constexpr int W = (int)vt::size();
+    vt lmax(nw_ninf<T>), ls(T(0));
     // The segment index as a vector, carried and incremented — NOT `vt(T(s))` in the loop:
     // for 64-bit lanes at AVX-512 gcc lowered that broadcast to eight merge-masked
     // `vpbroadcastq`, one per lane and each dependent on the last, an 8-deep chain per
     // segment that the blend then waited on; the Local int64 Pointers fill spent 46 % of
     // its time here (perf, solace, gcc 15.2), 72 vs clang's 43 µs a pair at L200.
-    vt vs{T(0)};
-    [[gnu::always_inline]] void step(const vt& vm, const vt& vx, const vt& vy, const vt& vp) {
+    vt vs(T(0));
+    const vt one(T(1));
+    for (int s = 0; s < seg; ++s, vs += one) {
+        const std::size_t o = (std::size_t)s * W;
+        vt vm, vx, vy, vp;
+        vm.copy_from(cM + o, stdx::element_aligned);
+        vx.copy_from(cX + o, stdx::element_aligned);
+        vy.copy_from(cY + o, stdx::element_aligned);
+        vp.copy_from(pad + o, stdx::element_aligned);
         const vt h = stdx::max(stdx::max(vm, vx), vy) + vp;
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
         if constexpr (sizeof(T) == 8) ls = avx512d_blend(avx512d_gt(h, lmax), ls, vs);
@@ -132,58 +137,36 @@ struct RowBest {
         stdx::where(h > lmax, ls) = vs;
 #endif
         lmax = stdx::max(lmax, h);
-        vs += vt(T(1));
     }
-    void finish(const T* cM, const T* cX, const T* cY, int seg, int i,
-                T& best, int& bi, int& bj, int& btbl) const {
-        T rmax;
-        int l;
-        // (clang + AVX-512: the 64-bit lane's equality mask hits the libstdc++ assertion the
-        // file's workaround describes; int64 keeps the scalar reduction there.)
+    T rmax;
+    int l;
+    // (clang + AVX-512: the 64-bit lane's equality mask hits the libstdc++ assertion the
+    // file's workaround describes; int64 keeps the scalar reduction there.)
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
-        constexpr bool vec_reduce = nw_is_int<T> && sizeof(T) != 8;
+    constexpr bool vec_reduce = nw_is_int<T> && sizeof(T) != 8;
 #else
-        constexpr bool vec_reduce = nw_is_int<T>;
+    constexpr bool vec_reduce = nw_is_int<T>;
 #endif
-        if constexpr (vec_reduce) {
-            // A vector reduction and a mask search (gcc extracted the 16 int16 lanes one by
-            // one, ~5 % of the Pointers kernel's time).  Exact for integers; floating T keeps
-            // the scalar loop, whose std::max keeps the FIRST of two equal values and so the
-            // sign of a zero the reduction might swap.
-            rmax = stdx::hmax(lmax);
-            if (!(rmax > best)) return;
-            l = stdx::find_first_set(lmax == rmax);
-        } else {
-            rmax = lmax[0];
-            for (int q = 1; q < W; ++q) rmax = std::max(rmax, T(lmax[q]));
-            if (!(rmax > best)) return;
-            l = 0;
-            while (!(lmax[l] == rmax)) ++l;
-        }
-        const int s = (int)ls[l];
-        const std::size_t k = (std::size_t)s * W + (std::size_t)l;
-        const T mm = cM[k], xx = cX[k], yy = cY[k];
-        best = rmax; bi = i; bj = l * seg + s + 1;
-        btbl = (mm >= xx && mm >= yy) ? 0 : ((xx >= yy) ? 1 : 2);
+    if constexpr (vec_reduce) {
+        // A vector reduction and a mask search (gcc extracted the 16 int16 lanes one by
+        // one, ~5 % of the Pointers kernel's time).  Exact for integers; floating T keeps
+        // the scalar loop, whose std::max keeps the FIRST of two equal values and so the
+        // sign of a zero the reduction might swap.
+        rmax = stdx::hmax(lmax);
+        if (!(rmax > best)) return;
+        l = stdx::find_first_set(lmax == rmax);
+    } else {
+        rmax = lmax[0];
+        for (int q = 1; q < W; ++q) rmax = std::max(rmax, T(lmax[q]));
+        if (!(rmax > best)) return;
+        l = 0;
+        while (!(lmax[l] == rmax)) ++l;
     }
-};
-
-template <class T>
-static inline void striped_row_best(const T* cM, const T* cX, const T* cY, const T* pad,
-                                    int seg, int i, T& best, int& bi, int& bj, int& btbl) {
-    using vt = stdx::native_simd<T>;
-    constexpr int W = (int)vt::size();
-    RowBest<T> rb;
-    for (int s = 0; s < seg; ++s) {
-        const std::size_t o = (std::size_t)s * W;
-        vt vm, vx, vy, vp;
-        vm.copy_from(cM + o, stdx::element_aligned);
-        vx.copy_from(cX + o, stdx::element_aligned);
-        vy.copy_from(cY + o, stdx::element_aligned);
-        vp.copy_from(pad + o, stdx::element_aligned);
-        rb.step(vm, vx, vy, vp);
-    }
-    rb.finish(cM, cX, cY, seg, i, best, bi, bj, btbl);
+    const int s = (int)ls[l];
+    const std::size_t k = (std::size_t)s * W + (std::size_t)l;
+    const T mm = cM[k], xx = cX[k], yy = cY[k];
+    best = rmax; bi = i; bj = l * seg + s + 1;
+    btbl = (mm >= xx && mm >= yy) ? 0 : ((xx >= yy) ? 1 : 2);
 }
 
 // pad[s*W + l] = 0 for a real column (l*seg + s + 1 <= n), -inf for padding.
