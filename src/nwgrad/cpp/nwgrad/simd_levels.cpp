@@ -43,13 +43,19 @@ void register_level_typed(SimdLevel l,
     k.inter_w           = inter_w;
 }
 
+template <class T>
+void register_level_grid(SimdLevel l, typename TypedKernels<T>::grid_fn grid_fwd) {
+    level_table()[(int)l].template of<T>().grid_fwd = grid_fwd;
+}
+
 #define NWGRAD_INSTANTIATE_REGISTER(T) \
     template void register_level_typed<T>(SimdLevel, TypedKernels<T>::viterbi_fn, \
         TypedKernels<T>::viterbi_fn, TypedKernels<T>::viterbi_fn, TypedKernels<T>::viterbi_fn, \
         void (*)(LhbJob<T>&), banded_row_fn_t<T>, banded_row_fn_t<T>, \
         TypedKernels<T>::hb_fn, TypedKernels<T>::hb_fn, TypedKernels<T>::hbbase_fn, \
         TypedKernels<T>::hbscan_fn, TypedKernels<T>::score_fn, TypedKernels<T>::inter_fn, \
-        TypedKernels<T>::inter_fn, int);
+        TypedKernels<T>::inter_fn, int); \
+    template void register_level_grid<T>(SimdLevel, TypedKernels<T>::grid_fn);
 NWGRAD_INSTANTIATE_REGISTER(double)
 NWGRAD_INSTANTIATE_REGISTER(float)
 NWGRAD_INSTANTIATE_REGISTER(int16_t)

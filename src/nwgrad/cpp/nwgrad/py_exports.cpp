@@ -301,10 +301,11 @@ static TracebackMode parse_traceback(const std::string& name) {
     if (name == "scores")     return TracebackMode::Scores;
     if (name == "hirschberg") return TracebackMode::Hirschberg;
     if (name == "hirschberg_pmax") return TracebackMode::HirschbergPmax;
+    if (name == "grid")       return TracebackMode::Grid;
     throw nb::value_error(
         ("nwgrad: unknown traceback \"" + name +
-         "\" (expected \"auto\", \"pointers\", \"scores\", \"hirschberg\" or "
-         "\"hirschberg_pmax\")").c_str());
+         "\" (expected \"auto\", \"pointers\", \"scores\", \"hirschberg\", "
+         "\"hirschberg_pmax\" or \"grid\")").c_str());
 }
 static bool parse_fill(const std::string& name) {
     if (name == "striped") return false;
@@ -356,6 +357,7 @@ static const char* traceback_name(TracebackMode t) {
         case TracebackMode::Pointers:   return "pointers";
         case TracebackMode::Hirschberg: return "hirschberg";
         case TracebackMode::HirschbergPmax: return "hirschberg_pmax";
+        case TracebackMode::Grid:       return "grid";
         case TracebackMode::Default:    return "auto";
         default:                        return "scores";
     }

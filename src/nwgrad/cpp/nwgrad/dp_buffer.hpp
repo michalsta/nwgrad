@@ -227,6 +227,21 @@ struct DpBufferT {
     // sweeps hold hramp across the base cases that run this carry.
     TVec iramp;
 
+    // ── TracebackMode::Grid (Aligner::viterbi_affine_grid) ────────────────────
+    // The grid lines of each recursion level (saved rows, segment-aligned columns and
+    // their column ids), the grid kernel's rolling rows and profile, the problem's border
+    // lines and the base block's values and direction codes.  O(k (m + n)) in all.
+    struct GridLevel {
+        TVec rows, cols;
+        std::vector<int> colid;
+        std::vector<std::pair<int, int>> gcols;   // (column, set * W + lane), sorted
+    };
+    std::vector<GridLevel> glv;          // one per recursion depth
+    TVec grows, gprof, gtop, gleft;
+    std::vector<unsigned char> gbuilt;   // profile rows built for the current rectangle
+    TVec gbM, gbX, gbY;
+    BVec gdM, gdX, gdY;
+
     // Scaled soft path (SoftImpl::Scaled): rolling backward rows (current/next, per
     // state) and the per-row power-of-two exponents of the forward tables.  The forward
     // tables reuse F / FM,FX,FY; the B tables are not used at all.
@@ -253,6 +268,10 @@ struct DpBufferT {
         clrT(hsM); clrT(hsX); clrT(hsY);
         clrT(hprof); clrT(hov); clrT(hramp); clrT(iramp);
         clrB(hbD); clrB(hops);
+        glv.clear(); glv.shrink_to_fit();
+        clrT(grows); clrT(gprof); clrT(gtop); clrT(gleft); clrT(gbM); clrT(gbX); clrT(gbY);
+        gbuilt.clear(); gbuilt.shrink_to_fit();
+        clrB(gdM); clrB(gdX); clrB(gdY);
         clrD(sb0); clrD(sb1); clrD(sb2); clrD(sb3); clrD(sb4); clrD(sb5); clrD(sqp);
         sexp.clear(); sexp.shrink_to_fit();
     }

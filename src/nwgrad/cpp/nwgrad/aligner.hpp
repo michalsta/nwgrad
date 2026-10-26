@@ -79,7 +79,19 @@ enum class AlignBand { Full,   GuideBanded };
 //              split are unaffected.  It remains bit-identical scalar-vs-simd across
 //              every ISA level (the closed form depends only on the absolute column
 //              index, not on the vector width).  See hb_kernel_impl.inl.
-enum class TracebackMode { Scores, Pointers, Hirschberg, HirschbergPmax, Default };
+//
+//   Grid       Pointers' result — score, path, guide, gradient, ties included — from one
+//              score-only forward pass that saves a grid of rows and columns (every
+//              state), then a walk back from (m, n) that re-fills, with direction codes,
+//              only the blocks the path crosses, recursively down to small blocks
+//              (viterbi_affine_grid).  O(k (m + n)) memory and ~1x the cell work
+//              (the re-filled blocks are ~2/k of the cells per level).  Bit-identical to
+//              Pointers because every re-filled cell is computed from the full fill's
+//              exact values by the same expressions.  Implemented for affine Global Full,
+//              untracked, floating T, opens >= 0, on a simd level with the kernel, and
+//              pairs longer than hb_cutoff; everything else runs AS Pointers (the same
+//              result by definition, so no fallback can change an answer).
+enum class TracebackMode { Scores, Pointers, Hirschberg, HirschbergPmax, Grid, Default };
 
 // How compute_forward_back() evaluates log Z and the expected counts.
 //   Scaled (default): probability space with exact power-of-two row rescaling and the
@@ -873,6 +885,7 @@ struct Aligner {
         tables_striped_ = false;
         pointers_       = false;
         hirschberg_     = false;
+        grid_           = false;
         inter_w_ = W; inter_lane_ = lane;
         if constexpr (GM == GapModel::Linear) {
             // Linear: H in buf.H's slot of the interleaved fill (InterJob.linear).
@@ -1352,6 +1365,9 @@ private:
     // is O(m+n) where a table would be O(m·n).
     bool        hirschberg_ = false;
     std::vector<unsigned char> hops_;   // 0=M diagonal, 1=X gap-in-b, 2=Y gap-in-a
+    // hops_ came from the Grid traceback (hirschberg_ is set too: every consumer replays
+    // hops_), whose guide follows Pointers' convention (guide_j_affine_hb).
+    bool grid_ = false;
     // Local Hirschberg only: the 0-based cell where the recovered local path STARTS.
     // hops_ is a path within the sub-rectangle A[hb_start_i_..ie) x B[hb_start_j_..je),
     // so every consumer replays it from this origin rather than (0, 0).  For Global (and
@@ -1544,7 +1560,8 @@ private:
     // smaller memory bounds even when rowwise was requested.
     bool uses_rowwise_full() const {
         if constexpr (GM == GapModel::Affine && AB == AlignBand::Full) {
-            if (!rowwise_full_ || hb_splits(tb_, tb_auto_ ? kAutoPointerCells : 0, hb_cutoff_, m_, n_)) return false;
+            if (!rowwise_full_ || hb_splits(tb_, tb_auto_ ? kAutoPointerCells : 0, hb_cutoff_, m_, n_) ||
+                (tb_ == TracebackMode::Grid && m_ > hb_cutoff_)) return false;
             const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
             return backend >= 0 && level_kernels(backend).template of<T>().banded_row_local;
         }
@@ -1563,7 +1580,7 @@ private:
     bool linear_ptr_fill() const noexcept {
         if constexpr (GM != GapModel::Linear || AB != AlignBand::Full) return false;
         else {
-            if (is_hirschberg(tb_)) return true;
+            if (is_hirschberg(tb_) || tb_ == TracebackMode::Grid) return true;
             if (tb_ != TracebackMode::Pointers) return false;
             return !tb_auto_ || sz_ * sizeof(T) > kLinearHTableBytes;
         }
@@ -1582,7 +1599,8 @@ private:
             // Hirschberg allocates even less: its scratch is O(n) rows sized on demand
             // inside the recursion, and the whole point is that no O(m*n) table exists.
             if constexpr (AB == AlignBand::Full)
-                if ((tb_ == TracebackMode::Pointers || is_hirschberg(tb_)) && !uses_rowwise_full()) return;
+                if ((tb_ == TracebackMode::Pointers || is_hirschberg(tb_) || tb_ == TracebackMode::Grid) &&
+                    !uses_rowwise_full()) return;
             for (auto* v : {&buf.VM, &buf.VX, &buf.VY}) if (v->size() < sz_) v->resize(sz_);
         }
     }
@@ -2185,6 +2203,7 @@ private:
         pointers_     = false;
         dense_        = false;
         hirschberg_   = false;
+        grid_         = false;
         inter_w_      = 0;
         // Hirschberg: divide and conquer, no tables above the base case.  It is a
         // DIFFERENT algorithm with a different tie-break, not a faster spelling of the
@@ -2264,12 +2283,19 @@ private:
         const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
         // Pointers is Full-affine only; banded/linear always keep score tables.
         // (a Hirschberg mode reaches here only for a short pair — see above)
-        const bool use_ptr = (tb_ == TracebackMode::Pointers || is_hirschberg(tb_)) &&
-                             (AB == AlignBand::Full);
+        const bool use_ptr = (tb_ == TracebackMode::Pointers || is_hirschberg(tb_) ||
+                              tb_ == TracebackMode::Grid) && (AB == AlignBand::Full);
         if (backend == kBackendScalar) {
             if (use_ptr) viterbi_affine_ptr(buf); else viterbi_affine(buf);
             return;
         }
+        // Grid: where it is implemented (grid_ok_), else Pointers below — the same result.
+        if constexpr (GM == GapModel::Affine && AM == AlignMode::Global && AB == AlignBand::Full &&
+                      std::is_floating_point_v<T>)
+            if (tb_ == TracebackMode::Grid && grid_ok_(level_kernels(backend))) {
+                viterbi_affine_grid(buf, level_kernels(backend));
+                return;
+            }
 
         // A simd level: its kernels.  If that level's TU was not linked (header-only
         // single-level build), every pointer is null and we fall through to scalar.
@@ -3830,6 +3856,7 @@ private:
     }
 
     std::vector<int> guide_j_affine_hb() const {
+        if (grid_) return guide_j_grid_();
         std::vector<int> gj(static_cast<std::size_t>(m_ + 1), -1);
         gj[0] = 0;
         // Local: the path covers only rows [is, ie); seed the start anchor and let the
@@ -3845,6 +3872,183 @@ private:
         gj[static_cast<std::size_t>(m_)] = n_;
         fill_guide_gaps(gj);
         return gj;
+    }
+
+    // The guide of a Grid path, in Pointers' convention (guide_j_affine): gj[i] is the
+    // column where the path LEAVES row i (an M or X move out of it), not where it enters.
+    std::vector<int> guide_j_grid_() const {
+        std::vector<int> gj;
+        guide_affine_init(gj);
+        int i = 0, j = 0;
+        for (unsigned char op : hops_) {
+            if (op == 0)      { gj[static_cast<std::size_t>(i)] = j; ++i; ++j; }
+            else if (op == 1) { gj[static_cast<std::size_t>(i)] = j; ++i; }
+            else              { ++j; }
+        }
+        fill_guide_gaps(gj);
+        return gj;
+    }
+
+    // ── TracebackMode::Grid: grid-checkpoint traceback (see the TracebackMode note) ──
+    //
+    // grid_solve(rect, entry cell) walks the optimal path back from the entry cell (i, j)
+    // in state st until it reaches the rectangle's top row or left column.  Nothing below
+    // or right of the entry cell can be on the path, so the rectangle is [r0, i] x [c0, j].
+    // Above the base size it runs the leveled grid kernel (grid_kernel_impl.inl) over the
+    // rectangle, saving every R-th row and segment-aligned columns, and hands each block
+    // the path crosses to grid_solve one level down, with the saved lines as its borders;
+    // a base rectangle is re-filled by the scalar Pointers fill (viterbi_affine_ptr's
+    // expressions) and walked.  Each re-filled cell is the full fill's value, so each code
+    // is the full fill's code and the walk takes Pointers' steps, ties included.
+    // Tuning (measured on the prototype, tools/gridgrad): kGridK lines per dimension, base
+    // blocks of kGridBase cells; memory ~ kGridK (m + n) * 3 values over all levels.
+    static constexpr int  kGridK = 32;
+    static constexpr long kGridBase = 64 * 64;
+    static constexpr int  kGridMin = 8;      // rows / columns per block, at least
+    static constexpr int  kGridDepth = 64;   // recursion levels (never reached: ~log_k(m))
+
+    struct GridLine {                        // value(s, idx) = p[s*ss + idx*es]
+        const T* p; std::size_t ss, es;
+        T operator()(int s, int idx) const noexcept {
+            return p[static_cast<std::size_t>(s) * ss + static_cast<std::size_t>(idx) * es];
+        }
+        GridLine shifted(int d) const noexcept {
+            return {p + static_cast<std::ptrdiff_t>(d) * static_cast<std::ptrdiff_t>(es), ss, es};
+        }
+    };
+
+    bool grid_ok_(const LevelKernels& K) const noexcept {
+        if (!K.template of<T>().grid_fwd || tr_ || m_ <= hb_cutoff_ || n_ == 0) return false;
+        return static_cast<T>(params_->gap_open_a) >= T(0) && static_cast<T>(params_->gap_open_b) >= T(0);
+    }
+
+    void viterbi_affine_grid(DpBuffer& buf, const LevelKernels& K) {
+        const T go_a = static_cast<T>(params_->gap_open_a), ge_a = static_cast<T>(params_->gap_extend_a);
+        const T go_b = static_cast<T>(params_->gap_open_b), ge_b = static_cast<T>(params_->gap_extend_b);
+        // the borders, as viterbi_affine_ptr leaves row 0 and column 0 (M, X, Y)
+        const std::size_t n1 = static_cast<std::size_t>(n_) + 1, m1 = static_cast<std::size_t>(m_) + 1;
+        buf.gtop.resize(3 * n1); buf.gleft.resize(3 * m1);
+        for (std::size_t j = 0; j < n1; ++j) {
+            buf.gtop[j] = j == 0 ? T(0) : NEG_INF;
+            buf.gtop[n1 + j] = NEG_INF;
+            buf.gtop[2 * n1 + j] = j == 0 ? NEG_INF : -(go_a + static_cast<T>(j) * ge_a);
+        }
+        for (std::size_t i = 0; i < m1; ++i) {
+            buf.gleft[i] = i == 0 ? T(0) : NEG_INF;
+            buf.gleft[m1 + i] = i == 0 ? NEG_INF : -(go_b + static_cast<T>(i) * ge_b);
+            buf.gleft[2 * m1 + i] = NEG_INF;
+        }
+        if (buf.glv.size() < static_cast<std::size_t>(kGridDepth)) buf.glv.resize(kGridDepth);   // never again: grid_solve holds references
+        hops_.clear();
+        hops_.reserve(static_cast<std::size_t>(m_ + n_));
+        int i = m_, j = n_, st = -1;
+        grid_solve(buf, K, 0, 0, GridLine{buf.gtop.data(), n1, 1}, GridLine{buf.gleft.data(), m1, 1},
+                   0, i, j, st);
+        // the borders: forced moves, as walk_affine's
+        for (; i == 0 && j > 0; --j) hops_.push_back(2);
+        for (; j == 0 && i > 0; --i) hops_.push_back(1);
+        std::reverse(hops_.begin(), hops_.end());
+        best_i_ = m_; best_j_ = n_;
+        hb_start_i_ = 0; hb_start_j_ = 0;
+        hirschberg_ = true;
+        grid_ = true;
+    }
+
+    void grid_solve(DpBuffer& buf, const LevelKernels& K, int r0, int c0, const GridLine& top,
+                    const GridLine& left, int depth, int& i, int& j, int& st) {
+        const int r1 = i, c1 = j, h = r1 - r0, w = c1 - c0;
+        if (static_cast<long>(h) * w <= kGridBase || h < 2 * kGridMin || w < 2 * kGridMin ||
+            depth + 1 >= kGridDepth) {
+            grid_base(buf, r0, r1, c0, c1, top, left, i, j, st);
+            return;
+        }
+        auto& L = buf.glv[static_cast<std::size_t>(depth)];
+        const int R = std::max(kGridMin, (h + kGridK - 1) / kGridK);
+        GridFwdJob<T> J{};
+        J.a = a_idx_.data(); J.b = b_idx_.data(); J.blk = blkT_; J.nalpha = nalpha_;
+        J.go_a = static_cast<T>(params_->gap_open_a); J.ge_a = static_cast<T>(params_->gap_extend_a);
+        J.go_b = static_cast<T>(params_->gap_open_b); J.ge_b = static_cast<T>(params_->gap_extend_b);
+        J.r0 = r0; J.r1 = r1; J.c0 = c0; J.c1 = c1;
+        J.top = top.p; J.top_ss = top.ss; J.top_es = top.es;
+        J.left = left.p; J.left_ss = left.ss; J.left_es = left.es;
+        J.R = R; J.spacing = std::max(kGridMin, (w + kGridK - 1) / kGridK);
+        J.rows = &L.rows; J.cols = &L.cols; J.colid = &L.colid; J.buf = &buf;
+        K.template of<T>().grid_fwd(J);
+        const int W = J.W, q = J.q;
+        L.gcols.clear();
+        L.gcols.push_back({c0, -1});                     // the rectangle's left line
+        for (int t = 0; t < q * W; ++t)
+            if (L.colid[static_cast<std::size_t>(t)] >= 0) L.gcols.push_back({L.colid[static_cast<std::size_t>(t)], t});
+        std::sort(L.gcols.begin(), L.gcols.end());
+        while (i > r0 && j > c0) {
+            const int br0 = r0 + ((i - r0 - 1) / R) * R;   // the band holding row i
+            auto it = std::lower_bound(L.gcols.begin(), L.gcols.end(), std::make_pair(j, -2));
+            --it;                                           // the last line left of column j
+            const int bc0 = it->first, tl = it->second;
+            const GridLine ctop = br0 == r0
+                ? top.shifted(bc0 - c0)
+                : GridLine{L.rows.data() + static_cast<std::size_t>((br0 - r0) / R - 1) * 3 * static_cast<std::size_t>(w + 1),
+                           static_cast<std::size_t>(w + 1), 1}.shifted(bc0 - c0);
+            const GridLine cleft = tl < 0
+                ? left.shifted(br0 - r0)
+                : GridLine{L.cols.data() + static_cast<std::size_t>(tl / W) * 3 * static_cast<std::size_t>(h + 1) * W + static_cast<std::size_t>(tl % W),
+                           static_cast<std::size_t>(h + 1) * W, static_cast<std::size_t>(W)}.shifted(br0 - r0);
+            grid_solve(buf, K, br0, bc0, ctop, cleft, depth + 1, i, j, st);
+        }
+    }
+
+    // The base block: viterbi_affine_ptr's fill over [r0, r1] x [c0, c1] from its borders,
+    // then the walk from (i, j) until the top row or the left column.
+    void grid_base(DpBuffer& buf, int r0, int r1, int c0, int c1, const GridLine& top,
+                   const GridLine& left, int& i, int& j, int& st) {
+        const T go_a = static_cast<T>(params_->gap_open_a), ge_a = static_cast<T>(params_->gap_extend_a);
+        const T go_b = static_cast<T>(params_->gap_open_b), ge_b = static_cast<T>(params_->gap_extend_b);
+        const std::size_t bw = static_cast<std::size_t>(c1 - c0) + 1, sz = (static_cast<std::size_t>(r1 - r0) + 1) * bw;
+        if (buf.gbM.size() < sz) {
+            buf.gbM.resize(sz); buf.gbX.resize(sz); buf.gbY.resize(sz);
+            buf.gdM.resize(sz); buf.gdX.resize(sz); buf.gdY.resize(sz);
+        }
+        T* bM = buf.gbM.data(); T* bX = buf.gbX.data(); T* bY = buf.gbY.data();
+        unsigned char* dM = buf.gdM.data(); unsigned char* dX = buf.gdX.data(); unsigned char* dY = buf.gdY.data();
+        auto at = [&](int ii, int jj) {
+            return static_cast<std::size_t>(ii - r0) * bw + static_cast<std::size_t>(jj - c0);
+        };
+        auto pick = [](T vm, T vx, T vy) -> unsigned char {   // viterbi_affine_ptr's
+            const unsigned char kxy = vx >= vy ? 1 : 2;
+            return vm >= std::max(vx, vy) ? static_cast<unsigned char>(0) : kxy;
+        };
+        for (int jj = c0; jj <= c1; ++jj) {
+            const std::size_t k = at(r0, jj);
+            bM[k] = top(0, jj - c0); bX[k] = top(1, jj - c0); bY[k] = top(2, jj - c0);
+        }
+        for (int ii = r0 + 1; ii <= r1; ++ii) {
+            const std::size_t k0 = at(ii, c0);
+            bM[k0] = left(0, ii - r0); bX[k0] = left(1, ii - r0); bY[k0] = left(2, ii - r0);
+            for (int jj = c0 + 1; jj <= c1; ++jj) {
+                const std::size_t k = at(ii, jj), up = k - bw, dg = up - 1, lf = k - 1;
+                const T dgM = bM[dg], dgX = bX[dg], dgY = bY[dg];
+                bM[k] = std::max({dgM, dgX, dgY}) + subTu(ii, jj);
+                dM[k] = pick(dgM, dgX, dgY);
+                const T ux = bM[up] - go_b - ge_b, vx = bX[up] - ge_b, wx = bY[up] - go_b - ge_b;
+                bX[k] = std::max({ux, vx, wx}); dX[k] = pick(ux, vx, wx);
+                const T uy = bM[lf] - go_a - ge_a, vy = bX[lf] - go_a - ge_a, wy = bY[lf] - ge_a;
+                bY[k] = std::max({uy, vy, wy}); dY[k] = pick(uy, vy, wy);
+            }
+        }
+        if (st < 0) {   // the end cell (m, n): its argmax and the score, as viterbi_affine_ptr
+            const std::size_t k = at(i, j);
+            const T vm = bM[k], vx = bX[k], vy = bY[k];
+            viterbi_score_ = std::max({vm, vx, vy});
+            st = (vm >= vx && vm >= vy) ? 0 : (vx >= vy ? 1 : 2);
+            best_tbl_ = st == 0 ? TBTable::M : (st == 1 ? TBTable::X : TBTable::Y);
+        }
+        while (i > r0 && j > c0) {
+            const std::size_t k = at(i, j);
+            hops_.push_back(static_cast<unsigned char>(st));
+            if (st == 0)      { st = dM[k]; --i; --j; }
+            else if (st == 1) { st = dX[k]; --i; }
+            else              { st = dY[k]; --j; }
+        }
     }
 
     // ── Score only, scalar: viterbi_affine / viterbi_linear on rolling rows ──
