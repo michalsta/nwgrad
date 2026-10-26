@@ -12,6 +12,7 @@
 #include "catch.hpp"
 
 #include <cstdint>
+#include <cstdlib>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -138,6 +139,20 @@ void sweep(uint64_t seed) {
     INFO(cases << " cases, " << dense_written << " written dense");
 }
 
+template <GapModel GM>
+bool gate_writes(Rng& rng, int len, int backend) {
+    const Alphabet& alpha = Alphabet::protein();
+    Aligner<GM, AlignMode::Global, AlignBand::Full, int32_t> al;
+    al.set_kernel(backend);
+    al.set_traceback(TracebackMode::Pointers);   // auto dense (dense_codes() == -1)
+    const AlignParams p = params(rng, alpha, GM == GapModel::Affine, 1);
+    const auto e = alpha.encode(seq(rng, alpha, len));
+    DpBufferT<int32_t> buf;
+    al.set_problem(e, e, p, 0);
+    al.compute_viterbi(buf);
+    return al.dense_written();
+}
+
 }  // namespace
 
 TEMPLATE_TEST_CASE("dense direction codes reproduce the one-byte codes bit for bit",
@@ -146,4 +161,39 @@ TEMPLATE_TEST_CASE("dense direction codes reproduce the one-byte codes bit for b
     sweep<GapModel::Affine, AlignMode::Local, TestType>(12);
     sweep<GapModel::Linear, AlignMode::Global, TestType>(13);
     sweep<GapModel::Linear, AlignMode::Local, TestType>(14);
+}
+
+// The auto gate (Aligner::dense_gate_): dense from kDenseFromCells cells a pair, never for
+// int16.  int32 affine Global has the smallest threshold (2^20 cells), so it is the one to
+// exercise at a test-friendly size.  NWGRAD_DENSE_CODES, if set in the environment, would
+// override auto: skip then.
+TEST_CASE("dense codes: the auto gate engages by pair size", "[dense][pointers]") {
+    if (std::getenv("NWGRAD_DENSE_CODES")) { WARN("NWGRAD_DENSE_CODES overrides the gate: skipped"); return; }
+    Rng rng(99);
+    // the unmeasured levels and the scalar fill never write them
+    STATIC_REQUIRE(Aligner<GapModel::Affine, AlignMode::Global, AlignBand::Full, int16_t>::kDenseFromCellsAvx2 == 0);
+    STATIC_REQUIRE(Aligner<GapModel::Affine, AlignMode::Global, AlignBand::GuideBanded, double>::kDenseFromCellsAvx2 == 0);
+    STATIC_REQUIRE(Aligner<GapModel::Affine, AlignMode::Global, AlignBand::Full, float>::kDenseFromCellsNeon == 0);
+    STATIC_REQUIRE(Aligner<GapModel::Linear, AlignMode::Global, AlignBand::Full, double>::kDenseFromCellsNeon == 0);
+    int level = -1;
+    for (SimdLevel l : detect_available_levels()) {
+#if defined(__aarch64__) || defined(_M_ARM64)
+        level = static_cast<int>(l);
+#else
+        if (l == SimdLevel::Avx2) level = static_cast<int>(l);
+#endif
+    }
+    // sse2 / sse4 (and avx512, unmeasured): off at any size
+    for (SimdLevel l : detect_available_levels())
+        if (static_cast<int>(l) != level)
+            CHECK_FALSE(gate_writes<GapModel::Affine>(rng, 1100, static_cast<int>(l)));
+    if (level < 0) { WARN("no gated level here: the positive half skipped"); return; }
+#if defined(__aarch64__) || defined(_M_ARM64)
+    CHECK_FALSE(gate_writes<GapModel::Linear>(rng, 500, level));    // 251 k cells
+    CHECK(gate_writes<GapModel::Linear>(rng, 1100, level));         // 1.21 M cells
+    CHECK_FALSE(gate_writes<GapModel::Affine>(rng, 1100, level));   // affine: never on NEON
+#else
+    CHECK_FALSE(gate_writes<GapModel::Affine>(rng, 500, level));    // 251 k cells: in cache
+    CHECK(gate_writes<GapModel::Affine>(rng, 1100, level));         // 1.21 M cells
+#endif
 }

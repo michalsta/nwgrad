@@ -589,6 +589,27 @@ struct Aligner {
     void set_dense_codes(int mode) noexcept { dense_mode_ = mode < 0 ? -1 : (mode ? 1 : 0); }
     int dense_codes() const noexcept { return dense_mode_; }
     bool dense_written() const noexcept { return dense_; }
+    // The auto gate's thresholds (dense_gate_): cells a pair from which the dense codes are
+    // written, per level, gap model, mode and type; 0 = never.  Only where measured faster
+    // (2026-10-26; AGENTS.md "Dense direction codes"); unmeasured levels stay off.
+    // AVX2 (nighthaven, 1-12 threads): from the size where dense won at every thread count.
+    static constexpr std::size_t kDenseFromCellsAvx2 = [] {
+        constexpr std::size_t M1 = std::size_t(1) << 20;
+        if constexpr (sizeof(T) < 4 || AB != AlignBand::Full) return std::size_t(0);
+        else if constexpr (GM == GapModel::Affine && AM == AlignMode::Global)
+            return nw_is_int<T> && sizeof(T) == 4 ? M1 : 16 * M1;         // int32 L1000; else L4000
+        else if constexpr (GM == GapModel::Affine)                         // Local: its row scan
+            return nw_is_int<T> && sizeof(T) == 4 ? 16 * M1 : 32 * M1;    // dilutes the code stream
+        else if constexpr (AM == AlignMode::Global)                        // linear
+            return std::is_same_v<T, double> ? 16 * M1 : 4 * M1;
+        else                                                               // linear Local
+            return std::is_same_v<T, float> ? 4 * M1 : 16 * M1;
+    }();
+    // NEON (M1, 1-8 threads): affine and linear double lost 4-18 % at every size (no memory
+    // wall there); linear float32 / int32 won 7-10 % at every size measured (L1000-5800).
+    static constexpr std::size_t kDenseFromCellsNeon =
+        (GM == GapModel::Linear && AB == AlignBand::Full &&
+         (std::is_same_v<T, float> || std::is_same_v<T, int32_t>)) ? std::size_t(1) << 20 : 0;
     void set_hb_cutoff(int rows) {
         if (rows < 1)
             throw std::invalid_argument("nwgrad: hb_cutoff must be >= 1");
@@ -1878,8 +1899,21 @@ private:
         if (env >= 0) return env == 1;
         return dense_gate_();
     }
-    // The auto choice: where the dense codes measured faster.  Not yet decided: off.
-    bool dense_gate_() const noexcept { return false; }
+    // The auto choice: the dense codes from kDenseFromCells{Avx2,Neon} cells a pair, by the
+    // level the fill runs at (0 = never).  On AVX2 they cost 2-13 % in cache (more shifting
+    // a segment) and win once a thread's code table presses on L2 / L3 -- from a size that
+    // hardly moves with the thread count, so the gate is on cells alone; on NEON the
+    // answer does not depend on size (see the constants).
+    bool dense_gate_() const noexcept {
+        const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
+#if defined(__aarch64__) || defined(_M_ARM64)
+        const std::size_t from = backend >= 0 ? kDenseFromCellsNeon : 0;
+#else
+        const std::size_t from = backend == static_cast<int>(SimdLevel::Avx2) ? kDenseFromCellsAvx2 : 0;
+#endif
+        return from != 0 &&
+               (static_cast<std::size_t>(m_) + 1) * (static_cast<std::size_t>(n_) + 1) >= from;
+    }
     // The affine cell's three codes in the one-byte packing, from whichever format holds them.
     unsigned char affine_codes(const BVec& d, int i, int j) const noexcept {
         if (!dense_) return dcode(d, i, j);
