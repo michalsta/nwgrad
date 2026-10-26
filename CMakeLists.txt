@@ -210,6 +210,7 @@ if (NWGRAD_BUILD_TESTS)
         tests/cpp/test_banded.cpp
         tests/cpp/test_seq_pair.cpp
         tests/cpp/test_traceback_modes.cpp
+        tests/cpp/test_dense_codes.cpp
         tests/cpp/test_viterbi_then_fwdbwd.cpp
         tests/cpp/test_buffer_reuse.cpp
         tests/cpp/test_batch_engine.cpp

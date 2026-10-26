@@ -84,8 +84,12 @@ static inline void striped_row_best1(const T* cH, const T* pad, int seg, int i,
 // Ptr: record direction bytes (TracebackMode::Pointers) on rolling rows; else the H table.
 // Tr: a tracked problem (job.tr): each row's extends, border and profile row from the
 // track arrays, in the same expressions, so equal sets give the untracked table.
-template <class T, bool Local, bool Ptr, bool Tr>
+// Dense (Ptr only): the same codes, four segments' worth a byte (dense_codes_row_bytes,
+// simd_levels.hpp: 0.25 B/cell), for the memory-bound regime -- each lane accumulates its
+// 2-bit codes by Horner over a group of four segments and stores one byte per lane a group.
+template <class T, bool Local, bool Ptr, bool Tr, bool Dense = false>
 static void striped_linear_full(ViterbiJob<T>& job) {
+    static_assert(!Dense || (Ptr && sizeof(T) >= 4), "dense codes: pointer fill, lanes >= 32 bits");
     using vd = stdx::native_simd<T>;
     constexpr int W = (int)vd::size();
     const T K_NINF = nw_ninf<T>;
@@ -128,8 +132,10 @@ static void striped_linear_full(ViterbiJob<T>& job) {
     // written once a cell).
     const std::size_t hstride = (Ptr || !table_spread()) ? rowsz : spread_stride<T>(rowsz, 2);
     T* pH; T* cH;
+    // the direction table's row length in bytes: one per slot, or the dense groups
+    const std::size_t drow = Dense ? dense_codes_row_bytes(seg, W, 1) : rowsz;
     if constexpr (Ptr) {
-        const std::size_t dsz = (std::size_t)(m + 1) * rowsz;
+        const std::size_t dsz = (std::size_t)(m + 1) * drow;
         if (buf.DM.size() < dsz) buf.DM.resize(dsz);
         pH = rows + 4 * rs; cH = rows + 5 * rs;
     } else {
@@ -150,7 +156,10 @@ static void striped_linear_full(ViterbiJob<T>& job) {
     if constexpr (Ptr) {
         unsigned char* d0 = buf.DM.data();
         d0[0] = 3;
-        for (std::size_t k = 0; k < sw; ++k) d0[off + k] = Local ? 3 : 2;   // row 0: left (Global)
+        if constexpr (Dense)   // every 2-bit field the same code: 3 = 0xFF, 2 = 0xAA
+            std::memset(d0 + off, Local ? 0xFF : 0xAA, drow - off);
+        else
+            for (std::size_t k = 0; k < sw; ++k) d0[off + k] = Local ? 3 : 2;   // row 0: left (Global)
     }
 
     vd vge_a(ge_a), vge_b(ge_b);
@@ -175,7 +184,7 @@ static void striped_linear_full(ViterbiJob<T>& job) {
         const T* sub = striped_row_profile<T, Tr>(buf.sprof.data(), blk, nalpha, a, b, n, seg, W, i, tr);
         unsigned char* dM = nullptr;
         if constexpr (Ptr) {
-            dM = buf.DM.data() + (std::size_t)i * rowsz;
+            dM = buf.DM.data() + (std::size_t)i * drow;
             dM[0] = Local ? 3 : 1;                       // column 0: up (Global) / stop
             dM += off;
         }
@@ -262,6 +271,7 @@ static void striped_linear_full(ViterbiJob<T>& job) {
             }
 
             // ── pass 2: H = max(U, Y); codes: left where Y > U, stop where Local <= 0 ──
+            vd acc = vzero;                              // Dense: this group's codes so far
             for (int s = 0; s < seg; ++s) {
                 vd u; u.copy_from(cH + off + (std::size_t)s * W, stdx::element_aligned);
                 vd y; y.copy_from(yv + (std::size_t)s * W, stdx::element_aligned);
@@ -287,7 +297,15 @@ static void striped_linear_full(ViterbiJob<T>& job) {
                         else                        stdx::where(h <= vzero, k) = vthree;
                     }
 #endif
-                    store_codes<T, W>(k, dM + (std::size_t)s * W);
+                    if constexpr (Dense) {
+                        acc = acc + acc; acc = acc + acc; acc = acc + k;   // 4*acc + k: exact in every T
+                        if ((s & 3) == 3 || s == seg - 1) {
+                            store_codes<T, W>(acc, dM + (std::size_t)(s >> 2) * W);   // <= 255
+                            acc = vzero;
+                        }
+                    } else {
+                        store_codes<T, W>(k, dM + (std::size_t)s * W);
+                    }
                 }
             }
             if constexpr (Local) striped_row_best1<T>(cH + off, pad, seg, i, best_local, best_i, best_j);
@@ -334,6 +352,19 @@ static void striped_linear_entry(ViterbiJob<T>& job) {
 }
 template <class T>
 static void striped_linear_ptr_entry(ViterbiJob<T>& job) {
+    if constexpr (sizeof(T) >= 4) {
+        if (job.dense) {
+            if (job.tr.on()) {
+                if (job.align_mode) striped_linear_full<T, true, true, true, true>(job);
+                else                striped_linear_full<T, false, true, true, true>(job);
+            } else {
+                if (job.align_mode) striped_linear_full<T, true, true, false, true>(job);
+                else                striped_linear_full<T, false, true, false, true>(job);
+            }
+            return;
+        }
+    }
+    job.dense = 0;
     if (job.tr.on()) {
         if (job.align_mode) striped_linear_full<T, true, true, true>(job);
         else                striped_linear_full<T, false, true, true>(job);

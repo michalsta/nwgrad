@@ -582,6 +582,13 @@ struct Aligner {
     // (base-case memory, per-block overhead, tie-break fidelity), not just a speed one:
     // at cutoff >= m no split happens at all and the result is the Pointers fill, hence
     // bit-exact — the memory win is what pays for the divergence.
+    // Which direction-code format a leveled Pointers fill writes: -1 auto (the gate,
+    // dense_gate_), 0 one byte a cell, 1 the dense codes (0.75 B/cell affine, 0.25 B/cell
+    // linear) wherever the kernel can (not int16).  Bit-identical results either way.
+    // NWGRAD_DENSE_CODES=0/1 overrides auto.
+    void set_dense_codes(int mode) noexcept { dense_mode_ = mode < 0 ? -1 : (mode ? 1 : 0); }
+    int dense_codes() const noexcept { return dense_mode_; }
+    bool dense_written() const noexcept { return dense_; }
     void set_hb_cutoff(int rows) {
         if (rows < 1)
             throw std::invalid_argument("nwgrad: hb_cutoff must be >= 1");
@@ -1273,6 +1280,11 @@ private:
     size_t inter_stride_ = 0;   // the interleaved tables' row length (>= stride_ if ragged)
     // Pointers mode: DM holds predecessor codes, VM/VX/VY are NOT retained.
     bool        pointers_ = false;
+    // The last Pointers fill wrote the DENSE codes (dense_codes_row_bytes, simd_levels.hpp:
+    // 2-bit fields, four segments a byte -- linear one plane, affine three).  dense_mode_ is
+    // the request: -1 auto (dense_gate_), 0 never, 1 always (where the kernel can).
+    bool        dense_ = false;
+    int         dense_mode_ = -1;
     // Hirschberg mode: no tables at all survive the fill.  The recursion recovers the
     // path directly, so hops_ IS the result — every consumer (gradient, alignment,
     // guide_j) replays it instead of walking a table.  One byte per step, so a path
@@ -1815,7 +1827,7 @@ private:
             if (i == 0 && j == 0) break;
             int k;
             if (pointers_) {
-                k = dcode(buf.DM, i, j);
+                k = dense_ ? dense_code(buf.DM, i, j, 1, 0) : dcode(buf.DM, i, j);
                 if (k == 3) break;
             } else {
                 if constexpr (AM == AlignMode::Local)
@@ -1845,6 +1857,35 @@ private:
     // Affine: one byte per cell, M | X << 2 | Y << 4; linear: the move, 0..3.
     unsigned char dcode(const BVec& d, int i, int j) const noexcept {
         return d[cell_index(i, j)];
+    }
+    // The dense codes (dense_): plane `plane` of `planes` at (i, j); column 0 keeps the
+    // one-byte format whole (linear: the move; affine: the packed M | X << 2 | Y << 4).
+    unsigned char dense_code(const BVec& d, int i, int j, int planes, int plane) const noexcept {
+        const unsigned char* row = d.data() +
+            static_cast<size_t>(i) * dense_codes_row_bytes(striped_seg_, striped_w_, planes);
+        if (j == 0) return row[0];
+        const int s = (j - 1) % striped_seg_, l = (j - 1) / striped_seg_;
+        return static_cast<unsigned char>(dense_code_at(row, striped_seg_, striped_w_, planes, plane, s, l));
+    }
+    // Whether this fill asks its Pointers kernel for the dense codes (dense_mode_, then
+    // NWGRAD_DENSE_CODES, then the gate).
+    bool want_dense_() const noexcept {
+        if (dense_mode_ >= 0) return dense_mode_ == 1;
+        static const int env = [] {
+            const char* e = std::getenv("NWGRAD_DENSE_CODES");
+            return e ? (std::atoi(e) != 0 ? 1 : 0) : -1;
+        }();
+        if (env >= 0) return env == 1;
+        return dense_gate_();
+    }
+    // The auto choice: where the dense codes measured faster.  Not yet decided: off.
+    bool dense_gate_() const noexcept { return false; }
+    // The affine cell's three codes in the one-byte packing, from whichever format holds them.
+    unsigned char affine_codes(const BVec& d, int i, int j) const noexcept {
+        if (!dense_) return dcode(d, i, j);
+        if (j == 0) return dense_code(d, i, 0, 3, 0);
+        return static_cast<unsigned char>(dense_code(d, i, j, 3, 0) | dense_code(d, i, j, 3, 1) << 2 |
+                                          dense_code(d, i, j, 3, 2) << 4);
     }
 
     // emit(s, i, j, open) for each move out of (i, j), from the optimum back to the
@@ -1912,7 +1953,7 @@ private:
             // (Global: past the border, which is emitted without reading the codes)
             unsigned char c = 0;
             if constexpr (AM == AlignMode::Local) {
-                if constexpr (Ptr) c = dcode(buf.DM, i, j);
+                if constexpr (Ptr) c = affine_codes(buf.DM, i, j);
                 if (tbl == TBTable::M) {
                     if constexpr (Ptr) { if ((c & 3) == 3) break; }
                     else               { if (rat(buf.VM, i, j) <= 0.0) break; }
@@ -1920,7 +1961,7 @@ private:
             } else {
                 if (i == 0) { for (; j > 0; --j) emit(TBTable::Y, 0, j, j == 1); break; }
                 if (j == 0) { for (; i > 0; --i) emit(TBTable::X, i, 0, i == 1); break; }
-                if constexpr (Ptr) c = dcode(buf.DM, i, j);
+                if constexpr (Ptr) c = affine_codes(buf.DM, i, j);
             }
             if      (i == 0) tbl = TBTable::Y;   // row 0: only leftward moves remain
             else if (j == 0) tbl = TBTable::X;   // col 0: only upward moves remain
@@ -2067,6 +2108,7 @@ private:
         // this back on.  Every other fill here writes VM/VX/VY row-major.
         tables_striped_ = false;
         pointers_     = false;
+        dense_        = false;
         hirschberg_   = false;
         inter_w_      = 0;
         // Hirschberg: divide and conquer, no tables above the base case.  It is a
@@ -2191,8 +2233,10 @@ private:
         job.buf = &buf;
         if (tr_) fill_track_job_(job.tr, true, static_cast<size_t>(n_) + 16);
         const TypedKernels<T>& KT = K.template of<T>();
+        job.dense = (use_ptr && want_dense_()) ? 1 : 0;
         if (use_ptr) KT.viterbi_ptr(job); else KT.viterbi(job);
         pointers_ = use_ptr;   // Pointers leaves codes, not score tables
+        dense_ = use_ptr && job.dense;
         // Adopt the layout the kernel produced (striped for the Full striped kernel).
         if (job.table_layout == 1) {
             tables_striped_ = true;
@@ -2247,8 +2291,10 @@ private:
         job.buf = &buf;
         if (tr_) fill_track_job_(job.tr, true, static_cast<size_t>(n_) + 16, true);
         const TypedKernels<T>& KT = K.template of<T>();
+        job.dense = (use_ptr && want_dense_()) ? 1 : 0;
         if (use_ptr) KT.linear_ptr(job); else KT.linear(job);
         pointers_ = use_ptr;
+        dense_ = use_ptr && job.dense;
         if (job.table_layout == 1) {
             tables_striped_ = true;
             striped_seg_ = job.seg; striped_w_ = job.width;

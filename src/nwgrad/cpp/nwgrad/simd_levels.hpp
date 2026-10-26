@@ -19,6 +19,7 @@
 // at their own -march gets a single level (no dispatch); the runtime table is a
 // feature of the built extension, where CMake compiles the level TUs with flags.
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
@@ -188,7 +189,31 @@ struct ViterbiJob {
     int     seg, width;                     // striping geometry (set when layout==1)
     std::size_t rstride;                    // striped row stride in T; 0 = (seg+1)*width
     TrackJob<T> tr;                         // tracked rows (tr.on()), else untracked
+    // Pointers fills only.  In: 1 asks for the DENSE direction codes (dense_codes_row_bytes,
+    // below: 2-bit codes, four segments' worth per byte -- 0.25 B/cell linear, three planes
+    // 0.75 B/cell affine).  Out: 1 if the kernel wrote them, 0 if it wrote one byte a cell
+    // (it clears the request it cannot honour: int16 lanes).
+    int dense = 0;
 };
+
+// The dense direction codes' geometry, shared by the kernels and the walks.  Per DP row:
+// W bytes of slot area (byte 0 = column 0's code in the one-byte format), then one group
+// per four segments: `planes` x W bytes (plane p, lane l at group_base + p*W + l), each byte
+// holding that lane's 2-bit codes for the group's segments, the group's FIRST segment in the
+// highest bits (accumulated by Horner, acc = 4*acc + k): segment r of a g-segment group at
+// shift 2*(g-1-r).  Linear: one plane (the move); affine: three (M, X, Y predecessor).
+inline std::size_t dense_codes_row_bytes(int seg, int width, int planes) noexcept {
+    return static_cast<std::size_t>(width) *
+           (1 + static_cast<std::size_t>(planes) * static_cast<std::size_t>((seg + 3) / 4));
+}
+// The 2-bit code of striped slot (s, l) of a dense row: s = (j-1) % seg, l = (j-1) / seg.
+inline unsigned dense_code_at(const unsigned char* row, int seg, int width, int planes,
+                              int plane, int s, int l) noexcept {
+    const int q = s >> 2, r = s & 3, g = std::min(4, seg - 4 * q);
+    const unsigned char byte = row[static_cast<std::size_t>(width) *
+                                   (1 + static_cast<std::size_t>(planes) * q + plane) + l];
+    return (byte >> (2 * (g - 1 - r))) & 3u;
+}
 
 
 // ── Score only: the optimal alignment score, no table, no traceback ───────────
