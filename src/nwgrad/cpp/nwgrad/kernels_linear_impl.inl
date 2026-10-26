@@ -86,7 +86,7 @@ static inline void striped_row_best1(const T* cH, const T* pad, int seg, int i,
 // track arrays, in the same expressions, so equal sets give the untracked table.
 // Dense (Ptr only): the same codes, four segments' worth a byte (dense_codes_row_bytes,
 // simd_levels.hpp: 0.25 B/cell), for the memory-bound regime -- each lane accumulates its
-// 2-bit codes over a group of four segments (k * 4^r) and stores one byte per lane a group.
+// 2-bit codes by Horner over a group of four segments and stores one byte per lane a group.
 template <class T, bool Local, bool Ptr, bool Tr, bool Dense = false>
 static void striped_linear_full(ViterbiJob<T>& job) {
     static_assert(!Dense || (Ptr && sizeof(T) >= 4), "dense codes: pointer fill, lanes >= 32 bits");
@@ -303,7 +303,7 @@ static void striped_linear_full(ViterbiJob<T>& job) {
                     }
 #endif
                     if constexpr (Dense) {
-                        acc += dense_weighted(k, s - s0);   // exact in every T
+                        acc = acc + acc; acc = acc + acc; acc = acc + k;   // 4*acc + k: exact in every T
                     } else {
                         store_codes<T, W>(k, dM + (std::size_t)s * W);
                     }
