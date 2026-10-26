@@ -90,6 +90,7 @@ static inline void striped_row_best1(const T* cH, const T* pad, int seg, int i,
 template <class T, bool Local, bool Ptr, bool Tr, bool Dense = false>
 static void striped_linear_full(ViterbiJob<T>& job) {
     static_assert(!Dense || (Ptr && sizeof(T) >= 4), "dense codes: pointer fill, lanes >= 32 bits");
+    [[maybe_unused]] const bool nt = Dense && job.nt;   // non-temporal code stores (store_codes_nt)
     using vd = stdx::native_simd<T>;
     constexpr int W = (int)vd::size();
     const T K_NINF = nw_ninf<T>;
@@ -300,7 +301,7 @@ static void striped_linear_full(ViterbiJob<T>& job) {
                     if constexpr (Dense) {
                         acc = acc + acc; acc = acc + acc; acc = acc + k;   // 4*acc + k: exact in every T
                         if ((s & 3) == 3 || s == seg - 1) {
-                            store_codes<T, W>(acc, dM + (std::size_t)(s >> 2) * W);   // <= 255
+                            store_codes_nt<T, W>(acc, dM + (std::size_t)(s >> 2) * W, nt);   // <= 255
                             acc = vzero;
                         }
                     } else {
@@ -325,6 +326,9 @@ static void striped_linear_full(ViterbiJob<T>& job) {
         job.best_i = m; job.best_j = n;
     }
     job.best_tbl = 0;
+#if defined(__SSE2__) && defined(__x86_64__)
+    if (nt) _mm_sfence();   // the non-temporal code stores complete before the walk reads them
+#endif
     job.table_layout = 1;
     job.seg = seg;
     job.width = W;
