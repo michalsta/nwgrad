@@ -258,8 +258,8 @@ struct GridFwdJob {
     const T* top;  std::size_t top_ss, top_es;    // top(s, j - c0) = top[s*top_ss + (j-c0)*top_es]
     const T* left; std::size_t left_ss, left_es;  // left(s, i - r0), likewise
     int R, spacing;
-    typename DpBufferT<T>::TVec* rows;      // out (resized by the kernel)
-    typename DpBufferT<T>::TVec* cols;
+    typename DpBufferT<T>::GVec* rows;      // out (resized by the kernel)
+    typename DpBufferT<T>::GVec* cols;
     std::vector<int>* colid;
     DpBufferT<T>* buf;                      // scratch: grows, gprof, gbuilt
     int W, q;                               // out

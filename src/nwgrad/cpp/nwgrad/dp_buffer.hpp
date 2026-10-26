@@ -52,26 +52,31 @@ inline bool nwgrad_hugepage_enabled() {
 //     allocation), so a table only qualifies once it is that big (len ~512+).  Best-
 //     effort — madvise failing is ignored; Linux-only; a no-op elsewhere.
 //
+// Huge = false drops (2): the grid traceback's lines are written once per call into fresh
+// buffers by every worker at once, and there the hint costs more than it saves (THP defrag
+// [madvise] compacts synchronously at fault time; nighthaven, 12 threads, f64 L3000: grid
+// 2.11x of score-only with the hint, 1.45x without).
+//
 // Uses C++17 aligned operator new, so it is portable (no posix_memalign / _aligned_malloc
 // split).  deallocate recomputes the alignment from the size, so it always matches.
-template <class T, std::size_t Align = 64>
+template <class T, std::size_t Align = 64, bool Huge = true>
 struct AlignedAllocator {
     using value_type = T;
     static constexpr std::size_t kHugePage = std::size_t(2) << 20;   // 2 MiB (x86 THP)
 
     static std::align_val_t align_of(std::size_t bytes) noexcept {
-        return bytes >= kHugePage ? std::align_val_t(kHugePage) : std::align_val_t(Align);
+        return Huge && bytes >= kHugePage ? std::align_val_t(kHugePage) : std::align_val_t(Align);
     }
 
     AlignedAllocator() noexcept = default;
-    template <class U> AlignedAllocator(const AlignedAllocator<U, Align>&) noexcept {}
+    template <class U> AlignedAllocator(const AlignedAllocator<U, Align, Huge>&) noexcept {}
 
     T* allocate(std::size_t n) {
         if (n == 0) return nullptr;
         const std::size_t bytes = n * sizeof(T);
         void* p = ::operator new(bytes, align_of(bytes));
 #if defined(__linux__) && defined(MADV_HUGEPAGE)
-        if (bytes >= kHugePage && nwgrad_hugepage_enabled())
+        if (Huge && bytes >= kHugePage && nwgrad_hugepage_enabled())
             ::madvise(p, bytes, MADV_HUGEPAGE);                       // best-effort
 #endif
         return static_cast<T*>(p);
@@ -80,9 +85,9 @@ struct AlignedAllocator {
         ::operator delete(p, align_of(n * sizeof(T)));
     }
 
-    template <class U> struct rebind { using other = AlignedAllocator<U, Align>; };
-    template <class U> bool operator==(const AlignedAllocator<U, Align>&) const noexcept { return true; }
-    template <class U> bool operator!=(const AlignedAllocator<U, Align>&) const noexcept { return false; }
+    template <class U> struct rebind { using other = AlignedAllocator<U, Align, Huge>; };
+    template <class U> bool operator==(const AlignedAllocator<U, Align, Huge>&) const noexcept { return true; }
+    template <class U> bool operator!=(const AlignedAllocator<U, Align, Huge>&) const noexcept { return false; }
 };
 
 // The always-double DP storage (forward-backward / soft path) uses it.
@@ -231,16 +236,19 @@ struct DpBufferT {
     // The grid lines of each recursion level (saved rows, segment-aligned columns and
     // their column ids), the grid kernel's rolling rows and profile, the problem's border
     // lines and the base block's values and direction codes.  O(k (m + n)) in all.
+    using GVec = std::vector<T, AlignedAllocator<T, 64, false>>;   // no huge-page hint (see above)
+    using GBVec = std::vector<unsigned char, AlignedAllocator<unsigned char, 64, false>>;
     struct GridLevel {
-        TVec rows, cols;
+        GVec rows, cols;
         std::vector<int> colid;
         std::vector<std::pair<int, int>> gcols;   // (column, set * W + lane), sorted
     };
     std::vector<GridLevel> glv;          // one per recursion depth
-    TVec grows, gprof, gtop, gleft;
+    TVec grows, gprof;
+    GVec gtop, gleft;
     std::vector<unsigned char> gbuilt;   // profile rows built for the current rectangle
-    TVec gbM, gbX, gbY;
-    BVec gdM, gdX, gdY;
+    GVec gbM, gbX, gbY;
+    GBVec gdM, gdX, gdY;
 
     // Scaled soft path (SoftImpl::Scaled): rolling backward rows (current/next, per
     // state) and the per-row power-of-two exponents of the forward tables.  The forward
@@ -269,9 +277,10 @@ struct DpBufferT {
         clrT(hprof); clrT(hov); clrT(hramp); clrT(iramp);
         clrB(hbD); clrB(hops);
         glv.clear(); glv.shrink_to_fit();
-        clrT(grows); clrT(gprof); clrT(gtop); clrT(gleft); clrT(gbM); clrT(gbX); clrT(gbY);
+        clrT(grows); clrT(gprof);
+        for (GVec* v : {&gtop, &gleft, &gbM, &gbX, &gbY}) { v->clear(); v->shrink_to_fit(); }
+        for (GBVec* v : {&gdM, &gdX, &gdY}) { v->clear(); v->shrink_to_fit(); }
         gbuilt.clear(); gbuilt.shrink_to_fit();
-        clrB(gdM); clrB(gdX); clrB(gdY);
         clrD(sb0); clrD(sb1); clrD(sb2); clrD(sb3); clrD(sb4); clrD(sb5); clrD(sqp);
         sexp.clear(); sexp.shrink_to_fit();
     }
