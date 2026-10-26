@@ -240,13 +240,17 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                 dgY = lane_shift_in(lY, bY);
             }
             vd accM = vzero, accX = vzero;   // Dense: this group's M / X codes so far
-            // One segment of pass 1.  R: its place in a dense group.  Floating T (kWeighted): the
-            // codes come out already weighted for the group's byte (segment R at shift 2*(3-R),
-            // dense_code_at), so accumulating costs one add a plane where 4*acc + k cost three
-            // dependent floating adds -- on NEON double (two lanes a segment) that was the cost of
-            // the dense codes.  Integer T keeps 4*acc + k (1-cycle adds), the groups not unrolled:
-            // unrolling them measured 2-8 % slower on AVX2 int32 at L2000-5800.
+            // One segment of pass 1.  R: its place in a dense group.  kWeighted: the codes come out
+            // already weighted for the group's byte (segment R at shift 2*(3-R), dense_code_at), so
+            // accumulating costs one add a plane where 4*acc + k cost three dependent adds (NEON
+            // double 1.11-1.15x one-byte with those, 1.00-1.05x without).  Integer T on x86 keeps
+            // 4*acc + k, the groups not unrolled: unrolled it measured 2-8 % slower on AVX2 int32
+            // at L2000-5800, while on NEON (M1) it is 6-10 % faster for int32 too.
+#if defined(__aarch64__)
+            constexpr bool kWeighted = Dense;
+#else
             constexpr bool kWeighted = Dense && !nw_is_int<T>;
+#endif
             auto seg_body = [&](int s, auto R) __attribute__((always_inline)) {
                 constexpr T wt = kWeighted ? static_cast<T>(1 << (2 * (3 - decltype(R)::value))) : T(1);
                 const vd cM1(Dense ? wt : T(1)), cM2(Dense ? 2 * wt : T(2)), cM3(Dense ? 3 * wt : T(3));
