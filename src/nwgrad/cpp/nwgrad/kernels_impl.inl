@@ -494,6 +494,19 @@ static inline V carry_pin(V v) {
     return v;
 }
 
+// Lazy-F's carry into the next segment, after the cell got v = max(c, F).  Floating T:
+// F - ge, not v - ge.  The row satisfies c(s+1) >= c(s) - ge in every lane (its carry pass
+// computed it so, and a raised cell is always followed by a visit to the next), so where
+// c(s) won, c(s) - ge <= c(s+1) and neither form exceeds c(s+1): the same stored maxima,
+// the same per-lane F > v masks (Pointers' revised codes included) and the same exit; the
+// loop-carried chain loses its max.  Integer T keeps v - ge: its sentinel stepped by - ge
+// once per segment could wrap.  (Measured: AGENTS.md, "The gap carry, shortened".)
+template <class V>
+static inline V lazy_f_next(const V& F, const V& v, const V& ge) {
+    if constexpr (std::is_floating_point_v<typename V::value_type>) return F - ge;
+    else                                                             return v - ge;
+}
+
 // ── Tracked rows: the striped query profile ───────────────────────────────────
 // One striped profile row: prof[s*W + l] = row[b[col(l,s)-1]], padding -> nw_pad.
 template <class T>

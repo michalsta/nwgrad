@@ -266,7 +266,7 @@ static void hb_sweep_striped(HbJob<T>& job) {
 #endif
                 v = stdx::max(v, F);
                 v.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
-                F = v - vge_a;
+                F = lazy_f_next(F, v, vge_a);
                 changed = true;
             }
             if (!changed) break;
@@ -762,7 +762,7 @@ static void hb_scan_impl(HbScanJob<T>& job) {
 #endif
                 v = stdx::max(v, F);
                 v.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
-                F = v - vge_a;
+                F = lazy_f_next(F, v, vge_a);
                 changed = true;
             }
             if (!changed) break;
@@ -1077,7 +1077,7 @@ static void hb_base_striped(HbBaseJob<T>& job) {
                 k.copy_to(yc + (std::size_t)s * W, stdx::element_aligned);
                 v = stdx::max(v, F);
                 v.copy_to(cY + off + (std::size_t)s * W, stdx::element_aligned);
-                F = v - vge_a;
+                F = lazy_f_next(F, v, vge_a);
                 changed = true;
             }
             if (!changed) break;

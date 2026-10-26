@@ -242,7 +242,7 @@ static void striped_linear_full(ViterbiJob<T>& job) {
 #endif
                         v = stdx::max(v, F);
                         v.copy_to(yv + (std::size_t)s * W, stdx::element_aligned);
-                        F = v - vge_a;
+                        F = lazy_f_next(F, v, vge_a);
                         changed = true;
                     }
                     if (!changed) break;
@@ -473,7 +473,7 @@ static void lhb_striped(LhbJob<T>& job) {
 #endif
                         v = stdx::max(v, F);
                         v.copy_to(yv + (std::size_t)s * W, stdx::element_aligned);
-                        F = v - vga;
+                        F = lazy_f_next(F, v, vga);
                         changed = true;
                     }
                     if (!changed) break;

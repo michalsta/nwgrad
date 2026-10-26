@@ -241,11 +241,7 @@ static void score_affine_striped(ScoreJob<T>& job) {
                 v = stdx::max(v, F);
                 v.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
                 if constexpr (Local) vbest = stdx::max(vbest, padded(v, s));
-                // Floating T: F - ge, not v - ge -- the same stored maxima and exit test,
-                // one subtraction on the chain (see score_affine_striped_pos_fp's lazy-F).
-                // Integer T keeps v - ge: its sentinel stepped by - ge could wrap.
-                if constexpr (std::is_floating_point_v<T>) F = F - vge_a;
-                else                                       F = v - vge_a;
+                F = lazy_f_next(F, v, vge_a);   // floating T: F - ge (kernels_impl.inl)
                 changed = true;
             }
             if (!changed) break;

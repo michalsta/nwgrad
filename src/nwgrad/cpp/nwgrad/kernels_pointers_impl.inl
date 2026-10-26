@@ -361,7 +361,7 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                     k.copy_to(yc + (std::size_t)s * W, stdx::element_aligned);
                     v = stdx::max(v, F);
                     v.copy_to(cY + off + (std::size_t)s * W, stdx::element_aligned);
-                    F = v - vge_a;
+                    F = lazy_f_next(F, v, vge_a);
                     changed = true;
                 }
                 if (!changed) break;
