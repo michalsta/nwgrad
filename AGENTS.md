@@ -847,6 +847,109 @@ Global with negative extends and opens >= 0 happens to be correct, but stays gua
 one rule, nothing gained by carving out the case. (The 0.5 float32 Local shortfall once
 listed here was the boundary-state bug fixed above.)
 
+**The gap carry, shortened (branch `cc/score-carry`, 2026-10-26).** Both striped score
+kernels spent most of their time on the loop-carried gap-in-A chain, not on the cells:
+perf on nighthaven put ~60% of the D/X kernel's float32 time in lazy-F. In a Global
+alignment the cells right of the diagonal are dominated by gap runs from the alignment,
+so nearly every row's carry crosses ~W/2 lanes, one lane per round: 4.3 rounds and ~3
+extra row sweeps per row at W = 8, 8 rounds and ~6.4 sweeps at W = 16. Lazy-F's work per
+row is therefore ~0.4 n vector visits at ANY width, and each visit was a sub + max on the
+chain. Three changes, all bit-identical (the [score] fuzz at every level and both
+variants, plus mutation checks that the tests catch a wrong carry):
+- **Lazy-F carries F - ge, not max(c, F) - ge.** The row already satisfies
+  Y(s+1) >= Y(s) - ge in every lane (the main pass computes it so; a raised cell is always
+  followed by a visit to the next), so where c(s) wins, c(s) - ge <= c(s+1) and neither form
+  raises s+1: the same stored maxima and exit test, one subtraction per segment on the
+  chain. Both kernels (D/X and three-state).
+- **D/X main pass: two segments per carry step.** Rounding is monotone, so
+  max(a, b) - g == max(a - g, b - g) bit for bit and Y(s+1) = max(max(O(s), O(s-1) - g),
+  (Y(s-1) - g) - g): two subtractions and ONE max per two segments. gcc re-associates the
+  off-chain max back onto the chain (max is exact, so it may); `carry_pin` (an empty asm,
+  gcc on x86 only) stops it. Without the pin the gain fell from ~30% to ~12% (prototype,
+  nighthaven).
+- **D/X rows store max(M, X), X and Y;** D = max(A, Y) is formed where a row is read, so
+  lazy-F raises Y alone (one load and one store per visit instead of two each). Neutral
+  on its own; it pays once the chain is short. It also removes the pattern clang compiled to
+  `vmaskmovps` (a masked store, reported slow on AMD Zen).
+Not kept: the two-column carry in the inter-pair score kernels (1.03-1.05x slower on
+Manakov 22 x 50 pairs, nighthaven: with W pairs per vector the column loop is not
+chain-bound). Measured with `tools/bench_score_ab.py` (main `0f1f00b` vs the branch,
+release-wheel flags, best of 5, control arm 0.98-1.02; B/A):
+
+| host | thr | prot_align (f32) | prot_align64 | conv | mk_align / mk_step / mk_align_f32 |
+|---|---|---|---|---|---|
+| nighthaven avx2 | 1 | **0.42** | **0.59** | **0.46** | 0.99 / 0.99 / 1.01 |
+| nighthaven avx2 | 12 | 0.70 | 0.79 | 0.47 | 1.00 / 1.00 / 1.01 |
+| solace avx512 | 1 | 0.70 | 0.75 | 0.72 | 1.01 / 0.98 / 1.00 |
+| solace avx512 | 16 | 0.80 | 0.85 | 0.72 | 1.02 / 1.00 / 1.01 |
+| skynet sse4 | 1 | 0.89 | 1.00 | 0.87 | 1.00 / 0.99 / 1.00 |
+
+(skynet's 12-thread arms were noisy, control 0.94-1.13, and are omitted.) AVX-512 gains least,
+because lazy-F's visits per row do not shrink with the width while the main pass halves. The
+prototype measured the 8-lane kernel faster than the 16-lane one on solace itself, for
+float32: the W = 8 float kernel on AVX-512 (Open TODO O1(b)) is the next step there.
+Unmeasured: NEON (spot was off; `carry_pin` is a no-op on AArch64, so gcc may re-associate
+there). The Viterbi fills' lazy-F loops (striped Scores/Pointers, Hirschberg sweeps) have the
+same carry and are not changed yet.
+
+**The same carry in the fills (2026-10-26, after the merge of main `491fb05`).** Floating T
+only (an integer sentinel stepped by - ge could wrap; integers keep their prefix-max carry and
+v - ge). Two helpers in `kernels_impl.inl`, both bit-identical:
+- `lazy_f_next`: lazy-F carries F - ge in the striped Scores and Pointers fills, the linear
+  kernels and the Hirschberg sweep / base case. Pointers' revised codes are unchanged: the
+  per-lane `F > v` mask is the same (where c(s) won, neither carry exceeds c(s+1)).
+- `carry_pass`: the fills' separate gap-in-A carry pass, Y(s) = max(O(s), Y(s-1) - ge), two
+  segments per dependent step. The code's ext(s+1) = max(O(s) - ge, (Y(s-1) - ge) - ge), so
+  the open-or-extend codes are the same too.
+The score-only D/X kernel's float path is now `score_affine_striped_pos_fp`
+(`score_affine_striped_pos` keeps main's integer path). Checks: the full C++ suite (2.74 M
+assertions), the Python suite, `tools/fuzz_ab.py` main vs branch (400 seeds, 0 differ), and
+mutations of each helper (32-35 failing test cases each). `tools/bench_fill_ab.py`, main
+`491fb05` vs the branch, release-wheel flags, best of 5, B/A (control 0.96-1.03 but for the
+12-thread Scores row, whose control is 1.07 and which is noise at both ends):
+
+| fill | nighthaven avx2, 1 thr | 12 thr | skynet sse4, 1 thr |
+|---|---|---|---|
+| Pointers Global f32 / f64 | 0.69 / 0.83 | 0.99 / 0.99 | 0.93 / 0.98 |
+| Pointers Local f64 | 0.87 | 0.93 | 0.99 |
+| Scores Global f64 | 0.84 | (1.10, control 1.07) | 0.97 |
+| Hirschberg (exact) f32 / f64 | **0.50 / 0.62** | **0.68 / 0.78** | 0.82 / 0.90 |
+| hirschberg_pmax f32 (exact base case) | 0.86 | 0.94 | 0.97 |
+| linear Pointers / Hirschberg f64 | 0.87 / 0.79 | 0.99 / 0.87 | 0.95 / 0.90 |
+
+Score-only on the merged branch, same A/B (`bench_score_ab.py`, nighthaven): prot_align 0.42 /
+0.71 (1 / 12 threads), prot_align64 0.57 / 0.79, conv 0.47 / 0.47, Manakov 0.96-1.02. Of the
+fills' gain, lazy-F's carry gives most (Pointers f32 0.73, Hirschberg 0.55 / 0.70 alone), the
+two-segment pass the rest (Hirschberg 0.90-0.91, linear 0.84-0.89 on top; Pointers ~1.0 at 6-12
+threads, where the table traffic bounds it). No gate: no path, precision or thread count lost.
+Pointers / Scores at 12 threads stay table-bandwidth bound.
+
+AVX-512 and NEON, the same A/B (`491fb05` vs `6e889b0` on solace, vs `ced6d2f` -- the AArch64
+pin below -- on spot; best of 5; control 0.97-1.02):
+
+| fill / path | solace avx512, 1 thr | 8 thr | spot neon (macOS, Homebrew gcc 16), 1 thr | 4 thr |
+|---|---|---|---|---|
+| Hirschberg (exact) f32 / f64 | 0.74 / 0.78 | 0.74 / 0.78 | 0.79 / 0.83 | 0.79 / 0.83 |
+| Pointers Global f32 / f64 | 0.79 / 0.86 | 0.88 / 0.88 | 0.89 / 0.91 | 0.89 / 0.91 |
+| Pointers Local f64 | 0.89 | 0.93 | 0.94 | 0.94 |
+| Scores Global f64 | 0.88 | 1.00 | 0.85 | 1.00 |
+| hirschberg_pmax f32 | 0.90 | 0.90 | 0.94 | 0.94 |
+| linear Pointers / Hirschberg f64 | 0.92 / 0.88 | 0.96 / 0.90 | 0.89 / 0.88 | 0.89 / 0.88 |
+| score-only prot_align / prot_align64 / conv | 0.68 / 0.75 / 0.70 | 0.71 / 0.77 / 0.71 | 0.71 / 0.75 / 0.74 | 0.71 / 0.75 / 0.74 |
+| score-only Manakov (mk_align on spot) | 1.00-1.01 | 0.99-1.00 | 1.00 | 1.01 |
+
+solace (Gentoo) ran with an `emerge world` frozen by `portage-freeze` for the run (frozen 1,
+outside_cgroup none throughout; thawed after), beside an X session at ~0.5 core. No loss on
+either. AVX-512 gains less than AVX2 (lazy-F's visits per row do not shrink with the width).
+NEON first measured 0.79-0.99 with `carry_pin` a no-op on AArch64; the disassembly (spot,
+Homebrew gcc 16) showed gcc re-associating both two-segment carries exactly as on x86: the D/X
+main pass as max(max(t2, Oin - g), O(s)) and `carry_pass` as max(max(t2, O(s+1)), O(s) - g), two
+fmaxnm on the chain. The AArch64 pin (`"+w"` on float32x4_t / float64x2_t, `ced6d2f`) restores one
+fmaxnm per two segments; lazy-F's carry was already a bare fsub. Pinned vs unpinned on spot: fills
+0.89-0.98 (linear 0.88-0.90, Hirschberg 0.92-0.95), score-only protein 0.86-0.92, Manakov 1.00.
+Checked on NEON: the C++ suite (2.73 M assertions), the Python suite, `fuzz_ab.py` vs main (200
+seeds, 0 differ).
+
 ### Linear gaps: Pointers and Hirschberg (2026-10-05)
 
 - **`traceback="pointers"` for linear** (`viterbi_linear_ptr`): one direction byte per
