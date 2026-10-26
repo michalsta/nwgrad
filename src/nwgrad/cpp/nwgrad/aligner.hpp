@@ -615,17 +615,24 @@ struct Aligner {
         else                                                               // linear Local
             return std::is_same_v<T, float> ? 4 * M1 : 16 * M1;
     }();
-    // AVX-512 (solace, 1 / 8 / 16 threads): every crossover came earlier than AVX2's -- affine
-    // Global from L2000 (0.83-0.99), linear float32 L2000, int32 L1000 (0.87-0.90), double
-    // L4000.  Local not measured there: AVX2's thresholds, which are higher.
+    // AVX-512: every crossover comes earlier than AVX2's.  Re-measured 2026-10-27 on PR #8's head (solace WSL, exact L x L, L700-5800, 1 / 8 / 16
+    // threads): each threshold sits between the last size that did not win and the first from
+    // which dense won (or tied within its control) at every thread count and size above.
+    // (m+1)(n+1) at L700 / 1000 / 1450 / 2000 / 2900 / 4000: 0.49 / 1.00 / 2.11 / 4.00 / 8.41 / 16.0 M.
     static constexpr std::size_t kDenseFromCellsAvx512 = [] {
         constexpr std::size_t M1 = std::size_t(1) << 20;
+        constexpr bool D = std::is_same_v<T, double>, F = std::is_same_v<T, float>;
         if constexpr (sizeof(T) < 4 || AB != AlignBand::Full) return std::size_t(0);
-        else if constexpr (AM == AlignMode::Local) return kDenseFromCellsAvx2;
-        else if constexpr (GM == GapModel::Affine)
-            return std::is_same_v<T, int64_t> ? 16 * M1 : 4 * M1;          // int64 unmeasured: AVX2's
-        else if constexpr (std::is_same_v<T, double>) return 16 * M1;
-        else return std::is_same_v<T, float> ? 4 * M1 : M1;
+        else if constexpr (std::is_same_v<T, int64_t> && !(GM == GapModel::Affine && AM == AlignMode::Global))
+            return kDenseFromCellsAvx2;                                    // unmeasured: AVX2's
+        else if constexpr (GM == GapModel::Affine && AM == AlignMode::Global)
+            return D ? M1 / 2 : F ? 3 * M1 : nw_is_int<T> && sizeof(T) == 4 ? 2 * M1 : M1 / 2;
+        else if constexpr (GM == GapModel::Affine)                         // Local
+            return D ? M1 / 2 : 6 * M1;
+        else if constexpr (AM == AlignMode::Global)                        // linear
+            return D ? 6 * M1 : F ? 2 * M1 : M1 / 2;
+        else                                                               // linear Local
+            return D ? 12 * M1 : 3 * M1;
     }();
     // sse2 / sse4 (wloczykij, Piledriver, 1 / 16 / 64 threads): dense lost 6-24 % almost
     // everywhere (gains of 2-4 % only at 64 threads, int32 affine and linear double) -- off.
