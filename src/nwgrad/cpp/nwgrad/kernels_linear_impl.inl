@@ -221,7 +221,7 @@ static void striped_linear_full(ViterbiJob<T>& job) {
                 }
                 if constexpr (Local) t = stdx::max(t, vzero);
                 t.copy_to(cH + off + (std::size_t)s * W, stdx::element_aligned);
-                if constexpr ((nw_is_int<T> && W >= 4) || kMergeStoredOpens)   // the integer carry reads the opens; the floating one recomputes them
+                if constexpr (nw_is_int<T> && W >= 4)   // the integer carry reads the opens; the floating one recomputes them
                     (t - vge_a).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
             }
 
@@ -237,12 +237,10 @@ static void striped_linear_full(ViterbiJob<T>& job) {
                     return vd(t - vge_a);
                 };
                 vd prev = vninf;                         // column 0 holds no Y
-                prev = carry_pass<kMergeTwoSeg>(seg, prev, vge_a,
+                prev = carry_pass(seg, prev, vge_a,
                     [&](int s) NWGRAD_ALWAYS_INLINE_LAMBDA {
                         const int q = s == 0 ? seg - 1 : s - 1;
-                        vd O;
-                        if constexpr (kMergeStoredOpens) O.copy_from(ov + (std::size_t)q * W, stdx::element_aligned);
-                        else                             O = open_at(q);
+                        const vd O = open_at(q);
                         return s == 0 ? lane_shift_in(O, nbOpen) : O;
                     },
                     [&](int s, const vd&, const vd&, const vd& v) NWGRAD_ALWAYS_INLINE_LAMBDA {
@@ -493,7 +491,7 @@ static void lhb_striped(LhbJob<T>& job) {
                 }
                 if (job.clamp) t = stdx::max(t, vzero);
                 t.copy_to(cH + off + (std::size_t)s * W, stdx::element_aligned);
-                if constexpr ((nw_is_int<T> && W >= 4) || kMergeStoredOpens)   // the integer carry reads the opens; the floating one recomputes them
+                if constexpr (nw_is_int<T> && W >= 4)   // the integer carry reads the opens; the floating one recomputes them
                     (t - vga).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
             }
 
@@ -508,12 +506,10 @@ static void lhb_striped(LhbJob<T>& job) {
                     return vd(t - vga);
                 };
                 vd prev = vninf;
-                prev = carry_pass<kMergeTwoSeg>(seg, prev, vga,
+                prev = carry_pass(seg, prev, vga,
                     [&](int s) NWGRAD_ALWAYS_INLINE_LAMBDA {
                         const int q = s == 0 ? seg - 1 : s - 1;
-                        vd O;
-                        if constexpr (kMergeStoredOpens) O.copy_from(ov + (std::size_t)q * W, stdx::element_aligned);
-                        else                             O = open_at(q);
+                        const vd O = open_at(q);
                         return s == 0 ? lane_shift_in(O, nbOpen) : O;
                     },
                     [&](int s, const vd&, const vd&, const vd& v) NWGRAD_ALWAYS_INLINE_LAMBDA {

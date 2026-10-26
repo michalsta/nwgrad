@@ -138,7 +138,6 @@ static void hb_sweep_striped(HbJob<T>& job) {
 
     T* pM = rows + 3 * rs; T* pX = rows + 4 * rs; T* pY = rows + 5 * rs;
     T* cM = rows;          T* cX = rows + rs;     T* cY = rows + 2 * rs;
-    [[maybe_unused]] T* const ov = rows + 6 * rs;   // the opens: stored only by merge prototype 1
     // row 6 held the opens (ov); the carry recomputes them from cM / cX now -- the row stays
     // in the block so the spread layout (strides, 4 KB offsets) is the one measured
 
@@ -221,14 +220,11 @@ static void hb_sweep_striped(HbJob<T>& job) {
             const vd vxv = stdx::max(stdx::max((uM - vgo_b) - vge_b, uX - vge_b),
                                      (uY - vgo_b) - vge_b);
             vxv.copy_to(cX + (std::size_t)s * W, stdx::element_aligned);
-            if constexpr (kMergeStoredOpens)
-                ((stdx::max(vmv, vxv) - vgo_a) - vge_a).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
         }
         // The open into Y at segment q: what pass 1 once stored in `ov`, recomputed from the
         // stored M and X with the same operations in the same order (the same bits), one
         // stream fewer per segment.
         auto open_at = [&](int q) __attribute__((always_inline)) {
-            if constexpr (kMergeStoredOpens) { vd o; o.copy_from(ov + (std::size_t)q * W, stdx::element_aligned); return o; }
             vd vm, vx;
             vm.copy_from(cM + (std::size_t)q * W, stdx::element_aligned);
             vx.copy_from(cX + (std::size_t)q * W, stdx::element_aligned);
@@ -242,12 +238,10 @@ static void hb_sweep_striped(HbJob<T>& job) {
         // precisely the chain the scalar loop walks, so the fixpoint is identical
         // rather than merely close.
         vd prev([&](int q) { return q == 0 ? bY : NINF; });
-        prev = carry_pass<kMergeTwoSeg>(seg, prev, vge_a,
+        prev = carry_pass(seg, prev, vge_a,
             [&](int s) NWGRAD_ALWAYS_INLINE_LAMBDA {
                 const int q = s == 0 ? seg - 1 : s - 1;
-                vd O;
-                if constexpr (kMergeStoredOpens) O.copy_from(ov + (std::size_t)q * W, stdx::element_aligned);
-                else                             O = open_at(q);
+                const vd O = open_at(q);
                 return s == 0 ? lane_shift_in(O, nbOpen) : O;
             },
             [&](int s, const vd&, const vd&, const vd& v) NWGRAD_ALWAYS_INLINE_LAMBDA {
@@ -392,7 +386,6 @@ static void hb_sweep_striped_pmax(HbJob<T>& job) {
 
     T* pM = rows + 3 * rs; T* pX = rows + 4 * rs; T* pY = rows + 5 * rs;
     T* cM = rows;          T* cX = rows + rs;     T* cY = rows + 2 * rs;
-    [[maybe_unused]] T* const ov = rows + 6 * rs;   // the opens: stored only by merge prototype 1
     // row 6 held the opens (ov); the carry recomputes them from cM / cX now -- the row stays
     // in the block so the spread layout (strides, 4 KB offsets) is the one measured
     T* rmp = rows + 7 * rs;
@@ -476,14 +469,11 @@ static void hb_sweep_striped_pmax(HbJob<T>& job) {
             const vd vxv = stdx::max(stdx::max((uM - vgo_b) - vge_b, uX - vge_b),
                                      (uY - vgo_b) - vge_b);
             vxv.copy_to(cX + (std::size_t)s * W, stdx::element_aligned);
-            if constexpr (kMergeStoredOpens)
-                ((stdx::max(vmv, vxv) - vgo_a) - vge_a).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
         }
         // The open into Y at segment q: what pass 1 once stored in `ov`, recomputed from the
         // stored M and X with the same operations in the same order (the same bits), one
         // stream fewer per segment.
         auto open_at = [&](int q) __attribute__((always_inline)) {
-            if constexpr (kMergeStoredOpens) { vd o; o.copy_from(ov + (std::size_t)q * W, stdx::element_aligned); return o; }
             vd vm, vx;
             vm.copy_from(cM + (std::size_t)q * W, stdx::element_aligned);
             vx.copy_from(cX + (std::size_t)q * W, stdx::element_aligned);
@@ -607,7 +597,6 @@ static void hb_scan_impl(HbScanJob<T>& job) {
 
     T* pM = rows + 3 * rs; T* pX = rows + 4 * rs; T* pY = rows + 5 * rs;
     T* cM = rows;          T* cX = rows + rs;     T* cY = rows + 2 * rs;
-    [[maybe_unused]] T* const ov = rows + 6 * rs;   // the opens: stored only by merge prototype 1
     // row 6 held the opens (ov); the carry recomputes them from cM / cX now -- the row stays
     // in the block so the spread layout (strides, 4 KB offsets) is the one measured
     T* rmp = rows + 7 * rs;
@@ -727,14 +716,11 @@ static void hb_scan_impl(HbScanJob<T>& job) {
             const vd vxv = stdx::max(stdx::max((uM - vgo_b) - vge_b, uX - vge_b),
                                      (uY - vgo_b) - vge_b);
             vxv.copy_to(cX + (std::size_t)s * W, stdx::element_aligned);
-            if constexpr (kMergeStoredOpens)
-                ((stdx::max(vmv, vxv) - vgo_a) - vge_a).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
         }
         // The open into Y at segment q: what pass 1 once stored in `ov`, recomputed from the
         // stored M and X with the same operations in the same order (the same bits), one
         // stream fewer per segment.
         auto open_at = [&](int q) __attribute__((always_inline)) {
-            if constexpr (kMergeStoredOpens) { vd o; o.copy_from(ov + (std::size_t)q * W, stdx::element_aligned); return o; }
             vd vm, vx;
             vm.copy_from(cM + (std::size_t)q * W, stdx::element_aligned);
             vx.copy_from(cX + (std::size_t)q * W, stdx::element_aligned);
@@ -769,12 +755,10 @@ static void hb_scan_impl(HbScanJob<T>& job) {
         } else {
         // ── the carry: VY, same-lane striped chain, then lazy-F (exact) ──────────
         vd prev([&](int q) { return q == 0 ? bY : NINF; });
-        prev = carry_pass<kMergeTwoSeg>(seg, prev, vge_a,
+        prev = carry_pass(seg, prev, vge_a,
             [&](int s) NWGRAD_ALWAYS_INLINE_LAMBDA {
                 const int q = s == 0 ? seg - 1 : s - 1;
-                vd O;
-                if constexpr (kMergeStoredOpens) O.copy_from(ov + (std::size_t)q * W, stdx::element_aligned);
-                else                             O = open_at(q);
+                const vd O = open_at(q);
                 return s == 0 ? lane_shift_in(O, nbOpen) : O;
             },
             [&](int s, const vd&, const vd&, const vd& v) NWGRAD_ALWAYS_INLINE_LAMBDA {
@@ -1035,7 +1019,7 @@ static void hb_base_striped(HbBaseJob<T>& job) {
             // max(om, ox) is bitwise max(vmv, vxv) - go - ge: rounding is monotone.
             // (Floating T: the carry recomputes both from cM / cX instead -- the same bits --
             // which saves two T-typed rows, a store and a load each, per segment.)
-            if constexpr (kOpenRows || kMergeStoredOpens) {
+            if constexpr (kOpenRows) {
                 const vd om = (vmv - vgo_a) - vge_a, ox = (vxv - vgo_a) - vge_a;
                 stdx::max(om, ox).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
                 vd okv = vsixteen;                  // open from X: Y's code 1, shifted
@@ -1075,29 +1059,20 @@ static void hb_base_striped(HbBaseJob<T>& job) {
 #endif
         };
             vd prev([&](int q) { return q == 0 ? bY : NINF; });
-            vd OKs[2];   // load_o's open codes, for put (recomputed opens)
-            prev = carry_pass<kMergeTwoSeg>(seg, prev, vge_a,
+            vd OKs[2];   // the open codes load_o computed beside each open, for put (carry_pass
+                         // loads two segments, then puts both: indexed by s & 1)
+            prev = carry_pass(seg, prev, vge_a,
                 [&](int s) NWGRAD_ALWAYS_INLINE_LAMBDA {
                     const int q = s == 0 ? seg - 1 : s - 1;
                     vd O;
-                    if constexpr (kMergeStoredOpens) {
-                        O.copy_from(ov + (std::size_t)q * W, stdx::element_aligned);
-                    } else {
-                        vd OK;
-                        open_from(q, O, OK);
-                        OKs[s & 1] = s == 0 ? lane_shift_in(OK, nbOpenK) : OK;
-                    }
+                    vd OK;
+                    open_from(q, O, OK);
+                    OKs[s & 1] = s == 0 ? lane_shift_in(OK, nbOpenK) : OK;
                     return s == 0 ? lane_shift_in(O, nbOpen) : O;
                 },
                 [&](int s, const vd& O, const vd& ext, const vd& v) NWGRAD_ALWAYS_INLINE_LAMBDA {
                     vd OK;
-                    if constexpr (kMergeStoredOpens) {
-                        const int q = s == 0 ? seg - 1 : s - 1;
-                        OK.copy_from(ok + (std::size_t)q * W, stdx::element_aligned);
-                        if (s == 0) OK = lane_shift_in(OK, nbOpenK);
-                    } else {
-                        OK = OKs[s & 1];
-                    }
+                    OK = OKs[s & 1];
                     vd ky = vthirtytwo;                       // extension
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
                     if constexpr (sizeof(T) == 8) {

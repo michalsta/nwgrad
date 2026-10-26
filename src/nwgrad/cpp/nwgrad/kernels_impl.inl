@@ -542,21 +542,13 @@ static inline V lazy_f_next(const V& F, const V& v, const V& ge) {
 #else
 #  define NWGRAD_FORCE_INLINE inline
 #endif
-// Merge prototypes (packed/dense codes x shortened carry), one tree, picked at build time:
-// 0 both -- the two-segment carry_pass fed by opens recomputed from the stored rows;
-// 1 theirs -- carry_pass fed by open rows pass 1 stores (main as merged);
-// 2 mine -- recomputed opens, one segment a dependent step.
-#ifndef NWGRAD_MERGE_VARIANT
-#  define NWGRAD_MERGE_VARIANT 0
-#endif
-inline constexpr int  kMergeVariant     = NWGRAD_MERGE_VARIANT;
-inline constexpr bool kMergeStoredOpens = kMergeVariant == 1;
-inline constexpr bool kMergeTwoSeg      = kMergeVariant != 2;
-
-template <bool Two = true, class V, class LoadO, class Put>
+// The callers feed it opens recomputed from the rows they sit beside (load_o), not rows pass
+// 1 stored: both together measured 0.71-0.95 of the stored-opens form on AVX2 and 0.76-0.86
+// for the linear fills (AGENTS.md, "Merging the shortened carry").
+template <class V, class LoadO, class Put>
 static NWGRAD_FORCE_INLINE V carry_pass(int seg, V prev, const V& ge, LoadO&& load_o, Put&& put) {
     int s = 0;
-    if constexpr (Two && std::is_floating_point_v<typename V::value_type>) {
+    if constexpr (std::is_floating_point_v<typename V::value_type>) {
         for (; s + 1 < seg; s += 2) {
             const V O0 = load_o(s), O1 = load_o(s + 1);
             const V t = prev - ge;                                   // chain
