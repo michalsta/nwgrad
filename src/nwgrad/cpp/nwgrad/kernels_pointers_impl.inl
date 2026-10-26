@@ -25,10 +25,88 @@
 // Narrow a T-typed lane-code vector (values 0..3) to one byte per lane.
 // Deliberately a single static_simd_cast, not a per-lane loop: writing direction
 // bytes scalar-per-lane measured ~2x slower than the vectorized narrow.
+// For the integer lane types the narrow is spelled in intrinsics: clang lowered the
+// int64 cast to one byte store per lane (movb x4 per vector, 1.13-1.33x gcc's time on the
+// Pointers kernel), gcc the int16/int32 ones to vpshufb sequences; a pack or a vpmov is
+// one or two instructions.  The codes are 0..3, so saturating packs are exact.
 template <class T, int W>
-static inline void store_codes(const stdx::native_simd<T>& code, unsigned char* dst) {
+[[gnu::always_inline]] static inline void store_codes(const stdx::native_simd<T>& code, unsigned char* dst) {
     using bvec = stdx::fixed_size_simd<unsigned char, W>;
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    if constexpr (std::is_same_v<T, int64_t> && W == 8) {
+        _mm_storel_epi64((__m128i*)dst, _mm512_cvtepi64_epi8((__m512i)static_cast<__v8di>(code))); return;
+    } else if constexpr (std::is_same_v<T, int32_t> && W == 16) {
+        _mm_storeu_si128((__m128i*)dst, _mm512_cvtepi32_epi8((__m512i)static_cast<__v16si>(code))); return;
+    } else if constexpr (std::is_same_v<T, int16_t> && W == 32) {
+        _mm256_storeu_si256((__m256i*)dst, _mm512_cvtepi16_epi8((__m512i)static_cast<__v32hi>(code))); return;
+    } else
+#elif defined(__AVX2__)
+    if constexpr (std::is_same_v<T, int64_t> && W == 4) {
+        // the low dword of each qword, then two packs: 4 bytes
+        const __m256i d = _mm256_permutevar8x32_epi32((__m256i)static_cast<__v4di>(code),
+                                                      _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6));
+        const __m128i w = _mm_packus_epi32(_mm256_castsi256_si128(d), _mm256_castsi256_si128(d));
+        const __m128i b = _mm_packus_epi16(w, w);
+        std::memcpy(dst, &b, 4); return;
+    } else if constexpr (std::is_same_v<T, int32_t> && W == 8) {
+        const __m256i w = _mm256_packus_epi32((__m256i)static_cast<__v8si>(code), (__m256i)static_cast<__v8si>(code));
+        const __m256i p = _mm256_permute4x64_epi64(w, 0x08);   // [lo words | hi words] in the low half
+        const __m128i b = _mm_packus_epi16(_mm256_castsi256_si128(p), _mm256_castsi256_si128(p));
+        _mm_storel_epi64((__m128i*)dst, b); return;
+    } else if constexpr (std::is_same_v<T, int16_t> && W == 16) {
+        const __m256i b = _mm256_packus_epi16((__m256i)static_cast<__v16hi>(code), (__m256i)static_cast<__v16hi>(code));
+        const __m256i p = _mm256_permute4x64_epi64(b, 0x08);
+        _mm_storeu_si128((__m128i*)dst, _mm256_castsi256_si128(p)); return;
+    } else
+#elif defined(__SSE2__)
+    if constexpr (std::is_same_v<T, int64_t> && W == 2) {
+        const __m128i d = _mm_shuffle_epi32((__m128i)static_cast<__v2di>(code), 0x08);
+        const __m128i b = _mm_packus_epi16(_mm_packs_epi32(d, d), _mm_packs_epi32(d, d));
+        std::memcpy(dst, &b, 2); return;
+    } else if constexpr (std::is_same_v<T, int32_t> && W == 4) {
+        const __m128i w = _mm_packs_epi32((__m128i)static_cast<__v4si>(code), (__m128i)static_cast<__v4si>(code));
+        const __m128i b = _mm_packus_epi16(w, w);
+        std::memcpy(dst, &b, 4); return;
+    } else if constexpr (std::is_same_v<T, int16_t> && W == 8) {
+        const __m128i b = _mm_packus_epi16((__m128i)static_cast<__v8hi>(code), (__m128i)static_cast<__v8hi>(code));
+        _mm_storel_epi64((__m128i*)dst, b); return;
+    } else
+#endif
     stdx::static_simd_cast<bvec>(code).copy_to(dst, stdx::element_aligned);
+}
+
+// The three-way argmax code of the scalar pick(): 0 when m >= x && m >= y, else 1 when
+// x >= y, else 2.  For an integer T it is written with STRICT compares and the blends
+// inverted — there is no packed integer >=, and gcc built each one from vpminsw +
+// vpcmpeqw (clang swaps the operands instead); the kernel has eight per vector of
+// cells, ~20 % of its instructions.  Same codes: (y > x ? 2 : 1) is (x >= y ? 1 : 2),
+// and "0 unless x > m or y > m" is "0 when m >= x and m >= y".  Floating T keeps the
+// form it always had (vcmpleps exists), so its codegen is untouched.
+// (always_inline: at AVX-512 gcc called these out of line for the 32-lane int16 vectors,
+// four and two calls per segment, each returning 64 bytes through memory.)
+template <class V>
+[[gnu::always_inline]] static inline V pick_code(const V& m, const V& x, const V& y, const V& vzero, const V& vone, const V& vtwo) {
+    using T = typename V::value_type;
+    if constexpr (nw_is_int<T>) {
+        V k = vone;
+        stdx::where(y > x, k) = vtwo;
+        V r = vzero;
+        stdx::where((x > m) || (y > m), r) = k;
+        return r;
+    } else {
+        V k = vtwo;
+        stdx::where(x >= y, k) = vone;
+        stdx::where((m >= x) && (m >= y), k) = vzero;
+        return k;
+    }
+}
+// `dest` where a >= b takes `value`: strict form for integer lanes (the default and the
+// value swapped), the >= form for floating.
+template <class V>
+[[gnu::always_inline]] static inline V sel_ge(const V& a, const V& b, const V& dest, const V& value) {
+    using T = typename V::value_type;
+    if constexpr (nw_is_int<T>) { V r = value; stdx::where(b > a, r) = dest; return r; }
+    else                        { V r = dest;  stdx::where(a >= b, r) = value; return r; }
 }
 
 // Tr: a tracked problem (job.tr), as striped_affine_full.
@@ -36,7 +114,7 @@ template <class T, bool Local, bool Tr = false>
 static void striped_affine_full_ptr(ViterbiJob<T>& job) {
     using vd = stdx::native_simd<T>;
     constexpr int W = (int)stdx::native_simd<T>::size();
-    const T K_NINF = -std::numeric_limits<T>::infinity();
+    const T K_NINF = nw_ninf<T>;
 
     const int m = job.m, n = job.n;
     const int nalpha = job.nalpha;
@@ -53,15 +131,15 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
     const std::size_t rowsz = (std::size_t)(seg + 1) * W;
     const std::size_t off   = (std::size_t)W;
 
-    if (buf.sopenv.size() < 2 * sw) buf.sopenv.resize(2 * sw);   // ov | openk
     const std::size_t dsz = (std::size_t)(m + 1) * rowsz;
     // Each vector is checked on its own: a linear pointer fill sharing this buffer grows
     // DM, rM and qM alone, so one size no longer speaks for the group.
     for (auto* d : {&buf.DM, &buf.DX, &buf.DY}) if (d->size() < dsz) d->resize(dsz);
-    // rolling score rows: 2 x rowsz instead of (m+1) x rowsz -- the whole point
-    for (auto* r : {&buf.rM, &buf.rX, &buf.rY, &buf.qM, &buf.qX, &buf.qY})
-        if (r->size() < rowsz) r->resize(rowsz);
-    if (buf.subbuf.size() < sw) buf.subbuf.resize(sw);           // y-code scratch
+    // rolling score rows: 2 x rowsz instead of (m+1) x rowsz -- the whole point; with the
+    // opens, open codes, Q (integer T), y-code scratch and Local's padding mask, eleven rows
+    // of one block (spread_rows, dp_buffer.hpp: no two in one L1 set, and none in the set of
+    // another stream read every row)
+    std::size_t rs; T* const rows = spread_rows<T>(buf.prows, rowsz, 11, rs);
 
     auto scol = [seg](int j) -> std::size_t {
         return (std::size_t)((j - 1) % seg) * W + (j - 1) / seg;
@@ -69,12 +147,13 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
 
     striped_profile_build<T, Tr>(buf.sprof, blk, nalpha, b, n, seg, W, tr);
 
-    T* ov = buf.sopenv.data();
-    T* ok = buf.sopenv.data() + sw;
-    T* yc = buf.subbuf.data();
+    T* ov = rows + 6 * rs;
+    T* ok = rows + 7 * rs;
+    T* qb = rows + 8 * rs;
+    T* yc = rows + 9 * rs;
 
-    T* pM = buf.qM.data(); T* pX = buf.qX.data(); T* pY = buf.qY.data();
-    T* cM = buf.rM.data(); T* cX = buf.rX.data(); T* cY = buf.rY.data();
+    T* pM = rows + 3 * rs; T* pX = rows + 4 * rs; T* pY = rows + 5 * rs;
+    T* cM = rows;          T* cX = rows + rs;     T* cY = rows + 2 * rs;
 
     // ── row 0: scores into the rolling "previous" row, codes into the tables ──
     {
@@ -106,7 +185,7 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
     const vd vthree(static_cast<T>(3));
     T bM = 0, bX = K_NINF, bY = K_NINF;
     T best_local = 0; int best_i = 0, best_j = 0, best_tbl = 0;
-    const T* pad = Local ? striped_pad(buf.spad, n, seg, W) : nullptr;
+    const T* pad = Local ? striped_pad_into(rows + 10 * rs, n, seg, W) : nullptr;
 
     for (int i = 1; i <= m; ++i) {
         if constexpr (Tr) {
@@ -151,28 +230,29 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                 // M code: same >= chain as the scalar pick(), M last so it wins ties
                 vd km = vtwo;
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
-                if constexpr (std::is_same_v<T, double>) {
+                if constexpr (sizeof(T) == 8) {
                     km = avx512d_blend(avx512d_ge(dgX, dgY), km, vone);
                     km = avx512d_blend(avx512d_ge(dgM, dgX) & avx512d_ge(dgM, dgY), km, vzero);
                 } else {
-                    stdx::where(dgX >= dgY, km) = vone;
-                    stdx::where((dgM >= dgX) && (dgM >= dgY), km) = vzero;
+                    km = pick_code(dgM, dgX, dgY, vzero, vone, vtwo);
                 }
 #else
-                stdx::where(dgX >= dgY, km) = vone;
-                stdx::where((dgM >= dgX) && (dgM >= dgY), km) = vzero;
+                km = pick_code(dgM, dgX, dgY, vzero, vone, vtwo);
 #endif
                 if constexpr (Local) {
                     vmv = stdx::max(vmv, vzero);
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
-                    if constexpr (std::is_same_v<T, double>) {
+                    if constexpr (sizeof(T) == 8) {
                         // vmv <= vzero  <=>  vzero >= vmv
                         km = avx512d_blend(avx512d_ge(vzero, vmv), km, vthree);
+                    } else if constexpr (nw_is_int<T>) {
+                        stdx::where(vmv == vzero, km) = vthree;   // clamped >= 0: <= 0 is == 0
                     } else {
                         stdx::where(vmv <= vzero, km) = vthree;   // traceback stops here
                     }
 #else
-                    stdx::where(vmv <= vzero, km) = vthree;   // traceback stops here
+                    if constexpr (nw_is_int<T>) stdx::where(vmv == vzero, km) = vthree;   // clamped >= 0
+                    else                        stdx::where(vmv <= vzero, km) = vthree;   // traceback stops here
 #endif
                 }
                 vmv.copy_to(cM + off + (std::size_t)s * W, stdx::element_aligned);
@@ -186,16 +266,14 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                 vd vxv = stdx::max(stdx::max(ax, bx), cx);
                 vd kx = vtwo;
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
-                if constexpr (std::is_same_v<T, double>) {
+                if constexpr (sizeof(T) == 8) {
                     kx = avx512d_blend(avx512d_ge(bx, cx), kx, vone);
                     kx = avx512d_blend(avx512d_ge(ax, bx) & avx512d_ge(ax, cx), kx, vzero);
                 } else {
-                    stdx::where(bx >= cx, kx) = vone;
-                    stdx::where((ax >= bx) && (ax >= cx), kx) = vzero;
+                    kx = pick_code(ax, bx, cx, vzero, vone, vtwo);
                 }
 #else
-                stdx::where(bx >= cx, kx) = vone;
-                stdx::where((ax >= bx) && (ax >= cx), kx) = vzero;
+                kx = pick_code(ax, bx, cx, vzero, vone, vtwo);
 #endif
                 vxv.copy_to(cX + off + (std::size_t)s * W, stdx::element_aligned);
                 store_codes<T, W>(kx, dX + (std::size_t)s * W);
@@ -208,18 +286,23 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                 stdx::max(om, ox).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
                 vd okv = vone;
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
-                if constexpr (std::is_same_v<T, double>) {
+                if constexpr (sizeof(T) == 8) {
                     okv = avx512d_blend(avx512d_ge(om, ox), okv, vzero);
                 } else {
-                    stdx::where(om >= ox, okv) = vzero;
+                    okv = sel_ge(om, ox, vone, vzero);
                 }
 #else
-                stdx::where(om >= ox, okv) = vzero;
+                okv = sel_ge(om, ox, vone, vzero);
 #endif
                 okv.copy_to(ok + (std::size_t)s * W, stdx::element_aligned);
             }
 
-            // ── the carry: VY, same-lane striped chain + lazy-F, codes tracked ──
+            // ── the carry: VY, same-lane striped chain + lazy-F, codes tracked (integer
+            // T: the exact prefix max with its codes, int_pmax_carry) ──
+            if constexpr (nw_is_int<T> && W >= 4) {
+                int_pmax_carry<T, W>(ov, ok, nbOpen, nbOpenK, bY, ge_a, seg,
+                                     cY + off, yc, qb);
+            } else {
             vd prev([&](int q) { return q == 0 ? bY : K_NINF; });
             for (int s = 0; s < seg; ++s) {
                 vd O, OK;
@@ -237,13 +320,13 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                 vd v = stdx::max(O, ext);
                 vd ky = vtwo;                       // extension
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
-                if constexpr (std::is_same_v<T, double>) {
+                if constexpr (sizeof(T) == 8) {
                     ky = avx512d_blend(avx512d_ge(O, ext), ky, OK);   // open: M or X, ties go to open
                 } else {
-                    stdx::where(O >= ext, ky) = OK;     // open: M or X, ties go to open
+                    ky = sel_ge(O, ext, vtwo, OK);      // open: M or X, ties go to open
                 }
 #else
-                stdx::where(O >= ext, ky) = OK;     // open: M or X, ties go to open
+                ky = sel_ge(O, ext, vtwo, OK);      // open: M or X, ties go to open
 #endif
                 v.copy_to(cY + off + (std::size_t)s * W, stdx::element_aligned);
                 ky.copy_to(yc + (std::size_t)s * W, stdx::element_aligned);
@@ -257,16 +340,8 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                 for (int s = 0; s < seg; ++s) {
                     vd v; v.copy_from(cY + off + (std::size_t)s * W, stdx::element_aligned);
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
-                    if constexpr (std::is_same_v<T, double>) {
-                        alignas(64) double fa[8], va[8];
-                        F.copy_to(fa, stdx::element_aligned);
-                        v.copy_to(va, stdx::element_aligned);
-                        if (_mm512_cmp_pd_mask(_mm512_load_pd(fa),
-                                               _mm512_load_pd(va), _CMP_GT_OQ) == 0)
-                            break;
-                    } else {
-                        if (!stdx::any_of(F > v)) break;
-                    }
+                    if constexpr (sizeof(T) == 8) { if (!avx512d_any_gt(F, v)) break; }
+                    else { if (!stdx::any_of(F > v)) break; }
 #else
                     if (!stdx::any_of(F > v)) break;
 #endif
@@ -275,7 +350,7 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                     // correction exists to fix.
                     vd k; k.copy_from(yc + (std::size_t)s * W, stdx::element_aligned);
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
-                    if constexpr (std::is_same_v<T, double>) {
+                    if constexpr (sizeof(T) == 8) {
                         k = avx512d_blend(avx512d_gt(F, v), k, vtwo);
                     } else {
                         stdx::where(F > v, k) = vtwo;
@@ -291,6 +366,7 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                 }
                 if (!changed) break;
             }
+            }   // integer / floating carry
             for (int s = 0; s < seg; ++s) {
                 vd k; k.copy_from(yc + (std::size_t)s * W, stdx::element_aligned);
                 store_codes<T, W>(k, dY + (std::size_t)s * W);

@@ -12,7 +12,7 @@
 // contiguous row slices, never the band geometry.
 //
 // Bit-exactness survives every ISA width because the bodies contain only max, add
-// and subtract on doubles — each IEEE-exact at any width, with no a*b+c for FMA to
+// and subtract on T — each IEEE-exact at any width, with no a*b+c for FMA to
 // fuse.  The two X-state subtractions are kept LEFT-ASSOCIATED, `(v - go) - ge`,
 // never folded to `v - (go + ge)`, which would round differently and break the
 // tracebacks that re-derive the path by exact float equality.
@@ -32,7 +32,6 @@ inline constexpr int ROW_BLOCK = NWGRAD_ROW_BLOCK;
 inline constexpr int ROW_BLOCK = (KW >= 4) ? 64 : 256;
 #endif
 
-inline constexpr double ROW_NEG_INF = -std::numeric_limits<double>::infinity();
 
 // The whole banded row in ONE leveled call: the interleaved block loop (carry-free
 // VM/VX, then the serial VY carry, per block) and — for Local — the row's max3.
@@ -53,46 +52,50 @@ inline constexpr double ROW_NEG_INF = -std::numeric_limits<double>::infinity();
     for (int base = lo; base <= hi; base += blk) {                             \
         const int end = (base + blk - 1 < hi) ? base + blk - 1 : hi;           \
         for (int j = base; j <= end; ++j) {          /* carry-free VM, VX */   \
-            double d = vm_prev[j - 1];                                         \
+            T d = vm_prev[j - 1];                                         \
             d = std::max(d, vx_prev[j - 1]);                                   \
             d = std::max(d, vy_prev[j - 1]);                                   \
-            double mv = d + subrow[j];                                         \
-            if (LOCAL) mv = std::max(mv, 0.0);                                 \
-            double x = (vm_prev[j] - go_b) - ge_b;                             \
-            x = std::max(x, vx_prev[j] - ge_b);                               \
-            x = std::max(x, (vy_prev[j] - go_b) - ge_b);                       \
+            T mv = d + subrow[j];                                         \
+            if (LOCAL) mv = std::max(mv, T(0));                                 \
+            T x = (vm_prev[j] - go_b) - ge_b;                             \
+            x = std::max<T>(x, vx_prev[j] - ge_b);                             \
+            x = std::max<T>(x, (vy_prev[j] - go_b) - ge_b);                     \
             vm_cur[j] = mv;                                                    \
             vx_cur[j] = x;                                                     \
         }                                                                     \
         for (int j = base; j <= end; ++j) {          /* serial VY carry */     \
-            double open = (std::max(vm_cur[j - 1], vx_cur[j - 1]) - go_a) - ge_a; \
-            vy_cur[j] = std::max(open, vy_cur[j - 1] - ge_a);                  \
+            T open = (std::max(vm_cur[j - 1], vx_cur[j - 1]) - go_a) - ge_a; \
+            vy_cur[j] = std::max<T>(open, vy_cur[j - 1] - ge_a);                \
         }                                                                     \
     }                                                                         \
     if (LOCAL) {                                                              \
-        double best = ROW_NEG_INF;                                            \
+        T best = nw_ninf<T>;                                            \
         for (int j = lo; j <= hi; ++j)                                        \
             best = std::max(best,                                             \
                             std::max(vm_cur[j], std::max(vx_cur[j], vy_cur[j]))); \
         return best;                                                          \
     }                                                                         \
-    return ROW_NEG_INF;
+    return nw_ninf<T>;
 
-static double banded_row_global(
-    double* __restrict vm_cur, double* __restrict vx_cur, double* __restrict vy_cur,
-    const double* __restrict vm_prev, const double* __restrict vx_prev,
-    const double* __restrict vy_prev, const double* __restrict subrow,
+// Templated on the scalar type T (double, float, the integer types); the body is the
+// same max/add/subtract per T.
+template <class T>
+static T banded_row_global(
+    T* __restrict vm_cur, T* __restrict vx_cur, T* __restrict vy_cur,
+    const T* __restrict vm_prev, const T* __restrict vx_prev,
+    const T* __restrict vy_prev, const T* __restrict subrow,
     int lo, int hi, int blk,
-    double go_a, double ge_a, double go_b, double ge_b) noexcept {
+    T go_a, T ge_a, T go_b, T ge_b) noexcept {
     NWGRAD_BANDED_ROW_BODY(0)
 }
 
-static double banded_row_local(
-    double* __restrict vm_cur, double* __restrict vx_cur, double* __restrict vy_cur,
-    const double* __restrict vm_prev, const double* __restrict vx_prev,
-    const double* __restrict vy_prev, const double* __restrict subrow,
+template <class T>
+static T banded_row_local(
+    T* __restrict vm_cur, T* __restrict vx_cur, T* __restrict vy_cur,
+    const T* __restrict vm_prev, const T* __restrict vx_prev,
+    const T* __restrict vy_prev, const T* __restrict subrow,
     int lo, int hi, int blk,
-    double go_a, double ge_a, double go_b, double ge_b) noexcept {
+    T go_a, T ge_a, T go_b, T ge_b) noexcept {
     NWGRAD_BANDED_ROW_BODY(1)
 }
 

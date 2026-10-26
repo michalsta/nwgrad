@@ -142,11 +142,8 @@ Row<T> run_sweep(const LevelKernels& K, bool pmax,
     job.H = H; job.ncols = NC; job.in_x = in_x ? 1 : 0;
     job.buf = &buf;
     job.outM = out.M.data(); job.outX = out.X.data(); job.outY = out.Y.data();
-    if constexpr (std::is_same_v<T, double>) {
-        if (pmax) K.hb_sweep_pmax(job); else K.hb_sweep(job);
-    } else {
-        if (pmax) K.hb_sweep_pmax_f(job); else K.hb_sweep_f(job);
-    }
+    const TypedKernels<T>& KT = K.template of<T>();
+    if (pmax) KT.hb_sweep_pmax(job); else KT.hb_sweep(job);
     return out;
 }
 
@@ -215,8 +212,7 @@ TEMPLATE_TEST_CASE("pmax sweep: differs from the exact sweep, and is width-indep
                     INFO("level = " << level_name((SimdLevel)level) << "  H=" << H
                                     << " NC=" << NC << " in_x=" << in_x);
                     const LevelKernels& K = level_kernels(level);
-                    REQUIRE(( std::is_same_v<T, double> ? K.hb_sweep_pmax != nullptr
-                                                        : K.hb_sweep_pmax_f != nullptr ));
+                    REQUIRE(K.template of<T>().hb_sweep_pmax != nullptr);
 
                     const Row<T> got = run_sweep<T>(K, true, f.a, f.b, blkT, f.nalpha,
                                                     go_a, ge_a, go_b, ge_b, H, NC, in_x);

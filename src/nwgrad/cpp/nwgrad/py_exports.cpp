@@ -464,10 +464,14 @@ static void bind_convenience(nb::module_& m, const std::string& sfx) {
     NWG_HARD("sw_grad", Linear, Local,  "SW local: returns (score, AlignParams grad) — hard subgradient (linear gap).");
     NWG_HARD("nw_affine_grad", Affine, Global, "NW global: returns (score, AlignParams grad) — hard subgradient (affine gap).");
     NWG_HARD("sw_affine_grad", Affine, Local,  "SW local: returns (score, AlignParams grad) — hard subgradient (affine gap).");
+    // The soft path has no integer form (it is a computation in exp/log space), so an
+    // integer T binds no soft function at all rather than one that always raises.
+    if constexpr (std::is_floating_point_v<T>) {
     NWG_SOFT("nw_soft_grad", Linear, Global, "NW global: returns (log_Z, AlignParams grad) — soft gradient (linear gap).");
     NWG_SOFT("sw_soft_grad", Linear, Local,  "SW local: returns (log_Z, AlignParams grad) — soft gradient (linear gap).");
     NWG_SOFT("nw_affine_soft_grad", Affine, Global, "NW global: returns (log_Z, AlignParams grad) — soft gradient (affine gap).");
     NWG_SOFT("sw_affine_soft_grad", Affine, Local,  "SW local: returns (log_Z, AlignParams grad) — soft gradient (affine gap).");
+    }
 #undef NWG_SCORE
 #undef NWG_HARD
 #undef NWG_SOFT
@@ -895,6 +899,14 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             "again.  No effect on an untracked batch or on soft gradients.")
         .def("drop_paths", &SPB::drop_paths,
              "Free the stored alignment paths (score_and_grad(keep_paths=True)).")
+        .def("_inter_plan",
+             [](SPB& self) {
+                 const auto c = self.inter_plan_counts();
+                 return std::vector<size_t>(c.begin(), c.end());
+             },
+             "UNSTABLE (nwgrad._tuning): the fill=\"interpair\" plan as the next call runs\n"
+             "it, [pairs in shared groups, pairs on their own fill, groups].  The\n"
+             "score-only gather gate acts per group inside the call and is not reflected.")
         .def_prop_ro(
             "alphabet",
             [](const SPB& self) { return self.alphabet().symbols(); },
@@ -1373,6 +1385,37 @@ NB_MODULE(nwgrad_ext, m) {
           "thread-safe to change while work is in flight — set it before dispatching.\n"
           "NWGRAD_ISA=<level> does the same before the module loads.");
 
+    // ── Fill-gate overrides (nwgrad._tuning; unstable, for tuning sweeps) ────────
+    // Raw: -1 = no override (the compiled default), INT64_MAX = the cap never rejects.
+    // nwgrad/_tuning.py maps these to Python values; use that, not these.
+    auto gate_of = [](const std::string& name) {
+        for (int g = 0; g < static_cast<int>(Gate::Count_); ++g)
+            if (name == kGateNames[g]) return static_cast<Gate>(g);
+        throw nb::value_error(("unknown fill gate: " + name).c_str());
+    };
+    m.def("_gate_names", []() {
+        return std::vector<std::string>(std::begin(kGateNames), std::end(kGateNames));
+    });
+    m.def("_gate_get", [gate_of](const std::string& name) { return gate_override(gate_of(name)); },
+          nb::arg("name"));
+    m.def("_gate_set", [gate_of](const std::string& name, int64_t v) {
+              set_gate_override(gate_of(name), v);
+          }, nb::arg("name"), nb::arg("value"));
+    m.def("_gate_off_value", []() { return kGateOff; });
+    // The compiled defaults of the single-valued caps (0 = no cap);
+    // linear_striped_min_n is per mode, type and level (Aligner::kLinearStripedMinN).
+    m.def("_gate_defaults", []() {
+        return std::vector<std::pair<std::string, int64_t>>{
+            {"inter_group_bytes", int64_t(kInterGroupBytes)},
+            {"inter_soft_bytes", int64_t(kInterSoftBytes)},
+            {"inter_score_gather_cells", int64_t(kInterScoreGatherCells)},
+            {"inter_linear_int_gather_cells", int64_t(kInterLinearIntGatherCells)},
+            {"inter_linear_f32_gather_cells", int64_t(kInterLinearF32GatherCells)},
+            {"inter_linear_f64_gather_cells", int64_t(kInterLinearF64GatherCells)},
+            {"inter_global_linear_int_cells", int64_t(kInterGlobalLinearIntCells)},
+            {"inter_global_linear_f32_cells", int64_t(kInterGlobalLinearF32Cells)}};
+    });
+
     m.def(
         "guide_j_from_aligned",
         [](const std::string& a_aligned, const std::string& b_aligned) {
@@ -1383,9 +1426,13 @@ NB_MODULE(nwgrad_ext, m) {
         "Returns a list of length m+1 where guide_j[i] = column j after consuming i\n"
         "characters of a.");
 
-    // ── Single-pair convenience functions (float32 default; _double variants) ──
+    // ── Single-pair convenience functions (float32 default; _double and the integer
+    //    variants: integral parameters only, no soft functions) ──
     bind_convenience<float >(m, "");
     bind_convenience<double>(m, "_double");
+    bind_convenience<int16_t>(m, "_int16");
+    bind_convenience<int32_t>(m, "_int32");
+    bind_convenience<int64_t>(m, "_int64");
 
     // ── BatchResult ──────────────────────────────────────────────────────────
     nb::class_<BatchResult>(m, "BatchResult")
@@ -1406,13 +1453,23 @@ NB_MODULE(nwgrad_ext, m) {
             nb::rv_policy::reference_internal,
             "Summed gradient over the batch as an AlignParams object.");
 
-    // ── SeqPair (float32 default) / SeqPairDouble ─────────────────────────────
+    // ── SeqPair (float32 default) / SeqPairDouble / SeqPairInt16, Int32, Int64 ─
     bind_seq_pair<float >(m, "SeqPair");
     bind_seq_pair<double>(m, "SeqPairDouble");
+    bind_seq_pair<int16_t>(m, "SeqPairInt16");
+    bind_seq_pair<int32_t>(m, "SeqPairInt32");
+    bind_seq_pair<int64_t>(m, "SeqPairInt64");
 
-    // ── SeqPairBatch (float32 default) / SeqPairBatchDouble ───────────────────
+    // ── SeqPairBatch (float32 default) / SeqPairBatchDouble / the integer three ──
+    // Integer batches: integral parameters only (a non-integral one raises ValueError
+    // at construction / set_params), a problem whose a-priori bound could overflow the
+    // type raises OverflowError, grad_mode "soft" raises ValueError.  Every hard-path
+    // result is bit-identical to the double batch's on the same integral parameters.
     bind_seq_pair_batch<float >(m, "SeqPairBatch");
     bind_seq_pair_batch<double>(m, "SeqPairBatchDouble");
+    bind_seq_pair_batch<int16_t>(m, "SeqPairBatchInt16");
+    bind_seq_pair_batch<int32_t>(m, "SeqPairBatchInt32");
+    bind_seq_pair_batch<int64_t>(m, "SeqPairBatchInt64");
 
     // ── logistic: a binary logistic link over batch scores (submodule) ────────
     bind_logistic(m);

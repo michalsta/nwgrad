@@ -99,6 +99,81 @@ no-SMT hosts) it cannot do harm.
 Until then, callers with short pairs should pass an explicit `n_threads`.
 DiscrimAlign does: it passes the logical core count.
 
+## Integer scalar types: what is left (branch `integer`, 2026-10-22)
+
+- **Linear kernels: what is left** (the leveled striped linear fill, linear Hirschberg, the
+  NEON float inter-pair cap and the AVX-512 gate all landed and were measured on AVX2,
+  AVX-512 and NEON, 2026-10-23: AGENTS "Versus parasail"). Global linear protein pairs now join the
+  inter-pair fill (done 2026-10-23; caps confirmed on AVX2, AVX-512 and NEON — on NEON
+  they forgo int L80-100 and float32 L130 wins of 3-23 %, accepted). The per-level thresholds come from one host per ISA — re-derive
+  them on another AVX-512 CPU (Zen 4 splits 512-bit ops) before trusting them there.
+- **The integer score kernel's working set: DONE for the score kernel** (2026-10-24, AGENTS
+  "Versus parasail": the carry fused into the row pass, 0.45–0.9 of the separate carry's
+  time on every host and type measured). Left: the same separate carry (opens / flags / Q
+  rows) in the Pointers, Scores and hb_base kernels, which write tables anyway — less to
+  gain, but check their 12-thread L1000 drop on nighthaven; the Pointers kernel needs the
+  open codes, so the fusion does not transfer one to one.
+- **4 KB aliasing on 4-way L1Ds**: FIXED for every leveled rolling-row kernel (2026-10-24)
+  and, on a narrow L1 only (`table_spread()`), the Scores tables and the linear H table
+  (2026-10-25; AGENTS "FIXED beside it" and the two paragraphs after it). Left: (1) a
+  residual toll on SHORT int32 Scores pairs on Piledriver (medians of 9: Local L322 1.09,
+  Global L444 1.04): placement or padding, unseparated (the knob build for it ran while
+  skynet was loaded); (2) the mechanism of the r = 0 mod 4 hazard (bank conflicts?);
+  (3) the register ramp of `int_pmax_carry` (AVX2 0.79-1.02, Piledriver 0.91-1.00, NEON
+  0.96-1.00, AVX-512 0.86-1.03: AGENTS) leaves one AVX-512 cell above the noise, int16
+  Local affine Pointers L200 1.04 (7 segments: the two-step pass's tail?), and int16 Global
+  Scores 1.035-1.043 at avx2 L100 / L200 and avx512 L140. Not the per-lane ramp base: built
+  without the generator it moved neither cell and lost up to 1.038 on short rows (AGENTS).
+  The v3 regression this caused (int16 Global Scores 1.02-1.06) is FIXED by the
+  in-register lane scan (AGENTS), on every level (NEON int16 too, once its shifts compiled
+  as `ext`). Not yet timed on spot under Fedora Asahi (macOS only).
+- **int16 saturating arithmetic, with a number**: at L1000 BLOSUM62 nwgrad refuses int16
+  and runs int32 (261 us a pair, score-only, AVX2) where parasail's saturating scan16 takes
+  145 us — the one fixture in the comparison parasail wins.
+- The streaming `align()` validates integer params per pair (the aligner's `nw_int_prepare`
+  on the caller's params, O(K * nalpha^2) a pair); prepare once per call as the batch does.
+- `score()` / `scores()` stay double: exact below 2^53, so an int64 score above that
+  (parameters ~2^40) loses bits in the report.
+- int16 with saturating arithmetic would remove the (m + n + 66) * step bound (the sentinel
+  then self-preserving under `psubsw`); std::simd has no saturating ops, so intrinsics per
+  level. Not started; measure int16 first.
+- AVX-512: verified and measured 2026-10-22 (solace under WSL, gcc 15.2 / clang 21.1; AGENTS
+  "Integer scalar types"). gcc's AVX-512 integer Pointers kernels: after the always_inline
+  round and the row-argmax broadcast fix (both 2026-10-23) gcc is at 1.10-1.23x clang on
+  them (int64 Local 49.4 vs 42.8 us a pair, Global 38.8 vs 31.6; int16 / int32 1.1-1.16x),
+  the striped loops' scheduling residue (AGENTS "Toolchain"); the score kernels tie.
+  Nothing specific left to read there; perf setup on solace: RelWithDebInfo venvs under
+  ~/cc/bench-int-inline, `perf record -e cpu-clock` works under WSL.
+- spot (NEON): the final state is verified (ctest 17/17, Python suite, `bench_int_cc.sh`
+  at neon, 2026-10-22; built with `CMAKE_BUILD_PARALLEL_LEVEL=3` after the first attempt
+  took the 16 GB laptop down). Note for long jobs there: take a `systemd-inhibit` (see
+  the fleet notes) — the laptop slept after this run finished.
+- gcc vs clang on the integer striped kernels, final state: clang still 4-20 % faster
+  (nighthaven protein int16/int32: gcc at 0.80-0.96 of clang's time at avx2, 0.78-0.94 at
+  sse4; Piledriver int16 score 0.70). What is left is clang's x2 unrolling and interleaved
+  scheduling of the segment loops, the same residue the float kernels show at W=2
+  (AGENTS "Toolchain"); `#pragma GCC unroll` did not close it there either. Not pursued.
+- int64 at AVX2 costs 1.5-2.6x float32 (no packed 64-bit max: `vpcmpgtq` + `vpblendvb`,
+  the same 4 lanes as double) and 4-5x at sse2 (no 64-bit compare at all). It is headroom
+  for huge parameters, not a speed type; nothing cheap left to do for it.
+
+## Per-ISA default gates: a large benchmark sweep
+
+The fill gates are thresholds measured on one host per ISA. `inter_score_ok` /
+`kInterScoreGatherCells` (8192 cells, ~L90), `kInterLinearIntGatherCells`, the
+`inter_pair_fits` byte caps and `kLinearStripedMinN` all come from nighthaven (AVX2),
+with spot (NEON) as a check. They do not carry over. On wloczykij (Piledriver, sse4 level,
+2026-10-25, nwgrad vs SeqAn3 run, `integer` 1f48c1e), float32 Global affine score-only
+at L100 runs striped at 55.5 ms a batch (2000 pairs, 1 thread). Forced through
+`interpair` on `main` (no gate there), it takes 36.5 ms: the gate costs 1.5x on that host.
+Sweep every gate per ISA level (sse2, sse4, avx2, avx512, neon) on the fleet, over
+length, every scalar type, mode, gap model and output (score / path / hard grad), at
+1 thread and all cores. Then make the thresholds per level, with a table instead of one
+constant. The integer types pass the same score-only gate; check whether they are
+penalised the same way. The knob exists now: `nwgrad._tuning` overrides every gate at
+runtime (docs/tuning.md "Fill gates"), and `SeqPairBatch._inter_plan()` shows where the
+plan routed the pairs.
+
 ## Per-pair gradients stored contiguously (weighted_grad, grads)
 
 `weighted_grad()` and `grads()` read every pair's cached gradient from its own

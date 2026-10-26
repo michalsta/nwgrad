@@ -99,12 +99,12 @@ void check_rowwise_storage(const AlignParams& p, int backend, TracebackMode tb, 
     // Splitting Hirschberg, float32 and scalar Pointers never use full score
     // tables. Check the buffers themselves rather than a noisy process RSS.
     const bool splits = tb != TracebackMode::Pointers && a.size() > static_cast<size_t>(cutoff);
-    if (splits || std::is_same_v<T, float> || backend == kBackendScalar) {
+    if (splits || backend == kBackendScalar) {
         CHECK(row_buf.VM.empty());
         CHECK(row_buf.VX.empty());
         CHECK(row_buf.VY.empty());
-    } else if (level_kernels(backend).banded_row_local) {
-        // Below the cutoff, double SIMD rowwise really does need these tables.
+    } else if (level_kernels(backend).template of<T>().banded_row_local) {
+        // Below the cutoff, SIMD rowwise (any T) really does need these tables.
         CHECK_FALSE(row_buf.VM.empty());
         CHECK_FALSE(row_buf.VX.empty());
         CHECK_FALSE(row_buf.VY.empty());

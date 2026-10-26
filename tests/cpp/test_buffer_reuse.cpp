@@ -15,6 +15,7 @@
 
 #include "catch.hpp"
 
+#include <cstdint>
 #include <random>
 #include <string>
 #include <vector>
@@ -140,4 +141,94 @@ TEST_CASE("one DpBuffer reused across gap models, modes, bands and sizes", "[buf
         check_sequence<double>(seed);
         check_sequence<float>(seed);
     }
+}
+
+// ── Row placement (dp_buffer.hpp): the 4 KB-aliasing fix must actually be in force ──
+//
+// Every result above is bit-identical whether or not the rows are spread, so nothing there
+// would notice the placement silently not happening.  These pin the mechanics: PlacedVec
+// lands where asked and keeps its contents, spread_stride / table_lines obey their rules,
+// and a striped Scores fill leaves VM at line 0 and VM / VX / VY >= 4 lines apart.
+TEST_CASE("rolling rows and striped tables are placed apart", "[buffer_reuse][layout]") {
+    auto line_of = [](const void* p) {
+        return static_cast<int>(reinterpret_cast<std::uintptr_t>(p) % 4096 / 64);
+    };
+    auto dist = [](int x) { x = ((x % 64) + 64) % 64; return x < 64 - x ? x : 64 - x; };
+
+    PlacedVec<double> v;
+    v.place(5);
+    v.resize(100);
+    CHECK(line_of(v.data()) == 5);
+    for (size_t k = 0; k < 100; ++k) v[k] = static_cast<double>(k);
+    v.place(17);
+    v.resize(300000);   // past 2 MiB: the allocator's huge-page alignment, then the offset
+    CHECK(line_of(v.data()) == 17);
+    for (size_t k = 0; k < 100; ++k) CHECK(v[k] == static_cast<double>(k));
+
+    for (std::size_t len : {1u, 16u, 1004u, 1016u, 2040u, 4100u})
+        for (int nrows = 2; nrows <= 12; ++nrows) {
+            const std::size_t st = spread_stride<int>(len, nrows);
+            const int r = static_cast<int>(st / 16 % 64);
+            CHECK(st >= len);
+            CHECK(r % 4 != 0);
+            for (int k = 1; k < nrows; ++k) CHECK(dist(k * r) >= 4);
+        }
+    for (int r = 0; r < 64; ++r) {
+        if (r % 4 == 0 || dist(r) < 4) continue;   // never chosen by spread_stride(len, 2)
+        const TableLines tl = table_lines(static_cast<std::size_t>(r));
+        const int s[6] = {0, tl.a, tl.b, -r, tl.a - r, tl.b - r};
+        for (int x = 0; x < 6; ++x)
+            for (int y = x + 1; y < 6; ++y) CHECK(dist(s[x] - s[y]) >= 4);
+    }
+
+    std::mt19937 rng(7);
+    std::vector<double> mat(16);
+    for (auto& x : mat) x = static_cast<double>(static_cast<int>(rng() % 9) - 3);
+    const AlignParams p(SubstMatrix(mat.data(), "ACGT"), 2.5, 0.5, 3.0, 0.5);
+    const auto ea = p.matrix.alphabet().encode(rseq(rng, 300));   // the aligner views them
+    const auto eb = p.matrix.alphabet().encode(rseq(rng, 300));
+    struct Spread {   // table_spread() forced on for the placement checks, auto after
+        explicit Spread(int m) { table_spread_mode().store(m); }
+        ~Spread() { table_spread_mode().store(-1); }
+    };
+    // Gated on a narrow L1D (dp_buffer.hpp), so a host's own setting runs ONE of the two
+    // table layouts: both run here, on the same problems, and must agree bit for bit.
+    {
+        std::vector<Problem> probs;
+        for (int k = 0; k < 24; ++k) {
+            const int len = (k % 4 == 0) ? 260 : 1 + static_cast<int>(rng() % 120);
+            probs.push_back({k % 2, (k / 2) % 2, 0, (k % 3 == 0) ? TracebackMode::Pointers : TracebackMode::Scores,
+                             rseq(rng, len), rseq(rng, 1 + static_cast<int>(rng() % 300))});
+        }
+        const AlignParams lin(SubstMatrix(mat.data(), "ACGT"), 0.0, 1.0, 0.0, 0.8);
+        for (int backend : backends_under_test())
+            for (const Problem& pr : probs) {
+                INFO("backend=" << backend_name(backend) << " gm=" << pr.gm << " am=" << pr.am
+                     << " m=" << pr.a.size() << " n=" << pr.b.size());
+                DpBufferT<double> b0, b1;
+                Result r0, r1;
+                { Spread off(0); r0 = run<double>(pr, pr.gm ? p : lin, backend, b0); }
+                { Spread on(1);  r1 = run<double>(pr, pr.gm ? p : lin, backend, b1); }
+                CHECK(r0 == r1);
+            }
+    }
+    Spread on(1);
+    int striped = 0;
+    for (int backend : backends_under_test()) {
+        INFO("backend=" << backend_name(backend));
+        Aligner<GapModel::Affine, AlignMode::Global, AlignBand::Full, double> al;
+        al.set_kernel(backend);
+        al.set_traceback(TracebackMode::Scores);
+        al.set_problem(ea, eb, p, 0);
+        DpBufferT<double> buf;
+        al.compute_viterbi(buf);
+        if (!al.tables_striped()) continue;   // scalar, or a build without leveled kernels
+        ++striped;
+        const int lm = line_of(buf.VM.data()), lx = line_of(buf.VX.data()), ly = line_of(buf.VY.data());
+        CHECK(lm == 0);
+        CHECK(dist(lx - lm) >= 4);
+        CHECK(dist(ly - lm) >= 4);
+        CHECK(dist(ly - lx) >= 4);
+    }
+    if (!striped) WARN("no backend ran the striped Scores kernel: placement unchecked");
 }

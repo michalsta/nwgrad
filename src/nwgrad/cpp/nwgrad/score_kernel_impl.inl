@@ -36,7 +36,7 @@ template <class T, bool Local, bool Fused, bool Tr = false>
 static void score_affine_striped(ScoreJob<T>& job) {
     using vd = stdx::native_simd<T>;
     const int W = (int)vd::size();
-    const T NINF = -std::numeric_limits<T>::infinity();
+    const T NINF = nw_ninf<T>;
 
     const int m = job.m, n = job.n, nalpha = job.nalpha;
     T go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;
@@ -45,33 +45,29 @@ static void score_affine_striped(ScoreJob<T>& job) {
     const unsigned char* a = job.a;
     const unsigned char* b = job.b;
     DpBufferT<T>& buf = *job.buf;
+    [[maybe_unused]] IntRampRow<T> irr{buf.iramp};   // int_row_ramp's row (Global, int16 at 16 lanes)
 
     if (n == 0) {
         // No columns: Global ends in one gap run down column 0 (or is empty); Local is 0.
         // The fill's (m, 0) cell: VM = -inf (0 at m == 0), VX = -(go_b + m*ge_b), VY = -inf.
-        if constexpr (Local) job.score = 0.0;
-        else if constexpr (Tr) job.score = (m == 0) ? 0.0 : static_cast<double>(tr.bx0[m]);
-        else job.score = (m == 0) ? 0.0 : static_cast<double>(-(go_b + static_cast<T>(m) * ge_b));
+        if constexpr (Local) job.score = T(0);
+        else if constexpr (Tr) job.score = (m == 0) ? T(0) : tr.bx0[m];
+        else job.score = (m == 0) ? T(0) : static_cast<T>(-(go_b + static_cast<T>(m) * ge_b));
         return;
     }
 
     const int seg = (n + W - 1) / W;
     const std::size_t sw = (std::size_t)seg * W;
-    for (auto* v : {&buf.rM, &buf.rX, &buf.rY, &buf.qM, &buf.qX, &buf.qY})
-        if (v->size() < sw) v->resize(sw);
-    if constexpr (!Fused) if (buf.sopenv.size() < sw) buf.sopenv.resize(sw);
+    // six rolling rows, the opens and Local's padding mask: one block (spread_rows,
+    // dp_buffer.hpp)
+    std::size_t rs; T* const rows = spread_rows<T>(buf.srows, sw, 8, rs);
+    T* const opens = rows + 6 * rs;
     // Local: the padding slots (columns > n) must not reach the maximum.  With a negative
     // gap extend a gap run GAINS score along the padding, so they can exceed every real
     // cell (the fill's argmax scans real columns only).  Added, not selected: x + 0 = x
     // exactly, x + -inf = -inf, and no mask op (see kernels_impl.inl's AVX-512/clang note).
     const T* pad = nullptr;
-    if constexpr (Local) {
-        if (buf.spad.size() < sw) buf.spad.resize(sw);
-        for (int l = 0; l < W; ++l)
-            for (int s = 0; s < seg; ++s)
-                buf.spad[(std::size_t)s * W + l] = (l * seg + s + 1 <= n) ? T(0) : NINF;
-        pad = buf.spad.data();
-    }
+    if constexpr (Local) pad = striped_pad_into(rows + 7 * rs, n, seg, W);
     auto padded = [&](const vd& v, int s) {
         vd p; p.copy_from(pad + (std::size_t)s * W, stdx::element_aligned);
         return v + p;
@@ -80,8 +76,8 @@ static void score_affine_striped(ScoreJob<T>& job) {
     // striped query profile, padding columns -inf (as striped_affine_full)
     striped_profile_build<T, Tr>(buf.sprof, job.blk, nalpha, b, n, seg, W, tr);
 
-    T* pM = buf.qM.data(); T* pX = buf.qX.data(); T* pY = buf.qY.data();   // row i-1
-    T* cM = buf.rM.data(); T* cX = buf.rX.data(); T* cY = buf.rY.data();   // row i
+    T* pM = rows + 3 * rs; T* pX = rows + 4 * rs; T* pY = rows + 5 * rs;   // row i-1
+    T* cM = rows;          T* cX = rows + rs;     T* cY = rows + 2 * rs;   // row i
 
     // row 0 (columns 1..n, striped); padding -inf, as the fill leaves it
     for (std::size_t k = 0; k < sw; ++k) { pM[k] = NINF; pX[k] = NINF; pY[k] = NINF; }
@@ -103,7 +99,7 @@ static void score_affine_striped(ScoreJob<T>& job) {
     // Is any lane of a greater than b?  (The lazy-F early exit — the one mask op.)
     auto any_gt = [](const vd& x, const vd& y) -> bool {
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
-        if constexpr (std::is_same_v<T, double>) return avx512d_gt(x, y) != 0;
+        if constexpr (sizeof(T) == 8) return avx512d_gt(x, y) != 0;
         else                                     return stdx::any_of(x > y);
 #else
         return stdx::any_of(x > y);
@@ -153,15 +149,21 @@ static void score_affine_striped(ScoreJob<T>& job) {
                 vd vxv = stdx::max(stdx::max((uM - vgo_b) - vge_b, uX - vge_b), (uY - vgo_b) - vge_b);
                 vxv.copy_to(cX + (std::size_t)s * W, stdx::element_aligned);
 
+                if constexpr (nw_is_int<T> && W >= 4) {
+                    // the opens to ov (int_pmax_carry reads them one segment back)
+                    ((stdx::max(vmv, vxv) - vgo_a) - vge_a).copy_to(opens + (std::size_t)s * W, stdx::element_aligned);
+                    if constexpr (Local) vbest = stdx::max(vbest, padded(stdx::max(vmv, vxv), s));
+                } else {
                 vd vyv = stdx::max(Oin, Yin - vge_a);
                 vyv.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
                 if constexpr (Local) vbest = stdx::max(vbest, padded(stdx::max(stdx::max(vmv, vxv), vyv), s));
                 Oin = (stdx::max(vmv, vxv) - vgo_a) - vge_a;
                 Yin = vyv;
+                }
             }
             Olast = Oin;
         } else {
-            T* ov = buf.sopenv.data();
+            T* ov = opens;
             for (int s = 0; s < seg; ++s) {
                 vd dM, dX, dY;
                 if (s == 0) {
@@ -190,6 +192,7 @@ static void score_affine_striped(ScoreJob<T>& job) {
                 if constexpr (Local) vbest = stdx::max(vbest, padded(stdx::max(vmv, vxv), s));
                 ((stdx::max(vmv, vxv) - vgo_a) - vge_a).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
             }
+            if constexpr (!(nw_is_int<T> && W >= 4)) {
             vd prev([&](int q) { return q == 0 ? bY : NINF; });
             for (int s = 0; s < seg; ++s) {
                 vd O;
@@ -204,12 +207,23 @@ static void score_affine_striped(ScoreJob<T>& job) {
                 if constexpr (Local) vbest = stdx::max(vbest, padded(v, s));
                 prev = v;
             }
+            }
         }
 
         // ── lazy-F: carry the gap-in-A run across the lane boundaries ──
         // Round 0 of the fused form also carries the OPEN from the previous lane's last
         // column (seeded -inf above); later rounds, and every round of the two-pass form
         // (whose carry pass already saw the opens), carry the extension only.
+        // (Integer T: the exact prefix-max carry instead, then Local's max over Y.)
+        if constexpr (nw_is_int<T> && W >= 4) {
+            int_pmax_carry<T, W, int_row_ramp<T, W> && !Local>(opens, nullptr, nbOpen, T(0), bY, ge_a,
+                                 seg, cY, nullptr, nullptr, &irr);
+            if constexpr (Local)
+                for (int s = 0; s < seg; ++s) {
+                    vd y; y.copy_from(cY + (std::size_t)s * W, stdx::element_aligned);
+                    vbest = stdx::max(vbest, padded(y, s));
+                }
+        } else
         for (int r = 0; r < W; ++r) {
             vd last; last.copy_from(cY + (std::size_t)(seg - 1) * W, stdx::element_aligned);
             vd F = lane_shift_in(last, NINF);
@@ -227,9 +241,11 @@ static void score_affine_striped(ScoreJob<T>& job) {
                 v = stdx::max(v, F);
                 v.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
                 if constexpr (Local) vbest = stdx::max(vbest, padded(v, s));
-                // F - g, not v - g: the same stored maxima and exit test, one subtraction
-                // on the chain (see score_affine_striped_pos's lazy-F)
-                F = F - vge_a;
+                // Floating T: F - ge, not v - ge -- the same stored maxima and exit test,
+                // one subtraction on the chain (see score_affine_striped_pos_fp's lazy-F).
+                // Integer T keeps v - ge: its sentinel stepped by - ge could wrap.
+                if constexpr (std::is_floating_point_v<T>) F = F - vge_a;
+                else                                       F = v - vge_a;
                 changed = true;
             }
             if (!changed) break;
@@ -242,11 +258,11 @@ static void score_affine_striped(ScoreJob<T>& job) {
     if constexpr (Local) {
         T best = 0;
         for (int q = 0; q < W; ++q) best = std::max(best, static_cast<T>(vbest[q]));
-        job.score = static_cast<double>(best);
+        job.score = best;
     } else {
         // (m, n) in the last row computed (row 0 when m == 0), striped
         const std::size_t k = (std::size_t)((n - 1) % seg) * W + (std::size_t)((n - 1) / seg);
-        job.score = static_cast<double>(std::max({pM[k], pX[k], pY[k]}));
+        job.score = std::max({pM[k], pX[k], pY[k]});
     }
 }
 
@@ -262,13 +278,24 @@ static void score_affine_striped(ScoreJob<T>& job) {
 // slower than the fill (1.03x) before it was moved back.  MOnly (extends >= 0 too): no
 // gap cell exceeds the cell it extends from, so the Local maximum is over M alone — and
 // M's padding slots are clamped to exactly 0, so they need no mask.
-// The row is stored as max(M, X), X and Y (D formed on reading); Y's carry steps two
-// segments at a time and lazy-F's carry is a bare subtraction — see the notes in the body.
+// An integer T (from 4 lanes) takes Y by the exact prefix max, FUSED into the row pass:
+// the opens never reach memory (the running prefix max of open(s-1) + ramp(s) is kept in
+// a register and stored to Y's row; the per-lane ramp base l*seg*ge_a plus one add per
+// segment replaces the ramp row), and after the row one pass applies the lanes' carry-in,
+// subtracts the ramp and folds Y into D.  Two passes over the row, six rows of working set,
+// where the separate int_pmax_carry took four passes and eight rows (opens and ramp
+// scratch).  Measured 2026-10-24, score-only, int32 ns/cell, fused / separate: AVX2
+// (nighthaven) 0.73-0.84 inside L1 and 0.5 at L1400-1600 (the separate form's L1 cliff:
+// eight rows of 4 B cross 48 KB at ~L1500, six at ~L2000), 6 threads L1600 0.49; AVX-512
+// (solace) 0.75-0.9 and 0.45 at L1600; NEON (spot) 0.70-0.79 at every length; sse4
+// (skynet) 0.60-0.95; int64 (AVX2 / AVX-512) 0.56-0.82; int16 0.74-0.93.  Bit-identical:
+// max is exact and associative, so Y is the separate carry's.  (A middle form, the ramp
+// in registers but the opens row kept, moved the cliff only and lost 3-10 % on NEON.)
 template <class T, bool Local, bool MOnly, bool Tr = false>
 static void score_affine_striped_pos(ScoreJob<T>& job) {
     using vd = stdx::native_simd<T>;
     const int W = (int)vd::size();
-    const T NINF = -std::numeric_limits<T>::infinity();
+    const T NINF = nw_ninf<T>;
 
     const int m = job.m, n = job.n, nalpha = job.nalpha;
     T go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;
@@ -279,24 +306,224 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
     DpBufferT<T>& buf = *job.buf;
 
     if (n == 0) {
-        if constexpr (Local) job.score = 0.0;
-        else if constexpr (Tr) job.score = (m == 0) ? 0.0 : static_cast<double>(tr.bx0[m]);
-        else job.score = (m == 0) ? 0.0 : static_cast<double>(-(go_b + static_cast<T>(m) * ge_b));
+        if constexpr (Local) job.score = T(0);
+        else if constexpr (Tr) job.score = (m == 0) ? T(0) : tr.bx0[m];
+        else job.score = (m == 0) ? T(0) : static_cast<T>(-(go_b + static_cast<T>(m) * ge_b));
         return;
     }
 
     const int seg = (n + W - 1) / W;
     const std::size_t sw = (std::size_t)seg * W;
-    for (auto* v : {&buf.rM, &buf.rX, &buf.rY, &buf.qM, &buf.qX, &buf.qY})
-        if (v->size() < sw) v->resize(sw);
+    // five rolling rows and Local's padding mask: one block (spread_rows, dp_buffer.hpp)
+    std::size_t rs; T* const rows = spread_rows<T>(buf.srows, sw, 6, rs);
     const T* pad = nullptr;
-    if constexpr (Local && !MOnly) {
-        if (buf.spad.size() < sw) buf.spad.resize(sw);
-        for (int l = 0; l < W; ++l)
-            for (int s = 0; s < seg; ++s)
-                buf.spad[(std::size_t)s * W + l] = (l * seg + s + 1 <= n) ? T(0) : NINF;
-        pad = buf.spad.data();
+    // (MOnly's M padding is clamped to exactly 0 for floating T — the padding profile is
+    // -inf — but an integer T pads the profile with 0 (nw_pad), so its padding M is a
+    // real value and needs the mask too.)
+    if constexpr (Local && (!MOnly || nw_is_int<T>)) pad = striped_pad_into(rows + 5 * rs, n, seg, W);
+    auto padded = [&](const vd& v, int s) {
+        vd p; p.copy_from(pad + (std::size_t)s * W, stdx::element_aligned);
+        return v + p;
+    };
+
+    striped_profile_build<T, Tr>(buf.sprof, job.blk, nalpha, b, n, seg, W, tr);
+
+    T* pD = rows + 3 * rs; T* pX = rows + 4 * rs;                          // row i-1
+    T* cD = rows;          T* cX = rows + rs;     T* cY = rows + 2 * rs;   // row i
+
+    // row 0: D = max(M, X, Y) of the three-state row 0, X = -inf; padding -inf
+    for (std::size_t k = 0; k < sw; ++k) { pD[k] = NINF; pX[k] = NINF; }
+    for (int l = 0; l < W; ++l)
+        for (int s = 0; s < seg; ++s) {
+            const int j = l * seg + s + 1;
+            if (j <= n) {
+                const std::size_t k = (std::size_t)s * W + l;
+                if constexpr (Local) pD[k] = 0;
+                else                 pD[k] = -(go_a + j * ge_a);
+            }
+        }
+
+    vd vgo_a(go_a), vge_a(ge_a), vgo_b(go_b), vge_b(ge_b);
+    const vd vzero(static_cast<T>(0)), vninf(NINF);
+    vd vbest = vzero;
+    T bD = 0;                               // D of column 0, previous row (M(0,0) = 0)
+
+    auto any_gt = [](const vd& x, const vd& y) -> bool {
+#if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
+        if constexpr (sizeof(T) == 8) return avx512d_gt(x, y) != 0;
+        else                                     return stdx::any_of(x > y);
+#else
+        return stdx::any_of(x > y);
+#endif
+    };
+
+    for (int i = 1; i <= m; ++i) {
+        if constexpr (Tr) {
+            go_a = tr.go_a[i]; ge_a = tr.ge_a[i]; go_b = tr.go_b[i]; ge_b = tr.ge_b[i];
+            vgo_a = vd(go_a); vge_a = vd(ge_a); vgo_b = vd(go_b); vge_b = vd(ge_b);
+        }
+        const T nbM = Local ? T(0) : NINF;
+        T nbX;
+        if constexpr (Tr) nbX = Local ? NINF : tr.bx0[i];
+        else              nbX = Local ? NINF : -(go_b + i * ge_b);
+        const T nbD = std::max(nbM, nbX);   // column 0's VY is -inf
+        const T nbOpen = (nbD - go_a) - ge_a;
+        const T* sub = striped_row_profile<T, Tr>(buf.sprof.data(), job.blk, nalpha, a, b, n, seg, W, i, tr);
+
+        vd Oin([&](int q) { return q == 0 ? nbOpen : NINF; });
+        vd Yin = vninf;
+        // integer carry: running prefix max, the previous segment's opens, the ramp
+        [[maybe_unused]] vd fP = vninf, fOprev = vninf, fR, fBase;
+        if constexpr (nw_is_int<T> && W >= 4) {
+            fBase = vd([&](int l) { return static_cast<T>(static_cast<T>(l * seg) * ge_a); });
+            fR = fBase;
+        }
+        for (int s = 0; s < seg; ++s) {
+            vd dD;
+            if (s == 0) {
+                vd lD; lD.copy_from(pD + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                dD = lane_shift_in(lD, bD);
+            } else {
+                dD.copy_from(pD + (std::size_t)(s - 1) * W, stdx::element_aligned);
+            }
+            vd sb; sb.copy_from(sub + (std::size_t)s * W, stdx::element_aligned);
+            vd vmv = dD + sb;
+            if constexpr (Local) vmv = stdx::max(vmv, vzero);
+            vd uD, uX;
+            uD.copy_from(pD + (std::size_t)s * W, stdx::element_aligned);
+            uX.copy_from(pX + (std::size_t)s * W, stdx::element_aligned);
+            const vd vxv = stdx::max((uD - vgo_b) - vge_b, uX - vge_b);
+            const vd mx = stdx::max(vmv, vxv);
+            vxv.copy_to(cX + (std::size_t)s * W, stdx::element_aligned);
+            if constexpr (nw_is_int<T> && W >= 4) {
+                // D without Y for now (the carry raises it below).  Q(s) = open(s-1) +
+                // ramp(s) into the running prefix max (s >= 1; segment 0's Q needs the
+                // LAST segment's open, shifted a lane, and is folded in after the row)
+                mx.copy_to(cD + (std::size_t)s * W, stdx::element_aligned);
+                if (s > 0) fP = stdx::max(fP, fOprev + fR);
+                nv_store(cY + (std::size_t)s * W, fP);
+                fOprev = (mx - vgo_a) - vge_a;
+                fR += vge_a;
+                if constexpr (Local) {
+                    if constexpr (MOnly) vbest = stdx::max(vbest, padded(vmv, s));
+                    else                 vbest = stdx::max(vbest, padded(mx, s));
+                }
+            } else {
+            const vd vyv = stdx::max(Oin, Yin - vge_a);
+            const vd dn = stdx::max(mx, vyv);
+            vyv.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
+            dn.copy_to(cD + (std::size_t)s * W, stdx::element_aligned);
+            if constexpr (Local) {
+                if constexpr (MOnly) vbest = stdx::max(vbest, vmv);
+                else                 vbest = stdx::max(vbest, padded(dn, s));
+            }
+            Oin = (mx - vgo_a) - vge_a;
+            Yin = vyv;
+            }
+        }
+        const vd Olast = Oin;
+
+        if constexpr (nw_is_int<T> && W >= 4) {
+            // segment 0's term, then the lane carry-in, then ONE pass: Y = max(P', cin') - ramp
+            // folded straight into D.  max is exact and associative, so Y is int_pmax_carry's.
+            const vd Q0 = lane_shift_in(fOprev, nbOpen) + fBase;
+            // int16: the in-register lane scan (int_lane_carry_in), fused score-only time / the
+            // scalar scan 0.83-0.94 v3, 0.78-0.80 AVX-512, 0.83-0.87 NEON.  Wider types keep the
+            // scalar scan: int32 0.91-1.03 across the three (v3 Global L300 1.027).
+            vd vcin;
+            if constexpr (sizeof(T) == 2) {
+                vcin = int_lane_carry_in<vd, (int)vd::size()>(stdx::max(Q0, fP), static_cast<T>(NINF - ge_a));
+            } else {
+                alignas(64) T tot[64], cin[64];
+                stdx::max(Q0, fP).copy_to(tot, stdx::element_aligned);
+                T run = static_cast<T>(NINF - ge_a);
+                for (int l = 0; l < W; ++l) { cin[l] = run; run = std::max(run, tot[l]); }
+                vcin.copy_from(cin, stdx::element_aligned);
+            }
+            vcin = stdx::max(vcin, Q0);
+            vd rq = fBase;
+            for (int s = 0; s < seg; ++s) {
+                const vd y = stdx::max(nv_load<vd>(cY + (std::size_t)s * W), vcin) - rq;
+                vd d; d.copy_from(cD + (std::size_t)s * W, stdx::element_aligned);
+                d = stdx::max(d, y);
+                d.copy_to(cD + (std::size_t)s * W, stdx::element_aligned);
+                if constexpr (Local && !MOnly) vbest = stdx::max(vbest, padded(y, s));
+                rq += vge_a;
+            }
+        } else
+        for (int r = 0; r < W; ++r) {
+            vd last; last.copy_from(cY + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+            vd F = lane_shift_in(last, NINF);
+            F = F - vge_a;
+            if (r == 0) {
+                vd Os = lane_shift_in(Olast, NINF);
+                F = stdx::max(Os, F);
+            }
+            bool changed = false;
+            for (int s = 0; s < seg; ++s) {
+                vd v; v.copy_from(cY + (std::size_t)s * W, stdx::element_aligned);
+                if (!any_gt(F, v)) break;
+                v = stdx::max(v, F);
+                v.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
+                vd d; d.copy_from(cD + (std::size_t)s * W, stdx::element_aligned);
+                d = stdx::max(d, v);
+                d.copy_to(cD + (std::size_t)s * W, stdx::element_aligned);
+                if constexpr (Local && !MOnly) vbest = stdx::max(vbest, padded(v, s));
+                F = v - vge_a;
+                changed = true;
+            }
+            if (!changed) break;
+        }
+
+        std::swap(pD, cD); std::swap(pX, cX);
+        bD = nbD;
     }
+
+    if constexpr (Local) {
+        T best = 0;
+        for (int q = 0; q < W; ++q) best = std::max(best, static_cast<T>(vbest[q]));
+        job.score = best;
+    } else {
+        const std::size_t k = (std::size_t)((n - 1) % seg) * W + (std::size_t)((n - 1) / seg);
+        job.score = pD[k];
+    }
+}
+
+// ── The D/X form at floating T, with the gap carry shortened ──────────────────────
+// score_affine_striped_pos's recurrence (above) for float / double, three changes, all
+// bit-identical: the rows keep A = max(M, X), X and Y (D = max(A, Y) formed where a row
+// is read, so lazy-F raises Y alone); the main pass steps Y's carry two segments at a time;
+// lazy-F carries F - ge instead of max(c, F) - ge.  Notes at each site; measurements in
+// AGENTS.md ("The gap carry, shortened").  Floating T only: -inf - ge stays -inf, where an
+// integer sentinel stepped by - ge per segment could wrap (the integer types take the exact
+// prefix-max carry in score_affine_striped_pos instead).
+template <class T, bool Local, bool MOnly, bool Tr = false>
+static void score_affine_striped_pos_fp(ScoreJob<T>& job) {
+    using vd = stdx::native_simd<T>;
+    const int W = (int)vd::size();
+    const T NINF = nw_ninf<T>;
+
+    const int m = job.m, n = job.n, nalpha = job.nalpha;
+    T go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;
+    const TrackJob<T>& tr = job.tr;
+    if constexpr (Tr) { go_a = tr.go_a[0]; ge_a = tr.ge_a[0]; }
+    const unsigned char* a = job.a;
+    const unsigned char* b = job.b;
+    DpBufferT<T>& buf = *job.buf;
+
+    if (n == 0) {
+        if constexpr (Local) job.score = T(0);
+        else if constexpr (Tr) job.score = (m == 0) ? T(0) : tr.bx0[m];
+        else job.score = (m == 0) ? T(0) : static_cast<T>(-(go_b + static_cast<T>(m) * ge_b));
+        return;
+    }
+
+    const int seg = (n + W - 1) / W;
+    const std::size_t sw = (std::size_t)seg * W;
+    // six rolling rows and Local's padding mask: one block (spread_rows, dp_buffer.hpp)
+    std::size_t rs; T* const rows = spread_rows<T>(buf.srows, sw, 7, rs);
+    const T* pad = nullptr;
+    if constexpr (Local && !MOnly) pad = striped_pad_into(rows + 6 * rs, n, seg, W);
     auto padded = [&](const vd& v, int s) {
         vd p; p.copy_from(pad + (std::size_t)s * W, stdx::element_aligned);
         return v + p;
@@ -307,8 +534,8 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
     // The rows keep A = max(M, X), X and Y; D = max(A, Y) is formed where a row is read
     // (max is exact, so that is D bit for bit).  Lazy-F then raises Y alone: one load and
     // one store per visit instead of two each.
-    T* pA = buf.qM.data(); T* pX = buf.qX.data(); T* pY = buf.qY.data();   // row i-1
-    T* cA = buf.rM.data(); T* cX = buf.rX.data(); T* cY = buf.rY.data();   // row i
+    T* pA = rows + 3 * rs; T* pX = rows + 4 * rs; T* pY = rows + 5 * rs;   // row i-1
+    T* cA = rows;          T* cX = rows + rs;     T* cY = rows + 2 * rs;   // row i
 
     // row 0 (three-state: Global M = X = -inf, Y = -(go + j*ge); Local M = 0); padding -inf
     for (std::size_t k = 0; k < sw; ++k) { pA[k] = NINF; pX[k] = NINF; pY[k] = NINF; }
@@ -329,7 +556,7 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
 
     auto any_gt = [](const vd& x, const vd& y) -> bool {
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
-        if constexpr (std::is_same_v<T, double>) return avx512d_gt(x, y) != 0;
+        if constexpr (sizeof(T) == 8) return avx512d_gt(x, y) != 0;
         else                                     return stdx::any_of(x > y);
 #else
         return stdx::any_of(x > y);
@@ -432,10 +659,10 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
     if constexpr (Local) {
         T best = 0;
         for (int q = 0; q < W; ++q) best = std::max(best, static_cast<T>(vbest[q]));
-        job.score = static_cast<double>(best);
+        job.score = best;
     } else {
         const std::size_t k = (std::size_t)((n - 1) % seg) * W + (std::size_t)((n - 1) / seg);
-        job.score = static_cast<double>(std::max(pA[k], pY[k]));
+        job.score = std::max(pA[k], pY[k]);
     }
 }
 
@@ -464,11 +691,20 @@ static void score_entry_impl(ScoreJob<T>& job) {
         pos_ext  = job.ge_a >= T(0) && job.ge_b >= T(0);
     }
     if (job.variant == 0 && pos_open) {
-        if (job.local) {
-            if (pos_ext) score_affine_striped_pos<T, true, true, Tr>(job);
-            else         score_affine_striped_pos<T, true, false, Tr>(job);
+        if constexpr (std::is_floating_point_v<T>) {
+            if (job.local) {
+                if (pos_ext) score_affine_striped_pos_fp<T, true, true, Tr>(job);
+                else         score_affine_striped_pos_fp<T, true, false, Tr>(job);
+            } else {
+                score_affine_striped_pos_fp<T, false, false, Tr>(job);
+            }
         } else {
-            score_affine_striped_pos<T, false, false, Tr>(job);
+            if (job.local) {
+                if (pos_ext) score_affine_striped_pos<T, true, true, Tr>(job);
+                else         score_affine_striped_pos<T, true, false, Tr>(job);
+            } else {
+                score_affine_striped_pos<T, false, false, Tr>(job);
+            }
         }
         return;
     }

@@ -101,6 +101,9 @@ Build dependencies: `scikit-build-core`, `nanobind>=3.0` (the bindings call its 
   repeated call at len 50 (stores the path eagerly). Batches are faster; only loops over
   standalone pairs pay it.
 - Default thread count for short pairs: see `TODO.md`.
+- **Per-ISA fill gates**: every threshold was measured on nighthaven (AVX2), with spot as a check,
+  and does not carry over (Piledriver float32 score-only L100 loses 1.5x to its gate). The sweep
+  is in `TODO.md`; the knob is `nwgrad._tuning` ("Every fill gate is runtime-overridable" below).
 - **Soft path: what is left** (see "The soft path" below). Done since the last list:
   the guide without a Viterbi (`soft_guide="posterior"`), the inter-pair soft pass for
   alphabets > 8 and for mixed B lengths, float32 batches sharing the soft pass.
@@ -690,7 +693,8 @@ skynet (Piledriver, W=2, 1 thread, 200k pairs): rowwise 12.4 µs/pair, interpair
   `trow`, scattered into the counts per lane after the row. Measured (AVX2, random
   protein pairs, µs/pair interpair/striped): 10–30 aa 0.28–0.37×, 30–60 aa 0.21–0.44×,
   60–120 aa 0.21–0.50× (affine, 1 thread); soft 0.40–0.67× up to 60 aa. Linear Global over 8 letters
-  keeps its own Viterbi fill (1.10–1.22× at 12 threads).
+  kept its own Viterbi fill (1.10–1.22× at 12 threads) until 2026-10-23 — re-measured against
+  the leveled linear kernel it now joins (see "Versus parasail").
 - **The size cap** (`inter_pair_fits`, `kInterGroupBytes` 1.25 MiB / `kInterSoftBytes`
   512 KiB): without it protein pairs of 150–600 aa ran 1.6–11.5× SLOWER at 12 threads
   (W pairs' tables past L2 while the per-pair fills keep 3 B/cell pointers). Affine won
@@ -724,6 +728,29 @@ skynet (Piledriver, W=2, 1 thread, 200k pairs): rowwise 12.4 µs/pair, interpair
   Linux and CI's ARM64 (Linux) job never saw it; the hard kernel's `thread_local`
   buffers (`InterCommon`) work on macOS. Test on spot before trusting new
   `thread_local` state in a kernel.
+- **Every fill gate is runtime-overridable** (`nwgrad._tuning`, `543fb1f`, 2026-10-25), for
+  the per-ISA gate sweep in `TODO.md`. `simd_levels.hpp` holds one process-wide table
+  (`Gate`, `kGateNames`, `gate_value(g, default)`): -1 = the compiled default,
+  `kGateOff` = the cap never rejects. It covers the nine gates `inter_pair_fits` (two
+  byte caps), `inter_score_ok`, the five linear gather caps and
+  `Aligner::linear_striped_min_n` (off = 0, striped at any length). Things to know:
+  (1) `inter_linear_gather_cap` is no longer `constexpr` and returns SIZE_MAX for no cap.
+  Under `if constexpr (... > 0)` the x86 float caps (default 0) compiled the check away, so
+  an override would have been silently ignored. (2) Every override bumps `gate_epoch()`,
+  and `InterPlan` rebuilds when the epoch moves (it used to rebuild only on an ISA or
+  `hb_cutoff` change). (3) Only baseline TUs call the gate code (the level TUs include
+  the header and nothing else from it), so the static table never gets a level's
+  `-march`. `SeqPairBatch._inter_plan()` returns [shared, own, groups] from the plan; it
+  does not see `inter_score_ok`, which acts per group inside the call. Verified: the
+  Python suite on skynet (sse4, gcc), 4456 passed, plus `tests/Python/test_tuning.py`.
+  That test checks every gate off and every gate forcing the own fill, all five types,
+  both modes and gap models, score-only and hard + path, bit-identical to the default.
+  NOT yet run: ctest (`test_linear_striped.cpp` calls `linear_striped_min_n`) and any
+  other level (avx2, avx512, neon: AArch64 is where the float gather caps are non-zero).
+  First reading (skynet, rough, the test suite running alongside): score-only L100
+  BLOSUM62, 1 thread, `inter_score_gather_cells=None`, default / off: float32 28.0 /
+  18.2 ms (the gate costs 1.54x; wloczykij 1.5x), int16 13.4 / 18.5 ms (the gate is right).
+  So on Piledriver the score gate's crossover depends on the type, not only the level.
 
 ### Score only: `compute_score` and the inter-pair score kernel (2026-10-08)
 
@@ -897,6 +924,843 @@ same carry and are not changed yet.
   0.05 GB vs 0.79 GB pointers, 6.0 GB H).  Opt-in: `auto` never picks it for linear. Tests: optimal score (exact on the
   integral fixture), real alignment, `g·params == score`; a mutation forcing the middle
   split fails 10 of them.
+
+### Integer scalar types: int16 / int32 / int64 (branch `integer`, 2026-10-22)
+
+`Aligner<GM, AM, AB, T>` takes `T` = `int16_t`, `int32_t` or `int64_t` beside `double` and
+`float`, through every hard-path variant: linear and affine, Global and Local, Full and
+GuideBanded, Pointers / Scores / Hirschberg / `hirschberg_pmax`, score-only, the inter-pair
+fills and scores, tracks, streaming `align()`. Every leveled kernel is instantiated per type
+(the dispatch table is one `TypedKernels<T>` per type, `LevelKernels::of<T>()`, registered by
+`register_level_typed<T>` with bare pointers in baseline code, as before). Python:
+`SeqPairInt16/32/64`, `SeqPairBatchInt16/32/64`, `*_int16/_int32/_int64` functions (the `Double`
+convention). The decisions (2026-10-22): all three widths; every variant; the soft path
+THROWS on an integer type (it is a computation in exp/log space; the integer classes bind no
+soft function and `grad_mode="soft"` raises `ValueError`); integral parameters ONLY (a
+non-integral one raises `ValueError` — the user quantizes; a silent 0.5 -> 0 was the
+alternative); gradients stay double `AlignParams` of counts; `auto` resolves affine Full to
+`hirschberg_pmax` at every integer type, both modes.
+
+**The one contract: bit-identity with double.** Double arithmetic on integral parameters is
+exact below 2^53, so the double aligner is not a reference within a tolerance but the ground
+truth: every integer result — score, alignment, guide, hard gradient, weighted sum, banded
+step, streaming result, score-only — equals double's bit for bit, ties included, on every
+backend. Integer arithmetic is exact and associative, so everything the floating kernels
+guard (left association, no FMA, the pmax ramp's rounding) is moot: `hirschberg_pmax` is
+bit-identical to the exact sweep for an integer `T`, which is why it is their default and why
+its liveness test (pmax must differ from exact) is a floating-point statement only.
+`tests/cpp/test_integer.cpp` (`[integer][simd]`, so once per ISA level): 1500 random
+configurations per type against the double oracle; `tests/Python/test_integer.py`: the
+batch surface (every fill, traceback, tracks and both stores, banded, streaming, score-only,
+every ISA level), the guards, the absent soft path.
+
+**The sentinel and the overflow bound** (`scalar_traits.hpp`). An integer `T` has no `-inf`:
+the unreachable value is `nw_ninf<T> = lowest()/2`, and `set_problem()` refuses (an
+`OverflowError` in Python) any problem whose a-priori bound `(m + n + 2 + 64) * step_max`
+exceeds `nw_int_cap<T> = |lowest|/4 - 1`, `step_max` being the largest magnitude one move can
+add (max |s| over the matrix stack, |go| + |ge| per side). A QUARTER of the range, not a
+half: every value the DP can form is then within the cap of either zero (a reachable score:
+at most m+n+2 moves) or the sentinel (an unreachable value drifts by at most as many
+penalties), so nothing wraps, an unreachable value never outruns a reachable one, and two
+in-range values can be ADDED (the pmax ramp `g[k] + k*ge_a`, a Hirschberg join's forward +
+reverse) without wrapping. The 64 is the striped kernels' padding (`nw_int_pad_cols`).
+Reach: int16 (cap 8191) takes BLOSUM62 (step 11) pairs up to ~370 aa each and any miRNA /
+DNA fixture; int32 (2^30 - 1) everything realistic; int64 is headroom for huge parameters.
+A batch prepares each params once (`nw_int_prepare`: checked casts of the whole stack and
+every set's gaps, step_max) and hands them to every pair's `set_problem()`, so a bad
+parameter raises at construction / `set_params()` and no pair repeats the checks; the
+streaming `align()` prepares per worker (`cast_block_`) and otherwise per pair.
+
+**Padding columns score 0, not the sentinel** (`nw_pad<T>`). Found by the first oracle run: the
+Local Hirschberg reverse scan returned a start column left of 0 at `int16`. The striped
+kernels pad the query profile's spare columns with `-inf`; for an integer `T` a padding cell
+then computed as sentinel + sentinel and the next row's penalty subtraction wrapped to a
+huge positive value, which the scan's unmasked argmax picked. So an integer `T` pads with 0 —
+the padding is an imaginary tail of B that scores 0, every padding value an ordinary in-range
+DP value — and every argmax that can read a padding cell masks it additively (the Local row
+best already did; the score kernels' M-only form and the endpoint scan now do for an integer
+`T`; a real value plus the sentinel cannot wrap and lands below every real one). Padding
+never feeds a real cell: it lies right of every real column and the DP flows right and down.
+
+**Codegen, and the gcc / clang round (2026-10-22, `tools/bench_int_cc.sh`: both compilers
+built into throwaway venvs under release-wheel codegen, every arm timed in one process per
+build).** gcc emits `vpmaxsw` / `vpmaxsd` for the integer maxima (`vpmaxsq` at AVX-512; at
+AVX2 int64 is `vpcmpgtq` + `vpblendvb`), but assembled the segment-boundary lane shift of
+integer lanes element by element (`vpinsrw` / `vpinsrd` sequences), the trap documented for
+double; `lane_shift_in` has intrinsic forms for the three integer widths at AVX2
+(`vpermd` / `vpermq` + `vpblendd`, `vperm2i128` + `vpalignr` + `vpinsrw` for int16) and
+AVX-512 (`valignd` / `valignq`, `vpermw` + a masked blend for int16). The inter-pair kernels
+use the GCC vector types per width (`IVT<T>`: int16 has 4x double's lanes). The first
+gcc-vs-clang run on nighthaven (every float32 and double arm within 3 %, so the harness is
+sound) found three stragglers, each read off the disassembly:
+- **gcc 20-25 % slower than clang on every int16 / int32 protein arm** (the per-pair striped
+  Pointers and score kernels, avx2 and sse4): there is no packed integer `>=`, and gcc built
+  each `stdx::where(a >= b, ...)` from `vpminsw` + `vpcmpeqw` where clang swaps the compare
+  and the blend operands; the Pointers kernel has eight per vector of cells, ~20 % of its
+  instructions. `pick_code` / `sel_ge` (kernels_pointers_impl.inl) now spell the three-way
+  code and the open/extend select with STRICT compares and inverted defaults for an integer
+  T (`(y > x ? 2 : 1)` is `(x >= y ? 1 : 2)`; "0 unless x > m or y > m" is "0 when m >= x
+  and m >= y"); the Local stop `vmv <= 0` is `vmv == 0` on the clamped value (one
+  `vpcmpeqw`). Floating T keeps its `vcmpleps` form, codegen untouched.
+- **clang 13-33 % slower than gcc on the int64 Pointers kernel**: it lowered the direction-
+  byte narrowing `static_simd_cast<fixed_size_simd<unsigned char, W>>` of 64-bit lanes to
+  one byte store per lane (`movb` x4 per vector); `store_codes` has intrinsic forms per
+  integer width at SSE2 / AVX2 (`vpackus*` + a permute) and AVX-512 (`vpmovqb` / `vpmovdb` /
+  `vpmovwb`).
+- gcc kept the per-row Local argmax (`striped_row_best`) out of line and reduced its 16 int16
+  lanes with scalar extracts (4.7 % of the Pointers kernel's samples): for an integer T it is
+  `stdx::hmax` + `find_first_set(lmax == rmax)` (floating T keeps the scalar loop, whose
+  `std::max` keeps the first of two equal values and so the sign of a zero).
+Then the structural one: **an integer T's VY carry is an exact prefix max** (`int_pmax_carry`,
+kernels_impl.inl, in the striped Pointers, Scores, both score-only forms and the Hirschberg
+base case; the sweeps and scans already had `hirschberg_pmax`). The serial chain + lazy-F
+fixpoint costs up to W data-dependent rounds per row, and W is 16-32 for int16; the prefix
+max is fixed work (a lane-local prefix max of `open + k*ge_a`, W scalar maxes across the
+lanes, one parallel pass) and in integers it is bit-identical to the chain — the Y code is
+the open's exactly when `open[c-1] + (c-1)*ge_a >= max(seed, Q[0..c-2])`, which is the
+chain's `O >= ext`. Verified: the oracle sweep at every level, the Python suite, ASan+UBSan.
+Two gcc traps inside it, both read off `perf annotate` (skynet, sse4): (1) gcc lowered
+`copy_to` of an INTEGER simd — `vector_aligned` or not — to a memcpy through the value's
+address, kept the loop-carried P on the stack and folded it into `pmaxsd` from memory
+every step (40 % of the carry; the sse4 int32 score kernel ran 1.6x its lazy-F time), so
+the carry's row loads and stores go through the GCC vector type of the lane width
+(`nv_load` / `nv_store`, types spelled per width: gcc drops a dependent `vector_size` in an
+alias template to the scalar); (2) gcc outlined the carry as a constant-propagated clone in
+every integer score kernel, a call and a frame per row that cost more than the kernel
+body around it — now `always_inline` (int16 score at sse4 +22 %, int32 -7 %). **From 4
+lanes only**: at W = 2 (int64 at sse4 / sse2 / neon) the chain + lazy-F is cheaper (the
+carry made the sse4 int64 score arm 1.45x slower), so the gate is `nw_is_int<T> && W >= 4`
+at every site.
+clang + AVX-512 + libstdc++: the `long` / `long long` mask assertion now also fires for
+int64 lanes (`operator>` / `==` on `simd<long>`), so every 64-bit-lane mask site goes through
+the `avx512d_*` helpers, which have int64 overloads (clang 22; clang 23 accepts the std::simd
+form). Also found by clang: the inter-pair lane initializer narrowed int to int16 (gcc waved
+it through); `ivlanes_` casts each lane.
+
+**Measured** (`tools/bench_int.py`, one process, every arm a runtime choice; control arm
+float32-vs-float32 0.97-1.06 unless noted; time / float32's time, below 1 = faster than the
+float32 default; DNA = 20k related 22 x 50 pairs, protein = 2k 30 %-mutated 200-aa pairs,
+BLOSUM62 11/1, affine Local; hard = `score_and_grad()`, score = `grad_mode="none"`,
+stream = `align()`):
+
+| host | level | thr | int16 hard / score / stream | int32 | int64 | double |
+|---|---|---|---|---|---|---|
+| **nighthaven (i5-12500)** | **avx2** | 1 | DNA 0.61 / 0.57 / 0.68; protein 0.63 / 0.65 / 0.65 | 0.96 / 0.96 / 1.03; 0.74 / 0.57 / 0.75 | 2.57 / 3.06 / 2.54; 1.81 / 1.44 / 1.82 | 1.73 / 1.87 / 1.69; 1.38 / 1.07 / 1.38 |
+| nighthaven | avx2 | 12 | DNA 0.61 / 0.60 / 0.69; protein 0.73 / 0.95 / 0.76 | 0.96 / 1.00 / 1.02; 0.95 / 0.93 / 0.96 | 2.41 / 2.77 / 2.34; 2.03 / 1.98 / 2.04 | 1.72 / 1.81 / 1.65; 1.46 / 1.12 / 1.47 |
+| nighthaven | sse4 | 1 | DNA 0.59 / 0.57 / 0.66; protein 0.50 / 0.53 / 0.51 | 0.96 / 1.02 / 1.01; 0.72 / 0.58 / 0.73 | 2.20 / 2.48 / 2.21; 1.66 / 1.16 / 1.67 | 1.84 / 2.12 / 1.85; 1.75 / 1.21 / 1.75 |
+| nighthaven | sse4 | 12 | DNA 0.58 / 0.57 / 0.65; protein 0.60 / 0.77 / 0.63 | 0.95 / 0.99 / 0.99; 0.93 / 0.97 / 0.93 | 2.12 / 2.28 / 2.08; 1.91 / 1.84 / 1.92 | 1.84 / 1.96 / 1.77; 1.78 / 1.30 / 1.77 |
+| skynet (Piledriver) | sse4 | 1 | DNA 0.56 / 0.53 / 0.61; protein 0.59 / 0.83 / 0.61 | 0.85 / 0.85 / 0.88; 0.83 / 0.88 / 0.86 | 1.85 / 1.95 / 1.83; 1.74 / 1.59 / 1.72 | 1.83 / 2.00 / 1.76; 1.80 / 1.37 / 1.73 |
+| skynet | sse2 | 1 | DNA 0.54 / 0.54 / 0.60; protein 0.63 / 0.79 / 0.65 | 1.25 / 1.19 / 1.29; 1.10 / 1.42 / 1.12 | **5.5 / 5.5 / 5.4**; 5.4 / 4.7 / 5.4 | 1.98 / 2.12 / 1.96; 1.87 / 1.31 / 1.89 |
+| spot (M1, Fedora) | neon | 1 | DNA 0.47 / 0.42 / 0.50; protein 0.54 / 0.85 / 0.54 | 0.77 / 0.78 / 0.79; 0.81 / 0.85 / 0.82 | 1.74 / 1.74 / 1.75; 1.51 / 1.44 / 1.51 | 1.87 / 1.88 / 1.84; 1.38 / 1.21 / 1.38 |
+| spot | neon | 4 | DNA 0.48 / 0.43 / 0.53; protein 0.54 / 0.85 / 0.55 | 0.81 / 0.80 / 0.84; 0.81 / 0.86 / 0.82 | 1.82 / 1.85 / 1.79; 1.52 / 1.44 / 1.52 | 1.86 / 1.86 / 1.79; 1.39 / 1.22 / 1.39 |
+
+**After the gcc / clang round** (the final state of the branch, nighthaven, `bench_int_cc.sh`,
+time / float32's time of the SAME build, gcc | clang; every float32 and double arm within 2 %
+of the first run, every integer arm at or below its first-run time except sse4 int64 hard at
+1.03):
+
+| arm (1 thread) | int16 | int32 | int64 |
+|---|---|---|---|
+| protein avx2 hard | **0.33** \| 0.29 (was 0.63) | 0.53 \| 0.43 (was 0.74) | 1.54 \| 1.58 (was 1.81) |
+| protein avx2 score | **0.27** \| 0.27 (was 0.65) | 0.38 \| 0.37 (was 0.57) | 1.34 \| 1.19 (was 1.44) |
+| protein sse4 hard | 0.36 \| 0.29 (was 0.50) | 0.65 \| 0.56 (was 0.72) | 1.70 \| 1.59 (was 1.66) |
+| protein sse4 score | 0.33 \| 0.27 (was 0.53) | 0.54 \| 0.52 (was 0.58) | 1.12 \| 0.99 (was 1.16) |
+| DNA avx2 hard / score | 0.61 / 0.57 (unchanged) | 0.96 / 0.95 (unchanged) | 2.57 / 3.05 (unchanged) |
+
+| protein sse4 hard, **skynet** (Piledriver, clang 23) | 0.46 \| 0.42 (was 0.59) | 0.85 \| 0.81 (was 0.83) | 1.80 \| 1.63 (was 1.74) |
+| protein sse4 score, skynet | 0.62 \| 0.46 (was 0.83) | 1.06 \| 0.84 (was 0.88) | 1.51 \| 1.42 (was 1.59) |
+| protein neon hard, **spot** (M1, Fedora; gcc 16.2 \| clang 22.1) | 0.32 \| 0.29 (was 0.54) | 0.69 \| 0.54 (was 0.81) | 1.52 \| 1.49 (was 1.51) |
+| protein neon score, spot | 0.41 \| 0.27 (was 0.85) | 0.65 \| 0.45 (was 0.85) | 1.49 \| 1.08 (was 1.44) |
+| DNA neon hard / score, spot | 0.47 / 0.42 (unchanged) | 0.77 / 0.78 (unchanged) | 1.75 / 1.74 (unchanged) |
+| protein **avx512** hard, **solace** (Tiger Lake under WSL; gcc 15.2 \| clang 21.1; final state, after the always_inline and row-argmax fixes of 2026-10-23 — before them gcc read 0.38 / 0.46 / 1.15) | 0.33 \| 0.30 | 0.41 \| 0.37 | **0.75** \| **0.68** |
+| protein avx512 score, solace | 0.27 \| 0.24 | 0.28 \| 0.26 | 0.45 \| 0.40 |
+| protein avx2 hard / score, solace (same box) | 0.37 / 0.31 \| 0.29 / 0.25 | 0.53 / 0.42 \| 0.46 / 0.35 | 1.36 / 1.26 \| 1.38 / 0.97 |
+| DNA avx512 hard / score, solace (final state) | 0.66 / 0.64 | 0.84 / 0.84 | 1.27 / 1.42 |
+
+12 threads: the same picture a little compressed (protein avx2 int16 hard 0.42, int32 0.68).
+On Piledriver the protein score arms kept the largest gcc-vs-clang residue (int16 0.70,
+int32 0.74: clang's unrolled 128-bit loops), and int32 score-only there ties float32 — the
+3-pass carry's row traffic costs what the 1-cycle max saves on a core that cracks every op.
+**AVX-512 (solace, 2026-10-22, the first execution of the integer kernels there)**: green
+under gcc 15.2 and clang 21.1 (the integer cases at avx512, ctest 17/17, Python 4557
+passed; the int16 `vpermw` shift, the `vpmovqb/db/wb` narrowing, the int64 clang mask
+helpers and `int_pmax_carry<T, 16/32>` all exercised).  avx512 over avx2 on the same box,
+1 thread, gcc: float32 hard 0.91, int16 hard 0.93 / score 0.94, int32 0.78 / 0.76, int64
+0.77 / 0.41 — AVX-512 is where int64 finally has a packed max (`vpmaxsq`), and under clang
+its hard step beats float32 (0.70).  DNA (inter-pair, 16 lanes of int32, 32 of int16):
+0.65-0.88 of avx2.  gcc against clang at avx512: the score kernels tie (0.92-1.01) but the
+Pointers kernels straggle under gcc — int16 0.77, int32 0.79, int64 0.56. Half of that was
+gcc OUTLINING `pick_code` / `sel_ge` (and `store_codes`, `lane_shift_in`, `nv_load/store`)
+for 64-byte vectors — a call per vector of cells; `[[gnu::always_inline]]` on them (114d3a5;
+the disassembly audit then shows no per-cell call left in any leveled integer kernel at
+any level) re-measured on solace, clang/gcc time at avx512, 1 thread: int16 hard 0.77 →
+0.91, stream 0.73 → 0.88; int32 hard 0.79 → 0.86, stream 0.74 → 0.92; int64 hard 0.56 →
+0.60, stream 0.59 → 0.61 (score kernels unchanged, 0.86-0.95; float32 / double within 3 %).
+int64 was then the one left: clang's AVX-512 int64 Pointers fill ran in 42.7 µs a pair,
+within 30 % of float32's, gcc's in 71. **Found by perf on solace (2026-10-23): 45.9 % of
+gcc's Local int64 run was `striped_row_best<long>`**, the once-per-row Local argmax, as much
+as the whole fill (Global, which has no row argmax, was a diffuse 1.19×). In its loop the
+broadcast of the segment index, `vt(T(s))`, was lowered by gcc for 64-bit lanes at AVX-512 to
+EIGHT merge-masked `vpbroadcastq`, one per lane and each dependent on the last — an 8-deep
+chain per segment that the blend then waited on (int16 / int32 got one broadcast). The
+index is now a vector carried through the loop and incremented by a splat of one
+(`vs += one`). gcc Local int64 72.1 → 49.4 µs a pair (clang 42.8 at the same moment), the
+argmax 14.6 % of the run; Global unchanged (38.8 vs clang's 31.6). The 1.15–1.23× left is
+the striped loops' scheduling residue every integer type shows under gcc. The final
+campaign on solace (b52b6d8, `bench_int_cc.sh`, avx512, 1 and 8 threads): gcc at 0.87–0.95
+of clang on every integer protein arm, int64 included (hard 47.2 vs 41.5 µs a pair at 1
+thread, 8.9 vs 7.7 at 8); DNA (inter-pair) arms within ±5 % either way; float32 and
+double within 3 %.
+spot (NEON, W = 8 for int16, 4 for int32, 2 for int64) verified the final state green (ctest
+17/17, Python 4371 passed) and shows the same shape: the prefix-max carry took the protein
+int16 hard step from 0.54 to 0.32 of float32 and int32 from 0.81 to 0.69; int64 stays on the
+chain (the W >= 4 gate) and is unchanged; on the DNA inter-pair arms gcc beats clang there
+(clang/gcc 1.06-1.33), on the protein striped arms clang leads (0.80-0.94), as on x86.
+gcc against clang on the final state, protein: int16 0.88-0.96 at avx2 and 0.78-0.86 at
+sse4 (clang faster), int32 0.80-0.96 / 0.84-0.94, int64 0.86-1.03 — the remaining gap is
+clang's unrolling and scheduling of the striped loops, the same residue the float kernels
+show at W = 2 (AGENTS, "Toolchain"), not a specific instruction. The DNA (inter-pair)
+arms never changed: those kernels were not touched in this round.
+
+(nighthaven's 12-thread control arm sits at 0.91-0.96 in three cells: +-10 % noise there;
+skynet at 16 threads: the same ordering, control up to 1.46 in one cell — a VM; not
+tabulated.)  The reading: **int16 is the fast type**, 0.42-0.68 of float32 on every host,
+level and arm (the weakest cells are the protein score-only kernel with many lanes,
+0.77-0.95, already lazy-F-bound); **int32 ties float32 on short DNA pairs at AVX2 and
+wins on protein (0.57-0.75 at 1 thread), wins modestly at sse4 / neon (0.72-0.88) and loses
+at sse2** (1.1-1.4: `pmaxsd` is SSE4.1, so the max is a compare-and-blend triple);
+**int64 costs double's time or more** — AVX2 has no packed 64-bit max (`vpcmpgtq` +
+`vpblendvb`, 2.0-3.1x float32), sse4 / neon about double's, and sse2 is a pathology (5.4x:
+no 64-bit compare at all, gcc emulates it per lane; the scalar fallback is no better at
+1.45x float32's scalar fill).  The int64 type is headroom for enormous parameters, not a
+speed choice.  The scalar fallbacks of int32/int64 run 1.45x the float32 scalar fill
+(skynet) — gcc's codegen of the scalar integer max, not looked into.  AVX-512 (W=32 for
+int16, `vpmaxsq`) unmeasured and its integer kernels unexecuted: solace was off.
+
+**Versus parasail (2026-10-23, `tools/bench_parasail.py`).** parasail (Daily 2016) is the
+reference striped integer aligner: Farrar striped, Farrar/Rognes scan (a prefix-max gap
+carry, the closest relative of nwgrad's integer carry) and Wozniak diagonal kernels, in
+8/16/32/64-bit saturating integers, score-only or with a traceback. Apples to apples: the
+SAME integer matrix and gaps (parasail open = go + ge, extend = ge: a gap of k costs
+open + (k-1)·extend), the same algorithm (nw / sw), the same width (parasail `_16` vs
+`SeqPairBatchInt16`), score-only against `grad_mode="none"`, parasail's trace kernels PLUS
+the CIGAR walk against nwgrad's `keep_paths` (and nwgrad's hard gradient beside it, which
+costs 1 % over the path). Every parasail score must equal nwgrad's integer score on every
+pair, exactly, before anything is timed — which also made parasail an independent oracle
+of the integer kernels (it agreed on every pair, with ONE exception that is parasail's: its
+striped 16/32-bit kernels score BELOW the optimum when open == extend — 238 of 2000 L200
+protein pairs, 15–32 of 20k DNA pairs — while its scan, diag and 64-bit kernels agree with
+nwgrad on all of them; a lazy-F defect in that degenerate case, flagged and still timed).
+Each arm in its own process, interleaved repeats, a control arm (two float32 processes).
+
+**parasail's Python bindings are not parasail** — the first run measured them and was
+thrown away. A one-residue pair costs ~10 µs per call through them (ctypes, the result
+object, a profile build per call), which is most of a 22×50 DNA pair's time and a quarter
+of an L200 protein pair's, and their threads share the GIL, so a 12-thread run measured the
+lock: parasail came out 10–15× slower on L200 at 12 threads and 400–970× on DNA. The tool
+therefore drives parasail through `tools/bench_parasail_driver.c`, compiled per run against
+the wheel's own headers and `libparasail.so` (whose SONAME, `libparasail.so.8`, is not the
+shipped file name: the driver gets a symlink next to it), pthreads spawned per pass as
+nwgrad's batch spawns its workers; `--driver python` keeps the bindings, labelled. On skynet
+the driver brought parasail's 22×50 pair from 13–20 µs to 2–3 µs.
+
+Measured (nighthaven, AVX2, gcc, release-wheel codegen; parasail time / nwgrad time, so
+above 1 = nwgrad faster; 1 thread; L200 = 2000 30 %-mutated BLOSUM62 pairs with 11/1 gaps,
+L1000 = 200, DNA = 20k related 22×50 pairs; control 1.00):
+
+| arm | int16 | int32 | int64 |
+|---|---|---|---|
+| L200 Global affine, score: striped / scan | 3.12 / 1.38 | 1.76 / 1.18 | 16.5 / 9.0 |
+| L200 Local affine, score: striped / scan | 2.21 / 1.47 | 1.52 / 1.31 | 10.3 / 10.3 |
+| L200 Global affine, trace + CIGAR / path | 5.03 | 3.08 | 10.9 |
+| L200 Local affine, trace + CIGAR / path | 3.18 | 2.04 | 6.4 |
+| L200 Global linear, score: striped* / scan | 0.92 / 1.37 | 0.93 / 1.19 | 11.2 / 9.0 |
+| L200 Local linear, score: striped* / scan | 0.78 / 1.45 | 0.82 / 1.30 | 7.6 / 10.5 |
+| L200 Global / Local linear, trace + CIGAR / path | 1.36 / 2.30 | 1.80 / 2.14 | — |
+| L1000 Global affine, score: striped / scan | refused | 1.58 / 0.92 | 14.9 / 8.1 |
+| L1000 Local affine, score: striped / scan | refused | 1.12 / 1.04 | 9.7 / 9.9 |
+| DNA Global affine, score: striped / scan | 7.3 / 8.0 | 3.3 / 3.3 | 19.8 / 14.5 |
+| DNA Local linear, score: striped* / scan | 3.2 / 9.1 | 2.0 / 4.1 | 11.4 / 16.5 |
+
+(* parasail's striped linear arms are the sub-optimal ones. The linear rows are the rerun
+after the two fixes below: nwgrad linear under `auto`, the score-only gate in place — the
+Local linear int16 score arm went 14.65 → 9.31 µs, and the Global linear int16 path 53.0 →
+37.5 µs; before them the Local linear score row read 0.52 / 0.96 and the linear path rows
+0.95–2.3.) Absolute: L200 Global affine
+int16 score-only 8.7 µs a pair (4.5 Gcell/s) against parasail striped16 27.3 and scan16
+12.1; path 18.3 against trace 92.3. At 12 threads the same picture (nwgrad scales as
+parasail does). skynet (sse4 vs parasail's sse41) ran the same campaign, but its numbers
+are NOT recorded: during the run its host wloczykij carried two foreign 90 %-CPU processes
+and a CI runner, and the guest's single-thread throughput on one arm wandered 122 → 456 →
+320 Mcell/s between repeats (the tool's control arm, two processes at the SAME moment,
+cannot see a slowly varying host load). Rerun it on a quiet host. The readings: (1) on affine protein nwgrad's integer kernels beat
+parasail's at the same width, 1.2–1.5× its scan and 1.5–3.1× its striped, and 2–5× with a
+traceback; (2) parasail's 64-bit kernels are 7–20× slower than nwgrad's int64 — int64 is
+no speed choice in nwgrad either, but it is a usable one; (3) on 22×50 pairs nwgrad is 2–8×
+faster through the C driver too (the inter-pair kernels, and parasail's per-call profile
+build and result allocation — it has no batch API); (4) **at L1000 parasail's int16 wins**:
+nwgrad's a-priori bound refuses int16 there (`(1000 + 998 + 66) · 15 > 8191`) where parasail
+saturates and reports, and its scan16 (145 µs) is 1.8× faster than nwgrad's best, int32
+(261 µs) — the saturating-int16 item in `TODO.md`, now with a number; (5) **nwgrad's linear
+arms were its weak ones**, for two reasons found by `perf` on the Local linear int16
+score-only arm, which ran 1.5× slower than Local AFFINE's:
+
+- **The inter-pair score kernel's gate was a byte cap** (`inter_pair_fits`, 1.25 MiB of
+  tables at `sizeof(T)`), so 16 lanes of 2-byte int16 cells let a 200-residue Local linear
+  pair through (1.22 MiB) that the affine one (three tables) and Global linear (its own
+  `linear_fill_ok_` gate) did not, and on a 20-letter alphabet that kernel GATHERS one
+  scalar load per lane-cell where the striped per-pair score kernel loads 1/W of a profile
+  row per cell. Measured, inter / striped, score-only, BLOSUM62, 1 thread, L30 / 60 / 100 /
+  150 / 200: int16 0.25 / 0.46 / 0.91 / 1.28 / 1.57, int32 0.35 / 0.65 / 1.02 / 1.20 / 1.25,
+  float32 0.32 / 0.54 / 0.80 / 1.13 / 1.30, double 0.55 / 0.83 / 1.12 / 1.38 / 1.51 — a
+  crossover near L100 for every type (a pre-existing loss for float32 and double too, which
+  the cap admitted up to L200 and L290). FIXED: `inter_score_ok` (`kInterScoreGatherCells` =
+  8192 cells of the group, ~L90; alphabets ≤ 8 keep the blend tree and the byte cap) in
+  the batch's score-only pass and the streaming one; verified on nighthaven: default fill /
+  striped, score-only, L60 / 100 / 200: int16 0.46 / 0.99 / 1.00, float32 0.54 / 1.01 / 1.00
+  (inter-pair kept where it wins, the striped kernel where it did not). Hard fills are NOT
+  gated by it: there
+  the shared fill replaces the own LINEAR fill, which it beats at every length (next item).
+- **The linear fills were not leveled — FIXED (2026-10-23, `kernels_linear_impl.inl`).**
+  `viterbi_linear` (the H fill `auto` keeps while H ≤ 2 MiB) and `viterbi_linear_ptr` were
+  header functions compiled at baseline, so at AVX2 they ran SSE2 code while the affine
+  striped kernel ran the full width. Now a leveled striped linear kernel, per ISA level and
+  scalar type, in both forms (H table; direction bytes on two rolling rows), Global and
+  Local, tracked or not: the query profile and striped layout of the affine kernels, the
+  horizontal gap as the affine VY carry with a ZERO open (`Y[c] = max(U[c-1] - ge_a,
+  Y[c-1] - ge_a)`, U the row's diagonal-or-up maximum, Local clamped first: the clamp
+  commutes), so the integer prefix max (`int_pmax_carry`, from 4 lanes) and lazy-F
+  otherwise; codes 0 diagonal unless up STRICTLY larger, 2 left where Y strictly exceeds
+  U, 3 stop where Local ≤ 0 — the scalar fill's first-largest order. Bit-exact with the
+  scalar fills (`tests/cpp/test_linear_striped.cpp`, `[linear][simd]`: every level, all
+  five types, both modes and tracebacks, tracked rows, B spanning the gate; a liveness
+  count requires the kernel to have run exactly where the level has it and the gate admits
+  the pair). Measured, hard, 1 thread, µs a pair, own fill under `auto`, nighthaven AVX2,
+  before → after: Local L200 int16 67.6 → 12.8, int32 36.0 → 16.9, float32 118 → 31.3;
+  Global L200 int16 35.6 → 10.1, int32 27.5 → 13.3, float32 54.4 → 24.4 — now 1.7–2.1×
+  FASTER than the affine striped Pointers kernel (one table against three). Parasail
+  trace + CIGAR over nwgrad's linear path: L200 Global int16 1.36 → 4.05, int32 1.81 →
+  3.42; L1000 Global int32 0.56 → 2.30 (nwgrad's worst cell in the comparison).
+  Three gates, each measured (nighthaven AVX2 and spot NEON agreeing):
+  (a) **short rows run the scalar fill** (`Aligner::kLinearStripedMinN`): a row pays a fixed
+  cost (two passes, the carry's cross-lane step, the profile row) that few columns cannot
+  amortize — without the gate Global L30 regressed 1.7–2.1× (int16 0.96 → 1.74 µs). The
+  crossover is a B LENGTH, nearly ISA-independent (22 × 50 DNA cells fall on the protein
+  lines): Global n 48 int16, 64 int32, 80 float32, 96 double; Local 32, 40, 24, 24. After
+  the gate the worst striped-or-scalar choice is 1.01–1.07× the faster fill on both hosts.
+  (b) **int64 has no linear kernel below 8 lanes** (`linear_kernel_pays`, registered null):
+  AVX2 emulates the 64-bit max with `vpcmpgtq` + `vpblendvb` and NEON / SSE run 2 lanes,
+  against one `cmov` in the scalar fill — striped / scalar 1.3–2.6× at every length.
+  AVX-512 (`vpmaxsq`, 8 lanes) keeps it, and it pays there (measured below).
+  (c) **integer linear pairs over 15000 cells leave the inter-pair gather fill**
+  (`kInterLinearIntGatherCells`, `inter_eligible_` and streaming `align()`): the inter-pair
+  kernel's per-lane-cell gather on a 20-letter alphabet now costs more than the integer
+  kernel's whole cell — inter / own, Local protein, L100 0.85–0.99, L150 1.12–1.22, L200
+  1.14–1.33. Floating T keeps the shared fill: it still wins on AVX2 through L200
+  (0.63–0.84); on NEON it loses from L150 (1.08–1.18), recorded in `TODO.md`.
+  (An explicit `traceback="pointers"` on linear is the byte form: past the 2 MiB H limit
+  `auto` takes it too. The tool's nwgrad linear arms run `auto`, as a user does.)
+  **The NEON float residue of (c), FIXED**: on AArch64 builds (where NEON is the only
+  simd level) floating linear pairs over alphabets above 8 leave the inter-pair fill too,
+  past 15000 cells (float32) / 8000 (double) — `inter_linear_gather_cap<T>()`, 0 on x86.
+  spot: float32 Local L150 inter 33.5 → 29.0 µs (= own), L200 56.4 → 47.7; nighthaven
+  unchanged (float32 Local L200 still the faster inter-pair 26.1 vs own 31.8).
+- **Linear Hirschberg, leveled (2026-10-23, `kernels_linear_impl.inl::lhb_striped`).** One
+  kernel for the four O(m·n) loops of `viterbi_linear_hirschberg`: both sweeps, the base
+  case (direction codes, striped, walked back by the aligner) and the Local forward
+  clamped / reverse global-suffix endpoint scans. The aligner hands it the B codes and the
+  rows in sweep order, each row's extends and the row-0 / column-0 borders, computed in
+  scalar exactly as the scalar loops compute them (`LhbJob`), so the kernel has no border
+  or direction logic and its rows are the scalar rows bit for bit — the join's argmax,
+  hence the path, cannot move with the level; argmax order as the scalar scans (strict
+  `>`, rows in order, column 0 first, then left to right; the reverse scan in mirrored
+  coordinates, seeded with its row 0). The same gates as the fill (`kLinearStripedMinN`;
+  no int64 below 8 lanes). Tested (`test_linear_striped.cpp`, second case): scalar vs
+  every level under `hirschberg` and `hirschberg_pmax`, cutoffs 1–8, all five types, both
+  modes, tracked rows; liveness by a kernel-call count. Planted bugs: left codes on
+  equality (caught, 3 of 5 types), a row-offset in the reverse-scan extends (caught, every
+  type, tracked Local); column 0 winning ties in the reverse scan PASSES, an equivalent
+  mutant (column 0 is a vertical gap run, ≤ 0, and the scan's maximum is the local optimum
+  S > 0, so it can only tie a running best of 0 that a later cell overwrites). Measured,
+  kernel vs the scalar loops in one binary (`kernel=` only), hard, 1 thread, L1000–2000,
+  Global and Local: nighthaven AVX2 int32 3.2–4.0×, float32 3.2–3.8×, double 1.8–1.9×;
+  spot NEON 2.3–2.7×, 3.0–3.1×, 1.6–1.7×; int64 1.00 (scalar by the gate). Linear
+  Hirschberg now matches linear Pointers at L2000 Global (AVX2 int32 2.02 vs 2.08 ms) and
+  beats it at double (5.76 vs 6.10), in O(n) memory. C++ suite at NEON (spot): 38 cases
+  green.
+- **AVX-512 (solace under WSL, gcc 15.2, 2026-10-23), the linear work's first execution
+  there**: the C++ suite at avx512 green (42 cases, 82,504 assertions). Linear Hirschberg,
+  kernel vs the scalar loops, L1000–2000: int32 4.6–5.4×, float32 4.3–6.4×, double
+  2.8–3.3×, and **int64 2.1–2.5×** — its linear kernels exist only at this level
+  (`vpmaxsq`, 8 lanes) and pay here. The length gate is PER LEVEL
+  (`linear_striped_min_n(backend)`): with twice AVX2's lanes some crossovers move a step
+  later — at the shared thresholds striped / scalar read int16 Global n 48 1.13, Local 32
+  1.18, float32 Local 24 1.36, int64 Local 24 1.50 / 32 1.20 — so AVX-512 takes its own
+  (`kLinearStripedMinN512`: int16 Global 56, Local 40; float32 Local 30; int64 Local 44;
+  the rest shared), after which the worst cell of the sweep is 1.04 (noise). AVX2 and NEON
+  keep the shared values. Parasail at avx2 on the same box (its wheel has no AVX-512):
+  nwgrad's linear path 2.3–3.4× parasail's trace on int16 / int32, parasail's 64-bit
+  kernels 18–26× slower than nwgrad's int64.
+- **Global linear protein pairs join the inter-pair fill (2026-10-23).** `linear_fill_ok_`
+  had kept every Global linear pair over an alphabet above 8 on its own fill (hard and
+  score-only), on a 1.10–1.22× measured against the old baseline own fill. Re-measured
+  against the leveled linear kernel (nighthaven AVX2, protein L10–200, a probe build that
+  lifted the exclusion, both arms in one process): the shared fill wins L20–80 for every
+  type, hard 0.54–0.85 at 1 thread and 0.67–0.87 at 12, score-only 0.09–0.78. It lost in two
+  bands, both at 12 threads: integers L80–100 (1.04–1.20; 1 thread 0.82–1.01) and float32
+  L160–200 (1.02–1.11; 1 thread 0.80–0.87). So the exclusion is gone (only W < 4 remains)
+  and those bands are capped per pair (`kInterGlobalLinearIntCells` 6000 ≈ L75,
+  `kInterGlobalLinearF32Cells` 20000 ≈ L140, folded into `inter_linear_gather_cap<T,
+  Global>()` with the Local and AArch64 caps): a batch's default is one thread per core.
+  Shipped routing, default / own fill: hard L20–80 int16 0.57–0.76 (1 thread) / 0.68–0.86
+  (12), int32 0.68–0.84 / 0.73–0.81, float32 0.54–0.84 / 0.71–0.81, double 0.69–1.00 /
+  0.82–0.89; score-only 0.09–0.62; the capped bands now 0.98–1.00; worst cell L10 1.03–1.08
+  (tiny pairs, not gated). The integer cap also returns score-only integers at L80 to the own
+  kernel (0.78 at 1 thread given up to avoid 1.04 at 12). **AVX-512 (solace, 1 / 8
+  threads) confirms the caps**: uncapped, the integers lose where the cap cuts them off
+  (int32 L80–100 1.08–1.12 at 8 threads; both integer types L130 1.21–1.54), shipped those
+  cells read 0.95–1.01; float32 wins uncapped through L130 and ties from L160; double ties
+  past L130 without a cap. Shipped L20–80: hard 0.49–0.89, score-only 0.06–0.78 (larger
+  wins than AVX2 at 1 thread). Highest shipped cells 1.04–1.07, at lengths where both arms
+  run the same own kernel: solace's noise floor under WSL. **NEON (spot, M1, 1 / 4 threads,
+  P cores) clean too**: worst shipped cell 1.01; shipped / own, hard L10–60 int16
+  0.52–0.75, int32 0.69–0.88, float32 0.50–0.80 (the shared fill wins even at L10 there),
+  score-only 0.13–0.93; double runs two lanes, never routed (1.00). Uncapped, the integers
+  lose only from L130 on the M1 (1.13–1.40, against L80 on AVX2), so the AVX2-set cap gives
+  up int16 0.77–0.85 / int32 0.89–0.97 at L80–100, and the AArch64 float cap float32 0.93 at
+  L130 — kept: v3 sets the default, and one band on a secondary target does not pay for a
+  per-level table.
+
+**The two regressions that were not explained above, run down on nighthaven (2026-10-23).**
+(a) At L1000 parasail's scan32 edges nwgrad's int32 score-only (0.92 at AVX2, 0.82 on
+solace pinned to avx2), though nwgrad leads 1.2–1.3× at L200; (b) every L1000 ratio on
+nighthaven drops at 12 threads (int32 score vs scan32 0.92 → 0.71). One cause. Length sweep,
+ns/cell, 1 thread: nwgrad int32 0.40 (L100) → 0.26 (L600–1000) → 0.36 (L1500) → 0.43
+(L2000); parasail scan32 0.54 → 0.24 → 0.23 → 0.22. Counters (perf stat, L200 → L1000):
+nwgrad's L1-dcache misses per cell 0.0005 → 0.041 (80×), parasail's 0.03 at L1000; branch
+misses 13× per cell but only ~3 a row — the misses are the cost. Threads at L1000, Gcell/s,
+nwgrad int32 score | parasail scan32: 1 thread 3.83 | 4.16; 6 threads on six distinct cores
+19.7 | 18.4 (nwgrad ahead); 6 threads on three cores' SIBLING pairs 8.5 | 12.3; 12 threads
+15.1 | 18.8 — nwgrad's 12-thread total is BELOW its own 6-thread one: two threads on a core
+share its 48 KB L1D. Per-type sweep (score-only, ns/cell, L200 … L2500): int32 0.30, 0.28,
+0.34, 0.31, 0.26, 0.28, **0.40**, 0.44, 0.44 (cliff between L1300 and L1600); double 1.07 …
+0.99 (L1000), **1.12** (L1300) …; float32 flat 0.86–1.03 to L2500 (compute-bound on lazy-F,
+the misses hidden). The cliffs sit where the working sets cross 48 KB: double keeps six
+rows of 8 B (the five rolling rows of the D/X form and the profile row: 48 KB at L1000);
+the int32 kernel kept those six PLUS the two rows its integer prefix-max carry scratched in
+(`sopenv`, the opens; `hramp`, the ramp) — eight rows of 4 B, 48 KB at ~L1500 — where six
+cross at L2000. (An earlier account here said nine rows and L1333, counting the Pointers
+kernel's three-row scratch; the score kernel's is two.) The kernel runs ~1.2 cycles a cell,
+so it has nothing to hide a miss behind. So: **the integer carry's scratch rows cost int32
+its L1 residency from ~L1500 on one thread and earlier with SMT siblings.**
+
+**FIXED (2026-10-24): the carry fused into the row pass** (`score_affine_striped_pos`, the
+D/X form every non-negative-opens integer score runs). The opens never reach memory: the
+running prefix max of `open(s-1) + ramp(s)` stays in a register and is stored to Y's row,
+the ramp is a per-lane base `l·seg·ge_a` plus one add a segment; after the row one pass
+applies the lanes' carry-in, subtracts the ramp and folds Y into D. Two passes over the row
+instead of four, six rows instead of eight; bit-identical (max is exact and associative).
+Two forms were prototyped behind a switch and measured in separate processes, interleaved,
+best of three (score-only, ns/cell, 1 thread, BLOSUM62 11/1, 30 %-mutated pairs); fused /
+separate:
+
+| host | int32 inside L1 | int32 at the old cliff | threads | int16 | int64 (≥ 4 lanes) |
+|---|---|---|---|---|---|
+| nighthaven AVX2 | 0.73–0.84 | 0.49 (Global L1600: 0.388 → 0.191) | 6 one per core L1600 0.49; 12 L1000 0.66 | 0.91–0.93 | 0.59–0.78 |
+| solace AVX-512 | 0.75–0.90 | 0.45 (Global L1600: 0.287 → 0.128) | 8 one per core L1600 0.47; 16 0.66–0.72 | 0.92 | 0.56–0.82 |
+| spot NEON (M1, 128 KB L1D) | 0.70–0.79 at every length to L3000 | 0.64–0.70 at L4000 (the separate form's cliff) | 4 P cores 0.75–0.80 | 0.74–0.76 | (2 lanes: chain, untouched) |
+| skynet sse4 (Piledriver) | 0.60–0.76 (L500 0.90–0.95) | — | — | 0.81–0.83 | (2 lanes) |
+
+Fused, the AVX2 / AVX-512 cliff moves to ~L2000 (Global L2000 0.43 → 0.27 on nighthaven,
+0.33 → 0.18 on solace), and 12 / 16 threads still score below 6 / 8 one per core, but by
+less (nighthaven L1000 12 threads 0.066 → 0.044 ns/cell). Against parasail's scan32
+(~0.23 ns/cell at L1600–2000 on nighthaven): nwgrad int32 0.19 at L1600 (was 0.39), 0.27 at
+L2000 (was 0.43). The middle form — the ramp in registers, the opens row kept — moved the
+cliff only, and lost 3–10 % on NEON; dropped.
+
+**FIXED beside it (2026-10-24): 4 KB aliasing of the leveled kernels' rolling rows on 4-way
+L1Ds.** Each kernel's rolling rows were separate `DpBuffer` vectors (`rM` .. `qY`, `sopenv`,
+`subbuf`, `hfa` .. `hff`, `hov`, `hramp`, `spad`); at row sizes of ~4000–4080 B and near
+multiples (int32 / float32 L993–1020, L2030; double / int64 L497–510, L1015) the allocator
+placed them exactly 4096 B apart. Rows walked in lockstep then compete for one L1 set at
+every segment, and a 16 KB 4-way L1D (Bulldozer / Piledriver) thrashes. Now each kernel
+family carves ALL its per-row streams from one block (`spread_rows`, `dp_buffer.hpp`):
+`srows` score-only (rolling rows, opens, ramp, pad: 6 / 9 rows), `prows` striped Pointers
+(12: six rolling rows, opens, open codes, Q, y codes, ramp, pad) and `hb_base_striped` (11),
+`hrows` Hirschberg sweeps (7, pmax 8) and endpoint scans (9), `lrows` linear fills (4 H form,
+7 byte form) and `lhb_striped` (7). The stride is r cache lines, r not a multiple of 4,
+with every row difference k·r (k < nrows <= 13) at least 4 lines from a multiple of 4096 B
+(at most 9 lines of padding a row); the ramp and pad rows are built per call into their
+rows (`int_ramp_into`, `striped_pad_into`). NOT `buf.rM` for the score rows: the scalar
+linear pointer fill grows `qM` only when `rM` is short (`aligner.hpp`) — a segfault in the
+tests. The Scores kernel's tables are whole tables: see the next paragraph.
+Three hazards, each measured by forcing r mod 64 (skynet; ns/cell):
+- score kernel, int32 Local L1024 (1.48 clean; L1D load misses 0.09 / cell): k·r ≡ 0 (the
+  old layout) 6.5, misses 0.55 — the set conflict; r = 32 (rows 0/2/4 on one 4 KB offset,
+  two rows a set) 2.3 with misses unchanged — the load/store unit's false dependency on a
+  12-bit address match; a row one line BEHIND another (r = 63; r = 21, where 3r ≡ -1 puts
+  `pD` a line behind `cD`) 2.4 / 1.76, misses up to 3x — a stream's next line in the set its
+  neighbour still uses; -2 lines (r = 31) 1.55; r = 1 (+1 line, every pair) 1.60.
+- striped Pointers int32 Local L1000 (4.65–4.86 clean), linear H / byte fills int32 L1908
+  (2.38–2.45 / 2.76–2.90): r ≡ 4 mod 8 5.0–5.5 / 2.5 / 2.9, 8 mod 16 4.9 / 2.8 / 3.2, 16 and
+  48 5.8 / 2.9–3.0 / 3.4–3.5, 32 7.7 / 3.2 / 3.7 — with FEWER L1 misses: a structural hazard
+  at strides of 256 B multiples (bank conflicts, presumably; not identified). The first
+  block rule allowed r = 4 and 56: Pointers L1298 / L1000 1.08–1.13, linear L1847–1908
+  1.06–1.12 over the old layout.
+- streams OUTSIDE the block read every row at one address (the integer carry's ramp, the
+  Local padding mask): after the mod-4 fix, linear byte fill L1542 1.26, hirschberg_pmax
+  float32 L1298 1.18, Pointers int32 L1298 1.13, double L1664 1.09 — gone once those rows
+  moved into the block (rows that move per DP row, the profile row and the direction / H
+  table rows, average out).
+Measured, final state / the old layout (6d1caba), one process a length, best of 2:
+wloczykij (bare metal, 540 cells: 12 arms x 45 lengths L200–2700): min 0.089, median 0.987,
+max 1.031 — hirschberg_pmax int32 Local L2030 66.6 -> 8.8 ns/cell (0.13), float32 Global
+L1000 0.19; exact Hirschberg double L1015 0.20; Pointers int32 / float32 L993 and L2030
+0.28–0.31, double L1015 0.32; linear Hirschberg double L504 0.53; linear fills int32 L2030
+0.68–0.71; score-only int32 L1000–2030 0.09 (Local) / 0.17–0.23 (Global), double L1015
+0.21, L1278 / L1786 0.54–0.56, and the milder victims of the old layout 0.71–0.85.
+nighthaven AVX2 (9 arms x 6 lengths): 0.91–1.05, median 1.00; solace AVX-512: 0.90–1.04,
+median 0.99 (gains at the aliased lengths, a 12-way L1 included); spot NEON (M1, macOS,
+g++-16): 0.92–1.01, median 0.995. One v3 cost, read off the counters: the linear int32 fills
+on AVX2 at L1970–2007 read 1.09–1.10 (fine sweep L1600–2400 step 37: 0.97–1.04 elsewhere),
+with 10–13 % more L1 replacements and FEWER 4K-alias blocks (`ld_blocks.address_alias`) —
+their seven ~8 KB streams just exceed the 48 KB L1 there, and which sets overflow depends
+on where the row tails fall: the old layout was lucky there, from L2044 both overflow.
+(RESOLVED the next day by the register ramp, below: the band now reads 0.83 of the old
+layout.)
+Bit-identical (only addresses change): C++ suite at sse2 / sse4 (skynet), avx2
+(nighthaven), avx512 (solace), neon (spot, macOS, g++-16), ctest everywhere, the Python
+suite on skynet.
+
+**The Scores tables and the linear H table, on a narrow L1 only (2026-10-25).** The striped
+Scores kernel (`traceback="scores"`) keeps whole VM / VX / VY tables, separately allocated,
+2 MiB-aligned above 2 MiB: row i of the three shared one 4 KB offset at every length, and
+row i-1 joined it where a row is near a 4 KB multiple (wloczykij int32 Local L1020 20.6 vs
+~5.9 ns/cell). The tables are now `PlacedVec` (dp_buffer.hpp: `data()` at a chosen line of
+its 4 KB page, 4 KB of slack, contents kept across re-placement), placed at lines 0 / a / b
+(`table_lines`: rows i and i-1 of the three >= 4 lines apart, at most two per line class
+mod 4), with the row stride padded by `spread_stride` and reported as `ViterbiJob::rstride`,
+which `cell_index` uses (`striped_rs_`). The linear H table's stride is padded the same way.
+BOTH ONLY WHERE THE L1D IS NARROW (`table_spread()`: glibc's `_SC_LEVEL1_DCACHE_ASSOC` <= 4;
+`NWGRAD_TABLE_SPREAD=0/1`; tests force both and require identical results): ungated, the
+placement cost the 12-way L1s — nighthaven AVX2 Scores float32 Global L2030 1.58x, int32 /
+double L1000 1.22-1.25x (best of 3; HEAD itself is bimodal there across launches, 0.77 vs
+0.90 ns/cell, so judge such cells on medians of >= 9 launches), solace 1.06-1.13x. Gated,
+nighthaven reads HEAD (medians of 9: 0.98-1.00). wloczykij (gate on), over L200-2700: Scores
+int32 Local median 0.91 (L1020 0.29), Global 0.93 (L1020 0.24), double Local 0.88 (L505
+0.64, L1542 0.72); a residual toll on short int32 Scores pairs (medians of 9: Local L322
+1.09, Global L444 1.04, L505 1.01). Pointers' direction tables (bytes, written once a cell)
+are not placed.
+
+**The integer carry's ramp in registers (2026-10-25).** `int_pmax_carry` read the ramp k*ge_a
+from a row (`hramp`, then a block row) in both of its passes; it is now a lane base
+l*seg*ge_a plus ge_a a segment — exact in integers, never past the ramp's last value, so
+bit-identical — and the ramp rows are gone from every block (Pointers 11 rows, hb_base 10,
+the linear fills 3 / 6, lhb_striped 6, the score kernel's three-state form 8; the floating
+pmax sweeps and scans keep theirs, whose rounding is the contract). One stream fewer moves
+the L1 capacity edge. nighthaven AVX2, int32, ramp / row ramp: linear H fill L1600-2400
+0.79-0.90 (the L1970-2007 band above: 0.83), linear byte fill 0.88-0.95, Pointers L1000
+0.90-0.93, inside L1 (L200-700) 0.98-1.02; Scores int32 Local L2030 0.75 (medians of 9).
+wloczykij: linear 0.91-0.98 median, Pointers 1.00, Scores unchanged against the placed
+layout. On NEON the one-ramp form LOST 1.04-1.07 (spot, M1 under macOS, g++-16, medians
+of 5-9 alternating launches, A/A control 1.000): int32 linear H / byte fills and Scores
+from L1000 on, against the row ramp. Read off the assembly: the carry's second pass had
+no loop-carried value with the ramp loaded, and `rq += vge` gave it one — a 2-cycle
+integer add on the M1 (1 cycle on x86, under the loop's throughput). That pass now
+steps two segments a trip with two ramps advanced by 2*ge_a (bit-identical; a planted
+rq1 = rq fails 3 of 7 `[integer]` cases): spot, ramp / row ramp, linear H fill L500-3000
+0.96-0.99, byte fill 0.98-0.99, Scores 0.96-0.98, Pointers 0.97-0.98, int16 0.98-1.00,
+L200 1.00; nighthaven AVX2, two ramps / one, 0.99-1.00 (every cell outside that range
+matched by its own B'/B launch control). AVX-512 (solace under WSL, gcc 15.2, taskset, medians
+of 9, A'/A control 0.99-1.02 but 1.06 in one cell), int32, two ramps / row ramp: linear H fill
+L700-2400 0.86-0.92 (L1600-2000 0.86), byte fill 0.86-0.96, Pointers 0.90-0.99, Scores and
+Hirschberg 0.99-1.03 (in the noise), L300 0.98-1.02; two ramps / one ramp 0.95-1.03. One
+cell above the noise: int16 Local affine Pointers L200 1.04 of the row ramp (1.03 of one
+ramp; 7 segments of 32 lanes, so the two-step loop runs 3 trips and a tail), L300 1.01.
+Suite at avx512 and avx2 green (191 cases), ctest 17/17.
+Tried for that cell and REJECTED (2026-10-25, same harness and box, + one arm): the
+per-lane ramp base `l*seg*ge_a` built as a lane-index vector times one splat instead of the
+generator constructor (in `int_pmax_carry` and the fused score carry). Bit-exact (suite at
+avx512 / avx2, sse2 / sse4), but no readable gain anywhere, patch / two ramps: int16 Local
+Pointers L96-288 0.99-1.01 (L200 0.990: the 1.03-1.04 stayed), avx2 0.98-1.00; and losses on
+short rows with clean controls: int16 Global Scores L200 1.038, int16 Global linear L300
+1.020, int32 Global linear L300 1.035; long rows (L1000-2000) noise. The same run found a
+second register-ramp cell: int16 Global Scores, two ramps / row ramp 1.035-1.043 at avx2
+L100 / L200 and avx512 L140 (avx512 L200 1.02, L300 0.98; control 1.00-1.01) -- not the ramp
+base, which the patch removed without moving it.
+Run down on solace at avx2 (int16 Global Scores L200, 600 fixed steps, symbolized builds of
+55bedee = row ramp vs c0ac8b6 = two ramps; timed 1.044): cycles +4.5 %, instructions -0.8 %,
+`ld_blocks.store_forward` 2.92 -> 3.03 a DP row. The excess is in `striped_affine_full`
+(+338 of +449 samples), and there not in the passes the ramp rewrote (net -152) but in the
+carry's CROSS-LANE SCAN, compiled near-identically in both: `P.copy_to(tot)`, 16 `vpextrw`
++ a serial `cmov` chain with stack round-trips, `cin` written as two 16-byte halves and
+read back as one 32-byte vector (`vmovdqa 0xc0(%rsp),%ymm12`), a load no store can forward.
+Its stall sites hold ~16 % of the kernel's samples in A and ~22 % in C (+631): the same
+stalls, waited longer (why longer is unproven: the ramp-free first pass reaching the scan
+with more stores in flight is the likely story). The lever is the scan, in both forms: an
+in-register exclusive prefix max across the lanes (log2 W shift + max steps, a cross-half
+permute at 256 bits) would remove the chain and both forwarding stalls, bit-identically.
+CAVEAT: a Windows game (~0.4-0.9 core, invisible to WSL's load average) ran on solace from
+18:58 that day, i.e. through most of the patch rerun above and all of this profiling; the
+A/A' controls held (0.96-1.01) but the single-run `perf stat` pair is exposed. Re-measure
+on a quiet host (Windows side checked) before acting on the cycle counts.
+RE-MEASURED on nighthaven (v3, quiet, gcc 16.2, same two commits, 2026-10-25): the excess is
+REAL ON v3 and larger, int16 Global Scores two ramps / row ramp, medians of 9: L100 1.040,
+L140 **1.061**, L200 1.018 (A'/A 0.995-1.003). Counters, L200, 600 steps, 10 runs an arm
+(A spread ~2 %): cycles 1.042, instructions 1.005, `ld_blocks.store_forward` **0.81** — C
+blocks LESS, so the solace reading (same stalls waited longer) does NOT carry to v3. The
+excess is in `striped_affine_full<short>` (L140: 4499 -> 4804 samples, +6.8 %; walk flat)
+but spread thin: the scalar scan's lines take ~130 of the +305, the rest vector lines
+whose inlined attribution is blurred, and the instruction-level profiles have the same
+shape (the post-scan `cin` reload 7.0 vs 7.3-8.1 %; C's kernel compiles larger, 2520 vs
+1976 annotated lines). Mechanism on v3 unidentified. An in-register scan remains worth
+trying (it removes a stall both arms pay), but is not established as the fix.
+**FIXED: the carry's cross-lane scan in registers (`int_lane_carry_in`, 2026-10-25).** The
+exclusive prefix max across lanes is log2(W) `__builtin_shufflevector` shift + max steps
+(gcc 15 at AVX2 int16: `vpshufb`/`vpermq`/`vpermd`/`vpblendd`/`vperm2i128` + `vpmaxsw`, no
+`vpextrw`, no stack round trip). Bit-identical (C++ suite at sse2 / sse4 skynet, avx2 /
+avx512 solace, neon spot; gcc and clang). Measured against the scalar scan (HEAD), medians
+of 9 (spot 7), one source tree, `-DNWGRAD_SCALAR_LANE_SCAN` the control build:
+
+| cell | nighthaven AVX2 | solace AVX-512 (screen) | spot NEON (macOS, g++-16): `tbl` form -> `ext` form |
+|---|---|---|---|
+| int16 Global Scores L100 / L140 / L200 | 0.891 / 0.891 / 0.895 | 0.819 / 0.750 / 0.773 | 1.026 / 1.016 / 1.016 -> 0.906 / 0.926 / 0.950 |
+| int16 Local Pointers L200 | 0.946 | 0.867 | 0.977 -> 0.961 |
+| int16 Global linear L300 | 0.848 | 0.733 | 1.015 -> 0.933 |
+| int32 Global linear L300 / L1000 | 0.868 / 1.007 | 0.766 / - | 0.849 -> 0.847 / - |
+| int32 Global Scores L300 / L1000 | 0.910 / 0.965 | 0.896 / 0.986 | 1.005 -> 0.980 / 1.004 |
+
+(controls 0.98-1.02; solace with a mostly idle Windows game, Windows 3-4 % CPU before and
+after.) On v3 it more than cancels the register ramp's regression: int16 Scores 0.85-0.95 of
+the old row ramp. **The NEON int16 loss was the shuffle's spelling:** filling the shifted-in
+lanes from f[I] (the fill vector's bottom lanes), gcc 16 built each shift on AArch64 as a
+two-register `tbl` whose operands went through the stack (`stp q27, q31, [x29, #0x1c0]`
+then `ldp q19, q20, ...`: three round trips in the carry) plus an index load per row.
+f is always a splat, so the fill now comes from its TOP lanes (index 2W-K+I), one
+contiguous window of (f, x): four `ext` + four `smax` on NEON, `vperm2i128 $0x21` +
+`vpalignr` on AVX2 (was `vpshufb` pairs + `vpermq` + `vpor`), AVX-512 unchanged. Bit-
+identical (suite at neon, avx2, avx512, sse4). v3, new / old indices: 0.988-1.004 over
+the seven cells (controls 1.00); NEON the column above. No AArch64 opt-out remains.
+**The row ramp back, for int16 Global Scores on AVX2 only (`int_row_ramp`, `IntRampRow`).**
+A `RowRamp` carry loading `hb_ramp`'s row. Prototyped in the Scores kernel: on v3 int16 it
+composed better than independently (Global Scores with both / scan alone: L100 0.852 / 0.891,
+L140 0.826 / 0.891, L200 0.812 / 0.895; alone 0.97-1.01), but it cost int32 there (L300
+0.944 vs 0.910, L1000 0.988 vs 0.965), AVX-512 int16 (L140 0.783 vs 0.750, L200 0.794 vs
+0.773) and NEON (1.023-1.046). The gate `sizeof(T) == 2 && W == 16` is exactly int16 on
+AVX2, a compile-time constant. Wired then into all six carry users (Global and Local
+Scores, Pointers, both linear fills, hb_base, the three-state score kernel) and timed
+against HEAD (nighthaven, `ext` indices, medians of 9, controls 0.993-1.018), row / register:
+Global Scores L100 0.975, L140 0.943, L200 **0.910**; Local Scores L200 1.002; Pointers L200
+Local 0.993 / Global 0.984 (in the noise); linear L300 Global 1.014 / Local 1.007. So it is on
+in the GLOBAL Scores kernel only (`int_row_ramp<T, W> && !Local`); every other site keeps the
+register ramp (hb_base and the score-only kernels untimed). The ramp row lives in
+`DpBuffer::iramp` (not `hramp`, which the Hirschberg sweeps hold), rebuilt only when ge_a or
+the segment count changes. int16 rows are short by the overflow bound (BLOSUM62 11/1:
+~L300), so the extra stream never meets the L1 capacity edge that put the ramp in registers.
+Tested: C++ suite at avx2 / sse4 (nighthaven, 191 cases), Python suite at avx2 (4518
+passed), skynet gcc / clang.
+**The kernels the first round did not time (2026-10-26).** `rr_two.py` (score-only, DNA, any
+gap costs) on nighthaven, one tree, macros per arm, medians of 9, controls 0.998-1.003:
+- **Three-state score kernel** (`score_affine_striped`, negative opens): the row ramp gives
+  int16 Global L200 **0.928**, Local 0.996. Shipped like Scores: `int_row_ramp && !Local`.
+- **Hirschberg base case** (int16 DNA L1000, past the 512 cutoff): row ramp Global 0.986,
+  Local 0.997 — the base case is a small part of the run; not shipped.
+- **Fused score-only kernel** (`score_affine_striped_pos`, every `align()` / `grad_mode="none"`
+  with non-negative opens) had its OWN copy of the scalar cross-lane scan, which the first
+  round never reached. Replaced by `int_lane_carry_in`, time / scalar scan:
+
+  | fused score-only | v3 AVX2 (nighthaven) | AVX-512 (solace, game closed) | NEON (spot, macOS) |
+  |---|---|---|---|
+  | int16 Global L100 / L140 / L200 | 0.830 / 0.877 / 0.944 | 0.794 / - / 0.804 | 0.829 / - / 0.867 |
+  | int16 Local L200 | 0.859 | 0.777 | 0.869 |
+  | int32 Global L300 / Local L300 | 1.027 / 0.985 | 0.985 / 0.909 | 0.981 / 0.996 |
+  | int32 Global L1000 | 0.992 | 1.008 | 0.997 |
+
+  Shipped for int16 only (`sizeof(T) == 2`): int32 is a wash whose one loss is on v3. The
+  row ramp in this kernel (on top): L100 1.032, L140 1.004, L200 0.902, Local 1.004 — it
+  changes sign with length; not shipped.
+Bit-identical: full C++ suite at avx512 / avx2 (solace), neon (spot), avx2 / sse4
+(nighthaven), sse2 / sse4 (skynet, gcc and clang); Python suite on skynet.
+Not a kernel-speed loss: below the cliff nwgrad int32 is 1.0–1.3× parasail's scan32 and
+1.7–1.8× its striped32 at every length.
+
+**The fleet, one table per architecture (2026-10-23, every host on the same commit and
+tool; parasail time / nwgrad time, above 1 = nwgrad faster; cells: parasail striped /
+parasail scan over nwgrad score-only, then parasail trace + CIGAR over nwgrad path;
+`*` = parasail's striped linear kernel, which scores below the optimum at open == extend;
+L200 = 2000 30 %-mutated BLOSUM62 pairs, L1000 = 200, DNA = 20k related 22×50 pairs).**
+
+*nighthaven — i5-12500, **AVX2** vs parasail avx2 (gcc 16.2; 1 and 12 threads).*
+
+**protein L200, 1 thread**
+
+| algorithm | int16 striped / scan / trace | int32 striped / scan / trace | int64 striped / scan / trace |
+|---|---|---|---|
+| global affine | 3.11 / 1.38 / 4.98 | 1.76 / 1.19 / 3.05 | 16.50 / 9.04 / 10.88 |
+| global linear | 0.92* / 1.38 / 1.36 | 0.93* / 1.18 / 1.81 | 11.22 / 9.04 / 21.36 |
+| local affine | 2.22 / 1.47 / 3.15 | 1.52 / 1.31 / 2.02 | 10.26 / 10.29 / 6.37 |
+| local linear | 0.78* / 1.44 / 2.26 | 0.82* / 1.29 / 2.15 | 7.49 / 10.33 / 10.01 |
+
+**protein L200, 12 threads**
+
+| algorithm | int16 striped / scan / trace | int32 striped / scan / trace | int64 striped / scan / trace |
+|---|---|---|---|
+| global affine | 2.87 / 1.10 / 5.42 | 1.60 / 0.99 / 3.34 | 12.21 / 6.81 / 7.61 |
+| global linear | 0.80* / 1.10 / 1.65 | 0.77* / 0.99 / 2.12 | 8.12 / 6.68 / 15.10 |
+| local affine | 1.85 / 1.15 / 3.17 | 1.32 / 1.07 / 2.08 | 7.43 / 7.63 / 4.46 |
+| local linear | 0.75* / 1.20 / 2.18 | 0.68* / 1.07 / 2.03 | 5.39 / 7.62 / 8.00 |
+
+**protein L1000, 1 thread**
+
+| algorithm | int16 striped / scan / trace | int32 striped / scan / trace | int64 striped / scan / trace |
+|---|---|---|---|
+| global affine | refused (int16 bound) | 1.59 / 0.92 / 2.61 | 14.82 / 8.05 / 10.44 |
+| global linear | refused (int16 bound) | 0.62* / 0.92 / 0.56 | 10.11 / 8.04 / 10.38 |
+| local affine | refused (int16 bound) | 1.12 / 1.04 / 1.62 | 9.67 / 9.94 / 6.18 |
+| local linear | refused (int16 bound) | 0.52* / 1.04 / 0.30 | 7.18 / 9.91 / 5.02 |
+
+**dna 22x50, 1 thread**
+
+| algorithm | int16 striped / scan / trace | int32 striped / scan / trace | int64 striped / scan / trace |
+|---|---|---|---|
+| global affine | 7.36 / 8.01 / 5.23 | 3.32 / 3.32 / 3.14 | 19.62 / 14.42 / 14.34 |
+| global linear | 3.46* / 9.70 / 2.74 | 2.21* / 4.27 / 2.03 | 17.62 / 15.24 / 12.84 |
+| local affine | 3.43 / 7.74 / 4.26 | 3.82 / 3.34 / 2.68 | 11.84 / 14.72 / 8.35 |
+| local linear | 3.21* / 9.09 / 4.59 | 2.00* / 4.09 / 3.37 | 11.34 / 16.45 / 11.49 |
+
+*solace — Tiger Lake under WSL, **nwgrad AVX-512 vs parasail AVX2** (the PyPI wheel has no AVX-512 kernels: what a pip user gets; gcc 15.2; 1 and 8 threads).*
+
+**protein L200, 1 thread**
+
+| algorithm | int16 striped / scan / trace | int32 striped / scan / trace | int64 striped / scan / trace |
+|---|---|---|---|
+| global affine | 2.66 / 1.23 / 4.74 | 2.31 / 1.43 / 4.17 | 38.76 / 21.43 / 23.91 |
+| global linear | 0.83* / 1.23 / 1.23 | 1.12* / 1.46 / 1.41 | 26.34 / 21.64 / 17.46 |
+| local affine | 1.90 / 1.32 / 3.17 | 2.02 / 1.59 / 2.72 | 25.19 / 25.88 / 14.55 |
+| local linear | 0.72* / 1.30 / 0.64 | 0.97* / 1.58 / 0.92 | 18.49 / 26.13 / 10.37 |
+
+**protein L200, 8 threads**
+
+| algorithm | int16 striped / scan / trace | int32 striped / scan / trace | int64 striped / scan / trace |
+|---|---|---|---|
+| global affine | 2.48 / 1.19 / 4.76 | 2.19 / 1.46 / 4.24 | 33.18 / 18.48 / 21.56 |
+| global linear | 0.84* / 1.19 / 1.22 | 1.07* / 1.40 / 1.39 | 22.30 / 18.04 / 15.99 |
+| local affine | 1.81 / 1.29 / 3.21 | 1.96 / 1.56 / 2.73 | 21.76 / 22.36 / 13.07 |
+| local linear | 0.77* / 1.31 / 0.67 | 0.98* / 1.55 / 0.97 | 16.38 / 22.94 / 9.71 |
+
+**protein L1000, 1 thread**
+
+| algorithm | int16 striped / scan / trace | int32 striped / scan / trace | int64 striped / scan / trace |
+|---|---|---|---|
+| global affine | refused (int16 bound) | 2.59 / 1.41 / 3.62 | 24.27 / 13.47 / 15.09 |
+| global linear | refused (int16 bound) | 0.91* / 1.42 / 0.46 | 16.27 / 13.12 / 8.50 |
+| local affine | refused (int16 bound) | 1.80 / 1.54 / 2.22 | 15.93 / 16.82 / 10.74 |
+| local linear | refused (int16 bound) | 0.71* / 1.48 / 0.30 | 11.84 / 16.75 / 4.97 |
+
+**dna 22x50, 1 thread**
+
+| algorithm | int16 striped / scan / trace | int32 striped / scan / trace | int64 striped / scan / trace |
+|---|---|---|---|
+| global affine | 8.21 / 8.85 / 5.15 | 4.61 / 4.33 / 3.50 | 46.80 / 34.59 / 22.19 |
+| global linear | 3.58* / 9.73 / 2.46 | 3.00* / 5.40 / 1.96 | 46.02 / 40.32 / 14.84 |
+| local affine | 4.01 / 8.70 / 4.61 | 5.65 / 4.87 / 3.42 | 32.46 / 40.31 / 17.96 |
+| local linear | 3.73* / 9.94 / 4.34 | 3.09* / 6.15 / 3.79 | 34.12 / 50.29 / 20.87 |
+
+*solace — the same box with **nwgrad pinned to AVX2** (`NWGRAD_ISA=avx2`): the ISA-matched row.*
+
+**protein L200, 1 thread**
+
+| algorithm | int16 striped / scan / trace | int32 striped / scan / trace | int64 striped / scan / trace |
+|---|---|---|---|
+| global affine | 2.59 / 1.19 / 4.20 | 1.69 / 1.05 / 3.01 | 16.38 / 9.09 / 12.15 |
+| global linear | 0.82* / 1.21 / 1.21 | 0.81* / 1.04 / 1.42 | 10.90 / 9.05 / 17.20 |
+| local affine | 1.86 / 1.31 / 2.70 | 1.55 / 1.22 / 1.89 | 10.01 / 10.41 / 7.56 |
+| local linear | 0.74* / 1.31 / 1.81 | 0.73* / 1.20 / 1.91 | 7.44 / 10.26 / 11.08 |
+
+**protein L1000, 1 thread**
+
+| algorithm | int16 striped / scan / trace | int32 striped / scan / trace | int64 striped / scan / trace |
+|---|---|---|---|
+| global affine | refused (int16 bound) | 1.48 / 0.82 / 2.57 | 14.76 / 8.06 / 10.48 |
+| global linear | refused (int16 bound) | 0.52* / 0.81 / 0.46 | 9.99 / 8.13 / 8.39 |
+| local affine | refused (int16 bound) | 1.01 / 0.85 / 1.57 | 9.21 / 9.65 / 6.53 |
+| local linear | refused (int16 bound) | 0.42* / 0.85 / 0.30 | 7.14 / 10.09 / 5.14 |
+
+**dna 22x50, 1 thread**
+
+| algorithm | int16 striped / scan / trace | int32 striped / scan / trace | int64 striped / scan / trace |
+|---|---|---|---|
+| global affine | 6.32 / 6.66 / 4.64 | 3.07 / 2.92 / 2.78 | 19.19 / 14.11 / 12.90 |
+| global linear | 2.91* / 7.91 / 2.38 | 1.98* / 3.57 / 1.80 | 18.19 / 16.65 / 11.80 |
+| local affine | 2.82 / 6.24 / 3.88 | 3.21 / 2.78 / 2.50 | 12.41 / 15.51 / 8.34 |
+| local linear | 2.67* / 7.19 / 3.99 | 1.73* / 3.36 / 2.80 | 12.31 / 18.20 / 11.58 |
+
+*spot — Apple M1 under Fedora Asahi, **NEON** vs parasail neon (gcc 16.2; pinned to the 4 performance cores; 1 and 4 threads).*
+
+**protein L200, 1 thread**
+
+| algorithm | int16 striped / scan / trace | int32 striped / scan / trace | int64 striped / scan / trace |
+|---|---|---|---|
+| global affine | 2.85 / 1.35 / 2.83 | 1.96 / 1.25 / 1.29 | 1.84 / 1.51 / 1.19 |
+| global linear | 0.97* / 1.35 / 0.76 | 1.01* / 1.25 / 1.38 | 2.01 / 1.97 / 3.31 |
+| local affine | 2.28 / 1.61 / 2.00 | 1.95 / 1.55 / 0.96 | 1.91 / 2.13 / 0.90 |
+| local linear | 0.96* / 1.58 / 1.53 | 1.17* / 1.54 / 1.31 | 1.97 / 2.58 / 1.53 |
+
+**protein L200, 4 threads**
+
+| algorithm | int16 striped / scan / trace | int32 striped / scan / trace | int64 striped / scan / trace |
+|---|---|---|---|
+| global affine | 3.74 / 1.96 / 3.35 | 2.56 / 1.78 / 1.52 | 2.06 / 1.76 / 1.30 |
+| global linear | 1.67* / 1.93 / 0.99 | 1.51* / 1.79 / 1.74 | 2.35 / 2.30 / 3.71 |
+| local affine | 3.08 / 2.36 / 2.40 | 2.47 / 2.05 / 1.17 | 2.18 / 2.40 / 1.01 |
+| local linear | 1.48* / 2.27 / 1.99 | 1.61* / 2.03 / 1.69 | 2.30 / 2.93 / 1.74 |
+
+**protein L1000, 1 thread**
+
+| algorithm | int16 striped / scan / trace | int32 striped / scan / trace | int64 striped / scan / trace |
+|---|---|---|---|
+| global affine | refused (int16 bound) | 1.82 / 1.13 / 1.30 | 1.89 / 1.55 / 1.16 |
+| global linear | refused (int16 bound) | 0.90* / 1.13 / 0.54 | 2.26 / 2.19 / 1.83 |
+| local affine | refused (int16 bound) | 1.72 / 1.51 / 0.94 | 1.90 / 2.22 / 0.88 |
+| local linear | refused (int16 bound) | 1.07* / 1.52 / 0.38 | 2.14 / 2.83 / 1.30 |
+
+**dna 22x50, 1 thread**
+
+| algorithm | int16 striped / scan / trace | int32 striped / scan / trace | int64 striped / scan / trace |
+|---|---|---|---|
+| global affine | 7.00 / 6.58 / 3.47 | 4.10 / 3.32 / 2.52 | 3.04 / 2.91 / 2.50 |
+| global linear | 3.13* / 6.75 / 2.03 | 3.02* / 3.35 / 1.80 | 1.53 / 1.68 / 2.38 |
+| local affine | 3.73 / 6.66 / 3.49 | 3.77 / 3.65 / 2.54 | 2.86 / 3.27 / 2.12 |
+| local linear | 3.73* / 7.37 / 3.87 | 3.31* / 4.07 / 2.97 | 2.07 / 2.78 / 2.32 |
+
+*skynet — Piledriver VM, **sse4** vs parasail sse41 (gcc 16.2; 1 and 16 threads). CAVEAT: the host wloczykij went busy again during the run (load 6.8 at its end); the L200 and DNA controls held (0.97–1.03) but the L1000 score-only cells (0.06–0.21) repeat the 3× drift of the discarded run and are NOT to be read as kernel numbers.*
+
+**protein L200, 1 thread**
+
+| algorithm | int16 striped / scan / trace | int32 striped / scan / trace | int64 striped / scan / trace |
+|---|---|---|---|
+| global affine | 1.74 / 1.00 / 2.64 | 1.17 / 0.91 / 1.54 | 13.87 / 10.28 / 17.68 |
+| global linear | 0.75* / 0.98 / 1.14 | 0.70* / 0.90 / 1.60 | 13.98 / 12.65 / 46.40 |
+| local affine | 1.33 / 1.08 / 1.75 | 0.93 / 0.99 / 1.09 | 9.86 / 12.50 / 6.01 |
+| local linear | 0.66* / 1.07 / 1.71 | 0.66* / 1.01 / 1.75 | 8.87 / 13.53 / 14.38 |
+
+**protein L200, 16 threads**
+
+| algorithm | int16 striped / scan / trace | int32 striped / scan / trace | int64 striped / scan / trace |
+|---|---|---|---|
+| global affine | 1.70 / 1.01 / 2.59 | 1.24 / 0.98 / 1.65 | 14.31 / 10.43 / 18.30 |
+| global linear | 0.85* / 1.06 / 1.16 | 0.78* / 0.98 / 1.64 | 14.16 / 12.71 / 45.47 |
+| local affine | 1.39 / 1.12 / 1.79 | 1.06 / 1.12 / 1.18 | 10.10 / 12.94 / 6.40 |
+| local linear | 0.73* / 1.09 / 1.60 | 0.66* / 1.01 / 1.54 | 6.79 / 9.98 / 14.71 |
+
+**dna 22x50, 1 thread**
+
+| algorithm | int16 striped / scan / trace | int32 striped / scan / trace | int64 striped / scan / trace |
+|---|---|---|---|
+| global affine | 2.84 / 2.25 / 2.59 | 1.71 / 1.47 / 1.92 | 10.86 / 9.15 / 21.27 |
+| global linear | 1.71* / 2.58 / 1.82 | 1.55* / 2.02 / 1.73 | 11.00 / 9.82 / 27.40 |
+| local affine | 1.58 / 2.29 / 2.11 | 1.51 / 1.67 / 1.65 | 8.18 / 12.70 / 9.81 |
+| local linear | 1.80* / 3.06 / 2.57 | 1.36* / 2.03 / 2.14 | 8.16 / 14.05 / 13.44 |
 
 ### The soft path: scaled probability space (2026-10-05)
 

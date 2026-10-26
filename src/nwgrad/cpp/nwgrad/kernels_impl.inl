@@ -60,6 +60,33 @@ static inline stdx::native_simd<double> avx512d_blend(__mmask8 k, stdx::native_s
     res.copy_from(out, stdx::element_aligned);
     return res;
 }
+// The int64 lane hits the same assertion (its mask is the same 64-bit lane type), so the
+// same three helpers exist for it over the epi64 intrinsics.
+static inline __mmask8 avx512d_ge(stdx::native_simd<int64_t> a, stdx::native_simd<int64_t> b) {
+    alignas(64) int64_t aa[8], bb[8];
+    a.copy_to(aa, stdx::element_aligned);
+    b.copy_to(bb, stdx::element_aligned);
+    return _mm512_cmpge_epi64_mask(_mm512_load_si512(aa), _mm512_load_si512(bb));
+}
+static inline __mmask8 avx512d_gt(stdx::native_simd<int64_t> a, stdx::native_simd<int64_t> b) {
+    alignas(64) int64_t aa[8], bb[8];
+    a.copy_to(aa, stdx::element_aligned);
+    b.copy_to(bb, stdx::element_aligned);
+    return _mm512_cmpgt_epi64_mask(_mm512_load_si512(aa), _mm512_load_si512(bb));
+}
+static inline stdx::native_simd<int64_t> avx512d_blend(__mmask8 k, stdx::native_simd<int64_t> dest,
+                                                        stdx::native_simd<int64_t> value) {
+    alignas(64) int64_t da[8], va[8], out[8];
+    dest.copy_to(da, stdx::element_aligned);
+    value.copy_to(va, stdx::element_aligned);
+    _mm512_store_si512(out, _mm512_mask_blend_epi64(k, _mm512_load_si512(da), _mm512_load_si512(va)));
+    stdx::native_simd<int64_t> res;
+    res.copy_from(out, stdx::element_aligned);
+    return res;
+}
+// The lazy-F early exit (any lane of F above v), for both 8-byte lane types.
+template <class V>
+static inline bool avx512d_any_gt(const V& F, const V& v) { return avx512d_gt(F, v) != 0; }
 #endif
 
 // ── Local: the best cell of one striped row, vectorized ──────────────────────
@@ -75,8 +102,15 @@ static inline void striped_row_best(const T* cM, const T* cX, const T* cY, const
                                     int seg, int i, T& best, int& bi, int& bj, int& btbl) {
     using vt = stdx::native_simd<T>;
     constexpr int W = (int)vt::size();
-    vt lmax(-std::numeric_limits<T>::infinity()), ls(T(0));
-    for (int s = 0; s < seg; ++s) {
+    vt lmax(nw_ninf<T>), ls(T(0));
+    // The segment index as a vector, carried and incremented — NOT `vt(T(s))` in the loop:
+    // for 64-bit lanes at AVX-512 gcc lowered that broadcast to eight merge-masked
+    // `vpbroadcastq`, one per lane and each dependent on the last, an 8-deep chain per
+    // segment that the blend then waited on; the Local int64 Pointers fill spent 46 % of
+    // its time here (perf, solace, gcc 15.2), 72 vs clang's 43 µs a pair at L200.
+    vt vs(T(0));
+    const vt one(T(1));
+    for (int s = 0; s < seg; ++s, vs += one) {
         const std::size_t o = (std::size_t)s * W;
         vt vm, vx, vy, vp;
         vm.copy_from(cM + o, stdx::element_aligned);
@@ -85,18 +119,37 @@ static inline void striped_row_best(const T* cM, const T* cX, const T* cY, const
         vp.copy_from(pad + o, stdx::element_aligned);
         const vt h = stdx::max(stdx::max(vm, vx), vy) + vp;
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
-        if constexpr (std::is_same_v<T, double>) ls = avx512d_blend(avx512d_gt(h, lmax), ls, vt(T(s)));
-        else                                      stdx::where(h > lmax, ls) = vt(T(s));
+        if constexpr (sizeof(T) == 8) ls = avx512d_blend(avx512d_gt(h, lmax), ls, vs);
+        else                                      stdx::where(h > lmax, ls) = vs;
 #else
-        stdx::where(h > lmax, ls) = vt(T(s));
+        stdx::where(h > lmax, ls) = vs;
 #endif
         lmax = stdx::max(lmax, h);
     }
-    T rmax = lmax[0];
-    for (int l = 1; l < W; ++l) rmax = std::max(rmax, T(lmax[l]));
-    if (!(rmax > best)) return;
-    int l = 0;
-    while (!(lmax[l] == rmax)) ++l;
+    T rmax;
+    int l;
+    // (clang + AVX-512: the 64-bit lane's equality mask hits the libstdc++ assertion the
+    // file's workaround describes; int64 keeps the scalar reduction there.)
+#if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
+    constexpr bool vec_reduce = nw_is_int<T> && sizeof(T) != 8;
+#else
+    constexpr bool vec_reduce = nw_is_int<T>;
+#endif
+    if constexpr (vec_reduce) {
+        // A vector reduction and a mask search (gcc extracted the 16 int16 lanes one by
+        // one, ~5 % of the Pointers kernel's time).  Exact for integers; floating T keeps
+        // the scalar loop, whose std::max keeps the FIRST of two equal values and so the
+        // sign of a zero the reduction might swap.
+        rmax = stdx::hmax(lmax);
+        if (!(rmax > best)) return;
+        l = stdx::find_first_set(lmax == rmax);
+    } else {
+        rmax = lmax[0];
+        for (int q = 1; q < W; ++q) rmax = std::max(rmax, T(lmax[q]));
+        if (!(rmax > best)) return;
+        l = 0;
+        while (!(lmax[l] == rmax)) ++l;
+    }
     const int s = (int)ls[l];
     const std::size_t k = (std::size_t)s * W + (std::size_t)l;
     const T mm = cM[k], xx = cX[k], yy = cY[k];
@@ -105,15 +158,20 @@ static inline void striped_row_best(const T* cM, const T* cX, const T* cY, const
 }
 
 // pad[s*W + l] = 0 for a real column (l*seg + s + 1 <= n), -inf for padding.
-template <class V>
-static inline const typename V::value_type* striped_pad(V& v, int n, int seg, int W) {
-    using T = typename V::value_type;
-    const std::size_t sw = (std::size_t)seg * W;
-    if (v.size() < sw) v.resize(sw);
+// The same mask into a row the caller owns (a spread_rows row: dp_buffer.hpp).
+template <class T>
+static inline const T* striped_pad_into(T* v, int n, int seg, int W) {
     for (int l = 0; l < W; ++l)
         for (int s = 0; s < seg; ++s)
-            v[(std::size_t)s * W + l] = (l * seg + s + 1 <= n) ? T(0) : -std::numeric_limits<T>::infinity();
-    return v.data();
+            v[(std::size_t)s * W + l] = (l * seg + s + 1 <= n) ? T(0) : nw_ninf<T>;
+    return v;
+}
+
+template <class V>
+static inline const typename V::value_type* striped_pad(V& v, int n, int seg, int W) {
+    const std::size_t sw = (std::size_t)seg * W;
+    if (v.size() < sw) v.resize(sw);
+    return striped_pad_into(v.data(), n, seg, W);
 }
 
 using vd = stdx::native_simd<double>;
@@ -127,11 +185,13 @@ static constexpr double K_NINF = -std::numeric_limits<double>::infinity();
 // (vpermpd + blend).  The intrinsic form gets gcc the same; at AVX-512 it is one valign
 // (gcc 0.84-0.98 on the striped arms, clang unchanged).  A pure lane move, so the result
 // is identical; SSE2/SSE4/NEON (W=2) keep the generator.
+// The integer types (int16/int32/int64) take the same treatment: gcc assembled the
+// generator form lane by lane (vpinsrw / vpinsrd / vpunpck sequences) at AVX2.
 template <class V>
-static inline V lane_shift_in(V x, typename V::value_type b) {
+[[gnu::always_inline]] static inline V lane_shift_in(V x, typename V::value_type b) {
+    using T [[maybe_unused]] = typename V::value_type;   // unused at the W=2 levels
 #if defined(__AVX512F__)
     // One valignq / valignd: (x : splat(b)) shifted right by W-1 lanes is [b, x0..x_{W-2}].
-    using T = typename V::value_type;
     if constexpr (std::is_same_v<T, double> && V::size() == 8) {
         const __m512i r = _mm512_alignr_epi64(_mm512_castpd_si512(static_cast<__m512d>(x)),
                                               _mm512_castpd_si512(_mm512_set1_pd(b)), 7);
@@ -140,9 +200,27 @@ static inline V lane_shift_in(V x, typename V::value_type b) {
         const __m512i r = _mm512_alignr_epi32(_mm512_castps_si512(static_cast<__m512>(x)),
                                               _mm512_castps_si512(_mm512_set1_ps(b)), 15);
         return V(_mm512_castsi512_ps(r));
+    } else if constexpr (std::is_same_v<T, int64_t> && V::size() == 8) {
+        using NV = __v8di;
+        const __m512i r = _mm512_alignr_epi64((__m512i)static_cast<NV>(x), _mm512_set1_epi64(b), 7);
+        return V((NV)r);
+    } else if constexpr (std::is_same_v<T, int32_t> && V::size() == 16) {
+        using NV = __v16si;
+        const __m512i r = _mm512_alignr_epi32((__m512i)static_cast<NV>(x), _mm512_set1_epi32(b), 15);
+        return V((NV)r);
+    } else if constexpr (std::is_same_v<T, int16_t> && V::size() == 32) {
+#if defined(__AVX512BW__)
+        using NV = __v32hi;
+        const __m512i idx = _mm512_set_epi16(30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15,
+                                             14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 0);
+        __m512i r = _mm512_permutexvar_epi16(idx, (__m512i)static_cast<NV>(x));
+        r = _mm512_mask_blend_epi16(__mmask32(1), r, _mm512_set1_epi16(b));
+        return V((NV)r);
+#else
+        return V([&](int q) { return q == 0 ? b : x[q - 1]; });
+#endif
     } else
 #elif defined(__AVX2__)
-    using T = typename V::value_type;
     if constexpr (std::is_same_v<T, double> && V::size() == 4) {
         const __m256d r = _mm256_permute4x64_pd(static_cast<__m256d>(x), 0x90);
         return V(_mm256_blend_pd(r, _mm256_set1_pd(b), 1));
@@ -150,9 +228,230 @@ static inline V lane_shift_in(V x, typename V::value_type b) {
         const __m256 r = _mm256_permutevar8x32_ps(static_cast<__m256>(x),
                                                   _mm256_setr_epi32(0, 0, 1, 2, 3, 4, 5, 6));
         return V(_mm256_blend_ps(r, _mm256_set1_ps(b), 1));
+    } else if constexpr (std::is_same_v<T, int64_t> && V::size() == 4) {
+        using NV = __v4di;
+        const __m256i r = _mm256_permute4x64_epi64((__m256i)static_cast<NV>(x), 0x90);
+        return V((NV)_mm256_blend_epi32(r, _mm256_set1_epi64x(b), 0x3));
+    } else if constexpr (std::is_same_v<T, int32_t> && V::size() == 8) {
+        using NV = __v8si;
+        const __m256i r = _mm256_permutevar8x32_epi32((__m256i)static_cast<NV>(x),
+                                                      _mm256_setr_epi32(0, 0, 1, 2, 3, 4, 5, 6));
+        return V((NV)_mm256_blend_epi32(r, _mm256_set1_epi32(b), 1));
+    } else if constexpr (std::is_same_v<T, int16_t> && V::size() == 16) {
+        // A 2-byte shift across the whole register: alignr works within 128-bit halves,
+        // so feed it the low half moved up (and zero below), then insert the border.
+        using NV = __v16hi;
+        const __m256i xi = (__m256i)static_cast<NV>(x);
+        const __m256i t = _mm256_permute2x128_si256(xi, xi, 0x08);   // [0 | x.low]
+        const __m256i r = _mm256_alignr_epi8(xi, t, 14);
+        return V((NV)_mm256_insert_epi16(r, b, 0));
     } else
 #endif
     return V([&](int q) { return q == 0 ? b : x[q - 1]; });
+}
+
+// ── The gap ramp k*ge_a, striped: slot (s, l) carries the ABSOLUTE column index k =
+// l*seg + s times ge_a (the prefix-max carries below and in hb_kernel_impl.inl).  A
+// scalar loop, loaded and never multiplied in a hot loop (no FMA for floating T; for an
+// integer T the product is exact anyway).
+template <class T>
+static inline void hb_ramp(T* rmp, T ge_a, int seg, int W) {
+    for (int l = 0; l < W; ++l)
+        for (int s = 0; s < seg; ++s)
+            rmp[(std::size_t)s * W + l] = static_cast<T>(l * seg + s) * ge_a;
+}
+
+// ── Integer T: the VY carry as an EXACT prefix max, no lazy-F ─────────────────────
+//
+// VY[c] = max over k <= c-1 of (open[k] + k*ge_a) minus (c-1)*ge_a (hb_sweep_striped_pmax,
+// hb_kernel_impl.inl), with the column-0 border folded in as the seed bY - ge_a.  In
+// floating point the ramp's round trip costs a rounding, which is why that carry is a
+// sibling mode there; in integer arithmetic it is exact, so every striped integer kernel
+// takes it in place of the serial chain + lazy-F fixpoint: fixed work per row (a lane-
+// local prefix max, W scalar maxes across the lanes, one parallel pass) instead of up to W
+// data-dependent correction rounds — which grow with the lane count, and int16 has 4x
+// double's lanes.  Bit-identical to the chain by construction (tested against the double
+// oracle at every level).  `ov` holds the opens per segment slot, read one segment back as
+// the chain reads them (the lane shift at s == 0 with the border's open); the ramp k*ge_a
+// is formed in a register (a lane base l*seg*ge_a, plus ge_a a segment: exact in integers,
+// and never past the ramp's last value), not read from a row — one stream fewer, which
+// moved the L1 capacity edge of the kernels that run it (nighthaven AVX2, int32: linear H
+// fill 0.79-0.90 of the row-ramp time over L1600-2400, Scores L2030 0.75, Pointers L1000
+// 0.90-0.93, 0.98-1.02 inside L1); Y lands in cY (+off), and P (the prefix maxima) rides in
+// cY between the two passes.
+// Codes (`ok`, `yc` non-null): the Y code is the open's (ok, shifted like ov) when the
+// open at column c-1 is at least the prefix before it — Q[c-1] >= max(seed, Q[0..c-2]) —
+// else 2 (extension): exactly `O >= ext` of the chain, since ext = that prefix - (c-1)*ge.
+// Loads and stores of a std::simd through the GCC vector type of its width.  gcc lowered
+// `copy_to` of an INTEGER simd (vector_aligned or not) to a memcpy through the value's
+// address: the loop-carried prefix max below was kept on the stack and copied into the
+// row through two general-purpose registers per vector (40 % of the sse4 int32 carry,
+// the score kernel at 1.6x its lazy-F time).  A store through the native vector type is
+// one instruction under both compilers.  (The types are spelled per width: gcc drops a
+// dependent `vector_size` in an alias template to the scalar.)
+template <class T, int Bytes> struct NVecOf;
+#define NWGRAD_NV(T, B) template <> struct NVecOf<T, B> { typedef T type __attribute__((vector_size(B))); };
+NWGRAD_NV(int16_t, 16) NWGRAD_NV(int16_t, 32) NWGRAD_NV(int16_t, 64)
+NWGRAD_NV(int32_t, 16) NWGRAD_NV(int32_t, 32) NWGRAD_NV(int32_t, 64)
+NWGRAD_NV(int64_t, 16) NWGRAD_NV(int64_t, 32) NWGRAD_NV(int64_t, 64)
+#undef NWGRAD_NV
+template <class V> [[gnu::always_inline]] static inline V nv_load(const typename V::value_type* p) {
+    using NV = typename NVecOf<typename V::value_type, (int)(sizeof(typename V::value_type) * V::size())>::type;
+    return V(*reinterpret_cast<const NV*>(p));
+}
+template <class V> [[gnu::always_inline]] static inline void nv_store(typename V::value_type* p, const V& x) {
+    using NV = typename NVecOf<typename V::value_type, (int)(sizeof(typename V::value_type) * V::size())>::type;
+    *reinterpret_cast<NV*>(p) = static_cast<NV>(x);
+}
+
+// x moved K lanes up, the low K lanes filled from f.  f is a SPLAT at every call, so the fill
+// is taken from f's TOP lanes (f[W-K+I]), which spells the shuffle as one contiguous window
+// of the pair (f, x): AArch64 `ext`, AVX2 `vperm2i128` + `vpalignr`.  Filling from f[I] (the
+// same values) compiled under gcc 16 on NEON to a two-register `tbl` whose operands went
+// through the stack, three round trips in the carry, and an index load per row (int16 1.015-
+// 1.026 of the scalar scan on the M1; 0.906-0.950 this way).
+template <class NV, int W, int K, std::size_t... I>
+[[gnu::always_inline]] static inline NV nv_shift_up_(NV x, NV f, std::index_sequence<I...>) {
+    return __builtin_shufflevector(x, f, (I < (std::size_t)K ? 2 * W - K + (int)I : (int)I - K)...);
+}
+template <class NV, int W, int K>
+[[gnu::always_inline]] static inline NV nv_shift_up(NV x, NV f) {
+    return nv_shift_up_<NV, W, K>(x, f, std::make_index_sequence<W>{});
+}
+// The carry-in of every lane: cin[l] = max(seed, P[0..l-1]), an exclusive prefix max across
+// the lanes.  In registers, log2(W) shift + max steps, where the scalar form stored P,
+// walked the lanes through a cmov chain and read cin back as one vector from W narrow
+// stores (a load no store can forward).  Integer max is exact and associative, so the
+// lanes carry the same values either way.  Time / scalar form (2026-10-25, medians of 9,
+// controls 0.98-1.02): nighthaven AVX2 0.84-0.95 at L100-300 (int16 / int32 Scores,
+// Pointers, linear), 0.97-1.01 at L1000; solace AVX-512 0.73-0.90, L1000 0.99; spot NEON
+// (M1, g++-16) 0.85-0.98, int16 Scores 0.91-0.95.
+// NWGRAD_SCALAR_LANE_SCAN forces the scalar form.
+#if !defined(NWGRAD_SCALAR_LANE_SCAN) && defined(__has_builtin)
+#if __has_builtin(__builtin_shufflevector)
+#define NWGRAD_LANE_SCAN_REG 1
+#endif
+#endif
+template <class vd, int W>
+[[gnu::always_inline]] static inline vd int_lane_carry_in(const vd& P, typename vd::value_type seed) {
+    using T = typename vd::value_type;
+#ifdef NWGRAD_LANE_SCAN_REG
+    using NV = typename NVecOf<T, (int)(sizeof(T) * W)>::type;
+    const NV ninf = static_cast<NV>(vd(nw_ninf<T>));
+    NV x = static_cast<NV>(P);
+    auto mx = [](NV a, NV b) __attribute__((always_inline)) { return a > b ? a : b; };
+    x = mx(x, nv_shift_up<NV, W, 1>(x, ninf));
+    if constexpr (W > 2)  x = mx(x, nv_shift_up<NV, W, 2>(x, ninf));
+    if constexpr (W > 4)  x = mx(x, nv_shift_up<NV, W, 4>(x, ninf));
+    if constexpr (W > 8)  x = mx(x, nv_shift_up<NV, W, 8>(x, ninf));
+    if constexpr (W > 16) x = mx(x, nv_shift_up<NV, W, 16>(x, ninf));
+    static_assert(W <= 32, "int_lane_carry_in: more lanes than steps");
+    const NV vs = static_cast<NV>(vd(seed));
+    return vd(mx(nv_shift_up<NV, W, 1>(x, vs), vs));
+#else
+    alignas(64) T tot[64], cin[64];
+    P.copy_to(tot, stdx::element_aligned);
+    T run = seed;
+    for (int l = 0; l < W; ++l) { cin[l] = run; run = std::max(run, tot[l]); }
+    vd vcin; vcin.copy_from(cin, stdx::element_aligned);
+    return vcin;
+#endif
+}
+
+// Where the ramp is LOADED from a row instead of formed in registers: int16 at 16 lanes
+// (AVX2), in the GLOBAL striped Scores kernel only.  nighthaven, with the lane scan, row /
+// register: Global Scores L100 0.975, L140 0.943, L200 0.910; flat or worse everywhere else
+// tried — Local Scores 1.002, Pointers 0.98-0.99 (in the noise), linear H fill 1.007-1.014,
+// int16 at 32 lanes (AVX-512) 0.98-1.04, int32 (AVX2) 1.02-1.04, NEON 1.006-1.007.  int16
+// rows are short by the overflow bound (BLOSUM62 11/1: ~L300), so the extra stream never
+// meets the L1 capacity edge that put the ramp in registers (int32 L1600+).
+template <class T, int W> inline constexpr bool int_row_ramp = sizeof(T) == 2 && W == 16;
+// The ramp row of one kernel call, rebuilt only when ge_a or the segment count changes
+// (tracked rows, Hirschberg blocks).  hb_ramp's striped layout: slot (s, l) = (l*seg + s)*ge_a.
+template <class T> struct IntRampRow {
+    typename DpBufferT<T>::TVec& v;
+    T ge = T(0);
+    int seg = -1;
+    const T* get(T ge_a, int sg, int W) {
+        if (sg != seg || ge_a != ge) {
+            const std::size_t need = (std::size_t)sg * W;
+            if (v.size() < need) v.resize(need);
+            hb_ramp(v.data(), ge_a, sg, W);
+            ge = ge_a; seg = sg;
+        }
+        return v.data();
+    }
+};
+
+// Always inlined: gcc outlined it as a constant-propagated clone in every integer score
+// kernel (a call, its own frame and the lane arrays per row), where it then cost more
+// than the kernel body around it.  RowRamp: the ramp loaded from `rr`'s row (int_row_ramp).
+template <class T, int W, bool RowRamp = false>
+[[gnu::always_inline]] static inline void int_pmax_carry(const T* ov, const T* ok, T nbOpen, T nbOpenK,
+                                  T bY, T ge_a, int seg, T* cY, T* yc, T* qbuf,
+                                  IntRampRow<T>* rr = nullptr) {
+    using vd = stdx::native_simd<T>;
+    [[maybe_unused]] const T* rmp = nullptr;
+    if constexpr (RowRamp) rmp = rr->get(ge_a, seg, W);
+    const vd vtwo(T(2));
+    const vd vge(ge_a);
+    const vd rbase([&](int l) { return static_cast<T>(static_cast<T>(l * seg) * ge_a); });
+    vd rq = rbase;                          // k*ge_a for k = l*seg + s
+    vd P(nw_ninf<T>);
+    for (int s = 0; s < seg; ++s) {
+        vd O;
+        if (s == 0) {
+            vd lo; lo = nv_load<vd>(ov + (std::size_t)(seg - 1) * W);
+            O = lane_shift_in(lo, nbOpen);
+        } else {
+            O = nv_load<vd>(ov + (std::size_t)(s - 1) * W);
+        }
+        vd Q;
+        if constexpr (RowRamp) { Q = O + nv_load<vd>(rmp + (std::size_t)s * W); }
+        else                   { Q = O + rq; rq += vge; }
+        if (yc) nv_store(qbuf + (std::size_t)s * W, Q);
+        P = stdx::max(Q, P);
+        nv_store(cY + (std::size_t)s * W, P);
+    }
+    rq = rbase;
+    const vd vcin = int_lane_carry_in<vd, W>(P, static_cast<T>(bY - ge_a));
+    vd before = vcin;                       // the prefix before this segment's open
+    // Two ramps a step apart, each advanced by 2*ge_a: this pass has no other loop-carried
+    // value, and one ramp's add chain bound it on NEON (2-cycle integer add: 1.04-1.07x the
+    // row ramp on the M1; an x86 add is 1 cycle, under the loop's throughput).
+    const vd vge2 = vge + vge;
+    vd rq1 = rq + vge;
+    auto step = [&](int s, const vd& r) __attribute__((always_inline)) {
+        vd p; p = nv_load<vd>(cY + (std::size_t)s * W);
+        const vd pc = stdx::max(p, vcin);
+        nv_store(cY + (std::size_t)s * W, pc - r);
+        if (yc) {
+            vd OK, q;
+            if (s == 0) {
+                vd lk; lk = nv_load<vd>(ok + (std::size_t)(seg - 1) * W);
+                OK = lane_shift_in(lk, nbOpenK);
+            } else {
+                OK = nv_load<vd>(ok + (std::size_t)(s - 1) * W);
+            }
+            q = nv_load<vd>(qbuf + (std::size_t)s * W);
+            vd ky = OK;                           // strict: q >= before keeps the open
+#if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
+            if constexpr (sizeof(T) == 8) ky = avx512d_blend(avx512d_gt(before, q), ky, vtwo);
+            else                          stdx::where(before > q, ky) = vtwo;
+#else
+            stdx::where(before > q, ky) = vtwo;
+#endif
+            nv_store(yc + (std::size_t)s * W, ky);
+            before = pc;
+        }
+    };
+    if constexpr (RowRamp) {
+        for (int s = 0; s < seg; ++s) step(s, nv_load<vd>(rmp + (std::size_t)s * W));
+    } else {
+        int s = 0;
+        for (; s + 1 < seg; s += 2) { step(s, rq); step(s + 1, rq1); rq += vge2; rq1 += vge2; }
+        if (s < seg) step(s, rq);
+    }
 }
 
 // An empty asm on a value: the compiler must treat it as opaque.  gcc re-associates a
@@ -196,15 +495,15 @@ static inline V carry_pin(V v) {
 }
 
 // ── Tracked rows: the striped query profile ───────────────────────────────────
-// One striped profile row: prof[s*W + l] = row[b[col(l,s)-1]], padding -> -inf.
+// One striped profile row: prof[s*W + l] = row[b[col(l,s)-1]], padding -> nw_pad.
 template <class T>
 static inline void striped_profile_row(T* dst, const T* row, const unsigned char* b,
                                        int n, int seg, int W) {
-    const T ninf = -std::numeric_limits<T>::infinity();
+    const T padv = nw_pad<T>;   // -inf, or 0 for an integer T (scalar_traits.hpp)
     for (int l = 0; l < W; ++l)
         for (int s = 0; s < seg; ++s) {
             const int j = l * seg + s + 1;
-            dst[(std::size_t)s * W + l] = (j <= n) ? row[b[j - 1]] : ninf;
+            dst[(std::size_t)s * W + l] = (j <= n) ? row[b[j - 1]] : padv;
         }
 }
 // The profile rows a striped fill reads (see TrackJob): Tr with tr.ra builds one per
@@ -257,7 +556,7 @@ template <class T, bool Local, bool Tr = false>
 static void striped_affine_full(ViterbiJob<T>& job) {
     using vd = stdx::native_simd<T>;
     const int W = (int)vd::size();                       // native T-lane count for this level
-    const T K_NINF = -std::numeric_limits<T>::infinity();
+    const T K_NINF = nw_ninf<T>;
 
     const int m = job.m, n = job.n;
     const int nalpha = job.nalpha;
@@ -268,23 +567,40 @@ static void striped_affine_full(ViterbiJob<T>& job) {
     const unsigned char* a = job.a;
     const unsigned char* b = job.b;
     DpBufferT<T>& buf = *job.buf;
+    [[maybe_unused]] IntRampRow<T> irr{buf.iramp};   // int_row_ramp's row
 
     const int seg = (n + W - 1) / W;
     const std::size_t sw = (std::size_t)seg * W;
-    // VM/VX/VY hold the tables in STRIPED layout — one row of rowsz = (seg+1)*W scalars
+    // VM/VX/VY hold the tables in STRIPED layout — one row of (seg+1)*W scalars
     // per i, written in place, so the traceback/hard-gradient read them striped with no
     // per-row de-stripe copy.  Slot 0 is column 0 (the gap border); slots [W, W+sw) are
     // the striped columns 1..n (started at W so every W-wide access is aligned given the
     // 64-byte allocator — see dp_buffer.hpp), column j at W + ((j-1)%seg)*W + (j-1)/seg;
     // slots 1..W-1 pad.  aligner.hpp's cell_index() computes the identical index — the
     // two must stay in lockstep.
-    const std::size_t rowsz = (std::size_t)(seg + 1) * W;
+    // On a narrow L1D (table_spread, dp_buffer.hpp) the row STRIDE is padded past (seg+1)*W
+    // (spread_stride) and the three tables start at chosen lines of a 4 KB page
+    // (table_lines), so rows i and i-1 of VM, VX and VY sit in six distinct L1 sets:
+    // unplaced, a 4-way L1D thrashed (wloczykij int32 Local L1020 3.5x its neighbours).  The
+    // stride reaches the aligner as job.rstride.
+    const bool spread = table_spread();
+    const std::size_t rowsz = spread ? spread_stride<T>((std::size_t)(seg + 1) * W, 2)
+                                     : (std::size_t)(seg + 1) * W;
     const std::size_t off   = (std::size_t)W;   // striped columns start here (col 0 at 0)
     if (buf.sopenv.size() < sw)     buf.sopenv.resize(sw);
     const std::size_t vsz = (std::size_t)(m + 1) * rowsz;
+    {
+        if (spread) {
+            const TableLines tl = table_lines(rowsz * sizeof(T) / 64);
+            buf.VM.place(0); buf.VX.place(tl.a); buf.VY.place(tl.b);
+        } else {
+            buf.VM.place(-1); buf.VX.place(-1); buf.VY.place(-1);
+        }
+    }
     // Per vector, never keyed on one (see kernels_pointers_impl.inl): a fill that grows
-    // only part of a group must not leave the rest short for the next one.
-    for (auto* v : {&buf.VM, &buf.VX, &buf.VY}) if (v->size() < vsz) v->resize(vsz);
+    // only part of a group must not leave the rest short for the next one.  resize() also
+    // applies the placement, so it runs even when the size suffices.
+    for (auto* v : {&buf.VM, &buf.VX, &buf.VY}) v->resize(std::max(v->size(), vsz));
     // striped slot within a row (offset past slot 0) for DP column j in 1..n
     auto scol = [seg](int j) -> std::size_t {
         return (std::size_t)((j - 1) % seg) * W + (j - 1) / seg;
@@ -379,7 +695,12 @@ static void striped_affine_full(ViterbiJob<T>& job) {
                 ((stdx::max(vmv, vxv) - vgo_a) - vge_a).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
             }
 
-            // ── the carry: VY, same-lane striped chain + lazy-F ──
+            // ── the carry: VY, same-lane striped chain + lazy-F (integer T: the exact
+            // prefix max, int_pmax_carry) ──
+            if constexpr (nw_is_int<T> && W >= 4) {
+                int_pmax_carry<T, W, int_row_ramp<T, W> && !Local>(ov, nullptr, nbOpen, T(0), bY,
+                                     ge_a, seg, cY, nullptr, nullptr, &irr);
+            } else {
             vd prev([&](int q) { return q == 0 ? bY : K_NINF; });
             for (int s = 0; s < seg; ++s) {
                 vd O;
@@ -419,26 +740,19 @@ static void striped_affine_full(ViterbiJob<T>& job) {
                     // early-exit gate.  -DNWGRAD_STD_SIMD_AVX512_MASK_OK forces the std::simd
                     // form back if a future clang compiles it.
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
-                    if constexpr (std::is_same_v<T, double>) {
-                        alignas(64) double fa[8], va[8];
-                        F.copy_to(fa, stdx::element_aligned);
-                        v.copy_to(va, stdx::element_aligned);
-                        if (_mm512_cmp_pd_mask(_mm512_load_pd(fa),
-                                               _mm512_load_pd(va), _CMP_GT_OQ) == 0)
-                            break;
-                    } else {
-                        if (!stdx::any_of(F > v)) break;
-                    }
+                    if constexpr (sizeof(T) == 8) { if (!avx512d_any_gt(F, v)) break; }
+                    else { if (!stdx::any_of(F > v)) break; }
 #else
                     if (!stdx::any_of(F > v)) break;
 #endif
                     v = stdx::max(v, F);
                     v.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
-                    F = v - vge_a;
+                    F = lazy_f_next(F, v, vge_a);
                     changed = true;
                 }
                 if (!changed) break;
             }
+            }   // integer / floating carry
 
             // ── Local: argmax over this row, j ascending, reading the striped cells,
             // with the scalar kernel's M>X>Y tie-break and strict > (bit-exact path) ──
@@ -464,6 +778,7 @@ static void striped_affine_full(ViterbiJob<T>& job) {
     job.table_layout = 1;   // striped (seg/width below tell the traceback how to index)
     job.seg = seg;
     job.width = W;
+    job.rstride = rowsz;
 }
 
 // The registered entry for a level, per precision: dispatch Full by mode.  GuideBanded

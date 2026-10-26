@@ -17,6 +17,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cmath>
 #include <cstdlib>
 #include <random>
 #include <string>
@@ -138,6 +139,22 @@ int main(int argc, char** argv) {
             bench_cfg<GapModel::Affine, AlignMode::Local,  float >(name("aff loc  f32"), P, p, threads, reps);
             bench_cfg<GapModel::Linear, AlignMode::Global, double>(name("lin glob f64"), P, p, threads, reps);
             bench_cfg<GapModel::Linear, AlignMode::Local,  float >(name("lin loc  f32"), P, p, threads, reps);
+            // The integer types, on integral parameters (the real matrix x3 rounded, gaps
+            // 10 / 1), with float32 on the same parameters as their reference.
+            // NWGRAD_BENCH_INT=0 skips them.
+            if (const char* e = std::getenv("NWGRAD_BENCH_INT"); !e || e[0] != '0') {
+                AlignParams pi(A);
+                for (int x = 0; x < A.size(); ++x)
+                    for (int y = 0; y < A.size(); ++y) pi.matrix.at(x, y) = std::round(3.0 * p.matrix.at(x, y));
+                pi.gap_open_a = pi.gap_open_b = 10.0;
+                pi.gap_extend_a = pi.gap_extend_b = 1.0;
+                bench_cfg<GapModel::Affine, AlignMode::Local,  float  >(name("aff loc  f32i"), P, pi, threads, reps);
+                bench_cfg<GapModel::Affine, AlignMode::Local,  int16_t>(name("aff loc  i16"), P, pi, threads, reps);
+                bench_cfg<GapModel::Affine, AlignMode::Local,  int32_t>(name("aff loc  i32"), P, pi, threads, reps);
+                bench_cfg<GapModel::Affine, AlignMode::Local,  int64_t>(name("aff loc  i64"), P, pi, threads, reps);
+                bench_cfg<GapModel::Affine, AlignMode::Global, int16_t>(name("aff glob i16"), P, pi, threads, reps);
+                bench_cfg<GapModel::Affine, AlignMode::Global, int32_t>(name("aff glob i32"), P, pi, threads, reps);
+            }
         }
     }
     std::fprintf(stderr, "sink %g\n", sink);

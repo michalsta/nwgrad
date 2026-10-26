@@ -4,14 +4,16 @@
 TEST_CASE("header-only consumer links no dispatched kernels", "[header-only]") {
     for (SimdLevel level : detect_available_levels()) {
         const auto& k = level_kernels(static_cast<int>(level));
-        REQUIRE(k.viterbi == nullptr);
-        REQUIRE(k.viterbi_f == nullptr);
-        REQUIRE(k.score == nullptr);
-        REQUIRE(k.score_f == nullptr);
-        REQUIRE(k.hb_sweep == nullptr);
-        REQUIRE(k.hb_sweep_f == nullptr);
-        REQUIRE(k.inter_fill == nullptr);
-        REQUIRE(k.inter_fill_f == nullptr);
+        REQUIRE(k.d.viterbi == nullptr);
+        REQUIRE(k.f.viterbi == nullptr);
+        REQUIRE(k.i32.viterbi == nullptr);
+        REQUIRE(k.d.score == nullptr);
+        REQUIRE(k.f.score == nullptr);
+        REQUIRE(k.d.hb_sweep == nullptr);
+        REQUIRE(k.f.hb_sweep == nullptr);
+        REQUIRE(k.d.inter_fill == nullptr);
+        REQUIRE(k.f.inter_fill == nullptr);
+        REQUIRE(k.i16.inter_fill == nullptr);
         REQUIRE(k.inter_soft == nullptr);
     }
 }
