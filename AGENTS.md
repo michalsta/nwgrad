@@ -924,24 +924,31 @@ two-segment pass the rest (Hirschberg 0.90-0.91, linear 0.84-0.89 on top; Pointe
 threads, where the table traffic bounds it). No gate: no path, precision or thread count lost.
 Pointers / Scores at 12 threads stay table-bandwidth bound.
 
-AVX-512 and NEON, the same A/B (`491fb05` vs `6e889b0`, best of 5; control 0.99-1.02):
+AVX-512 and NEON, the same A/B (`491fb05` vs `6e889b0` on solace, vs `ced6d2f` -- the AArch64
+pin below -- on spot; best of 5; control 0.97-1.02):
 
 | fill / path | solace avx512, 1 thr | 8 thr | spot neon (macOS, Homebrew gcc 16), 1 thr | 4 thr |
 |---|---|---|---|---|
-| Hirschberg (exact) f32 / f64 | 0.74 / 0.78 | 0.74 / 0.78 | 0.83 / 0.90 | 0.83 / 0.90 |
-| Pointers Global f32 / f64 | 0.79 / 0.86 | 0.88 / 0.88 | 0.92 / 0.96 | 0.92 / 0.96 |
-| Pointers Local f64 | 0.89 | 0.93 | 0.97 | 0.98 |
-| Scores Global f64 | 0.88 | 1.00 | 0.93 | 0.99 |
-| hirschberg_pmax f32 | 0.90 | 0.90 | 0.98 | 0.96 |
-| linear Pointers / Hirschberg f64 | 0.92 / 0.88 | 0.96 / 0.90 | 0.99 / 0.99 | 0.99 / 0.99 |
-| score-only prot_align / prot_align64 / conv | 0.68 / 0.75 / 0.70 | 0.71 / 0.77 / 0.71 | 0.79 / 0.87 / 0.81 | 0.78 / 0.87 / 0.81 |
-| score-only Manakov (3 sections) | 1.00-1.01 | 0.99-1.00 | 1.00 | 1.00 |
+| Hirschberg (exact) f32 / f64 | 0.74 / 0.78 | 0.74 / 0.78 | 0.79 / 0.83 | 0.79 / 0.83 |
+| Pointers Global f32 / f64 | 0.79 / 0.86 | 0.88 / 0.88 | 0.89 / 0.91 | 0.89 / 0.91 |
+| Pointers Local f64 | 0.89 | 0.93 | 0.94 | 0.94 |
+| Scores Global f64 | 0.88 | 1.00 | 0.85 | 1.00 |
+| hirschberg_pmax f32 | 0.90 | 0.90 | 0.94 | 0.94 |
+| linear Pointers / Hirschberg f64 | 0.92 / 0.88 | 0.96 / 0.90 | 0.89 / 0.88 | 0.89 / 0.88 |
+| score-only prot_align / prot_align64 / conv | 0.68 / 0.75 / 0.70 | 0.71 / 0.77 / 0.71 | 0.71 / 0.75 / 0.74 | 0.71 / 0.75 / 0.74 |
+| score-only Manakov (mk_align on spot) | 1.00-1.01 | 0.99-1.00 | 1.00 | 1.01 |
 
 solace (Gentoo) ran with an `emerge world` frozen by `portage-freeze` for the run (frozen 1,
 outside_cgroup none throughout; thawed after), beside an X session at ~0.5 core. No loss on
-either. AVX-512 gains less than AVX2 (lazy-F's visits per row do not shrink with the width),
-NEON less again: there `carry_pin` is a no-op, so gcc may re-associate the two-segment carry
-(not checked in the disassembly; an AArch64 `"+w"` pin is the next thing to try).
+either. AVX-512 gains less than AVX2 (lazy-F's visits per row do not shrink with the width).
+NEON first measured 0.79-0.99 with `carry_pin` a no-op on AArch64; the disassembly (spot,
+Homebrew gcc 16) showed gcc re-associating both two-segment carries exactly as on x86: the D/X
+main pass as max(max(t2, Oin - g), O(s)) and `carry_pass` as max(max(t2, O(s+1)), O(s) - g), two
+fmaxnm on the chain. The AArch64 pin (`"+w"` on float32x4_t / float64x2_t, `ced6d2f`) restores one
+fmaxnm per two segments; lazy-F's carry was already a bare fsub. Pinned vs unpinned on spot: fills
+0.89-0.98 (linear 0.88-0.90, Hirschberg 0.92-0.95), score-only protein 0.86-0.92, Manakov 1.00.
+Checked on NEON: the C++ suite (2.73 M assertions), the Python suite, `fuzz_ab.py` vs main (200
+seeds, 0 differ).
 
 ### Linear gaps: Pointers and Hirschberg (2026-10-05)
 
