@@ -431,12 +431,14 @@ public:
     }
 
     // Free the stored paths.  Scores, published gradients and guides stay.
-    // Both also free the single-pair DP buffer (solo_), which is only a cache.
+    // Both also free the single-pair DP buffer (solo_), which is only a cache; drop_paths()
+    // the workers' pooled buffers too.
     void drop_paths() noexcept {
         std::vector<std::vector<uint32_t>>().swap(path_);
         std::vector<std::array<int, 2>>().swap(path_end_);
         for (auto& f : flags_) f &= static_cast<uint8_t>(~kStored);
         solo_.reset();
+        drop_pool_();
     }
     void drop_path(size_t i) noexcept {
         if (i < path_.size()) { std::vector<uint32_t>().swap(path_[i]); }
@@ -1589,7 +1591,45 @@ private:
             band.set_soft_impl(e.s_.soft_impl);
             band.set_soft_temperature(e.s_.soft_temperature);
         }
+        // State valid for one call only, reset when a pooled Work starts a new one: swp is
+        // compared by ADDRESS (a new call's params may sit where the last one's did).
+        void new_call() noexcept { swp = nullptr; tcbuf = nullptr; }
     };
+    // The workers' Works, kept between calls and leased one per worker per call, as
+    // solo_ is for single pairs: a fresh Work per call first-touched its DP buffers (the
+    // Pointers tables, the Grid lines) in every worker at once, and those page faults
+    // serialize — nighthaven, 12 threads, L3000: Pointers and Grid 1.x-2x the time of a
+    // warm buffer (AGENTS.md, "Grid traceback").  At most n_threads Works are pooled (the
+    // same footprint a call holds anyway, now kept until drop_paths() or the batch dies).
+    // (the mutex through a pointer: SeqPairBatchT moves its engine, and std::mutex cannot)
+    mutable std::unique_ptr<std::mutex> pool_mu_ = std::make_unique<std::mutex>();
+    mutable std::vector<std::unique_ptr<Work>> pool_;
+    struct WorkLease {
+        const BatchEngine& e;
+        std::unique_ptr<Work> w;
+        explicit WorkLease(const BatchEngine& eng) : e(eng) {
+            {
+                std::lock_guard<std::mutex> lock(*e.pool_mu_);
+                if (!e.pool_.empty()) { w = std::move(e.pool_.back()); e.pool_.pop_back(); }
+            }
+            if (w) { w->configure(e); w->new_call(); }
+            else   w = std::make_unique<Work>(e);
+        }
+        ~WorkLease() {
+            try {
+                std::lock_guard<std::mutex> lock(*e.pool_mu_);
+                e.pool_.push_back(std::move(w));
+            } catch (...) {}   // a failed push frees the Work; the next call builds one
+        }
+        WorkLease(const WorkLease&) = delete;
+        WorkLease& operator=(const WorkLease&) = delete;
+        Work& operator*() const noexcept { return *w; }
+    };
+    void drop_pool_() const noexcept {
+        if (!pool_mu_) return;   // moved from
+        std::lock_guard<std::mutex> lock(*pool_mu_);
+        pool_.clear();
+    }
     // The calling thread's Work for single-pair operations (SeqPair's align() and
     // friends), kept between calls: a fresh one per call re-allocated the DP tables
     // every time, which the pre-0.6 SeqPair (pair-owned tables) did not — measured
@@ -2137,7 +2177,8 @@ private:
         const bool want_post = soft && s_.soft_guide_posterior && !keep;
         std::atomic<size_t> idx{0};
         auto worker = [&]() {
-            Work w(*this);
+            WorkLease lease(*this);
+            Work& w = *lease;
             std::vector<const unsigned char*> a, b;
             std::vector<int> m, bi, bj, nb;
             std::vector<T> best, blkT;
@@ -2329,7 +2370,8 @@ private:
         const size_t G = groups.size(), tasks = G + other.size();
         std::atomic<size_t> idx{0};
         auto worker = [&]() {
-            Work w(*this);
+            WorkLease lease(*this);
+            Work& w = *lease;
             std::vector<const unsigned char*> a, b;
             std::vector<int> m, bi, bj, blo, bhi, ulo, uhi, bri, brj;
             std::vector<T> best, blkT;
@@ -2395,8 +2437,8 @@ private:
     // inter-pair score kernel for the plan's groups — and no Viterbi table or traceback.
     // The guides banded_grad() bands around become PENDING, resolved on first use under
     // the params scored here (gparams_), so they are exactly the guides the eager
-    // path would have stored.  Scores are the exact optimum (the Pointers fill's score):
-    // under float32 `auto` the traceback-bearing modes report hirschberg_pmax's instead.
+    // path would have stored.  Scores are the exact optimum (the Pointers fill's score), as
+    // `auto`'s Grid reports too (a float32 hirschberg_pmax pair may report a hair below).
     void score_only_() {
         gparams_ = params_;
         const size_t N = size();
@@ -2406,7 +2448,8 @@ private:
         const size_t tasks = inter ? G + plan_.other.size() : N;
         std::atomic<size_t> idx{0};
         auto worker = [&]() {
-            Work w(*this);
+            WorkLease lease(*this);
+            Work& w = *lease;
             std::vector<const unsigned char*> a, b;
             std::vector<int> m, nb;
             std::vector<T> best, blkT;
@@ -2471,7 +2514,8 @@ private:
         const size_t N = size();
         std::atomic<size_t> idx{0};
         auto worker = [&]() {
-            Work w(*this);
+            WorkLease lease(*this);
+            Work& w = *lease;
             for (size_t i; (i = idx.fetch_add(1, std::memory_order_relaxed)) < N; )
                 run_full_(i, w, keep);
         };
@@ -2527,7 +2571,8 @@ private:
         };
         auto worker = [&]() {
             const int k = next_worker.fetch_add(1, std::memory_order_relaxed);
-            Work w(*this);
+            WorkLease lease(*this);
+            Work& w = *lease;
             PhaseProfile pp;
             const auto t0 = clk::now();
             if (k < nthr) {
@@ -2576,7 +2621,8 @@ private:
         const size_t N = size();
         std::atomic<size_t> idx{0};
         auto worker = [&]() {
-            Work w(*this);
+            WorkLease lease(*this);
+            Work& w = *lease;
             for (size_t i; (i = idx.fetch_add(1, std::memory_order_relaxed)) < N; )
                 run_banded_(i, w, bandwidth, keep);
         };
@@ -2597,7 +2643,8 @@ private:
         std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return cost[a] > cost[b]; });
         std::atomic<size_t> idx{0};
         auto worker = [&]() {
-            Work w(*this);
+            WorkLease lease(*this);
+            Work& w = *lease;
             for (size_t k; (k = idx.fetch_add(1, std::memory_order_relaxed)) < N; )
                 run_banded_(order[k], w, bandwidth, keep);
         };
