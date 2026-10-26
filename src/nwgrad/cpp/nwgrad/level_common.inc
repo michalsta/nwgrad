@@ -28,6 +28,9 @@ namespace stdx = std::experimental;
 #if defined(__x86_64__) || defined(__i386__)
 #  include <immintrin.h>   // lane_shift_in / store_codes intrinsic forms at every level
 #endif
+#if defined(__aarch64__)
+#  include <arm_neon.h>    // carry_pin's AArch64 form (kernels_impl.inl)
+#endif
 
 #include "dp_buffer.hpp"
 #include "simd_levels.hpp"

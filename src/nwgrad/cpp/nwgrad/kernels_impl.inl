@@ -458,8 +458,7 @@ template <class T, int W, bool RowRamp = false>
 // max of maxes (max is exact, so it may), and in the two-segment gap carry it turned the
 // off-chain max(P, chain) back into max(max(chain, a), b) -- two maxes on the
 // loop-carried chain again (nighthaven, gcc 16: the carry's gain fell from ~30% to ~12%).
-// clang keeps the order written, so gcc only.  x86 only: on AArch64 the pin is a no-op
-// (exact either way; the gcc/NEON speed is unmeasured).
+// clang keeps the order written, so gcc only (x86 and AArch64).
 #ifndef NWGRAD_CARRY_PIN_DEFINED
 #  define NWGRAD_CARRY_PIN_DEFINED
 #  if defined(__GNUC__) && !defined(__clang__)
@@ -489,6 +488,15 @@ static inline V carry_pin(V v) {
     } else if constexpr (std::is_same_v<T, double> && B == 64) {
         __m512d r = static_cast<__m512d>(v); __asm__("" : "+v"(r)); return V(r);
 #  endif
+    }
+#elif defined(__GNUC__) && !defined(__clang__) && defined(__aarch64__)
+    // gcc does the same on AArch64: without the pin the two-segment carry compiled to
+    // max(max(t2, Oin - g), O) -- two fmaxnm on the chain (spot, Homebrew gcc 16).
+    using T = typename V::value_type;
+    if constexpr (std::is_same_v<T, float> && V::size() == 4) {
+        float32x4_t r = static_cast<float32x4_t>(v); __asm__("" : "+w"(r)); return V(r);
+    } else if constexpr (std::is_same_v<T, double> && V::size() == 2) {
+        float64x2_t r = static_cast<float64x2_t>(v); __asm__("" : "+w"(r)); return V(r);
     }
 #endif
     return v;
