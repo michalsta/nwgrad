@@ -46,6 +46,14 @@ linear-memory recursion above that. Global float32 and int16/int32 keep
 `"pointers"` at every size — select `traceback="hirschberg"` explicitly for very long
 local pairs (e.g. >10k residues), where the pointer table would not fit.
 
+Past a size, `"pointers"` records **dense** direction codes — 2 bits per code, four
+cells per byte for linear gaps and four cells in three bytes for affine — where the
+smaller table outweighs the extra packing work. That size depends on the SIMD level,
+gap model, mode and number type. Dense codes are used on AVX2 and AVX-512, and on
+NEON for linear float32 / int32 and affine int32, float32 and local float64. SSE2 /
+SSE4 and the scalar fill always use one byte per cell. The path is bit-identical
+either way. `NWGRAD_DENSE_CODES=0` / `=1` forces the format (for A/B timing).
+
 Recursive Hirschberg (pairs with `len(seq_a) > hb_cutoff`) requires non-negative
 gap penalties; linear gaps ignore the gap-open fields. An explicit
 `"hirschberg"` or `"hirschberg_pmax"` request raises `ValueError` otherwise.

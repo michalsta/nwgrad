@@ -173,7 +173,8 @@ TEST_CASE("dense codes: the auto gate engages by pair size", "[dense][pointers]"
     // the unmeasured levels and the scalar fill never write them
     STATIC_REQUIRE(Aligner<GapModel::Affine, AlignMode::Global, AlignBand::Full, int16_t>::kDenseFromCellsAvx2 == 0);
     STATIC_REQUIRE(Aligner<GapModel::Affine, AlignMode::Global, AlignBand::GuideBanded, double>::kDenseFromCellsAvx2 == 0);
-    STATIC_REQUIRE(Aligner<GapModel::Affine, AlignMode::Global, AlignBand::Full, float>::kDenseFromCellsNeon == 0);
+    STATIC_REQUIRE(Aligner<GapModel::Affine, AlignMode::Global, AlignBand::Full, double>::kDenseFromCellsNeon == 0);
+    STATIC_REQUIRE(Aligner<GapModel::Affine, AlignMode::Local, AlignBand::Full, double>::kDenseFromCellsNeon != 0);
     STATIC_REQUIRE(Aligner<GapModel::Linear, AlignMode::Global, AlignBand::Full, double>::kDenseFromCellsNeon == 0);
     int level = -1;
     for (SimdLevel l : detect_available_levels()) {
@@ -193,7 +194,8 @@ TEST_CASE("dense codes: the auto gate engages by pair size", "[dense][pointers]"
 #if defined(__aarch64__) || defined(_M_ARM64)
     CHECK_FALSE(gate_writes<GapModel::Linear>(rng, 500, level));    // 251 k cells
     CHECK(gate_writes<GapModel::Linear>(rng, 1100, level));         // 1.21 M cells
-    CHECK_FALSE(gate_writes<GapModel::Affine>(rng, 1100, level));   // affine: never on NEON
+    CHECK_FALSE(gate_writes<GapModel::Affine>(rng, 500, level));    // affine int32: from 2^18 (262 k)
+    CHECK(gate_writes<GapModel::Affine>(rng, 1100, level));
 #else
     CHECK_FALSE(gate_writes<GapModel::Affine>(rng, 500, level));    // 251 k cells: in cache
     CHECK(gate_writes<GapModel::Affine>(rng, 2100, level));         // 4.4 M: past avx2 2^20, avx512 2^22

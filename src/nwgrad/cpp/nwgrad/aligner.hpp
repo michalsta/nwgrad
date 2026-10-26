@@ -631,9 +631,16 @@ struct Aligner {
     // everywhere (gains of 2-4 % only at 64 threads, int32 affine and linear double) -- off.
     // NEON (M1, 1-8 threads): affine and linear double lost 4-18 % at every size (no memory
     // wall there); linear float32 / int32 won 7-10 % at every size measured (L1000-5800).
+    // NEON (M1): linear float32 / int32 from 2^20; affine int32 and Local double from 2^18
+    // (0.92-0.98 from L500), float32 from 2^22 (parity at L500, 0.95-0.98 above); affine
+    // Global double off (1.00-1.05 even with the weighted pass 1); linear double off.
     static constexpr std::size_t kDenseFromCellsNeon =
-        (GM == GapModel::Linear && AB == AlignBand::Full &&
-         (std::is_same_v<T, float> || std::is_same_v<T, int32_t>)) ? std::size_t(1) << 20 : 0;
+        AB != AlignBand::Full ? 0
+        : GM == GapModel::Linear
+            ? ((std::is_same_v<T, float> || std::is_same_v<T, int32_t>) ? std::size_t(1) << 20 : 0)
+        : std::is_same_v<T, int32_t> ? std::size_t(1) << 18
+        : std::is_same_v<T, float>   ? std::size_t(1) << 22
+        : (std::is_same_v<T, double> && AM == AlignMode::Local) ? std::size_t(1) << 18 : 0;
     void set_hb_cutoff(int rows) {
         if (rows < 1)
             throw std::invalid_argument("nwgrad: hb_cutoff must be >= 1");
