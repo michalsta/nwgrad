@@ -240,11 +240,15 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                 dgY = lane_shift_in(lY, bY);
             }
             vd accM = vzero, accX = vzero;   // Dense: this group's M / X codes so far
-            // One segment of pass 1.  R: its place in a dense group -- the codes come out already
-            // weighted for the group's byte (segment R at shift 2*(3-R), dense_code_at), so
-            // accumulating costs one add a plane where 4*acc + k cost three.
+            // One segment of pass 1.  R: its place in a dense group.  Floating T (kWeighted): the
+            // codes come out already weighted for the group's byte (segment R at shift 2*(3-R),
+            // dense_code_at), so accumulating costs one add a plane where 4*acc + k cost three
+            // dependent floating adds -- on NEON double (two lanes a segment) that was the cost of
+            // the dense codes.  Integer T keeps 4*acc + k (1-cycle adds), the groups not unrolled:
+            // unrolling them measured 2-8 % slower on AVX2 int32 at L2000-5800.
+            constexpr bool kWeighted = Dense && !nw_is_int<T>;
             auto seg_body = [&](int s, auto R) __attribute__((always_inline)) {
-                constexpr T wt = Dense ? static_cast<T>(1 << (2 * (3 - decltype(R)::value))) : T(1);
+                constexpr T wt = kWeighted ? static_cast<T>(1 << (2 * (3 - decltype(R)::value))) : T(1);
                 const vd cM1(Dense ? wt : T(1)), cM2(Dense ? 2 * wt : T(2)), cM3(Dense ? 3 * wt : T(3));
                 const vd cX1 = Dense ? cM1 : kX1, cX2 = Dense ? cM2 : kX2;
                 vd sb; sb.copy_from(sub + (std::size_t)s * W, stdx::element_aligned);
@@ -300,9 +304,12 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                 kx = pick_code_mx(vxv, ax, bx, cx, vzero, cX1, cX2);
 #endif
                 vxv.copy_to(cX + off + (std::size_t)s * W, stdx::element_aligned);
-                if constexpr (Dense) {   // M and X are final: their planes now (codes already x 4^(3-R))
+                if constexpr (kWeighted) {   // M and X are final: their planes now (codes x 4^(3-R))
                     accM += km;
                     accX += kx;
+                } else if constexpr (Dense) {
+                    accM = accM + accM; accM = accM + accM; accM = accM + km;
+                    accX = accX + accX; accX = accX + accX; accX = accX + kx;
                 } else {
                     (km + kx).copy_to(mx + (std::size_t)s * W, stdx::element_aligned);
                 }
@@ -329,7 +336,7 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                     okv.copy_to(ok + (std::size_t)s * W, stdx::element_aligned);
                 }
             };
-            if constexpr (Dense) {
+            if constexpr (kWeighted) {
                 // groups of four segments, unrolled so R is a constant; a group's planes stored
                 // after it (a short last group leaves its missing fields 0)
                 using I0 = std::integral_constant<int, 0>; using I1 = std::integral_constant<int, 1>;
@@ -344,8 +351,19 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                     store_codes<T, W>(accM, g); store_codes<T, W>(accX, g + W);
                     accM = vzero; accX = vzero;
                 }
+            } else if constexpr (Dense) {   // integer T: 4*acc + k over each group
+                for (int s0 = 0; s0 < seg; s0 += 4) {
+                    const int s1 = std::min(seg - s0, 4) + s0;
+                    for (int s = s0; s < s1; ++s) seg_body(s, std::integral_constant<int, 3>{});
+                    for (int s = s1; s < s0 + 4; ++s) {   // short group: fixed shifts
+                        accM = accM + accM; accM = accM + accM; accX = accX + accX; accX = accX + accX;
+                    }
+                    unsigned char* g = dP + (std::size_t)(s0 >> 2) * 3 * W;
+                    store_codes<T, W>(accM, g); store_codes<T, W>(accX, g + W);
+                    accM = vzero; accX = vzero;
+                }
             } else {
-                for (int s = 0; s < seg; ++s) seg_body(s, std::integral_constant<int, 0>{});
+                for (int s = 0; s < seg; ++s) seg_body(s, std::integral_constant<int, 3>{});
             }
 
             // ── the carry: VY, same-lane striped chain + lazy-F, codes tracked (integer
