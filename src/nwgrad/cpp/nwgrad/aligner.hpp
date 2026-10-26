@@ -615,6 +615,20 @@ struct Aligner {
         else                                                               // linear Local
             return std::is_same_v<T, float> ? 4 * M1 : 16 * M1;
     }();
+    // AVX-512 (solace, 1 / 8 / 16 threads): every crossover came earlier than AVX2's -- affine
+    // Global from L2000 (0.83-0.99), linear float32 L2000, int32 L1000 (0.87-0.90), double
+    // L4000.  Local not measured there: AVX2's thresholds, which are higher.
+    static constexpr std::size_t kDenseFromCellsAvx512 = [] {
+        constexpr std::size_t M1 = std::size_t(1) << 20;
+        if constexpr (sizeof(T) < 4 || AB != AlignBand::Full) return std::size_t(0);
+        else if constexpr (AM == AlignMode::Local) return kDenseFromCellsAvx2;
+        else if constexpr (GM == GapModel::Affine)
+            return std::is_same_v<T, int64_t> ? 16 * M1 : 4 * M1;          // int64 unmeasured: AVX2's
+        else if constexpr (std::is_same_v<T, double>) return 16 * M1;
+        else return std::is_same_v<T, float> ? 4 * M1 : M1;
+    }();
+    // sse2 / sse4 (wloczykij, Piledriver, 1 / 16 / 64 threads): dense lost 6-24 % almost
+    // everywhere (gains of 2-4 % only at 64 threads, int32 affine and linear double) -- off.
     // NEON (M1, 1-8 threads): affine and linear double lost 4-18 % at every size (no memory
     // wall there); linear float32 / int32 won 7-10 % at every size measured (L1000-5800).
     static constexpr std::size_t kDenseFromCellsNeon =
@@ -1926,7 +1940,8 @@ private:
 #if defined(__aarch64__) || defined(_M_ARM64)
         const std::size_t from = backend >= 0 ? kDenseFromCellsNeon : 0;
 #else
-        const std::size_t from = backend == static_cast<int>(SimdLevel::Avx2) ? kDenseFromCellsAvx2 : 0;
+        const std::size_t from = backend == static_cast<int>(SimdLevel::Avx2)   ? kDenseFromCellsAvx2
+                               : backend == static_cast<int>(SimdLevel::Avx512) ? kDenseFromCellsAvx512 : 0;
 #endif
         return from != 0 &&
                (static_cast<std::size_t>(m_) + 1) * (static_cast<std::size_t>(n_) + 1) >= from;
