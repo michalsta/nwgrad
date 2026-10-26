@@ -1086,7 +1086,12 @@ p0 = fresh Work per call, p1 = pooled; HP = the huge-page hint):
 | Pointers f64 12 thr L3000 / L10000 | 1.06 / 1.39 | 0.86 / 0.93 | **0.49 / 0.49** |
 | Grid f64 12 thr L3000 / L10000 | 0.165 / 0.151 | 0.148 / 0.141 | **0.132 / 0.128** |
 
-(score-only 0.07 / 0.11 ns at 12 threads, 0.45 / 0.72 at 1.)  Pointers at L10000 had been 11-17x
+(score-only 0.07 / 0.11 ns at 12 threads, 0.45 / 0.72 at 1.)  solace (AVX-512, WSL2, THP and defrag
+[madvise]; the PR head, Windows side ~10-17 % busy): hint off vs on at 1 thread within noise; at 8
+threads Pointers 0.48 vs 0.58 ns (f32 L10000) and 0.64 vs 0.72 (f64 L10000), with one cell the other
+way (f32 L1000 0.22 vs 0.20) — no large regression either way, so opt-in stands.  Grid there
+1.07-1.30x score-only (1 thread) and 1.10-1.34x (8 threads); spot (NEON, macOS: no THP hint)
+0.83-1.26x, the pool changing nothing measurable.  Pointers at L10000 had been 11-17x
 score-only on one thread purely from first-touching its tables every call.  skynet (THP
 [always]): HP on/off within noise, as expected.  The pool keeps up to n_threads Works' buffers
 alive between calls — the footprint a call already had.
