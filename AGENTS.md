@@ -1514,6 +1514,28 @@ the segment count changes. int16 rows are short by the overflow bound (BLOSUM62 
 ~L300), so the extra stream never meets the L1 capacity edge that put the ramp in registers.
 Tested: C++ suite at avx2 / sse4 (nighthaven, 191 cases), Python suite at avx2 (4518
 passed), skynet gcc / clang.
+**The kernels the first round did not time (2026-10-26).** `rr_two.py` (score-only, DNA, any
+gap costs) on nighthaven, one tree, macros per arm, medians of 9, controls 0.998-1.003:
+- **Three-state score kernel** (`score_affine_striped`, negative opens): the row ramp gives
+  int16 Global L200 **0.928**, Local 0.996. Shipped like Scores: `int_row_ramp && !Local`.
+- **Hirschberg base case** (int16 DNA L1000, past the 512 cutoff): row ramp Global 0.986,
+  Local 0.997 — the base case is a small part of the run; not shipped.
+- **Fused score-only kernel** (`score_affine_striped_pos`, every `align()` / `grad_mode="none"`
+  with non-negative opens) had its OWN copy of the scalar cross-lane scan, which the first
+  round never reached. Replaced by `int_lane_carry_in`, time / scalar scan:
+
+  | fused score-only | v3 AVX2 (nighthaven) | AVX-512 (solace, game closed) | NEON (spot, macOS) |
+  |---|---|---|---|
+  | int16 Global L100 / L140 / L200 | 0.830 / 0.877 / 0.944 | 0.794 / - / 0.804 | 0.829 / - / 0.867 |
+  | int16 Local L200 | 0.859 | 0.777 | 0.869 |
+  | int32 Global L300 / Local L300 | 1.027 / 0.985 | 0.985 / 0.909 | 0.981 / 0.996 |
+  | int32 Global L1000 | 0.992 | 1.008 | 0.997 |
+
+  Shipped for int16 only (`sizeof(T) == 2`): int32 is a wash whose one loss is on v3. The
+  row ramp in this kernel (on top): L100 1.032, L140 1.004, L200 0.902, Local 1.004 — it
+  changes sign with length; not shipped.
+Bit-identical: full C++ suite at avx512 / avx2 (solace), neon (spot), avx2 / sse4
+(nighthaven), sse2 / sse4 (skynet, gcc and clang); Python suite on skynet.
 Not a kernel-speed loss: below the cliff nwgrad int32 is 1.0–1.3× parasail's scan32 and
 1.7–1.8× its striped32 at every length.
 
