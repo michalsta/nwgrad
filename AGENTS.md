@@ -1024,6 +1024,71 @@ fmaxnm per two segments; lazy-F's carry was already a bare fsub. Pinned vs unpin
 Checked on NEON: the C++ suite (2.73 M assertions), the Python suite, `fuzz_ab.py` vs main (200
 seeds, 0 differ).
 
+### Grid traceback: `traceback="grid"` (branch `cc/grid-traceback`, 2026-10-26)
+
+**Pointers' result — score bits, path, guide, `aligned()`, hard gradient — at about the cost
+of a score-only pass, in O(k (m + n)) memory.** A grid-checkpoint (FastLSA-style) traceback,
+prototyped in `tools/gridgrad/` and integrated as `TracebackMode::Grid`:
+- **Forward:** `grid_kernel_impl.inl` (leveled; `TypedKernels::grid_fwd`, registered by
+  `register_level_grid<T>`, null for integer T) runs `score_affine_striped_pos_fp`'s recurrence
+  over a rectangle from a given top row and left column (three states), saving every R-th row
+  dense and q sets of SEGMENT-ALIGNED columns (set t at segment st[t]: its W lanes are W
+  columns, one vector store per state per row).  M is re-formed at a saved line as
+  D(i-1, j-1) + s, the row pass's own sum.
+- **Walk:** `Aligner::viterbi_affine_grid` / `grid_solve` / `grid_base`.  From (m, n), the
+  block holding the current cell is solved one level down with the saved lines as its exact
+  borders; a rectangle is cut to [r0, i] x [c0, j] (nothing below / right of the entry cell
+  can be on the path); above `kGridBase` (64 x 64) cells it is gridded again, below it the
+  scalar Pointers fill (viterbi_affine_ptr's expressions and `pick`) re-fills it and the walk
+  follows its codes.  Moves go to `hops_` (backward, then reversed); `hirschberg_` is set so
+  every path consumer replays them, and `grid_` so the GUIDE follows Pointers' convention
+  (`guide_j_grid_`: the column where the path LEAVES each row; `guide_j_affine_hb` records
+  where it ENTERS — a different guide for the same path wherever a row holds a gap in A; not
+  touched here, noted for Hirschberg).  The score is the end cell's value, not a replay
+  (a replay re-rounds row 0's closed form -(go + j*ge)).
+- **Why exact:** every re-filled cell is computed from the full fill's exact values by the
+  same expressions, so it has the same value and the same code; the walk takes Pointers'
+  steps, ties included.  Tested: `tests/cpp/test_grid.cpp` (every backend, both precisions,
+  ties, 0.1 extends, small `hb_cutoff` so the recursion and its block borders run; a mutated
+  base-block tie-break fails it), `tests/Python/test_grid.py` (SeqPairBatch / SeqPair).
+- **Scope:** affine Global Full, untracked, floating T, opens >= 0 (the D/X form), a simd
+  level with the kernel, m > `hb_cutoff`.  Everything else — Local, linear, tracks, negative
+  opens, integer T, `scalar_fallback`, short pairs — runs AS Pointers, which is the same result
+  by definition, so no fallback can change an answer.  Not the `auto` default (yet).
+- **Tuning:** `kGridK` = 32 lines per dimension per level, `kGridMin` = 8, `kGridBase` = 64 x 64
+  cells (the prototype's sweep: k = 32 version B was the best time; k = 8 cuts memory ~3x for
+  ~10 %).  Memory ~ kGridK (m + n) * 3 values summed over levels: ~15 MB at 10 000 aa f64.
+- **Huge pages:** the grid buffers use `AlignedAllocator<T, 64, false>` (no MADV_HUGEPAGE).
+  The batch engine gives every worker a fresh `Work` (and DpBuffer) per call, so the grid lines
+  are first-touched by all workers at once on every call; with THP defrag [madvise] the
+  hint compacts synchronously at fault time.  nighthaven, 12 threads, f64 L3000: grid 2.11x of
+  score-only with the hint, 1.45x without (page faults 78.6 k -> 115 k per 10 calls, but
+  cheaper).  The same experiment (NWGRAD_HUGEPAGE=0) moved Pointers at 12 threads from 8.6x /
+  10.9x to 5.6x / 5.5x of score-only (L3000 / L10000): the hint, and the per-call Work, look
+  costly for the table modes too — not changed here; a pooled per-thread Work would remove the
+  first-touch cost for every mode.
+
+Measured (`tools/bench_tracebacks.py`, related protein pairs, BLOSUM62 11/1, striped per-pair
+fill, best of 3, ns/cell and x score-only; L = 300 runs as Pointers, below hb_cutoff):
+
+| host | prec | thr | L | none | pointers | hirschberg | hirschberg_pmax | **grid** |
+|---|---|---|---|---|---|---|---|---|
+| nighthaven avx2 | f32 | 1 | 1000 / 3000 / 10000 | 0.35 / 0.47 / 0.45 | 3.06 / 3.40 / 25.9x | 3.33 / 2.85 / 3.05x | 2.61 / 2.07 / 2.25x | **1.44 / 1.09 / 0.93x** |
+| | f64 | 1 | | 0.66 / 0.73 / 0.72 | 2.65 / 3.07 / 12.9x | 2.87 / 2.92 / 3.06x | 2.65 / 2.67 / 2.86x | **1.15 / 1.06 / 0.88x** |
+| | f32 | 12 | | | 3.97 / 14.3 / 18.5x | 2.81 / 2.87 / 2.85x | 2.19 / 2.03 / 2.08x | **1.33 / 1.33 / 1.11x** |
+| | f64 | 12 | | | 2.96 / 9.66 / 10.9x | 2.74 / 2.80 / 2.58x | 2.55 / 2.61 / 2.59x | **1.27 / 1.47 / 1.17x** |
+| solace avx512 | f32 | 1 | | 0.65 / 0.63 / 0.60 | 1.49 / 1.97 / 2.36x | 2.35 / 2.99 / 3.03x | 1.29 / 1.15 / 1.17x | **1.27 / 1.22 / 1.10x** |
+| | f64 | 1 | | 0.80 / 0.82 / 0.79 | 1.95 / 2.23 / 2.48x | 2.45 / 2.87 / 2.98x | 1.70 / 1.64 / 1.78x | **1.28 / 1.24 / 1.11x** |
+| | f32 | 8 | | | 1.48 / 3.36 / 3.12x | 2.31 / 3.13 / 3.03x | 1.25 / 1.14 / 1.15x | **1.24 / 1.24 / 1.13x** |
+| | f64 | 8 | | | 1.93 / 3.26 / 2.95x | 2.39 / 2.94 / 2.97x | 1.63 / 1.68 / 1.76x | **1.26 / 1.36 / 1.13x** |
+
+Against the `auto` defaults (f32 `hirschberg_pmax`, f64 `hirschberg`): nighthaven 1 thread
+1.8-2.4x (f32) and 2.5-3.5x (f64) faster, 12 threads 1.6-1.9x / 1.9-2.2x; solace roughly even
+with `hirschberg_pmax` at f32 (0.95-1.06) and 1.9-2.7x faster than `hirschberg` at f64.  The grid
+is exact where `hirschberg_pmax` is not, and Pointers' path where `hirschberg` is not.  Below
+score-only at 1 thread, L >= 3000 on nighthaven: the grid kernel keeps six rolling rows to the
+score kernel's seven.  NEON not measured yet (spot unreachable).
+
 ### Linear gaps: Pointers and Hirschberg (2026-10-05)
 
 - **`traceback="pointers"` for linear** (`viterbi_linear_ptr`): one direction byte per
