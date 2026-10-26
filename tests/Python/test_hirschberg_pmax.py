@@ -135,8 +135,8 @@ def test_unknown_traceback_still_rejected():
 
 def test_default_is_split_by_precision(params):
     """`auto` resolves to grid for affine Global (both precisions, since 2026-10-26); where
-    grid does not apply (here: tracks) the run takes the old split, pmax at float32 and the
-    exact carry at double, which is what this test pins through the explicit modes.
+    grid does not apply (tracks, the scalar backend, negative opens) the run takes the old
+    split, pmax at float32 and the exact carry at double.
 
     The split is the whole safety argument for defaulting to a mode that can return a
     suboptimal path: at float32 the ramp costs ~5e-4 against the ~8e-3 the precision
