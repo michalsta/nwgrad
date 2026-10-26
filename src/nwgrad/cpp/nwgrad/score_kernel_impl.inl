@@ -45,6 +45,7 @@ static void score_affine_striped(ScoreJob<T>& job) {
     const unsigned char* a = job.a;
     const unsigned char* b = job.b;
     DpBufferT<T>& buf = *job.buf;
+    [[maybe_unused]] IntRampRow<T> irr{buf.iramp};   // int_row_ramp's row (Global, int16 at 16 lanes)
 
     if (n == 0) {
         // No columns: Global ends in one gap run down column 0 (or is empty); Local is 0.
@@ -225,8 +226,8 @@ static void score_affine_striped(ScoreJob<T>& job) {
         // (whose carry pass already saw the opens), carry the extension only.
         // (Integer T: the exact prefix-max carry instead, then Local's max over Y.)
         if constexpr (nw_is_int<T> && W >= 4) {
-            int_pmax_carry<T, W>(opens, nullptr, nbOpen, T(0), bY, ge_a,
-                                 seg, cY, nullptr, nullptr);
+            int_pmax_carry<T, W, int_row_ramp<T, W> && !Local>(opens, nullptr, nbOpen, T(0), bY, ge_a,
+                                 seg, cY, nullptr, nullptr, &irr);
             if constexpr (Local)
                 for (int s = 0; s < seg; ++s) {
                     vd y; y.copy_from(cY + (std::size_t)s * W, stdx::element_aligned);
@@ -432,11 +433,19 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
             // segment 0's term, then the lane carry-in, then ONE pass: Y = max(P', cin') - ramp
             // folded straight into D.  max is exact and associative, so Y is int_pmax_carry's.
             const vd Q0 = lane_shift_in(fOprev, nbOpen) + fBase;
-            alignas(64) T tot[64], cin[64];
-            stdx::max(Q0, fP).copy_to(tot, stdx::element_aligned);
-            T run = static_cast<T>(NINF - ge_a);
-            for (int l = 0; l < W; ++l) { cin[l] = run; run = std::max(run, tot[l]); }
-            vd vcin; vcin.copy_from(cin, stdx::element_aligned);
+            // int16: the in-register lane scan (int_lane_carry_in), fused score-only time / the
+            // scalar scan 0.83-0.94 v3, 0.78-0.80 AVX-512, 0.83-0.87 NEON.  Wider types keep the
+            // scalar scan: int32 0.91-1.03 across the three (v3 Global L300 1.027).
+            vd vcin;
+            if constexpr (sizeof(T) == 2) {
+                vcin = int_lane_carry_in<vd, (int)vd::size()>(stdx::max(Q0, fP), static_cast<T>(NINF - ge_a));
+            } else {
+                alignas(64) T tot[64], cin[64];
+                stdx::max(Q0, fP).copy_to(tot, stdx::element_aligned);
+                T run = static_cast<T>(NINF - ge_a);
+                for (int l = 0; l < W; ++l) { cin[l] = run; run = std::max(run, tot[l]); }
+                vcin.copy_from(cin, stdx::element_aligned);
+            }
             vcin = stdx::max(vcin, Q0);
             vd rq = fBase;
             for (int s = 0; s < seg; ++s) {

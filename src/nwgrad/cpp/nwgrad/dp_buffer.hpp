@@ -222,6 +222,10 @@ struct DpBufferT {
     // in one level TU and a mul+add in another would round differently and break the
     // scalar==simd bit-identity the pmax family is required to hold.
     TVec hramp;
+    // The integer carry's ramp row where it is loaded rather than formed in registers
+    // (int_row_ramp, kernels_impl.inl: int16 at 16 lanes).  Its own vector: the Hirschberg
+    // sweeps hold hramp across the base cases that run this carry.
+    TVec iramp;
 
     // Scaled soft path (SoftImpl::Scaled): rolling backward rows (current/next, per
     // state) and the per-row power-of-two exponents of the forward tables.  The forward
@@ -247,7 +251,7 @@ struct DpBufferT {
         clrT(hfa); clrT(hfb); clrT(hfc); clrT(hfd); clrT(hfe); clrT(hff);
         clrT(hra); clrT(hrb); clrT(hrc); clrT(hrd); clrT(hre); clrT(hrf);
         clrT(hsM); clrT(hsX); clrT(hsY);
-        clrT(hprof); clrT(hov); clrT(hramp);
+        clrT(hprof); clrT(hov); clrT(hramp); clrT(iramp);
         clrB(hbD); clrB(hops);
         clrD(sb0); clrD(sb1); clrD(sb2); clrD(sb3); clrD(sb4); clrD(sb5); clrD(sqp);
         sexp.clear(); sexp.shrink_to_fit();

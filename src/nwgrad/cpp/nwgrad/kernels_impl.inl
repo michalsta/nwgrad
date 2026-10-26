@@ -316,15 +316,97 @@ template <class V> [[gnu::always_inline]] static inline void nv_store(typename V
     *reinterpret_cast<NV*>(p) = static_cast<NV>(x);
 }
 
+// x moved K lanes up, the low K lanes filled from f.  f is a SPLAT at every call, so the fill
+// is taken from f's TOP lanes (f[W-K+I]), which spells the shuffle as one contiguous window
+// of the pair (f, x): AArch64 `ext`, AVX2 `vperm2i128` + `vpalignr`.  Filling from f[I] (the
+// same values) compiled under gcc 16 on NEON to a two-register `tbl` whose operands went
+// through the stack, three round trips in the carry, and an index load per row (int16 1.015-
+// 1.026 of the scalar scan on the M1; 0.906-0.950 this way).
+template <class NV, int W, int K, std::size_t... I>
+[[gnu::always_inline]] static inline NV nv_shift_up_(NV x, NV f, std::index_sequence<I...>) {
+    return __builtin_shufflevector(x, f, (I < (std::size_t)K ? 2 * W - K + (int)I : (int)I - K)...);
+}
+template <class NV, int W, int K>
+[[gnu::always_inline]] static inline NV nv_shift_up(NV x, NV f) {
+    return nv_shift_up_<NV, W, K>(x, f, std::make_index_sequence<W>{});
+}
+// The carry-in of every lane: cin[l] = max(seed, P[0..l-1]), an exclusive prefix max across
+// the lanes.  In registers, log2(W) shift + max steps, where the scalar form stored P,
+// walked the lanes through a cmov chain and read cin back as one vector from W narrow
+// stores (a load no store can forward).  Integer max is exact and associative, so the
+// lanes carry the same values either way.  Time / scalar form (2026-10-25, medians of 9,
+// controls 0.98-1.02): nighthaven AVX2 0.84-0.95 at L100-300 (int16 / int32 Scores,
+// Pointers, linear), 0.97-1.01 at L1000; solace AVX-512 0.73-0.90, L1000 0.99; spot NEON
+// (M1, g++-16) 0.85-0.98, int16 Scores 0.91-0.95.
+// NWGRAD_SCALAR_LANE_SCAN forces the scalar form.
+#if !defined(NWGRAD_SCALAR_LANE_SCAN) && defined(__has_builtin)
+#if __has_builtin(__builtin_shufflevector)
+#define NWGRAD_LANE_SCAN_REG 1
+#endif
+#endif
+template <class vd, int W>
+[[gnu::always_inline]] static inline vd int_lane_carry_in(const vd& P, typename vd::value_type seed) {
+    using T = typename vd::value_type;
+#ifdef NWGRAD_LANE_SCAN_REG
+    using NV = typename NVecOf<T, (int)(sizeof(T) * W)>::type;
+    const NV ninf = static_cast<NV>(vd(nw_ninf<T>));
+    NV x = static_cast<NV>(P);
+    auto mx = [](NV a, NV b) __attribute__((always_inline)) { return a > b ? a : b; };
+    x = mx(x, nv_shift_up<NV, W, 1>(x, ninf));
+    if constexpr (W > 2)  x = mx(x, nv_shift_up<NV, W, 2>(x, ninf));
+    if constexpr (W > 4)  x = mx(x, nv_shift_up<NV, W, 4>(x, ninf));
+    if constexpr (W > 8)  x = mx(x, nv_shift_up<NV, W, 8>(x, ninf));
+    if constexpr (W > 16) x = mx(x, nv_shift_up<NV, W, 16>(x, ninf));
+    static_assert(W <= 32, "int_lane_carry_in: more lanes than steps");
+    const NV vs = static_cast<NV>(vd(seed));
+    return vd(mx(nv_shift_up<NV, W, 1>(x, vs), vs));
+#else
+    alignas(64) T tot[64], cin[64];
+    P.copy_to(tot, stdx::element_aligned);
+    T run = seed;
+    for (int l = 0; l < W; ++l) { cin[l] = run; run = std::max(run, tot[l]); }
+    vd vcin; vcin.copy_from(cin, stdx::element_aligned);
+    return vcin;
+#endif
+}
+
+// Where the ramp is LOADED from a row instead of formed in registers: int16 at 16 lanes
+// (AVX2), in the GLOBAL striped Scores kernel only.  nighthaven, with the lane scan, row /
+// register: Global Scores L100 0.975, L140 0.943, L200 0.910; flat or worse everywhere else
+// tried — Local Scores 1.002, Pointers 0.98-0.99 (in the noise), linear H fill 1.007-1.014,
+// int16 at 32 lanes (AVX-512) 0.98-1.04, int32 (AVX2) 1.02-1.04, NEON 1.006-1.007.  int16
+// rows are short by the overflow bound (BLOSUM62 11/1: ~L300), so the extra stream never
+// meets the L1 capacity edge that put the ramp in registers (int32 L1600+).
+template <class T, int W> inline constexpr bool int_row_ramp = sizeof(T) == 2 && W == 16;
+// The ramp row of one kernel call, rebuilt only when ge_a or the segment count changes
+// (tracked rows, Hirschberg blocks).  hb_ramp's striped layout: slot (s, l) = (l*seg + s)*ge_a.
+template <class T> struct IntRampRow {
+    typename DpBufferT<T>::TVec& v;
+    T ge = T(0);
+    int seg = -1;
+    const T* get(T ge_a, int sg, int W) {
+        if (sg != seg || ge_a != ge) {
+            const std::size_t need = (std::size_t)sg * W;
+            if (v.size() < need) v.resize(need);
+            hb_ramp(v.data(), ge_a, sg, W);
+            ge = ge_a; seg = sg;
+        }
+        return v.data();
+    }
+};
+
 // Always inlined: gcc outlined it as a constant-propagated clone in every integer score
 // kernel (a call, its own frame and the lane arrays per row), where it then cost more
-// than the kernel body around it.
+// than the kernel body around it.  RowRamp: the ramp loaded from `rr`'s row (int_row_ramp).
 // Ext: the code recorded for an extension (the Pointers kernels pass 32, Y's field of the
-// packed byte already shifted; the open codes in `ok` are then 0 / 16).
-template <class T, int W, int Ext = 2>
+// packed byte already shifted, the open codes in `ok` then 0 / 16; dense codes 2).
+template <class T, int W, bool RowRamp = false, int Ext = 2>
 [[gnu::always_inline]] static inline void int_pmax_carry(const T* ov, const T* ok, T nbOpen, T nbOpenK,
-                                  T bY, T ge_a, int seg, T* cY, T* yc, T* qbuf) {
+                                  T bY, T ge_a, int seg, T* cY, T* yc, T* qbuf,
+                                  IntRampRow<T>* rr = nullptr) {
     using vd = stdx::native_simd<T>;
+    [[maybe_unused]] const T* rmp = nullptr;
+    if constexpr (RowRamp) rmp = rr->get(ge_a, seg, W);
     const vd vtwo(static_cast<T>(Ext));
     const vd vge(ge_a);
     const vd rbase([&](int l) { return static_cast<T>(static_cast<T>(l * seg) * ge_a); });
@@ -338,18 +420,15 @@ template <class T, int W, int Ext = 2>
         } else {
             O = nv_load<vd>(ov + (std::size_t)(s - 1) * W);
         }
-        const vd Q = O + rq;
-        rq += vge;
+        vd Q;
+        if constexpr (RowRamp) { Q = O + nv_load<vd>(rmp + (std::size_t)s * W); }
+        else                   { Q = O + rq; rq += vge; }
         if (yc) nv_store(qbuf + (std::size_t)s * W, Q);
         P = stdx::max(Q, P);
         nv_store(cY + (std::size_t)s * W, P);
     }
     rq = rbase;
-    alignas(64) T tot[64], cin[64];
-    P.copy_to(tot, stdx::element_aligned);
-    T run = static_cast<T>(bY - ge_a);
-    for (int l = 0; l < W; ++l) { cin[l] = run; run = std::max(run, tot[l]); }
-    vd vcin; vcin.copy_from(cin, stdx::element_aligned);
+    const vd vcin = int_lane_carry_in<vd, W>(P, static_cast<T>(bY - ge_a));
     vd before = vcin;                       // the prefix before this segment's open
     // Two ramps a step apart, each advanced by 2*ge_a: this pass has no other loop-carried
     // value, and one ramp's add chain bound it on NEON (2-cycle integer add: 1.04-1.07x the
@@ -380,9 +459,13 @@ template <class T, int W, int Ext = 2>
             before = pc;
         }
     };
-    int s = 0;
-    for (; s + 1 < seg; s += 2) { step(s, rq); step(s + 1, rq1); rq += vge2; rq1 += vge2; }
-    if (s < seg) step(s, rq);
+    if constexpr (RowRamp) {
+        for (int s = 0; s < seg; ++s) step(s, nv_load<vd>(rmp + (std::size_t)s * W));
+    } else {
+        int s = 0;
+        for (; s + 1 < seg; s += 2) { step(s, rq); step(s + 1, rq1); rq += vge2; rq1 += vge2; }
+        if (s < seg) step(s, rq);
+    }
 }
 
 // ── Tracked rows: the striped query profile ───────────────────────────────────
@@ -458,6 +541,7 @@ static void striped_affine_full(ViterbiJob<T>& job) {
     const unsigned char* a = job.a;
     const unsigned char* b = job.b;
     DpBufferT<T>& buf = *job.buf;
+    [[maybe_unused]] IntRampRow<T> irr{buf.iramp};   // int_row_ramp's row
 
     const int seg = (n + W - 1) / W;
     const std::size_t sw = (std::size_t)seg * W;
@@ -594,8 +678,8 @@ static void striped_affine_full(ViterbiJob<T>& job) {
             // ── the carry: VY, same-lane striped chain + lazy-F (integer T: the exact
             // prefix max, int_pmax_carry) ──
             if constexpr (nw_is_int<T> && W >= 4) {
-                int_pmax_carry<T, W>(ov, nullptr, nbOpen, T(0), bY, ge_a, seg,
-                                     cY, nullptr, nullptr);
+                int_pmax_carry<T, W, int_row_ramp<T, W> && !Local>(ov, nullptr, nbOpen, T(0), bY,
+                                     ge_a, seg, cY, nullptr, nullptr, &irr);
             } else {
             vd prev([&](int q) { return q == 0 ? bY : K_NINF; });
             for (int s = 0; s < seg; ++s) {
