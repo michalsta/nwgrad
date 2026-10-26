@@ -414,9 +414,24 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                 if (!changed) break;
             }
             }   // integer / floating carry
+            // Local: the row's best cell is scanned in the loop below, where cY is final and
+            // cM / cX still hot, not in a pass of its own (RowBest, kernels_impl.inl).
+            RowBest<T> rbest;
+            [[maybe_unused]] auto row_best_step = [&](int s) __attribute__((always_inline)) {
+                if constexpr (Local) {
+                    const std::size_t o = off + (std::size_t)s * W;
+                    vd vm, vx, vy, vp;
+                    vm.copy_from(cM + o, stdx::element_aligned);
+                    vx.copy_from(cX + o, stdx::element_aligned);
+                    vy.copy_from(cY + o, stdx::element_aligned);
+                    vp.copy_from(pad + (std::size_t)s * W, stdx::element_aligned);
+                    rbest.step(vm, vx, vy, vp);
+                }
+            };
             if constexpr (Dense) {           // Y's plane
                 vd accY = vzero;
                 for (int s = 0; s < seg; ++s) {
+                    row_best_step(s);
                     vd k; k.copy_from(yc + (std::size_t)s * W, stdx::element_aligned);
                     accY = accY + accY; accY = accY + accY; accY = accY + k;
                     if ((s & 3) == 3 || s == seg - 1) {
@@ -426,6 +441,7 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                 }
             } else
             for (int s = 0; s < seg; ++s) {   // M | X << 2 | Y << 4 (<= 43: the packs stay exact)
+                row_best_step(s);
                 vd k, kmx;
                 k.copy_from(yc + (std::size_t)s * W, stdx::element_aligned);
                 kmx.copy_from(mx + (std::size_t)s * W, stdx::element_aligned);
@@ -433,8 +449,7 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
             }
 
             if constexpr (Local)
-                striped_row_best<T>(cM + off, cX + off, cY + off, pad, seg, i,
-                                    best_local, best_i, best_j, best_tbl);
+                rbest.finish(cM + off, cX + off, cY + off, seg, i, best_local, best_i, best_j, best_tbl);
         }
         bM = nbM; bX = nbX; bY = K_NINF;
         std::swap(pM, cM); std::swap(pX, cX); std::swap(pY, cY);
