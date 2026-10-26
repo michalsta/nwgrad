@@ -199,9 +199,11 @@ struct ViterbiJob {
 // The dense direction codes' geometry, shared by the kernels and the walks.  Per DP row:
 // W bytes of slot area (byte 0 = column 0's code in the one-byte format), then one group
 // per four segments: `planes` x W bytes (plane p, lane l at group_base + p*W + l), each byte
-// holding that lane's 2-bit codes for the group's segments, the group's FIRST segment in the
-// highest bits (accumulated by Horner, acc = 4*acc + k): segment r of a g-segment group at
-// shift 2*(g-1-r).  Linear: one plane (the move); affine: three (M, X, Y predecessor).
+// holding that lane's 2-bit codes for the group's segments: segment r of the group (s = 4q+r)
+// at shift 2*r, so a kernel adds k * 4^r -- one add a segment on the loop-carried chain, the
+// weight off it (a Horner form, acc = 4*acc + k, put three dependent adds a segment on the
+// chain: 1.11-1.15x on NEON double, whose two lanes leave little else to overlap).
+// Linear: one plane (the move); affine: three (M, X, Y predecessor).
 inline std::size_t dense_codes_row_bytes(int seg, int width, int planes) noexcept {
     return static_cast<std::size_t>(width) *
            (1 + static_cast<std::size_t>(planes) * static_cast<std::size_t>((seg + 3) / 4));
@@ -209,10 +211,11 @@ inline std::size_t dense_codes_row_bytes(int seg, int width, int planes) noexcep
 // The 2-bit code of striped slot (s, l) of a dense row: s = (j-1) % seg, l = (j-1) / seg.
 inline unsigned dense_code_at(const unsigned char* row, int seg, int width, int planes,
                               int plane, int s, int l) noexcept {
-    const int q = s >> 2, r = s & 3, g = std::min(4, seg - 4 * q);
+    (void)seg;
+    const int q = s >> 2, r = s & 3;
     const unsigned char byte = row[static_cast<std::size_t>(width) *
                                    (1 + static_cast<std::size_t>(planes) * q + plane) + l];
-    return (byte >> (2 * (g - 1 - r))) & 3u;
+    return (byte >> (2 * r)) & 3u;
 }
 
 

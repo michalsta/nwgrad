@@ -82,6 +82,15 @@ template <class T, int W>
     stdx::static_simd_cast<bvec>(code).copy_to(dst, stdx::element_aligned);
 }
 
+// k * 4^r for the dense codes (dense_code_at): a shift for integer lanes, an exact multiply
+// for floating ones -- the weight is applied off the loop-carried add.
+template <class V>
+[[gnu::always_inline]] static inline V dense_weighted(const V& k, int r) {
+    using T = typename V::value_type;
+    if constexpr (nw_is_int<T>) return k << (2 * r);
+    else                        return k * V(static_cast<T>(1 << (2 * r)));
+}
+
 // The three-way argmax code of the scalar pick(): 0 when m >= x && m >= y, else 1 when
 // x >= y, else 2 -- read off the three-way max the kernel computes anyway,
 // mx = max(max(m, x), y): m >= x && m >= y is exactly mx == m (max is exact, -inf
@@ -115,7 +124,7 @@ template <class V>
 // Tr: a tracked problem (job.tr), as striped_affine_full.
 // Dense: the dense codes (dense_codes_row_bytes, simd_levels.hpp: 0.75 B/cell) -- three
 // planes of 2-bit codes, M's and X's stored from pass 1 (final there), Y's after the
-// carry; each lane accumulates a plane's codes over four segments by Horner and stores one
+// carry; each lane accumulates a plane's codes over four segments (k * 4^r) and stores one
 // byte per lane a group.  The codes are the same choices; only where their bits go differs.
 template <class T, bool Local, bool Tr = false, bool Dense = false>
 static void striped_affine_full_ptr(ViterbiJob<T>& job) {
@@ -179,7 +188,7 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                 unsigned char* g = d0 + off + (std::size_t)q * 3 * W;
                 std::memset(g, 0xFF, W); std::memset(g + W, 0, W); std::memset(g + 2 * W, 0xAA, W);
             }
-            if (seg > 0) d0[off + 2 * W] &= (unsigned char)~(3u << (2 * (std::min(4, seg) - 1)));
+            if (seg > 0) d0[off + 2 * W] &= (unsigned char)~3u;   // segment 0's field, lane 0
         }
         for (int l = 0; l < W; ++l)
             for (int s = 0; s < seg; ++s) {
@@ -300,8 +309,8 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
 #endif
                 vxv.copy_to(cX + off + (std::size_t)s * W, stdx::element_aligned);
                 if constexpr (Dense) {   // M and X are final: their planes now (4*acc + k)
-                    accM = accM + accM; accM = accM + accM; accM = accM + km;
-                    accX = accX + accX; accX = accX + accX; accX = accX + kx;
+                    accM += dense_weighted(km, s - s0);
+                    accX += dense_weighted(kx, s - s0);
                 } else {
                     (km + kx).copy_to(mx + (std::size_t)s * W, stdx::element_aligned);
                 }
@@ -426,7 +435,7 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                     const int s1 = std::min(seg - s0, 4) + s0;
                     for (int s = s0; s < s1; ++s) {
                         vd k; k.copy_from(yc + (std::size_t)s * W, stdx::element_aligned);
-                        accY = accY + accY; accY = accY + accY; accY = accY + k;
+                        accY += dense_weighted(k, s - s0);
                     }
                     store_codes<T, W>(accY, dP + (std::size_t)(s0 >> 2) * 3 * W + 2 * W);
                 }
