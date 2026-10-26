@@ -19,7 +19,7 @@ from nwgrad.matrices import BLOSUM62
 mode, L, prec, threads = sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4])
 rng = np.random.default_rng(L)
 P = "ACDEFGHIKLMNPQRSTVWY"
-npairs = max(1, int(round(12e6 / (L * L))))
+npairs = max(1, int(round(12e6 / (L * L)))) * threads   # ~12 M cells per thread
 A, B = [], []
 for _ in range(npairs):
     a = "".join(rng.choice(list(P), L))
