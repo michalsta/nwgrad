@@ -112,12 +112,13 @@ inline constexpr std::size_t kAutoHbPointerCells = std::size_t(1) << 25;
 
 // Whether a pair splits -- runs the Hirschberg recursion -- rather than the Pointers fill:
 // every Hirschberg mode splits past hb_cutoff rows, except, under `auto` for a type with a
-// pointer budget (auto_budget), a pair within kAutoHbPointerCells.  The aligner's dispatch
+// pointer budget, a pair within that budget (kAutoHbPointerCells; Global double 2x that).  The aligner's dispatch
 // and the batch engine's planning (which pairs may share a fill) ask the same question.
-inline constexpr bool hb_splits(TracebackMode tb, bool auto_budget, int cutoff,
+// auto_cells: the budget that applies (Aligner::kAutoPointerCells under `auto`), 0 = none.
+inline constexpr bool hb_splits(TracebackMode tb, std::size_t auto_cells, int cutoff,
                                 std::size_t la, std::size_t lb) noexcept {
     if (!is_hirschberg(tb) || la <= static_cast<std::size_t>(cutoff)) return false;
-    return !(auto_budget && (la + 1) * (lb + 1) <= kAutoHbPointerCells);
+    return !(auto_cells != 0 && (la + 1) * (lb + 1) <= auto_cells);
 }
 
 // Which Viterbi backend fills the DP tables is a runtime field (backend_, below), one of
@@ -571,6 +572,15 @@ struct Aligner {
         GM == GapModel::Affine && AB == AlignBand::Full &&
         ((AM == AlignMode::Global && (std::is_same_v<T, double> || std::is_same_v<T, int64_t>)) ||
          (AM == AlignMode::Local && (std::is_same_v<T, float> || nw_is_int<T>)));
+    // ... and up to how many cells (0 = no budget).  Global double 2^26: with the dense codes
+    // (dense_gate_) Pointers kept beating the exact recursion to L8000 at 1 and 6 threads
+    // (nighthaven 2026-10-26: Hirschberg 1.07-1.32x unrelated, 1.38-1.81x homologous); only
+    // 12 threads on 6 cores (SMT) lost there (0.81 / 0.96).  Local float32 / integers keep
+    // 2^25: above it pmax won on unrelated pairs by 2-5x.
+    static constexpr std::size_t kAutoPointerCells =
+        !kAutoPointerBudget ? 0
+        : (AM == AlignMode::Global && std::is_same_v<T, double>) ? 2 * kAutoHbPointerCells
+                                                                  : kAutoHbPointerCells;
     void set_traceback(TracebackMode t) noexcept {
         tb_auto_ = (t == TracebackMode::Default);
         tb_ = tb_auto_ ? kDefaultTb : t;
@@ -1506,7 +1516,7 @@ private:
     // smaller memory bounds even when rowwise was requested.
     bool uses_rowwise_full() const {
         if constexpr (GM == GapModel::Affine && AB == AlignBand::Full) {
-            if (!rowwise_full_ || hb_splits(tb_, tb_auto_ && kAutoPointerBudget, hb_cutoff_, m_, n_)) return false;
+            if (!rowwise_full_ || hb_splits(tb_, tb_auto_ ? kAutoPointerCells : 0, hb_cutoff_, m_, n_)) return false;
             const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
             return backend >= 0 && level_kernels(backend).template of<T>().banded_row_local;
         }
@@ -2162,7 +2172,7 @@ private:
                 throw std::logic_error(
                     "nwgrad: traceback=\"hirschberg\" is implemented for full DP only; a "
                     "guide band already bounds memory, which is the only thing Hirschberg buys");
-            else if (hb_splits(tb_, tb_auto_ && kAutoPointerBudget, hb_cutoff_, m_, n_) && !hb_penalties_ok_()) {
+            else if (hb_splits(tb_, tb_auto_ ? kAutoPointerCells : 0, hb_cutoff_, m_, n_) && !hb_penalties_ok_()) {
                 // A NEGATIVE gap penalty breaks the recursion (characterized 2026-10-11,
                 // after the boundary-state fix):
                 //  * a negative OPEN (either sequence): the join's plain form adds a prefix
@@ -2183,7 +2193,7 @@ private:
                         "nwgrad: traceback=\"hirschberg\" / \"hirschberg_pmax\" needs non-negative "
                         "gap penalties (got a negative one); use traceback=\"pointers\" or \"auto\"");
             }
-            else if (hb_splits(tb_, tb_auto_ && kAutoPointerBudget, hb_cutoff_, m_, n_)) {
+            else if (hb_splits(tb_, tb_auto_ ? kAutoPointerCells : 0, hb_cutoff_, m_, n_)) {
                 // Linear: one exact sweep for both "hirschberg" and "hirschberg_pmax" —
                 // the prefix-max carry exists to remove affine's lazy-F fixpoint, and the
                 // scalar linear sweep has none.

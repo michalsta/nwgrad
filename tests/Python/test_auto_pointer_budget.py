@@ -2,7 +2,7 @@
 
 Under `auto`, affine Global Full at float64 (exact Hirschberg) and int64
 (hirschberg_pmax), and affine Local Full at float32 and the integer types
-(hirschberg_pmax) run a pair of up to kAutoHbPointerCells (2**25) cells as
+(hirschberg_pmax) run a pair of up to 2**25 cells (Aligner::kAutoPointerCells; float64 Global 2**26) as
 Pointers and split only above it; before, they split past hb_cutoff (512) rows.  With
 one-byte direction codes Pointers measured faster than both recursions there (AGENTS.md).
 

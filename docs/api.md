@@ -401,7 +401,7 @@ Which pairs each fill applies to:
   leave L2 (1.25 MiB; 512 KiB for the soft pass — long pairs, where the per-pair fills
   win), hard linear Global pairs below 4 lanes or with alphabets over 8 letters (their
   own fill is cheaper), empty sequences, Hirschberg pairs that split (longer than
-  `hb_cutoff`, and under `traceback="auto"` larger than the 2²⁵-cell pointer budget
+  `hb_cutoff`, and under `traceback="auto"` larger than the pointer budget (2²⁵ or 2²⁶ cells)
   where it applies — see tuning.md), and
   `kernel="scalar_fallback"`.
 - **`"rowwise"`**: affine gaps at double precision on a simd kernel. Float32, linear

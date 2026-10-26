@@ -30,7 +30,7 @@ what the DP retains in order to recover the alignment path:
 | `"scores"` | 12 B/cell (affine, float32) | Keeps the score tables and re-derives the path. Bit-identical to `"pointers"`; for table introspection. |
 | `"hirschberg"` | O(m+n) | Linear-space divide-and-conquer, affine or linear gaps, full DP (global or local). Pairs no longer than `hb_cutoff` (default 512) never split and are bit-exact with `"pointers"`; longer pairs get an optimal path, but where alignments tie it may be a *different* optimal path (a different valid subgradient). |
 | `"hirschberg_pmax"` | O(m+n) | As `"hirschberg"`, with the affine gap carry computed as a closed-form prefix max — in the recursion and, for local alignment, in the endpoint scans: 1.5–3.9× faster than `"hirschberg"` on related sequences. The **only mode that can return a slightly suboptimal path** — measured worst case 4.9e-4 at float32, below float32's own error. Bit-identical across ISA levels. For linear gaps it is `"hirschberg"` (there is no gap-open chain to replace). |
-| `"auto"` (default) | — | Affine full DP at float32: `"hirschberg_pmax"`, global and local. Affine full DP at float64: `"hirschberg"` for global, `"pointers"` for local. Integers: `"hirschberg_pmax"`. Within those, float64 global, int64 global and every local float32 / integer pair of up to 2²⁵ cells (≈ 5800 × 5800) runs as `"pointers"` (bit-exact with it) and only larger pairs split. Linear: `"pointers"` (see below). Banded: score tables. |
+| `"auto"` (default) | — | Affine full DP at float32: `"hirschberg_pmax"`, global and local. Affine full DP at float64: `"hirschberg"` for global, `"pointers"` for local. Integers: `"hirschberg_pmax"`. Within those, float64 global pairs of up to 2²⁶ cells (≈ 8200 × 8200), and int64 global and every local float32 / integer pair of up to 2²⁵ cells (≈ 5800 × 5800), run as `"pointers"` (bit-exact with it) and only larger pairs split. Linear: `"pointers"` (see below). Banded: score tables. |
 
 Asking explicitly for a Hirschberg mode on a banded problem raises; `"auto"` never
 selects one there. With one byte per cell of direction codes, `"pointers"` is faster
@@ -39,7 +39,8 @@ on AVX2, AVX-512, NEON and a 64-core NUMA host, 2026-10-25): 1.2–2× against e
 `"hirschberg"` for float64 global alignment, 1.5–3× against `"hirschberg_pmax"` for
 local alignment of related sequences (on unrelated sequences, where the local
 alignment is short, the recursion stays 0–37 % faster). So `"auto"` runs those pairs as
-pointers up to 2²⁵ cells (32 MiB of codes per thread) and switches to the
+pointers up to 2²⁵ cells — 2²⁶ for float64 global, where pointers kept winning to
+L8000 once the codes went dense (see below) — and switches to the
 linear-memory recursion above that. Global float32 and int16/int32 keep
 `"hirschberg_pmax"`, which wins there on related sequences. Local float64 keeps
 `"pointers"` at every size — select `traceback="hirschberg"` explicitly for very long
@@ -98,7 +99,7 @@ override. A batch regroups on its next call after any change.
 
 ## Performance notes
 
-- With `traceback="pointers"`, a hard-gradient alignment keeps 1 byte per DP cell; `"scores"` keeps 12. Under `"auto"`, pairs up to 2²⁵ cells run as pointers (≤ 32 MiB per thread) and larger ones take a Hirschberg mode, which keeps O(m+n) — so the per-thread buffer described below applies to the pointer modes and to the Hirschberg base case (≤ `hb_cutoff` rows).
+- With `traceback="pointers"`, a hard-gradient alignment keeps 1 byte per DP cell; `"scores"` keeps 12. Under `"auto"`, pairs up to 2²⁵ cells (2²⁶ for float64 global) run as pointers (≤ 64 MiB per thread) and larger ones take a Hirschberg mode, which keeps O(m+n) — so the per-thread buffer described below applies to the pointer modes and to the Hirschberg base case (≤ `hb_cutoff` rows).
 - `SeqPairBatch.score_and_grad()` allocates one `DpBuffer` per thread (sized to the largest sequence pair in the batch) and reuses it across all assigned pairs. Pair-owned DP tables are never allocated, keeping peak memory at `n_threads × max(m×n)` rather than `N × max(m×n)`.
 - Work is distributed via a shared `std::atomic` counter — no per-task mutex, no work-stealing queue.
 - Stored-batch gradients are summed in fixed blocks of 4096 pairs, with each block
