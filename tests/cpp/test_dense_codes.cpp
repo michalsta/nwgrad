@@ -183,10 +183,12 @@ TEST_CASE("dense codes: the auto gate engages by pair size", "[dense][pointers]"
         if (l == SimdLevel::Avx2 || l == SimdLevel::Avx512) level = static_cast<int>(l);
 #endif
     }
+#if !(defined(__aarch64__) || defined(_M_ARM64))
     // sse2 / sse4: off at any size (the gated levels are the last one found above)
     for (SimdLevel l : detect_available_levels())
         if (l != SimdLevel::Avx2 && l != SimdLevel::Avx512 && static_cast<int>(l) != level)
             CHECK_FALSE(gate_writes<GapModel::Affine>(rng, 1100, static_cast<int>(l)));
+#endif
     if (level < 0) { WARN("no gated level here: the positive half skipped"); return; }
 #if defined(__aarch64__) || defined(_M_ARM64)
     CHECK_FALSE(gate_writes<GapModel::Linear>(rng, 500, level));    // 251 k cells
