@@ -419,6 +419,47 @@ struct SoftPairJob {
     double* grow = nullptr;
 };
 using soft_pair_fn = void (*)(SoftPairJob&);
+
+// ── Runtime overrides of the fill gates (nwgrad._tuning) ─────────────────────────
+// The gates below (and Aligner::linear_striped_min_n) are thresholds measured on one
+// host per ISA, so they are runtime-overridable for tuning sweeps: each reads
+// gate_value(g, its compiled default).  Overrides are process-wide; setting one bumps
+// gate_epoch(), which makes a batch's cached inter-pair plan regroup on its next call.
+// kGateUnset: no override, the compiled default; kGateOff: the cap never rejects
+// (LinearStripedMinN takes 0 for that instead: the striped kernel from any length).
+// Only baseline TUs call these (the level TUs include this header but no gate code),
+// so the one static table is never compiled at a level's -march.
+enum class Gate : int {
+    InterGroupBytes, InterSoftBytes, InterScoreGatherCells,
+    InterLinearIntGatherCells, InterLinearF32GatherCells, InterLinearF64GatherCells,
+    InterGlobalLinearIntCells, InterGlobalLinearF32Cells, LinearStripedMinN, Count_
+};
+inline constexpr const char* kGateNames[] = {
+    "inter_group_bytes", "inter_soft_bytes", "inter_score_gather_cells",
+    "inter_linear_int_gather_cells", "inter_linear_f32_gather_cells",
+    "inter_linear_f64_gather_cells", "inter_global_linear_int_cells",
+    "inter_global_linear_f32_cells", "linear_striped_min_n"};
+static_assert(sizeof(kGateNames) / sizeof(kGateNames[0]) == static_cast<size_t>(Gate::Count_));
+inline constexpr int64_t kGateUnset = -1;
+inline constexpr int64_t kGateOff = INT64_MAX;
+struct GateTable {
+    std::atomic<int64_t> v[static_cast<size_t>(Gate::Count_)];
+    std::atomic<unsigned> epoch{0};
+    GateTable() { for (auto& x : v) x.store(kGateUnset, std::memory_order_relaxed); }
+};
+inline GateTable& gate_table() { static GateTable t; return t; }
+inline int64_t gate_override(Gate g) {
+    return gate_table().v[static_cast<size_t>(g)].load(std::memory_order_relaxed);
+}
+inline void set_gate_override(Gate g, int64_t v) {
+    gate_table().v[static_cast<size_t>(g)].store(v < 0 ? kGateUnset : v, std::memory_order_relaxed);
+    gate_table().epoch.fetch_add(1, std::memory_order_relaxed);
+}
+inline unsigned gate_epoch() { return gate_table().epoch.load(std::memory_order_relaxed); }
+inline size_t gate_value(Gate g, size_t def) {
+    const int64_t v = gate_override(g);
+    return v < 0 ? def : static_cast<size_t>(v);
+}
 // Whether a pair of lengths (la, lb) may join an inter-pair group: the group's
 // interleaved tables must stay in L2.  Measured (nighthaven, i5-12500, Golden Cove: 1.25
 // MiB L2 per core; protein pairs, 12 threads): affine Viterbi wins up to 100-130
@@ -461,31 +502,37 @@ inline constexpr size_t kInterLinearF64GatherCells = 0;
 // bands are capped: ~L75 and ~L140.  double wins through L200 (0.77-0.93).
 inline constexpr size_t kInterGlobalLinearIntCells = size_t(6000);
 inline constexpr size_t kInterGlobalLinearF32Cells = size_t(20000);
-// The gather cap for a linear hard pair of T over an alphabet over 8 letters, or 0: the
-// smallest of the caps that apply (the mode's, the type's, AArch64's for floats).
+// The gather cap for a linear hard pair of T over an alphabet over 8 letters, or
+// SIZE_MAX (none): the smallest of the caps that apply (the mode's, the type's,
+// AArch64's for floats).  A compiled default of 0 means no cap; an override is literal.
 template <class T, bool Global>
-inline constexpr size_t inter_linear_gather_cap() {
-    size_t cap = 0;
-    auto take = [&cap](size_t c) { if (c > 0 && (cap == 0 || c < cap)) cap = c; };
-    if constexpr (std::is_integral_v<T>) take(kInterLinearIntGatherCells);
-    else if constexpr (std::is_same_v<T, float>) take(kInterLinearF32GatherCells);
-    else take(kInterLinearF64GatherCells);
+inline size_t inter_linear_gather_cap() {
+    size_t cap = SIZE_MAX;
+    auto take = [&cap](Gate g, size_t def) {
+        const size_t c = gate_override(g) < 0 ? (def > 0 ? def : SIZE_MAX) : gate_value(g, def);
+        if (c < cap) cap = c;
+    };
+    if constexpr (std::is_integral_v<T>) take(Gate::InterLinearIntGatherCells, kInterLinearIntGatherCells);
+    else if constexpr (std::is_same_v<T, float>) take(Gate::InterLinearF32GatherCells, kInterLinearF32GatherCells);
+    else take(Gate::InterLinearF64GatherCells, kInterLinearF64GatherCells);
     if constexpr (Global) {
-        if constexpr (std::is_integral_v<T>) take(kInterGlobalLinearIntCells);
-        else if constexpr (std::is_same_v<T, float>) take(kInterGlobalLinearF32Cells);
+        if constexpr (std::is_integral_v<T>) take(Gate::InterGlobalLinearIntCells, kInterGlobalLinearIntCells);
+        else if constexpr (std::is_same_v<T, float>) take(Gate::InterGlobalLinearF32Cells, kInterGlobalLinearF32Cells);
     }
     return cap;
 }
 inline bool inter_score_ok(size_t nalpha, int M, int n) {
     return nalpha <= 8 ||
-           static_cast<size_t>(M + 1) * static_cast<size_t>(n + 1) <= kInterScoreGatherCells;
+           static_cast<size_t>(M + 1) * static_cast<size_t>(n + 1) <=
+               gate_value(Gate::InterScoreGatherCells, kInterScoreGatherCells);
 }
 inline bool inter_pair_fits(size_t la, size_t lb, bool affine, bool soft, int W,
                             size_t tsize, int Ws) {
     const size_t cells = (la + 1) * (lb + 1);
-    if (cells * static_cast<size_t>(W) * (affine ? 3 : 1) * tsize > kInterGroupBytes) return false;
+    if (cells * static_cast<size_t>(W) * (affine ? 3 : 1) * tsize >
+        gate_value(Gate::InterGroupBytes, kInterGroupBytes)) return false;
     return !soft || cells * static_cast<size_t>(Ws) * (affine ? 5 : 2) * sizeof(double) <=
-                        kInterSoftBytes;
+                        gate_value(Gate::InterSoftBytes, kInterSoftBytes);
 }
 
 // Doubles of scratch the inter-pair soft pass needs for W lanes (the caller allocates it,

@@ -305,7 +305,7 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
             // ── the carry: VY, same-lane striped chain + lazy-F, codes tracked (integer
             // T: the exact prefix max with its codes, int_pmax_carry) ──
             if constexpr (kOpenRows) {
-                int_pmax_carry<T, W, 32>(ov, ok, nbOpen, nbOpenK, bY, ge_a, seg,
+                int_pmax_carry<T, W, false, 32>(ov, ok, nbOpen, nbOpenK, bY, ge_a, seg,
                                      cY + off, yc, qb);
             } else {
             // The open into Y and its source, from segment q of this row's M and X: what pass 1

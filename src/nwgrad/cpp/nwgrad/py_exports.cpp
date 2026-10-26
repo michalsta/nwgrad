@@ -902,6 +902,14 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             "again.  No effect on an untracked batch or on soft gradients.")
         .def("drop_paths", &SPB::drop_paths,
              "Free the stored alignment paths (score_and_grad(keep_paths=True)).")
+        .def("_inter_plan",
+             [](SPB& self) {
+                 const auto c = self.inter_plan_counts();
+                 return std::vector<size_t>(c.begin(), c.end());
+             },
+             "UNSTABLE (nwgrad._tuning): the fill=\"interpair\" plan as the next call runs\n"
+             "it, [pairs in shared groups, pairs on their own fill, groups].  The\n"
+             "score-only gather gate acts per group inside the call and is not reflected.")
         .def_prop_ro(
             "alphabet",
             [](const SPB& self) { return self.alphabet().symbols(); },
@@ -1381,6 +1389,37 @@ NB_MODULE(nwgrad_ext, m) {
           "level the CPU cannot run raises ValueError (it would SIGILL).  NOT\n"
           "thread-safe to change while work is in flight — set it before dispatching.\n"
           "NWGRAD_ISA=<level> does the same before the module loads.");
+
+    // ── Fill-gate overrides (nwgrad._tuning; unstable, for tuning sweeps) ────────
+    // Raw: -1 = no override (the compiled default), INT64_MAX = the cap never rejects.
+    // nwgrad/_tuning.py maps these to Python values; use that, not these.
+    auto gate_of = [](const std::string& name) {
+        for (int g = 0; g < static_cast<int>(Gate::Count_); ++g)
+            if (name == kGateNames[g]) return static_cast<Gate>(g);
+        throw nb::value_error(("unknown fill gate: " + name).c_str());
+    };
+    m.def("_gate_names", []() {
+        return std::vector<std::string>(std::begin(kGateNames), std::end(kGateNames));
+    });
+    m.def("_gate_get", [gate_of](const std::string& name) { return gate_override(gate_of(name)); },
+          nb::arg("name"));
+    m.def("_gate_set", [gate_of](const std::string& name, int64_t v) {
+              set_gate_override(gate_of(name), v);
+          }, nb::arg("name"), nb::arg("value"));
+    m.def("_gate_off_value", []() { return kGateOff; });
+    // The compiled defaults of the single-valued caps (0 = no cap);
+    // linear_striped_min_n is per mode, type and level (Aligner::kLinearStripedMinN).
+    m.def("_gate_defaults", []() {
+        return std::vector<std::pair<std::string, int64_t>>{
+            {"inter_group_bytes", int64_t(kInterGroupBytes)},
+            {"inter_soft_bytes", int64_t(kInterSoftBytes)},
+            {"inter_score_gather_cells", int64_t(kInterScoreGatherCells)},
+            {"inter_linear_int_gather_cells", int64_t(kInterLinearIntGatherCells)},
+            {"inter_linear_f32_gather_cells", int64_t(kInterLinearF32GatherCells)},
+            {"inter_linear_f64_gather_cells", int64_t(kInterLinearF64GatherCells)},
+            {"inter_global_linear_int_cells", int64_t(kInterGlobalLinearIntCells)},
+            {"inter_global_linear_f32_cells", int64_t(kInterGlobalLinearF32Cells)}};
+    });
 
     m.def(
         "guide_j_from_aligned",

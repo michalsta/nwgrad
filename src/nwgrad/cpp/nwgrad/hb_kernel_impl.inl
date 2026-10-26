@@ -1044,7 +1044,7 @@ static void hb_base_striped(HbBaseJob<T>& job) {
 
         // ── VY carry: same-lane striped chain + exact lazy-F, codes tracked ──
         if constexpr (kOpenRows) {
-            int_pmax_carry<T, W, 32>(ov, ok, nbOpen, nbOpenK, bY, ge_a, seg,
+            int_pmax_carry<T, W, false, 32>(ov, ok, nbOpen, nbOpenK, bY, ge_a, seg,
                                  cY + off, yc, qb);
         } else {
         // The open into Y and its source, from segment q of this row's M and X: what pass 1

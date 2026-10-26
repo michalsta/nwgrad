@@ -150,8 +150,14 @@ DiscrimAlign does: it passes the logical core count.
   residual toll on SHORT int32 Scores pairs on Piledriver (medians of 9: Local L322 1.09,
   Global L444 1.04): placement or padding, unseparated (the knob build for it ran while
   skynet was loaded); (2) the mechanism of the r = 0 mod 4 hazard (bank conflicts?);
-  (3) the register ramp of `int_pmax_carry` is unmeasured on AVX-512 (AVX2 0.79-1.02,
-  Piledriver 0.91-1.00, NEON 0.96-1.00 once its second pass took two ramps: AGENTS).
+  (3) the register ramp of `int_pmax_carry` (AVX2 0.79-1.02, Piledriver 0.91-1.00, NEON
+  0.96-1.00, AVX-512 0.86-1.03: AGENTS) leaves one AVX-512 cell above the noise, int16
+  Local affine Pointers L200 1.04 (7 segments: the two-step pass's tail?), and int16 Global
+  Scores 1.035-1.043 at avx2 L100 / L200 and avx512 L140. Not the per-lane ramp base: built
+  without the generator it moved neither cell and lost up to 1.038 on short rows (AGENTS).
+  The v3 regression this caused (int16 Global Scores 1.02-1.06) is FIXED by the
+  in-register lane scan (AGENTS), on every level (NEON int16 too, once its shifts compiled
+  as `ext`). Not yet timed on spot under Fedora Asahi (macOS only).
 - **int16 saturating arithmetic, with a number**: at L1000 BLOSUM62 nwgrad refuses int16
   and runs int32 (261 us a pair, score-only, AVX2) where parasail's saturating scan16 takes
   145 us — the one fixture in the comparison parasail wins.
@@ -181,6 +187,23 @@ DiscrimAlign does: it passes the logical core count.
 - int64 at AVX2 costs 1.5-2.6x float32 (no packed 64-bit max: `vpcmpgtq` + `vpblendvb`,
   the same 4 lanes as double) and 4-5x at sse2 (no 64-bit compare at all). It is headroom
   for huge parameters, not a speed type; nothing cheap left to do for it.
+
+## Per-ISA default gates: a large benchmark sweep
+
+The fill gates are thresholds measured on one host per ISA. `inter_score_ok` /
+`kInterScoreGatherCells` (8192 cells, ~L90), `kInterLinearIntGatherCells`, the
+`inter_pair_fits` byte caps and `kLinearStripedMinN` all come from nighthaven (AVX2),
+with spot (NEON) as a check. They do not carry over. On wloczykij (Piledriver, sse4 level,
+2026-10-25, nwgrad vs SeqAn3 run, `integer` 1f48c1e), float32 Global affine score-only
+at L100 runs striped at 55.5 ms a batch (2000 pairs, 1 thread). Forced through
+`interpair` on `main` (no gate there), it takes 36.5 ms: the gate costs 1.5x on that host.
+Sweep every gate per ISA level (sse2, sse4, avx2, avx512, neon) on the fleet, over
+length, every scalar type, mode, gap model and output (score / path / hard grad), at
+1 thread and all cores. Then make the thresholds per level, with a table instead of one
+constant. The integer types pass the same score-only gate; check whether they are
+penalised the same way. The knob exists now: `nwgrad._tuning` overrides every gate at
+runtime (docs/tuning.md "Fill gates"), and `SeqPairBatch._inter_plan()` shows where the
+plan routed the pairs.
 
 ## Per-pair gradients stored contiguously (weighted_grad, grads)
 

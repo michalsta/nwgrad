@@ -594,6 +594,8 @@ struct Aligner {
     // The B length from which the linear Full fill takes the leveled striped kernel.
     // ... on `backend` (a level id): AVX-512's lanes move some crossovers later.
     static int linear_striped_min_n(int backend) noexcept {
+        if (const int64_t o = gate_override(Gate::LinearStripedMinN); o >= 0)   // nwgrad._tuning
+            return o > INT32_MAX ? INT32_MAX : static_cast<int>(o);
 #if !(defined(__aarch64__) || defined(_M_ARM64))
         if (backend == static_cast<int>(SimdLevel::Avx512)) return kLinearStripedMinN512;
 #endif
