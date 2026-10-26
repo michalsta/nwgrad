@@ -1,6 +1,6 @@
 # TODO
 
-## Denser direction codes for the multithreaded memory wall (requested 2026-10-25) — DONE on AVX2 / NEON, gated (2026-10-26; AGENTS.md "Dense direction codes, gated"); AVX-512 and sse4 still to measure
+## Denser direction codes for the multithreaded memory wall (requested 2026-10-25) — DONE, gated: AVX2, AVX-512, NEON (linear float32 / int32); sse4 measured and off (2026-10-26; AGENTS.md "Dense direction codes, gated")
 
 Wanted: BOTH variants below prototyped, tested bit-exact, and added as variants of the
 Pointers fill, selected by a gate only in the scenarios where they measure faster —
