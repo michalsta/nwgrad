@@ -26,14 +26,22 @@
 inline constexpr int IW = KW;
 typedef double ivd __attribute__((vector_size(8 * IW)));
 typedef long long ivl __attribute__((vector_size(8 * IW)));
-// float32: the same register holds twice the lanes.
+// float32: the same register holds twice the lanes; the integer types likewise by width.
 typedef float ivf __attribute__((vector_size(8 * IW)));
 typedef int ivi __attribute__((vector_size(8 * IW)));
+typedef short ivs __attribute__((vector_size(8 * IW)));
+typedef int16_t ivi16 __attribute__((vector_size(8 * IW)));
+typedef int32_t ivi32 __attribute__((vector_size(8 * IW)));
+typedef int64_t ivi64 __attribute__((vector_size(8 * IW)));
 
-// Vector, mask and lane count per precision.
+// Vector, mask (a signed integer vector of the same lane width) and lane count per
+// scalar type.
 template <class T> struct IVT;
-template <> struct IVT<double> { using v = ivd; using l = ivl; static constexpr int W = IW; };
-template <> struct IVT<float>  { using v = ivf; using l = ivi; static constexpr int W = 2 * IW; };
+template <> struct IVT<double>  { using v = ivd;   using l = ivl;   static constexpr int W = IW; };
+template <> struct IVT<float>   { using v = ivf;   using l = ivi;   static constexpr int W = 2 * IW; };
+template <> struct IVT<int16_t> { using v = ivi16; using l = ivi16; static constexpr int W = 4 * IW; };
+template <> struct IVT<int32_t> { using v = ivi32; using l = ivi32; static constexpr int W = 2 * IW; };
+template <> struct IVT<int64_t> { using v = ivi64; using l = ivi64; static constexpr int W = IW; };
 
 // Lane-wise std::max(a, b), i.e. a < b ? b : a — the same choice on ties as the
 // scalar and row-wise kernels.  On 128-bit x86 vectors it is MAXPD/MAXPS(b, a), which
@@ -62,15 +70,21 @@ template <class L, class V> static inline V ivsel(L m, V a, V b) noexcept { retu
 // Every lane = x.  Not `ivd{} + x`: +0 + -0 is +0, so that idiom loses the sign of a
 // zero border (-0 when a gap extend is 0), which the scalar fill keeps.
 template <class V, class S> static inline V ivsplat(S x) noexcept {
-    V v;
-    for (unsigned l = 0; l < sizeof(V) / sizeof(S); ++l) v[l] = x;
+    using E = std::remove_cvref_t<decltype(V{}[0])>;   // the lane type, not S's (an int
+    V v;                                                // promotion would halve the count)
+    for (unsigned l = 0; l < sizeof(V) / sizeof(E); ++l) v[l] = static_cast<E>(x);
     return v;
 }
 
 // A vector of f(0), f(1), ... f(W-1), as a braced initializer: built in registers (lane
 // by lane into a local, then read back whole, it stalls on store forwarding).
+// Each lane cast to the element type: an int16 lane's value arrives as an int (the
+// promotion of -T(j) * ge), which a braced initializer narrows — clang refuses it.
 template <class V, class F, std::size_t... I>
-static inline V ivlanes_(F& f, std::index_sequence<I...>) noexcept { return V{f(static_cast<int>(I))...}; }
+static inline V ivlanes_(F& f, std::index_sequence<I...>) noexcept {
+    using E = std::remove_cvref_t<decltype(V{}[0])>;
+    return V{static_cast<E>(f(static_cast<int>(I)))...};
+}
 template <class V, int W, class F>
 static inline V ivlanes(F f) noexcept { return ivlanes_<V>(f, std::make_index_sequence<static_cast<std::size_t>(W)>{}); }
 
@@ -146,7 +160,7 @@ struct InterCommon {
     // of column j (-(go_a + j*ge_a) of each lane's row 0; linear: -j*ge_a).
     ivd border_x(int i) const {
         return ivlanes<ivd, IW>([&](int l) {
-            return (i <= J.m[l]) ? J.tr[l].bx0[i] : -std::numeric_limits<T>::infinity();
+            return (i <= J.m[l]) ? J.tr[l].bx0[i] : nw_ninf<T>;
         });
     }
     ivd border_y0(int j, bool linear) const {
@@ -211,7 +225,7 @@ struct InterCommon {
     ivd border_mask(ivd v, int k, const int* lim) const {
         ivd kv, limv;
         for (int l = 0; l < IW; ++l) { kv[l] = static_cast<T>(k); limv[l] = static_cast<T>(lim[l]); }
-        return ivsel(kv <= limv, v, ivd{} + (-std::numeric_limits<T>::infinity()));
+        return ivsel(kv <= limv, v, ivd{} + nw_ninf<T>);
     }
     // Local: the row's first strict best folded into the running best (row-major order).
     void best_out(const ivd& best, const ivd& bi, const ivd& bj) const {
@@ -246,7 +260,7 @@ static void inter_fill_linear(InterJobT<T>& J) noexcept {
     const int n = J.n, M = J.M, st = n + 1;
     const bool local = J.align_mode == 1;
     ivd* H = reinterpret_cast<ivd*>(J.VM);
-    const ivd z = {}, ninf = z + (-std::numeric_limits<T>::infinity()), one = z + T(1);
+    const ivd z = {}, ninf = z + nw_ninf<T>, one = z + T(1);
 
     if (local) {
         for (int j = 0; j <= n; ++j) H[j] = z;
@@ -321,7 +335,7 @@ static void inter_fill_affine(InterJobT<T>& J) noexcept {
     ivd* VM = reinterpret_cast<ivd*>(J.VM);
     ivd* VX = reinterpret_cast<ivd*>(J.VX);
     ivd* VY = reinterpret_cast<ivd*>(J.VY);
-    const ivd z = {}, ninf = z + (-std::numeric_limits<T>::infinity()), one = z + T(1);
+    const ivd z = {}, ninf = z + nw_ninf<T>, one = z + T(1);
 
     // Borders, as viterbi_affine_simd's Full path sets them.
     for (int j = 0; j <= n; ++j) { VM[j] = ninf; VX[j] = ninf; VY[j] = ninf; }
@@ -420,8 +434,8 @@ static void inter_fill_t(InterJobT<T>& J) noexcept {
     else      inter_fill_tr<T, false>(J);
 }
 
-static void inter_fill_entry(InterJob& J) noexcept { inter_fill_t<double>(J); }
-static void inter_fill_entry_f(InterJobT<float>& J) noexcept { inter_fill_t<float>(J); }
+template <class T>
+static void inter_fill_entry(InterJobT<T>& J) noexcept { inter_fill_t<T>(J); }
 
 // ── Inter-pair SCORE ONLY (Full): the fills above on one row, updated in place ──
 //
@@ -444,7 +458,7 @@ static void inter_score_affine(InterJobT<T>& J) noexcept {
     ivd* VM = reinterpret_cast<ivd*>(J.VM);
     ivd* VX = reinterpret_cast<ivd*>(J.VX);
     ivd* VY = reinterpret_cast<ivd*>(J.VY);
-    const ivd z = {}, ninf = z + (-std::numeric_limits<T>::infinity());
+    const ivd z = {}, ninf = z + nw_ninf<T>;
     ivd go_a = z + J.go_a, ge_a = z + J.ge_a, go_b = z + J.go_b, ge_b = z + J.ge_b;
 
     // row 0, as inter_fill_affine leaves it
@@ -581,7 +595,7 @@ static void inter_score_affine_pos(InterJobT<T>& J) noexcept {
     const bool local = J.align_mode == 1;
     ivd* D = reinterpret_cast<ivd*>(J.VM);
     ivd* X = reinterpret_cast<ivd*>(J.VX);
-    const ivd z = {}, ninf = z + (-std::numeric_limits<T>::infinity());
+    const ivd z = {}, ninf = z + nw_ninf<T>;
     ivd go_a = z + J.go_a, ge_a = z + J.ge_a, go_b = z + J.go_b, ge_b = z + J.ge_b;
 
     // row 0: D = max(M, X, Y) of inter_score_affine's row 0, X as there
@@ -668,5 +682,5 @@ static void inter_score_t(InterJobT<T>& J) noexcept {
     if (J.tr) inter_score_tr<T, true>(J);
     else      inter_score_tr<T, false>(J);
 }
-static void inter_score_entry(InterJob& J) noexcept { inter_score_t<double>(J); }
-static void inter_score_entry_f(InterJobT<float>& J) noexcept { inter_score_t<float>(J); }
+template <class T>
+static void inter_score_entry(InterJobT<T>& J) noexcept { inter_score_t<T>(J); }

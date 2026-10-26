@@ -25,6 +25,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 template <class T> struct DpBufferT;   // defined in dp_buffer.hpp; referenced by pointer
@@ -164,7 +165,7 @@ struct TrackJob {
 // Everything a forward pass needs, and everything it produces — no std::simd, no
 // Aligner: the only currency that crosses a level boundary.  Templated on the Viterbi
 // precision T (double or float32): the substitution block, gap penalties and DP buffer
-// are all T; the reported score stays double (a T score promotes to double exactly).
+// are all T, the reported score too.
 template <class T>
 struct ViterbiJob {
     // problem (sequences already encoded to alphabet indices)
@@ -181,16 +182,14 @@ struct ViterbiJob {
     DpBufferT<T>* buf;
 
     // results
-    double  score;                          // reported as double regardless of T
+    T       score;                          // in T (the aligner promotes it)
     int     best_i, best_j, best_tbl;       // best_tbl: 0=M 1=X 2=Y
     int     table_layout;                   // 0 = row-major VM/VX/VY, 1 = striped
     int     seg, width;                     // striping geometry (set when layout==1)
+    std::size_t rstride;                    // striped row stride in T; 0 = (seg+1)*width
     TrackJob<T> tr;                         // tracked rows (tr.on()), else untracked
 };
 
-// One striped-Full entry per precision.  Both are registered by each level TU.
-using viterbi_fn   = void (*)(ViterbiJob<double>&);
-using viterbi_fn_f = void (*)(ViterbiJob<float>&);
 
 // ── Score only: the optimal alignment score, no table, no traceback ───────────
 //
@@ -209,11 +208,9 @@ struct ScoreJob {
     int local;                              // 0 = Global, 1 = Local
     int variant;                            // 0 auto, 1 two-pass, 2 fused three-state (measuring)
     DpBufferT<T>* buf;
-    double score;                           // out
+    T score;                                // out
     TrackJob<T> tr;                         // tracked rows (tr.on()), else untracked
 };
-using score_fn   = void (*)(ScoreJob<double>&);
-using score_fn_f = void (*)(ScoreJob<float>&);
 
 // ── Hirschberg linear-space sweep ─────────────────────────────────────────────
 //
@@ -242,8 +239,6 @@ struct HbJob {
     TrackJob<T> tr;                         // tracked rows (tr.on()), else untracked
 };
 
-using hb_fn   = void (*)(HbJob<double>&);
-using hb_fn_f = void (*)(HbJob<float>&);
 
 // ── Hirschberg LOCAL endpoint scan: a striped affine sweep that reports its argmax ─
 //
@@ -279,8 +274,6 @@ struct HbScanJob {
     TrackJob<T> tr;                         // tracked rows (tr.on()), else untracked
 };
 
-using hbscan_fn   = void (*)(HbScanJob<double>&);
-using hbscan_fn_f = void (*)(HbScanJob<float>&);
 
 // ── Hirschberg base case: striped fill that RECORDS direction bytes ───────────
 //
@@ -309,8 +302,6 @@ struct HbBaseJob {
     TrackJob<T> tr;                         // tracked rows (tr.on()), else untracked
 };
 
-using hbbase_fn   = void (*)(HbBaseJob<double>&);
-using hbbase_fn_f = void (*)(HbBaseJob<float>&);
 
 // Inter-pair affine Full fill, double: W pairs at once, one per vector lane (W = the
 // level's native double count, reported in LevelKernels::inter_w).  All W pairs share
@@ -358,8 +349,6 @@ struct InterJobT {
     const TrackJob<T>* tr = nullptr;
 };
 using InterJob = InterJobT<double>;
-using inter_fn   = void (*)(InterJobT<double>&);
-using inter_fn_f = void (*)(InterJobT<float>&);
 
 // Inter-pair SOFT pass (scaled forward-backward with the gradient fused), double: the
 // same W-lane grouping as InterJob, Full band, affine or linear gaps, nalpha <= 8.  Per lane it is
@@ -430,6 +419,47 @@ struct SoftPairJob {
     double* grow = nullptr;
 };
 using soft_pair_fn = void (*)(SoftPairJob&);
+
+// ── Runtime overrides of the fill gates (nwgrad._tuning) ─────────────────────────
+// The gates below (and Aligner::linear_striped_min_n) are thresholds measured on one
+// host per ISA, so they are runtime-overridable for tuning sweeps: each reads
+// gate_value(g, its compiled default).  Overrides are process-wide; setting one bumps
+// gate_epoch(), which makes a batch's cached inter-pair plan regroup on its next call.
+// kGateUnset: no override, the compiled default; kGateOff: the cap never rejects
+// (LinearStripedMinN takes 0 for that instead: the striped kernel from any length).
+// Only baseline TUs call these (the level TUs include this header but no gate code),
+// so the one static table is never compiled at a level's -march.
+enum class Gate : int {
+    InterGroupBytes, InterSoftBytes, InterScoreGatherCells,
+    InterLinearIntGatherCells, InterLinearF32GatherCells, InterLinearF64GatherCells,
+    InterGlobalLinearIntCells, InterGlobalLinearF32Cells, LinearStripedMinN, Count_
+};
+inline constexpr const char* kGateNames[] = {
+    "inter_group_bytes", "inter_soft_bytes", "inter_score_gather_cells",
+    "inter_linear_int_gather_cells", "inter_linear_f32_gather_cells",
+    "inter_linear_f64_gather_cells", "inter_global_linear_int_cells",
+    "inter_global_linear_f32_cells", "linear_striped_min_n"};
+static_assert(sizeof(kGateNames) / sizeof(kGateNames[0]) == static_cast<size_t>(Gate::Count_));
+inline constexpr int64_t kGateUnset = -1;
+inline constexpr int64_t kGateOff = INT64_MAX;
+struct GateTable {
+    std::atomic<int64_t> v[static_cast<size_t>(Gate::Count_)];
+    std::atomic<unsigned> epoch{0};
+    GateTable() { for (auto& x : v) x.store(kGateUnset, std::memory_order_relaxed); }
+};
+inline GateTable& gate_table() { static GateTable t; return t; }
+inline int64_t gate_override(Gate g) {
+    return gate_table().v[static_cast<size_t>(g)].load(std::memory_order_relaxed);
+}
+inline void set_gate_override(Gate g, int64_t v) {
+    gate_table().v[static_cast<size_t>(g)].store(v < 0 ? kGateUnset : v, std::memory_order_relaxed);
+    gate_table().epoch.fetch_add(1, std::memory_order_relaxed);
+}
+inline unsigned gate_epoch() { return gate_table().epoch.load(std::memory_order_relaxed); }
+inline size_t gate_value(Gate g, size_t def) {
+    const int64_t v = gate_override(g);
+    return v < 0 ? def : static_cast<size_t>(v);
+}
 // Whether a pair of lengths (la, lb) may join an inter-pair group: the group's
 // interleaved tables must stay in L2.  Measured (nighthaven, i5-12500, Golden Cove: 1.25
 // MiB L2 per core; protein pairs, 12 threads): affine Viterbi wins up to 100-130
@@ -443,12 +473,66 @@ using soft_pair_fn = void (*)(SoftPairJob&);
 // tables of Ws lanes are capped at 512 KiB.
 inline constexpr size_t kInterGroupBytes = size_t(5) << 18;   // 1.25 MiB
 inline constexpr size_t kInterSoftBytes  = size_t(1) << 19;   // 512 KiB
+// Score only, alphabets over 8 (the gather): the inter-pair score kernel loads one scalar
+// per lane-cell where the striped per-pair score kernel loads 1/W of a profile row per
+// cell, so the shared score pays only for short pairs — measured on nighthaven (AVX2,
+// BLOSUM62, 1 thread, inter / striped): L60 0.46-0.85, L100 0.80-1.14, L150 1.13-1.38,
+// L200 1.25-1.57, for int16, int32, float32 and double alike (the crossover ~L100 is
+// independent of the type and the lane count).  Hard fills are not gated by this: there
+// the shared fill replaces the own LINEAR fill, which is slower at every length.
+inline constexpr size_t kInterScoreGatherCells = size_t(8192);   // (M + 1) * (n + 1) of the group
+// Hard fills, linear, integer T, alphabets over 8 (batch_engine.hpp, inter_eligible_): ~L120.
+inline constexpr size_t kInterLinearIntGatherCells = size_t(15000);
+// The same for FLOATING T on AArch64 (NEON, the only simd level there): the inter-pair
+// gather loses to the leveled linear kernel from ~L120 (float32) / ~L90 (double) on the
+// M1 (inter / own, Local protein, hard: float32 L100 0.87, L150 1.14, L200 1.18; double
+// L60 0.95, L100 1.02, L150 1.11), while on AVX2 it still wins through L200 (0.63-0.84),
+// so x86 keeps no cap.  0 = no cap.
+#if defined(__aarch64__) || defined(_M_ARM64)
+inline constexpr size_t kInterLinearF32GatherCells = size_t(15000);
+inline constexpr size_t kInterLinearF64GatherCells = size_t(8000);
+#else
+inline constexpr size_t kInterLinearF32GatherCells = 0;
+inline constexpr size_t kInterLinearF64GatherCells = 0;
+#endif
+// Global linear, alphabets over 8 (admitted to the shared fill 2026-10-23): it wins L20-80
+// for every type, but at 12 threads (nighthaven AVX2, inter / own, hard) loses for the
+// integers at L80-100 (1.04-1.20; 1 thread 0.82-1.01) and for float32 at L160-200
+// (1.02-1.11; 1 thread 0.80-0.87) — the threaded case is a batch's default, so those
+// bands are capped: ~L75 and ~L140.  double wins through L200 (0.77-0.93).
+inline constexpr size_t kInterGlobalLinearIntCells = size_t(6000);
+inline constexpr size_t kInterGlobalLinearF32Cells = size_t(20000);
+// The gather cap for a linear hard pair of T over an alphabet over 8 letters, or
+// SIZE_MAX (none): the smallest of the caps that apply (the mode's, the type's,
+// AArch64's for floats).  A compiled default of 0 means no cap; an override is literal.
+template <class T, bool Global>
+inline size_t inter_linear_gather_cap() {
+    size_t cap = SIZE_MAX;
+    auto take = [&cap](Gate g, size_t def) {
+        const size_t c = gate_override(g) < 0 ? (def > 0 ? def : SIZE_MAX) : gate_value(g, def);
+        if (c < cap) cap = c;
+    };
+    if constexpr (std::is_integral_v<T>) take(Gate::InterLinearIntGatherCells, kInterLinearIntGatherCells);
+    else if constexpr (std::is_same_v<T, float>) take(Gate::InterLinearF32GatherCells, kInterLinearF32GatherCells);
+    else take(Gate::InterLinearF64GatherCells, kInterLinearF64GatherCells);
+    if constexpr (Global) {
+        if constexpr (std::is_integral_v<T>) take(Gate::InterGlobalLinearIntCells, kInterGlobalLinearIntCells);
+        else if constexpr (std::is_same_v<T, float>) take(Gate::InterGlobalLinearF32Cells, kInterGlobalLinearF32Cells);
+    }
+    return cap;
+}
+inline bool inter_score_ok(size_t nalpha, int M, int n) {
+    return nalpha <= 8 ||
+           static_cast<size_t>(M + 1) * static_cast<size_t>(n + 1) <=
+               gate_value(Gate::InterScoreGatherCells, kInterScoreGatherCells);
+}
 inline bool inter_pair_fits(size_t la, size_t lb, bool affine, bool soft, int W,
                             size_t tsize, int Ws) {
     const size_t cells = (la + 1) * (lb + 1);
-    if (cells * static_cast<size_t>(W) * (affine ? 3 : 1) * tsize > kInterGroupBytes) return false;
+    if (cells * static_cast<size_t>(W) * (affine ? 3 : 1) * tsize >
+        gate_value(Gate::InterGroupBytes, kInterGroupBytes)) return false;
     return !soft || cells * static_cast<size_t>(Ws) * (affine ? 5 : 2) * sizeof(double) <=
-                        kInterSoftBytes;
+                        gate_value(Gate::InterSoftBytes, kInterSoftBytes);
 }
 
 // Doubles of scratch the inter-pair soft pass needs for W lanes (the caller allocates it,
@@ -468,44 +552,94 @@ inline size_t inter_soft_scratch(int n, int M, int W) {
 // level's real -march.  Plain-typed, so it obeys the ODR rule (no std::simd crosses the
 // boundary).  Returns max3 for the Local entry; Global's return is ignored.  Bodies in
 // row_kernel_impl.inl.
-using banded_row_fn = double (*)(double* __restrict, double* __restrict, double* __restrict,
-                                 const double* __restrict, const double* __restrict,
-                                 const double* __restrict, const double* __restrict,
-                                 int, int, int, double, double, double, double);
+template <class T>
+using banded_row_fn_t = T (*)(T* __restrict, T* __restrict, T* __restrict,
+                              const T* __restrict, const T* __restrict,
+                              const T* __restrict, const T* __restrict,
+                              int, int, int, T, T, T, T);
+
+// ── The kernels of one scalar type T (double, float, int16_t, int32_t, int64_t) ──
+//
+// Every hard-path kernel is instantiated per T by each level TU and registered in the
+// level's TypedKernels<T> (LevelKernels::of<T>()).  A null entry means the level has no
+// kernel of that kind for that T, and the aligner runs its scalar fill instead — which
+// is what a header-only build (no level TU linked) sees for every entry.
+// ── Linear Hirschberg, one striped kernel for its four O(m*n) loops ─────────────
+// (kernels_linear_impl.inl, lhb_striped.)  The aligner hands over everything that
+// differs between the forward / reverse sweeps, the base case and the two Local
+// endpoint scans — the B codes and the rows in SWEEP order, each row's extends, and the
+// row-0 and column-0 borders, computed in scalar exactly as the scalar loops compute
+// them — so the kernel holds no border or direction logic of its own and its rows are
+// bit for bit the scalar loops' rows.  Rows r = 1..h; columns c = 1..n.
+template <class T>
+struct LhbJob {
+    const unsigned char* b; int n;          // B codes in sweep order (column c: b[c-1])
+    const T* blk; int nalpha;               // substitution stack
+    const uint32_t* srow; int h;            // row r: stacked substitution row srow[r-1]
+    const T* ga; const T* gb;               // row r: extend of a gap in A / into the row (index r-1)
+    const T* row0;                          // n+1 values: row 0
+    const T* col0;                          // h+1 values: column 0 (col0[0] == row0[0])
+    int by_symbol;                          // srow < nalpha for every row: one profile per symbol
+    int clamp;                              // Local: max(., 0) after the diagonal/up maximum
+    int argmax;                             // 0 none; 1 columns 1..n; 2 column 0 too (first)
+    T best; int bi, bj;                     // in: the seed; out: the best cell (strict >,
+                                            //   topmost row, then leftmost column)
+    unsigned char* codes;                   // non-null: (h+1) x rowsz direction codes, striped
+    T* out;                                 // non-null: row h, de-striped, n+1 values
+    int seg, width;                         // out: striping geometry (for codes)
+    DpBufferT<T>* buf;
+};
+
+template <class T>
+struct TypedKernels {
+    using viterbi_fn = void (*)(ViterbiJob<T>&);
+    using hb_fn      = void (*)(HbJob<T>&);
+    using hbbase_fn  = void (*)(HbBaseJob<T>&);
+    using hbscan_fn  = void (*)(HbScanJob<T>&);
+    using score_fn   = void (*)(ScoreJob<T>&);
+    using inter_fn   = void (*)(InterJobT<T>&);
+    viterbi_fn         viterbi = nullptr;            // striped affine Full (Global + Local)
+    viterbi_fn         viterbi_ptr = nullptr;        // TracebackMode::Pointers
+    viterbi_fn         linear = nullptr;             // striped LINEAR Full, H table (kernels_linear_impl.inl)
+    viterbi_fn         linear_ptr = nullptr;         // ... recording direction bytes
+    using lhb_fn = void (*)(LhbJob<T>&);
+    lhb_fn             lhb = nullptr;                // linear Hirschberg sweeps / base / scans
+    banded_row_fn_t<T> banded_row_global = nullptr;  // row-wise banded whole-row kernels
+    banded_row_fn_t<T> banded_row_local = nullptr;
+    hb_fn              hb_sweep = nullptr;           // Hirschberg linear-space sweep
+    // The prefix-max sibling of the sweep (TracebackMode::HirschbergPmax): same job, same
+    // output, a closed-form VY carry instead of the serial chain + lazy-F.  Bit-identical
+    // to hb_sweep only for an integer T; its own slot, never overwriting the sweep's.
+    hb_fn              hb_sweep_pmax = nullptr;
+    hbbase_fn          hb_base = nullptr;            // Hirschberg base case (records directions)
+    hbscan_fn          hb_scan = nullptr;            // Hirschberg local endpoint scan
+    score_fn           score = nullptr;              // score only (rolling rows)
+    inter_fn           inter_fill = nullptr;         // inter-pair Full fill, W pairs per call
+    inter_fn           inter_score = nullptr;        // inter-pair score only (Full)
+    int                inter_w = 0;                  // the inter-pair lane count (pairs per call)
+};
 
 struct LevelKernels {
-    viterbi_fn    viterbi = nullptr;            // striped affine Full, double (Global + Local)
-    viterbi_fn_f  viterbi_f = nullptr;          // striped affine Full, float32
-    viterbi_fn    viterbi_ptr = nullptr;          // TracebackMode::Pointers, double
-    viterbi_fn_f  viterbi_ptr_f = nullptr;        // TracebackMode::Pointers, float32
-    banded_row_fn banded_row_global = nullptr;  // row-wise banded whole-row kernels ↓ (double)
-    banded_row_fn banded_row_local  = nullptr;
-    hb_fn         hb_sweep = nullptr;           // Hirschberg linear-space sweep, double
-    hb_fn_f       hb_sweep_f = nullptr;         // ditto, float32
-    // The opt-in prefix-max sibling of the sweep (TracebackMode::HirschbergPmax): same
-    // job, same output, a closed-form VY carry instead of the serial chain + lazy-F.
-    // NOT interchangeable with the pair above — it is bit-identical only within its own
-    // family — so it gets its own slots rather than overwriting theirs.
-    hb_fn         hb_sweep_pmax = nullptr;      // prefix-max carry sweep, double
-    hb_fn_f       hb_sweep_pmax_f = nullptr;    // ditto, float32
-    hbbase_fn     hb_base = nullptr;            // Hirschberg base case (records directions), double
-    hbbase_fn_f   hb_base_f = nullptr;         // ditto, float32
-    hbscan_fn     hb_scan = nullptr;            // Hirschberg local endpoint scan, double
-    hbscan_fn_f   hb_scan_f = nullptr;          // ditto, float32
+    TypedKernels<double>  d;
+    TypedKernels<float>   f;
+    TypedKernels<int16_t> i16;
+    TypedKernels<int32_t> i32;
+    TypedKernels<int64_t> i64;
     int           row_block = 0;                // columns per interleaved block (per-µarch)
-    inter_fn      inter_fill = nullptr;         // inter-pair affine Full fill, double
-    int           inter_w = 0;                  // its lane count (pairs per call)
-    inter_fn_f    inter_fill_f = nullptr;       // ditto, float32
-    int           inter_w_f = 0;                // its lane count (2 * inter_w)
-    inter_soft_fn inter_soft = nullptr;         // inter-pair soft pass, double (same W)
+    inter_soft_fn inter_soft = nullptr;         // inter-pair soft pass, double (W = d.inter_w)
     soft_pair_fn  soft_pair_linear = nullptr;   // per-pair scaled forward-backward ↓
     soft_pair_fn  soft_pair_affine = nullptr;
-    score_fn      score = nullptr;              // score only (rolling rows), double
-    score_fn_f    score_f = nullptr;            // ditto, float32
-    // Inter-pair score only (Full): InterJobT with ONE-row VM/VX/VY ((n+1)*W each), the
-    // lanes' scores out in best[] (Global and Local).  Same lane counts as inter_fill.
-    inter_fn      inter_score = nullptr;
-    inter_fn_f    inter_score_f = nullptr;
+    // The kernels of scalar type T.
+    template <class T> const TypedKernels<T>& of() const noexcept {
+        if constexpr (std::is_same_v<T, double>)        return d;
+        else if constexpr (std::is_same_v<T, float>)    return f;
+        else if constexpr (std::is_same_v<T, int16_t>)  return i16;
+        else if constexpr (std::is_same_v<T, int32_t>)  return i32;
+        else { static_assert(std::is_same_v<T, int64_t>, "unsupported scalar type"); return i64; }
+    }
+    template <class T> TypedKernels<T>& of() noexcept {
+        return const_cast<TypedKernels<T>&>(static_cast<const LevelKernels*>(this)->of<T>());
+    }
 };
 
 // One slot per possible level; index by (int)SimdLevel.  Populated by the level TUs'
@@ -516,18 +650,18 @@ inline LevelKernels* level_table() {
 }
 
 // Register a level's kernels.  Deliberately takes the pointers *individually*, not a
-// LevelKernels by value, and is defined out-of-line in simd_levels.cpp — which is
-// compiled at the x86-64 baseline.  Both facts are load-bearing: the level TUs are
-// compiled with -mavx512 etc. and their registrars run at static init on EVERY CPU,
-// so any code they emit must be baseline-legal.  If they built a LevelKernels locally,
-// GCC would zero-init its 56 bytes with an AVX512 GPR-broadcast (vpbroadcastd) and the
-// program would SIGILL at load on a non-AVX512 box.  Passing bare pointers keeps the
-// registrar to scalar `lea`s; the struct is assembled and stored here, in baseline code.
-// The score-only kernels, registered separately (same baseline-code rule) right after
-// register_level by the same registrar, so they cannot be overwritten by it.
+// TypedKernels / LevelKernels by value, and is defined out-of-line in simd_levels.cpp —
+// which is compiled at the x86-64 baseline.  Both facts are load-bearing: the level TUs
+// are compiled with -mavx512 etc. and their registrars run at static init on EVERY CPU,
+// so any code they emit must be baseline-legal.  If they built a struct locally, GCC
+// would zero-init it with an AVX512 GPR-broadcast (vpbroadcastd) and the program would
+// SIGILL at load on a non-AVX512 box.  Passing bare pointers keeps the registrar to
+// scalar `lea`s; the struct is assembled and stored here, in baseline code.  One typed
+// call per scalar type (register_level_typed<T>, explicitly instantiated for the five)
+// and one for the type-free entries (register_level_common).
 // Out-of-line is not enough under LTO: the link-time inliner may put a baseline callee
 // into an AVX-512 caller (a callee with fewer target features is inlinable), and gcc
-// -flto did exactly that, SIGILLing at load (vinserti64x2) on an AVX2 CPU.  So the two
+// -flto did exactly that, SIGILLing at load (vinserti64x2) on an AVX2 CPU.  So the
 // registrars are never inlined or IPA-specialized into their callers.
 #if defined(__GNUC__) && !defined(__clang__)
 #define NWGRAD_BASELINE_ONLY __attribute__((noipa))
@@ -536,22 +670,26 @@ inline LevelKernels* level_table() {
 #else
 #define NWGRAD_BASELINE_ONLY
 #endif
+template <class T>
 NWGRAD_BASELINE_ONLY
-void register_level_score(SimdLevel l, score_fn score, score_fn_f score_f,
-                          inter_fn inter_score, inter_fn_f inter_score_f);
+void register_level_typed(SimdLevel l,
+                          typename TypedKernels<T>::viterbi_fn viterbi,
+                          typename TypedKernels<T>::viterbi_fn viterbi_ptr,
+                          typename TypedKernels<T>::viterbi_fn linear,
+                          typename TypedKernels<T>::viterbi_fn linear_ptr,
+                          void (*lhb)(LhbJob<T>&),
+                          banded_row_fn_t<T> banded_row_global, banded_row_fn_t<T> banded_row_local,
+                          typename TypedKernels<T>::hb_fn hb_sweep,
+                          typename TypedKernels<T>::hb_fn hb_sweep_pmax,
+                          typename TypedKernels<T>::hbbase_fn hb_base,
+                          typename TypedKernels<T>::hbscan_fn hb_scan,
+                          typename TypedKernels<T>::score_fn score,
+                          typename TypedKernels<T>::inter_fn inter_fill,
+                          typename TypedKernels<T>::inter_fn inter_score, int inter_w);
 
 NWGRAD_BASELINE_ONLY
-void register_level(SimdLevel l, viterbi_fn viterbi, viterbi_fn_f viterbi_f,
-                    viterbi_fn viterbi_ptr, viterbi_fn_f viterbi_ptr_f,
-                    banded_row_fn banded_row_global, banded_row_fn banded_row_local,
-                    hb_fn hb_sweep, hb_fn_f hb_sweep_f,
-                    hb_fn hb_sweep_pmax, hb_fn_f hb_sweep_pmax_f,
-                    hbbase_fn hb_base, hbbase_fn_f hb_base_f,
-                    hbscan_fn hb_scan, hbscan_fn_f hb_scan_f,
-                    int row_block, inter_fn inter_fill, int inter_w,
-                    inter_fn_f inter_fill_f, int inter_w_f,
-                    inter_soft_fn inter_soft,
-                    soft_pair_fn soft_pair_linear, soft_pair_fn soft_pair_affine);
+void register_level_common(SimdLevel l, int row_block, inter_soft_fn inter_soft,
+                           soft_pair_fn soft_pair_linear, soft_pair_fn soft_pair_affine);
 
 // ── The global default backend ────────────────────────────────────────────────
 //

@@ -67,29 +67,21 @@ struct HbRows {
     // Row t's striped profile row (built here: a tracked block keeps no shared profile).
     const T* profile(T* dst, const T* blk, int nalpha, const unsigned char* b, int b_start,
                      int b_step, int NC, int seg, int W, int t) const {
-        const T ninf = -std::numeric_limits<T>::infinity();
+        const T padv = nw_pad<T>;
         const T* row = blk + (std::size_t)tr.rs[res(t)] * nalpha;
         for (int l = 0; l < W; ++l)
             for (int s = 0; s < seg; ++s) {
                 const int c = l * seg + s + 1;
-                dst[(std::size_t)s * W + l] = (c <= NC) ? row[b[b_start + (c - 1) * b_step]] : ninf;
+                dst[(std::size_t)s * W + l] = (c <= NC) ? row[b[b_start + (c - 1) * b_step]] : padv;
             }
         return dst;
     }
 };
-// The pmax ramp k*ge_a, striped, for the row's ge_a — rebuilt only when it changes (a
-// tracked sweep's rows may differ), a scalar loop either way: loaded, never multiplied
-// in the hot loop (no FMA), so bit-identical with the scalar reference's per-row ramp.
-template <class T>
-static inline void hb_ramp(T* rmp, T ge_a, int seg, int W) {
-    for (int l = 0; l < W; ++l)
-        for (int s = 0; s < seg; ++s)
-            rmp[(std::size_t)s * W + l] = static_cast<T>(l * seg + s) * ge_a;
-}
+// (hb_ramp, the pmax ramp k*ge_a striped for a row's ge_a, lives in kernels_impl.inl now:
+// every striped integer kernel builds it.)
 template <class T>
 static inline bool same_bits(T x, T y) noexcept {
-    if constexpr (sizeof(T) == 8) return std::bit_cast<uint64_t>(x) == std::bit_cast<uint64_t>(y);
-    else                          return std::bit_cast<uint32_t>(x) == std::bit_cast<uint32_t>(y);
+    return std::bit_cast<nw_bits_t<T>>(x) == std::bit_cast<nw_bits_t<T>>(y);
 }
 
 // One half-sweep of a Hirschberg block.  Rows are walked by (a_start, a_step) and
@@ -99,7 +91,7 @@ template <class T, bool Tr = false>
 static void hb_sweep_striped(HbJob<T>& job) {
     using vd = stdx::native_simd<T>;
     const int W = (int)vd::size();
-    const T NINF = -std::numeric_limits<T>::infinity();
+    const T NINF = nw_ninf<T>;
 
     const int H = job.H, NC = job.ncols;
     T go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;
@@ -130,7 +122,7 @@ static void hb_sweep_striped(HbJob<T>& job) {
         r0M[c] = NINF;
         r0X[c] = NINF;
         const T open = (std::max(r0M[c - 1], r0X[c - 1]) - go_a) - ge_a;
-        r0Y[c] = std::max(open, r0Y[c - 1] - ge_a);
+        r0Y[c] = std::max<T>(open, r0Y[c - 1] - ge_a);
     }
     if (H == 0) return;                 // nothing to sweep: row 0 IS the answer, in place
 
@@ -140,14 +132,13 @@ static void hb_sweep_striped(HbJob<T>& job) {
     auto fit = [](typename DpBufferT<T>::TVec& v, std::size_t k) {
         if (v.size() < k) v.resize(k);
     };
-    fit(buf.hfa, sw); fit(buf.hfb, sw); fit(buf.hfc, sw);
-    fit(buf.hfd, sw); fit(buf.hfe, sw); fit(buf.hff, sw);
-    fit(buf.hov, sw);
+    // six rolling rows and the opens, one block (spread_rows, dp_buffer.hpp)
+    std::size_t rs; T* const rows = spread_rows<T>(buf.hrows, sw, 7, rs);
     fit(buf.hprof, (std::size_t)(Tr ? 1 : nalpha) * sw);
 
-    T* pM = buf.hfa.data(); T* pX = buf.hfb.data(); T* pY = buf.hfc.data();
-    T* cM = buf.hfd.data(); T* cX = buf.hfe.data(); T* cY = buf.hff.data();
-    T* ov = buf.hov.data();
+    T* pM = rows + 3 * rs; T* pX = rows + 4 * rs; T* pY = rows + 5 * rs;
+    T* cM = rows;          T* cX = rows + rs;     T* cY = rows + 2 * rs;
+    T* ov = rows + 6 * rs;
 
     // Striped query profile over the block's column slice.  prof[sym][s*W+l] is the
     // score of `sym` against the residue in column l*seg+s+1.  Built per block because
@@ -161,7 +152,7 @@ static void hb_sweep_striped(HbJob<T>& job) {
             for (int s = 0; s < seg; ++s) {
                 const int c = l * seg + s + 1;
                 dst[(std::size_t)s * W + l] =
-                    (c <= NC) ? row[b[job.b_start + (c - 1) * job.b_step]] : NINF;
+                    (c <= NC) ? row[b[job.b_start + (c - 1) * job.b_step]] : nw_pad<T>;
             }
     }
 
@@ -268,12 +259,8 @@ static void hb_sweep_striped(HbJob<T>& job) {
                 // for T=double (its 64-bit lane asserts `long` but clang canonicalizes
                 // `long long`).  Same swap as kernels_impl.inl — see the long note there.
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
-                if constexpr (std::is_same_v<T, double>) {
-                    alignas(64) double fa[8], va[8];
-                    F.copy_to(fa, stdx::element_aligned);
-                    v.copy_to(va, stdx::element_aligned);
-                    if (_mm512_cmp_pd_mask(_mm512_load_pd(fa), _mm512_load_pd(va), _CMP_GT_OQ) == 0) break;
-                } else { if (!stdx::any_of(F > v)) break; }
+                if constexpr (sizeof(T) == 8) { if (!avx512d_any_gt(F, v)) break; }
+                    else { if (!stdx::any_of(F > v)) break; }
 #else
                 if (!stdx::any_of(F > v)) break;
 #endif
@@ -303,11 +290,9 @@ static void hb_sweep_striped(HbJob<T>& job) {
         }
 }
 
-static void hb_sweep_entry_d(HbJob<double>& j) {
-    if (j.tr.on()) hb_sweep_striped<double, true>(j); else hb_sweep_striped<double>(j);
-}
-static void hb_sweep_entry_f(HbJob<float>&  j) {
-    if (j.tr.on()) hb_sweep_striped<float, true>(j); else hb_sweep_striped<float>(j);
+template <class T>
+static void hb_sweep_entry(HbJob<T>& j) {
+    if (j.tr.on()) hb_sweep_striped<T, true>(j); else hb_sweep_striped<T>(j);
 }
 
 // ── OPT-IN SIBLING: the same sweep with a CLOSED-FORM prefix-max carry ────────────
@@ -346,7 +331,7 @@ static void hb_sweep_entry_f(HbJob<float>&  j) {
 // serial one exactly.  pmax-scalar == pmax-sse2 == pmax-avx2 == pmax-avx512 == pmax-neon,
 // bit for bit, which is what keeps NWGRAD_ISA a speed knob here as everywhere else.
 //
-// The ramp k*ge_a is precomputed into buf.hramp by a scalar loop, once per sweep, for
+// The ramp k*ge_a is precomputed into a row of the block by a scalar loop, once per sweep, for
 // two reasons: it depends on the column and not the row, and a multiply adjacent to the
 // add in the hot loop is exactly what a compiler contracts into an FMA — which would
 // round differently in the -mfma level TUs than in the baseline one and shatter the
@@ -355,7 +340,7 @@ template <class T, bool Tr = false>
 static void hb_sweep_striped_pmax(HbJob<T>& job) {
     using vd = stdx::native_simd<T>;
     const int W = (int)vd::size();
-    const T NINF = -std::numeric_limits<T>::infinity();
+    const T NINF = nw_ninf<T>;
 
     const int H = job.H, NC = job.ncols;
     T go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;
@@ -382,7 +367,7 @@ static void hb_sweep_striped_pmax(HbJob<T>& job) {
         r0M[c] = NINF;
         r0X[c] = NINF;
         const T open = (std::max(r0M[c - 1], r0X[c - 1]) - go_a) - ge_a;
-        r0Y[c] = std::max(open, r0Y[c - 1] - ge_a);
+        r0Y[c] = std::max<T>(open, r0Y[c - 1] - ge_a);
     }
     if (H == 0) return;                 // nothing to sweep: row 0 IS the answer, in place
 
@@ -391,15 +376,14 @@ static void hb_sweep_striped_pmax(HbJob<T>& job) {
     auto fit = [](typename DpBufferT<T>::TVec& v, std::size_t k) {
         if (v.size() < k) v.resize(k);
     };
-    fit(buf.hfa, sw); fit(buf.hfb, sw); fit(buf.hfc, sw);
-    fit(buf.hfd, sw); fit(buf.hfe, sw); fit(buf.hff, sw);
-    fit(buf.hov, sw); fit(buf.hramp, sw);
+    // six rolling rows, the opens and the ramp, one block (spread_rows, dp_buffer.hpp)
+    std::size_t rs; T* const rows = spread_rows<T>(buf.hrows, sw, 8, rs);
     fit(buf.hprof, (std::size_t)(Tr ? 1 : nalpha) * sw);
 
-    T* pM = buf.hfa.data(); T* pX = buf.hfb.data(); T* pY = buf.hfc.data();
-    T* cM = buf.hfd.data(); T* cX = buf.hfe.data(); T* cY = buf.hff.data();
-    T* ov = buf.hov.data();
-    T* rmp = buf.hramp.data();
+    T* pM = rows + 3 * rs; T* pX = rows + 4 * rs; T* pY = rows + 5 * rs;
+    T* cM = rows;          T* cX = rows + rs;     T* cY = rows + 2 * rs;
+    T* ov = rows + 6 * rs;
+    T* rmp = rows + 7 * rs;
 
     // The gap ramp, striped: slot (s,l) carries k*ge_a for the ABSOLUTE column index
     // k = l*seg + s.  Scalar, so it is bit-identical to the scalar reference's
@@ -419,7 +403,7 @@ static void hb_sweep_striped_pmax(HbJob<T>& job) {
             for (int s = 0; s < seg; ++s) {
                 const int c = l * seg + s + 1;
                 dst[(std::size_t)s * W + l] =
-                    (c <= NC) ? row[b[job.b_start + (c - 1) * job.b_step]] : NINF;
+                    (c <= NC) ? row[b[job.b_start + (c - 1) * job.b_step]] : nw_pad<T>;
             }
     }
 
@@ -536,11 +520,9 @@ static void hb_sweep_striped_pmax(HbJob<T>& job) {
         }
 }
 
-static void hb_sweep_pmax_entry_d(HbJob<double>& j) {
-    if (j.tr.on()) hb_sweep_striped_pmax<double, true>(j); else hb_sweep_striped_pmax<double>(j);
-}
-static void hb_sweep_pmax_entry_f(HbJob<float>&  j) {
-    if (j.tr.on()) hb_sweep_striped_pmax<float, true>(j); else hb_sweep_striped_pmax<float>(j);
+template <class T>
+static void hb_sweep_pmax_entry(HbJob<T>& j) {
+    if (j.tr.on()) hb_sweep_striped_pmax<T, true>(j); else hb_sweep_striped_pmax<T>(j);
 }
 
 // ── Hirschberg LOCAL endpoint scan: striped affine sweep that reports its argmax ──
@@ -575,7 +557,7 @@ template <class T, bool Local, bool Pmax, bool Tr = false>
 static void hb_scan_impl(HbScanJob<T>& job) {
     using vd = stdx::native_simd<T>;
     constexpr int W = (int)vd::size();
-    const T NINF = -std::numeric_limits<T>::infinity();
+    const T NINF = nw_ninf<T>;
 
     const int H = job.H, NC = job.ncols;
     T go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;
@@ -596,16 +578,15 @@ static void hb_scan_impl(HbScanJob<T>& job) {
     auto fit = [](typename DpBufferT<T>::TVec& v, std::size_t k) {
         if (v.size() < k) v.resize(k);
     };
-    fit(buf.hfa, sw); fit(buf.hfb, sw); fit(buf.hfc, sw);
-    fit(buf.hfd, sw); fit(buf.hfe, sw); fit(buf.hff, sw);
-    fit(buf.hov, sw);
+    // six rolling rows, the opens, the ramp (Pmax) and the padding mask (integer T), one
+    // block (spread_rows, dp_buffer.hpp)
+    std::size_t rs; T* const rows = spread_rows<T>(buf.hrows, sw, 9, rs);
     fit(buf.hprof, (std::size_t)(Tr ? 1 : nalpha) * sw);
-    if constexpr (Pmax) fit(buf.hramp, sw);
 
-    T* pM = buf.hfa.data(); T* pX = buf.hfb.data(); T* pY = buf.hfc.data();
-    T* cM = buf.hfd.data(); T* cX = buf.hfe.data(); T* cY = buf.hff.data();
-    T* ov = buf.hov.data();
-    T* rmp = buf.hramp.data();
+    T* pM = rows + 3 * rs; T* pX = rows + 4 * rs; T* pY = rows + 5 * rs;
+    T* cM = rows;          T* cX = rows + rs;     T* cY = rows + 2 * rs;
+    T* ov = rows + 6 * rs;
+    T* rmp = rows + 7 * rs;
     T ramp_ge = ge_a;
     bool ramp_ok = false;
     if constexpr (Pmax && !Tr) { hb_ramp(rmp, ge_a, seg, W); ramp_ok = true; }   // loaded never multiplied (no FMA)
@@ -619,7 +600,7 @@ static void hb_scan_impl(HbScanJob<T>& job) {
             for (int s = 0; s < seg; ++s) {
                 const int c = l * seg + s + 1;
                 dst[(std::size_t)s * W + l] =
-                    (c <= NC) ? row[b[job.b_start + (c - 1) * job.b_step]] : NINF;
+                    (c <= NC) ? row[b[job.b_start + (c - 1) * job.b_step]] : nw_pad<T>;
             }
     }
 
@@ -646,7 +627,7 @@ static void hb_scan_impl(HbScanJob<T>& job) {
             const T pm = (c == 1) ? T(0) : NINF;
             const T px = NINF;
             const T open = (std::max(pm, px) - go_a) - ge_a;
-            prevY = std::max(open, prevY - ge_a);
+            prevY = std::max<T>(open, prevY - ge_a);
             const int cc = c;
             const std::size_t k = (std::size_t)((cc - 1) % seg) * W + (cc - 1) / seg;
             pM[k] = NINF; pX[k] = NINF; pY[k] = prevY;
@@ -664,6 +645,13 @@ static void hb_scan_impl(HbScanJob<T>& job) {
     vd vgo_a(go_a), vge_a(ge_a), vgo_b(go_b), vge_b(ge_b);
     const vd vzero(T(0));
     const vd vlane([](int q) { return T(q); });   // [0,1,...,W-1] for per-lane column ids
+    // Integer T: the padding columns hold ordinary values (nw_pad), so the argmax below
+    // masks them — added, 0 for a real column and the sentinel for padding (a real value
+    // plus the sentinel cannot wrap, and lands below every real value).
+    const T* padm = nullptr;
+    if constexpr (nw_is_int<T>) {
+        padm = striped_pad_into(rows + 8 * rs, NC, seg, W);
+    }
 
     T gbest = T(0); int gi = 0, gj = 0;
 
@@ -767,12 +755,8 @@ static void hb_scan_impl(HbScanJob<T>& job) {
             for (int s = 0; s < seg; ++s) {
                 vd v; v.copy_from(cY + (std::size_t)s * W, stdx::element_aligned);
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
-                if constexpr (std::is_same_v<T, double>) {
-                    alignas(64) double fa[8], va[8];
-                    F.copy_to(fa, stdx::element_aligned);
-                    v.copy_to(va, stdx::element_aligned);
-                    if (_mm512_cmp_pd_mask(_mm512_load_pd(fa), _mm512_load_pd(va), _CMP_GT_OQ) == 0) break;
-                } else { if (!stdx::any_of(F > v)) break; }
+                if constexpr (sizeof(T) == 8) { if (!avx512d_any_gt(F, v)) break; }
+                    else { if (!stdx::any_of(F > v)) break; }
 #else
                 if (!stdx::any_of(F > v)) break;
 #endif
@@ -791,10 +775,11 @@ static void hb_scan_impl(HbScanJob<T>& job) {
             vd mm; mm.copy_from(cM + (std::size_t)s * W, stdx::element_aligned);
             vd xx; xx.copy_from(cX + (std::size_t)s * W, stdx::element_aligned);
             vd yy; yy.copy_from(cY + (std::size_t)s * W, stdx::element_aligned);
-            const vd here = stdx::max(stdx::max(mm, xx), yy);
+            vd here = stdx::max(stdx::max(mm, xx), yy);
+            if constexpr (nw_is_int<T>) { vd pv; pv.copy_from(padm + (std::size_t)s * W, stdx::element_aligned); here = here + pv; }
             const vd colv = vlane * T(seg) + T(s + 1);     // column l*seg + s + 1, per lane
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
-            if constexpr (std::is_same_v<T, double>) {
+            if constexpr (sizeof(T) == 8) {
                 vbcol = avx512d_blend(avx512d_gt(here, vbest), vbcol, colv);
             } else {
                 stdx::where(here > vbest, vbcol) = colv;
@@ -831,8 +816,8 @@ static void hb_scan_dispatch(HbScanJob<T>& j) {
     if (j.tr.on()) hb_scan_dispatch_tr<T, true>(j);
     else           hb_scan_dispatch_tr<T, false>(j);
 }
-static void hb_scan_entry_d(HbScanJob<double>& j) { hb_scan_dispatch(j); }
-static void hb_scan_entry_f(HbScanJob<float>& j)  { hb_scan_dispatch(j); }
+template <class T>
+static void hb_scan_entry(HbScanJob<T>& j) { hb_scan_dispatch(j); }
 
 // ── Hirschberg base case: striped fill that RECORDS direction bytes ───────────
 //
@@ -851,7 +836,7 @@ template <class T, bool Tr = false>
 static void hb_base_striped(HbBaseJob<T>& job) {
     using vd = stdx::native_simd<T>;
     const int W = (int)vd::size();
-    const T NINF = -std::numeric_limits<T>::infinity();
+    const T NINF = nw_ninf<T>;
 
     const int H = job.H, NC = job.ncols;
     T go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;
@@ -874,10 +859,9 @@ static void hb_base_striped(HbBaseJob<T>& job) {
     auto fit = [](typename DpBufferT<T>::TVec& v, std::size_t k) { if (v.size() < k) v.resize(k); };
     if (buf.hbD.size() < 3 * plane) buf.hbD.resize(3 * plane);
     fit(buf.hprof, (std::size_t)(Tr ? 1 : nalpha) * sw);
-    fit(buf.hfa, rowsz); fit(buf.hfb, rowsz); fit(buf.hfc, rowsz);
-    fit(buf.hfd, rowsz); fit(buf.hfe, rowsz); fit(buf.hff, rowsz);
-    fit(buf.hov, 2 * sw);
-    fit(buf.hsX, sw);                                   // y-code scratch
+    // six rolling rows, ov | ok | Q (integer T) and the y-code scratch: ten rows of one
+    // block (spread_rows, dp_buffer.hpp)
+    std::size_t rs; T* const rows = spread_rows<T>(buf.prows, rowsz, 10, rs);
 
     auto scol = [seg](int c) -> std::size_t {
         return (std::size_t)((c - 1) % seg) * W + (c - 1) / seg;
@@ -890,19 +874,20 @@ static void hb_base_striped(HbBaseJob<T>& job) {
         for (int l = 0; l < W; ++l)
             for (int s = 0; s < seg; ++s) {
                 const int c = l * seg + s + 1;
-                dst[(std::size_t)s * W + l] = (c <= NC) ? row[b[job.b_start + (c - 1) * job.b_step]] : NINF;
+                dst[(std::size_t)s * W + l] = (c <= NC) ? row[b[job.b_start + (c - 1) * job.b_step]] : nw_pad<T>;
             }
     }
 
     unsigned char* D0 = buf.hbD.data();
     unsigned char* D1 = D0 + plane;
     unsigned char* D2 = D1 + plane;
-    T* ov = buf.hov.data();
-    T* ok = buf.hov.data() + sw;
-    T* yc = buf.hsX.data();
+    T* ov = rows + 6 * rs;
+    T* ok = rows + 7 * rs;
+    T* qb = rows + 8 * rs;             // integer T: the Q scratch
+    T* yc = rows + 9 * rs;
 
-    T* pM = buf.hfa.data(); T* pX = buf.hfb.data(); T* pY = buf.hfc.data();
-    T* cM = buf.hfd.data(); T* cX = buf.hfe.data(); T* cY = buf.hff.data();
+    T* pM = rows + 3 * rs; T* pX = rows + 4 * rs; T* pY = rows + 5 * rs;
+    T* cM = rows;          T* cX = rows + rs;     T* cY = rows + 2 * rs;
 
     // ── row 0: origin seed (in_x), Y series rightward ────────────────────────
     pM[0] = job.in_x ? NINF : T(0);
@@ -912,7 +897,7 @@ static void hb_base_striped(HbBaseJob<T>& job) {
     {
         // scalar row-0 Y series (serial, O(NC), once) — kept scalar to match hb_base bit
         // for bit; then stripe it into pY and record its codes.
-        buf.hfd[0] = pM[0]; buf.hfe[0] = pX[0]; buf.hff[0] = pY[0];  // temp scalars via cM/cX/cY[0]
+        cM[0] = pM[0]; cX[0] = pX[0]; cY[0] = pY[0];  // temp scalars via cM/cX/cY[0]
         T prevM = pM[0], prevX = pX[0], prevY = pY[0];
         for (int c = 1; c <= NC; ++c) {
             const T uy = prevM - go_a - ge_a, vy = prevX - go_a - ge_a, wy = prevY - ge_a;
@@ -981,16 +966,14 @@ static void hb_base_striped(HbBaseJob<T>& job) {
             vd vmv = stdx::max(stdx::max(dgM, dgX), dgY) + sb;
             vd km = vtwo;
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
-            if constexpr (std::is_same_v<T, double>) {
+            if constexpr (sizeof(T) == 8) {
                 km = avx512d_blend(avx512d_ge(dgX, dgY), km, vone);
                 km = avx512d_blend(avx512d_ge(dgM, dgX) & avx512d_ge(dgM, dgY), km, vzero);
             } else {
-                stdx::where(dgX >= dgY, km) = vone;
-                stdx::where((dgM >= dgX) && (dgM >= dgY), km) = vzero;
+                km = pick_code(dgM, dgX, dgY, vzero, vone, vtwo);
             }
 #else
-            stdx::where(dgX >= dgY, km) = vone;
-            stdx::where((dgM >= dgX) && (dgM >= dgY), km) = vzero;
+            km = pick_code(dgM, dgX, dgY, vzero, vone, vtwo);
 #endif
             vmv.copy_to(cM + off + (std::size_t)s * W, stdx::element_aligned);
             store_codes<T, W>(km, dM + (std::size_t)s * W);
@@ -1003,16 +986,14 @@ static void hb_base_striped(HbBaseJob<T>& job) {
             vd vxv = stdx::max(stdx::max(ax, bx), cx);
             vd kx = vtwo;
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
-            if constexpr (std::is_same_v<T, double>) {
+            if constexpr (sizeof(T) == 8) {
                 kx = avx512d_blend(avx512d_ge(bx, cx), kx, vone);
                 kx = avx512d_blend(avx512d_ge(ax, bx) & avx512d_ge(ax, cx), kx, vzero);
             } else {
-                stdx::where(bx >= cx, kx) = vone;
-                stdx::where((ax >= bx) && (ax >= cx), kx) = vzero;
+                kx = pick_code(ax, bx, cx, vzero, vone, vtwo);
             }
 #else
-            stdx::where(bx >= cx, kx) = vone;
-            stdx::where((ax >= bx) && (ax >= cx), kx) = vzero;
+            kx = pick_code(ax, bx, cx, vzero, vone, vtwo);
 #endif
             vxv.copy_to(cX + off + (std::size_t)s * W, stdx::element_aligned);
             store_codes<T, W>(kx, dX + (std::size_t)s * W);
@@ -1025,18 +1006,22 @@ static void hb_base_striped(HbBaseJob<T>& job) {
             stdx::max(om, ox).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
             vd okv = vone;
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
-            if constexpr (std::is_same_v<T, double>) {
+            if constexpr (sizeof(T) == 8) {
                 okv = avx512d_blend(avx512d_ge(om, ox), okv, vzero);
             } else {
-                stdx::where(om >= ox, okv) = vzero;
+                okv = sel_ge(om, ox, vone, vzero);
             }
 #else
-            stdx::where(om >= ox, okv) = vzero;
+            okv = sel_ge(om, ox, vone, vzero);
 #endif
             okv.copy_to(ok + (std::size_t)s * W, stdx::element_aligned);
         }
 
         // ── VY carry: same-lane striped chain + exact lazy-F, codes tracked ──
+        if constexpr (nw_is_int<T> && W >= 4) {
+            int_pmax_carry<T, W>(ov, ok, nbOpen, nbOpenK, bY, ge_a, seg,
+                                 cY + off, yc, qb);
+        } else {
         vd prev([&](int q) { return q == 0 ? bY : NINF; });
         for (int s = 0; s < seg; ++s) {
             vd O, OK;
@@ -1054,13 +1039,13 @@ static void hb_base_striped(HbBaseJob<T>& job) {
             vd v = stdx::max(O, ext);
             vd ky = vtwo;
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
-            if constexpr (std::is_same_v<T, double>) {
+            if constexpr (sizeof(T) == 8) {
                 ky = avx512d_blend(avx512d_ge(O, ext), ky, OK);
             } else {
-                stdx::where(O >= ext, ky) = OK;
+                ky = sel_ge(O, ext, vtwo, OK);
             }
 #else
-            stdx::where(O >= ext, ky) = OK;
+            ky = sel_ge(O, ext, vtwo, OK);
 #endif
             v.copy_to(cY + off + (std::size_t)s * W, stdx::element_aligned);
             ky.copy_to(yc + (std::size_t)s * W, stdx::element_aligned);
@@ -1074,18 +1059,14 @@ static void hb_base_striped(HbBaseJob<T>& job) {
             for (int s = 0; s < seg; ++s) {
                 vd v; v.copy_from(cY + off + (std::size_t)s * W, stdx::element_aligned);
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
-                if constexpr (std::is_same_v<T, double>) {
-                    alignas(64) double fa[8], va[8];
-                    F.copy_to(fa, stdx::element_aligned);
-                    v.copy_to(va, stdx::element_aligned);
-                    if (_mm512_cmp_pd_mask(_mm512_load_pd(fa), _mm512_load_pd(va), _CMP_GT_OQ) == 0) break;
-                } else { if (!stdx::any_of(F > v)) break; }
+                if constexpr (sizeof(T) == 8) { if (!avx512d_any_gt(F, v)) break; }
+                    else { if (!stdx::any_of(F > v)) break; }
 #else
                 if (!stdx::any_of(F > v)) break;
 #endif
                 vd k; k.copy_from(yc + (std::size_t)s * W, stdx::element_aligned);
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
-                if constexpr (std::is_same_v<T, double>) {
+                if constexpr (sizeof(T) == 8) {
                     k = avx512d_blend(avx512d_gt(F, v), k, vtwo);
                 } else {
                     stdx::where(F > v, k) = vtwo;
@@ -1101,6 +1082,7 @@ static void hb_base_striped(HbBaseJob<T>& job) {
             }
             if (!changed) break;
         }
+        }   // integer / floating carry
         for (int s = 0; s < seg; ++s) {
             vd k; k.copy_from(yc + (std::size_t)s * W, stdx::element_aligned);
             store_codes<T, W>(k, dY + (std::size_t)s * W);
@@ -1118,9 +1100,7 @@ static void hb_base_striped(HbBaseJob<T>& job) {
     }
 }
 
-static void hb_base_entry_d(HbBaseJob<double>& j) {
-    if (j.tr.on()) hb_base_striped<double, true>(j); else hb_base_striped<double>(j);
-}
-static void hb_base_entry_f(HbBaseJob<float>&  j) {
-    if (j.tr.on()) hb_base_striped<float, true>(j); else hb_base_striped<float>(j);
+template <class T>
+static void hb_base_entry(HbBaseJob<T>& j) {
+    if (j.tr.on()) hb_base_striped<T, true>(j); else hb_base_striped<T>(j);
 }

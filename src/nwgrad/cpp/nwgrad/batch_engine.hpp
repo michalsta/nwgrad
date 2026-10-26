@@ -117,6 +117,11 @@ public:
 
     // No pairs: an engine for streaming align_stream() only.
     BatchEngine(BatchSettings s, GradMode gd) : s_(std::move(s)), grad_mode_(gd) {
+        if constexpr (nw_is_int<T>)
+            if (gd == GradMode::Soft)
+                throw std::invalid_argument(
+                    std::string("nwgrad: grad_mode \"soft\" (forward-backward) needs a floating-point "
+                                "scalar type; this batch's is ") + nw_type_name<T>());
         s_.set_n_threads(s_.n_threads);
         FullAl probe;   // what "auto" resolves to for this problem type
         probe.set_traceback(s_.traceback);
@@ -711,7 +716,7 @@ private:
         if (backend < 0) return -1;
         const LevelKernels& K = level_kernels(backend);
         if (grad_mode_ == GradMode::Soft)
-            return (K.inter_soft && K.inter_w > 0 && s_.soft_impl != SoftImpl::Log && !banded) ? backend : -1;
+            return (K.inter_soft && K.d.inter_w > 0 && s_.soft_impl != SoftImpl::Log && !banded) ? backend : -1;
         if (inter_w_(K) <= 0) return -1;
         if (GM == GapModel::Linear &&
             (banded || (AM == AlignMode::Global && (inter_w_(K) < 4 || params.matrix.size() > 8))))
@@ -728,16 +733,23 @@ private:
         const size_t N = problems.size();
         const LevelKernels& K = level_kernels(backend);
         const bool soft = grad_mode_ == GradMode::Soft;
-        const int W = soft ? K.inter_w : inter_w_(K);
+        const int W = soft ? K.d.inter_w : inter_w_(K);
         const bool hb_case = !soft && AB == AlignBand::Full && is_hirschberg(tb_resolved_);
         std::vector<size_t> other, elig;
         size_t maxa = 0, maxb = 0;
         for (size_t i = 0; i < N; ++i) {
             const size_t la = problems[i].seq_a.size(), lb = problems[i].seq_b.size();
             if (la == 0 || lb == 0 || (hb_case && la > static_cast<size_t>(s_.hb_cutoff)) ||
-                !inter_pair_fits(la, lb, GM == GapModel::Affine, soft, inter_w_(K), sizeof(T), K.inter_w)) {
+                !inter_pair_fits(la, lb, GM == GapModel::Affine, soft, inter_w_(K), sizeof(T), K.d.inter_w)) {
                 other.push_back(i); continue;
             }
+            // the integer linear gather gate of inter_eligible_ (hard fills only; score-only
+            // groups are gated by inter_score_ok in the loop)
+            if constexpr (GM == GapModel::Linear)
+                if (grad_mode_ == GradMode::Hard && params.matrix.size() > 8 &&
+                    (la + 1) * (lb + 1) > inter_linear_gather_cap<T, AM == AlignMode::Global>()) {
+                    other.push_back(i); continue;
+                }
             elig.push_back(i);
             maxa = std::max(maxa, la); maxb = std::max(maxb, lb);
         }
@@ -877,6 +889,10 @@ private:
             }
             if constexpr (AB == AlignBand::Full) {
                 if (grad_mode_ == GradMode::None && has_inter_score_(K)) {
+                    if (!inter_score_ok(na, M, n)) {   // the gather: short pairs only
+                        for (size_t l = 0; l < real; ++l) own(elig[s + l]);
+                        continue;
+                    }
                     // Score only: one row per table, no adopt / traceback.
                     InterJobT<T> job{};
                     job.a = a.data(); job.m = m.data(); job.b = b.data(); job.n = n; job.M = M;
@@ -960,13 +976,22 @@ private:
     // once: its gap fields cast to T, 4 per set (setup_tracks_ reads them), and (float32,
     // K > 1) its whole matrix stack cast to T (the Aligner would otherwise cast K matrices
     // per pair).  Shared: the pending guides' params (gparams_) may be the current ones.
+    // An integer T prepares every params ONCE here (nw_int_prepare: checked casts of
+    // the whole stack and every set's gaps, and step_max), tracked or not, so a
+    // non-integral parameter raises at construction / set_params() and no pair repeats
+    // the checks.
     struct OwnedParams {
         AlignParams p;
         std::vector<T> stack, gaps;
+        T step_max = T(-1);   // integer T: the largest step (nw_int_prepare); -1 = not prepared
         const T* stack_or_null() const noexcept { return stack.empty() ? nullptr : stack.data(); }
     };
     std::shared_ptr<const OwnedParams> own_params_(const AlignParams& p) const {
-        auto o = std::make_shared<OwnedParams>(OwnedParams{p, {}, {}});
+        auto o = std::make_shared<OwnedParams>(OwnedParams{p, {}, {}, T(-1)});
+        if constexpr (nw_is_int<T>) {
+            nw_int_prepare<T>(p, p.num_sets(), o->stack, o->gaps, o->step_max);
+            return o;
+        }
         if (!tracked_) return o;   // untracked (and standalone SeqPair): no allocation
         const std::vector<double> all = p.all_gaps();
         o->gaps.assign(all.begin(), all.end());
@@ -1586,7 +1611,10 @@ private:
     [[gnu::always_inline]] inline void problem_(Al& al, size_t i, const OwnedParams& o, int band,
                                                 std::vector<int>&& guide) const {
         if (tracked_) al.set_problem(codes_a(i), codes_b(i), o.p, band, std::move(guide),
-                                     track(i), gap_track(i), o.stack_or_null(), o.gaps.data());
+                                     track(i), gap_track(i), o.stack_or_null(), o.gaps.data(), o.step_max);
+        else if constexpr (nw_is_int<T>)   // the prepared stack, gaps and step_max (no tracks)
+            al.set_problem(codes_a(i), codes_b(i), o.p, band, std::move(guide), {}, {},
+                           o.stack_or_null(), o.gaps.data(), o.step_max);
         else          al.set_problem(codes_a(i), codes_b(i), o.p, band, std::move(guide));
     }
     // The hard gradient and guide of the DP `al` just ran, into pair i, in one walk —
@@ -1841,8 +1869,8 @@ private:
     // ── Inter-pair plan ──────────────────────────────────────────────────────
 
     static int inter_w_(const LevelKernels& K) {
-        if constexpr (std::is_same_v<T, double>) return K.inter_fill ? K.inter_w : 0;
-        else                                     return K.inter_fill_f ? K.inter_w_f : 0;
+        const TypedKernels<T>& KT = K.template of<T>();
+        return KT.inter_fill ? KT.inter_w : 0;
     }
 
     // The pieces of an InterJob every inter-pair fill shares (score_and_grad_inter_,
@@ -1858,7 +1886,10 @@ private:
         const size_t nbk = static_cast<size_t>(P.matrix.size()) * P.matrix.size() *
                            static_cast<size_t>(P.num_sets());
         blkT.resize(nbk);
-        for (size_t k = 0; k < nbk; ++k) blkT[k] = static_cast<T>(P.matrix.data()[k]);
+        for (size_t k = 0; k < nbk; ++k) {
+            if constexpr (nw_is_int<T>) blkT[k] = nw_int_checked<T>(P.matrix.data()[k], "substitution score");
+            else                        blkT[k] = static_cast<T>(P.matrix.data()[k]);
+        }
     }
     // Tracked inter-pair lanes: lane l's aligner set up with its pair (the group's last
     // pair repeated in spare lanes) and its rows in w.tjobs[l], before the fill, so the
@@ -1972,25 +2003,24 @@ private:
         }
     }
     static void run_inter_fill_(const LevelKernels& K, InterJobT<T>& job) {
-        if constexpr (std::is_same_v<T, double>) K.inter_fill(job);
-        else                                     K.inter_fill_f(job);
+        K.template of<T>().inter_fill(job);
     }
     // Score only (grad_mode None, Full): the same lanes on ONE row per table, each lane's
     // score out in job.best; false when the level has no such kernel.
     static bool has_inter_score_(const LevelKernels& K) {
-        if constexpr (std::is_same_v<T, double>) return K.inter_score != nullptr;
-        else                                     return K.inter_score_f != nullptr;
+        return K.template of<T>().inter_score != nullptr;
     }
     static void run_inter_score_(const LevelKernels& K, InterJobT<T>& job) {
-        if constexpr (std::is_same_v<T, double>) K.inter_score(job);
-        else                                     K.inter_score_f(job);
+        K.template of<T>().inter_score(job);
     }
-    // Linear Global's own fill is cheap: the shared one loses below 4 lanes (DNA, W=2:
-    // 0.76x on SSE2) and for alphabets over 8 (protein, the per-row gather: 1.10-1.22x
-    // at 12 threads on AVX2).  Soft pairs still take the soft pass and skip the fill.
+    // Linear Global takes the shared fill only from 4 lanes: below that (DNA, W=2) the own
+    // fill wins (0.76x on SSE2).  Alphabets over 8 used to be excluded too, on a 1.10-1.22x
+    // measured against the old baseline-compiled own fill; re-measured 2026-10-23 against the
+    // leveled striped linear kernel (nighthaven AVX2, protein, inter / own): hard L20-80
+    // 0.54-0.85 at 1 thread and 0.67-0.87 at 12 for every type, score-only 0.09-0.78 — so the
+    // exclusion is gone, and the per-pair caps in inter_eligible_ take the bands that lose.
     bool linear_fill_ok_(const LevelKernels& K) const {
-        return !(GM == GapModel::Linear && AM == AlignMode::Global &&
-                 (inter_w_(K) < 4 || alpha_->size() > 8));
+        return !(GM == GapModel::Linear && AM == AlignMode::Global && inter_w_(K) < 4);
     }
     // The vector backend the batch's inter-pair fills run on, or -1 (every pair its own
     // fill).
@@ -2006,8 +2036,19 @@ private:
     bool inter_eligible_(size_t i, const LevelKernels& K) const {
         if (len_a(i) == 0 || len_b(i) == 0) return false;
         if (!inter_pair_fits(len_a(i), len_b(i), GM == GapModel::Affine,
-                             grad_mode_ == GradMode::Soft, inter_w_(K), sizeof(T), K.inter_w))
+                             grad_mode_ == GradMode::Soft, inter_w_(K), sizeof(T), K.d.inter_w))
             return false;
+        // Linear, integer T, alphabet over 8: the inter-pair fill gathers per lane-cell,
+        // and the leveled striped linear kernel now beats it past ~L120 (inter / own, Local
+        // protein, hard, 1 thread: L100 0.85-0.99, L150 1.12-1.22, L200 1.14-1.33; nighthaven
+        // AVX2 and spot NEON agree).  Floating T keeps the shared fill: on AVX2 it still wins
+        // through L200 (0.63-0.84), and the NEON loss there (1.08-1.18 from L150) does not
+        // justify costing the primary target.
+        // (floating T: capped on AArch64 only, inter_linear_gather_cap — simd_levels.hpp)
+        if constexpr (GM == GapModel::Linear)
+            if (alpha_->size() > 8 && grad_mode_ != GradMode::Soft &&
+                (len_a(i) + 1) * (len_b(i) + 1) > inter_linear_gather_cap<T, AM == AlignMode::Global>())
+                return false;
         // Hirschberg pairs past the cutoff split: no shared fill.
         return !(is_hirschberg(tb_resolved_) && len_a(i) > static_cast<size_t>(s_.hb_cutoff));
     }
@@ -2018,25 +2059,37 @@ public:
     static bool ragged_ok(size_t shortest, size_t len_b) {
         return len_b * 4 <= shortest * 5 + 16;   // <= 1.25x + 4 columns
     }
+    // The inter-pair plan as the next "interpair" call runs it, rebuilt if stale:
+    // {pairs in shared groups, pairs on their own fill, groups}.  For nwgrad._tuning
+    // sweeps, to see where the gates routed the pairs.  (The score-only gather gate,
+    // inter_score_ok, acts per group inside the call and is not reflected here.)
+    std::array<size_t, 3> inter_plan_counts() {
+        ensure_plan_();
+        return {plan_.elig.size(), plan_.other.size(), plan_.groups.size()};
+    }
 private:
     struct InterPlan {
         int default_backend = -1000, hb_cutoff = -1;   // what it was built for
+        unsigned gate_epoch = ~0u;                      // ... and under which gate overrides
         int backend = -1;                               // every group's vector backend
         std::vector<size_t> elig, other;
         std::vector<std::pair<size_t, size_t>> groups;   // [start, end) into elig
     };
     InterPlan plan_;
 
-    // Built once and reused until the default ISA changes or the Hirschberg cutoff moves:
+    // Built once and reused until the default ISA changes, the Hirschberg cutoff moves or
+    // a fill gate is overridden (nwgrad._tuning):
     // re-sorting 2.5M pairs every training iteration was ~0.9 s of serial work per call.
     // Groups: len B runs of len-A-sorted pairs, cut every W and wherever len B outgrows
     // the group's shortest past ragged_ok().
     void ensure_plan_() {
         const int def_backend = global_default_backend();
-        if (plan_.default_backend == def_backend && plan_.hb_cutoff == s_.hb_cutoff) return;
+        const unsigned epoch = gate_epoch();
+        if (plan_.default_backend == def_backend && plan_.hb_cutoff == s_.hb_cutoff &&
+            plan_.gate_epoch == epoch) return;
         const size_t N = size();
         InterPlan P;
-        P.default_backend = def_backend; P.hb_cutoff = s_.hb_cutoff;
+        P.default_backend = def_backend; P.hb_cutoff = s_.hb_cutoff; P.gate_epoch = epoch;
         P.backend = inter_backend_();
         if (P.backend < 0) {
             P.other.resize(N);
@@ -2151,7 +2204,7 @@ private:
                     if (fin) {
                         // The soft pass is double, K.inter_w lanes: a float32 group runs
                         // it in W / SW chunks.
-                        const int SW = K.inter_w;
+                        const int SW = K.d.inter_w;
                         slogz.resize(W); scnt.resize(W * ccnt); sgap.resize(W * cgap); sok.assign(W, 0);
                         cM_.assign(static_cast<size_t>(W), 0);
                         if (want_post) sgp.assign(static_cast<size_t>(M + 1) * W, 0);
@@ -2182,7 +2235,7 @@ private:
                     SoftLane lane{};
                     const bool use = soft_group && sok[l];
                     if (use && tracked_) {
-                        const int SW = K.inter_w, c = static_cast<int>(l) / SW * SW, Mc = cM_[l];
+                        const int SW = K.d.inter_w, c = static_cast<int>(l) / SW * SW, Mc = cM_[l];
                         const size_t na = alpha_->size();
                         lane = {slogz[l],
                                 scnt.data() + static_cast<size_t>(c) * static_cast<size_t>(M) * na +
@@ -2196,7 +2249,7 @@ private:
                     } else if (use) {
                         lane = {slogz[l], scnt.data() + l * nnk, sgap.data() + l * 4};
                         if (want_post) {
-                            const int SW = K.inter_w, c = static_cast<int>(l) / SW * SW;
+                            const int SW = K.d.inter_w, c = static_cast<int>(l) / SW * SW;
                             lane.gpost = sgp.data() + static_cast<size_t>(c) * (M + 1) + (l - c);
                             lane.gstride = SW;
                         }
@@ -2386,6 +2439,10 @@ private:
                     M = std::max(M, m[l]);
                     n = std::max(n, nb[l]);
                     ragged |= nb[l] != nb[0];
+                }
+                if (!inter_score_ok(alpha_->size(), M, n)) {   // the gather: short pairs only
+                    for (size_t l = 0; l < real; ++l) own(plan_.elig[s + l]);
+                    continue;
                 }
                 InterJobT<T> job{};
                 job.a = a.data(); job.m = m.data(); job.b = b.data(); job.n = n; job.M = M;

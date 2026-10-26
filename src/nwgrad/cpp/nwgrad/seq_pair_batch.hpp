@@ -84,6 +84,9 @@ public:
     // ── Pairs ────────────────────────────────────────────────────────────────
 
     size_t size() const noexcept { return visit([](const auto& e) { return e.size(); }); }
+    std::array<size_t, 3> inter_plan_counts() {
+        return visit([](auto& e) { return e.inter_plan_counts(); });
+    }
     bool tracked() const noexcept { return visit([](const auto& e) { return e.tracked(); }); }
     int num_sets() const noexcept { return visit([](const auto& e) { return e.num_sets(); }); }
     const Alphabet& alphabet() const {

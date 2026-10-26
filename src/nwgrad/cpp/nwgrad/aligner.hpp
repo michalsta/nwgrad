@@ -165,6 +165,58 @@ static inline double lse3(double a, double b, double c) noexcept {
 // Runtime per-ISA-level dispatch table for the leveled affine kernels.
 #include "simd_levels.hpp"
 
+// ── Integer scalar types: checked parameter casts and the largest step ──────────
+//
+// An integer T takes integral parameters only (the user quantizes; a silent truncation
+// of 0.5 to 0 would be the alternative), each within +-nw_int_cap, and every problem's
+// a-priori bound (m + n + 2 + 64) * step_max must fit the cap (scalar_traits.hpp);
+// step_max is the largest magnitude one move can add — max |s| over the matrix stack,
+// |go| + |ge| per side over the sets.  nw_int_prepare casts K sets of `p` (the whole
+// stack, K*4 gaps) with those checks and reports step_max; a batch runs it once per
+// params and hands the results to every pair's set_problem(), a standalone aligner
+// runs it per problem.
+template <class T>
+T nw_int_checked(double x, const char* what) {
+    static_assert(nw_is_int<T>);
+    if (!(x == std::nearbyint(x)) || !(std::fabs(x) <= static_cast<double>(nw_int_cap<T>)))
+        throw std::invalid_argument(
+            "nwgrad: " + std::string(what) + " " + std::to_string(x) + " is not an integer within +-" +
+            std::to_string(static_cast<long long>(nw_int_cap<T>)) + " (the " + nw_type_name<T>() +
+            " scalar type takes integral parameters only; quantize them first)");
+    return static_cast<T>(x);
+}
+template <class T>
+void nw_int_prepare(const AlignParams& p, int K, std::vector<T>& stack, std::vector<T>& gaps,
+                    T& step_max) {
+    static_assert(nw_is_int<T>);
+    auto abs_t = [](T v) noexcept { return v < T(0) ? static_cast<T>(-v) : v; };
+    const std::size_t nn = static_cast<std::size_t>(p.matrix.size()) * p.matrix.size() *
+                           static_cast<std::size_t>(K);
+    stack.resize(nn);
+    T smax = T(0);
+    const double* src = p.matrix.data();
+    for (std::size_t k = 0; k < nn; ++k) {
+        const T v = nw_int_checked<T>(src[k], "substitution score");
+        stack[k] = v;
+        smax = std::max(smax, abs_t(v));
+    }
+    gaps.resize(4 * static_cast<std::size_t>(K));
+    const long long cap = static_cast<long long>(nw_int_cap<T>);
+    for (int k = 0; k < K; ++k) {
+        T* g = gaps.data() + 4 * static_cast<std::size_t>(k);
+        g[AlignParams::kOpenA]   = nw_int_checked<T>(p.gap(k, AlignParams::kOpenA), "gap_open_a");
+        g[AlignParams::kExtendA] = nw_int_checked<T>(p.gap(k, AlignParams::kExtendA), "gap_extend_a");
+        g[AlignParams::kOpenB]   = nw_int_checked<T>(p.gap(k, AlignParams::kOpenB), "gap_open_b");
+        g[AlignParams::kExtendB] = nw_int_checked<T>(p.gap(k, AlignParams::kExtendB), "gap_extend_b");
+        // |go| + |ge| <= 2 * cap fits a long long; clamped to the cap (the bound check
+        // then refuses all but the smallest problems).
+        const long long sa = static_cast<long long>(abs_t(g[0])) + abs_t(g[1]);
+        const long long sb = static_cast<long long>(abs_t(g[2])) + abs_t(g[3]);
+        smax = std::max(smax, static_cast<T>(std::min(cap, std::max(sa, sb))));
+    }
+    step_max = smax;
+}
+
 // The per-pair scaled soft kernels at the baseline ISA (scalar_fallback, header-only
 // builds, levels without their own copy).  The level TUs compile the same file again
 // with their -march; see soft_kernel_impl.inl.
@@ -293,16 +345,18 @@ struct Aligner {
                      const AlignParams& params,
                      int band = 0,
                      std::vector<int> guide_j = {}) {
-        problem_common_(a, b, params, band, std::move(guide_j), params.num_sets() > 1, nullptr);
+        problem_common_(a, b, params, band, std::move(guide_j), params.num_sets() > 1, nullptr, T(-1));
         if (tr_) setup_tracks_({}, {}, nullptr);
         problem_set_      = true;
     }
+    // `step_max` (integer T, with blkT and gapsT): the params' largest step, prepared by the
+    // batch with the casts; T(-1) = compute it here (floating T: ignored).
     void set_problem(std::span<const uint8_t> a, std::span<const uint8_t> b,
                      const AlignParams& params, int band, std::vector<int> guide_j,
                      std::span<const uint16_t> track, std::span<const uint16_t> gap_track,
-                     const T* blkT = nullptr, const T* gapsT = nullptr) {
+                     const T* blkT = nullptr, const T* gapsT = nullptr, T step_max = T(-1)) {
         problem_common_(a, b, params, band, std::move(guide_j),
-                        params.num_sets() > 1 || !track.empty() || !gap_track.empty(), blkT);
+                        params.num_sets() > 1 || !track.empty() || !gap_track.empty(), blkT, step_max);
         if (tr_) setup_tracks_(track, gap_track, gapsT);
         problem_set_      = true;
     }
@@ -503,6 +557,20 @@ struct Aligner {
         hb_cutoff_ = rows;
     }
     int hb_cutoff() const noexcept { return hb_cutoff_; }
+    // Whether the retained Viterbi tables (or direction bytes) are in the striped layout
+    // of a leveled kernel — i.e. one ran, not the scalar fill.  For tests' liveness checks.
+    bool tables_striped() const noexcept { return tables_striped_; }
+    // The B length from which the linear Full fill takes the leveled striped kernel.
+    // ... on `backend` (a level id): AVX-512's lanes move some crossovers later.
+    static int linear_striped_min_n(int backend) noexcept {
+        if (const int64_t o = gate_override(Gate::LinearStripedMinN); o >= 0)   // nwgrad._tuning
+            return o > INT32_MAX ? INT32_MAX : static_cast<int>(o);
+#if !(defined(__aarch64__) || defined(_M_ARM64))
+        if (backend == static_cast<int>(SimdLevel::Avx512)) return kLinearStripedMinN512;
+#endif
+        (void)backend;
+        return kLinearStripedMinN;
+    }
     int  kernel() const noexcept { return backend_; }
     // Which simd fill the Full band uses at double precision: the striped kernel (false,
     // the default) or the row-wise one the guide-banded path uses (true).  Both write
@@ -525,16 +593,19 @@ struct Aligner {
     void compute_forward_back() {
         check_problem();
         check_own_buf_allocated();
-        run_fwdbwd(own_buf_);
-        fwdbwd_done_ = any_fwdbwd_done_ = true;
-        fwdbwd_is_newest_ = true;
+        if constexpr (nw_is_int<T>) throw_soft_int_();
+        else {
+            run_fwdbwd(own_buf_);
+            fwdbwd_done_ = any_fwdbwd_done_ = true;
+            fwdbwd_is_newest_ = true;
+        }
     }
 
     // Returns the score from whichever DP ran most recently (Viterbi score or log Z),
     // regardless of which buffer was used.
     double score() const {
         if (fwdbwd_is_newest_) return log_z_;
-        if (any_viterbi_done_) return viterbi_score_;
+        if (any_viterbi_done_) return static_cast<double>(viterbi_score_);
         throw std::logic_error(
             "nwgrad: call compute_viterbi() or compute_forward_back() before score()");
     }
@@ -626,11 +697,7 @@ struct Aligner {
         } else {
             const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
             if (backend != kBackendScalar) {
-                const LevelKernels& K = level_kernels(backend);
-                auto fn = [&] {
-                    if constexpr (std::is_same_v<T, double>) return K.score;
-                    else                                     return K.score_f;
-                }();
+                const auto fn = level_kernels(backend).template of<T>().score;
                 if (fn) {
                     ScoreJob<T> job{};
                     job.a = a_idx_.data(); job.m = m_;
@@ -646,7 +713,7 @@ struct Aligner {
                     job.buf = &buf;
                     if (tr_) fill_track_job_(job.tr, true, static_cast<size_t>(n_) + 16, lin);
                     fn(job);
-                    return job.score;
+                    return static_cast<double>(job.score);
                 }
             }
             if constexpr (GM == GapModel::Linear) return score_linear_scalar(buf);
@@ -703,7 +770,7 @@ struct Aligner {
     // `stride`: the group's row length (n+1 of its longest B) when B lengths are ragged
     // (InterJobT::nb); 0 = this problem's own n+1.
     void adopt_interleaved(const DpBuffer& buf, int W, int lane,
-                           double local_best, int best_i, int best_j, size_t stride = 0) {
+                           T local_best, int best_i, int best_j, size_t stride = 0) {
         check_problem();
         inter_stride_ = stride ? stride : stride_;
         tables_striped_ = false;
@@ -713,13 +780,13 @@ struct Aligner {
         if constexpr (GM == GapModel::Linear) {
             // Linear: H in buf.H's slot of the interleaved fill (InterJob.linear).
             if constexpr (AM == AlignMode::Local) {
-                viterbi_score_ = static_cast<T>(local_best);
+                viterbi_score_ = local_best;
                 best_i_ = best_i; best_j_ = best_j;
             } else {
                 viterbi_score_ = rat(buf.H, m_, n_);
             }
         } else if constexpr (AM == AlignMode::Local) {
-            viterbi_score_ = static_cast<T>(local_best);
+            viterbi_score_ = local_best;
             best_i_ = best_i; best_j_ = best_j; best_tbl_ = TBTable::M;
             if (best_i > 0) {
                 const T mv = rat(buf.VM, best_i, best_j), xv = rat(buf.VX, best_i, best_j),
@@ -742,9 +809,12 @@ struct Aligner {
 
     void compute_forward_back(DpBuffer& buf) {
         check_problem();
-        run_fwdbwd(buf);
-        any_fwdbwd_done_ = true;
-        fwdbwd_is_newest_ = true;
+        if constexpr (nw_is_int<T>) throw_soft_int_();
+        else {
+            run_fwdbwd(buf);
+            any_fwdbwd_done_ = true;
+            fwdbwd_is_newest_ = true;
+        }
     }
 
     std::vector<int> guide_j_from_viterbi(const DpBuffer& buf) const {
@@ -840,7 +910,10 @@ struct Aligner {
     double soft_temperature() const noexcept { return soft_temp_; }
 
 private:
+    // The soft path's sentinel (always double) and the hard path's (in T; see
+    // scalar_traits.hpp: -inf for floating T, lowest()/2 for an integer T).
     static constexpr double NEG_INF = -std::numeric_limits<double>::infinity();
+    static constexpr T      NINF    = nw_ninf<T>;
 
     // ── Problem state ─────────────────────────────────────────────────────────
     std::span<const uint8_t> a_idx_, b_idx_;   // alphabet indices, not characters
@@ -865,7 +938,7 @@ private:
     [[gnu::always_inline]] inline void problem_common_(std::span<const uint8_t> a, std::span<const uint8_t> b,
                                                        const AlignParams& params, int band,
                                                        std::vector<int>&& guide_j, bool tracked,
-                                                       const T* blkT) {
+                                                       const T* blkT, T step_max) {
         // Invalidate first: a guide rejected below must not leave the previous
         // problem's results readable against this problem's sequences.
         problem_set_      = false;
@@ -884,9 +957,22 @@ private:
         // tracked).  T=double aliases the master (no copy); float32 converts once per
         // problem into blkT_storage_, unless the caller prepared it.
         if constexpr (std::is_same_v<T, double>) {
-            (void)blkT;
+            (void)blkT; (void)step_max;
             blkT_ = blk_;
+        } else if constexpr (nw_is_int<T>) {
+            // The batch prepared the stack, the gaps and step_max once per params
+            // (nw_int_prepare) and hands them to every pair, tracked or not; a standalone
+            // problem prepares its own (the sets it reads: K when tracked, else set 0).
+            if (blkT && step_max >= T(0)) {
+                blkT_ = blkT;
+                step_max_ = step_max;
+            } else {
+                nw_int_prepare<T>(params, tr_ ? params.num_sets() : 1, blkT_storage_,
+                                  int_gaps_scratch_, step_max_);
+                blkT_ = blkT_storage_.data();
+            }
         } else {
+            (void)step_max;
             if (tr_ && blkT) {
                 blkT_ = blkT;
             } else {
@@ -903,6 +989,7 @@ private:
         n_      = static_cast<int>(b.size());
         stride_ = static_cast<size_t>(n_ + 1);
         sz_     = static_cast<size_t>(m_ + 1) * stride_;
+        if constexpr (nw_is_int<T>) int_bound_check_();
         // Checked for Full too: the entry points pick GuideBanded only for band > 0, so
         // a negative band would otherwise slip through as a full DP.
         if (band_ < 0)
@@ -1121,8 +1208,7 @@ private:
         T csum = static_cast<T>(0);     // C_{s-1}: the sum over rows before the current run
         size_t s = 1;                   // the current run's first row
         for (size_t i = 1; i <= m; ++i) {
-            if (i > 1 && std::bit_cast<std::conditional_t<sizeof(T) == 8, uint64_t, uint32_t>>(tgeb_[i]) !=
-                         std::bit_cast<std::conditional_t<sizeof(T) == 8, uint64_t, uint32_t>>(tgeb_[i - 1])) {
+            if (i > 1 && std::bit_cast<nw_bits_t<T>>(tgeb_[i]) != std::bit_cast<nw_bits_t<T>>(tgeb_[i - 1])) {
                 // close the run [s, i-1]
                 csum = (s == 1) ? static_cast<T>(i - 1) * tgeb_[i - 1]
                                 : csum + static_cast<T>(i - s) * tgeb_[i - 1];
@@ -1145,7 +1231,8 @@ private:
     // to skip a per-row de-stripe copy.  When tables_striped_ is set, rat/at index those
     // tables striped (cell_index); every row-major fill clears it.  striped_seg_ and
     // striped_w_ come straight from the kernel (ViterbiJob.seg / .width); a striped row
-    // is striped_seg_*striped_w_ + 1 doubles, slot 0 being column 0.
+    // is striped_seg_*striped_w_ + 1 doubles, slot 0 being column 0, at a stride of
+    // striped_rs_ (ViterbiJob.rstride: the Scores and linear H kernels pad it, dp_buffer.hpp).
     bool   tables_striped_ = false;
     bool   rowwise_full_   = false;   // see set_rowwise_full()
     // Set by adopt_interleaved(): VM/VX/VY hold inter_w_ pairs' tables interleaved per
@@ -1202,17 +1289,22 @@ private:
     // and 2.8-3.6x / 3.7-5x on unrelated pairs, identical totals; pairs <= hb_cutoff run
     // AS Pointers.  Local double stays Pointers (exact Local Hirschberg loses there; pmax
     // at double is opt-in by the rule above).  Linear and banded resolve to Pointers.
+    //
+    // An INTEGER T resolves affine Full (both modes) to HirschbergPmax outright: integer
+    // arithmetic is exact and associative, so the prefix-max carry is bit-identical to the
+    // serial one there (scalar_traits.hpp) and the only difference left is its speed.
     static constexpr TracebackMode kDefaultTb =
         (GM == GapModel::Affine && AB == AlignBand::Full && AM == AlignMode::Global)
-            ? (std::is_same_v<T, float> ? TracebackMode::HirschbergPmax
-                                        : TracebackMode::Hirschberg)
-        : (GM == GapModel::Affine && AB == AlignBand::Full && std::is_same_v<T, float>)
+            ? ((std::is_same_v<T, float> || nw_is_int<T>) ? TracebackMode::HirschbergPmax
+                                                           : TracebackMode::Hirschberg)
+        : (GM == GapModel::Affine && AB == AlignBand::Full && (std::is_same_v<T, float> || nw_is_int<T>))
             ? TracebackMode::HirschbergPmax
             : TracebackMode::Pointers;
     TracebackMode tb_ = kDefaultTb;
     bool          tb_auto_ = true;   // tb_ came from "auto" (see linear_ptr_fill)
     int    striped_seg_    = 0;
     int    striped_w_      = 1;
+    size_t striped_rs_     = 0;   // a striped row's stride (>= (seg+1)*W: a kernel may pad it)
 
     int backend_ = kBackendAuto;  // which Viterbi backend fills the tables (default: auto)
 
@@ -1225,7 +1317,7 @@ private:
     bool fwdbwd_is_newest_  = false; // true if forward-back ran more recently than viterbi
 
     // ── Scalar results (written by every compute_viterbi / compute_forward_back)
-    double viterbi_score_ = 0.0;
+    T      viterbi_score_ = T(0);   // in T; score() promotes (exact below 2^53)
     double log_z_         = 0.0;
     int    best_i_ = 0, best_j_ = 0;
 
@@ -1280,6 +1372,34 @@ private:
             throw std::logic_error("nwgrad: call compute_forward_back() first");
     }
 
+    // The soft path (forward-backward, log Z, expected counts) is a computation in
+    // exp/log space: it has no integer form.  An integer T throws here, and the
+    // `if constexpr` at the two call sites keeps the double-space body from being
+    // instantiated against integer tables at all.
+    [[noreturn]] static void throw_soft_int_() {
+        throw std::invalid_argument(
+            std::string("nwgrad: the soft path (forward-backward / soft gradient) needs a "
+                        "floating-point scalar type; this aligner's is ") + nw_type_name<T>());
+    }
+
+    // ── Integer T: parameter checks and the overflow bound (see scalar_traits.hpp) ──
+    //
+    // Every parameter must be an integer within ±nw_int_cap (the user quantizes; a
+    // silent truncation of 0.5 to 0 would be the alternative), and the problem's a-priori
+    // bound (m+n+2) * step_max_ must not exceed the cap, step_max_ being the largest
+    // magnitude any one move can add: max |s| over the block, |go| + |ge| per side.
+    T step_max_ = T(0);
+    mutable std::vector<T> int_gaps_scratch_;   // nw_int_prepare's gaps, when run here
+    void int_bound_check_() const {
+        if (step_max_ > T(0) &&
+            static_cast<long long>(m_) + n_ + 2 + nw_int_pad_cols > static_cast<long long>(nw_int_cap<T> / step_max_))
+            throw std::overflow_error(
+                "nwgrad: a " + std::to_string(m_) + " x " + std::to_string(n_) + " problem with a largest "
+                "step of " + std::to_string(static_cast<long long>(step_max_)) + " could overflow the " +
+                nw_type_name<T>() + " scalar type ((m + n + 2 + 64 padding columns) * step exceeds " +
+                std::to_string(static_cast<long long>(nw_int_cap<T>)) + "); use a wider type");
+    }
+
     // Throw if own buffer shell has never been allocated.
     void check_own_buf_allocated() const {
         if (!own_buf_allocated_)
@@ -1318,15 +1438,13 @@ private:
     }
 
     // Whether this run actually selects rowwise score tables. The preference
-    // alone is insufficient: splitting Hirschberg, float32 and scalar kernels
-    // ignore it. Share the predicate with dispatch so those paths keep their
+    // alone is insufficient: splitting Hirschberg and scalar kernels ignore it. Share the predicate with dispatch so those paths keep their
     // smaller memory bounds even when rowwise was requested.
     bool uses_rowwise_full() const {
-        if constexpr (GM == GapModel::Affine && AB == AlignBand::Full &&
-                      std::is_same_v<T, double>) {
+        if constexpr (GM == GapModel::Affine && AB == AlignBand::Full) {
             if (!rowwise_full_ || (is_hirschberg(tb_) && m_ > hb_cutoff_)) return false;
             const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
-            return backend >= 0 && level_kernels(backend).banded_row_local;
+            return backend >= 0 && level_kernels(backend).template of<T>().banded_row_local;
         }
         return false;
     }
@@ -1397,7 +1515,7 @@ private:
             // address, given the 64-byte-aligned allocator), slots 1..W-1 pad.  Column j
             // is at W + ((j-1)%seg)*W + (j-1)/seg.  Must match kernels_impl.inl exactly.
             const size_t W = static_cast<size_t>(striped_w_);
-            const size_t rowsz = (static_cast<size_t>(striped_seg_) + 1) * W;
+            const size_t rowsz = striped_rs_;   // (seg+1)*W, or a kernel's padded stride
             if (j == 0) return static_cast<size_t>(i) * rowsz;
             const int jj = j - 1;
             return static_cast<size_t>(i) * rowsz + W +
@@ -1585,24 +1703,22 @@ private:
             for (int i = 0; i <= m_; ++i) {
                 int lo, hi; band_row_span(i, lo, hi);
                 auto* row = vec.data() + static_cast<size_t>(i) * stride_;
-                std::fill(row + lo, row + hi + 1, NEG_INF);
+                std::fill(row + lo, row + hi + 1, nw_ninf<typename V::value_type>);
             }
         }
     }
 
     // Fill `vec` with `value`.  Full: the whole (m+1)×(n+1) table.  GuideBanded:
-    // only the band region (O(m·band)).  Element-generic; `value` is passed as double
-    // and std::fill converts it to the table's element type (NEG_INF stays -inf).
-    template <class V> void band_fill(V& vec, double value) const {
+    // only the band region (O(m·band)).  Element-generic: `value` is the table's own
+    // element type (NINF for the T tables, NEG_INF for the double soft tables).
+    template <class V> void band_fill(V& vec, typename V::value_type value) const {
         if constexpr (AB == AlignBand::Full) {
-            std::fill(vec.begin(), vec.begin() + static_cast<ptrdiff_t>(sz_),
-                      static_cast<typename V::value_type>(value));
+            std::fill(vec.begin(), vec.begin() + static_cast<ptrdiff_t>(sz_), value);
         } else {
             for (int i = 0; i <= m_; ++i) {
                 int lo, hi; band_row_span(i, lo, hi);
                 auto* row = vec.data() + static_cast<size_t>(i) * stride_;
-                std::fill(row + lo, row + hi + 1,
-                          static_cast<typename V::value_type>(value));
+                std::fill(row + lo, row + hi + 1, value);
             }
         }
     }
@@ -1972,9 +2088,23 @@ private:
         // (the pointer kernels are chosen after the backend is resolved, below: every
         // simd level has its own, and only the scalar path falls back here.)
         if constexpr (GM == GapModel::Linear) {
-            // No simd per-pair linear kernel: every backend is scalar here.  The pointer
-            // fill keeps direction bytes, not H, where linear_ptr_fill() says so.
-            if (linear_ptr_fill()) { viterbi_linear_ptr(buf); return; }
+            // The pointer fill keeps direction bytes, not H, where linear_ptr_fill() says
+            // so.  Full: the leveled striped linear kernel (kernels_linear_impl.inl) when
+            // the backend has one — bit-exact with the scalar fills below, which remain
+            // the scalar backend's, the banded path's and the header-only build's.
+            const bool lin_ptr = linear_ptr_fill();
+            if constexpr (AB == AlignBand::Full) {
+                const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
+                if (backend != kBackendScalar && n_ >= linear_striped_min_n(backend)) {
+                    const LevelKernels& K = level_kernels(backend);
+                    const TypedKernels<T>& KT = K.template of<T>();
+                    if (lin_ptr ? KT.linear_ptr != nullptr : KT.linear != nullptr) {
+                        run_dispatched_linear(buf, K, lin_ptr);
+                        return;
+                    }
+                }
+            }
+            if (lin_ptr) { viterbi_linear_ptr(buf); return; }
             viterbi_linear(buf);
             return;
         }
@@ -1992,28 +2122,19 @@ private:
         // A simd level: its kernels.  If that level's TU was not linked (header-only
         // single-level build), every pointer is null and we fall through to scalar.
         const LevelKernels& K = level_kernels(backend);
+        const TypedKernels<T>& KT = K.template of<T>();
         if constexpr (AB == AlignBand::Full) {
             // Opt-in row-wise fill (set_rowwise_full): score tables, row-major, read back
             // by the Scores traceback whatever tb_ says — the paths are identical.
-            if constexpr (std::is_same_v<T, double>) {
-                if (uses_rowwise_full()) { viterbi_affine_simd(buf, K); return; }
-            }
-            // The striped Full kernel exists at both precisions (viterbi / viterbi_f).
-            if constexpr (std::is_same_v<T, double>) {
-                if (use_ptr && K.viterbi_ptr) { run_dispatched_affine(buf, K, true);  return; }
-                if (K.viterbi)             { run_dispatched_affine(buf, K, false); return; }
-            } else {
-                if (use_ptr && K.viterbi_ptr_f) { run_dispatched_affine(buf, K, true);  return; }
-                if (K.viterbi_f)             { run_dispatched_affine(buf, K, false); return; }
-            }
+            if (uses_rowwise_full()) { viterbi_affine_simd(buf, K); return; }
+            // The striped Full kernel, this level's instantiation for T.
+            if (use_ptr && KT.viterbi_ptr) { run_dispatched_affine(buf, K, true);  return; }
+            if (KT.viterbi)                { run_dispatched_affine(buf, K, false); return; }
             if (use_ptr) { viterbi_affine_ptr(buf); return; }   // level lacks the ptr kernel
         }
-        // The row-wise banded kernel is double-only for now; float banded falls back to the
-        // (T-templated) scalar fill.  Gated so viterbi_affine_simd — whose body is
-        // double-typed — is never instantiated for T=float.
-        if constexpr (std::is_same_v<T, double>) {
-            if (K.banded_row_local) { viterbi_affine_simd(buf, K); return; }
-        }
+        // The row-wise banded kernel (every T); a level without it falls back to the
+        // scalar fill.
+        if (KT.banded_row_local) { viterbi_affine_simd(buf, K); return; }
         viterbi_affine(buf);
     }
 
@@ -2034,13 +2155,15 @@ private:
         job.guide_j = nullptr; job.guide_len = 0;
         job.buf = &buf;
         if (tr_) fill_track_job_(job.tr, true, static_cast<size_t>(n_) + 16);
-        if constexpr (std::is_same_v<T, double>) { if (use_ptr) K.viterbi_ptr(job); else K.viterbi(job); }
-        else                                     { if (use_ptr) K.viterbi_ptr_f(job); else K.viterbi_f(job); }
+        const TypedKernels<T>& KT = K.template of<T>();
+        if (use_ptr) KT.viterbi_ptr(job); else KT.viterbi(job);
         pointers_ = use_ptr;   // Pointers leaves codes, not score tables
         // Adopt the layout the kernel produced (striped for the Full striped kernel).
         if (job.table_layout == 1) {
             tables_striped_ = true;
             striped_seg_ = job.seg; striped_w_ = job.width;
+            striped_rs_ = job.rstride ? job.rstride
+                                      : (static_cast<size_t>(job.seg) + 1) * static_cast<size_t>(job.width);
         } else {
             tables_striped_ = false;
         }
@@ -2048,6 +2171,60 @@ private:
         best_i_ = job.best_i; best_j_ = job.best_j;
         best_tbl_ = (job.best_tbl == 0) ? TBTable::M
                   : (job.best_tbl == 1) ? TBTable::X : TBTable::Y;
+    }
+
+    // Below these B lengths the scalar linear fill beats the striped kernel: each row pays
+    // a fixed cost (two passes, the carry's cross-lane step, the profile row) that few
+    // columns cannot amortize.  Measured, striped / scalar time reaching 1.0, own fill,
+    // hard, 1 thread, protein and DNA, nighthaven (AVX2) and spot (NEON) agreeing within
+    // one fixture step (2026-10-23): Global n ~48 int16, ~64 int32, ~80 float32, ~96
+    // double; Local ~32, ~40, ~24, ~24.  A column count, nearly independent of the ISA:
+    // the 22 x 50 DNA cells fall on the same lines.  (int64 has no striped linear kernel
+    // below AVX-512 at all: kernels_linear_impl.inl, linear_kernel_pays.)
+    static constexpr int kLinearStripedMinN =
+        (AM == AlignMode::Global)
+            ? (std::is_same_v<T, int16_t> ? 48 : std::is_same_v<T, int32_t> ? 64
+               : std::is_same_v<T, float> ? 80 : 96)
+            : (std::is_same_v<T, int16_t> ? 32 : std::is_same_v<T, int32_t> ? 40 : 24);
+    // AVX-512 (solace, Tiger Lake, gcc 15.2, 2026-10-23): the lanes double AVX2's and some
+    // crossovers move a step later — striped / scalar at the shared thresholds: int16 Global
+    // n 48 1.13, Local 32 1.18; float32 Local 24 1.36; int64 Local 24 1.50, 32 1.20 — each
+    // winning a step later (int16 Global 64 0.79, Local 48 0.84; float32 Local 32 0.89;
+    // int64 Local 48 0.88).  The rest keep the shared values (crossing at or before them).
+    static constexpr int kLinearStripedMinN512 =
+        (AM == AlignMode::Global)
+            ? (std::is_same_v<T, int16_t> ? 56 : kLinearStripedMinN)
+            : (std::is_same_v<T, int16_t> ? 40 : std::is_same_v<T, float> ? 30
+               : std::is_same_v<T, int64_t> ? 44 : kLinearStripedMinN);
+
+    // The leveled linear kernel (Full): H in STRIPED layout (or direction bytes in it),
+    // read back through cell_index like the affine tables.  No gap opens in the job.
+    void run_dispatched_linear(DpBuffer& buf, const LevelKernels& K, bool use_ptr) {
+        ViterbiJob<T> job{};
+        job.a = a_idx_.data(); job.m = m_;
+        job.b = b_idx_.data(); job.n = n_;
+        job.blk = blkT_;       job.nalpha = nalpha_;
+        job.go_a = static_cast<T>(0); job.ge_a = static_cast<T>(params_->gap_extend_a);
+        job.go_b = static_cast<T>(0); job.ge_b = static_cast<T>(params_->gap_extend_b);
+        job.align_mode = (AM == AlignMode::Local) ? 1 : 0;
+        job.align_band = 0; job.band = 0;
+        job.guide_j = nullptr; job.guide_len = 0;
+        job.buf = &buf;
+        if (tr_) fill_track_job_(job.tr, true, static_cast<size_t>(n_) + 16, true);
+        const TypedKernels<T>& KT = K.template of<T>();
+        if (use_ptr) KT.linear_ptr(job); else KT.linear(job);
+        pointers_ = use_ptr;
+        if (job.table_layout == 1) {
+            tables_striped_ = true;
+            striped_seg_ = job.seg; striped_w_ = job.width;
+            striped_rs_ = job.rstride ? job.rstride
+                                      : (static_cast<size_t>(job.seg) + 1) * static_cast<size_t>(job.width);
+        } else {
+            tables_striped_ = false;
+        }
+        viterbi_score_ = job.score;
+        best_i_ = job.best_i; best_j_ = job.best_j;
+        best_tbl_ = TBTable::M;
     }
 
     // ── Simd kernel — defined out-of-line in aligner_simd.hpp ─────────────────
@@ -2064,7 +2241,7 @@ private:
     // full-width profile would outcost the banded DP.  Defined in aligner_simd.hpp.
     void build_profile(DpBuffer& buf);
     bool rw_prof_ = false;   // tracked row-wise Full: build_profile kept a compact profile
-    const double* subrow(DpBuffer& buf, int i, int lo, int hi) const;
+    const T* subrow(DpBuffer& buf, int i, int lo, int hi) const;
 
     // ═════════════════════════════════════════════════════════════════════════
     // Viterbi — Linear gap model
@@ -2103,7 +2280,7 @@ private:
         }
 
         best_i_ = 0; best_j_ = 0;
-        double best_local = 0.0;
+        T best_local = T(0);
         // Row pointers, not rat()/at(): run_viterbi cleared the layout flags, so H is
         // row-major here, and cell_index()'s layout switch inside the loop is dead weight
         // that gcc unswitches and clang does not (clang/gcc 1.77x on this fill).  The
@@ -2180,7 +2357,7 @@ private:
         }
         int bi = 0, bj = 0;   // locals: best_i_/best_j_ are members (see below)
         const int n = n_;     // ditto: a member bound is reloaded after every byte store
-        double best_local = 0.0;
+        T best_local = T(0);
         const unsigned char* __restrict bcode = b_idx_.data();
         for (int i = 1; i <= m_; ++i) {
             unsigned char* __restrict d = D + static_cast<size_t>(i) * st;
@@ -2220,6 +2397,7 @@ private:
                 if constexpr (local) {
                     v = std::max(v, static_cast<T>(0));
 #if defined(__GNUC__) && !defined(__clang__) && defined(__aarch64__)
+                  if constexpr (std::is_floating_point_v<T>) {
                     // gcc on AArch64 turned every form of the float stop compare into a
                     // branch around the code (out of line, mispredicted where many cells
                     // clamp to 0) and branched on the best cell too: 1.8x clang.  So: stop
@@ -2227,13 +2405,17 @@ private:
                     // without the sign are 0", an integer test; the best cell as selects,
                     // its row taken once after the row (0.53x).  x86 keeps the plain form:
                     // this one was 5-7 % slower there under both compilers.
-                    using U = std::conditional_t<sizeof(T) == 8, std::uint64_t, std::uint32_t>;
+                    using U = nw_bits_t<T>;
                     const unsigned z = static_cast<unsigned>((std::bit_cast<U>(v) << 1) == 0);
                     c = static_cast<unsigned char>(c | (3u * z));
                     const bool up = v > best_local;
-                    best_local = up ? static_cast<double>(v) : best_local;
+                    best_local = up ? v : best_local;
                     bj = up ? j : bj;
                     hit |= static_cast<int>(up);
+                  } else {   // integer T: the plain form (a `v <= 0` on an int is one compare)
+                    c = static_cast<unsigned char>(c | (3u * static_cast<unsigned>(v <= static_cast<T>(0))));
+                    if (v > best_local) { best_local = v; bi = i; bj = j; }
+                  }
 #else
                     // c is 0..2: OR-ing 3 sets the stop code without the branch gcc made
                     c = static_cast<unsigned char>(c | (3u * static_cast<unsigned>(v <= static_cast<T>(0))));
@@ -2366,11 +2548,11 @@ private:
 
         // ── row 0 ────────────────────────────────────────────────────────────
         for (std::size_t j = 0; j <= static_cast<std::size_t>(n_); ++j) {
-            if constexpr (AM == AlignMode::Local) { pM[j] = 0; pX[j] = NEG_INF; pY[j] = NEG_INF; }
+            if constexpr (AM == AlignMode::Local) { pM[j] = 0; pX[j] = NINF; pY[j] = NINF; }
             else {
-                pM[j] = (j == 0) ? static_cast<T>(0) : NEG_INF;
-                pX[j] = NEG_INF;
-                pY[j] = (j == 0) ? NEG_INF : -(go_a + static_cast<T>(j) * ge_a);
+                pM[j] = (j == 0) ? static_cast<T>(0) : NINF;
+                pX[j] = NINF;
+                pY[j] = (j == 0) ? NINF : -(go_a + static_cast<T>(j) * ge_a);
             }
             dM[j] = (AM == AlignMode::Local || j == 0) ? 3 : 3;   // row 0 is a start
             dX[j] = 0;
@@ -2391,10 +2573,10 @@ private:
                 srow = blkT_ + static_cast<size_t>(rs_[static_cast<size_t>(i) - 1]) * static_cast<size_t>(nalpha_);
             }
             // column 0 of this row
-            if constexpr (AM == AlignMode::Local) { cM[0] = 0; cX[0] = NEG_INF; }
-            else if constexpr (Tr) { cM[0] = NEG_INF; cX[0] = tbx0_[static_cast<size_t>(i)]; }
-            else { cM[0] = NEG_INF; cX[0] = -(go_b + static_cast<T>(i) * ge_b); }
-            cY[0] = NEG_INF;
+            if constexpr (AM == AlignMode::Local) { cM[0] = 0; cX[0] = NINF; }
+            else if constexpr (Tr) { cM[0] = NINF; cX[0] = tbx0_[static_cast<size_t>(i)]; }
+            else { cM[0] = NINF; cX[0] = -(go_b + static_cast<T>(i) * ge_b); }
+            cY[0] = NINF;
             dM[rb] = 3;
             dX[rb] = (i <= 1) ? 0 : 1;    // (1,0) opens from M(0,0); deeper rows extend X
             dY[rb] = 0;
@@ -2484,9 +2666,8 @@ private:
         const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
         if (backend == kBackendScalar) return nullptr;
         const LevelKernels& K = level_kernels(backend);
-        const bool dbl = std::is_same_v<T, double>;
-        const bool have = hb_pmax() ? (dbl ? K.hb_sweep_pmax != nullptr : K.hb_sweep_pmax_f != nullptr)
-                                    : (dbl ? K.hb_sweep      != nullptr : K.hb_sweep_f      != nullptr);
+        const TypedKernels<T>& KT = K.template of<T>();
+        const bool have = hb_pmax() ? KT.hb_sweep_pmax != nullptr : KT.hb_sweep != nullptr;
         return have ? &K : nullptr;
     }
 
@@ -2508,11 +2689,8 @@ private:
         job.buf = &buf;
         job.outM = oM; job.outX = oX; job.outY = oY;
         if (tr_) { hb_reverse_rows_(); fill_track_job_(job.tr, false, 0); }
-        if constexpr (std::is_same_v<T, double>) {
-            if (hb_pmax()) K.hb_sweep_pmax(job); else K.hb_sweep(job);
-        } else {
-            if (hb_pmax()) K.hb_sweep_pmax_f(job); else K.hb_sweep_f(job);
-        }
+        const TypedKernels<T>& KT = K.template of<T>();
+        if (hb_pmax()) KT.hb_sweep_pmax(job); else KT.hb_sweep(job);
     }
 
     // Forward sweep of rows (i0, i1], keeping two rolling rows.  On return the three
@@ -2537,14 +2715,14 @@ private:
         const int W = j1 - j0;
 
         // Row i0: the block's origin, then Y moves rightward along it.
-        pM[0] = in_x ? static_cast<T>(NEG_INF) : static_cast<T>(0);
+        pM[0] = in_x ? NINF : static_cast<T>(0);
         // An inherited X run (in_x) may only CONTINUE: the origin feeds nothing but the
         // first row's column-0 X (below) — see hb_solve's note on boundary states.
-        pX[0] = static_cast<T>(NEG_INF);
-        pY[0] = static_cast<T>(NEG_INF);
+        pX[0] = NINF;
+        pY[0] = NINF;
         for (int c = 1; c <= W; ++c) {
-            pM[c] = static_cast<T>(NEG_INF);
-            pX[c] = static_cast<T>(NEG_INF);
+            pM[c] = NINF;
+            pX[c] = NINF;
             pY[c] = std::max({pM[c-1] - go_a - ge_a, pX[c-1] - go_a - ge_a, pY[c-1] - ge_a});
         }
 
@@ -2554,10 +2732,10 @@ private:
                 go_a = hb_go_a(r); ge_a = hb_ge_a(r); go_b = hb_go_b(r, false); ge_b = hb_ge_b(r, false);
                 if constexpr (Pmax) for (int k = 0; k <= W; ++k) rr[k] = static_cast<T>(k) * ge_a;
             }
-            cM[0] = static_cast<T>(NEG_INF);
+            cM[0] = NINF;
             cX[0] = std::max({pM[0] - go_b - ge_b, pX[0] - ge_b, pY[0] - go_b - ge_b});
             if (in_x && r == i0 + 1) cX[0] = static_cast<T>(0) - ge_b;   // the run continues
-            cY[0] = static_cast<T>(NEG_INF);
+            cY[0] = NINF;
             // The running prefix max over Q[k] = g[k] + k*ge_a, seeded with the column-0
             // border folded in as k = -1.  Unused (and cold) when Pmax is false.
             T P = cY[0] - ge_a;
@@ -2570,7 +2748,7 @@ private:
                     // exactly (subtracting a common value is order-preserving, so this is
                     // bit-identical to the three-way form the exact branch uses).
                     const T g = (std::max(cM[c-1], cX[c-1]) - go_a) - ge_a;
-                    P = std::max(g + rmp[c-1], P);
+                    P = std::max<T>(g + rmp[c-1], P);
                     cY[c] = P - rmp[c-1];
                 } else {
                     cY[c] = std::max({cM[c-1] - go_a - ge_a, cX[c-1] - go_a - ge_a, cY[c-1] - ge_a});
@@ -2597,14 +2775,14 @@ private:
         const int W = j1 - j0;
 
         // Reversed column offset d = j1 - j, so d grows leftward from the block's end.
-        pM[0] = out_x ? static_cast<T>(NEG_INF) : static_cast<T>(0);
+        pM[0] = out_x ? NINF : static_cast<T>(0);
         // A run continuing past the corner (out_x) must ENTER it vertically: the corner
         // feeds nothing but the first reversed row's column-0 X (below).
-        pX[0] = static_cast<T>(NEG_INF);
-        pY[0] = static_cast<T>(NEG_INF);
+        pX[0] = NINF;
+        pY[0] = NINF;
         for (int d = 1; d <= W; ++d) {
-            pM[d] = static_cast<T>(NEG_INF);
-            pX[d] = static_cast<T>(NEG_INF);
+            pM[d] = NINF;
+            pX[d] = NINF;
             pY[d] = std::max({pM[d-1] - go_a - ge_a, pX[d-1] - go_a - ge_a, pY[d-1] - ge_a});
         }
 
@@ -2614,10 +2792,10 @@ private:
                 go_a = hb_go_a(r); ge_a = hb_ge_a(r); go_b = hb_go_b(r + 1, true); ge_b = hb_ge_b(r + 1, true);
                 if constexpr (Pmax) for (int k = 0; k <= W; ++k) rr[k] = static_cast<T>(k) * ge_a;
             }
-            cM[0] = static_cast<T>(NEG_INF);
+            cM[0] = NINF;
             cX[0] = std::max({pM[0] - go_b - ge_b, pX[0] - ge_b, pY[0] - go_b - ge_b});
             if (out_x && r == i1 - 1) cX[0] = static_cast<T>(0) - ge_b;   // enters the corner vertically
-            cY[0] = static_cast<T>(NEG_INF);
+            cY[0] = NINF;
             T P = cY[0] - ge_a;
             for (int d = 1; d <= W; ++d) {
                 // Mirrored diagonal: this step pairs a[r] with b[j1-d], i.e. subT(r+1, j1-d+1).
@@ -2625,7 +2803,7 @@ private:
                 cX[d] = std::max({pM[d] - go_b - ge_b, pX[d] - ge_b, pY[d] - go_b - ge_b});
                 if constexpr (Pmax) {
                     const T g = (std::max(cM[d-1], cX[d-1]) - go_a) - ge_a;
-                    P = std::max(g + rmp[d-1], P);
+                    P = std::max<T>(g + rmp[d-1], P);
                     cY[d] = P - rmp[d-1];
                 } else {
                     cY[d] = std::max({cM[d-1] - go_a - ge_a, cX[d-1] - go_a - ge_a, cY[d-1] - ge_a});
@@ -2647,9 +2825,7 @@ private:
         const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
         if (backend == kBackendScalar) return nullptr;
         const LevelKernels& K = level_kernels(backend);
-        const bool have = std::is_same_v<T, double> ? (K.hb_base != nullptr)
-                                                    : (K.hb_base_f != nullptr);
-        return have ? &K : nullptr;
+        return K.template of<T>().hb_base ? &K : nullptr;
     }
 
     // Vectorized base case: the striped kernel fills buf.hbD (3 direction planes, striped)
@@ -2669,8 +2845,7 @@ private:
         job.b_start = j0; job.b_step = 1;      // col c=1..NC pairs   b[j0 + (c-1)]
         job.H = H; job.ncols = NC; job.in_x = in_x ? 1 : 0; job.buf = &buf;
         if (tr_) fill_track_job_(job.tr, false, 0);
-        if constexpr (std::is_same_v<T, double>) K.hb_base(job);
-        else                                     K.hb_base_f(job);
+        K.template of<T>().hb_base(job);
 
         // Striped walk-back over buf.hbD.  Column c lives at slot (c==0 ? 0 : W+scol(c)).
         const int seg = job.seg, Wl = job.width;
@@ -2731,13 +2906,13 @@ private:
             return (vx >= vy) ? 1 : 2;
         };
 
-        pM[0] = in_x ? static_cast<T>(NEG_INF) : static_cast<T>(0);
-        pX[0] = static_cast<T>(NEG_INF);   // in_x: only the first row's column-0 X continues it
-        pY[0] = static_cast<T>(NEG_INF);
+        pM[0] = in_x ? NINF : static_cast<T>(0);
+        pX[0] = NINF;   // in_x: only the first row's column-0 X continues it
+        pY[0] = NINF;
         dM[0] = 3; dX[0] = 3; dY[0] = 3;
         for (int c = 1; c <= W; ++c) {
-            pM[c] = static_cast<T>(NEG_INF);
-            pX[c] = static_cast<T>(NEG_INF);
+            pM[c] = NINF;
+            pX[c] = NINF;
             const T uy = pM[c-1] - go_a - ge_a, vy = pX[c-1] - go_a - ge_a, wy = pY[c-1] - ge_a;
             pY[c] = std::max({uy, vy, wy});
             dM[c] = 3; dX[c] = 3; dY[static_cast<std::size_t>(c)] = pick(uy, vy, wy);
@@ -2750,9 +2925,9 @@ private:
                 go_b = hb_go_b(i0 + r, false); ge_b = hb_ge_b(i0 + r, false);
             }
             const T ux0 = pM[0] - go_b - ge_b, vx0 = pX[0] - ge_b, wx0 = pY[0] - go_b - ge_b;
-            cM[0] = static_cast<T>(NEG_INF);
+            cM[0] = NINF;
             cX[0] = std::max({ux0, vx0, wx0});
-            cY[0] = static_cast<T>(NEG_INF);
+            cY[0] = NINF;
             dM[rb] = 3; dX[rb] = pick(ux0, vx0, wx0); dY[rb] = 3;
             if (in_x && r == 1) { cX[0] = static_cast<T>(0) - ge_b; dX[rb] = 1; }   // continues the run
             for (int c = 1; c <= W; ++c) {
@@ -2882,7 +3057,7 @@ private:
         // Tracked: the open refunded is that of the first row below the cut, DP row p+1
         // (see hb_reverse_rows_).
         const T go_b = tr_ ? tgob_[static_cast<size_t>(p) + 1] : static_cast<T>(params_->gap_open_b);
-        T best = static_cast<T>(NEG_INF);
+        T best = NINF;
         int cstar = 0;
         bool span = false;
         for (int c = 0; c <= W; ++c) {
@@ -2891,7 +3066,7 @@ private:
             const T g = std::max({rM[d], rX[d], rY[d]});
             const T plain = f + g;
             if (plain > best) { best = plain; cstar = c; span = false; }
-            if (FX[c] > static_cast<T>(NEG_INF) && rX[d] > static_cast<T>(NEG_INF)) {
+            if (FX[c] > NINF && rX[d] > NINF) {
                 const T joined = FX[c] + rX[d] + go_b;
                 if (joined > best) { best = joined; cstar = c; span = true; }
             }
@@ -2935,7 +3110,7 @@ private:
             }
             prev = op;
         }
-        viterbi_score_ = static_cast<double>(s);
+        viterbi_score_ = s;
         best_i_ = m_; best_j_ = n_;
         best_tbl_ = hops_.empty() ? TBTable::M
                   : (hops_.back() == 1 ? TBTable::X
@@ -2951,9 +3126,7 @@ private:
         const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
         if (backend == kBackendScalar) return nullptr;
         const LevelKernels& K = level_kernels(backend);
-        const bool have = std::is_same_v<T, double> ? (K.hb_scan != nullptr)
-                                                    : (K.hb_scan_f != nullptr);
-        return have ? &K : nullptr;
+        return K.template of<T>().hb_scan ? &K : nullptr;
     }
 
     // Run one endpoint scan over the sub-rectangle rows [i0, i1), cols [j0, j1): simd if
@@ -2979,8 +3152,7 @@ private:
             job.pmax = hb_pmax() ? 1 : 0;
             job.buf = &buf;
             if (tr_) { hb_reverse_rows_(); fill_track_job_(job.tr, false, 0); }
-            if constexpr (std::is_same_v<T, double>) K->hb_scan(job);
-            else                                     K->hb_scan_f(job);
+            K->template of<T>().hb_scan(job);
             best = job.best; bi = job.best_i; bj = job.best_j;
             return;
         }
@@ -3019,11 +3191,11 @@ private:
 
         // Row 0.  Local: M = 0 for every column (fresh start anywhere).  Global: the
         // Y-gap-open series, so the reverse pass computes the suffixes' global alignment.
-        pM[0] = static_cast<T>(0); pX[0] = static_cast<T>(NEG_INF); pY[0] = static_cast<T>(NEG_INF);
+        pM[0] = static_cast<T>(0); pX[0] = NINF; pY[0] = NINF;
         for (int c = 1; c <= NC; ++c) {
-            if (local) { pM[c] = static_cast<T>(0); pX[c] = static_cast<T>(NEG_INF); pY[c] = static_cast<T>(NEG_INF); }
+            if (local) { pM[c] = static_cast<T>(0); pX[c] = NINF; pY[c] = NINF; }
             else {
-                pM[c] = static_cast<T>(NEG_INF); pX[c] = static_cast<T>(NEG_INF);
+                pM[c] = NINF; pX[c] = NINF;
                 pY[c] = std::max((std::max(pM[c-1], pX[c-1]) - go_a) - ge_a, pY[c-1] - ge_a);
             }
         }
@@ -3037,9 +3209,9 @@ private:
                 go_b = hb_go_b(arow + 1, reverse); ge_b = hb_ge_b(arow + 1, reverse);
                 if (pmax) for (int k = 0; k < NC; ++k) rmp[k] = static_cast<T>(k) * ge_a;
             }
-            cM[0] = local ? static_cast<T>(0) : static_cast<T>(NEG_INF);
+            cM[0] = local ? static_cast<T>(0) : NINF;
             cX[0] = std::max(std::max((pM[0] - go_b) - ge_b, pX[0] - ge_b), (pY[0] - go_b) - ge_b);
-            cY[0] = static_cast<T>(NEG_INF);
+            cY[0] = NINF;
             T P = cY[0] - ge_a;   // Pmax: the running prefix max, the border as its seed
             for (int c = 1; c <= NC; ++c) {
                 const int bcol = b_start + (c - 1) * b_step;       // 0-based sequence col
@@ -3049,7 +3221,7 @@ private:
                 T y;
                 if (pmax) {
                     const T g = (std::max(cM[c-1], cX[c-1]) - go_a) - ge_a;
-                    P = std::max(g + rmp[c-1], P);
+                    P = std::max<T>(g + rmp[c-1], P);
                     y = P - rmp[c-1];
                 } else {
                     y = std::max(std::max((cM[c-1] - go_a) - ge_a, (cX[c-1] - go_a) - ge_a), cY[c-1] - ge_a);
@@ -3078,7 +3250,7 @@ private:
 
         // No positive-scoring local alignment: the empty alignment (score 0) is optimal.
         if (s_fwd <= static_cast<T>(0) || ie <= 0 || je <= 0) {
-            viterbi_score_ = 0.0;
+            viterbi_score_ = T(0);
             best_i_ = 0; best_j_ = 0; best_tbl_ = TBTable::M;
             hirschberg_ = true;
             return;
@@ -3103,7 +3275,7 @@ private:
             else              { if (prev != 2) s -= row_go_a(i); s -= row_ge_a(i); ++j; }
             prev = op;
         }
-        viterbi_score_ = static_cast<double>(s);
+        viterbi_score_ = s;
         best_i_ = ie; best_j_ = je;
         best_tbl_ = hops_.empty() ? TBTable::M
                   : (hops_.back() == 1 ? TBTable::X
@@ -3127,8 +3299,69 @@ private:
     // Forward sweep from (i0, j0), Global borders, to row i1: out[c] = best score of
     // A[i0..i1) x B[j0..j0+c).  Reverse (rev): from (i1, j1) back to row i0, out[d] =
     // best score of A[i0..i1) x B[j1-d..j1).
+    // The leveled linear Hirschberg kernel (kernels_linear_impl.inl, lhb_striped) for a
+    // loop of `ncols` columns, or null: the scalar backend, a level without it (int64
+    // below 8 lanes), a header-only build, or a row too short to pay (the linear fill's
+    // measured gate, kLinearStripedMinN).  Every caller keeps its scalar loop as the
+    // fallback, and the two are bit-identical, so the choice moves no path.
+    using lhb_fn_t = void (*)(LhbJob<T>&);
+    lhb_fn_t lhb_kernel_(int ncols) const {
+        const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
+        if (backend == kBackendScalar) return nullptr;
+        if (ncols < linear_striped_min_n(backend)) return nullptr;
+        return level_kernels(backend).template of<T>().lhb;
+    }
+    uint32_t lhb_srow_(int i) const noexcept {   // DP row i's stacked substitution row
+        return static_cast<uint32_t>((sub_row_(i) - blkT_) / nalpha_);
+    }
+    std::vector<unsigned char> lhb_b_;
+    std::vector<uint32_t> lhb_rows_;
+    std::vector<T> lhb_ga_, lhb_gb_, lhb_r0_, lhb_c0_;
+    int lhb_runs_ = 0;   // kernel calls, for the tests' liveness check
+    LhbJob<T> lhb_job_(DpBuffer& buf, int ncols, int nrows) {
+        LhbJob<T> job{};
+        job.b = lhb_b_.data(); job.n = ncols;
+        job.blk = blkT_; job.nalpha = nalpha_;
+        job.srow = lhb_rows_.data(); job.h = nrows;
+        job.ga = lhb_ga_.data(); job.gb = lhb_gb_.data();
+        job.row0 = lhb_r0_.data(); job.col0 = lhb_c0_.data();
+        job.by_symbol = (!tr_ && nrows >= nalpha_) ? 1 : 0;
+        job.buf = &buf;
+        return job;
+    }
+public:
+    int lhb_kernel_runs() const noexcept { return lhb_runs_; }
+private:
+
     void lhb_sweep(DpBuffer& buf, bool rev, int i0, int i1, int j0, int j1, T* out) {
         const int W = j1 - j0;
+        if (const lhb_fn_t fn = lhb_kernel_(W); fn && i1 > i0 && W > 0) {
+            // the scalar sweep's arrays, in its order and with its expressions
+            const int Hh = i1 - i0;
+            lhb_b_.resize(static_cast<size_t>(W));
+            for (int c = 1; c <= W; ++c)
+                lhb_b_[static_cast<size_t>(c) - 1] = rev ? b_idx_[static_cast<size_t>(j1 - c)]
+                                                         : b_idx_[static_cast<size_t>(j0 + c - 1)];
+            lhb_rows_.resize(static_cast<size_t>(Hh));
+            lhb_ga_.resize(static_cast<size_t>(Hh)); lhb_gb_.resize(static_cast<size_t>(Hh));
+            T ga = hb_ge_a(rev ? i1 : i0), gb = static_cast<T>(params_->gap_extend_b);
+            lhb_r0_.resize(static_cast<size_t>(W) + 1); lhb_c0_.resize(static_cast<size_t>(Hh) + 1);
+            lhb_r0_[0] = static_cast<T>(0);
+            for (int c = 1; c <= W; ++c) lhb_r0_[static_cast<size_t>(c)] = lhb_r0_[static_cast<size_t>(c) - 1] - ga;
+            lhb_c0_[0] = lhb_r0_[0];
+            for (int r = 1; r <= Hh; ++r) {
+                const int i = rev ? i1 - r + 1 : i0 + r;
+                if (tr_) { gb = tgeb_[static_cast<size_t>(i)]; ga = hb_ge_a(rev ? i - 1 : i); }
+                lhb_rows_[static_cast<size_t>(r) - 1] = lhb_srow_(i);
+                lhb_ga_[static_cast<size_t>(r) - 1] = ga; lhb_gb_[static_cast<size_t>(r) - 1] = gb;
+                lhb_c0_[static_cast<size_t>(r)] = lhb_c0_[static_cast<size_t>(r) - 1] - gb;
+            }
+            LhbJob<T> job = lhb_job_(buf, W, Hh);
+            job.out = out;
+            fn(job);
+            ++lhb_runs_;
+            return;
+        }
         hb_fit(buf.hfa, static_cast<std::size_t>(W) + 1);
         T* row = buf.hfa.data();
         // Tracked: no opens in linear, so the mirror needs no rewritten rows — only the
@@ -3174,6 +3407,47 @@ private:
     // (i1, j1) to (i0, j0); the moves appended to hops_ in forward order.
     void lhb_base(DpBuffer& buf, int i0, int i1, int j0, int j1) {
         const int H = i1 - i0, W = j1 - j0;
+        if (const lhb_fn_t fn = lhb_kernel_(W); fn && H > 0 && W > 0) {
+            lhb_b_.resize(static_cast<size_t>(W));
+            for (int c = 1; c <= W; ++c) lhb_b_[static_cast<size_t>(c) - 1] = b_idx_[static_cast<size_t>(j0 + c - 1)];
+            lhb_rows_.resize(static_cast<size_t>(H));
+            lhb_ga_.resize(static_cast<size_t>(H)); lhb_gb_.resize(static_cast<size_t>(H));
+            T ga = hb_ge_a(i0), gb = static_cast<T>(params_->gap_extend_b);
+            lhb_r0_.resize(static_cast<size_t>(W) + 1); lhb_c0_.resize(static_cast<size_t>(H) + 1);
+            lhb_r0_[0] = static_cast<T>(0);
+            for (int c = 1; c <= W; ++c) lhb_r0_[static_cast<size_t>(c)] = lhb_r0_[static_cast<size_t>(c) - 1] - ga;
+            lhb_c0_[0] = lhb_r0_[0];
+            for (int r = 1; r <= H; ++r) {
+                if (tr_) { ga = tgea_[static_cast<size_t>(i0 + r)]; gb = tgeb_[static_cast<size_t>(i0 + r)]; }
+                lhb_rows_[static_cast<size_t>(r) - 1] = lhb_srow_(i0 + r);
+                lhb_ga_[static_cast<size_t>(r) - 1] = ga; lhb_gb_[static_cast<size_t>(r) - 1] = gb;
+                lhb_c0_[static_cast<size_t>(r)] = lhb_c0_[static_cast<size_t>(r) - 1] - gb;
+            }
+            // rowsz = (seg + 1) * lanes <= W + 2 * 64 for every level's lane count
+            const std::size_t cap = (static_cast<std::size_t>(H) + 1) * (static_cast<std::size_t>(W) + 130);
+            if (buf.hbD.size() < cap) buf.hbD.resize(cap);
+            LhbJob<T> job = lhb_job_(buf, W, H);
+            job.codes = buf.hbD.data();
+            fn(job);
+            ++lhb_runs_;
+            const std::size_t lw = static_cast<std::size_t>(job.width), sg = static_cast<std::size_t>(job.seg);
+            const std::size_t rs = (sg + 1) * lw;
+            auto at = [&](int r, int c) -> std::size_t {
+                if (c == 0) return static_cast<std::size_t>(r) * rs;
+                const std::size_t cc = static_cast<std::size_t>(c) - 1;
+                return static_cast<std::size_t>(r) * rs + lw + (cc % sg) * lw + cc / sg;
+            };
+            const unsigned char* D = buf.hbD.data();
+            const std::size_t at0 = hops_.size();
+            int r = H, c = W;
+            while (r > 0 || c > 0) {
+                const unsigned char k = D[at(r, c)];
+                hops_.push_back(k);
+                if (k == 0) { --r; --c; } else if (k == 1) --r; else --c;
+            }
+            std::reverse(hops_.begin() + static_cast<std::ptrdiff_t>(at0), hops_.end());
+            return;
+        }
         const std::size_t st = static_cast<std::size_t>(W) + 1;
         if (buf.DM.size() < (static_cast<std::size_t>(H) + 1) * st)
             buf.DM.resize((static_cast<std::size_t>(H) + 1) * st);
@@ -3221,7 +3495,7 @@ private:
         lhb_sweep(buf, false, i0, p, j0, j1, buf.hsM.data());
         lhb_sweep(buf, true, p, i1, j0, j1, buf.hra.data());
         const T* F = buf.hsM.data(); const T* R = buf.hra.data();
-        T best = static_cast<T>(NEG_INF);
+        T best = NINF;
         int cstar = 0;
         for (int c = 0; c <= W; ++c) {
             const T v = F[c] + R[W - c];
@@ -3247,7 +3521,25 @@ private:
             T* row = buf.hfa.data();
             std::fill(row, row + n_ + 1, static_cast<T>(0));
             T best = static_cast<T>(0); int ie = 0, je = 0;
-            for (int i = 1; i <= m_; ++i) {
+            const lhb_fn_t fscan = lhb_kernel_(n_);
+            if (fscan && m_ > 0 && n_ > 0) {
+                lhb_b_.assign(b_idx_.begin(), b_idx_.begin() + n_);
+                lhb_rows_.resize(static_cast<size_t>(m_));
+                lhb_ga_.resize(static_cast<size_t>(m_)); lhb_gb_.resize(static_cast<size_t>(m_));
+                for (int i = 1; i <= m_; ++i) {
+                    lhb_rows_[static_cast<size_t>(i) - 1] = lhb_srow_(i);
+                    lhb_ga_[static_cast<size_t>(i) - 1] = ga(i); lhb_gb_[static_cast<size_t>(i) - 1] = gb(i);
+                }
+                lhb_r0_.assign(static_cast<size_t>(n_) + 1, static_cast<T>(0));
+                lhb_c0_.assign(static_cast<size_t>(m_) + 1, static_cast<T>(0));
+                LhbJob<T> job = lhb_job_(buf, n_, m_);
+                job.clamp = 1; job.argmax = 1;
+                job.best = static_cast<T>(0); job.bi = 0; job.bj = 0;
+                fscan(job);
+                ++lhb_runs_;
+                best = job.best; ie = job.bi; je = job.bj;
+            }
+            for (int i = 1; i <= (fscan && m_ > 0 && n_ > 0 ? 0 : m_); ++i) {
                 T diag = row[0];
                 const T ge_a = ga(i), ge_b = gb(i);
                 for (int j = 1; j <= n_; ++j) {
@@ -3262,7 +3554,7 @@ private:
                 }
             }
             if (!(best > static_cast<T>(0))) {
-                viterbi_score_ = 0.0; best_i_ = 0; best_j_ = 0; hirschberg_ = true; return;
+                viterbi_score_ = T(0); best_i_ = 0; best_j_ = 0; hirschberg_ = true; return;
             }
             // Unclamped global-suffix scan over [0, ie) x [0, je): the start maximizing
             // the box's global score (any argmax scores the local optimum).
@@ -3272,7 +3564,35 @@ private:
             for (int q = je - 1; q >= 0; --q) g[q] = g[q + 1] - ga(ie);
             T sbest = g[0]; int is = ie, js = 0;
             for (int q = 0; q <= je; ++q) if (g[q] > sbest) { sbest = g[q]; js = q; }
-            for (int pi = ie - 1; pi >= 0; --pi) {
+            // Leveled: the suffix scan is a reverse sweep in mirrored coordinates (row r =
+            // DP row pi = ie - r, column c = je - q), its row 0 the g just computed; the
+            // scalar argmax order (rows pi descending; in each, q = je first, then q
+            // descending; strict >) is the kernel's (rows ascending, column 0 first, then
+            // columns ascending), seeded with row 0's best.
+            const lhb_fn_t rscan = lhb_kernel_(je);
+            const bool rk = rscan && ie > 0 && je > 0;
+            if (rk) {
+                lhb_b_.resize(static_cast<size_t>(je));
+                for (int c = 1; c <= je; ++c) lhb_b_[static_cast<size_t>(c) - 1] = b_idx_[static_cast<size_t>(je - c)];
+                lhb_rows_.resize(static_cast<size_t>(ie));
+                lhb_ga_.resize(static_cast<size_t>(ie)); lhb_gb_.resize(static_cast<size_t>(ie));
+                lhb_r0_.resize(static_cast<size_t>(je) + 1); lhb_c0_.resize(static_cast<size_t>(ie) + 1);
+                for (int c = 0; c <= je; ++c) lhb_r0_[static_cast<size_t>(c)] = g[je - c];
+                lhb_c0_[0] = g[je];
+                for (int r = 1; r <= ie; ++r) {
+                    const int pi = ie - r;
+                    lhb_rows_[static_cast<size_t>(r) - 1] = lhb_srow_(pi + 1);
+                    lhb_ga_[static_cast<size_t>(r) - 1] = ga(pi); lhb_gb_[static_cast<size_t>(r) - 1] = gb(pi + 1);
+                    lhb_c0_[static_cast<size_t>(r)] = lhb_c0_[static_cast<size_t>(r) - 1] - gb(pi + 1);
+                }
+                LhbJob<T> job = lhb_job_(buf, je, ie);
+                job.argmax = 2;
+                job.best = sbest; job.bi = 0; job.bj = je - js;
+                rscan(job);
+                ++lhb_runs_;
+                sbest = job.best; is = ie - job.bi; js = je - job.bj;
+            }
+            for (int pi = (rk ? -1 : ie - 1); pi >= 0; --pi) {
                 // the suffix from DP row pi: its first move down is into row pi+1, its
                 // gaps in A lie in row pi
                 const T ge_a = ga(pi), ge_b = gb(pi + 1);
@@ -3303,7 +3623,7 @@ private:
             else if (op == 1) { ++i; sc -= gb(i); }
             else              { sc -= ga(i); ++j; }
         }
-        viterbi_score_ = static_cast<double>(sc);
+        viterbi_score_ = sc;
         best_i_ = i_end; best_j_ = j_end;
         hirschberg_ = true;
     }
@@ -3431,7 +3751,7 @@ private:
         T* pM = buf.qM.data(); T* pX = buf.qX.data(); T* pY = buf.qY.data();
         T* cM = buf.rM.data(); T* cX = buf.rX.data(); T* cY = buf.rY.data();
         constexpr bool local = AM == AlignMode::Local;
-        const T ninf = static_cast<T>(NEG_INF);
+        const T ninf = NINF;
         pM[0] = static_cast<T>(0); pX[0] = ninf; pY[0] = ninf;
         for (int j = 1; j <= n_; ++j) {
             pM[j] = local ? static_cast<T>(0) : ninf;
@@ -3546,9 +3866,9 @@ private:
     }
     template <bool Tr>
     void viterbi_affine_impl(DpBuffer& buf) {
-        band_fill(buf.VM, NEG_INF);
-        band_fill(buf.VX, NEG_INF);
-        band_fill(buf.VY, NEG_INF);
+        band_fill(buf.VM, NINF);
+        band_fill(buf.VX, NINF);
+        band_fill(buf.VY, NINF);
 
         // Gap penalties in the Viterbi precision T.  Converting once, up front, is what
         // makes this scalar fill bit-exact with the T-typed simd kernel: both then do

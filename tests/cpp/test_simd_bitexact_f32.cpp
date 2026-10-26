@@ -121,7 +121,7 @@ TEST_CASE("f32 striped kernel is actually dispatched (not a scalar fallback)", "
     // scalar fill.  Prove it does not: the level's float striped entry is registered, and
     // a Simd run over a length that is not a multiple of the vector width leaves the table
     // in the padded striped layout (buffer larger than the row-major (m+1)(n+1)).
-    REQUIRE(level_kernels(best_simd_backend()).viterbi_f != nullptr);
+    REQUIRE(level_kernels(best_simd_backend()).f.viterbi != nullptr);
 
     AlignParams p = int_params(11.0, 1.0, 11.0, 1.0);
     std::mt19937_64 rng(1234);
