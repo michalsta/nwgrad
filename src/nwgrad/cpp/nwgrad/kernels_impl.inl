@@ -468,6 +468,117 @@ template <class T, int W, bool RowRamp = false, int Ext = 2>
     }
 }
 
+// An empty asm on a value: the compiler must treat it as opaque.  gcc re-associates a
+// max of maxes (max is exact, so it may), and in the two-segment gap carry it turned the
+// off-chain max(P, chain) back into max(max(chain, a), b) -- two maxes on the
+// loop-carried chain again (nighthaven, gcc 16: the carry's gain fell from ~30% to ~12%).
+// clang keeps the order written, so gcc only (x86 and AArch64).
+#ifndef NWGRAD_CARRY_PIN_DEFINED
+#  define NWGRAD_CARRY_PIN_DEFINED
+#  if defined(__GNUC__) && !defined(__clang__)
+#    define NWGRAD_ALWAYS_INLINE_LAMBDA __attribute__((always_inline))
+#  else
+#    define NWGRAD_ALWAYS_INLINE_LAMBDA
+#  endif
+#endif
+template <class V>
+static inline V carry_pin(V v) {
+#if defined(__GNUC__) && !defined(__clang__) && defined(__x86_64__)
+    using T = typename V::value_type;
+    constexpr std::size_t B = V::size() * sizeof(T);
+    if constexpr (std::is_same_v<T, float> && B == 16) {
+        __m128 r = static_cast<__m128>(v); __asm__("" : "+v"(r)); return V(r);
+    } else if constexpr (std::is_same_v<T, double> && B == 16) {
+        __m128d r = static_cast<__m128d>(v); __asm__("" : "+v"(r)); return V(r);
+#  if defined(__AVX__)
+    } else if constexpr (std::is_same_v<T, float> && B == 32) {
+        __m256 r = static_cast<__m256>(v); __asm__("" : "+v"(r)); return V(r);
+    } else if constexpr (std::is_same_v<T, double> && B == 32) {
+        __m256d r = static_cast<__m256d>(v); __asm__("" : "+v"(r)); return V(r);
+#  endif
+#  if defined(__AVX512F__)
+    } else if constexpr (std::is_same_v<T, float> && B == 64) {
+        __m512 r = static_cast<__m512>(v); __asm__("" : "+v"(r)); return V(r);
+    } else if constexpr (std::is_same_v<T, double> && B == 64) {
+        __m512d r = static_cast<__m512d>(v); __asm__("" : "+v"(r)); return V(r);
+#  endif
+    }
+#elif defined(__GNUC__) && !defined(__clang__) && defined(__aarch64__)
+    // gcc does the same on AArch64: without the pin the two-segment carry compiled to
+    // max(max(t2, Oin - g), O) -- two fmaxnm on the chain (spot, Homebrew gcc 16).
+    using T = typename V::value_type;
+    if constexpr (std::is_same_v<T, float> && V::size() == 4) {
+        float32x4_t r = static_cast<float32x4_t>(v); __asm__("" : "+w"(r)); return V(r);
+    } else if constexpr (std::is_same_v<T, double> && V::size() == 2) {
+        float64x2_t r = static_cast<float64x2_t>(v); __asm__("" : "+w"(r)); return V(r);
+    }
+#endif
+    return v;
+}
+
+// Lazy-F's carry into the next segment, after the cell got v = max(c, F).  Floating T:
+// F - ge, not v - ge.  The row satisfies c(s+1) >= c(s) - ge in every lane (its carry pass
+// computed it so, and a raised cell is always followed by a visit to the next), so where
+// c(s) won, c(s) - ge <= c(s+1) and neither form exceeds c(s+1): the same stored maxima,
+// the same per-lane F > v masks (Pointers' revised codes included) and the same exit; the
+// loop-carried chain loses its max.  Integer T keeps v - ge: its sentinel stepped by - ge
+// once per segment could wrap.  (Measured: AGENTS.md, "The gap carry, shortened".)
+template <class V>
+static inline V lazy_f_next(const V& F, const V& v, const V& ge) {
+    if constexpr (std::is_floating_point_v<typename V::value_type>) return F - ge;
+    else                                                             return v - ge;
+}
+
+// The fills' carry pass along a row: Y(s) = max(O(s), Y(s-1) - ge), O(s) from load_o(s),
+// each cell handed to put(s, O, ext, v) with ext = Y(s-1) - ge (for the codes).  Floating T
+// steps two segments per dependent step: rounding is monotone, so max(a, b) - g ==
+// max(a - g, b - g) bit for bit, Y(s+1) = max(max(O(s+1), O(s) - g), (Y(s-1) - g) - g) and
+// the code's ext(s+1) = max(O(s) - g, (Y(s-1) - g) - g) -- the same values and codes, two
+// subtractions and ONE max on the chain per two segments (was two of each); the off-chain max
+// is pinned against gcc's re-association.  Integer T keeps one segment per step (it reaches
+// here only below 4 lanes; the identity holds, but its sentinel arithmetic is left as it was).
+#if defined(__GNUC__)
+#  define NWGRAD_FORCE_INLINE inline __attribute__((always_inline))
+#else
+#  define NWGRAD_FORCE_INLINE inline
+#endif
+// Merge prototypes (packed/dense codes x shortened carry), one tree, picked at build time:
+// 0 both -- the two-segment carry_pass fed by opens recomputed from the stored rows;
+// 1 theirs -- carry_pass fed by open rows pass 1 stores (main as merged);
+// 2 mine -- recomputed opens, one segment a dependent step.
+#ifndef NWGRAD_MERGE_VARIANT
+#  define NWGRAD_MERGE_VARIANT 0
+#endif
+inline constexpr int  kMergeVariant     = NWGRAD_MERGE_VARIANT;
+inline constexpr bool kMergeStoredOpens = kMergeVariant == 1;
+inline constexpr bool kMergeTwoSeg      = kMergeVariant != 2;
+
+template <bool Two = true, class V, class LoadO, class Put>
+static NWGRAD_FORCE_INLINE V carry_pass(int seg, V prev, const V& ge, LoadO&& load_o, Put&& put) {
+    int s = 0;
+    if constexpr (Two && std::is_floating_point_v<typename V::value_type>) {
+        for (; s + 1 < seg; s += 2) {
+            const V O0 = load_o(s), O1 = load_o(s + 1);
+            const V t = prev - ge;                                   // chain
+            const V O0g = O0 - ge;
+            const V v0 = stdx::max(O0, t);
+            const V t2 = t - ge;                                     // chain
+            const V v1 = stdx::max(carry_pin(stdx::max(O1, O0g)), t2);   // chain: one max
+            put(s, O0, t, v0);
+            put(s + 1, O1, stdx::max(O0g, t2), v1);
+            prev = v1;
+        }
+    }
+    for (; s < seg; ++s) {
+        const V O = load_o(s);
+        const V ext = prev - ge;
+        const V v = stdx::max(O, ext);
+        put(s, O, ext, v);
+        prev = v;
+    }
+    return prev;
+}
+
 // ── Tracked rows: the striped query profile ───────────────────────────────────
 // One striped profile row: prof[s*W + l] = row[b[col(l,s)-1]], padding -> nw_pad.
 template <class T>
@@ -682,18 +793,20 @@ static void striped_affine_full(ViterbiJob<T>& job) {
                                      ge_a, seg, cY, nullptr, nullptr, &irr);
             } else {
             vd prev([&](int q) { return q == 0 ? bY : K_NINF; });
-            for (int s = 0; s < seg; ++s) {
-                vd O;
-                if (s == 0) {
-                    vd lo; lo.copy_from(ov + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                    O = lane_shift_in(lo, nbOpen);
-                } else {
-                    O.copy_from(ov + (std::size_t)(s - 1) * W, stdx::element_aligned);
-                }
-                vd v = stdx::max(O, prev - vge_a);
-                v.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
-                prev = v;
-            }
+            prev = carry_pass(seg, prev, vge_a,
+                [&](int s) NWGRAD_ALWAYS_INLINE_LAMBDA {
+                    vd O;
+                    if (s == 0) {
+                        vd lo; lo.copy_from(ov + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                        O = lane_shift_in(lo, nbOpen);
+                    } else {
+                        O.copy_from(ov + (std::size_t)(s - 1) * W, stdx::element_aligned);
+                    }
+                    return O;
+                },
+                [&](int s, const vd&, const vd&, const vd& v) NWGRAD_ALWAYS_INLINE_LAMBDA {
+                    v.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
+                });
             for (int r = 0; r < W; ++r) {
                 vd last; last.copy_from(cY + (std::size_t)(seg - 1) * W, stdx::element_aligned);
                 vd F = lane_shift_in(last, bY);
@@ -727,7 +840,7 @@ static void striped_affine_full(ViterbiJob<T>& job) {
 #endif
                     v = stdx::max(v, F);
                     v.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
-                    F = v - vge_a;
+                    F = lazy_f_next(F, v, vge_a);
                     changed = true;
                 }
                 if (!changed) break;

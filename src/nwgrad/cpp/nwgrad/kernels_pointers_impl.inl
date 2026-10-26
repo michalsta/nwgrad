@@ -324,7 +324,7 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                 // max(om, ox) is bitwise max(vmv, vxv) - go - ge: rounding is monotone.
                 // (Floating T: the carry recomputes both from cM / cX instead -- the same bits --
                 // which saves two T-typed rows, a store and a load each, per segment.)
-                if constexpr (kOpenRows) {
+                if constexpr (kOpenRows || kMergeStoredOpens) {
                     const vd om = (vmv - vgo_a) - vge_a, ox = (vxv - vgo_a) - vge_a;
                     stdx::max(om, ox).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
                     vd okv = kYX;                  // open from X: Y's code 1, shifted
@@ -394,32 +394,42 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
 #endif
             };
             vd prev([&](int q) { return q == 0 ? bY : K_NINF; });
-            for (int s = 0; s < seg; ++s) {
-                vd O, OK;
-                if (s == 0) {
-                    vd lo, lk;
-                    open_from(seg - 1, lo, lk);
-                    O  = lane_shift_in(lo, nbOpen);
-                    OK = lane_shift_in(lk, nbOpenK);
-                } else {
-                    open_from(s - 1, O, OK);
-                }
-                const vd ext = prev - vge_a;
-                vd v = stdx::max(O, ext);
-                vd ky = kYE;                       // extension
+            vd OKs[2];   // load_o's open codes, for put (recomputed opens)
+            prev = carry_pass<kMergeTwoSeg>(seg, prev, vge_a,
+                [&](int s) NWGRAD_ALWAYS_INLINE_LAMBDA {
+                    const int q = s == 0 ? seg - 1 : s - 1;
+                    vd O;
+                    if constexpr (kMergeStoredOpens) {
+                        O.copy_from(ov + (std::size_t)q * W, stdx::element_aligned);
+                    } else {
+                        vd OK;
+                        open_from(q, O, OK);
+                        OKs[s & 1] = s == 0 ? lane_shift_in(OK, nbOpenK) : OK;
+                    }
+                    return s == 0 ? lane_shift_in(O, nbOpen) : O;
+                },
+                [&](int s, const vd& O, const vd& ext, const vd& v) NWGRAD_ALWAYS_INLINE_LAMBDA {
+                    vd OK;
+                    if constexpr (kMergeStoredOpens) {
+                        const int q = s == 0 ? seg - 1 : s - 1;
+                        OK.copy_from(ok + (std::size_t)q * W, stdx::element_aligned);
+                        if (s == 0) OK = lane_shift_in(OK, nbOpenK);
+                    } else {
+                        OK = OKs[s & 1];
+                    }
+                    vd ky = kYE;                       // extension
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
-                if constexpr (sizeof(T) == 8) {
-                    ky = avx512d_blend(avx512d_ge(O, ext), ky, OK);   // open: M or X, ties go to open
-                } else {
-                    ky = sel_ge(O, ext, kYE, OK);      // open: M or X, ties go to open
-                }
+                    if constexpr (sizeof(T) == 8) {
+                        ky = avx512d_blend(avx512d_ge(O, ext), ky, OK);   // open: M or X, ties go to open
+                    } else {
+                        ky = sel_ge(O, ext, kYE, OK);      // open: M or X, ties go to open
+                    }
 #else
-                ky = sel_ge(O, ext, kYE, OK);      // open: M or X, ties go to open
+                    ky = sel_ge(O, ext, kYE, OK);      // open: M or X, ties go to open
 #endif
-                v.copy_to(cY + off + (std::size_t)s * W, stdx::element_aligned);
-                ky.copy_to(yc + (std::size_t)s * W, stdx::element_aligned);
-                prev = v;
-            }
+                    v.copy_to(cY + off + (std::size_t)s * W, stdx::element_aligned);
+                    ky.copy_to(yc + (std::size_t)s * W, stdx::element_aligned);
+                });
             for (int r = 0; r < W; ++r) {
                 vd last; last.copy_from(cY + off + (std::size_t)(seg - 1) * W, stdx::element_aligned);
                 vd F = lane_shift_in(last, bY);
@@ -449,7 +459,7 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                     k.copy_to(yc + (std::size_t)s * W, stdx::element_aligned);
                     v = stdx::max(v, F);
                     v.copy_to(cY + off + (std::size_t)s * W, stdx::element_aligned);
-                    F = v - vge_a;
+                    F = lazy_f_next(F, v, vge_a);
                     changed = true;
                 }
                 if (!changed) break;
