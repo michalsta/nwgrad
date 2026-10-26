@@ -23,12 +23,15 @@
 #  include <sys/mman.h>
 #endif
 
-// THP hinting is on by default; NWGRAD_HUGEPAGE=0 disables it (escape hatch, and the
-// A/B knob for measuring its effect — resolved once).
+// THP hinting is OFF by default since 2026-10-26; NWGRAD_HUGEPAGE=1 enables it (resolved
+// once).  With the batch workers' buffers pooled across calls, the hint measured nothing at
+// 1 thread and 1.3-1.9x SLOWER for Pointers at 12 threads (nighthaven, THP [madvise] with
+// defrag [madvise], f32/f64 L3000/L10000; AGENTS.md, "Grid traceback").  Hosts with THP
+// [always] (skynet, wloczykij) are unaffected either way.
 inline bool nwgrad_hugepage_enabled() {
     static const bool on = [] {
         const char* e = std::getenv("NWGRAD_HUGEPAGE");
-        return !(e && e[0] == '0');
+        return e && e[0] == '1';
     }();
     return on;
 }
@@ -47,7 +50,8 @@ inline bool nwgrad_hugepage_enabled() {
 // (2) Transparent huge pages.  Our Linux boxes default THP to [madvise], so a plain
 //     std::vector never gets huge pages and the DP walk eats TLB misses.  An
 //     allocation >= the 2 MiB huge-page size is aligned to 2 MiB and MADV_HUGEPAGE'd,
-//     so it can be backed by huge pages.  The >= 2 MiB gate is not a tunable: a table
+//     so it can be backed by huge pages (only with NWGRAD_HUGEPAGE=1 since 2026-10-26: see
+//     nwgrad_hugepage_enabled).  The >= 2 MiB gate is not a tunable: a table
 //     smaller than a huge page CANNOT be backed by one (the page would run past the
 //     allocation), so a table only qualifies once it is that big (len ~512+).  Best-
 //     effort — madvise failing is ignored; Linux-only; a no-op elsewhere.

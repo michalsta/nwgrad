@@ -467,7 +467,11 @@ The key that unlocked all of them was **striping** (Farrar's layout). Lane `l` o
 - **Variant A — striped, retains the 3 double tables.** Drop-in: identical tables, paths, gradients. **~1.6–2.2× everywhere, no regime where it loses.** This is the free win. W=4 is the sweet spot on SSE2/AVX2; W=8 helps on AVX2 at long lengths.
 - **Variant B — striped + direction pointers.** Records a 1-byte-per-cell argmax instead of retaining 3 double tables, so it keeps only rolling rows + a direction table (~4 B/cell vs 24). Bit-exact including tie-breaking, because the forward pass records exactly the argmax the traceback would re-derive (`M > X > Y` order). Loses in cache (does A's work *plus* recording, ~2.2× more compute) but **wins the memory-bound regime by 6–14×** at high thread counts.
 
-**The memory wall is real, but it is x86-specific.** At len≥1000 the tables (24 MB) blow past L3; the shipped kernel and A then *regress as threads are added* (i5 len=1000: 314→200 Mcell/s 1→12 threads) because they stream 24 B/cell through a saturated memory system. That is exactly the regime B owns. **The M1 does not have this wall at all** — its shipped kernel *scales* at len=1000 (182→561, 3.1× over 8 threads), so on Apple Silicon A wins everywhere and B is never needed. Confirmed it is not TLB thrashing: on the *old* row-major kernel `MADV_HUGEPAGE` on the DP tables gave +15–79% at len=200 (that kernel scattered the band across `(n+1)`-strided rows — terrible TLB behaviour) and did **not** touch the len≥1000 collapse (+1% on the i5). It is now **shipped** (`dp_buffer.hpp`'s allocator 2 MiB-aligns and `MADV_HUGEPAGE`s any DP table ≥ 2 MiB — the huge-page size, below which a table cannot be backed by one; `NWGRAD_HUGEPAGE=0` disables), **but the win is now marginal**: the striped + 64-byte-aligned kernel already stores each row contiguous and packed, so it subsumed the TLB benefit. Re-measured on the striped kernel (i5, 1 thread): **+0.4% len=200 (noise, <2 MiB so no huge page), +1.2% len=700, +4.4% len=1500**, nothing for short sequences. Kept because it is free and never hurts, not because it is large.
+**The memory wall is real, but it is x86-specific.** At len≥1000 the tables (24 MB) blow past L3; the shipped kernel and A then *regress as threads are added* (i5 len=1000: 314→200 Mcell/s 1→12 threads) because they stream 24 B/cell through a saturated memory system. That is exactly the regime B owns. **The M1 does not have this wall at all** — its shipped kernel *scales* at len=1000 (182→561, 3.1× over 8 threads), so on Apple Silicon A wins everywhere and B is never needed. Confirmed it is not TLB thrashing: on the *old* row-major kernel `MADV_HUGEPAGE` on the DP tables gave +15–79% at len=200 (that kernel scattered the band across `(n+1)`-strided rows — terrible TLB behaviour) and did **not** touch the len≥1000 collapse (+1% on the i5). It is now **shipped** (`dp_buffer.hpp`'s allocator 2 MiB-aligns and `MADV_HUGEPAGE`s any DP table ≥ 2 MiB — the huge-page size, below which a table cannot be backed by one; `NWGRAD_HUGEPAGE=0` disables), **but the win is now marginal**: the striped + 64-byte-aligned kernel already stores each row contiguous and packed, so it subsumed the TLB benefit. Re-measured on the striped kernel (i5, 1 thread): **+0.4% len=200 (noise, <2 MiB so no huge page), +1.2% len=700, +4.4% len=1500**, nothing for short sequences. Kept because it is free and never hurts, not because it is large. **Turned off by default
+2026-10-26** (`NWGRAD_HUGEPAGE=1` opts in): with the batch workers' buffers pooled across calls
+it measured nothing at 1 thread and cost Pointers 1.3-1.9x at 12 threads on this same i5
+(nighthaven, THP and defrag [madvise]; see "Grid traceback").  skynet / wloczykij run THP
+[always], so the hint is moot there; solace (Gentoo) and spot not measured.
 
 **Selection rule:** A when `threads × 24 × (m+1)(n+1)` fits L3, B otherwise. On the M1, always A.
 
@@ -1067,6 +1071,25 @@ prototyped in `tools/gridgrad/` and integrated as `TracebackMode::Grid`:
   10.9x to 5.6x / 5.5x of score-only (L3000 / L10000): the hint, and the per-call Work, look
   costly for the table modes too — not changed here; a pooled per-thread Work would remove the
   first-touch cost for every mode.
+
+**Then, for every mode: pooled worker buffers, huge pages opt-in (same branch).**  The batch
+workers now lease `Work`s from a pool kept between calls (`BatchEngine::WorkLease`; `Work::new_call`
+resets the per-call `swp` / `tcbuf`; `drop_paths()` frees the pool), as `solo_` already was for
+single pairs, and `NWGRAD_HUGEPAGE` became opt-in.  nighthaven (`bench_tracebacks.py`, ns/cell,
+p0 = fresh Work per call, p1 = pooled; HP = the huge-page hint):
+
+| | p0, HP on (as before) | p1, HP on | **p1, HP off (now)** |
+|---|---|---|---|
+| Pointers f32 1 thr L3000 / L10000 | 1.45 / 7.58 | 1.03 / 1.07 | **1.02 / 1.06** |
+| Pointers f64 1 thr L3000 / L10000 | 2.17 / 7.90 | 1.73 / 1.79 | **1.73 / 1.75** |
+| Pointers f32 12 thr L3000 / L10000 | 0.94 / 1.26 | 0.65 / 0.81 | **0.49 / 0.42** |
+| Pointers f64 12 thr L3000 / L10000 | 1.06 / 1.39 | 0.86 / 0.93 | **0.49 / 0.49** |
+| Grid f64 12 thr L3000 / L10000 | 0.165 / 0.151 | 0.148 / 0.141 | **0.132 / 0.128** |
+
+(score-only 0.07 / 0.11 ns at 12 threads, 0.45 / 0.72 at 1.)  Pointers at L10000 had been 11-17x
+score-only on one thread purely from first-touching its tables every call.  skynet (THP
+[always]): HP on/off within noise, as expected.  The pool keeps up to n_threads Works' buffers
+alive between calls — the footprint a call already had.
 
 Measured (`tools/bench_tracebacks.py`, related protein pairs, BLOSUM62 11/1, striped per-pair
 fill, best of 3, ns/cell and x score-only; L = 300 runs as Pointers, below hb_cutoff):
