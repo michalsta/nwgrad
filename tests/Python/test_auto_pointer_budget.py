@@ -9,7 +9,12 @@ one-byte direction codes Pointers measured faster than both recursions there (AG
 Within the budget the pair runs the Pointers fill itself, so it must equal an explicit
 traceback="pointers" BIT FOR BIT — score, gradient, path — past hb_cutoff, in a batch
 whose planner mixes short and long pairs too.  The types without a budget (Global
-float32 and int32) must still split exactly as their explicit mode does.
+int32) must still split exactly as their explicit mode does.
+
+Since 2026-10-26 (`traceback="grid"`), affine Global Full at float32 and float64 resolves
+to grid, which returns Pointers' result by construction; the budget applies where grid
+does not (the run falls back to the old default).  So float64 Global still equals explicit
+Pointers bit for bit, now reported as "grid", and float32 Global equals Pointers too.
 """
 import numpy as np
 import pytest
@@ -82,11 +87,12 @@ def test_budgeted_auto_is_pointers_past_the_cutoff(params, prec, mode, fill):
     A, B = _problem(11)
     ba, ra = _run(prec, mode, "auto", A, B, params, fill)
     _, rp = _run(prec, mode, "pointers", A, B, params, fill)
-    assert ba[0].traceback == ("hirschberg" if prec == "double" else "hirschberg_pmax")   # resolved
+    # resolved: grid for float64 Global (Pointers' result), the budgeted mode otherwise
+    assert ba[0].traceback == ("grid" if prec == "double" else "hirschberg_pmax")
     assert _same(ra, rp)
 
 
-@pytest.mark.parametrize("prec,mode,explicit", [("float", "global", "hirschberg_pmax"),
+@pytest.mark.parametrize("prec,mode,explicit", [("float", "global", "pointers"),   # grid
                                                 ("int32", "global", "hirschberg_pmax")])
 def test_unbudgeted_auto_still_splits_as_its_mode(params, prec, mode, explicit):
     A, B = _problem(23)
