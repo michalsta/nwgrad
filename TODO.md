@@ -1,5 +1,14 @@
 # TODO
 
+## A float32 soft path (requested 2026-10-27)
+
+The soft (forward–backward) path runs in float64 at both precisions: `SeqPair` and the
+`_double` soft functions compute the same thing (tuning.md, "Precision"). Wanted: a real
+float32 soft implementation, so the soft gradient gets float32's lane width like the
+Viterbi kernels do. Found while planning the fleet-wide competitor benchmark, which
+compares only within one dtype: DeepBLAST's default float32 soft gradient has no nwgrad
+counterpart to be compared with.
+
 ## Denser direction codes for the multithreaded memory wall (requested 2026-10-25) — DONE, gated: AVX2, AVX-512, NEON (linear float32 / int32); sse4 measured and off (2026-10-26; AGENTS.md "Dense direction codes, gated")
 
 Wanted: BOTH variants below prototyped, tested bit-exact, and added as variants of the
