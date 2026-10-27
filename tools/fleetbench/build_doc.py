@@ -56,7 +56,6 @@ def main():
         "variants": "\n".join(T.variants(H)),
         "compilers": "\n".join(T.compilers(H)),
         "mt": "\n".join(T.mt(H)),
-        "detail": "\n".join(T.detail(H)),
         "ab": ab_section(a.results),
     }
     s = open(os.path.join(HERE, "benchmarks_skeleton.md")).read()
@@ -66,6 +65,17 @@ def main():
         sys.exit("unfilled marker left: " + s[s.index("<!-- GEN:"):][:40])
     with open(a.out, "w") as f:
         f.write(s)
+    cells = os.path.join(os.path.dirname(a.out), "benchmarks-cells.md")
+    with open(cells, "w") as f:
+        f.write("# Benchmarks: every cell\n\nGenerated from `tools/fleetbench/results/` "
+                "by `tools/fleetbench/build_doc.py`; the method, the hosts and the reading of "
+                "these numbers are in [benchmarks.md](benchmarks.md).\n\n"
+                "Mcell/s; each tool's best arm whose scores all matched nwgrad's float64 "
+                "reference. (x) = nwgrad default / tool: above 1, nwgrad is faster. `-` no "
+                "implementation, `>10x` stopped at 10x nwgrad's time, `wrong` scores disagreed, "
+                "`err` failed; `sat` a saturating integer cascade, `‡` harness-parallel. The "
+                "second column is the best of nwgrad's non-default variants.\n")
+        f.write("\n".join(T.detail(H)) + "\n")
 
 
 if __name__ == "__main__":

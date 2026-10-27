@@ -73,7 +73,11 @@ warning says: gap scores above the mismatch score).
 - **Timing.** One process per arm; setup (reading, encoding, building objects) untimed;
   one warm-up pass, then the best of 3 passes (5 on the laptops). Mcell/s = DP cells /
   best pass. nwgrad's default arm runs first in each cell; any other arm whose pass exceeds
-  **10× nwgrad's default time** is stopped and shown as `>10x`.
+  **10× nwgrad's default time** is stopped and shown as `>10x`. The warm-up pass gets 3 s
+  on top of that, for one-time costs that do not scale with the work (imports, JIT, plan
+  building, first-touch page faults); without it, cells whose 10× budget was a few tens of
+  ms produced false `>10x` — the first run did that, and every timeout was re-run under
+  this rule.
 - **Builds.** nwgrad and every source-built competitor use release-wheel codegen —
   `-fcf-protection=none -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector
   -fno-stack-clash-protection -mtls-dialect=gnu` on x86-64 — because the hosts' toolchains
@@ -98,10 +102,12 @@ warning says: gap scores above the mismatch score).
 - **Saturating integer cascades** (parasail `sat`, SSW, Opal) are filed under the narrowest
   type that completed the cell — int16 if no pair needed more, int32 otherwise — marked
   `sat`.
-- **Load.** Gentoo desktops were checked before and during the run (an emerge or another
-  user's process above 60 % of a core paused the runner between arms). On the laptops the
-  user was allowed to work; their load is recorded per arm and rows run under load are
-  marked.
+- **Load.** The Gentoo desktops were watched throughout: an emerge, or another user's
+  process above 60 % of a core, paused the runner between arms (on 64-core wloczykij:
+  foreign load adding up to more than 4 cores, 3 in its multithread phase — other users'
+  jobs, CI runners and the VM the coordinator ran in shared the machine; its multithread
+  rows carry up to ~2.5 foreign cores). On the laptops the user was allowed to work. The
+  load average is recorded with every arm, and rows run under load are marked.
 - **Multithreading.** nwgrad's batch with `n_threads` = its own default (physical cores;
   8 on spot, see below), SeqAn3's `parallel` and SeqAn 2's `Parallel` policy are native.
   Tools without threads of their own get a **harness-parallel** row (‡): the pairs split over
@@ -177,15 +183,24 @@ Ratios are speed over speed (above 1, the first build is faster).
 
 <!-- GEN:ab -->
 
+The one consistent loss — gcc on oldsolace, linear-gap global protein L100 traceback at
+float64 (0.82× hard, 0.86× path, neutral on the other two hosts) — is not a code-generation
+change: it is the JCC erratum of Skylake-family cores (Kaby Lake has it, Alder Lake and Tiger
+Lake do not). Rebuilt with `-Wa,-mbranches-within-32B-boundaries`, which pins branch
+alignment, the PR is 1.03–1.05× faster than `main` on the same cells (main itself gains only
+0–6 % from the flag: it had landed on a lucky alignment). Whether the release build should
+pass that flag has not been measured on the other hosts.
+
 ## Multithreaded
 
 <!-- GEN:mt -->
 
 ## Every cell
 
-`x` = nwgrad default / tool. The second column is the best of nwgrad's non-default variants.
-
-<!-- GEN:detail -->
+Every cell of every host — each tool's best correct arm, the ratio to nwgrad's default, and
+the best of nwgrad's own variants — is in [benchmarks-cells.md](benchmarks-cells.md)
+(generated; the raw per-arm records are in
+[`tools/fleetbench/results/`](../tools/fleetbench/results/)).
 
 ## Competitor notes
 
@@ -219,6 +234,8 @@ Ratios are speed over speed (above 1, the first build is faster).
 ## Not measured
 
 - GPU paths (DeepBLAST's CUDA decoder and GPU aligners).
+- PR #12 on spot (powered off at the time — its NEON float change is unmeasured here) and on
+  wloczykij (still running the main benchmark).
 - scikit-bio and DeepBLAST on spot and solace (metered connections: their dependency stacks
   are hundreds of MB).
 
