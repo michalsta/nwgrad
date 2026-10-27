@@ -1072,6 +1072,26 @@ prototyped in `tools/gridgrad/` and integrated as `TracebackMode::Grid`:
   costly for the table modes too — not changed here; a pooled per-thread Work would remove the
   first-touch cost for every mode.
 
+**Grid vs the pointer budget (after rebasing onto main `51712a4`, 2026-10-27).**  Main's `auto`
+ran float64 Global pairs of up to 2^26 cells as Pointers with the dense codes (`kAutoPointerCells`),
+Hirschberg above; float32 Global stayed `hirschberg_pmax`.  Grid replaces both for affine Global at
+floating T; the budget still applies where grid does not (the `kGridFallbackTb` run goes through
+`hb_splits`).  Grid vs budget Pointers inside the budget (nighthaven, `bench_tracebacks.py`,
+ns/cell; Pointers as `auto` would run it, dense gate on):
+
+| prec | thr | L = 1000 / 2000 / 4000 / 8000: Pointers | grid |
+|---|---|---|---|
+| f64 | 1 | 1.26 / 1.36 / 1.44 / 1.25 | **0.72 / 0.70 / 0.62 / 0.59** |
+| f64 | 6 | 0.27 / 0.30 / 0.37 / 0.27 | **0.14 / 0.13 / 0.14 / 0.12** |
+| f64 | 12 | 0.21 / 0.23 / 0.29 / 0.25 | **0.13 / 0.13 / 0.13 / 0.12** |
+| f32 | 1 | 0.76 / 0.80 / 0.85 / 0.84 | **0.49 / 0.49 / 0.43 / 0.40** |
+| f32 | 12 | 0.14 / 0.15 / 0.22 / 0.17 | **0.09 / 0.09 / 0.09 / 0.07** |
+
+Grid 1.6-2.7x faster at every length and thread count, in O(k (m + n)) memory instead of the
+tables, so `auto` keeps grid inside the budget too.  `fuzz_ab.py` main `51712a4` vs the rebased
+branch: 400 seeds, 12 differ, all float32 `auto` affine Global (main: pmax; branch: Pointers'
+optimum) — the intended change; nothing else differs.
+
 **Then, for every mode: pooled worker buffers, huge pages opt-in (same branch).**  The batch
 workers now lease `Work`s from a pool kept between calls (`BatchEngine::WorkLease`; `Work::new_call`
 resets the per-call `swp` / `tcbuf`; `drop_paths()` frees the pool), as `solo_` already was for
