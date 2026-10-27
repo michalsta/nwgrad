@@ -467,7 +467,11 @@ The key that unlocked all of them was **striping** (Farrar's layout). Lane `l` o
 - **Variant A — striped, retains the 3 double tables.** Drop-in: identical tables, paths, gradients. **~1.6–2.2× everywhere, no regime where it loses.** This is the free win. W=4 is the sweet spot on SSE2/AVX2; W=8 helps on AVX2 at long lengths.
 - **Variant B — striped + direction pointers.** Records a 1-byte-per-cell argmax instead of retaining 3 double tables, so it keeps only rolling rows + a direction table (~4 B/cell vs 24). Bit-exact including tie-breaking, because the forward pass records exactly the argmax the traceback would re-derive (`M > X > Y` order). Loses in cache (does A's work *plus* recording, ~2.2× more compute) but **wins the memory-bound regime by 6–14×** at high thread counts.
 
-**The memory wall is real, but it is x86-specific.** At len≥1000 the tables (24 MB) blow past L3; the shipped kernel and A then *regress as threads are added* (i5 len=1000: 314→200 Mcell/s 1→12 threads) because they stream 24 B/cell through a saturated memory system. That is exactly the regime B owns. **The M1 does not have this wall at all** — its shipped kernel *scales* at len=1000 (182→561, 3.1× over 8 threads), so on Apple Silicon A wins everywhere and B is never needed. Confirmed it is not TLB thrashing: on the *old* row-major kernel `MADV_HUGEPAGE` on the DP tables gave +15–79% at len=200 (that kernel scattered the band across `(n+1)`-strided rows — terrible TLB behaviour) and did **not** touch the len≥1000 collapse (+1% on the i5). It is now **shipped** (`dp_buffer.hpp`'s allocator 2 MiB-aligns and `MADV_HUGEPAGE`s any DP table ≥ 2 MiB — the huge-page size, below which a table cannot be backed by one; `NWGRAD_HUGEPAGE=0` disables), **but the win is now marginal**: the striped + 64-byte-aligned kernel already stores each row contiguous and packed, so it subsumed the TLB benefit. Re-measured on the striped kernel (i5, 1 thread): **+0.4% len=200 (noise, <2 MiB so no huge page), +1.2% len=700, +4.4% len=1500**, nothing for short sequences. Kept because it is free and never hurts, not because it is large.
+**The memory wall is real, but it is x86-specific.** At len≥1000 the tables (24 MB) blow past L3; the shipped kernel and A then *regress as threads are added* (i5 len=1000: 314→200 Mcell/s 1→12 threads) because they stream 24 B/cell through a saturated memory system. That is exactly the regime B owns. **The M1 does not have this wall at all** — its shipped kernel *scales* at len=1000 (182→561, 3.1× over 8 threads), so on Apple Silicon A wins everywhere and B is never needed. Confirmed it is not TLB thrashing: on the *old* row-major kernel `MADV_HUGEPAGE` on the DP tables gave +15–79% at len=200 (that kernel scattered the band across `(n+1)`-strided rows — terrible TLB behaviour) and did **not** touch the len≥1000 collapse (+1% on the i5). It is now **shipped** (`dp_buffer.hpp`'s allocator 2 MiB-aligns and `MADV_HUGEPAGE`s any DP table ≥ 2 MiB — the huge-page size, below which a table cannot be backed by one; `NWGRAD_HUGEPAGE=0` disables), **but the win is now marginal**: the striped + 64-byte-aligned kernel already stores each row contiguous and packed, so it subsumed the TLB benefit. Re-measured on the striped kernel (i5, 1 thread): **+0.4% len=200 (noise, <2 MiB so no huge page), +1.2% len=700, +4.4% len=1500**, nothing for short sequences. Kept because it is free and never hurts, not because it is large. **Turned off by default
+2026-10-26** (`NWGRAD_HUGEPAGE=1` opts in): with the batch workers' buffers pooled across calls
+it measured nothing at 1 thread and cost Pointers 1.3-1.9x at 12 threads on this same i5
+(nighthaven, THP and defrag [madvise]; see "Grid traceback").  skynet / wloczykij run THP
+[always], so the hint is moot there; solace (Gentoo) and spot not measured.
 
 **Selection rule:** A when `threads × 24 × (m+1)(n+1)` fits L3, B otherwise. On the M1, always A.
 
@@ -1025,6 +1029,121 @@ fmaxnm per two segments; lazy-F's carry was already a bare fsub. Pinned vs unpin
 0.89-0.98 (linear 0.88-0.90, Hirschberg 0.92-0.95), score-only protein 0.86-0.92, Manakov 1.00.
 Checked on NEON: the C++ suite (2.73 M assertions), the Python suite, `fuzz_ab.py` vs main (200
 seeds, 0 differ).
+
+### Grid traceback: `traceback="grid"` (branch `cc/grid-traceback`, 2026-10-26)
+
+**Pointers' result — score bits, path, guide, `aligned()`, hard gradient — at about the cost
+of a score-only pass, in O(k (m + n)) memory.** A grid-checkpoint (FastLSA-style) traceback,
+prototyped in `tools/gridgrad/` and integrated as `TracebackMode::Grid`:
+- **Forward:** `grid_kernel_impl.inl` (leveled; `TypedKernels::grid_fwd`, registered by
+  `register_level_grid<T>`, null for integer T) runs `score_affine_striped_pos_fp`'s recurrence
+  over a rectangle from a given top row and left column (three states), saving every R-th row
+  dense and q sets of SEGMENT-ALIGNED columns (set t at segment st[t]: its W lanes are W
+  columns, one vector store per state per row).  M is re-formed at a saved line as
+  D(i-1, j-1) + s, the row pass's own sum.
+- **Walk:** `Aligner::viterbi_affine_grid` / `grid_solve` / `grid_base`.  From (m, n), the
+  block holding the current cell is solved one level down with the saved lines as its exact
+  borders; a rectangle is cut to [r0, i] x [c0, j] (nothing below / right of the entry cell
+  can be on the path); above `kGridBase` (64 x 64) cells it is gridded again, below it the
+  scalar Pointers fill (viterbi_affine_ptr's expressions and `pick`) re-fills it and the walk
+  follows its codes.  Moves go to `hops_` (backward, then reversed); `hirschberg_` is set so
+  every path consumer replays them, and `grid_` so the GUIDE follows Pointers' convention
+  (`guide_j_grid_`: the column where the path LEAVES each row; `guide_j_affine_hb` records
+  where it ENTERS — a different guide for the same path wherever a row holds a gap in A; not
+  touched here, noted for Hirschberg).  The score is the end cell's value, not a replay
+  (a replay re-rounds row 0's closed form -(go + j*ge)).
+- **Why exact:** every re-filled cell is computed from the full fill's exact values by the
+  same expressions, so it has the same value and the same code; the walk takes Pointers'
+  steps, ties included.  Tested: `tests/cpp/test_grid.cpp` (every backend, both precisions,
+  ties, 0.1 extends, small `hb_cutoff` so the recursion and its block borders run; a mutated
+  base-block tie-break fails it), `tests/Python/test_grid.py` (SeqPairBatch / SeqPair).
+- **Scope:** affine Global Full, untracked, floating T, opens >= 0 (the D/X form), a simd
+  level with the kernel, m > `hb_cutoff`.  Everything else — Local, linear, tracks, negative
+  opens, integer T, `scalar_fallback`, short pairs — runs AS Pointers, which is the same result
+  by definition, so no fallback can change an answer.  Not the `auto` default (yet).
+- **Tuning:** `kGridK` = 32 lines per dimension per level, `kGridMin` = 8, `kGridBase` = 64 x 64
+  cells (the prototype's sweep: k = 32 version B was the best time; k = 8 cuts memory ~3x for
+  ~10 %).  Memory ~ kGridK (m + n) * 3 values summed over levels: ~15 MB at 10 000 aa f64.
+- **Huge pages:** the grid buffers use `AlignedAllocator<T, 64, false>` (no MADV_HUGEPAGE).
+  The batch engine gives every worker a fresh `Work` (and DpBuffer) per call, so the grid lines
+  are first-touched by all workers at once on every call; with THP defrag [madvise] the
+  hint compacts synchronously at fault time.  nighthaven, 12 threads, f64 L3000: grid 2.11x of
+  score-only with the hint, 1.45x without (page faults 78.6 k -> 115 k per 10 calls, but
+  cheaper).  The same experiment (NWGRAD_HUGEPAGE=0) moved Pointers at 12 threads from 8.6x /
+  10.9x to 5.6x / 5.5x of score-only (L3000 / L10000): the hint, and the per-call Work, look
+  costly for the table modes too — not changed here; a pooled per-thread Work would remove the
+  first-touch cost for every mode.
+
+**Grid vs the pointer budget (after rebasing onto main `51712a4`, 2026-10-27).**  Main's `auto`
+ran float64 Global pairs of up to 2^26 cells as Pointers with the dense codes (`kAutoPointerCells`),
+Hirschberg above; float32 Global stayed `hirschberg_pmax`.  Grid replaces both for affine Global at
+floating T; the budget still applies where grid does not (the `kGridFallbackTb` run goes through
+`hb_splits`).  Grid vs budget Pointers inside the budget (nighthaven, `bench_tracebacks.py`,
+ns/cell; Pointers as `auto` would run it, dense gate on):
+
+| prec | thr | L = 1000 / 2000 / 4000 / 8000: Pointers | grid |
+|---|---|---|---|
+| f64 | 1 | 1.26 / 1.36 / 1.44 / 1.25 | **0.72 / 0.70 / 0.62 / 0.59** |
+| f64 | 6 | 0.27 / 0.30 / 0.37 / 0.27 | **0.14 / 0.13 / 0.14 / 0.12** |
+| f64 | 12 | 0.21 / 0.23 / 0.29 / 0.25 | **0.13 / 0.13 / 0.13 / 0.12** |
+| f32 | 1 | 0.76 / 0.80 / 0.85 / 0.84 | **0.49 / 0.49 / 0.43 / 0.40** |
+| f32 | 12 | 0.14 / 0.15 / 0.22 / 0.17 | **0.09 / 0.09 / 0.09 / 0.07** |
+
+Grid 1.6-2.7x faster at every length and thread count, in O(k (m + n)) memory instead of the
+tables, so `auto` keeps grid inside the budget too.  `fuzz_ab.py` main `51712a4` vs the rebased
+branch: 400 seeds, 12 differ, all float32 `auto` affine Global (main: pmax; branch: Pointers'
+optimum) — the intended change; nothing else differs.
+
+**Then, for every mode: pooled worker buffers, huge pages opt-in (same branch).**  The batch
+workers now lease `Work`s from a pool kept between calls (`BatchEngine::WorkLease`; `Work::new_call`
+resets the per-call `swp` / `tcbuf`; `drop_paths()` frees the pool), as `solo_` already was for
+single pairs, and `NWGRAD_HUGEPAGE` became opt-in.  nighthaven (`bench_tracebacks.py`, ns/cell,
+p0 = fresh Work per call, p1 = pooled; HP = the huge-page hint):
+
+| | p0, HP on (as before) | p1, HP on | **p1, HP off (now)** |
+|---|---|---|---|
+| Pointers f32 1 thr L3000 / L10000 | 1.45 / 7.58 | 1.03 / 1.07 | **1.02 / 1.06** |
+| Pointers f64 1 thr L3000 / L10000 | 2.17 / 7.90 | 1.73 / 1.79 | **1.73 / 1.75** |
+| Pointers f32 12 thr L3000 / L10000 | 0.94 / 1.26 | 0.65 / 0.81 | **0.49 / 0.42** |
+| Pointers f64 12 thr L3000 / L10000 | 1.06 / 1.39 | 0.86 / 0.93 | **0.49 / 0.49** |
+| Grid f64 12 thr L3000 / L10000 | 0.165 / 0.151 | 0.148 / 0.141 | **0.132 / 0.128** |
+
+(score-only 0.07 / 0.11 ns at 12 threads, 0.45 / 0.72 at 1.)  solace (AVX-512, WSL2, THP and defrag
+[madvise]; the PR head, Windows side ~10-17 % busy): hint off vs on at 1 thread within noise; at 8
+threads Pointers 0.48 vs 0.58 ns (f32 L10000) and 0.64 vs 0.72 (f64 L10000), with one cell the other
+way (f32 L1000 0.22 vs 0.20) — no large regression either way, so opt-in stands.  Grid there
+1.07-1.30x score-only (1 thread) and 1.10-1.34x (8 threads); spot (NEON, macOS: no THP hint)
+0.83-1.26x, the pool changing nothing measurable.  Pointers at L10000 had been 11-17x
+score-only on one thread purely from first-touching its tables every call.  skynet (THP
+[always]): HP on/off within noise, as expected.  The pool keeps up to n_threads Works' buffers
+alive between calls — the footprint a call already had.
+
+Measured (`tools/bench_tracebacks.py`, related protein pairs, BLOSUM62 11/1, striped per-pair
+fill, best of 3, ns/cell and x score-only; L = 300 runs as Pointers, below hb_cutoff):
+
+| host | prec | thr | L | none | pointers | hirschberg | hirschberg_pmax | **grid** |
+|---|---|---|---|---|---|---|---|---|
+| nighthaven avx2 | f32 | 1 | 1000 / 3000 / 10000 | 0.35 / 0.47 / 0.45 | 3.06 / 3.40 / 25.9x | 3.33 / 2.85 / 3.05x | 2.61 / 2.07 / 2.25x | **1.44 / 1.09 / 0.93x** |
+| | f64 | 1 | | 0.66 / 0.73 / 0.72 | 2.65 / 3.07 / 12.9x | 2.87 / 2.92 / 3.06x | 2.65 / 2.67 / 2.86x | **1.15 / 1.06 / 0.88x** |
+| | f32 | 12 | | | 3.97 / 14.3 / 18.5x | 2.81 / 2.87 / 2.85x | 2.19 / 2.03 / 2.08x | **1.33 / 1.33 / 1.11x** |
+| | f64 | 12 | | | 2.96 / 9.66 / 10.9x | 2.74 / 2.80 / 2.58x | 2.55 / 2.61 / 2.59x | **1.27 / 1.47 / 1.17x** |
+| solace avx512 | f32 | 1 | | 0.65 / 0.63 / 0.60 | 1.49 / 1.97 / 2.36x | 2.35 / 2.99 / 3.03x | 1.29 / 1.15 / 1.17x | **1.27 / 1.22 / 1.10x** |
+| | f64 | 1 | | 0.80 / 0.82 / 0.79 | 1.95 / 2.23 / 2.48x | 2.45 / 2.87 / 2.98x | 1.70 / 1.64 / 1.78x | **1.28 / 1.24 / 1.11x** |
+| | f32 | 8 | | | 1.48 / 3.36 / 3.12x | 2.31 / 3.13 / 3.03x | 1.25 / 1.14 / 1.15x | **1.24 / 1.24 / 1.13x** |
+| | f64 | 8 | | | 1.93 / 3.26 / 2.95x | 2.39 / 2.94 / 2.97x | 1.63 / 1.68 / 1.76x | **1.26 / 1.36 / 1.13x** |
+| spot neon (macOS, Homebrew gcc 16) | f32 | 1 | | 0.71 / 0.67 / 0.71 | 2.97 / 3.16 / 3.11x | 3.30 / 3.54 / 3.35x | 2.35 / 1.93 / 1.80x | **1.26 / 1.10 / 0.95x** |
+| | f64 | 1 | | 0.90 / 1.06 / 1.12 | 3.14 / 2.91 / 2.80x | 3.47 / 3.23 / 3.22x | 2.80 / 2.36 / 2.39x | **1.22 / 0.93 / 0.82x** |
+| | f32 | 4 | | | 2.97 / 3.34 / 3.25x | 3.28 / 3.53 / 3.35x | 2.34 / 1.93 / 1.81x | **1.26 / 1.11 / 0.95x** |
+| | f64 | 4 | | | 3.14 / 3.02 / 2.89x | 3.46 / 3.21 / 3.18x | 2.79 / 2.40 / 2.46x | **1.22 / 0.95 / 0.84x** |
+
+Against the `auto` defaults (f32 `hirschberg_pmax`, f64 `hirschberg`): nighthaven 1 thread
+1.8-2.4x (f32) and 2.5-3.5x (f64) faster, 12 threads 1.6-1.9x / 1.9-2.2x; solace roughly even
+with `hirschberg_pmax` at f32 (0.95-1.06) and 1.9-2.7x faster than `hirschberg` at f64.  The grid
+is exact where `hirschberg_pmax` is not, and Pointers' path where `hirschberg` is not.  Below
+score-only at 1 thread, L >= 3000 on nighthaven: the grid kernel keeps six rolling rows to the
+score kernel's seven.  NEON (spot, the user at its desktop, ~0.5 core of WindowServer during the
+run): 1.9-2.7x faster than the f32 default, 2.9-3.9x than the f64 one; `tests/Python/test_grid.py`
+passes there.
 
 ### Linear gaps: Pointers and Hirschberg (2026-10-05)
 

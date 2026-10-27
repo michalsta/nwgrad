@@ -46,6 +46,7 @@ namespace NWGRAD_LVL_NAME {
 #include "inter_soft_impl.inl"    // inter-pair soft pass (uses the above's IW/ivd)
 #include "soft_kernel_impl.inl"   // per-pair scaled forward-backward
 #include "score_kernel_impl.inl"  // score only: rolling rows, no table
+#include "grid_kernel_impl.inl"   // TracebackMode::Grid's forward pass (score recurrence + grid lines)
 }
 #undef NWGRAD_LEVEL_NS
 
@@ -76,6 +77,7 @@ struct NwgradLevelRegistrar {
                                 &NWGRAD_LVL_NAME::inter_fill_entry<T>,        // inter-pair Full fill
                                 &NWGRAD_LVL_NAME::inter_score_entry<T>,       // inter-pair score only
                                 NWGRAD_LVL_NAME::IVT<T>::W);
+        register_level_grid<T>(NWGRAD_LVL_ENUM, NWGRAD_LVL_NAME::grid_fwd_ptr<T>());
     }
     NwgradLevelRegistrar() {
         typed<double>();

@@ -23,12 +23,15 @@
 #  include <sys/mman.h>
 #endif
 
-// THP hinting is on by default; NWGRAD_HUGEPAGE=0 disables it (escape hatch, and the
-// A/B knob for measuring its effect — resolved once).
+// THP hinting is OFF by default since 2026-10-26; NWGRAD_HUGEPAGE=1 enables it (resolved
+// once).  With the batch workers' buffers pooled across calls, the hint measured nothing at
+// 1 thread and 1.3-1.9x SLOWER for Pointers at 12 threads (nighthaven, THP [madvise] with
+// defrag [madvise], f32/f64 L3000/L10000; AGENTS.md, "Grid traceback").  Hosts with THP
+// [always] (skynet, wloczykij) are unaffected either way.
 inline bool nwgrad_hugepage_enabled() {
     static const bool on = [] {
         const char* e = std::getenv("NWGRAD_HUGEPAGE");
-        return !(e && e[0] == '0');
+        return e && e[0] == '1';
     }();
     return on;
 }
@@ -47,31 +50,37 @@ inline bool nwgrad_hugepage_enabled() {
 // (2) Transparent huge pages.  Our Linux boxes default THP to [madvise], so a plain
 //     std::vector never gets huge pages and the DP walk eats TLB misses.  An
 //     allocation >= the 2 MiB huge-page size is aligned to 2 MiB and MADV_HUGEPAGE'd,
-//     so it can be backed by huge pages.  The >= 2 MiB gate is not a tunable: a table
+//     so it can be backed by huge pages (only with NWGRAD_HUGEPAGE=1 since 2026-10-26: see
+//     nwgrad_hugepage_enabled).  The >= 2 MiB gate is not a tunable: a table
 //     smaller than a huge page CANNOT be backed by one (the page would run past the
 //     allocation), so a table only qualifies once it is that big (len ~512+).  Best-
 //     effort — madvise failing is ignored; Linux-only; a no-op elsewhere.
 //
+// Huge = false drops (2): the grid traceback's lines are written once per call into fresh
+// buffers by every worker at once, and there the hint costs more than it saves (THP defrag
+// [madvise] compacts synchronously at fault time; nighthaven, 12 threads, f64 L3000: grid
+// 2.11x of score-only with the hint, 1.45x without).
+//
 // Uses C++17 aligned operator new, so it is portable (no posix_memalign / _aligned_malloc
 // split).  deallocate recomputes the alignment from the size, so it always matches.
-template <class T, std::size_t Align = 64>
+template <class T, std::size_t Align = 64, bool Huge = true>
 struct AlignedAllocator {
     using value_type = T;
     static constexpr std::size_t kHugePage = std::size_t(2) << 20;   // 2 MiB (x86 THP)
 
     static std::align_val_t align_of(std::size_t bytes) noexcept {
-        return bytes >= kHugePage ? std::align_val_t(kHugePage) : std::align_val_t(Align);
+        return Huge && bytes >= kHugePage ? std::align_val_t(kHugePage) : std::align_val_t(Align);
     }
 
     AlignedAllocator() noexcept = default;
-    template <class U> AlignedAllocator(const AlignedAllocator<U, Align>&) noexcept {}
+    template <class U> AlignedAllocator(const AlignedAllocator<U, Align, Huge>&) noexcept {}
 
     T* allocate(std::size_t n) {
         if (n == 0) return nullptr;
         const std::size_t bytes = n * sizeof(T);
         void* p = ::operator new(bytes, align_of(bytes));
 #if defined(__linux__) && defined(MADV_HUGEPAGE)
-        if (bytes >= kHugePage && nwgrad_hugepage_enabled())
+        if (Huge && bytes >= kHugePage && nwgrad_hugepage_enabled())
             ::madvise(p, bytes, MADV_HUGEPAGE);                       // best-effort
 #endif
         return static_cast<T*>(p);
@@ -80,9 +89,9 @@ struct AlignedAllocator {
         ::operator delete(p, align_of(n * sizeof(T)));
     }
 
-    template <class U> struct rebind { using other = AlignedAllocator<U, Align>; };
-    template <class U> bool operator==(const AlignedAllocator<U, Align>&) const noexcept { return true; }
-    template <class U> bool operator!=(const AlignedAllocator<U, Align>&) const noexcept { return false; }
+    template <class U> struct rebind { using other = AlignedAllocator<U, Align, Huge>; };
+    template <class U> bool operator==(const AlignedAllocator<U, Align, Huge>&) const noexcept { return true; }
+    template <class U> bool operator!=(const AlignedAllocator<U, Align, Huge>&) const noexcept { return false; }
 };
 
 // The always-double DP storage (forward-backward / soft path) uses it.
@@ -227,6 +236,24 @@ struct DpBufferT {
     // sweeps hold hramp across the base cases that run this carry.
     TVec iramp;
 
+    // ── TracebackMode::Grid (Aligner::viterbi_affine_grid) ────────────────────
+    // The grid lines of each recursion level (saved rows, segment-aligned columns and
+    // their column ids), the grid kernel's rolling rows and profile, the problem's border
+    // lines and the base block's values and direction codes.  O(k (m + n)) in all.
+    using GVec = std::vector<T, AlignedAllocator<T, 64, false>>;   // no huge-page hint (see above)
+    using GBVec = std::vector<unsigned char, AlignedAllocator<unsigned char, 64, false>>;
+    struct GridLevel {
+        GVec rows, cols;
+        std::vector<int> colid;
+        std::vector<std::pair<int, int>> gcols;   // (column, set * W + lane), sorted
+    };
+    std::vector<GridLevel> glv;          // one per recursion depth
+    TVec grows, gprof;
+    GVec gtop, gleft;
+    std::vector<unsigned char> gbuilt;   // profile rows built for the current rectangle
+    GVec gbM, gbX, gbY;
+    GBVec gdM, gdX, gdY;
+
     // Scaled soft path (SoftImpl::Scaled): rolling backward rows (current/next, per
     // state) and the per-row power-of-two exponents of the forward tables.  The forward
     // tables reuse F / FM,FX,FY; the B tables are not used at all.
@@ -253,6 +280,11 @@ struct DpBufferT {
         clrT(hsM); clrT(hsX); clrT(hsY);
         clrT(hprof); clrT(hov); clrT(hramp); clrT(iramp);
         clrB(hbD); clrB(hops);
+        glv.clear(); glv.shrink_to_fit();
+        clrT(grows); clrT(gprof);
+        for (GVec* v : {&gtop, &gleft, &gbM, &gbX, &gbY}) { v->clear(); v->shrink_to_fit(); }
+        for (GBVec* v : {&gdM, &gdX, &gdY}) { v->clear(); v->shrink_to_fit(); }
+        gbuilt.clear(); gbuilt.shrink_to_fit();
         clrD(sb0); clrD(sb1); clrD(sb2); clrD(sb3); clrD(sb4); clrD(sb5); clrD(sqp);
         sexp.clear(); sexp.shrink_to_fit();
     }

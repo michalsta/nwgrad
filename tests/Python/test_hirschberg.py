@@ -222,11 +222,12 @@ def test_is_the_default_where_it_applies(params):
     the exact chain at double (see test_hirschberg_pmax.py).  Both are Hirschberg; this
     test is about the algorithm, so it accepts either."""
     assert nwgrad.SeqPairBatch(n_threads=1).traceback == "auto"
-    # affine + global + full resolves to a hirschberg mode
+    # affine + global + full resolves to grid (since 2026-10-26; Pointers' result, and
+    # where grid does not apply the run falls back to the hirschberg mode below)
     assert nwgrad.SeqPair("ACDE", "ACDE", params, gap_model="affine",
-                          mode="global").traceback == "hirschberg_pmax"
+                          mode="global").traceback == "grid"
     assert nwgrad.SeqPairDouble("ACDE", "ACDE", params, gap_model="affine",
-                                mode="global").traceback == "hirschberg"
+                                mode="global").traceback == "grid"
     # Local affine: pmax at float32 (its endpoint scans take the carry), pointers at
     # double; linear resolves to pointers
     assert nwgrad.SeqPair("ACDE", "ACDE", params, gap_model="affine",

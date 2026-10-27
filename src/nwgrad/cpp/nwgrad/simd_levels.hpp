@@ -239,6 +239,32 @@ struct ScoreJob {
     TrackJob<T> tr;                         // tracked rows (tr.on()), else untracked
 };
 
+// ── Grid forward pass (TracebackMode::Grid) ──────────────────────────────────
+//
+// The score kernel's D/X recurrence over the rectangle rows r0..r1 x columns c0..c1
+// (DP coordinates), from its top row and left column (all three states), saving every
+// R-th row (dense, rows[(t-1)*3*(w+1) + s*(w+1) + (j-c0)] for row r0 + t*R < r1) and q
+// sets of segment-aligned columns (cols[((t*3 + s)*(h+1) + (i-r0))*W + lane], the column
+// of set t / lane l in colid[t*W + l], -1 past the rectangle).  The kernel picks q from
+// `spacing` (columns between lines) and its own width, resizes the outputs, and reports
+// W and q.  Every value is the full fill's, bit for bit (opens >= 0, floating T).
+template <class T>
+struct GridFwdJob {
+    const unsigned char* a;                 // full encoded sequences
+    const unsigned char* b;
+    const T* blk; int nalpha;
+    T go_a, ge_a, go_b, ge_b;
+    int r0, r1, c0, c1;
+    const T* top;  std::size_t top_ss, top_es;    // top(s, j - c0) = top[s*top_ss + (j-c0)*top_es]
+    const T* left; std::size_t left_ss, left_es;  // left(s, i - r0), likewise
+    int R, spacing;
+    typename DpBufferT<T>::GVec* rows;      // out (resized by the kernel)
+    typename DpBufferT<T>::GVec* cols;
+    std::vector<int>* colid;
+    DpBufferT<T>* buf;                      // scratch: grows, gprof, gbuilt
+    int W, q;                               // out
+};
+
 // ── Hirschberg linear-space sweep ─────────────────────────────────────────────
 //
 // One half-sweep of a divide-and-conquer block: fill H rows keeping only rolling rows,
@@ -644,6 +670,8 @@ struct TypedKernels {
     inter_fn           inter_fill = nullptr;         // inter-pair Full fill, W pairs per call
     inter_fn           inter_score = nullptr;        // inter-pair score only (Full)
     int                inter_w = 0;                  // the inter-pair lane count (pairs per call)
+    using grid_fn = void (*)(GridFwdJob<T>&);
+    grid_fn            grid_fwd = nullptr;           // TracebackMode::Grid's forward pass (floating T)
 };
 
 struct LevelKernels {
@@ -713,6 +741,11 @@ void register_level_typed(SimdLevel l,
                           typename TypedKernels<T>::score_fn score,
                           typename TypedKernels<T>::inter_fn inter_fill,
                           typename TypedKernels<T>::inter_fn inter_score, int inter_w);
+
+// TracebackMode::Grid's forward pass (null for a type without one: it runs as Pointers).
+template <class T>
+NWGRAD_BASELINE_ONLY
+void register_level_grid(SimdLevel l, typename TypedKernels<T>::grid_fn grid_fwd);
 
 NWGRAD_BASELINE_ONLY
 void register_level_common(SimdLevel l, int row_block, inter_soft_fn inter_soft,
