@@ -606,13 +606,14 @@ struct Aligner {
     // each threshold sits between the last size that did not win and the first from which dense
     // won (or tied within its control) at every thread count and every size above.  (m+1)(n+1)
     // at L700 / 1000 / 1450 / 2000 / 2900 / 4000: 0.49 / 1.00 / 2.11 / 4.00 / 8.41 / 16.0 M.
-    // AVX2 (nighthaven, 1 / 6 / 12 threads).  int64 off: affine Global lost 3-5 % at every
-    // size, and the other int64 fills were not measured.
+    // AVX2 (nighthaven, 1 / 6 / 12 threads).  int64: affine from L2900 with the weighted pass
+    // 1 (0.94-1.00; with 4*acc + k it lost 2-5 % at every size), linear not measured: off.
     static constexpr std::size_t kDenseFromCellsAvx2 = [] {
         constexpr std::size_t M1 = std::size_t(1) << 20;
         constexpr bool D = std::is_same_v<T, double>, F = std::is_same_v<T, float>;
-        if constexpr (sizeof(T) != 4 && !D) return std::size_t(0);      // int16, int64
-        else if constexpr (AB != AlignBand::Full) return std::size_t(0);
+        if constexpr (sizeof(T) < 4 || AB != AlignBand::Full) return std::size_t(0);
+        else if constexpr (std::is_same_v<T, int64_t>)
+            return GM == GapModel::Affine ? 6 * M1 : std::size_t(0);
         else if constexpr (GM == GapModel::Affine && AM == AlignMode::Global)
             return F ? 3 * M1 : M1 / 2;
         else if constexpr (GM == GapModel::Affine)                         // Local

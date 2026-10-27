@@ -245,9 +245,14 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
             // accumulating costs one add a plane where 4*acc + k cost three dependent adds (NEON
             // double 1.11-1.15x one-byte with those, 1.00-1.05x without).  Integer T on x86 keeps
             // 4*acc + k, the groups not unrolled: unrolled it measured 2-8 % slower on AVX2 int32
-            // at L2000-5800, while on NEON (M1) it is 6-10 % faster for int32 too.
+            // at L2000-5800, while on NEON (M1) it is 6-10 % faster for int32 too.  AVX2 int64
+            // is the exception the other way: 4 lanes a vector double the packing's share of the
+            // work, and with 4*acc + k dense codes ran +19 % instructions and lost 2-5 % to
+            // one-byte (AGENTS.md, "int64 dense on AVX2").  AVX-512 int64 was measured as it is.
 #if defined(__aarch64__)
             constexpr bool kWeighted = Dense;
+#elif defined(__AVX2__) && !defined(__AVX512F__)
+            constexpr bool kWeighted = Dense && (!nw_is_int<T> || sizeof(T) == 8);
 #else
             constexpr bool kWeighted = Dense && !nw_is_int<T>;
 #endif
