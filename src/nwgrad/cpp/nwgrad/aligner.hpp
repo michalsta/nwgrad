@@ -602,29 +602,33 @@ struct Aligner {
     // The auto gate's thresholds (dense_gate_): cells a pair from which the dense codes are
     // written, per level, gap model, mode and type; 0 = never.  Only where measured faster
     // (2026-10-26; AGENTS.md "Dense direction codes"); unmeasured levels stay off.
-    // AVX2 (nighthaven, 1-12 threads): from the size where dense won at every thread count.
+    // Both x86 tables re-measured 2026-10-27 on main after PR #8 (exact L x L, L700-5800):
+    // each threshold sits between the last size that did not win and the first from which dense
+    // won (or tied within its control) at every thread count and every size above.  (m+1)(n+1)
+    // at L700 / 1000 / 1450 / 2000 / 2900 / 4000: 0.49 / 1.00 / 2.11 / 4.00 / 8.41 / 16.0 M.
+    // AVX2 (nighthaven, 1 / 6 / 12 threads).  int64 off: affine Global lost 3-5 % at every
+    // size, and the other int64 fills were not measured.
     static constexpr std::size_t kDenseFromCellsAvx2 = [] {
         constexpr std::size_t M1 = std::size_t(1) << 20;
-        if constexpr (sizeof(T) < 4 || AB != AlignBand::Full) return std::size_t(0);
+        constexpr bool D = std::is_same_v<T, double>, F = std::is_same_v<T, float>;
+        if constexpr (sizeof(T) != 4 && !D) return std::size_t(0);      // int16, int64
+        else if constexpr (AB != AlignBand::Full) return std::size_t(0);
         else if constexpr (GM == GapModel::Affine && AM == AlignMode::Global)
-            return nw_is_int<T> && sizeof(T) == 4 ? M1 : 16 * M1;         // int32 L1000; else L4000
-        else if constexpr (GM == GapModel::Affine)                         // Local: its row scan
-            return nw_is_int<T> && sizeof(T) == 4 ? 16 * M1 : 32 * M1;    // dilutes the code stream
+            return F ? 3 * M1 : M1 / 2;
+        else if constexpr (GM == GapModel::Affine)                         // Local
+            return D ? 2 * M1 : 6 * M1;
         else if constexpr (AM == AlignMode::Global)                        // linear
-            return std::is_same_v<T, double> ? 16 * M1 : 4 * M1;
+            return F || D ? 3 * M1 : M1 / 2;
         else                                                               // linear Local
-            return std::is_same_v<T, float> ? 4 * M1 : 16 * M1;
+            return D ? 3 * M1 : F ? M1 / 2 : 12 * M1;
     }();
-    // AVX-512: every crossover comes earlier than AVX2's.  Re-measured 2026-10-27 on PR #8's head (solace WSL, exact L x L, L700-5800, 1 / 8 / 16
-    // threads): each threshold sits between the last size that did not win and the first from
-    // which dense won (or tied within its control) at every thread count and size above.
-    // (m+1)(n+1) at L700 / 1000 / 1450 / 2000 / 2900 / 4000: 0.49 / 1.00 / 2.11 / 4.00 / 8.41 / 16.0 M.
+    // AVX-512 (solace under WSL, 1 / 8 / 16 threads; measured on PR #8's head).
     static constexpr std::size_t kDenseFromCellsAvx512 = [] {
         constexpr std::size_t M1 = std::size_t(1) << 20;
         constexpr bool D = std::is_same_v<T, double>, F = std::is_same_v<T, float>;
         if constexpr (sizeof(T) < 4 || AB != AlignBand::Full) return std::size_t(0);
         else if constexpr (std::is_same_v<T, int64_t> && !(GM == GapModel::Affine && AM == AlignMode::Global))
-            return kDenseFromCellsAvx2;                                    // unmeasured: AVX2's
+            return std::size_t(0);                                         // unmeasured: off
         else if constexpr (GM == GapModel::Affine && AM == AlignMode::Global)
             return D ? M1 / 2 : F ? 3 * M1 : nw_is_int<T> && sizeof(T) == 4 ? 2 * M1 : M1 / 2;
         else if constexpr (GM == GapModel::Affine)                         // Local
