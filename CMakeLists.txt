@@ -86,8 +86,21 @@ nanobind_add_module(nwgrad_ext
 # movmsk and a branch.  Off there (nighthaven, clang 22, scalar_fallback): score-only
 # 1.9-2.6x faster, affine DNA fills 1.5x, protein Pointers 1.6x.  The per-ISA level TUs
 # keep it: the float32 std::simd kernels lose 1.35-1.6x without it.  gcc is unaffected.
+#
+# And, on x86, its cmov converter (X86CmovConversion): it turns a cmov on a loop's
+# critical path into a branch, which in these fills is data-dependent — the Local clamp
+# max(v, 0) and the left-carry max, where unrelated proteins clamp to 0 at random.
+# Local linear int64 hard, protein L300: clang 0.50x gcc on nighthaven, 0.82x at sse4
+# (the scalar H fill; gcc keeps every cmov).  Source forms do not survive it: the clamp as
+# v & ~(v >> 63) is folded back into smax, and moving the clamp off the carry made it
+# convert the carry's max instead.  Header-only users building with clang can pass the
+# same -mllvm flag.
+set(NWGRAD_SCALAR_TU_CLANG_OPTS -fno-slp-vectorize)
+if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64|i.86")
+    list(APPEND NWGRAD_SCALAR_TU_CLANG_OPTS -mllvm -x86-cmov-converter=false)
+endif()
 set_source_files_properties(src/nwgrad/cpp/nwgrad/py_exports.cpp PROPERTIES
-    COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:Clang,AppleClang>:-fno-slp-vectorize>")
+    COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:Clang,AppleClang>:${NWGRAD_SCALAR_TU_CLANG_OPTS}>")
 
 # Add -Wall -Wextra for Unix-style compilers (GCC/Clang)
 if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")

@@ -199,6 +199,18 @@ static constexpr double K_NINF = -std::numeric_limits<double>::infinity();
 // is identical; SSE2/SSE4/NEON (W=2) keep the generator.
 // The integer types (int16/int32/int64) take the same treatment: gcc assembled the
 // generator form lane by lane (vpinsrw / vpinsrd / vpunpck sequences) at AVX2.
+// The open penalty (v - go) - ge, with goe = go + ge precomputed by the caller.  A
+// floating T keeps the left-associated form the scalar recurrence uses (bit-exactness).
+// An integer T takes v - goe: the same value in wrapping arithmetic, which is what the
+// vector lanes do.  gcc does not make that rewrite itself (signed overflow is UB, and
+// go + ge could overflow where the original did not), so it paid two subtractions per
+// open on the carry; clang folds them.  (-fwrapv lets gcc fold them too, but costs it
+// 10-20 % on the inter-pair kernels: sse4, cudak, 2026-10-27.)
+template <class V>
+[[gnu::always_inline]] static inline V open_pen(const V& v, const V& go, const V& ge, const V& goe) {
+    if constexpr (std::is_integral_v<typename V::value_type>) { (void)go; (void)ge; return v - goe; }
+    else { (void)goe; return (v - go) - ge; }
+}
 template <class V>
 [[gnu::always_inline]] static inline V lane_shift_in(V x, typename V::value_type b) {
     using T [[maybe_unused]] = typename V::value_type;   // unused at the W=2 levels
@@ -583,29 +595,61 @@ static inline void striped_profile_row(T* dst, const T* row, const unsigned char
             dst[(std::size_t)s * W + l] = (j <= n) ? row[b[j - 1]] : padv;
         }
 }
+// Many rows at once: the striped order's symbol per slot, idx[s*W + l] = b[col(l,s)-1],
+// is computed ONCE, and each row is then one contiguous, branch-free lookup pass; the
+// padding slots (columns n+1..seg*W, fewer than W, at the tail of the last lanes) read
+// symbol 0 and are overwritten after.  The same values as striped_profile_row.  The
+// per-row form above walked each lane with a W-strided store, a bounds test and the
+// b[] gather per element (9 instructions/element under gcc), and at protein L100 the
+// build was a third of the score-only kernel's time.
+static inline void striped_profile_index(unsigned char* idx, const unsigned char* b,
+                                         int n, int seg, int W) {
+    for (int l = 0; l < W; ++l)
+        for (int s = 0; s < seg; ++s) {
+            const int j = l * seg + s + 1;
+            idx[(std::size_t)s * W + l] = (j <= n) ? b[j - 1] : 0;
+        }
+}
+template <class T>
+static inline void striped_profile_row_idx(T* dst, const T* row, const unsigned char* idx,
+                                           int n, int seg, int W) {
+    const std::size_t sw = (std::size_t)seg * W;
+    for (std::size_t k = 0; k < sw; ++k) dst[k] = row[idx[k]];
+    for (int j = n + 1; j <= seg * W; ++j)
+        dst[(std::size_t)((j - 1) % seg) * W + (std::size_t)((j - 1) / seg)] = nw_pad<T>;
+}
 // The profile rows a striped fill reads (see TrackJob): Tr with tr.ra builds one per
 // compact symbol; Tr without it builds none here (striped_row_profile builds each DP
 // row's as the fill reaches it, into the single row reserved); untracked, one per
-// alphabet symbol — exactly the loop the untracked kernels always ran.
+// alphabet symbol — exactly the loop the untracked kernels always ran.  The slot index
+// lives past the rows, in `prof`'s own tail (sw bytes).
 template <class T, bool Tr>
 static inline void striped_profile_build(typename DpBufferT<T>::TVec& prof, const T* blk,
                                          int nalpha, const unsigned char* b, int n, int seg, int W,
                                          const TrackJob<T>& tr) {
     const std::size_t sw = (std::size_t)seg * W;
+    const std::size_t idx_elems = (sw + sizeof(T) - 1) / sizeof(T);
     if constexpr (Tr) {
         if (tr.ra) {
-            if (prof.size() < (std::size_t)tr.nrow * sw) prof.resize((std::size_t)tr.nrow * sw);
+            const std::size_t need = (std::size_t)tr.nrow * sw;
+            if (prof.size() < need + idx_elems) prof.resize(need + idx_elems);
+            unsigned char* idx = reinterpret_cast<unsigned char*>(prof.data() + need);
+            striped_profile_index(idx, b, n, seg, W);
             for (int c = 0; c < tr.nrow; ++c)
-                striped_profile_row(prof.data() + (std::size_t)c * sw, blk + (std::size_t)tr.crow[c] * nalpha,
-                                    b, n, seg, W);
+                striped_profile_row_idx(prof.data() + (std::size_t)c * sw,
+                                        blk + (std::size_t)tr.crow[c] * nalpha, idx, n, seg, W);
         } else if (prof.size() < sw) {
             prof.resize(sw);
         }
     } else {
         (void)tr;
-        if (prof.size() < (std::size_t)nalpha * sw) prof.resize((std::size_t)nalpha * sw);
+        const std::size_t need = (std::size_t)nalpha * sw;
+        if (prof.size() < need + idx_elems) prof.resize(need + idx_elems);
+        unsigned char* idx = reinterpret_cast<unsigned char*>(prof.data() + need);
+        striped_profile_index(idx, b, n, seg, W);
         for (int c = 0; c < nalpha; ++c)
-            striped_profile_row(prof.data() + (std::size_t)c * sw, blk + (std::size_t)c * nalpha, b, n, seg, W);
+            striped_profile_row_idx(prof.data() + (std::size_t)c * sw, blk + (std::size_t)c * nalpha,
+                                    idx, n, seg, W);
     }
 }
 // DP row i's profile row (1-based i).

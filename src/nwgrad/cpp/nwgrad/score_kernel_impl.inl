@@ -92,6 +92,7 @@ static void score_affine_striped(ScoreJob<T>& job) {
         }
 
     vd vgo_a(go_a), vge_a(ge_a), vgo_b(go_b), vge_b(ge_b);
+    vd vgoe_a = vgo_a + vge_a, vgoe_b = vgo_b + vge_b;   // open_pen (integer T)
     const vd vzero(static_cast<T>(0)), vninf(NINF);
     vd vbest = vzero;                       // Local: running per-lane max (best starts at 0)
     T bM = 0, bX = NINF, bY = NINF;         // column 0 of the previous row
@@ -110,6 +111,7 @@ static void score_affine_striped(ScoreJob<T>& job) {
         if constexpr (Tr) {
             go_a = tr.go_a[i]; ge_a = tr.ge_a[i]; go_b = tr.go_b[i]; ge_b = tr.ge_b[i];
             vgo_a = vd(go_a); vge_a = vd(ge_a); vgo_b = vd(go_b); vge_b = vd(ge_b);
+            vgoe_a = vgo_a + vge_a; vgoe_b = vgo_b + vge_b;
         }
         const T nbM = Local ? T(0) : NINF;
         T nbX;
@@ -146,18 +148,18 @@ static void score_affine_striped(ScoreJob<T>& job) {
                 uX.copy_from(pX + (std::size_t)s * W, stdx::element_aligned);
                 uY.copy_from(pY + (std::size_t)s * W, stdx::element_aligned);
                 dM = uM; dX = uX; dY = uY;   // the next segment's diagonal
-                vd vxv = stdx::max(stdx::max((uM - vgo_b) - vge_b, uX - vge_b), (uY - vgo_b) - vge_b);
+                vd vxv = stdx::max(stdx::max(open_pen(uM, vgo_b, vge_b, vgoe_b), uX - vge_b), open_pen(uY, vgo_b, vge_b, vgoe_b));
                 vxv.copy_to(cX + (std::size_t)s * W, stdx::element_aligned);
 
                 if constexpr (nw_is_int<T> && W >= 4) {
                     // the opens to ov (int_pmax_carry reads them one segment back)
-                    ((stdx::max(vmv, vxv) - vgo_a) - vge_a).copy_to(opens + (std::size_t)s * W, stdx::element_aligned);
+                    (open_pen(stdx::max(vmv, vxv), vgo_a, vge_a, vgoe_a)).copy_to(opens + (std::size_t)s * W, stdx::element_aligned);
                     if constexpr (Local) vbest = stdx::max(vbest, padded(stdx::max(vmv, vxv), s));
                 } else {
                 vd vyv = stdx::max(Oin, Yin - vge_a);
                 vyv.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
                 if constexpr (Local) vbest = stdx::max(vbest, padded(stdx::max(stdx::max(vmv, vxv), vyv), s));
-                Oin = (stdx::max(vmv, vxv) - vgo_a) - vge_a;
+                Oin = open_pen(stdx::max(vmv, vxv), vgo_a, vge_a, vgoe_a);
                 Yin = vyv;
                 }
             }
@@ -187,11 +189,11 @@ static void score_affine_striped(ScoreJob<T>& job) {
                 uX.copy_from(pX + (std::size_t)s * W, stdx::element_aligned);
                 uY.copy_from(pY + (std::size_t)s * W, stdx::element_aligned);
                 dM = uM; dX = uX; dY = uY;   // the next segment's diagonal
-                vd vxv = stdx::max(stdx::max((uM - vgo_b) - vge_b, uX - vge_b), (uY - vgo_b) - vge_b);
+                vd vxv = stdx::max(stdx::max(open_pen(uM, vgo_b, vge_b, vgoe_b), uX - vge_b), open_pen(uY, vgo_b, vge_b, vgoe_b));
                 vxv.copy_to(cX + (std::size_t)s * W, stdx::element_aligned);
                 if constexpr (Local) vbest = stdx::max(vbest, padded(stdx::max(vmv, vxv), s));
                 if constexpr (nw_is_int<T> && W >= 4)   // the integer carry reads the opens; the floating one recomputes them
-                    ((stdx::max(vmv, vxv) - vgo_a) - vge_a).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
+                    (open_pen(stdx::max(vmv, vxv), vgo_a, vge_a, vgoe_a)).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
             }
             if constexpr (!(nw_is_int<T> && W >= 4)) {
             // The open into Y at segment q: what pass 1 stores in `ov` for the integer carry,
@@ -201,7 +203,7 @@ static void score_affine_striped(ScoreJob<T>& job) {
                 vd vm, vx;
                 vm.copy_from(cM + (std::size_t)q * W, stdx::element_aligned);
                 vx.copy_from(cX + (std::size_t)q * W, stdx::element_aligned);
-                return vd((stdx::max(vm, vx) - vgo_a) - vge_a);
+                return vd(open_pen(stdx::max(vm, vx), vgo_a, vge_a, vgoe_a));
             };
             vd prev([&](int q) { return q == 0 ? bY : NINF; });
             for (int s = 0; s < seg; ++s) {
@@ -350,6 +352,7 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
         }
 
     vd vgo_a(go_a), vge_a(ge_a), vgo_b(go_b), vge_b(ge_b);
+    vd vgoe_a = vgo_a + vge_a, vgoe_b = vgo_b + vge_b;   // open_pen (integer T)
     const vd vzero(static_cast<T>(0)), vninf(NINF);
     vd vbest = vzero;
     T bD = 0;                               // D of column 0, previous row (M(0,0) = 0)
@@ -367,6 +370,7 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
         if constexpr (Tr) {
             go_a = tr.go_a[i]; ge_a = tr.ge_a[i]; go_b = tr.go_b[i]; ge_b = tr.ge_b[i];
             vgo_a = vd(go_a); vge_a = vd(ge_a); vgo_b = vd(go_b); vge_b = vd(ge_b);
+            vgoe_a = vgo_a + vge_a; vgoe_b = vgo_b + vge_b;
         }
         const T nbM = Local ? T(0) : NINF;
         T nbX;
@@ -383,6 +387,10 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
         if constexpr (nw_is_int<T> && W >= 4) {
             fBase = vd([&](int l) { return static_cast<T>(static_cast<T>(l * seg) * ge_a); });
             fR = fBase;
+            // Segment 0 has no Q term; seeded so that its fOprev + fR is exactly -inf (the
+            // lane arithmetic wraps), which leaves fP at -inf with no `s > 0` test in the
+            // loop — gcc kept that test on every segment (sse4: 3 branches per segment).
+            fOprev = vninf - fBase;
         }
         for (int s = 0; s < seg; ++s) {
             vd dD;
@@ -398,7 +406,7 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
             vd uD, uX;
             uD.copy_from(pD + (std::size_t)s * W, stdx::element_aligned);
             uX.copy_from(pX + (std::size_t)s * W, stdx::element_aligned);
-            const vd vxv = stdx::max((uD - vgo_b) - vge_b, uX - vge_b);
+            const vd vxv = stdx::max(open_pen(uD, vgo_b, vge_b, vgoe_b), uX - vge_b);
             const vd mx = stdx::max(vmv, vxv);
             vxv.copy_to(cX + (std::size_t)s * W, stdx::element_aligned);
             if constexpr (nw_is_int<T> && W >= 4) {
@@ -406,9 +414,9 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
                 // ramp(s) into the running prefix max (s >= 1; segment 0's Q needs the
                 // LAST segment's open, shifted a lane, and is folded in after the row)
                 mx.copy_to(cD + (std::size_t)s * W, stdx::element_aligned);
-                if (s > 0) fP = stdx::max(fP, fOprev + fR);
+                fP = stdx::max(fP, fOprev + fR);
                 nv_store(cY + (std::size_t)s * W, fP);
-                fOprev = (mx - vgo_a) - vge_a;
+                fOprev = open_pen(mx, vgo_a, vge_a, vgoe_a);
                 fR += vge_a;
                 if constexpr (Local) {
                     if constexpr (MOnly) vbest = stdx::max(vbest, padded(vmv, s));
@@ -423,7 +431,7 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
                 if constexpr (MOnly) vbest = stdx::max(vbest, vmv);
                 else                 vbest = stdx::max(vbest, padded(dn, s));
             }
-            Oin = (mx - vgo_a) - vge_a;
+            Oin = open_pen(mx, vgo_a, vge_a, vgoe_a);
             Yin = vyv;
             }
         }

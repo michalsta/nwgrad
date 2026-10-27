@@ -2516,15 +2516,28 @@ private:
             T*       hc = buf.H.data() + static_cast<size_t>(i) * stride_;
             const int j0 = jlo(i), j1 = jhi(i);
             T rowmax = static_cast<T>(0);   // Local: see local_row_best_
+            [[maybe_unused]] T left = hc[j0 - 1];   // the carry in a register (integer Local)
             for (int j = j0; j <= j1; ++j) {
-                T v = std::max({
-                    hp[j-1] + srow[bcode[static_cast<size_t>(j) - 1]],
-                    hp[j]   - ge_b_r,
-                    hc[j-1] - ge_a_r,
-                });
-                if constexpr (AM == AlignMode::Local) {
-                    v = std::max(v, static_cast<T>(0));
+                T v;
+                if constexpr (AM == AlignMode::Local && nw_is_int<T>) {
+                    // the clamp off the left carry, the same value (see nw_opaque); the carry
+                    // a local, not hc[j-1]: with the pin, clang reloaded it from the store
+                    // just made (a store-forward on the chain: 0.41x gcc)
+                    const T t = std::max<T>(std::max<T>(hp[j-1] + srow[bcode[static_cast<size_t>(j) - 1]],
+                                                        hp[j] - ge_b_r), static_cast<T>(0));
+                    v = std::max<T>(nw_opaque(t), left - ge_a_r);
+                    left = v;
                     rowmax = std::max(rowmax, v);
+                } else {
+                    v = std::max({
+                        hp[j-1] + srow[bcode[static_cast<size_t>(j) - 1]],
+                        hp[j]   - ge_b_r,
+                        hc[j-1] - ge_a_r,
+                    });
+                    if constexpr (AM == AlignMode::Local) {
+                        v = std::max(v, static_cast<T>(0));
+                        rowmax = std::max(rowmax, v);
+                    }
                 }
                 hc[j] = v;
             }
@@ -3749,8 +3762,13 @@ private:
                     T v = diag + (tr_ ? subT(i, j) : subTu(i, j));
                     const T u = row[j] - ge_b, l = row[j - 1] - ge_a;
                     if (v < u) v = u;
-                    if (v < l) v = l;
-                    v = std::max(v, static_cast<T>(0));
+                    if constexpr (nw_is_int<T>) {   // the clamp off the left carry (see nw_opaque)
+                        v = nw_opaque(std::max<T>(v, static_cast<T>(0)));
+                        if (v < l) v = l;
+                    } else {
+                        if (v < l) v = l;
+                        v = std::max(v, static_cast<T>(0));
+                    }
                     diag = row[j];
                     row[j] = v;
                     if (v > best) { best = v; ie = i; je = j; }
@@ -4209,10 +4227,17 @@ private:
             const uint8_t* bcode = b_idx_.data();
             T rowmax = static_cast<T>(0);
             for (int j = 1; j <= n_; ++j) {
-                T v = std::max({prev[j-1] + sub[bcode[j - 1]], prev[j] - ge_b, left - ge_a});
-                if constexpr (local) {
-                    v = std::max(v, static_cast<T>(0));
+                T v;
+                if constexpr (local && nw_is_int<T>) {   // the clamp off the left carry (see nw_opaque)
+                    const T t = std::max<T>(std::max<T>(prev[j-1] + sub[bcode[j - 1]], prev[j] - ge_b), static_cast<T>(0));
+                    v = std::max<T>(nw_opaque(t), left - ge_a);
                     rowmax = std::max(rowmax, v);
+                } else {
+                    v = std::max({prev[j-1] + sub[bcode[j - 1]], prev[j] - ge_b, left - ge_a});
+                    if constexpr (local) {
+                        v = std::max(v, static_cast<T>(0));
+                        rowmax = std::max(rowmax, v);
+                    }
                 }
                 cur[j] = v;
                 left = v;
