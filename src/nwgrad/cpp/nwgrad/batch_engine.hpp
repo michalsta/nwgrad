@@ -739,7 +739,7 @@ private:
         size_t maxa = 0, maxb = 0;
         for (size_t i = 0; i < N; ++i) {
             const size_t la = problems[i].seq_a.size(), lb = problems[i].seq_b.size();
-            if (la == 0 || lb == 0 || (hb_case && la > static_cast<size_t>(s_.hb_cutoff)) ||
+            if (la == 0 || lb == 0 || (hb_case && hb_splits(tb_resolved_, s_.traceback == TracebackMode::Default ? FullAl::kAutoPointerCells : 0, s_.hb_cutoff, la, lb)) ||
                 !inter_pair_fits(la, lb, GM == GapModel::Affine, soft, inter_w_(K), sizeof(T), K.d.inter_w)) {
                 other.push_back(i); continue;
             }
@@ -2050,7 +2050,7 @@ private:
                 (len_a(i) + 1) * (len_b(i) + 1) > inter_linear_gather_cap<T, AM == AlignMode::Global>())
                 return false;
         // Hirschberg pairs past the cutoff split: no shared fill.
-        return !(is_hirschberg(tb_resolved_) && len_a(i) > static_cast<size_t>(s_.hb_cutoff));
+        return !hb_splits(tb_resolved_, s_.traceback == TracebackMode::Default ? FullAl::kAutoPointerCells : 0, s_.hb_cutoff, len_a(i), len_b(i));
     }
 
 public:

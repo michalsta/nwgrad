@@ -84,6 +84,18 @@ static inline stdx::native_simd<int64_t> avx512d_blend(__mmask8 k, stdx::native_
     res.copy_from(out, stdx::element_aligned);
     return res;
 }
+static inline __mmask8 avx512d_eq(stdx::native_simd<double> a, stdx::native_simd<double> b) {
+    alignas(64) double aa[8], bb[8];
+    a.copy_to(aa, stdx::element_aligned);
+    b.copy_to(bb, stdx::element_aligned);
+    return _mm512_cmp_pd_mask(_mm512_load_pd(aa), _mm512_load_pd(bb), _CMP_EQ_OQ);
+}
+static inline __mmask8 avx512d_eq(stdx::native_simd<int64_t> a, stdx::native_simd<int64_t> b) {
+    alignas(64) int64_t aa[8], bb[8];
+    a.copy_to(aa, stdx::element_aligned);
+    b.copy_to(bb, stdx::element_aligned);
+    return _mm512_cmpeq_epi64_mask(_mm512_load_si512(aa), _mm512_load_si512(bb));
+}
 // The lazy-F early exit (any lane of F above v), for both 8-byte lane types.
 template <class V>
 static inline bool avx512d_any_gt(const V& F, const V& v) { return avx512d_gt(F, v) != 0; }
@@ -386,14 +398,16 @@ template <class T> struct IntRampRow {
 // Always inlined: gcc outlined it as a constant-propagated clone in every integer score
 // kernel (a call, its own frame and the lane arrays per row), where it then cost more
 // than the kernel body around it.  RowRamp: the ramp loaded from `rr`'s row (int_row_ramp).
-template <class T, int W, bool RowRamp = false>
+// Ext: the code recorded for an extension (the Pointers kernels pass 32, Y's field of the
+// packed byte already shifted, the open codes in `ok` then 0 / 16; dense codes 2).
+template <class T, int W, bool RowRamp = false, int Ext = 2>
 [[gnu::always_inline]] static inline void int_pmax_carry(const T* ov, const T* ok, T nbOpen, T nbOpenK,
                                   T bY, T ge_a, int seg, T* cY, T* yc, T* qbuf,
                                   IntRampRow<T>* rr = nullptr) {
     using vd = stdx::native_simd<T>;
     [[maybe_unused]] const T* rmp = nullptr;
     if constexpr (RowRamp) rmp = rr->get(ge_a, seg, W);
-    const vd vtwo(T(2));
+    const vd vtwo(static_cast<T>(Ext));
     const vd vge(ge_a);
     const vd rbase([&](int l) { return static_cast<T>(static_cast<T>(l * seg) * ge_a); });
     vd rq = rbase;                          // k*ge_a for k = l*seg + s
@@ -528,6 +542,9 @@ static inline V lazy_f_next(const V& F, const V& v, const V& ge) {
 #else
 #  define NWGRAD_FORCE_INLINE inline
 #endif
+// The callers feed it opens recomputed from the rows they sit beside (load_o), not rows pass
+// 1 stored: both together measured 0.71-0.95 of the stored-opens form on AVX2 and 0.76-0.86
+// for the linear fills (AGENTS.md, "Merging the shortened carry").
 template <class V, class LoadO, class Put>
 static NWGRAD_FORCE_INLINE V carry_pass(int seg, V prev, const V& ge, LoadO&& load_o, Put&& put) {
     int s = 0;
@@ -726,21 +743,20 @@ static void striped_affine_full(ViterbiJob<T>& job) {
 
         if (seg > 0) {
             // ── carry-free: VM (diagonal, clamped to 0 for Local), VX (same column) ──
+            // The diagonal predecessors: the previous iteration's up vectors, rotated in
+            // registers (each previous-row vector loaded once, not twice); at s = 0 the last
+            // segment, shifted one lane in.
+            vd dM(nw_ninf<T>), dX(nw_ninf<T>), dY(nw_ninf<T>);
+            if (seg > 0) {
+                vd lM, lX, lY;
+                lM.copy_from(pM + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                lX.copy_from(pX + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                lY.copy_from(pY + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                dM = lane_shift_in(lM, bM);
+                dX = lane_shift_in(lX, bX);
+                dY = lane_shift_in(lY, bY);
+            }
             for (int s = 0; s < seg; ++s) {
-                vd dM, dX, dY;
-                if (s == 0) {
-                    vd lM, lX, lY;
-                    lM.copy_from(pM + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                    lX.copy_from(pX + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                    lY.copy_from(pY + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                    dM = lane_shift_in(lM, bM);
-                    dX = lane_shift_in(lX, bX);
-                    dY = lane_shift_in(lY, bY);
-                } else {
-                    dM.copy_from(pM + (std::size_t)(s - 1) * W, stdx::element_aligned);
-                    dX.copy_from(pX + (std::size_t)(s - 1) * W, stdx::element_aligned);
-                    dY.copy_from(pY + (std::size_t)(s - 1) * W, stdx::element_aligned);
-                }
                 vd sb; sb.copy_from(sub + (std::size_t)s * W, stdx::element_aligned);
                 vd vmv = stdx::max(stdx::max(dM, dX), dY) + sb;
                 if constexpr (Local) vmv = stdx::max(vmv, vzero);
@@ -750,8 +766,15 @@ static void striped_affine_full(ViterbiJob<T>& job) {
                 uM.copy_from(pM + (std::size_t)s * W, stdx::element_aligned);
                 uX.copy_from(pX + (std::size_t)s * W, stdx::element_aligned);
                 uY.copy_from(pY + (std::size_t)s * W, stdx::element_aligned);
+                dM = uM; dX = uX; dY = uY;   // the next segment's diagonal
                 vd vxv = stdx::max(stdx::max((uM - vgo_b) - vge_b, uX - vge_b), (uY - vgo_b) - vge_b);
                 vxv.copy_to(cX + (std::size_t)s * W, stdx::element_aligned);
+                // The opens stay a row of their own here (buf.sopenv), unlike
+                // the Pointers / Hirschberg / linear kernels, which recompute them from M and X:
+                // this kernel's cM / cX / cY are rows of whole tables, which on a wide-L1 host
+                // (table_spread() off) share one 4 KB offset, and a carry loading cM[s-1] /
+                // cX[s-1] right after storing cY[s-1] hit the store-to-load 4 KB alias on every
+                // segment -- 2.05-2.26x the time (nighthaven AVX2, double, 1 thread, 2026-10-25).
                 ((stdx::max(vmv, vxv) - vgo_a) - vge_a).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
             }
 

@@ -25,9 +25,9 @@ enum class AlignBand { Full,   GuideBanded };
 //
 //   Scores    retain VM/VX/VY for the whole DP and RE-DERIVE the argmax by repeating
 //             the forward pass's comparison chain.  12 B/cell (float32).
-//   Pointers  record the predecessor as one byte per cell per state during the fill
-//             and simply FOLLOW it; scores then need only two rolling rows.
-//             3 B/cell — and measured 1.4-2.2x faster, because the footprint is what
+//   Pointers  record the predecessors in one byte per cell (the three states' codes
+//             packed) during the fill and simply FOLLOW them; scores then need only two
+//             rolling rows.  1 B/cell (3 until 2026-10-25) — and measured 1.4-2.2x faster, because the footprint is what
 //             drives the page-fault cost that dominates the memory-bound regime.
 //
 // The two are bit-identical — same score, alignment, guide_j and gradient, ties
@@ -102,6 +102,23 @@ enum class SoftImpl { Scaled, ScaledOrLog, Log };
 // Everything structural therefore asks this rather than naming one of them.
 inline constexpr bool is_hirschberg(TracebackMode t) noexcept {
     return t == TracebackMode::Hirschberg || t == TracebackMode::HirschbergPmax;
+}
+
+// Where `auto` resolves to a Hirschberg mode with a pointer budget (Aligner::
+// kAutoPointerBudget), a pair of up to this many cells runs as Pointers -- the same fill,
+// table and traceback as traceback="pointers", so bit-exact with it -- and splits only
+// above it, where the 1 B/cell code table grows past what a thread should hold.
+inline constexpr std::size_t kAutoHbPointerCells = std::size_t(1) << 25;
+
+// Whether a pair splits -- runs the Hirschberg recursion -- rather than the Pointers fill:
+// every Hirschberg mode splits past hb_cutoff rows, except, under `auto` for a type with a
+// pointer budget, a pair within that budget (kAutoHbPointerCells; Global double 2x that).  The aligner's dispatch
+// and the batch engine's planning (which pairs may share a fill) ask the same question.
+// auto_cells: the budget that applies (Aligner::kAutoPointerCells under `auto`), 0 = none.
+inline constexpr bool hb_splits(TracebackMode tb, std::size_t auto_cells, int cutoff,
+                                std::size_t la, std::size_t lb) noexcept {
+    if (!is_hirschberg(tb) || la <= static_cast<std::size_t>(cutoff)) return false;
+    return !(auto_cells != 0 && (la + 1) * (lb + 1) <= auto_cells);
 }
 
 // Which Viterbi backend fills the DP tables is a runtime field (backend_, below), one of
@@ -540,6 +557,30 @@ struct Aligner {
     // Default resolves to this Aligner's compile-time kDefaultTb (Hirschberg for the
     // affine+global+full case, Pointers elsewhere) — so a caller can pass the sentinel
     // through without knowing the problem type.
+    // Under `auto`, these types run a pair of up to kAutoHbPointerCells cells as Pointers
+    // and split only above it (hb_splits): affine Global Full at T=double (exact
+    // Hirschberg above the budget) and int64 (hirschberg_pmax above it), and affine Local
+    // Full at T=float and the integer types (hirschberg_pmax above it).  Measured
+    // 2026-10-25 with one-byte codes (AGENTS.md, "`auto` with a pointer budget"): Global
+    // double, Pointers beat the exact recursion at every length and thread count within
+    // the budget (nighthaven, wloczykij 64 cores); Global int64, Pointers beat pmax on both
+    // fixtures; Local, Pointers beat pmax 1.5-3x on homologous pairs and lose 0-14 %
+    // (float32) / 6-37 % (integers) on unrelated ones.  Local double keeps plain Pointers
+    // (kDefaultTb); Global float32 / int16 / int32 keep hirschberg_pmax past hb_cutoff,
+    // which won there (homologous float32, both int32 fixtures).
+    static constexpr bool kAutoPointerBudget =
+        GM == GapModel::Affine && AB == AlignBand::Full &&
+        ((AM == AlignMode::Global && (std::is_same_v<T, double> || std::is_same_v<T, int64_t>)) ||
+         (AM == AlignMode::Local && (std::is_same_v<T, float> || nw_is_int<T>)));
+    // ... and up to how many cells (0 = no budget).  Global double 2^26: with the dense codes
+    // (dense_gate_) Pointers kept beating the exact recursion to L8000 at 1 and 6 threads
+    // (nighthaven 2026-10-26: Hirschberg 1.07-1.32x unrelated, 1.38-1.81x homologous); only
+    // 12 threads on 6 cores (SMT) lost there (0.81 / 0.96).  Local float32 / integers keep
+    // 2^25: above it pmax won on unrelated pairs by 2-5x.
+    static constexpr std::size_t kAutoPointerCells =
+        !kAutoPointerBudget ? 0
+        : (AM == AlignMode::Global && std::is_same_v<T, double>) ? 2 * kAutoHbPointerCells
+                                                                  : kAutoHbPointerCells;
     void set_traceback(TracebackMode t) noexcept {
         tb_auto_ = (t == TracebackMode::Default);
         tb_ = tb_auto_ ? kDefaultTb : t;
@@ -551,6 +592,62 @@ struct Aligner {
     // (base-case memory, per-block overhead, tie-break fidelity), not just a speed one:
     // at cutoff >= m no split happens at all and the result is the Pointers fill, hence
     // bit-exact — the memory win is what pays for the divergence.
+    // Which direction-code format a leveled Pointers fill writes: -1 auto (the gate,
+    // dense_gate_), 0 one byte a cell, 1 the dense codes (0.75 B/cell affine, 0.25 B/cell
+    // linear) wherever the kernel can (not int16).  Bit-identical results either way.
+    // NWGRAD_DENSE_CODES=0/1 overrides auto.
+    void set_dense_codes(int mode) noexcept { dense_mode_ = mode < 0 ? -1 : (mode ? 1 : 0); }
+    int dense_codes() const noexcept { return dense_mode_; }
+    bool dense_written() const noexcept { return dense_; }
+    // The auto gate's thresholds (dense_gate_): cells a pair from which the dense codes are
+    // written, per level, gap model, mode and type; 0 = never.  Only where measured faster
+    // (2026-10-26; AGENTS.md "Dense direction codes"); unmeasured levels stay off.
+    // AVX2 (nighthaven, 1-12 threads): from the size where dense won at every thread count.
+    static constexpr std::size_t kDenseFromCellsAvx2 = [] {
+        constexpr std::size_t M1 = std::size_t(1) << 20;
+        if constexpr (sizeof(T) < 4 || AB != AlignBand::Full) return std::size_t(0);
+        else if constexpr (GM == GapModel::Affine && AM == AlignMode::Global)
+            return nw_is_int<T> && sizeof(T) == 4 ? M1 : 16 * M1;         // int32 L1000; else L4000
+        else if constexpr (GM == GapModel::Affine)                         // Local: its row scan
+            return nw_is_int<T> && sizeof(T) == 4 ? 16 * M1 : 32 * M1;    // dilutes the code stream
+        else if constexpr (AM == AlignMode::Global)                        // linear
+            return std::is_same_v<T, double> ? 16 * M1 : 4 * M1;
+        else                                                               // linear Local
+            return std::is_same_v<T, float> ? 4 * M1 : 16 * M1;
+    }();
+    // AVX-512: every crossover comes earlier than AVX2's.  Re-measured 2026-10-27 on PR #8's head (solace WSL, exact L x L, L700-5800, 1 / 8 / 16
+    // threads): each threshold sits between the last size that did not win and the first from
+    // which dense won (or tied within its control) at every thread count and size above.
+    // (m+1)(n+1) at L700 / 1000 / 1450 / 2000 / 2900 / 4000: 0.49 / 1.00 / 2.11 / 4.00 / 8.41 / 16.0 M.
+    static constexpr std::size_t kDenseFromCellsAvx512 = [] {
+        constexpr std::size_t M1 = std::size_t(1) << 20;
+        constexpr bool D = std::is_same_v<T, double>, F = std::is_same_v<T, float>;
+        if constexpr (sizeof(T) < 4 || AB != AlignBand::Full) return std::size_t(0);
+        else if constexpr (std::is_same_v<T, int64_t> && !(GM == GapModel::Affine && AM == AlignMode::Global))
+            return kDenseFromCellsAvx2;                                    // unmeasured: AVX2's
+        else if constexpr (GM == GapModel::Affine && AM == AlignMode::Global)
+            return D ? M1 / 2 : F ? 3 * M1 : nw_is_int<T> && sizeof(T) == 4 ? 2 * M1 : M1 / 2;
+        else if constexpr (GM == GapModel::Affine)                         // Local
+            return D ? M1 / 2 : 6 * M1;
+        else if constexpr (AM == AlignMode::Global)                        // linear
+            return D ? 6 * M1 : F ? 2 * M1 : M1 / 2;
+        else                                                               // linear Local
+            return D ? 12 * M1 : 3 * M1;
+    }();
+    // sse2 / sse4 (wloczykij, Piledriver, 1 / 16 / 64 threads): dense lost 6-24 % almost
+    // everywhere (gains of 2-4 % only at 64 threads, int32 affine and linear double) -- off.
+    // NEON (M1, 1-8 threads): affine and linear double lost 4-18 % at every size (no memory
+    // wall there); linear float32 / int32 won 7-10 % at every size measured (L1000-5800).
+    // NEON (M1): linear float32 / int32 from 2^20; affine int32 and Local double from 2^18
+    // (0.92-0.98 from L500), float32 from 2^22 (parity at L500, 0.95-0.98 above); affine
+    // Global double off (1.00-1.05 even with the weighted pass 1); linear double off.
+    static constexpr std::size_t kDenseFromCellsNeon =
+        AB != AlignBand::Full ? 0
+        : GM == GapModel::Linear
+            ? ((std::is_same_v<T, float> || std::is_same_v<T, int32_t>) ? std::size_t(1) << 20 : 0)
+        : std::is_same_v<T, int32_t> ? std::size_t(1) << 18
+        : std::is_same_v<T, float>   ? std::size_t(1) << 22
+        : (std::is_same_v<T, double> && AM == AlignMode::Local) ? std::size_t(1) << 18 : 0;
     void set_hb_cutoff(int rows) {
         if (rows < 1)
             throw std::invalid_argument("nwgrad: hb_cutoff must be >= 1");
@@ -1242,8 +1339,13 @@ private:
     std::vector<int> post_rows_;
     int    inter_w_ = 0, inter_lane_ = 0;
     size_t inter_stride_ = 0;   // the interleaved tables' row length (>= stride_ if ragged)
-    // Pointers mode: DM/DX/DY hold predecessor codes, VM/VX/VY are NOT retained.
+    // Pointers mode: DM holds predecessor codes, VM/VX/VY are NOT retained.
     bool        pointers_ = false;
+    // The last Pointers fill wrote the DENSE codes (dense_codes_row_bytes, simd_levels.hpp:
+    // 2-bit fields, four segments a byte -- linear one plane, affine three).  dense_mode_ is
+    // the request: -1 auto (dense_gate_), 0 never, 1 always (where the kernel can).
+    bool        dense_ = false;
+    int         dense_mode_ = -1;
     // Hirschberg mode: no tables at all survive the fill.  The recursion recovers the
     // path directly, so hops_ IS the result — every consumer (gradient, alignment,
     // guide_j) replays it instead of walking a table.  One byte per step, so a path
@@ -1442,7 +1544,7 @@ private:
     // smaller memory bounds even when rowwise was requested.
     bool uses_rowwise_full() const {
         if constexpr (GM == GapModel::Affine && AB == AlignBand::Full) {
-            if (!rowwise_full_ || (is_hirschberg(tb_) && m_ > hb_cutoff_)) return false;
+            if (!rowwise_full_ || hb_splits(tb_, tb_auto_ ? kAutoPointerCells : 0, hb_cutoff_, m_, n_)) return false;
             const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
             return backend >= 0 && level_kernels(backend).template of<T>().banded_row_local;
         }
@@ -1786,7 +1888,7 @@ private:
             if (i == 0 && j == 0) break;
             int k;
             if (pointers_) {
-                k = dcode(buf.DM, i, j);
+                k = dense_ ? dense_code(buf.DM, i, j, 1, 0) : dcode(buf.DM, i, j);
                 if (k == 3) break;
             } else {
                 if constexpr (AM == AlignMode::Local)
@@ -1813,8 +1915,52 @@ private:
     // Directions (Pointers, variant B) live in whatever layout the fill used -- row-major
     // from the scalar B fill, striped from the leveled B kernel -- so index them through
     // the same cell_index() the score tables use.  One copy of the striping arithmetic.
+    // Affine: one byte per cell, M | X << 2 | Y << 4; linear: the move, 0..3.
     unsigned char dcode(const BVec& d, int i, int j) const noexcept {
         return d[cell_index(i, j)];
+    }
+    // The dense codes (dense_): plane `plane` of `planes` at (i, j); column 0 keeps the
+    // one-byte format whole (linear: the move; affine: the packed M | X << 2 | Y << 4).
+    unsigned char dense_code(const BVec& d, int i, int j, int planes, int plane) const noexcept {
+        const unsigned char* row = d.data() +
+            static_cast<size_t>(i) * dense_codes_row_bytes(striped_seg_, striped_w_, planes);
+        if (j == 0) return row[0];
+        const int s = (j - 1) % striped_seg_, l = (j - 1) / striped_seg_;
+        return static_cast<unsigned char>(dense_code_at(row, striped_seg_, striped_w_, planes, plane, s, l));
+    }
+    // Whether this fill asks its Pointers kernel for the dense codes (dense_mode_, then
+    // NWGRAD_DENSE_CODES, then the gate).
+    bool want_dense_() const noexcept {
+        if (dense_mode_ >= 0) return dense_mode_ == 1;
+        static const int env = [] {
+            const char* e = std::getenv("NWGRAD_DENSE_CODES");
+            return e ? (std::atoi(e) != 0 ? 1 : 0) : -1;
+        }();
+        if (env >= 0) return env == 1;
+        return dense_gate_();
+    }
+    // The auto choice: the dense codes from kDenseFromCells{Avx2,Neon} cells a pair, by the
+    // level the fill runs at (0 = never).  On AVX2 they cost 2-13 % in cache (more shifting
+    // a segment) and win once a thread's code table presses on L2 / L3 -- from a size that
+    // hardly moves with the thread count, so the gate is on cells alone; on NEON the
+    // answer does not depend on size (see the constants).
+    bool dense_gate_() const noexcept {
+        const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
+#if defined(__aarch64__) || defined(_M_ARM64)
+        const std::size_t from = backend >= 0 ? kDenseFromCellsNeon : 0;
+#else
+        const std::size_t from = backend == static_cast<int>(SimdLevel::Avx2)   ? kDenseFromCellsAvx2
+                               : backend == static_cast<int>(SimdLevel::Avx512) ? kDenseFromCellsAvx512 : 0;
+#endif
+        return from != 0 &&
+               (static_cast<std::size_t>(m_) + 1) * (static_cast<std::size_t>(n_) + 1) >= from;
+    }
+    // The affine cell's three codes in the one-byte packing, from whichever format holds them.
+    unsigned char affine_codes(const BVec& d, int i, int j) const noexcept {
+        if (!dense_) return dcode(d, i, j);
+        if (j == 0) return dense_code(d, i, 0, 3, 0);
+        return static_cast<unsigned char>(dense_code(d, i, j, 3, 0) | dense_code(d, i, j, 3, 1) << 2 |
+                                          dense_code(d, i, j, 3, 2) << 4);
     }
 
     // emit(s, i, j, open) for each move out of (i, j), from the optimum back to the
@@ -1878,28 +2024,33 @@ private:
         TBTable tbl = best_tbl_;
         while (true) {
             if (i == 0 && j == 0) break;
+            // Ptr: the cell's packed byte, read once for whichever state the walk is in
+            // (Global: past the border, which is emitted without reading the codes)
+            unsigned char c = 0;
             if constexpr (AM == AlignMode::Local) {
+                if constexpr (Ptr) c = affine_codes(buf.DM, i, j);
                 if (tbl == TBTable::M) {
-                    if constexpr (Ptr) { if (dcode(buf.DM, i, j) == 3) break; }
+                    if constexpr (Ptr) { if ((c & 3) == 3) break; }
                     else               { if (rat(buf.VM, i, j) <= 0.0) break; }
                 }
             } else {
                 if (i == 0) { for (; j > 0; --j) emit(TBTable::Y, 0, j, j == 1); break; }
                 if (j == 0) { for (; i > 0; --i) emit(TBTable::X, i, 0, i == 1); break; }
+                if constexpr (Ptr) c = affine_codes(buf.DM, i, j);
             }
             if      (i == 0) tbl = TBTable::Y;   // row 0: only leftward moves remain
             else if (j == 0) tbl = TBTable::X;   // col 0: only upward moves remain
 
             TBTable prev;
             if (tbl == TBTable::M) {
-                if constexpr (Ptr) prev = from_code(dcode(buf.DM, i, j));
+                if constexpr (Ptr) prev = from_code(c & 3);
                 else { const size_t k = cell_index(i-1, j-1);
                        prev = argmax(buf.VM[k], buf.VX[k], buf.VY[k]); }
                 emit(TBTable::M, i, j, false);
                 --i; --j;
             } else if (tbl == TBTable::X) {   // gap in B: advance i, gap_b penalties
                 if constexpr (Tr) { go_b = tgob_[static_cast<size_t>(i)]; ge_b = tgeb_[static_cast<size_t>(i)]; }
-                if constexpr (Ptr) prev = from_code(dcode(buf.DX, i, j));
+                if constexpr (Ptr) prev = from_code((c >> 2) & 3);
                 else { const size_t k = cell_index(i-1, j);
                        prev = argmax(buf.VM[k] - go_b - ge_b,
                                      buf.VX[k]        - ge_b,
@@ -1908,7 +2059,7 @@ private:
                 --i;
             } else {                          // gap in A: advance j, gap_a penalties
                 if constexpr (Tr) { go_a = tgoa_[static_cast<size_t>(i)]; ge_a = tgea_[static_cast<size_t>(i)]; }
-                if constexpr (Ptr) prev = from_code(dcode(buf.DY, i, j));
+                if constexpr (Ptr) prev = from_code(c >> 4);
                 else { const size_t k = cell_index(i, j-1);
                        prev = argmax(buf.VM[k] - go_a - ge_a,
                                      buf.VX[k] - go_a - ge_a,
@@ -2032,6 +2183,7 @@ private:
         // this back on.  Every other fill here writes VM/VX/VY row-major.
         tables_striped_ = false;
         pointers_     = false;
+        dense_        = false;
         hirschberg_   = false;
         inter_w_      = 0;
         // Hirschberg: divide and conquer, no tables above the base case.  It is a
@@ -2044,7 +2196,7 @@ private:
                 throw std::logic_error(
                     "nwgrad: traceback=\"hirschberg\" is implemented for full DP only; a "
                     "guide band already bounds memory, which is the only thing Hirschberg buys");
-            else if (m_ > hb_cutoff_ && !hb_penalties_ok_()) {
+            else if (hb_splits(tb_, tb_auto_ ? kAutoPointerCells : 0, hb_cutoff_, m_, n_) && !hb_penalties_ok_()) {
                 // A NEGATIVE gap penalty breaks the recursion (characterized 2026-10-11,
                 // after the boundary-state fix):
                 //  * a negative OPEN (either sequence): the join's plain form adds a prefix
@@ -2065,7 +2217,7 @@ private:
                         "nwgrad: traceback=\"hirschberg\" / \"hirschberg_pmax\" needs non-negative "
                         "gap penalties (got a negative one); use traceback=\"pointers\" or \"auto\"");
             }
-            else if (m_ > hb_cutoff_) {
+            else if (hb_splits(tb_, tb_auto_ ? kAutoPointerCells : 0, hb_cutoff_, m_, n_)) {
                 // Linear: one exact sweep for both "hirschberg" and "hirschberg_pmax" —
                 // the prefix-max carry exists to remove affine's lazy-F fixpoint, and the
                 // scalar linear sweep has none.
@@ -2083,7 +2235,7 @@ private:
             // short pairs differed from Pointers.  Same memory (the base case kept
             // a Pointers-sized table too) and the same speed (measured 0.99-1.04x).
         }
-        // Variant B: direction pointers + rolling rows, 3 B/cell instead of 12/24.
+        // Variant B: direction pointers + rolling rows, 1 B/cell instead of 12/24.
         // Full affine only; the banded and linear paths keep their score tables.
         // (the pointer kernels are chosen after the backend is resolved, below: every
         // simd level has its own, and only the scalar path falls back here.)
@@ -2156,8 +2308,10 @@ private:
         job.buf = &buf;
         if (tr_) fill_track_job_(job.tr, true, static_cast<size_t>(n_) + 16);
         const TypedKernels<T>& KT = K.template of<T>();
+        job.dense = (use_ptr && want_dense_()) ? 1 : 0;
         if (use_ptr) KT.viterbi_ptr(job); else KT.viterbi(job);
         pointers_ = use_ptr;   // Pointers leaves codes, not score tables
+        dense_ = use_ptr && job.dense;
         // Adopt the layout the kernel produced (striped for the Full striped kernel).
         if (job.table_layout == 1) {
             tables_striped_ = true;
@@ -2212,8 +2366,10 @@ private:
         job.buf = &buf;
         if (tr_) fill_track_job_(job.tr, true, static_cast<size_t>(n_) + 16, true);
         const TypedKernels<T>& KT = K.template of<T>();
+        job.dense = (use_ptr && want_dense_()) ? 1 : 0;
         if (use_ptr) KT.linear_ptr(job); else KT.linear(job);
         pointers_ = use_ptr;
+        dense_ = use_ptr && job.dense;
         if (job.table_layout == 1) {
             tables_striped_ = true;
             striped_seg_ = job.seg; striped_w_ = job.width;
@@ -2496,9 +2652,9 @@ private:
     // ── TracebackMode::Pointers: affine Viterbi, scalar reference ─────────────
     //
     // Computes the same DP as viterbi_affine() but retains, instead of three score
-    // tables, one byte per cell per state naming the predecessor the forward pass
-    // chose.  Scores live in two rolling rows, so the retained footprint is
-    // 3 B/cell against 12 (float32) / 24 (double).
+    // tables, one byte per cell naming the predecessor each state's forward pass chose,
+    // packed `M | X << 2 | Y << 4` (buf.DM).  Scores live in two rolling rows, so the
+    // retained footprint is 1 B/cell against 12 (float32) / 24 (double).
     //
     // BIT-EXACTNESS is the whole contract, and it holds for a specific reason: the
     // codes below are produced by the *identical* comparison chain the traceback
@@ -2526,15 +2682,13 @@ private:
 
         const std::size_t stride = stride_;   // row-major, matches cell_index()
         const std::size_t dsz    = static_cast<std::size_t>(m_ + 1) * stride;
-        // Per vector, not keyed on DM / rM: viterbi_linear_ptr grows only DM, rM and qM.
-        for (auto* d : {&buf.DM, &buf.DX, &buf.DY}) if (d->size() < dsz) d->resize(dsz);
+        if (buf.DM.size() < dsz) buf.DM.resize(dsz);
+        // Per vector, not keyed on rM: viterbi_linear_ptr grows only rM and qM.
         for (auto* r : {&buf.rM, &buf.rX, &buf.rY, &buf.qM, &buf.qX, &buf.qY})
             if (r->size() < stride) r->resize(stride);
         T* pM = buf.qM.data(); T* pX = buf.qX.data(); T* pY = buf.qY.data();  // row i-1
         T* cM = buf.rM.data(); T* cX = buf.rX.data(); T* cY = buf.rY.data();  // row i
-        unsigned char* dM = buf.DM.data();
-        unsigned char* dX = buf.DX.data();
-        unsigned char* dY = buf.DY.data();
+        unsigned char* D = buf.DM.data();   // M | X << 2 | Y << 4 per cell
 
         // Same three-way argmax the traceback runs, in one place so the two cannot drift.
         // Selects between constants on one compare each (the values are finite or -inf,
@@ -2554,12 +2708,10 @@ private:
                 pX[j] = NINF;
                 pY[j] = (j == 0) ? NINF : -(go_a + static_cast<T>(j) * ge_a);
             }
-            dM[j] = (AM == AlignMode::Local || j == 0) ? 3 : 3;   // row 0 is a start
-            dX[j] = 0;
-            // Y along row 0 extends leftward: (0,1) opens from M(0,0), the rest extend Y.
-            dY[j] = (j <= 1) ? 0 : 2;
+            // row 0 is a start (M 3, X 0); Y along it extends leftward: (0,1) opens from
+            // M(0,0), the rest extend Y.
+            D[j] = (j <= 1) ? 3 : 3 | 2 << 4;
         }
-        if constexpr (AM == AlignMode::Global) dM[0] = 3;
 
         best_i_ = 0; best_j_ = 0; best_tbl_ = TBTable::M;
         T best_local = static_cast<T>(0);
@@ -2577,9 +2729,7 @@ private:
             else if constexpr (Tr) { cM[0] = NINF; cX[0] = tbx0_[static_cast<size_t>(i)]; }
             else { cM[0] = NINF; cX[0] = -(go_b + static_cast<T>(i) * ge_b); }
             cY[0] = NINF;
-            dM[rb] = 3;
-            dX[rb] = (i <= 1) ? 0 : 1;    // (1,0) opens from M(0,0); deeper rows extend X
-            dY[rb] = 0;
+            D[rb] = (i <= 1) ? 3 : 3 | 1 << 2;   // M 3, Y 0; X: (1,0) opens from M(0,0), deeper rows extend
             T rowmax = static_cast<T>(0);   // Local: see local_row_best_
 
             for (int j = 1; j <= n_; ++j) {
@@ -2607,7 +2757,7 @@ private:
                 }
 
                 cM[k] = m_val; cX[k] = x_val; cY[k] = y_val;
-                dM[rb + k] = km; dX[rb + k] = kx; dY[rb + k] = ky;
+                D[rb + k] = static_cast<unsigned char>(km | kx << 2 | ky << 4);
             }
             if constexpr (AM == AlignMode::Local)
                 if (rowmax > best_local) local_row_best_(cM, cX, cY, 1, rowmax, i, best_local);
@@ -2828,7 +2978,7 @@ private:
         return K.template of<T>().hb_base ? &K : nullptr;
     }
 
-    // Vectorized base case: the striped kernel fills buf.hbD (3 direction planes, striped)
+    // Vectorized base case: the striped kernel fills buf.hbD (packed codes, striped)
     // and returns seg/width + the final-cell scores; the walk-back below reads them
     // striped.  Bit-identical to the scalar fill, so which one runs is a speed choice.
     void hb_base_striped_run(const LevelKernels& K, DpBuffer& buf,
@@ -2851,10 +3001,7 @@ private:
         const int seg = job.seg, Wl = job.width;
         const std::size_t rowsz = (std::size_t)(seg + 1) * Wl;
         const std::size_t off   = (std::size_t)Wl;
-        const std::size_t plane = (std::size_t)(H + 1) * rowsz;
-        const unsigned char* dM = buf.hbD.data();
-        const unsigned char* dX = dM + plane;
-        const unsigned char* dY = dX + plane;
+        const unsigned char* D = buf.hbD.data();   // M | X << 2 | Y << 4
         auto idx = [&](int r, int c) -> std::size_t {
             return (std::size_t)r * rowsz + (c == 0 ? 0 : off + (std::size_t)((c - 1) % seg) * Wl + (c - 1) / seg);
         };
@@ -2865,11 +3012,11 @@ private:
                  : ((job.fX >= job.fY) ? TBTable::X : TBTable::Y);
         const std::size_t first = hops_.size();
         while (r > 0 || c > 0) {
-            const std::size_t k = idx(r, c);
+            const unsigned char p = D[idx(r, c)];
             unsigned char code;
-            if (tbl == TBTable::M)      { code = dM[k]; hops_.push_back(0); --r; --c; }
-            else if (tbl == TBTable::X) { code = dX[k]; hops_.push_back(1); --r; }
-            else                        { code = dY[k]; hops_.push_back(2); --c; }
+            if (tbl == TBTable::M)      { code = p & 3;        hops_.push_back(0); --r; --c; }
+            else if (tbl == TBTable::X) { code = (p >> 2) & 3; hops_.push_back(1); --r; }
+            else                        { code = p >> 4;       hops_.push_back(2); --c; }
             tbl = (code == 1) ? TBTable::X : (code == 2 ? TBTable::Y : TBTable::M);
         }
         std::reverse(hops_.begin() + static_cast<std::ptrdiff_t>(first), hops_.end());
@@ -2888,11 +3035,11 @@ private:
         }
 
         const std::size_t stride = static_cast<std::size_t>(W) + 1;
-        const std::size_t plane  = static_cast<std::size_t>(H + 1) * stride;
-        hb_fit_b(buf.hbD, 3 * plane);
-        unsigned char* dM = buf.hbD.data();
-        unsigned char* dX = dM + plane;
-        unsigned char* dY = dX + plane;
+        hb_fit_b(buf.hbD, static_cast<std::size_t>(H + 1) * stride);
+        unsigned char* D = buf.hbD.data();   // M | X << 2 | Y << 4, as the striped kernel's
+        auto pack = [](unsigned km, unsigned kx, unsigned ky) {
+            return static_cast<unsigned char>(km | kx << 2 | ky << 4);
+        };
 
         // Score rows: two rolling is not enough here because Y reads the current row,
         // but M/X read only the row above — the same shape as the Pointers fill.
@@ -2909,13 +3056,13 @@ private:
         pM[0] = in_x ? NINF : static_cast<T>(0);
         pX[0] = NINF;   // in_x: only the first row's column-0 X continues it
         pY[0] = NINF;
-        dM[0] = 3; dX[0] = 3; dY[0] = 3;
+        D[0] = pack(3, 3, 3);
         for (int c = 1; c <= W; ++c) {
             pM[c] = NINF;
             pX[c] = NINF;
             const T uy = pM[c-1] - go_a - ge_a, vy = pX[c-1] - go_a - ge_a, wy = pY[c-1] - ge_a;
             pY[c] = std::max({uy, vy, wy});
-            dM[c] = 3; dX[c] = 3; dY[static_cast<std::size_t>(c)] = pick(uy, vy, wy);
+            D[c] = pack(3, 3, pick(uy, vy, wy));
         }
 
         for (int r = 1; r <= H; ++r) {
@@ -2928,8 +3075,8 @@ private:
             cM[0] = NINF;
             cX[0] = std::max({ux0, vx0, wx0});
             cY[0] = NINF;
-            dM[rb] = 3; dX[rb] = pick(ux0, vx0, wx0); dY[rb] = 3;
-            if (in_x && r == 1) { cX[0] = static_cast<T>(0) - ge_b; dX[rb] = 1; }   // continues the run
+            D[rb] = pack(3, pick(ux0, vx0, wx0), 3);
+            if (in_x && r == 1) { cX[0] = static_cast<T>(0) - ge_b; D[rb] = pack(3, 1, 3); }   // continues the run
             for (int c = 1; c <= W; ++c) {
                 const T dgM = pM[c-1], dgX = pX[c-1], dgY = pY[c-1];
                 cM[c] = std::max({dgM, dgX, dgY}) + (tr_ ? subT(i0 + r, j0 + c) : subTu(i0 + r, j0 + c));
@@ -2937,9 +3084,7 @@ private:
                 cX[c] = std::max({ux, vx, wx});
                 const T uy = cM[c-1] - go_a - ge_a, vy = cX[c-1] - go_a - ge_a, wy = cY[c-1] - ge_a;
                 cY[c] = std::max({uy, vy, wy});
-                dM[rb + c] = pick(dgM, dgX, dgY);
-                dX[rb + c] = pick(ux, vx, wx);
-                dY[rb + c] = pick(uy, vy, wy);
+                D[rb + c] = pack(pick(dgM, dgX, dgY), pick(ux, vx, wx), pick(uy, vy, wy));
             }
             std::swap(pM, cM); std::swap(pX, cX); std::swap(pY, cY);
         }
@@ -2956,11 +3101,11 @@ private:
         // Walk back, emitting moves; reverse at the end since we produce them backwards.
         const std::size_t first = hops_.size();
         while (r > 0 || c > 0) {
-            const std::size_t k = static_cast<std::size_t>(r) * stride + static_cast<std::size_t>(c);
+            const unsigned char p = D[static_cast<std::size_t>(r) * stride + static_cast<std::size_t>(c)];
             unsigned char code;
-            if (tbl == TBTable::M)      { code = dM[k]; hops_.push_back(0); --r; --c; }
-            else if (tbl == TBTable::X) { code = dX[k]; hops_.push_back(1); --r; }
-            else                        { code = dY[k]; hops_.push_back(2); --c; }
+            if (tbl == TBTable::M)      { code = p & 3;        hops_.push_back(0); --r; --c; }
+            else if (tbl == TBTable::X) { code = (p >> 2) & 3; hops_.push_back(1); --r; }
+            else                        { code = p >> 4;       hops_.push_back(2); --c; }
             tbl = (code == 1) ? TBTable::X : (code == 2 ? TBTable::Y : TBTable::M);
         }
         std::reverse(hops_.begin() + static_cast<std::ptrdiff_t>(first), hops_.end());

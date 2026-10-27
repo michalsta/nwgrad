@@ -23,9 +23,10 @@ params = params + 0.01 * grad   # every matrix cell and all four gap costs move 
   instruction set is a speed knob, never a correctness one. Batches run on all cores;
   measured at 6.4 billion DP cells per second on a 16-thread laptop CPU (Intel
   i7-11850H, AVX-512, float32).
-- **Linear memory for long sequences.** Affine global alignment defaults to
-  Hirschberg (Myers–Miller) traceback, which keeps O(m+n) state instead of O(m×n)
-  tables: titin (35,991 residues) aligned against itself needs about 0.9 MB of DP
+- **Linear memory for long sequences.** Past about 5800 × 5800 cells (8200 × 8200 for float64 global), affine
+  alignment defaults to Hirschberg (Myers–Miller) traceback, which keeps O(m+n)
+  state instead of O(m×n) tables (below that, a one-byte-per-cell pointer table is
+  faster): titin (35,991 residues) aligned against itself needs about 0.9 MB of DP
   memory per thread rather than 3.9 GB.
 - **Built for training loops.** Sequences are validated and encoded once and reused
   across steps. After a parameter update, banded re-alignment around the previous

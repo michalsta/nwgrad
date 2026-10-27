@@ -84,8 +84,12 @@ static inline void striped_row_best1(const T* cH, const T* pad, int seg, int i,
 // Ptr: record direction bytes (TracebackMode::Pointers) on rolling rows; else the H table.
 // Tr: a tracked problem (job.tr): each row's extends, border and profile row from the
 // track arrays, in the same expressions, so equal sets give the untracked table.
-template <class T, bool Local, bool Ptr, bool Tr>
+// Dense (Ptr only): the same codes, four segments' worth a byte (dense_codes_row_bytes,
+// simd_levels.hpp: 0.25 B/cell), for the memory-bound regime -- each lane accumulates its
+// 2-bit codes by Horner over a group of four segments and stores one byte per lane a group.
+template <class T, bool Local, bool Ptr, bool Tr, bool Dense = false>
 static void striped_linear_full(ViterbiJob<T>& job) {
+    static_assert(!Dense || (Ptr && sizeof(T) >= 4), "dense codes: pointer fill, lanes >= 32 bits");
     using vd = stdx::native_simd<T>;
     constexpr int W = (int)vd::size();
     const T K_NINF = nw_ninf<T>;
@@ -128,8 +132,10 @@ static void striped_linear_full(ViterbiJob<T>& job) {
     // written once a cell).
     const std::size_t hstride = (Ptr || !table_spread()) ? rowsz : spread_stride<T>(rowsz, 2);
     T* pH; T* cH;
+    // the direction table's row length in bytes: one per slot, or the dense groups
+    const std::size_t drow = Dense ? dense_codes_row_bytes(seg, W, 1) : rowsz;
     if constexpr (Ptr) {
-        const std::size_t dsz = (std::size_t)(m + 1) * rowsz;
+        const std::size_t dsz = (std::size_t)(m + 1) * drow;
         if (buf.DM.size() < dsz) buf.DM.resize(dsz);
         pH = rows + 4 * rs; cH = rows + 5 * rs;
     } else {
@@ -150,7 +156,10 @@ static void striped_linear_full(ViterbiJob<T>& job) {
     if constexpr (Ptr) {
         unsigned char* d0 = buf.DM.data();
         d0[0] = 3;
-        for (std::size_t k = 0; k < sw; ++k) d0[off + k] = Local ? 3 : 2;   // row 0: left (Global)
+        if constexpr (Dense)   // every 2-bit field the same code: 3 = 0xFF, 2 = 0xAA
+            std::memset(d0 + off, Local ? 0xFF : 0xAA, drow - off);
+        else
+            for (std::size_t k = 0; k < sw; ++k) d0[off + k] = Local ? 3 : 2;   // row 0: left (Global)
     }
 
     vd vge_a(ge_a), vge_b(ge_b);
@@ -175,24 +184,29 @@ static void striped_linear_full(ViterbiJob<T>& job) {
         const T* sub = striped_row_profile<T, Tr>(buf.sprof.data(), blk, nalpha, a, b, n, seg, W, i, tr);
         unsigned char* dM = nullptr;
         if constexpr (Ptr) {
-            dM = buf.DM.data() + (std::size_t)i * rowsz;
+            dM = buf.DM.data() + (std::size_t)i * drow;
             dM[0] = Local ? 3 : 1;                       // column 0: up (Global) / stop
             dM += off;
         }
 
         if (seg > 0) {
             // ── pass 1: U = max(diag + s, up - ge_b) (Local: and 0), its code, the open ──
+            // the diagonal: floating T, the previous iteration's up vector, rotated in a register
+            // (each previous-row vector loaded once); at s = 0 the last segment, shifted one lane in
+            vd dg(nw_ninf<T>);
+            if (seg > 0) {
+                vd last; last.copy_from(pH + off + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                dg = lane_shift_in(last, bprev);
+            }
             for (int s = 0; s < seg; ++s) {
-                vd dg;
-                if (s == 0) {
-                    vd last; last.copy_from(pH + off + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                    dg = lane_shift_in(last, bprev);
-                } else {
-                    dg.copy_from(pH + off + (std::size_t)(s - 1) * W, stdx::element_aligned);
-                }
                 vd up; up.copy_from(pH + off + (std::size_t)s * W, stdx::element_aligned);
                 vd sb; sb.copy_from(sub + (std::size_t)s * W, stdx::element_aligned);
+                // Integer T reloads it: there the rotation cost NEON 2-5 % (int32, spot, every
+                // length and thread count) and bought nothing on AVX2 (0.99-1.01, nighthaven).
+                if constexpr (nw_is_int<T>)
+                    if (s > 0) dg.copy_from(pH + off + (std::size_t)(s - 1) * W, stdx::element_aligned);
                 const vd d0 = dg + sb;
+                if constexpr (!nw_is_int<T>) dg = up;   // the next segment's diagonal
                 const vd u  = up - vge_b;
                 vd t = stdx::max(d0, u);
                 if constexpr (Ptr) {
@@ -207,7 +221,8 @@ static void striped_linear_full(ViterbiJob<T>& job) {
                 }
                 if constexpr (Local) t = stdx::max(t, vzero);
                 t.copy_to(cH + off + (std::size_t)s * W, stdx::element_aligned);
-                (t - vge_a).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
+                if constexpr (nw_is_int<T> && W >= 4)   // the integer carry reads the opens; the floating one recomputes them
+                    (t - vge_a).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
             }
 
             // ── the carry: Y[c] = max(open[c-1], Y[c-1] - ge_a) along each lane ──
@@ -215,17 +230,18 @@ static void striped_linear_full(ViterbiJob<T>& job) {
                 int_pmax_carry<T, W>(ov, nullptr, nbOpen, static_cast<T>(0),
                                      K_NINF, ge_a, seg, yv, nullptr, nullptr);
             } else {
+                // The open into Y at segment q: `t - ge_a`, t still in cH until pass 2 -- the same
+                // bits pass 1 stores in `ov` for the integer carry; one stream fewer per segment.
+                auto open_at = [&](int q) __attribute__((always_inline)) {
+                    vd t; t.copy_from(cH + off + (std::size_t)q * W, stdx::element_aligned);
+                    return vd(t - vge_a);
+                };
                 vd prev = vninf;                         // column 0 holds no Y
                 prev = carry_pass(seg, prev, vge_a,
                     [&](int s) NWGRAD_ALWAYS_INLINE_LAMBDA {
-                        vd O;
-                        if (s == 0) {
-                            vd lo; lo.copy_from(ov + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                            O = lane_shift_in(lo, nbOpen);
-                        } else {
-                            O.copy_from(ov + (std::size_t)(s - 1) * W, stdx::element_aligned);
-                        }
-                        return O;
+                        const int q = s == 0 ? seg - 1 : s - 1;
+                        const vd O = open_at(q);
+                        return s == 0 ? lane_shift_in(O, nbOpen) : O;
                     },
                     [&](int s, const vd&, const vd&, const vd& v) NWGRAD_ALWAYS_INLINE_LAMBDA {
                         v.copy_to(yv + (std::size_t)s * W, stdx::element_aligned);
@@ -252,7 +268,13 @@ static void striped_linear_full(ViterbiJob<T>& job) {
             }
 
             // ── pass 2: H = max(U, Y); codes: left where Y > U, stop where Local <= 0 ──
-            for (int s = 0; s < seg; ++s) {
+            vd acc = vzero;                              // Dense: this group's codes so far
+            // Dense: in groups of four segments, a group's byte stored after it -- no branch in
+            // the segment loop (one-byte codes and the H form: one group, the whole row).
+            constexpr int G = Dense ? 4 : (1 << 30);
+            for (int s0 = 0; s0 < seg; s0 += G) {
+            const int s1 = std::min(seg - s0, G) + s0;
+            for (int s = s0; s < s1; ++s) {
                 vd u; u.copy_from(cH + off + (std::size_t)s * W, stdx::element_aligned);
                 vd y; y.copy_from(yv + (std::size_t)s * W, stdx::element_aligned);
                 const vd h = stdx::max(u, y);
@@ -277,9 +299,19 @@ static void striped_linear_full(ViterbiJob<T>& job) {
                         else                        stdx::where(h <= vzero, k) = vthree;
                     }
 #endif
-                    store_codes<T, W>(k, dM + (std::size_t)s * W);
+                    if constexpr (Dense) {
+                        acc = acc + acc; acc = acc + acc; acc = acc + k;   // 4*acc + k: exact in every T
+                    } else {
+                        store_codes<T, W>(k, dM + (std::size_t)s * W);
+                    }
                 }
             }
+            if constexpr (Dense) {
+                for (int s = s1; s < s0 + 4; ++s) { acc = acc + acc; acc = acc + acc; }   // short group: fixed shifts
+                store_codes<T, W>(acc, dM + (std::size_t)(s0 >> 2) * W);   // <= 255
+                acc = vzero;
+            }
+            }   // groups
             if constexpr (Local) striped_row_best1<T>(cH + off, pad, seg, i, best_local, best_i, best_j);
         }
 
@@ -324,6 +356,19 @@ static void striped_linear_entry(ViterbiJob<T>& job) {
 }
 template <class T>
 static void striped_linear_ptr_entry(ViterbiJob<T>& job) {
+    if constexpr (sizeof(T) >= 4) {
+        if (job.dense) {
+            if (job.tr.on()) {
+                if (job.align_mode) striped_linear_full<T, true, true, true, true>(job);
+                else                striped_linear_full<T, false, true, true, true>(job);
+            } else {
+                if (job.align_mode) striped_linear_full<T, true, true, false, true>(job);
+                else                striped_linear_full<T, false, true, false, true>(job);
+            }
+            return;
+        }
+    }
+    job.dense = 0;
     if (job.tr.on()) {
         if (job.align_mode) striped_linear_full<T, true, true, true>(job);
         else                striped_linear_full<T, false, true, true>(job);
@@ -416,17 +461,22 @@ static void lhb_striped(LhbJob<T>& job) {
         if (job.argmax == 2 && c0 > best) { best = c0; bi = r; bj = 0; }
 
         if (seg > 0) {
+            // the diagonal: floating T, the previous iteration's up vector, rotated in a register
+            // (each previous-row vector loaded once); at s = 0 the last segment, shifted one lane in
+            vd dg(nw_ninf<T>);
+            if (seg > 0) {
+                vd last; last.copy_from(pH + off + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                dg = lane_shift_in(last, bprev);
+            }
             for (int s = 0; s < seg; ++s) {
-                vd dg;
-                if (s == 0) {
-                    vd last; last.copy_from(pH + off + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                    dg = lane_shift_in(last, bprev);
-                } else {
-                    dg.copy_from(pH + off + (std::size_t)(s - 1) * W, stdx::element_aligned);
-                }
                 vd up; up.copy_from(pH + off + (std::size_t)s * W, stdx::element_aligned);
                 vd sb; sb.copy_from(sub + (std::size_t)s * W, stdx::element_aligned);
+                // Integer T reloads it: there the rotation cost NEON 2-5 % (int32, spot, every
+                // length and thread count) and bought nothing on AVX2 (0.99-1.01, nighthaven).
+                if constexpr (nw_is_int<T>)
+                    if (s > 0) dg.copy_from(pH + off + (std::size_t)(s - 1) * W, stdx::element_aligned);
                 const vd d0 = dg + sb;
+                if constexpr (!nw_is_int<T>) dg = up;   // the next segment's diagonal
                 const vd u = up - vgb;
                 vd t = stdx::max(d0, u);
                 if (D) {
@@ -441,24 +491,26 @@ static void lhb_striped(LhbJob<T>& job) {
                 }
                 if (job.clamp) t = stdx::max(t, vzero);
                 t.copy_to(cH + off + (std::size_t)s * W, stdx::element_aligned);
-                (t - vga).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
+                if constexpr (nw_is_int<T> && W >= 4)   // the integer carry reads the opens; the floating one recomputes them
+                    (t - vga).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
             }
 
             if constexpr (nw_is_int<T> && W >= 4) {
                 int_pmax_carry<T, W>(ov, nullptr, nbOpen, static_cast<T>(0),
                                      K_NINF, ga, seg, yv, nullptr, nullptr);
             } else {
+                // The open into Y at segment q: `t - ge_a`, t still in cH until pass 2 -- the same
+                // bits pass 1 stores in `ov` for the integer carry; one stream fewer per segment.
+                auto open_at = [&](int q) __attribute__((always_inline)) {
+                    vd t; t.copy_from(cH + off + (std::size_t)q * W, stdx::element_aligned);
+                    return vd(t - vga);
+                };
                 vd prev = vninf;
                 prev = carry_pass(seg, prev, vga,
                     [&](int s) NWGRAD_ALWAYS_INLINE_LAMBDA {
-                        vd O;
-                        if (s == 0) {
-                            vd lo; lo.copy_from(ov + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                            O = lane_shift_in(lo, nbOpen);
-                        } else {
-                            O.copy_from(ov + (std::size_t)(s - 1) * W, stdx::element_aligned);
-                        }
-                        return O;
+                        const int q = s == 0 ? seg - 1 : s - 1;
+                        const vd O = open_at(q);
+                        return s == 0 ? lane_shift_in(O, nbOpen) : O;
                     },
                     [&](int s, const vd&, const vd&, const vd& v) NWGRAD_ALWAYS_INLINE_LAMBDA {
                         v.copy_to(yv + (std::size_t)s * W, stdx::element_aligned);

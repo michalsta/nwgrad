@@ -400,10 +400,12 @@ Which pairs each fill applies to:
   padded to the longest). Run their own fill instead: pairs whose group tables would
   leave L2 (1.25 MiB; 512 KiB for the soft pass — long pairs, where the per-pair fills
   win), hard linear Global pairs below 4 lanes or with alphabets over 8 letters (their
-  own fill is cheaper), empty sequences, Hirschberg pairs longer than `hb_cutoff`, and
+  own fill is cheaper), empty sequences, Hirschberg pairs that split (longer than
+  `hb_cutoff`, and under `traceback="auto"` larger than the pointer budget (2²⁵ or 2²⁶ cells)
+  where it applies — see tuning.md), and
   `kernel="scalar_fallback"`.
 - **`"rowwise"`**: affine gaps at double precision on a simd kernel. Float32, linear
-  gaps, `kernel="scalar_fallback"` and Hirschberg pairs longer than `hb_cutoff` ignore
+  gaps, `kernel="scalar_fallback"` and Hirschberg pairs that split ignore
   it.
 
 Measured on an i5-12500 (AVX2), `score_and_grad()`: on miRNA × target-site pairs

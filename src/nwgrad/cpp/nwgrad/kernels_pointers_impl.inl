@@ -5,7 +5,14 @@
 // recurrence, same lazy-F.  The difference is what it retains:
 //
 //   Scores     three T score tables, (m+1)*rowsz each   12 B/cell (float32)
-//   Pointers   three BYTE predecessor tables + two rolling score rows  3 B/cell
+//   Pointers   one BYTE predecessor table + two rolling score rows     1 B/cell
+//
+// The byte packs the three states' codes, `M | X << 2 | Y << 4` (M 0..3, 3 = Local stop;
+// X and Y 0..2).  Every code is produced already shifted into its field (X's picked as
+// 0 / 4 / 8, Y's carried as 0 / 16 / 32), so packing is a sum.  Y's code is final only
+// after the carry, so M's and X's wait for it in a T-typed scratch row (`mx`) and the last
+// per-row loop stores `mx + y` -- one byte stream instead of three.  (Measured against
+// storing M + X as bytes and OR-ing Y in: that narrows twice, and lost in cache.)
 //
 // The traceback then reads a recorded predecessor instead of re-deriving it from
 // the tables.  Bit-exactness is preserved because the codes are produced by the
@@ -22,13 +29,13 @@
 #  error "kernels_pointers_impl.inl must be included inside a level namespace by a level TU"
 #endif
 
-// Narrow a T-typed lane-code vector (values 0..3) to one byte per lane.
+// Narrow a T-typed lane-code vector (values 0..63) to one byte per lane.
 // Deliberately a single static_simd_cast, not a per-lane loop: writing direction
 // bytes scalar-per-lane measured ~2x slower than the vectorized narrow.
 // For the integer lane types the narrow is spelled in intrinsics: clang lowered the
 // int64 cast to one byte store per lane (movb x4 per vector, 1.13-1.33x gcc's time on the
 // Pointers kernel), gcc the int16/int32 ones to vpshufb sequences; a pack or a vpmov is
-// one or two instructions.  The codes are 0..3, so saturating packs are exact.
+// one or two instructions.  The codes are 0..63 (a packed byte), so saturating packs are exact.
 template <class T, int W>
 [[gnu::always_inline]] static inline void store_codes(const stdx::native_simd<T>& code, unsigned char* dst) {
     using bvec = stdx::fixed_size_simd<unsigned char, W>;
@@ -76,29 +83,25 @@ template <class T, int W>
 }
 
 // The three-way argmax code of the scalar pick(): 0 when m >= x && m >= y, else 1 when
-// x >= y, else 2.  For an integer T it is written with STRICT compares and the blends
-// inverted — there is no packed integer >=, and gcc built each one from vpminsw +
-// vpcmpeqw (clang swaps the operands instead); the kernel has eight per vector of
-// cells, ~20 % of its instructions.  Same codes: (y > x ? 2 : 1) is (x >= y ? 1 : 2),
-// and "0 unless x > m or y > m" is "0 when m >= x and m >= y".  Floating T keeps the
-// form it always had (vcmpleps exists), so its codegen is untouched.
+// x >= y, else 2 -- read off the three-way max the kernel computes anyway,
+// mx = max(max(m, x), y): m >= x && m >= y is exactly mx == m (max is exact, -inf
+// equals itself, there is no NaN, and == ignores the sign of a zero, so the order the
+// max ran in cannot matter).  One compare where the chain took two and an AND (floating)
+// or two and an OR (integer).  For an integer T the x/y choice is STRICT with the blend
+// inverted -- there is no packed integer >=, and gcc built each one from vpminsw +
+// vpcmpeqw (clang swaps the operands instead): (y > x ? 2 : 1) is (x >= y ? 1 : 2).
+// `vone` / `vtwo` are the codes of x / y (X's are passed pre-shifted, 4 and 8).
 // (always_inline: at AVX-512 gcc called these out of line for the 32-lane int16 vectors,
 // four and two calls per segment, each returning 64 bytes through memory.)
 template <class V>
-[[gnu::always_inline]] static inline V pick_code(const V& m, const V& x, const V& y, const V& vzero, const V& vone, const V& vtwo) {
+[[gnu::always_inline]] static inline V pick_code_mx(const V& mx, const V& m, const V& x, const V& y,
+                                                   const V& vzero, const V& vone, const V& vtwo) {
     using T = typename V::value_type;
-    if constexpr (nw_is_int<T>) {
-        V k = vone;
-        stdx::where(y > x, k) = vtwo;
-        V r = vzero;
-        stdx::where((x > m) || (y > m), r) = k;
-        return r;
-    } else {
-        V k = vtwo;
-        stdx::where(x >= y, k) = vone;
-        stdx::where((m >= x) && (m >= y), k) = vzero;
-        return k;
-    }
+    V k;
+    if constexpr (nw_is_int<T>) { k = vone; stdx::where(y > x, k) = vtwo; }
+    else                        { k = vtwo; stdx::where(x >= y, k) = vone; }
+    stdx::where(mx == m, k) = vzero;
+    return k;
 }
 // `dest` where a >= b takes `value`: strict form for integer lanes (the default and the
 // value swapped), the >= form for floating.
@@ -110,10 +113,18 @@ template <class V>
 }
 
 // Tr: a tracked problem (job.tr), as striped_affine_full.
-template <class T, bool Local, bool Tr = false>
+// Dense: the dense codes (dense_codes_row_bytes, simd_levels.hpp: 0.75 B/cell) -- three
+// planes of 2-bit codes, M's and X's stored from pass 1 (final there), Y's after the
+// carry; each lane accumulates a plane's codes over four segments by Horner and stores one
+// byte per lane a group.  The codes are the same choices; only where their bits go differs.
+template <class T, bool Local, bool Tr = false, bool Dense = false>
 static void striped_affine_full_ptr(ViterbiJob<T>& job) {
+    static_assert(!Dense || sizeof(T) >= 4, "dense codes: lanes >= 32 bits");
     using vd = stdx::native_simd<T>;
     constexpr int W = (int)stdx::native_simd<T>::size();
+    // the integer carry (int_pmax_carry) reads the opens and their codes from rows; the
+    // floating one recomputes them from cM / cX
+    constexpr bool kOpenRows = nw_is_int<T> && W >= 4;
     const T K_NINF = nw_ninf<T>;
 
     const int m = job.m, n = job.n;
@@ -131,15 +142,14 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
     const std::size_t rowsz = (std::size_t)(seg + 1) * W;
     const std::size_t off   = (std::size_t)W;
 
-    const std::size_t dsz = (std::size_t)(m + 1) * rowsz;
-    // Each vector is checked on its own: a linear pointer fill sharing this buffer grows
-    // DM, rM and qM alone, so one size no longer speaks for the group.
-    for (auto* d : {&buf.DM, &buf.DX, &buf.DY}) if (d->size() < dsz) d->resize(dsz);
+    const std::size_t drow = Dense ? dense_codes_row_bytes(seg, W, 3) : rowsz;   // code bytes a row
+    const std::size_t dsz = (std::size_t)(m + 1) * drow;
+    if (buf.DM.size() < dsz) buf.DM.resize(dsz);   // the packed codes (the linear fill's table too)
     // rolling score rows: 2 x rowsz instead of (m+1) x rowsz -- the whole point; with the
-    // opens, open codes, Q (integer T), y-code scratch and Local's padding mask, eleven rows
-    // of one block (spread_rows, dp_buffer.hpp: no two in one L1 set, and none in the set of
-    // another stream read every row)
-    std::size_t rs; T* const rows = spread_rows<T>(buf.prows, rowsz, 11, rs);
+    // opens, open codes, Q (integer T), y-code and M+X-code scratch and Local's padding
+    // mask, twelve rows of one block (spread_rows, dp_buffer.hpp: no two in one L1 set,
+    // and none in the set of another stream read every row)
+    std::size_t rs; T* const rows = spread_rows<T>(buf.prows, rowsz, 12, rs);
 
     auto scol = [seg](int j) -> std::size_t {
         return (std::size_t)((j - 1) % seg) * W + (j - 1) / seg;
@@ -151,6 +161,7 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
     T* ok = rows + 7 * rs;
     T* qb = rows + 8 * rs;
     T* yc = rows + 9 * rs;
+    T* mx = rows + 11 * rs;
 
     T* pM = rows + 3 * rs; T* pX = rows + 4 * rs; T* pY = rows + 5 * rs;
     T* cM = rows;          T* cX = rows + rs;     T* cY = rows + 2 * rs;
@@ -161,9 +172,15 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
         for (std::size_t k = 0; k < sw; ++k) {
             pM[off + k] = K_NINF; pX[off + k] = K_NINF; pY[off + k] = K_NINF;
         }
-        unsigned char* d0M = buf.DM.data(); unsigned char* d0X = buf.DX.data();
-        unsigned char* d0Y = buf.DY.data();
-        d0M[0] = 3; d0X[0] = 0; d0Y[0] = 0;
+        unsigned char* d0 = buf.DM.data();
+        d0[0] = 3;                                     // M 3, X 0, Y 0
+        if constexpr (Dense) {   // planes: M all 3, X all 0, Y 2 (extend) but (0,1), which opens
+            for (int q = 0; q < (seg + 3) / 4; ++q) {
+                unsigned char* g = d0 + off + (std::size_t)q * 3 * W;
+                std::memset(g, 0xFF, W); std::memset(g + W, 0, W); std::memset(g + 2 * W, 0xAA, W);
+            }
+            if (seg > 0) d0[off + 2 * W] &= (unsigned char)~(3u << 6);   // segment 0 at shift 2*(3-0)
+        }
         for (int l = 0; l < W; ++l)
             for (int s = 0; s < seg; ++s) {
                 const int j = l * seg + s + 1;
@@ -171,11 +188,10 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                 if (j <= n) {
                     if constexpr (Local) pM[off + k] = 0;
                     else                 pY[off + k] = -(go_a + j * ge_a);
-                    d0M[off + k] = 3;                  // row 0 is a start
-                    d0X[off + k] = 0;
-                    d0Y[off + k] = (j <= 1) ? 0 : 2;   // (0,1) opens from M; rest extend
+                    // row 0 is a start (M 3, X 0); Y: (0,1) opens from M, the rest extend
+                    if constexpr (!Dense) d0[off + k] = (j <= 1) ? 3 : 3 | 2 << 4;
                 } else {
-                    d0M[off + k] = 3; d0X[off + k] = 0; d0Y[off + k] = 2;
+                    if constexpr (!Dense) d0[off + k] = 3 | 2 << 4;
                 }
             }
     }
@@ -183,6 +199,10 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
     vd vgo_a(go_a), vge_a(ge_a), vgo_b(go_b), vge_b(ge_b);
     const vd vzero(static_cast<T>(0)), vone(static_cast<T>(1)), vtwo(static_cast<T>(2));
     const vd vthree(static_cast<T>(3));
+    const vd vfour(static_cast<T>(4)), veight(static_cast<T>(8)), vsixteen(static_cast<T>(16)), vthirtytwo(static_cast<T>(32));
+    // the codes X and Y record: pre-shifted into the one-byte packing, or plain 0..2 (Dense)
+    const vd kX1 = Dense ? vone : vfour, kX2 = Dense ? vtwo : veight;
+    const vd kYX = Dense ? vone : vsixteen, kYE = Dense ? vtwo : vthirtytwo;
     T bM = 0, bX = K_NINF, bY = K_NINF;
     T best_local = 0; int best_i = 0, best_j = 0, best_tbl = 0;
     const T* pad = Local ? striped_pad_into(rows + 10 * rs, n, seg, W) : nullptr;
@@ -197,141 +217,206 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
         if constexpr (Tr) nbX = Local ? K_NINF : tr.bx0[i];
         else              nbX = Local ? K_NINF : -(go_b + i * ge_b);
         const T nbOpen = (std::max(nbM, nbX) - go_a) - ge_a;
-        const T nbOpenK = ((nbM - go_a) - ge_a >= (nbX - go_a) - ge_a) ? T(0) : T(1);
+        const T nbOpenK = ((nbM - go_a) - ge_a >= (nbX - go_a) - ge_a) ? T(0) : T(Dense ? 1 : 16);   // Y's open codes
         const T* sub = striped_row_profile<T, Tr>(buf.sprof.data(), blk, nalpha, a, b, n, seg, W, i, tr);
 
-        unsigned char* dM = buf.DM.data() + (std::size_t)i * rowsz + off;
-        unsigned char* dX = buf.DX.data() + (std::size_t)i * rowsz + off;
-        unsigned char* dY = buf.DY.data() + (std::size_t)i * rowsz + off;
+        unsigned char* dP = buf.DM.data() + (std::size_t)i * drow + off;
         cM[0] = nbM; cX[0] = nbX; cY[0] = K_NINF;
-        buf.DM.data()[(std::size_t)i * rowsz] = 3;
-        buf.DX.data()[(std::size_t)i * rowsz] = (i <= 1) ? 0 : 1;
-        buf.DY.data()[(std::size_t)i * rowsz] = 0;
+        // column 0: M 3, Y 0; X opens from M(0,0) at (1,0), extends below
+        buf.DM.data()[(std::size_t)i * drow] = (i <= 1) ? 3 : 3 | 1 << 2;
 
         if (seg > 0) {
-            for (int s = 0; s < seg; ++s) {
-                vd dgM, dgX, dgY;
-                if (s == 0) {
-                    vd lM, lX, lY;
-                    lM.copy_from(pM + off + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                    lX.copy_from(pX + off + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                    lY.copy_from(pY + off + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                    dgM = lane_shift_in(lM, bM);
-                    dgX = lane_shift_in(lX, bX);
-                    dgY = lane_shift_in(lY, bY);
-                } else {
-                    dgM.copy_from(pM + off + (std::size_t)(s - 1) * W, stdx::element_aligned);
-                    dgX.copy_from(pX + off + (std::size_t)(s - 1) * W, stdx::element_aligned);
-                    dgY.copy_from(pY + off + (std::size_t)(s - 1) * W, stdx::element_aligned);
-                }
+            // The diagonal predecessors: segment s-1 of the previous row, i.e. the up vectors
+            // of the previous iteration, rotated in registers (each previous-row vector is
+            // loaded once, not twice); at s = 0 the last segment, shifted one lane in.
+            vd dgM, dgX, dgY;
+            {
+                vd lM, lX, lY;
+                lM.copy_from(pM + off + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                lX.copy_from(pX + off + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                lY.copy_from(pY + off + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                dgM = lane_shift_in(lM, bM);
+                dgX = lane_shift_in(lX, bX);
+                dgY = lane_shift_in(lY, bY);
+            }
+            vd accM = vzero, accX = vzero;   // Dense: this group's M / X codes so far
+            // One segment of pass 1.  R: its place in a dense group.  kWeighted: the codes come out
+            // already weighted for the group's byte (segment R at shift 2*(3-R), dense_code_at), so
+            // accumulating costs one add a plane where 4*acc + k cost three dependent adds (NEON
+            // double 1.11-1.15x one-byte with those, 1.00-1.05x without).  Integer T on x86 keeps
+            // 4*acc + k, the groups not unrolled: unrolled it measured 2-8 % slower on AVX2 int32
+            // at L2000-5800, while on NEON (M1) it is 6-10 % faster for int32 too.
+#if defined(__aarch64__)
+            constexpr bool kWeighted = Dense;
+#else
+            constexpr bool kWeighted = Dense && !nw_is_int<T>;
+#endif
+            auto seg_body = [&](int s, auto R) __attribute__((always_inline)) {
+                constexpr T wt = kWeighted ? static_cast<T>(1 << (2 * (3 - decltype(R)::value))) : T(1);
+                const vd cM1(Dense ? wt : T(1)), cM2(Dense ? 2 * wt : T(2)), cM3(Dense ? 3 * wt : T(3));
+                const vd cX1 = Dense ? cM1 : kX1, cX2 = Dense ? cM2 : kX2;
                 vd sb; sb.copy_from(sub + (std::size_t)s * W, stdx::element_aligned);
-                vd vmv = stdx::max(stdx::max(dgM, dgX), dgY) + sb;
+                const vd mx3 = stdx::max(stdx::max(dgM, dgX), dgY);
+                vd vmv = mx3 + sb;
 
                 // M code: same >= chain as the scalar pick(), M last so it wins ties
-                vd km = vtwo;
+                vd km = cM2;
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
                 if constexpr (sizeof(T) == 8) {
-                    km = avx512d_blend(avx512d_ge(dgX, dgY), km, vone);
-                    km = avx512d_blend(avx512d_ge(dgM, dgX) & avx512d_ge(dgM, dgY), km, vzero);
+                    km = avx512d_blend(avx512d_ge(dgX, dgY), km, cM1);
+                    km = avx512d_blend(avx512d_eq(mx3, dgM), km, vzero);
                 } else {
-                    km = pick_code(dgM, dgX, dgY, vzero, vone, vtwo);
+                    km = pick_code_mx(mx3, dgM, dgX, dgY, vzero, cM1, cM2);
                 }
 #else
-                km = pick_code(dgM, dgX, dgY, vzero, vone, vtwo);
+                km = pick_code_mx(mx3, dgM, dgX, dgY, vzero, cM1, cM2);
 #endif
                 if constexpr (Local) {
                     vmv = stdx::max(vmv, vzero);
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
                     if constexpr (sizeof(T) == 8) {
                         // vmv <= vzero  <=>  vzero >= vmv
-                        km = avx512d_blend(avx512d_ge(vzero, vmv), km, vthree);
+                        km = avx512d_blend(avx512d_ge(vzero, vmv), km, cM3);
                     } else if constexpr (nw_is_int<T>) {
-                        stdx::where(vmv == vzero, km) = vthree;   // clamped >= 0: <= 0 is == 0
+                        stdx::where(vmv == vzero, km) = cM3;   // clamped >= 0: <= 0 is == 0
                     } else {
-                        stdx::where(vmv <= vzero, km) = vthree;   // traceback stops here
+                        stdx::where(vmv <= vzero, km) = cM3;   // traceback stops here
                     }
 #else
-                    if constexpr (nw_is_int<T>) stdx::where(vmv == vzero, km) = vthree;   // clamped >= 0
-                    else                        stdx::where(vmv <= vzero, km) = vthree;   // traceback stops here
+                    if constexpr (nw_is_int<T>) stdx::where(vmv == vzero, km) = cM3;   // clamped >= 0
+                    else                        stdx::where(vmv <= vzero, km) = cM3;   // traceback stops here
 #endif
                 }
                 vmv.copy_to(cM + off + (std::size_t)s * W, stdx::element_aligned);
-                store_codes<T, W>(km, dM + (std::size_t)s * W);
 
                 vd uM, uX, uY;
                 uM.copy_from(pM + off + (std::size_t)s * W, stdx::element_aligned);
                 uX.copy_from(pX + off + (std::size_t)s * W, stdx::element_aligned);
                 uY.copy_from(pY + off + (std::size_t)s * W, stdx::element_aligned);
+                dgM = uM; dgX = uX; dgY = uY;   // the next segment's diagonal
                 const vd ax = (uM - vgo_b) - vge_b, bx = uX - vge_b, cx = (uY - vgo_b) - vge_b;
                 vd vxv = stdx::max(stdx::max(ax, bx), cx);
-                vd kx = vtwo;
+                vd kx = cX2;                        // X's code: 0 / 4 / 8 (Dense: 0 / 1 / 2, times 4^R)
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
                 if constexpr (sizeof(T) == 8) {
-                    kx = avx512d_blend(avx512d_ge(bx, cx), kx, vone);
-                    kx = avx512d_blend(avx512d_ge(ax, bx) & avx512d_ge(ax, cx), kx, vzero);
+                    kx = avx512d_blend(avx512d_ge(bx, cx), kx, cX1);
+                    kx = avx512d_blend(avx512d_eq(vxv, ax), kx, vzero);
                 } else {
-                    kx = pick_code(ax, bx, cx, vzero, vone, vtwo);
+                    kx = pick_code_mx(vxv, ax, bx, cx, vzero, cX1, cX2);
                 }
 #else
-                kx = pick_code(ax, bx, cx, vzero, vone, vtwo);
+                kx = pick_code_mx(vxv, ax, bx, cx, vzero, cX1, cX2);
 #endif
                 vxv.copy_to(cX + off + (std::size_t)s * W, stdx::element_aligned);
-                store_codes<T, W>(kx, dX + (std::size_t)s * W);
+                if constexpr (kWeighted) {   // M and X are final: their planes now (codes x 4^(3-R))
+                    accM += km;
+                    accX += kx;
+                } else if constexpr (Dense) {
+                    accM = accM + accM; accM = accM + accM; accM = accM + km;
+                    accX = accX + accX; accX = accX + accX; accX = accX + kx;
+                } else {
+                    (km + kx).copy_to(mx + (std::size_t)s * W, stdx::element_aligned);
+                }
 
                 // The open's source is chosen on the ROUNDED candidates, as the scalar pick(uy, vy, wy)
                 // does: M and X values that differ can round to the same open, and then M wins.
                 // Comparing vmv >= vxv before subtracting picked X there (float32, a path moved).
                 // max(om, ox) is bitwise max(vmv, vxv) - go - ge: rounding is monotone.
-                const vd om = (vmv - vgo_a) - vge_a, ox = (vxv - vgo_a) - vge_a;
-                stdx::max(om, ox).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
-                vd okv = vone;
+                // (Floating T: the carry recomputes both from cM / cX instead -- the same bits --
+                // which saves two T-typed rows, a store and a load each, per segment.)
+                if constexpr (kOpenRows) {
+                    const vd om = (vmv - vgo_a) - vge_a, ox = (vxv - vgo_a) - vge_a;
+                    stdx::max(om, ox).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
+                    vd okv = kYX;                  // open from X: Y's code 1, shifted
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
-                if constexpr (sizeof(T) == 8) {
-                    okv = avx512d_blend(avx512d_ge(om, ox), okv, vzero);
-                } else {
-                    okv = sel_ge(om, ox, vone, vzero);
-                }
+                    if constexpr (sizeof(T) == 8) {
+                        okv = avx512d_blend(avx512d_ge(om, ox), okv, vzero);
+                    } else {
+                        okv = sel_ge(om, ox, kYX, vzero);
+                    }
 #else
-                okv = sel_ge(om, ox, vone, vzero);
+                    okv = sel_ge(om, ox, kYX, vzero);
 #endif
-                okv.copy_to(ok + (std::size_t)s * W, stdx::element_aligned);
+                    okv.copy_to(ok + (std::size_t)s * W, stdx::element_aligned);
+                }
+            };
+            if constexpr (kWeighted) {
+                // groups of four segments, unrolled so R is a constant; a group's planes stored
+                // after it (a short last group leaves its missing fields 0)
+                using I0 = std::integral_constant<int, 0>; using I1 = std::integral_constant<int, 1>;
+                using I2 = std::integral_constant<int, 2>; using I3 = std::integral_constant<int, 3>;
+                for (int s0 = 0; s0 < seg; s0 += 4) {
+                    const int n = seg - s0;
+                    seg_body(s0, I0{});
+                    if (n > 1) seg_body(s0 + 1, I1{});
+                    if (n > 2) seg_body(s0 + 2, I2{});
+                    if (n > 3) seg_body(s0 + 3, I3{});
+                    unsigned char* g = dP + (std::size_t)(s0 >> 2) * 3 * W;
+                    store_codes<T, W>(accM, g); store_codes<T, W>(accX, g + W);
+                    accM = vzero; accX = vzero;
+                }
+            } else if constexpr (Dense) {   // integer T: 4*acc + k over each group
+                for (int s0 = 0; s0 < seg; s0 += 4) {
+                    const int s1 = std::min(seg - s0, 4) + s0;
+                    for (int s = s0; s < s1; ++s) seg_body(s, std::integral_constant<int, 3>{});
+                    for (int s = s1; s < s0 + 4; ++s) {   // short group: fixed shifts
+                        accM = accM + accM; accM = accM + accM; accX = accX + accX; accX = accX + accX;
+                    }
+                    unsigned char* g = dP + (std::size_t)(s0 >> 2) * 3 * W;
+                    store_codes<T, W>(accM, g); store_codes<T, W>(accX, g + W);
+                    accM = vzero; accX = vzero;
+                }
+            } else {
+                for (int s = 0; s < seg; ++s) seg_body(s, std::integral_constant<int, 3>{});
             }
 
             // ── the carry: VY, same-lane striped chain + lazy-F, codes tracked (integer
             // T: the exact prefix max with its codes, int_pmax_carry) ──
-            if constexpr (nw_is_int<T> && W >= 4) {
-                int_pmax_carry<T, W>(ov, ok, nbOpen, nbOpenK, bY, ge_a, seg,
+            if constexpr (kOpenRows) {
+                int_pmax_carry<T, W, false, Dense ? 2 : 32>(ov, ok, nbOpen, nbOpenK, bY, ge_a, seg,
                                      cY + off, yc, qb);
             } else {
+            // The open into Y and its source, from segment q of this row's M and X: what pass 1
+            // once stored as ov / ok, recomputed with the same operations in the same order.
+            // The open's source is chosen on the ROUNDED candidates (see pass 1).
+            auto open_from = [&](int q, vd& O, vd& OK) __attribute__((always_inline)) {
+                vd vm, vx;
+                vm.copy_from(cM + off + (std::size_t)q * W, stdx::element_aligned);
+                vx.copy_from(cX + off + (std::size_t)q * W, stdx::element_aligned);
+                const vd om = (vm - vgo_a) - vge_a, ox = (vx - vgo_a) - vge_a;
+                O = stdx::max(om, ox);
+                OK = kYX;
+#if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
+                if constexpr (sizeof(T) == 8) OK = avx512d_blend(avx512d_ge(om, ox), OK, vzero);
+                else                          OK = sel_ge(om, ox, kYX, vzero);
+#else
+                OK = sel_ge(om, ox, kYX, vzero);
+#endif
+            };
             vd prev([&](int q) { return q == 0 ? bY : K_NINF; });
+            vd OKs[2];   // the open codes load_o computed beside each open, for put (carry_pass
+                         // loads two segments, then puts both: indexed by s & 1)
             prev = carry_pass(seg, prev, vge_a,
                 [&](int s) NWGRAD_ALWAYS_INLINE_LAMBDA {
+                    const int q = s == 0 ? seg - 1 : s - 1;
                     vd O;
-                    if (s == 0) {
-                        vd lo; lo.copy_from(ov + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                        O = lane_shift_in(lo, nbOpen);
-                    } else {
-                        O.copy_from(ov + (std::size_t)(s - 1) * W, stdx::element_aligned);
-                    }
-                    return O;
+                    vd OK;
+                    open_from(q, O, OK);
+                    OKs[s & 1] = s == 0 ? lane_shift_in(OK, nbOpenK) : OK;
+                    return s == 0 ? lane_shift_in(O, nbOpen) : O;
                 },
                 [&](int s, const vd& O, const vd& ext, const vd& v) NWGRAD_ALWAYS_INLINE_LAMBDA {
                     vd OK;
-                    if (s == 0) {
-                        vd lk; lk.copy_from(ok + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                        OK = lane_shift_in(lk, nbOpenK);
-                    } else {
-                        OK.copy_from(ok + (std::size_t)(s - 1) * W, stdx::element_aligned);
-                    }
-                    vd ky = vtwo;                       // extension
+                    OK = OKs[s & 1];
+                    vd ky = kYE;                       // extension
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
                     if constexpr (sizeof(T) == 8) {
                         ky = avx512d_blend(avx512d_ge(O, ext), ky, OK);   // open: M or X, ties go to open
                     } else {
-                        ky = sel_ge(O, ext, vtwo, OK);      // open: M or X, ties go to open
+                        ky = sel_ge(O, ext, kYE, OK);      // open: M or X, ties go to open
                     }
 #else
-                    ky = sel_ge(O, ext, vtwo, OK);      // open: M or X, ties go to open
+                    ky = sel_ge(O, ext, kYE, OK);      // open: M or X, ties go to open
 #endif
                     v.copy_to(cY + off + (std::size_t)s * W, stdx::element_aligned);
                     ky.copy_to(yc + (std::size_t)s * W, stdx::element_aligned);
@@ -355,12 +440,12 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                     vd k; k.copy_from(yc + (std::size_t)s * W, stdx::element_aligned);
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
                     if constexpr (sizeof(T) == 8) {
-                        k = avx512d_blend(avx512d_gt(F, v), k, vtwo);
+                        k = avx512d_blend(avx512d_gt(F, v), k, kYE);
                     } else {
-                        stdx::where(F > v, k) = vtwo;
+                        stdx::where(F > v, k) = kYE;
                     }
 #else
-                    stdx::where(F > v, k) = vtwo;
+                    stdx::where(F > v, k) = kYE;
 #endif
                     k.copy_to(yc + (std::size_t)s * W, stdx::element_aligned);
                     v = stdx::max(v, F);
@@ -371,9 +456,23 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                 if (!changed) break;
             }
             }   // integer / floating carry
-            for (int s = 0; s < seg; ++s) {
-                vd k; k.copy_from(yc + (std::size_t)s * W, stdx::element_aligned);
-                store_codes<T, W>(k, dY + (std::size_t)s * W);
+            if constexpr (Dense) {           // Y's plane
+                for (int s0 = 0; s0 < seg; s0 += 4) {
+                    vd accY = vzero;
+                    const int s1 = std::min(seg - s0, 4) + s0;
+                    for (int s = s0; s < s1; ++s) {
+                        vd k; k.copy_from(yc + (std::size_t)s * W, stdx::element_aligned);
+                        accY = accY + accY; accY = accY + accY; accY = accY + k;
+                    }
+                    for (int s = s1; s < s0 + 4; ++s) { accY = accY + accY; accY = accY + accY; }   // short group: fixed shifts
+                    store_codes<T, W>(accY, dP + (std::size_t)(s0 >> 2) * 3 * W + 2 * W);
+                }
+            } else
+            for (int s = 0; s < seg; ++s) {   // M | X << 2 | Y << 4 (<= 43: the packs stay exact)
+                vd k, kmx;
+                k.copy_from(yc + (std::size_t)s * W, stdx::element_aligned);
+                kmx.copy_from(mx + (std::size_t)s * W, stdx::element_aligned);
+                store_codes<T, W>(kmx + k, dP + (std::size_t)s * W);
             }
 
             if constexpr (Local)
@@ -401,6 +500,19 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
 
 template <class T>
 static void striped_full_ptr_entry(ViterbiJob<T>& job) {
+    if constexpr (sizeof(T) >= 4) {
+        if (job.dense) {
+            if (job.tr.on()) {
+                if (job.align_mode) striped_affine_full_ptr<T, true, true, true>(job);
+                else                striped_affine_full_ptr<T, false, true, true>(job);
+            } else {
+                if (job.align_mode) striped_affine_full_ptr<T, true, false, true>(job);
+                else                striped_affine_full_ptr<T, false, false, true>(job);
+            }
+            return;
+        }
+    }
+    job.dense = 0;
     if (job.tr.on()) {
         if (job.align_mode) striped_affine_full_ptr<T, true, true>(job);
         else                striped_affine_full_ptr<T, false, true>(job);
