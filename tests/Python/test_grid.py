@@ -73,3 +73,21 @@ def test_seqpair_grid_equals_pointers():
 def test_grid_unknown_name_lists_grid():
     with pytest.raises(ValueError, match="grid"):
         nwgrad.SeqPairBatch(["ACD"], ["ACD"], PARAMS[0], traceback="gridd")
+
+
+@pytest.mark.parametrize("cls", [nwgrad.SeqPairBatch, nwgrad.SeqPairBatchDouble])
+@pytest.mark.parametrize("fill", ["rowwise", "striped", "interpair"])
+def test_auto_grid_fallback_sizes_its_tables(cls, fill):
+    # `auto` resolves to grid, which declines a negative gap open: the run takes the
+    # fallback mode.  The buffers must be sized for that mode — rowwise fill used to run
+    # into unallocated score tables (null store, CI 2026-10-27).
+    A, B = related_pairs(8, 20, 120, seed=11)
+    p = nwgrad.AlignParams(BLOSUM62, -1.0, 1.0, -1.0, 1.0)
+    res = {}
+    for tb in ("auto", "pointers"):
+        b = cls(A, B, p, n_threads=3, traceback=tb)
+        b.fill = fill
+        b.hb_cutoff = 4
+        b.score_and_grad(keep_paths=True)
+        res[tb] = b.scores()
+    np.testing.assert_array_equal(res["auto"], res["pointers"])

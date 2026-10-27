@@ -1564,10 +1564,24 @@ private:
     // Whether this run actually selects rowwise score tables. The preference
     // alone is insufficient: splitting Hirschberg and scalar kernels ignore it. Share the predicate with dispatch so those paths keep their
     // smaller memory bounds even when rowwise was requested.
+    // The traceback this run takes: `auto` resolved to Grid where Grid does not apply runs
+    // kGridFallbackTb.  Shared by run_viterbi and the buffer sizing (uses_rowwise_full),
+    // which runs first and must see the same mode.
+    TracebackMode run_tb_() const {
+        if constexpr (GM == GapModel::Affine && AM == AlignMode::Global && AB == AlignBand::Full &&
+                      std::is_floating_point_v<T>)
+            if (tb_ == TracebackMode::Grid && tb_auto_) {
+                const int be = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
+                if (be == kBackendScalar || !grid_ok_(level_kernels(be))) return kGridFallbackTb;
+            }
+        return tb_;
+    }
+
     bool uses_rowwise_full() const {
         if constexpr (GM == GapModel::Affine && AB == AlignBand::Full) {
-            if (!rowwise_full_ || hb_splits(tb_, tb_auto_ ? kAutoPointerCells : 0, hb_cutoff_, m_, n_) ||
-                (tb_ == TracebackMode::Grid && m_ > hb_cutoff_)) return false;
+            const TracebackMode tb = run_tb_();
+            if (!rowwise_full_ || hb_splits(tb, tb_auto_ ? kAutoPointerCells : 0, hb_cutoff_, m_, n_) ||
+                (tb == TracebackMode::Grid && m_ > hb_cutoff_)) return false;
             const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
             return backend >= 0 && level_kernels(backend).template of<T>().banded_row_local;
         }
@@ -2209,12 +2223,7 @@ private:
             TracebackMode& t; TracebackMode saved;
             ~TbRestore() { t = saved; }
         } tb_restore{tb_, tb_};
-        if constexpr (GM == GapModel::Affine && AM == AlignMode::Global && AB == AlignBand::Full &&
-                      std::is_floating_point_v<T>)
-            if (tb_ == TracebackMode::Grid && tb_auto_) {
-                const int be = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
-                if (be == kBackendScalar || !grid_ok_(level_kernels(be))) tb_ = kGridFallbackTb;
-            }
+        tb_ = run_tb_();
         // Default to row-major; only the striped Full kernel (run_dispatched_affine) flips
         // this back on.  Every other fill here writes VM/VX/VY row-major.
         tables_striped_ = false;
