@@ -177,14 +177,19 @@ struct InterCommon {
         for (int l = 0; l < IW; ++l) live[l] = (i <= J.m[l]) ? -1 : 0;
         if (levels < 0) {
             const int n = J.n;
+            // A local pointer, not srow[j]: clang reloaded the vector's data pointer from
+            // the object after every lane store (two dependent loads per element; this
+            // gather is the larger half of a protein L100 inter-pair fill, clang 1.35x
+            // gcc's samples here at sse4).
+            ivd* const sr = srow.data();
             for (int l = 0; l < IW; ++l) {
                 const T* pr;
                 if constexpr (Tr) pr = J.blk + brow<Tr>(l, i) * na;
                 else pr = J.blk + static_cast<size_t>((i <= J.m[l]) ? J.a[l][i - 1] : 0) * na;
                 const unsigned char* bl = J.b[l];
                 const int nl = J.nb ? J.nb[l] : n;
-                for (int j = 1; j <= nl; ++j) srow[j][l] = pr[bl[j - 1]];
-                for (int j = nl + 1; j <= n; ++j) srow[j][l] = pr[0];   // ragged: pad
+                for (int j = 1; j <= nl; ++j) sr[j][l] = pr[bl[j - 1]];
+                for (int j = nl + 1; j <= n; ++j) sr[j][l] = pr[0];   // ragged: pad
             }
             return;
         }
@@ -211,6 +216,20 @@ struct InterCommon {
     ivd s(const ivd* P, int j) const {
         return levels < 0 ? srow[j] : inter_sub(P, bits.data(), j, levels);
     }
+    // s() over values copied out of the object, for the column loops.  `cm` escapes (row()
+    // takes `this`), so through s() clang reloaded `levels` and the srow vector's data
+    // pointer from memory at EVERY column — a store to the table through a vector type
+    // may alias them as far as it can tell — and kept the loads on the critical path
+    // (protein inter-pair fill, sse4).  A local copy whose address is never taken stays in
+    // registers under either compiler.  Taken once per job: srow and bits are sized in
+    // the constructor and never reallocated during the fill.
+    struct Sub {
+        const ivd* srow; const ivl* bits; int levels;
+        ivd operator()(const ivd* P, int j) const {
+            return levels < 0 ? srow[j] : inter_sub(P, bits, j, levels);
+        }
+    };
+    Sub sub() const { return Sub{srow.data(), bits.data(), levels}; }
     // Banded (InterJobT::blo != nullptr): row i's columns [j0, j1] to compute (the union
     // of the lanes' initialised spans) and the per-lane band [lo, hi] as T vectors.
     void band(int i, int& j0, int& j1, ivd& lo, ivd& hi) const {
@@ -252,17 +271,17 @@ struct InterCommon {
 // the operands of its own fill; the cells outside its span are never read by its own
 // traceback or gradient.
 // Tr: tracked lanes (J.tr) — each lane's borders, penalties and rows from its own arrays.
-template <class T, bool Banded, bool Ragged, bool Tr = false>
+template <class T, bool Banded, bool Ragged, bool Tr = false, bool Local = false>
 static void inter_fill_linear(InterJobT<T>& J) noexcept {
     using C = InterCommon<T>;
     using ivd = typename C::ivd; using ivl = typename C::ivl;
     const C cm(J);
+    const auto sub = cm.sub();
     const int n = J.n, M = J.M, st = n + 1;
-    const bool local = J.align_mode == 1;
     ivd* H = reinterpret_cast<ivd*>(J.VM);
     const ivd z = {}, ninf = z + nw_ninf<T>, one = z + T(1);
 
-    if (local) {
+    if constexpr (Local) {
         for (int j = 0; j <= n; ++j) H[j] = z;
         for (int i = 1; i <= M; ++i) H[static_cast<size_t>(i) * st] = z;
     } else {
@@ -297,41 +316,43 @@ static void inter_fill_linear(InterJobT<T>& J) noexcept {
         const ivd* p = h - st;
         ivd lh = (!Banded || j0 == 1) ? h[j0 - 1] : ninf;
         ivd rb = ninf, rj = z;
+        ivd jc = z + static_cast<T>(j0);   // column j as T (exact): no per-column int->T convert
         for (int j = j0; j <= j1; ++j) {
-            ivd v = p[j - 1] + cm.s(P, j);
+            ivd v = p[j - 1] + sub(P, j);
             v = ivmax(v, p[j] - ge_b);
             v = ivmax(v, lh - ge_a);
-            if (local) v = ivmax(v, z);
+            if constexpr (Local) v = ivmax(v, z);
             if constexpr (Banded) { v = ivsel((jv >= lo) & (jv <= hi), v, ninf); jv += one; }
             h[j] = v;
             lh = v;
-            if (local) {
+            if constexpr (Local) {
                 ivl upd = rb < v;
-                if constexpr (Ragged) upd &= (z + static_cast<T>(j)) <= cm.nbv;
+                if constexpr (Ragged) upd &= jc <= cm.nbv;
                 rb = ivsel(upd, v, rb);
-                rj = ivsel(upd, z + static_cast<T>(j), rj);
+                rj = ivsel(upd, jc, rj);
             }
+            jc += one;
         }
-        if (local) {
+        if constexpr (Local) {
             const ivl imp = live & (rb > best);
             best = ivsel(imp, rb, best);
             bi = ivsel(imp, z + static_cast<T>(i), bi);
             bj = ivsel(imp, rj, bj);
         }
     }
-    if (local) cm.best_out(best, bi, bj);
+    if constexpr (Local) cm.best_out(best, bi, bj);
 }
 
 // Affine.  T = double or float32: the operations are the same in either precision, each
 // in T — at float32 exactly the scalar viterbi_affine<float>, whose penalties are cast to
 // T once and whose borders are -(go + T(i)*ge) in T.  Banded: as for linear above.
-template <class T, bool Banded, bool Ragged, bool Tr = false>
+template <class T, bool Banded, bool Ragged, bool Tr = false, bool Local = false>
 static void inter_fill_affine(InterJobT<T>& J) noexcept {
     using C = InterCommon<T>;
     using ivd = typename C::ivd; using ivl = typename C::ivl;
     const C cm(J);
+    const auto sub = cm.sub();
     const int n = J.n, M = J.M, st = n + 1;
-    const bool local = J.align_mode == 1;
     ivd* VM = reinterpret_cast<ivd*>(J.VM);
     ivd* VX = reinterpret_cast<ivd*>(J.VX);
     ivd* VY = reinterpret_cast<ivd*>(J.VY);
@@ -343,7 +364,7 @@ static void inter_fill_affine(InterJobT<T>& J) noexcept {
         const size_t o = static_cast<size_t>(i) * st;
         VM[o] = ninf; VX[o] = ninf; VY[o] = ninf;
     }
-    if (local) {
+    if constexpr (Local) {
         for (int i = 0; i <= M; ++i) VM[static_cast<size_t>(i) * st] = z;
         for (int j = 0; j <= n; ++j) VM[j] = z;
     } else {
@@ -381,13 +402,14 @@ static void inter_fill_affine(InterJobT<T>& J) noexcept {
         ivd lm = ninf, lx = ninf, ly = ninf;   // column j0-1 of this row
         if (!Banded || j0 == 1) { lm = vm[j0 - 1]; lx = vx[j0 - 1]; ly = vy[j0 - 1]; }
         ivd rb = ninf, rj = z;
+        ivd jc = z + static_cast<T>(j0);   // column j as T (exact): no per-column int->T convert
         for (int j = j0; j <= j1; ++j) {
-            const ivd s = cm.s(P, j);
+            const ivd s = sub(P, j);
             ivd d = pm[j - 1];
             d = ivmax(d, px[j - 1]);
             d = ivmax(d, py[j - 1]);
             ivd mv = d + s;
-            if (local) mv = ivmax(mv, z);
+            if constexpr (Local) mv = ivmax(mv, z);
             ivd x = (pm[j] - go_b) - ge_b;
             x = ivmax(x, px[j] - ge_b);
             x = ivmax(x, (py[j] - go_b) - ge_b);
@@ -400,33 +422,45 @@ static void inter_fill_affine(InterJobT<T>& J) noexcept {
             }
             vm[j] = mv; vx[j] = x; vy[j] = y;
             lm = mv; lx = x; ly = y;
-            if (local) {
+            if constexpr (Local) {
                 const ivd cur = ivmax(mv, ivmax(x, y));
                 ivl upd = rb < cur;                // first strict improvement in the row
-                if constexpr (Ragged) upd &= (z + static_cast<T>(j)) <= cm.nbv;
+                if constexpr (Ragged) upd &= jc <= cm.nbv;
                 rb = ivsel(upd, cur, rb);
-                rj = ivsel(upd, z + static_cast<T>(j), rj);
+                rj = ivsel(upd, jc, rj);
             }
+            jc += one;
         }
-        if (local) {
+        if constexpr (Local) {
             const ivl imp = live & (rb > best);
             best = ivsel(imp, rb, best);
             bi = ivsel(imp, z + static_cast<T>(i), bi);
             bj = ivsel(imp, rj, bj);
         }
     }
-    if (local) cm.best_out(best, bi, bj);
+    if constexpr (Local) cm.best_out(best, bi, bj);
 }
 
 // Banded needs no ragged variant: a lane's band never passes its own n (jhi <= n), and
 // the masked cells cannot be its Local best.  Only the bits' padding (InterCommon) is
 // needed there.  Full + ragged masks the Local best by column.
+// Local is a template parameter, not a runtime flag in the column loop: clang (sse4,
+// protein, 2026-10-27) tested it twice per column in the affine fill and kept the
+// Local best-tracking out of line, where gcc unswitched it (clang 0.83x gcc).
+template <class T, bool Tr, bool Local>
+static void inter_fill_tl(InterJobT<T>& J) noexcept {
+    const bool lin = J.linear, rag = Local && J.nb != nullptr;
+    if (J.blo) { if (lin) inter_fill_linear<T, true, false, Tr, Local>(J); else inter_fill_affine<T, true, false, Tr, Local>(J); }
+    else if constexpr (Local) {
+        if (rag) { if (lin) inter_fill_linear<T, false, true, Tr, Local>(J); else inter_fill_affine<T, false, true, Tr, Local>(J); }
+        else     { if (lin) inter_fill_linear<T, false, false, Tr, Local>(J); else inter_fill_affine<T, false, false, Tr, Local>(J); }
+    }
+    else       { if (lin) inter_fill_linear<T, false, false, Tr, Local>(J); else inter_fill_affine<T, false, false, Tr, Local>(J); }
+}
 template <class T, bool Tr>
 static void inter_fill_tr(InterJobT<T>& J) noexcept {
-    const bool lin = J.linear, rag = J.nb != nullptr && J.align_mode == 1;
-    if (J.blo) { if (lin) inter_fill_linear<T, true, false, Tr>(J); else inter_fill_affine<T, true, false, Tr>(J); }
-    else if (rag) { if (lin) inter_fill_linear<T, false, true, Tr>(J); else inter_fill_affine<T, false, true, Tr>(J); }
-    else       { if (lin) inter_fill_linear<T, false, false, Tr>(J); else inter_fill_affine<T, false, false, Tr>(J); }
+    if (J.align_mode == 1) inter_fill_tl<T, Tr, true>(J);
+    else                   inter_fill_tl<T, Tr, false>(J);
 }
 template <class T>
 static void inter_fill_t(InterJobT<T>& J) noexcept {
@@ -453,6 +487,7 @@ static void inter_score_affine(InterJobT<T>& J) noexcept {
     using ivd = typename C::ivd; using ivl = typename C::ivl;
     constexpr int W = C::IW;
     const C cm(J);
+    const auto sub = cm.sub();
     const int n = J.n, M = J.M;
     const bool local = J.align_mode == 1;
     ivd* VM = reinterpret_cast<ivd*>(J.VM);
@@ -491,7 +526,7 @@ static void inter_score_affine(InterJobT<T>& J) noexcept {
         ivd ly = ninf;
         VM[0] = lm; VX[0] = lx; VY[0] = ly;
         for (int j = 1; j <= n; ++j) {
-            const ivd s = cm.s(P, j);
+            const ivd s = sub(P, j);
             const ivd um = VM[j], ux = VX[j], uy = VY[j];   // row i-1, column j
             ivd d = dm;
             d = ivmax(d, dx);
@@ -523,6 +558,7 @@ static void inter_score_linear(InterJobT<T>& J) noexcept {
     using ivd = typename C::ivd; using ivl = typename C::ivl;
     constexpr int W = C::IW;
     const C cm(J);
+    const auto sub = cm.sub();
     const int n = J.n, M = J.M;
     const bool local = J.align_mode == 1;
     ivd* H = reinterpret_cast<ivd*>(J.VM);
@@ -552,7 +588,7 @@ static void inter_score_linear(InterJobT<T>& J) noexcept {
         H[0] = lh;
         for (int j = 1; j <= n; ++j) {
             const ivd up = H[j];
-            ivd v = d + cm.s(P, j);
+            ivd v = d + sub(P, j);
             v = ivmax(v, up - ge_b);
             v = ivmax(v, lh - ge_a);
             if (local) v = ivmax(v, z);
@@ -591,6 +627,7 @@ static void inter_score_affine_pos(InterJobT<T>& J) noexcept {
     using ivd = typename C::ivd; using ivl = typename C::ivl;
     constexpr int W = C::IW;
     const C cm(J);
+    const auto sub = cm.sub();
     const int n = J.n, M = J.M;
     const bool local = J.align_mode == 1;
     ivd* D = reinterpret_cast<ivd*>(J.VM);
@@ -624,7 +661,7 @@ static void inter_score_affine_pos(InterJobT<T>& J) noexcept {
         ivd ly = ninf;                                           // Y(i, 0)
         D[0] = lmx; X[0] = x0;                                   // D(i, 0): Y(i, 0) is -inf
         for (int j = 1; j <= n; ++j) {
-            const ivd s = cm.s(P, j);
+            const ivd s = sub(P, j);
             const ivd du = D[j], xu = X[j];                      // row i-1, column j
             ivd mv = dd + s;
             if (local) mv = ivmax(mv, z);

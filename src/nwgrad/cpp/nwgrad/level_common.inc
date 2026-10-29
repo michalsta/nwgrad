@@ -12,7 +12,33 @@
 // level (verified).
 
 #include <experimental/simd>
-namespace stdx = std::experimental;
+#if defined(__aarch64__)
+#  include <arm_neon.h>    // carry_pin's AArch64 form (kernels_impl.inl); nw_stdx::max below
+#endif
+// The kernels spell std::simd as stdx::, and stdx is nw_stdx: std::experimental re-exported
+// whole, plus, under clang on AArch64 only, its own max for float and double vectors.
+// libstdc++'s simd max is `a > b ? a : b` inside [[gnu::optimize("finite-math-only,
+// no-signed-zeros")]].  gcc honours the attribute and emits one FMAXNM; clang ignores it,
+// keeps the select's exact NaN / signed-zero semantics and emits FCMGT + BSL, two
+// dependent instructions on every max chain of every floating kernel (spot, M1: clang
+// 0.80-0.87x gcc on every float cell, integers level, which have an exact SMAX).  The
+// overload emits the FMAXNM gcc already ships, so the two builds agree.  Qualified lookup
+// finds this max first; every other name comes through the using-directive.
+namespace nw_stdx {
+using namespace std::experimental;
+#if defined(__aarch64__) && defined(__clang__)
+template <class T, class A>
+[[gnu::always_inline]] inline simd<T, A> max(const simd<T, A>& a, const simd<T, A>& b) noexcept {
+    if constexpr (std::is_same_v<T, float> && simd<T, A>::size() == 4)
+        return simd<T, A>(vmaxnmq_f32(static_cast<float32x4_t>(a), static_cast<float32x4_t>(b)));
+    else if constexpr (std::is_same_v<T, double> && simd<T, A>::size() == 2)
+        return simd<T, A>(vmaxnmq_f64(static_cast<float64x2_t>(a), static_cast<float64x2_t>(b)));
+    else
+        return std::experimental::max(a, b);
+}
+#endif
+}
+namespace stdx = nw_stdx;
 
 #include <algorithm>
 #include <array>
@@ -27,9 +53,6 @@ namespace stdx = std::experimental;
 // not be pulled into a namespace.  See the long note at that site.
 #if defined(__x86_64__) || defined(__i386__)
 #  include <immintrin.h>   // lane_shift_in / store_codes intrinsic forms at every level
-#endif
-#if defined(__aarch64__)
-#  include <arm_neon.h>    // carry_pin's AArch64 form (kernels_impl.inl)
 #endif
 
 #include "dp_buffer.hpp"

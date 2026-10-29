@@ -38,6 +38,21 @@
 template <class T>
 inline constexpr bool nw_is_int = std::is_integral_v<T>;
 
+// v, opaque to clang's optimizer (an empty asm on a register: no instruction).  The scalar
+// Local linear fills clamp an integer cell as max(max(diag, up), 0) and only then take the
+// left carry, so the carry passes through one max, not a max and the clamp — gcc makes
+// that rewrite itself (int64 L300 Local hard on nighthaven, 2 cmovs on the carry against
+// clang's 4: clang 0.55x gcc).  Integer max being exact and associative, it is the same
+// value; but clang reassociates the smax chain and puts the 0 back on the carry, unless
+// the clamped value is pinned.  gcc: a plain copy.
+template <class T>
+[[gnu::always_inline]] inline T nw_opaque(T v) noexcept {
+#if defined(__clang__)
+    __asm__("" : "+r"(v));
+#endif
+    return v;
+}
+
 template <class T>
 inline constexpr T nw_ninf = std::is_floating_point_v<T>
     ? -std::numeric_limits<T>::infinity()
