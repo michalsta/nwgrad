@@ -63,10 +63,23 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
     # others so no -march/-mtune change rides along.
     set_source_files_properties(${NWGRAD_LEVEL_DIR}/level_sse4.cpp    PROPERTIES
         COMPILE_OPTIONS "-msse4.2;-mpopcnt")
+    # The avx2 and avx512 levels are the ones Skylake-derived cores run (6th-10th gen Core,
+    # Skylake-SP/Cascade Lake Xeons), whose JCC-erratum microcode keeps any jump that crosses
+    # or ends on a 32-byte boundary out of the uop cache: a hot loop that lands there runs from
+    # the legacy decoder.  Which kernel lands there is layout luck — on oldsolace (i7-7700HQ),
+    # shifting the avx2 TU by 0..30 bytes put nearly every hot kernel at 50-97% legacy decode
+    # at 2-3 of 16 offsets, 1.2-1.7x slower (inter_fill int16/int32 1.6x, linear f64 1.4x).
+    # The assembler's padding keeps every jump clear: legacy decode 0-7% at all offsets.  On
+    # gcc it comes with its own loop/jump alignment off, which otherwise pins small loops to
+    # fixed offsets and, combined with the padding, cost nighthaven float32 cells 6-9%; as here,
+    # nighthaven geomean 1.002 over 116 cells (worst 0.966), solace 0.98-1.02.
+    set(NWGRAD_JCC_OPTS
+        "$<$<CXX_COMPILER_ID:GNU>:-Wa,-mbranches-within-32B-boundaries;-falign-functions=32;-falign-loops=1;-falign-jumps=1;-falign-labels=1>"
+        "$<$<CXX_COMPILER_ID:Clang,AppleClang>:-mbranches-within-32B-boundaries>")
     set_source_files_properties(${NWGRAD_LEVEL_DIR}/level_avx2.cpp    PROPERTIES
-        COMPILE_OPTIONS "-mavx2;-mfma")
+        COMPILE_OPTIONS "-mavx2;-mfma;${NWGRAD_JCC_OPTS}")
     set_source_files_properties(${NWGRAD_LEVEL_DIR}/level_avx512.cpp  PROPERTIES
-        COMPILE_OPTIONS "-mavx512f;-mavx512dq;-mavx512vl;-mavx512bw")
+        COMPILE_OPTIONS "-mavx512f;-mavx512dq;-mavx512vl;-mavx512bw;${NWGRAD_JCC_OPTS}")
 elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
     # NEON is mandatory baseline on AArch64 — one level, no runtime dispatch.
     set(NWGRAD_LEVEL_SOURCES
