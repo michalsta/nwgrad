@@ -44,7 +44,7 @@ def same_params(a, b):
 def test_long_protein_pairs_match_double(mode, tb):
     rng = np.random.default_rng(len(mode) * 31 + len(tb))
     p = blosum_params()
-    sa, sb = related_pairs(rng, matrices.BLOSUM62.alphabet.symbols, 6, 1000)
+    sa, sb = related_pairs(rng, matrices.BLOSUM62.alphabet, 6, 1000)
     kw = dict(gap_model="affine", mode=mode, n_threads=2, traceback=tb)
     bd = nwgrad.SeqPairBatchDouble(sa, sb, p, **kw)
     bi = nwgrad.SeqPairBatchInt16(sa, sb, p, **kw)
@@ -55,9 +55,15 @@ def test_long_protein_pairs_match_double(mode, tb):
         assert same_params(bd.compute_grad(), bi.compute_grad())
         for i in range(len(sa)):
             assert bd[i].aligned() == bi[i].aligned()
-    # banded re-alignment around the path, with the guides just computed
-    assert np.array_equal(bd.realign_banded(16), bi.realign_banded(16))
-    assert np.array_equal(bd.scores(), bi.scores())
+    # a banded step around the guides just computed, under slightly different params
+    # (Local only at this length: a guide-banded GLOBAL value's floor is the move-count
+    # bound, so int16 refuses it past ~L600 -- test_banded_global_within_its_floor)
+    if mode == "local":
+        q = blosum_params(10.0, 2.0)
+        bd.set_params(q); bi.set_params(q)
+        assert bd.banded_grad(16) == bi.banded_grad(16)
+        assert np.array_equal(bd.scores(), bi.scores())
+        assert same_params(bd.compute_grad(), bi.compute_grad())
     # score-only and streaming
     sd = nwgrad.SeqPairBatchDouble(sa, sb, p, grad_mode="none", **kw)
     si = nwgrad.SeqPairBatchInt16(sa, sb, p, grad_mode="none", **kw)
@@ -73,7 +79,7 @@ def test_long_protein_pairs_match_double(mode, tb):
 def test_long_linear_pairs_match_double(mode):
     rng = np.random.default_rng(7 + len(mode))
     p = nwgrad.AlignParams(matrices.BLOSUM62, 0.0, 4.0, 0.0, 4.0)
-    sa, sb = related_pairs(rng, matrices.BLOSUM62.alphabet.symbols, 4, 900)
+    sa, sb = related_pairs(rng, matrices.BLOSUM62.alphabet, 4, 900)
     for tb in ["auto", "pointers", "hirschberg"]:
         kw = dict(gap_model="linear", mode=mode, n_threads=2, traceback=tb)
         bd = nwgrad.SeqPairBatchDouble(sa, sb, p, **kw)
@@ -87,7 +93,7 @@ def test_long_linear_pairs_match_double(mode):
 def test_every_isa_level_agrees_on_long_pairs():
     rng = np.random.default_rng(2026)
     p = blosum_params()
-    sa, sb = related_pairs(rng, matrices.BLOSUM62.alphabet.symbols, 4, 1100)
+    sa, sb = related_pairs(rng, matrices.BLOSUM62.alphabet, 4, 1100)
     ref = None
     for level in nwgrad.available_isa_levels():
         for tb in ["pointers", "hirschberg_pmax"]:
@@ -103,7 +109,7 @@ def test_every_isa_level_agrees_on_long_pairs():
 def test_bound_is_the_value_range():
     """The int16 bound follows the values a path can collect, not the move count."""
     p = blosum_params()
-    alpha = matrices.BLOSUM62.alphabet.symbols
+    alpha = matrices.BLOSUM62.alphabet
     rng = np.random.default_rng(5)
     sa, sb = related_pairs(rng, alpha, 1, 1400)      # 1400 * 11 * 2 + 11 <= 32767: fits
     assert nwgrad.nw_score_affine_int16(sa[0], sb[0], p) == nwgrad.nw_score_affine_double(sa[0], sb[0], p)
@@ -119,3 +125,25 @@ def test_bound_is_the_value_range():
     with pytest.raises(OverflowError, match="int16"):
         nwgrad.nw_score_affine_int16(a, b, q)
     assert nwgrad.nw_score_affine_int32(a, b, q) == nwgrad.nw_score_affine_double(a, b, q)
+
+
+def test_banded_global_within_its_floor():
+    """A guide-banded Global step keeps the move-count floor: fits at L450, refused at L1000."""
+    rng = np.random.default_rng(11)
+    p = blosum_params()
+    alpha = matrices.BLOSUM62.alphabet
+    sa, sb = related_pairs(rng, alpha, 4, 450)
+    kw = dict(gap_model="affine", mode="global", n_threads=2, traceback="pointers")
+    bd = nwgrad.SeqPairBatchDouble(sa, sb, p, **kw)
+    bi = nwgrad.SeqPairBatchInt16(sa, sb, p, **kw)
+    bd.score_and_grad(); bi.score_and_grad()
+    q = blosum_params(10.0, 2.0)
+    bd.set_params(q); bi.set_params(q)
+    assert bd.banded_grad(16) == bi.banded_grad(16)
+    assert np.array_equal(bd.scores(), bi.scores())
+    assert same_params(bd.compute_grad(), bi.compute_grad())
+    sa, sb = related_pairs(rng, alpha, 2, 1000)
+    bi = nwgrad.SeqPairBatchInt16(sa, sb, p, **kw)
+    bi.score_and_grad()
+    with pytest.raises(OverflowError, match="int16"):
+        bi.banded_grad(16)

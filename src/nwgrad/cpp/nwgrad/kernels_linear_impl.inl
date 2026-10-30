@@ -448,7 +448,7 @@ static void lhb_striped(LhbJob<T>& job) {
         const T c0 = job.col0[r];
         const T bprev = pH[0];
         cH[0] = c0;
-        const T nbOpen = c0 - ga;
+        const T nbOpen = nw_sub(c0, ga);
         const T* sub;
         if (by_symbol) {
             sub = buf.hprof.data() + (std::size_t)job.srow[r - 1] * sw;

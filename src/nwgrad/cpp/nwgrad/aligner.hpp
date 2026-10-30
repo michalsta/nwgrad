@@ -3033,15 +3033,15 @@ private:
             T P = nw_sub(cY[0], ge_a);
             for (int c = 1; c <= W; ++c) {
                 // subT is 1-based over the full sequences; row r consumes a[r-1].
-                cM[c] = std::max({pM[c-1], pX[c-1], pY[c-1]}) + (tr_ ? subT(r, j0 + c) : subTu(r, j0 + c));
+                cM[c] = nw_add<T>(std::max({pM[c-1], pX[c-1], pY[c-1]}), tr_ ? subT(r, j0 + c) : subTu(r, j0 + c));
                 cX[c] = std::max({nw_sub(nw_sub(pM[c], go_b), ge_b), nw_sub(pX[c], ge_b), nw_sub(nw_sub(pY[c], go_b), ge_b)});
                 if constexpr (Pmax) {
                     // g[k] for k = c-1.  Max-then-subtract mirrors the kernel's `ov`
                     // exactly (subtracting a common value is order-preserving, so this is
                     // bit-identical to the three-way form the exact branch uses).
                     const T g = nw_sub(nw_sub(std::max(cM[c-1], cX[c-1]), go_a), ge_a);
-                    P = std::max<T>(g + rmp[c-1], P);
-                    cY[c] = P - rmp[c-1];
+                    P = std::max<T>(nw_add(g, rmp[c-1]), P);
+                    cY[c] = nw_sub(P, rmp[c-1]);
                 } else {
                     cY[c] = std::max({nw_sub(nw_sub(cM[c-1], go_a), ge_a), nw_sub(nw_sub(cX[c-1], go_a), ge_a), nw_sub(cY[c-1], ge_a)});
                 }
@@ -3091,12 +3091,12 @@ private:
             T P = nw_sub(cY[0], ge_a);
             for (int d = 1; d <= W; ++d) {
                 // Mirrored diagonal: this step pairs a[r] with b[j1-d], i.e. subT(r+1, j1-d+1).
-                cM[d] = std::max({pM[d-1], pX[d-1], pY[d-1]}) + (tr_ ? subT(r + 1, j1 - d + 1) : subTu(r + 1, j1 - d + 1));
+                cM[d] = nw_add<T>(std::max({pM[d-1], pX[d-1], pY[d-1]}), tr_ ? subT(r + 1, j1 - d + 1) : subTu(r + 1, j1 - d + 1));
                 cX[d] = std::max({nw_sub(nw_sub(pM[d], go_b), ge_b), nw_sub(pX[d], ge_b), nw_sub(nw_sub(pY[d], go_b), ge_b)});
                 if constexpr (Pmax) {
                     const T g = nw_sub(nw_sub(std::max(cM[d-1], cX[d-1]), go_a), ge_a);
-                    P = std::max<T>(g + rmp[d-1], P);
-                    cY[d] = P - rmp[d-1];
+                    P = std::max<T>(nw_add(g, rmp[d-1]), P);
+                    cY[d] = nw_sub(P, rmp[d-1]);
                 } else {
                     cY[d] = std::max({nw_sub(nw_sub(cM[d-1], go_a), ge_a), nw_sub(nw_sub(cX[d-1], go_a), ge_a), nw_sub(cY[d-1], ge_a)});
                 }
@@ -3221,7 +3221,7 @@ private:
             if (in_x && r == 1) { cX[0] = nw_sub(static_cast<T>(0), ge_b); D[rb] = pack(3, 1, 3); }   // continues the run
             for (int c = 1; c <= W; ++c) {
                 const T dgM = pM[c-1], dgX = pX[c-1], dgY = pY[c-1];
-                cM[c] = std::max({dgM, dgX, dgY}) + (tr_ ? subT(i0 + r, j0 + c) : subTu(i0 + r, j0 + c));
+                cM[c] = nw_add<T>(std::max({dgM, dgX, dgY}), tr_ ? subT(i0 + r, j0 + c) : subTu(i0 + r, j0 + c));
                 const T ux = nw_sub(nw_sub(pM[c], go_b), ge_b), vx = nw_sub(pX[c], ge_b), wx = nw_sub(nw_sub(pY[c], go_b), ge_b);
                 cX[c] = std::max({ux, vx, wx});
                 const T uy = nw_sub(nw_sub(cM[c-1], go_a), ge_a), vy = nw_sub(nw_sub(cX[c-1], go_a), ge_a), wy = nw_sub(cY[c-1], ge_a);
@@ -3502,14 +3502,14 @@ private:
             T P = nw_sub(cY[0], ge_a);   // Pmax: the running prefix max, the border as its seed
             for (int c = 1; c <= NC; ++c) {
                 const int bcol = b_start + (c - 1) * b_step;       // 0-based sequence col
-                T m = std::max({pM[c-1], pX[c-1], pY[c-1]}) + (tr_ ? subT(arow + 1, bcol + 1) : subTu(arow + 1, bcol + 1));
+                T m = nw_add<T>(std::max({pM[c-1], pX[c-1], pY[c-1]}), tr_ ? subT(arow + 1, bcol + 1) : subTu(arow + 1, bcol + 1));
                 if (local) m = std::max(m, static_cast<T>(0));
                 const T x = std::max(std::max(nw_sub(nw_sub(pM[c], go_b), ge_b), nw_sub(pX[c], ge_b)), nw_sub(nw_sub(pY[c], go_b), ge_b));
                 T y;
                 if (pmax) {
                     const T g = nw_sub(nw_sub(std::max(cM[c-1], cX[c-1]), go_a), ge_a);
-                    P = std::max<T>(g + rmp[c-1], P);
-                    y = P - rmp[c-1];
+                    P = std::max<T>(nw_add(g, rmp[c-1]), P);
+                    y = nw_sub(P, rmp[c-1]);
                 } else {
                     y = std::max(std::max(nw_sub(nw_sub(cM[c-1], go_a), ge_a), nw_sub(nw_sub(cX[c-1], go_a), ge_a)), nw_sub(cY[c-1], ge_a));
                 }
@@ -3634,14 +3634,14 @@ private:
             T ga = hb_ge_a(rev ? i1 : i0), gb = static_cast<T>(params_->gap_extend_b);
             lhb_r0_.resize(static_cast<size_t>(W) + 1); lhb_c0_.resize(static_cast<size_t>(Hh) + 1);
             lhb_r0_[0] = static_cast<T>(0);
-            for (int c = 1; c <= W; ++c) lhb_r0_[static_cast<size_t>(c)] = lhb_r0_[static_cast<size_t>(c) - 1] - ga;
+            for (int c = 1; c <= W; ++c) lhb_r0_[static_cast<size_t>(c)] = nw_sub(lhb_r0_[static_cast<size_t>(c) - 1], ga);
             lhb_c0_[0] = lhb_r0_[0];
             for (int r = 1; r <= Hh; ++r) {
                 const int i = rev ? i1 - r + 1 : i0 + r;
                 if (tr_) { gb = tgeb_[static_cast<size_t>(i)]; ga = hb_ge_a(rev ? i - 1 : i); }
                 lhb_rows_[static_cast<size_t>(r) - 1] = lhb_srow_(i);
                 lhb_ga_[static_cast<size_t>(r) - 1] = ga; lhb_gb_[static_cast<size_t>(r) - 1] = gb;
-                lhb_c0_[static_cast<size_t>(r)] = lhb_c0_[static_cast<size_t>(r) - 1] - gb;
+                lhb_c0_[static_cast<size_t>(r)] = nw_sub(lhb_c0_[static_cast<size_t>(r) - 1], gb);
             }
             LhbJob<T> job = lhb_job_(buf, W, Hh);
             job.out = out;
@@ -3670,13 +3670,13 @@ private:
                 const int jb = S < 0 ? j1 : j0 - 1;
                 const T gb = ge_b, ga = ge_a;
                 T diag = row[0];
-                row[0] = row[0] - gb;
+                row[0] = nw_sub(row[0], gb);
                 // The left neighbour rides in a register: clang re-loaded row[c-1] just
                 // stored, a store-forward on the serial chain.
                 T left = row[0];
                 for (int c = 1; c <= W; ++c) {
                     T v = nw_add(diag, srow[bc[jb + S * c]]);
-                    const T u = row[c] - gb, l = left - ga;
+                    const T u = nw_sub(row[c], gb), l = nw_sub(left, ga);
                     if (v < u) v = u;
                     if (v < l) v = l;
                     diag = row[c];
@@ -3702,13 +3702,13 @@ private:
             T ga = hb_ge_a(i0), gb = static_cast<T>(params_->gap_extend_b);
             lhb_r0_.resize(static_cast<size_t>(W) + 1); lhb_c0_.resize(static_cast<size_t>(H) + 1);
             lhb_r0_[0] = static_cast<T>(0);
-            for (int c = 1; c <= W; ++c) lhb_r0_[static_cast<size_t>(c)] = lhb_r0_[static_cast<size_t>(c) - 1] - ga;
+            for (int c = 1; c <= W; ++c) lhb_r0_[static_cast<size_t>(c)] = nw_sub(lhb_r0_[static_cast<size_t>(c) - 1], ga);
             lhb_c0_[0] = lhb_r0_[0];
             for (int r = 1; r <= H; ++r) {
                 if (tr_) { ga = tgea_[static_cast<size_t>(i0 + r)]; gb = tgeb_[static_cast<size_t>(i0 + r)]; }
                 lhb_rows_[static_cast<size_t>(r) - 1] = lhb_srow_(i0 + r);
                 lhb_ga_[static_cast<size_t>(r) - 1] = ga; lhb_gb_[static_cast<size_t>(r) - 1] = gb;
-                lhb_c0_[static_cast<size_t>(r)] = lhb_c0_[static_cast<size_t>(r) - 1] - gb;
+                lhb_c0_[static_cast<size_t>(r)] = nw_sub(lhb_c0_[static_cast<size_t>(r) - 1], gb);
             }
             // rowsz = (seg + 1) * lanes <= W + 2 * 64 for every level's lane count
             const std::size_t cap = (static_cast<std::size_t>(H) + 1) * (static_cast<std::size_t>(W) + 130);
@@ -3756,7 +3756,7 @@ private:
             for (int c = 1; c <= W; ++c) {
                 T v = nw_add(prev[c - 1], srow[bc[j0 + c - 1]]);
                 unsigned char k = 0;
-                const T u = prev[c] - gb, l = left - ga;
+                const T u = nw_sub(prev[c], gb), l = nw_sub(left, ga);
                 if (v < u) { v = u; k = 1; }
                 if (v < l) { v = l; k = 2; }
                 cur[c] = v; d[c] = k; left = v;
@@ -3785,7 +3785,7 @@ private:
         T best = NINF;
         int cstar = 0;
         for (int c = 0; c <= W; ++c) {
-            const T v = F[c] + R[W - c];
+            const T v = nw_add(F[c], R[W - c]);
             if (v > best) { best = v; cstar = c; }
         }
         lhb_solve(buf, i0, p, j0, j0 + cstar);
@@ -3830,7 +3830,7 @@ private:
                 T diag = row[0];
                 const T ge_a = ga(i), ge_b = gb(i);
                 for (int j = 1; j <= n_; ++j) {
-                    T v = diag + (tr_ ? subT(i, j) : subTu(i, j));
+                    T v = nw_add<T>(diag, tr_ ? subT(i, j) : subTu(i, j));
                     const T u = nw_sub(row[j], ge_b), l = nw_sub(row[j - 1], ge_a);
                     if (v < u) v = u;
                     if constexpr (nw_is_int<T>) {   // the clamp off the left carry (see nw_opaque)
@@ -3853,7 +3853,7 @@ private:
             hb_fit(buf.hfb, static_cast<std::size_t>(je) + 1);
             T* g = buf.hfb.data();                       // g[q] = score from (p, q) to (ie, je)
             g[je] = static_cast<T>(0);
-            for (int q = je - 1; q >= 0; --q) g[q] = g[q + 1] - ga(ie);
+            for (int q = je - 1; q >= 0; --q) g[q] = nw_sub(g[q + 1], ga(ie));
             T sbest = g[0]; int is = ie, js = 0;
             for (int q = 0; q <= je; ++q) if (g[q] > sbest) { sbest = g[q]; js = q; }
             // Leveled: the suffix scan is a reverse sweep in mirrored coordinates (row r =
@@ -3875,7 +3875,7 @@ private:
                     const int pi = ie - r;
                     lhb_rows_[static_cast<size_t>(r) - 1] = lhb_srow_(pi + 1);
                     lhb_ga_[static_cast<size_t>(r) - 1] = ga(pi); lhb_gb_[static_cast<size_t>(r) - 1] = gb(pi + 1);
-                    lhb_c0_[static_cast<size_t>(r)] = lhb_c0_[static_cast<size_t>(r) - 1] - gb(pi + 1);
+                    lhb_c0_[static_cast<size_t>(r)] = nw_sub(lhb_c0_[static_cast<size_t>(r) - 1], gb(pi + 1));
                 }
                 LhbJob<T> job = lhb_job_(buf, je, ie);
                 job.argmax = 2;
@@ -3892,7 +3892,7 @@ private:
                 g[je] = nw_sub(g[je], ge_b);
                 if (g[je] > sbest) { sbest = g[je]; is = pi; js = je; }
                 for (int q = je - 1; q >= 0; --q) {
-                    T v = diag + (tr_ ? subT(pi + 1, q + 1) : subTu(pi + 1, q + 1));
+                    T v = nw_add<T>(diag, tr_ ? subT(pi + 1, q + 1) : subTu(pi + 1, q + 1));
                     const T u = nw_sub(g[q], ge_b), l = nw_sub(g[q + 1], ge_a);
                     if (v < u) v = u;
                     if (v < l) v = l;
