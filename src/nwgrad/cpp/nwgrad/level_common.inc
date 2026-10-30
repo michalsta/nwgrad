@@ -44,6 +44,7 @@ namespace stdx = nw_stdx;
 #include <array>
 #include <bit>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <type_traits>
 #include <utility>

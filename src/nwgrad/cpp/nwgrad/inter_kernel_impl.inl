@@ -121,6 +121,24 @@ struct InterCommon {
         levels = na <= 1 ? 0 : na <= 2 ? 1 : na <= 4 ? 2 : na <= 8 ? 3 : -1;
         if (levels < 0 && srow.size() < static_cast<size_t>(n + 1)) srow.resize(n + 1);
         if (bits.size() < static_cast<size_t>(3 * (n + 1))) bits.resize(3 * (n + 1));
+        // The masks from the lanes' residues: the W residues of column j gathered as bytes
+        // (one byte load and store per lane), widened to the lane width in one convert, and
+        // each bit's mask as an arithmetic shift pair -- where building each mask vector
+        // lane by lane (a shift, a test and an insert per lane) was 14 % of a 22 x 50 DNA
+        // score-only step at 16 lanes (nighthaven, perf, 2026-10-30).  Same masks.
+        if constexpr (IW >= 4) {
+            using E = std::remove_cvref_t<decltype(ivl{}[0])>;
+            typedef unsigned char u8v __attribute__((vector_size(IW)));
+            constexpr int EB = 8 * sizeof(E);
+            alignas(64) unsigned char bt[64];
+            for (int j = 1; j <= n; ++j) {
+                for (int l = 0; l < IW; ++l) bt[l] = (!J.nb || j <= J.nb[l]) ? J.b[l][j - 1] : 0;   // ragged: pad
+                u8v bv; std::memcpy(&bv, bt, IW);
+                const ivl wv = __builtin_convertvector(bv, ivl);
+                for (int k = 0; k < levels; ++k)
+                    bits[3 * j + k] = (wv << (EB - 1 - k)) >> (EB - 1);   // bit k, as 0 / -1
+            }
+        } else
         for (int j = 1; j <= n; ++j)
             for (int k = 0; k < levels; ++k) {
                 bits[3 * j + k] = ivlanes<ivl, IW>([&](int l) {
