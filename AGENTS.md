@@ -2073,25 +2073,40 @@ unreachable value can drift no lower than lowest() and never wraps, and the boun
 only that every REACHABLE value fits the range and that a sentinel-derived value stays
 below every reachable one (`NwIntBound`: the facts of the params; the comment at
 `nw_int_bound_check` has the terms).  The sentinel stays lowest() / 2 (-16384) in both
-regimes, so the plain kernels are untouched: a problem inside the quarter rule runs the
-code it always ran, bit for bit -- deliberately, because the saturating instructions issue
-on fewer ports on Intel cores (p01 against p015 for the plain ones: ungated, int16 lost
-6 % on the AVX2 score kernel and 19 % at sse4, nighthaven).  The sentinel's depth is what
-bounds the new regime: the values' whole range (the top a path can collect plus the
-prefix-max ramp, down to the all-gap floor) must fit under 16384, i.e. BLOSUM62 11/1 to
-~L1150 (Global and Local), guide-banded Global to ~L430 (its floor is the move-count
-bound: a band confines the paths).  The scalar fills saturate always (a clamp at the
-bottom, one compare and a cmov; `nw_add` / `nw_sub`), so a table is the same bits at every
-level in either regime; the inter-pair kernels have no saturating variant, so the engine
-keeps such pairs on their own fill (`inter_eligible_`, the streaming loop).  int32 / int64
-keep the quarter rule (no 32 / 64-bit saturating vector ops on x86).
-Measured (nighthaven, `bench_int.py`, protein BLOSUM62 11/1 30 %-mutated, Local, 1 thread,
-avx2): L1000 int16 hard 338 us a pair, 0.37 of float32 and 0.41 of int32 (823); score-only
-114 us, 0.36 of float32 and 0.61 of int32 (188).  Inside the quarter rule nothing moved
-(A/B 0.99-1.01 on every arm).  Verified: `tests/cpp/test_integer.cpp` (the oracle sweep
-at L <= 500, every level; the refusal test), `tests/Python/test_int16_long.py` (L1000
-pairs at every traceback mode, both modes, banded, streaming, score-only, every level; the
-bound's edges), the full suites, ASan + UBSan on the integer cases.
+-- the saturating instructions issue on fewer ports on Intel cores (p01 against p015 for
+the plain ones: ungated, int16 lost 6 % on the AVX2 score kernel and 19 % at sse4,
+nighthaven), so a problem inside the quarter rule runs the plain kernels it always ran,
+with their sentinel lowest() / 2, bit for bit.  The saturating regime's sentinel is
+lowest() itself (`nw_ninf_s<T, Sat>` in the kernels; the aligner's `NINF()` -- a function,
+not a member: a member cost the float32 score-only step 2 % by losing the constant fold),
+self-preserving under the saturating penalties, so its depth, 32768, is the room for the
+values' whole range (the top a path can collect plus the prefix-max ramp, down to the
+all-gap floor): BLOSUM62 11/1 to ~L2300 (Global and Local), guide-banded Global to ~L880
+(its floor is the move-count bound: a band confines the paths).  A Hirschberg join's sum
+is a real alignment's score, so it costs the top bound nothing (the first form charged
+2 Hi).  The scalar fills saturate always (a clamp at the bottom, one compare and a cmov;
+`nw_add` / `nw_sub`; they also saturate in the plain regime, where the clamp never fires),
+so a table is the same bits at every level in either regime; the inter-pair kernels have
+no saturating variant, so the engine keeps such pairs on their own fill
+(`inter_eligible_`, the streaming loop).  int32 / int64 keep the quarter rule (no 32 /
+64-bit saturating vector ops on x86).
+Measured (nighthaven, `bench_int.py`, protein BLOSUM62 11/1 30 %-mutated, 1 thread, avx2;
+us a pair, and the ratio to float32 / int32): L1000 Local hard 350 (0.39 / 0.43), score-only
+114 (0.37 / 0.61); L2000 Local hard 1483 (0.47 / 0.40), score-only 435 (0.28 / 0.32), Global
+hard 1267 (0.64 / 0.53), score-only 385 (0.22 / 0.36).  Against parasail at L2000 (its
+`scan16` the fastest 16-bit form): int16 score-only 364 / 433 us (Global / Local) against
+525 / 645 (1.44x / 1.49x), path + gradient 1300 / 1500 against `striped16` trace 7604 /
+5880.  Inside the quarter rule nothing moved (A/B 0.99-1.01 on every arm).  Verified:
+`tests/cpp/test_integer.cpp` (the oracle sweep at L <= 500, every level; the refusal
+test), `tests/Python/test_int16_long.py` (L1000 pairs at every traceback mode, both
+modes, banded, streaming, score-only, every level; L2000; the bound's edges), the full
+suites, ASan + UBSan on the integer cases, `fuzz_ab.py` against main.
+A caution on the A/B harness: a stripped release build's loops are not aligned
+(`-falign-loops=1`, the JCC padding), so an unrelated change moves a hot loop's
+placement; the DNA int16 streaming arm read 1.06 on one build of this branch with the
+inter-pair fill's code byte-for-byte unchanged (same size, same instruction mix), and
+0.99-1.00 on the builds before and after.  Judge a cell by its instruction count
+(`perf stat`) and its code before believing a few per cent either way.
 
 **The four together** (`perf/smallint`, nighthaven, 1 thread, B/A against main `b0a075a`,
 controls 0.99-1.01; the `bench_int.py` arms: protein = 2000 30 %-mutated L200 BLOSUM62 11/1

@@ -169,11 +169,11 @@ DiscrimAlign does: it passes the logical core count.
   as `ext`). Not yet timed on spot under Fedora Asahi (macOS only).
 - **int16 saturating arithmetic: DONE as a per-problem regime (2026-10-30, AGENTS
   "Small-integer round")**: int16 L1000 BLOSUM62 Local score-only 114 us a pair on AVX2
-  (int32 188, float32 307; parasail scan16 was 145), hard 350 (int32 813).  Left: (1) the
-  regime's reach is the sentinel's depth (lowest() / 2 = 16384 for the values' whole range:
-  ~L1150 for BLOSUM62 11/1, ~L430 guide-banded Global); a sentinel of lowest() would double
-  it but needs the plain kernels to saturate too (6-19 % on Intel: the saturating ops issue
-  on p01 only), or a sentinel that is a runtime value; (2) NEON and AVX-512 not yet run
+  (int32 188, float32 307; parasail scan16 was 145), hard 350 (int32 813); L2000 score-only
+  435 (int32 1345), 1.44-1.49x parasail's scan16.  Left: (1) the regime's reach is the
+  sentinel's depth, 32768 for the values' whole range: ~L2300 for BLOSUM62 11/1, ~L880
+  guide-banded Global (the band's floor is the move-count bound; a bound from the guide
+  path's own prefix scores would lift it); (2) NEON and AVX-512 not yet run
   (spot / solace were off limits for the round): `vqaddq_s16` / `vqsubq_s16` and
   `_mm512_adds_epi16` are written, untested; (3) the scalar fills saturate always (a clamp
   per op): the short-row scalar linear fill and `scalar_fallback` of int16 carry it,
