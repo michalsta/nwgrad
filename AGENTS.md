@@ -2107,6 +2107,13 @@ placement; the DNA int16 streaming arm read 1.06 on one build of this branch wit
 inter-pair fill's code byte-for-byte unchanged (same size, same instruction mix), and
 0.99-1.00 on the builds before and after.  Judge a cell by its instruction count
 (`perf stat`) and its code before believing a few per cent either way.
+**The branch's final A/B** (`4ff7775`, nighthaven, 1 thread, 3 rounds, controls 0.99-1.00):
+protein hard / stream float32 0.905 / 0.907 (avx2), 0.866 / 0.860 (sse4); double 0.880 /
+0.879, 0.829 / 0.829; int16 0.926 / 0.940, 0.930 / 0.942; int32 0.974 / 0.982, 0.951 /
+0.951; every protein score-only arm 1.000-1.007 but int16 0.858 (avx2) / 0.908 (sse4); DNA
+int16 hard 0.978 / 0.974, score-only 0.942 / 0.930, stream 0.999 / 0.972; DNA float32 /
+double / int32 0.96-1.014, but double stream avx2 1.034 -- `perf stat` on that arm: +0.1 %
+instructions, +1.1 % cycles in a direct rerun, i.e. placement and noise, not code.
 
 **The four together** (`perf/smallint`, nighthaven, 1 thread, B/A against main `b0a075a`,
 controls 0.99-1.01; the `bench_int.py` arms: protein = 2000 30 %-mutated L200 BLOSUM62 11/1
