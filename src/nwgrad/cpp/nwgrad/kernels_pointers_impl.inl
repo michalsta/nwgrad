@@ -125,7 +125,6 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
     // the integer carry (int_pmax_carry) reads the opens and their codes from rows; the
     // floating one recomputes them from cM / cX
     constexpr bool kOpenRows = nw_is_int<T> && W >= 4;
-    constexpr bool kFused = kOpenRows && !Dense;      // the carry fused into pass 1 (below)
     const T K_NINF = nw_ninf<T>;
 
     const int m = job.m, n = job.n;
@@ -241,23 +240,6 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                 dgY = lane_shift_in(lY, bY);
             }
             vd accM = vzero, accX = vzero;   // Dense: this group's M / X codes so far
-            // kFused (an integer T from 4 lanes, one-byte codes): the prefix-max carry fused
-            // into this pass, as score_affine_striped_pos fuses it.  The opens never reach
-            // memory: Q(s) = open(s-1) + ramp(s) goes into the running lane prefix max fP,
-            // stored to Y's row; segment 0's Q (the last segment's open, lane-shifted) is
-            // folded in after the row; pass 2 then applies the lanes' carry-in, subtracts the
-            // ramp, derives Y's codes (the open's when Q(s) >= the prefix before it, as
-            // int_pmax_carry), packs the byte and keeps the Local row best -- one pass where
-            // the carry's two, the packing loop and striped_row_best were four.  The row
-            // best runs in two phases (max(M, X) here, Y in pass 2): a cell's maximum is the
-            // same, and strict > keeps the first segment reaching it in either order.
-            [[maybe_unused]] vd fP = vd(K_NINF), fR, fBase, fOprev, fOKprev = vzero;
-            [[maybe_unused]] vd lmax(K_NINF), ls(vzero), vs(vzero);
-            if constexpr (kFused) {
-                fBase = vd([&](int l) { return static_cast<T>(static_cast<T>(l * seg) * ge_a); });
-                fR = fBase;
-                fOprev = vd(K_NINF) - fBase;   // Q(0) = -inf in this pass (the lane arithmetic wraps)
-            }
             // One segment of pass 1.  R: its place in a dense group.  kWeighted: the codes come out
             // already weighted for the group's byte (segment R at shift 2*(3-R), dense_code_at), so
             // accumulating costs one add a plane where 4*acc + k cost three dependent adds (NEON
@@ -347,36 +329,7 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                 // max(om, ox) is bitwise max(vmv, vxv) - go - ge: rounding is monotone.
                 // (Floating T: the carry recomputes both from cM / cX instead -- the same bits --
                 // which saves two T-typed rows, a store and a load each, per segment.)
-                if constexpr (kFused) {
-                    const vd om = (vmv - vgo_a) - vge_a, ox = (vxv - vgo_a) - vge_a;
-                    fP = stdx::max(fP, fOprev + fR);
-                    nv_store(cY + off + (std::size_t)s * W, fP);
-                    fOprev = stdx::max(om, ox);
-                    fR += vge_a;
-                    vd okv = kYX;                  // open from X: Y's code 1, shifted
-#if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
-                    if constexpr (sizeof(T) == 8) {
-                        okv = avx512d_blend(avx512d_ge(om, ox), okv, vzero);
-                    } else {
-                        okv = sel_ge(om, ox, kYX, vzero);
-                    }
-#else
-                    okv = sel_ge(om, ox, kYX, vzero);
-#endif
-                    fOKprev = okv;
-                    if constexpr (Local) {   // row best, phase 1: max(M, X)
-                        vd vp; vp.copy_from(pad + (std::size_t)s * W, stdx::element_aligned);
-                        const vd h = stdx::max(vmv, vxv) + vp;
-#if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
-                        if constexpr (sizeof(T) == 8) ls = avx512d_blend(avx512d_gt(h, lmax), ls, vs);
-                        else                          stdx::where(h > lmax, ls) = vs;
-#else
-                        stdx::where(h > lmax, ls) = vs;
-#endif
-                        lmax = stdx::max(lmax, h);
-                        vs += vone;
-                    }
-                } else if constexpr (kOpenRows) {
+                if constexpr (kOpenRows) {
                     const vd om = (vmv - vgo_a) - vge_a, ox = (vxv - vgo_a) - vge_a;
                     stdx::max(om, ox).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
                     vd okv = kYX;                  // open from X: Y's code 1, shifted
@@ -424,72 +377,7 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
 
             // ── the carry: VY, same-lane striped chain + lazy-F, codes tracked (integer
             // T: the exact prefix max with its codes, int_pmax_carry) ──
-            if constexpr (kFused) {
-                // segment 0's term (the last segment's open, lane-shifted, plus the lane base),
-                // the lanes' carry-in from the full lane prefixes, then ONE pass over the row
-                const vd Q0 = lane_shift_in(fOprev, nbOpen) + fBase;
-                const vd OK0 = lane_shift_in(fOKprev, nbOpenK);
-                const vd vcin = int_lane_carry_in<vd, W>(stdx::max(Q0, fP), static_cast<T>(bY - ge_a));
-                const vd vcinQ = stdx::max(vcin, Q0);
-                vd before = vcin;                 // the prefix before segment s's open: Q0 is tested first
-                vd rq = fBase;
-                vd vsq = vzero;
-                for (int s = 0; s < seg; ++s) {
-                    vd O, OK;
-                    if (s == 0) { O = Q0; OK = OK0; }
-                    else {
-                        vd vm, vx;
-                        vm.copy_from(cM + off + (std::size_t)(s - 1) * W, stdx::element_aligned);
-                        vx.copy_from(cX + off + (std::size_t)(s - 1) * W, stdx::element_aligned);
-                        const vd om = (vm - vgo_a) - vge_a, ox = (vx - vgo_a) - vge_a;
-                        O = stdx::max(om, ox) + rq;
-#if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
-                        if constexpr (sizeof(T) == 8) OK = avx512d_blend(avx512d_ge(om, ox), kYX, vzero);
-                        else                          OK = sel_ge(om, ox, kYX, vzero);
-#else
-                        OK = sel_ge(om, ox, kYX, vzero);
-#endif
-                    }
-                    const vd pc = stdx::max(nv_load<vd>(cY + off + (std::size_t)s * W), vcinQ);
-                    const vd y = pc - rq;
-                    nv_store(cY + off + (std::size_t)s * W, y);
-                    vd ky = OK;                    // strict: Q >= before keeps the open
-#if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
-                    if constexpr (sizeof(T) == 8) ky = avx512d_blend(avx512d_gt(before, O), ky, kYE);
-                    else                          stdx::where(before > O, ky) = kYE;
-#else
-                    stdx::where(before > O, ky) = kYE;
-#endif
-                    before = pc;
-                    vd kmx; kmx.copy_from(mx + (std::size_t)s * W, stdx::element_aligned);
-                    store_codes<T, W>(kmx + ky, dP + (std::size_t)s * W);
-                    if constexpr (Local) {         // row best, phase 2: Y
-                        vd vp; vp.copy_from(pad + (std::size_t)s * W, stdx::element_aligned);
-                        const vd h = y + vp;
-#if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
-                        if constexpr (sizeof(T) == 8) ls = avx512d_blend(avx512d_gt(h, lmax), ls, vsq);
-                        else                          stdx::where(h > lmax, ls) = vsq;
-#else
-                        stdx::where(h > lmax, ls) = vsq;
-#endif
-                        lmax = stdx::max(lmax, h);
-                        vsq += vone;
-                    }
-                    rq += vge_a;
-                }
-                if constexpr (Local) {
-                    // the row's best cell from the lanes' (lmax, ls): striped_row_best's reduction
-                    const T rmax = stdx::hmax(lmax);
-                    if (rmax > best_local) {
-                        const int l = stdx::find_first_set(lmax == rmax);
-                        const int sb = (int)ls[l];
-                        const std::size_t k = off + (std::size_t)sb * W + (std::size_t)l;
-                        const T mm = cM[k], xx = cX[k], yy = cY[k];
-                        best_local = rmax; best_i = i; best_j = l * seg + sb + 1;
-                        best_tbl = (mm >= xx && mm >= yy) ? 0 : ((xx >= yy) ? 1 : 2);
-                    }
-                }
-            } else if constexpr (kOpenRows) {
+            if constexpr (kOpenRows) {
                 int_pmax_carry<T, W, false, Dense ? 2 : 32>(ov, ok, nbOpen, nbOpenK, bY, ge_a, seg,
                                      cY + off, yc, qb);
             } else {
@@ -584,7 +472,7 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                     for (int s = s1; s < s0 + 4; ++s) { accY = accY + accY; accY = accY + accY; }   // short group: fixed shifts
                     store_codes<T, W>(accY, dP + (std::size_t)(s0 >> 2) * 3 * W + 2 * W);
                 }
-            } else if constexpr (!kFused)
+            } else
             for (int s = 0; s < seg; ++s) {   // M | X << 2 | Y << 4 (<= 43: the packs stay exact)
                 vd k, kmx;
                 k.copy_from(yc + (std::size_t)s * W, stdx::element_aligned);
@@ -592,7 +480,7 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                 store_codes<T, W>(kmx + k, dP + (std::size_t)s * W);
             }
 
-            if constexpr (Local && !kFused)
+            if constexpr (Local)
                 striped_row_best<T>(cM + off, cX + off, cY + off, pad, seg, i,
                                     best_local, best_i, best_j, best_tbl);
         }
