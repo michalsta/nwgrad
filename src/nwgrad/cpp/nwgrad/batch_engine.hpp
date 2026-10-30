@@ -630,8 +630,9 @@ private:
         const Alphabet& alpha = params.matrix.alphabet();
         std::vector<uint8_t> a_enc, b_enc;
         const size_t N = problems.size();
+        const StreamPrep pp(params);
         for (size_t idx; (idx = work_idx.fetch_add(1, std::memory_order_relaxed)) < N; )
-            stream_one_(al, problems, idx, alpha, params, band, buf, a_enc, b_enc, scores, local_grad, st);
+            stream_one_(al, problems, idx, alpha, params, band, buf, a_enc, b_enc, scores, local_grad, st, pp);
     }
     // A problem's effective tracks: as given, or the defaults (all zeros; derived).
     static void effective_tracks_(std::span<const uint16_t> tk, std::span<const uint16_t> gk, size_t m,
@@ -689,16 +690,32 @@ private:
             }
         }
     }
+    // An integer T's params, prepared ONCE per streaming worker (nw_int_prepare: the checked
+    // casts of the stack and the gaps, the bound facts) and handed to every pair's
+    // set_problem() -- which otherwise prepares them per pair: 7 % of a 22 x 50 int16 DNA
+    // streaming step (nighthaven, perf, 2026-10-30).  Empty (null) for a floating T.
+    struct StreamPrep {
+        std::vector<T> stack, gaps;
+        NwIntBound<T> ib;
+        const T* st() const noexcept { return nw_is_int<T> ? stack.data() : nullptr; }
+        const T* gp() const noexcept { return nw_is_int<T> ? gaps.data() : nullptr; }
+        const NwIntBound<T>* ibp() const noexcept { return nw_is_int<T> ? &ib : nullptr; }
+        explicit StreamPrep(const AlignParams& p) {
+            if constexpr (nw_is_int<T>) nw_int_prepare<T>(p, p.num_sets(), stack, gaps, ib);
+        }
+    };
     // One streaming problem on its own path: encode, set up, fill, score, gradient.
     template<class Al>
     void stream_one_(Al& al, const std::vector<ProblemInstance>& problems, size_t i,
                      const Alphabet& alpha, const AlignParams& params, int band, DpBuffer& buf,
                      std::vector<uint8_t>& a_enc, std::vector<uint8_t>& b_enc,
-                     std::vector<double>& scores, AlignParams& local_grad, const StreamTracks& st) const {
+                     std::vector<double>& scores, AlignParams& local_grad, const StreamTracks& st,
+                     const StreamPrep& pp) const {
         const auto& p = problems[i];
         stream_encode_(alpha, p.seq_a, a_enc, i, 'a');
         stream_encode_(alpha, p.seq_b, b_enc, i, 'b');
-        al.set_problem(a_enc, b_enc, params, band, p.guide_j, st.track(i), st.gap_track(i));
+        al.set_problem(a_enc, b_enc, params, band, p.guide_j, st.track(i), st.gap_track(i),
+                       pp.st(), pp.gp(), pp.ibp());
         if (grad_mode_ == GradMode::Hard) {
             al.compute_viterbi(buf); scores[i] = al.score(); al.hard_grad(buf, local_grad);
         } else if (grad_mode_ == GradMode::Soft) {
@@ -823,6 +840,7 @@ private:
         const size_t nn = static_cast<size_t>(params.matrix.size()) * params.matrix.size();
         const size_t na = static_cast<size_t>(params.matrix.size());
         if (!soft) cast_block_(params, blkT);   // params are fixed for the call: once per worker
+        const StreamPrep pp(params);            // an integer T: prepared once, for every set_problem below
         // Tracked lanes: each lane's effective tracks, its TrackJob (hard / none) or soft rows.
         std::vector<std::vector<uint16_t>> lt(W), lg(W);
         std::vector<TrackJob<T>> tj(W);
@@ -831,7 +849,7 @@ private:
         std::vector<const uint32_t*> lrsp(W);
         std::vector<const double*> lrwp(W);
         auto own = [&](size_t i) {
-            stream_one_(al[0], problems, i, alpha, params, band, buf, ae[0], be[0], scores, local_grad, st);
+            stream_one_(al[0], problems, i, alpha, params, band, buf, ae[0], be[0], scores, local_grad, st, pp);
         };
         const size_t G = groups.size(), tasks = G + other.size();
         for (size_t t; (t = idx.fetch_add(1, std::memory_order_relaxed)) < tasks; ) {
@@ -913,7 +931,7 @@ private:
                         for (int l = 0; l < W; ++l) {
                             const size_t lr = std::min<size_t>(l, real - 1);
                             if (static_cast<size_t>(l) == lr) {
-                                al[l].set_problem(ae[l], be[l], params, band, {}, lt[l], lg[l]);
+                                al[l].set_problem(ae[l], be[l], params, band, {}, lt[l], lg[l], pp.st(), pp.gp(), pp.ibp());
                                 al[l].track_job(tj[l]);
                             } else {
                                 tj[l] = tj[lr];
@@ -936,10 +954,12 @@ private:
             }
             for (size_t l = 0; l < real; ++l) {
                 if (trk) {
-                    al[l].set_problem(ae[l], be[l], params, band, problems[elig[s + l]].guide_j, lt[l], lg[l]);
+                    al[l].set_problem(ae[l], be[l], params, band, problems[elig[s + l]].guide_j, lt[l], lg[l],
+                                      pp.st(), pp.gp(), pp.ibp());
                     al[l].track_job(tj[l]);
                 } else {
-                    al[l].set_problem(ae[l], be[l], params, band, problems[elig[s + l]].guide_j);
+                    al[l].set_problem(ae[l], be[l], params, band, problems[elig[s + l]].guide_j, {}, {},
+                                      pp.st(), pp.gp(), pp.ibp());
                 }
                 if constexpr (AB == AlignBand::GuideBanded)
                     al[l].banded_lane_rows(W, static_cast<int>(l), M, blo.data(), bhi.data(),
