@@ -173,7 +173,7 @@ void compare_case(const std::string& A, const std::string& B, const AlignParams&
 }
 
 template <class T>
-void sweep(uint64_t seed, int rounds, int& mismatches, int& cases, std::string& first) {
+void sweep(uint64_t seed, int rounds, int& mismatches, int& cases, std::string& first, int maxlen = 40) {
     Rng rng(seed);
     const Alphabet* alphas[] = {&Alphabet::get("ACGT"), &Alphabet::get("ACDEFGHIKLMNPQRSTVWY"), &Alphabet::get("AB")};
     const auto backends = backends_under_test();
@@ -185,8 +185,8 @@ void sweep(uint64_t seed, int rounds, int& mismatches, int& cases, std::string& 
         const int which = rng.in(0, 4);   // 0 scores, 1 pointers, 2 hirschberg, 3 pmax, 4 banded
         const bool neg = which <= 1 && rng.in(0, 3) == 0;
         const AlignParams p = int_params(rng, alpha, affine, sets, neg);
-        const int la = rng.in(0, 3) == 0 ? rng.in(0, 3) : rng.in(1, 40);
-        const int lb = rng.in(0, 3) == 0 ? rng.in(0, 3) : rng.in(1, 40);
+        const int la = rng.in(0, 3) == 0 ? rng.in(0, 3) : rng.in(1, maxlen);
+        const int lb = rng.in(0, 3) == 0 ? rng.in(0, 3) : rng.in(1, maxlen);
         const std::string A = random_seq(rng, alpha, la), B = random_seq(rng, alpha, lb);
         const std::vector<uint16_t> track = sets > 1 ? random_track(rng, la, sets) : std::vector<uint16_t>{};
         const int backend = backends[static_cast<size_t>(rng.in(0, static_cast<int>(backends.size()) - 1))];
@@ -227,6 +227,20 @@ TEMPLATE_TEST_CASE("integer aligners reproduce the double oracle bit for bit", "
     CHECK(cases == 1500);
 }
 
+// int16 past the old quarter-range bound (saturating arithmetic, the value-range bound):
+// the same sweep at lengths up to 500, where (m + n + 66) * step once refused most cases
+// (random |s| <= 5, gaps <= 6: step up to 12, so ~L300).  A refusal counts as a mismatch
+// (double never throws), so the fixture must fit every form of the bound, the guide-
+// banded Global one included (its floor is the move-count bound, (m + n + 66) * step).
+TEST_CASE("int16 reproduces the double oracle on long pairs", "[integer][simd][long]") {
+    int mismatches = 0, cases = 0;
+    std::string first;
+    sweep<int16_t>(0x5eedf00d, 60, mismatches, cases, first, 500);
+    INFO("first mismatch: " << first);
+    CHECK(mismatches == 0);
+    CHECK(cases == 60);
+}
+
 TEST_CASE("integer aligners refuse non-integral parameters", "[integer]") {
     const Alphabet& alpha = Alphabet::get("ACGT");
     std::vector<double> m(16, -1.0);
@@ -262,14 +276,23 @@ TEST_CASE("integer aligners refuse problems that could overflow; a wider type ta
     for (int i = 0; i < 4; ++i) m[static_cast<size_t>(i) * 5] = 100.0;
     AlignParams p(SubstMatrix(m.data(), alpha));
     p.gap_open_a = 50; p.gap_extend_a = 10; p.gap_open_b = 50; p.gap_extend_b = 10;
-    // step 100: int16's cap is 8191, so m + n + 2 + 64 (padding columns) must be <= 81
-    const auto ea = alpha.encode(std::string(60, 'A')), eb = alpha.encode(std::string(60, 'C'));
-    const auto sa = alpha.encode(std::string(7, 'A')), sb = alpha.encode(std::string(7, 'C'));
+    // int16 saturates and is bounded by the VALUES a path can collect: 2 * 200 * 100 + 50
+    // (a Hirschberg join of two halves) exceeds 32767, so 200 x 200 is refused; 60 x 60
+    // (once refused by the quarter rule, (60 + 60 + 66) * 100 > 8191) now fits.
+    const auto ea = alpha.encode(std::string(200, 'A')), eb = alpha.encode(std::string(200, 'C'));
+    const auto sa = alpha.encode(std::string(60, 'A')), sb = alpha.encode(std::string(60, 'C'));
 
     Aligner<GapModel::Affine, AlignMode::Global, AlignBand::Full, int16_t> a16;
     DpBufferT<int16_t> b16;
     CHECK_THROWS_AS(a16.set_problem(ea, eb, p), std::overflow_error);
     a16.set_problem(sa, sb, p); a16.compute_viterbi(b16);
+    {
+        Aligner<GapModel::Affine, AlignMode::Global, AlignBand::Full, double> ad60;
+        DpBufferT<double> bd60;
+        ad60.set_problem(sa, sb, p); ad60.compute_viterbi(bd60);
+        CHECK(a16.score() == ad60.score());
+        CHECK(a16.aligned(b16) == ad60.aligned(bd60));
+    }
 
     Aligner<GapModel::Affine, AlignMode::Global, AlignBand::Full, int32_t> a32;
     DpBufferT<int32_t> b32;

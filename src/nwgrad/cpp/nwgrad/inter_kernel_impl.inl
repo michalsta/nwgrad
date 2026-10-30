@@ -67,6 +67,11 @@ template <class V> static inline V ivmax(V a, V b) noexcept {
     return a < b ? b : a;
 }
 template <class L, class V> static inline V ivsel(L m, V a, V b) noexcept { return m ? a : b; }
+// Lane-wise add / subtract (plain: the inter-pair kernels never run a problem past the
+// quarter-range bound -- the engine keeps such pairs on their own fill, whose kernels
+// have a saturating variant; see nw_sat in scalar_traits.hpp).
+template <class V> [[gnu::always_inline]] static inline V ivsub(V a, V b) noexcept { return a - b; }
+template <class V> [[gnu::always_inline]] static inline V ivadd(V a, V b) noexcept { return a + b; }
 // Every lane = x.  Not `ivd{} + x`: +0 + -0 is +0, so that idiom loses the sign of a
 // zero border (-0 when a gap extend is 0), which the scalar fill keeps.
 template <class V, class S> static inline V ivsplat(S x) noexcept {
@@ -345,9 +350,9 @@ static void inter_fill_linear(InterJobT<T>& J) noexcept {
         ivd rb = ninf, rj = z;
         ivd jc = z + static_cast<T>(j0);   // column j as T (exact): no per-column int->T convert
         for (int j = j0; j <= j1; ++j) {
-            ivd v = p[j - 1] + sub(P, j);
-            v = ivmax(v, p[j] - ge_b);
-            v = ivmax(v, lh - ge_a);
+            ivd v = ivadd(p[j - 1], sub(P, j));
+            v = ivmax(v, ivsub(p[j], ge_b));
+            v = ivmax(v, ivsub(lh, ge_a));
             if constexpr (Local) v = ivmax(v, z);
             if constexpr (Banded) { v = ivsel((jv >= lo) & (jv <= hi), v, ninf); jv += one; }
             h[j] = v;
@@ -435,13 +440,13 @@ static void inter_fill_affine(InterJobT<T>& J) noexcept {
             ivd d = pm[j - 1];
             d = ivmax(d, px[j - 1]);
             d = ivmax(d, py[j - 1]);
-            ivd mv = d + s;
+            ivd mv = ivadd(d, s);
             if constexpr (Local) mv = ivmax(mv, z);
-            ivd x = (pm[j] - go_b) - ge_b;
-            x = ivmax(x, px[j] - ge_b);
-            x = ivmax(x, (py[j] - go_b) - ge_b);
-            ivd open = (ivmax(lm, lx) - go_a) - ge_a;
-            ivd y = ivmax(open, ly - ge_a);
+            ivd x = ivsub(ivsub(pm[j], go_b), ge_b);
+            x = ivmax(x, ivsub(px[j], ge_b));
+            x = ivmax(x, ivsub(ivsub(py[j], go_b), ge_b));
+            ivd open = ivsub(ivsub(ivmax(lm, lx), go_a), ge_a);
+            ivd y = ivmax(open, ivsub(ly, ge_a));
             if constexpr (Banded) {
                 const ivl inb = (jv >= lo) & (jv <= hi);
                 mv = ivsel(inb, mv, ninf); x = ivsel(inb, x, ninf); y = ivsel(inb, y, ninf);
@@ -558,13 +563,13 @@ static void inter_score_affine(InterJobT<T>& J) noexcept {
             ivd d = dm;
             d = ivmax(d, dx);
             d = ivmax(d, dy);
-            ivd mv = d + s;
+            ivd mv = ivadd(d, s);
             if (local) mv = ivmax(mv, z);
-            ivd x = (um - go_b) - ge_b;
-            x = ivmax(x, ux - ge_b);
-            x = ivmax(x, (uy - go_b) - ge_b);
-            const ivd open = (ivmax(lm, lx) - go_a) - ge_a;
-            const ivd y = ivmax(open, ly - ge_a);
+            ivd x = ivsub(ivsub(um, go_b), ge_b);
+            x = ivmax(x, ivsub(ux, ge_b));
+            x = ivmax(x, ivsub(ivsub(uy, go_b), ge_b));
+            const ivd open = ivsub(ivsub(ivmax(lm, lx), go_a), ge_a);
+            const ivd y = ivmax(open, ivsub(ly, ge_a));
             VM[j] = mv; VX[j] = x; VY[j] = y;
             dm = um; dx = ux; dy = uy;
             lm = mv; lx = x; ly = y;
@@ -615,9 +620,9 @@ static void inter_score_linear(InterJobT<T>& J) noexcept {
         H[0] = lh;
         for (int j = 1; j <= n; ++j) {
             const ivd up = H[j];
-            ivd v = d + sub(P, j);
-            v = ivmax(v, up - ge_b);
-            v = ivmax(v, lh - ge_a);
+            ivd v = ivadd(d, sub(P, j));
+            v = ivmax(v, ivsub(up, ge_b));
+            v = ivmax(v, ivsub(lh, ge_a));
             if (local) v = ivmax(v, z);
             H[j] = v;
             d = up;
@@ -690,11 +695,11 @@ static void inter_score_affine_pos(InterJobT<T>& J) noexcept {
         for (int j = 1; j <= n; ++j) {
             const ivd s = sub(P, j);
             const ivd du = D[j], xu = X[j];                      // row i-1, column j
-            ivd mv = dd + s;
+            ivd mv = ivadd(dd, s);
             if (local) mv = ivmax(mv, z);
-            const ivd x = ivmax((du - go_b) - ge_b, xu - ge_b);
+            const ivd x = ivmax(ivsub(ivsub(du, go_b), ge_b), ivsub(xu, ge_b));
             const ivd mx = ivmax(mv, x);
-            const ivd y = ivmax((lmx - go_a) - ge_a, ly - ge_a);
+            const ivd y = ivmax(ivsub(ivsub(lmx, go_a), ge_a), ivsub(ly, ge_a));
             const ivd dn = ivmax(mx, y);
             D[j] = dn; X[j] = x;
             dd = du; lmx = mx; ly = y;

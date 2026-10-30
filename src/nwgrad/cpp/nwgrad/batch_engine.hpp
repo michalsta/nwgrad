@@ -739,12 +739,20 @@ private:
         const bool hb_case = !soft && AB == AlignBand::Full && is_hirschberg(tb_resolved_);
         std::vector<size_t> other, elig;
         size_t maxa = 0, maxb = 0;
+        // an nw_sat T: the params' bound facts, to keep pairs of the saturating regime off
+        // the inter-pair fill (inter_eligible_)
+        [[maybe_unused]] NwIntBound<T> sib;
+        if constexpr (nw_sat<T>) { std::vector<T> st, gp; nw_int_prepare<T>(params, params.num_sets(), st, gp, sib); }
         for (size_t i = 0; i < N; ++i) {
             const size_t la = problems[i].seq_a.size(), lb = problems[i].seq_b.size();
             if (la == 0 || lb == 0 || (hb_case && hb_splits(tb_resolved_, s_.traceback == TracebackMode::Default ? FullAl::kAutoPointerCells : 0, s_.hb_cutoff, la, lb)) ||
                 !inter_pair_fits(la, lb, GM == GapModel::Affine, soft, inter_w_(K), sizeof(T), K.d.inter_w)) {
                 other.push_back(i); continue;
             }
+            if constexpr (nw_sat<T>)
+                if (nw_int_bound_check<T, AM == AlignMode::Local, false>(sib, static_cast<int>(la), static_cast<int>(lb)) != 0) {
+                    other.push_back(i); continue;
+                }
             // the integer linear gather gate of inter_eligible_ (hard fills only; score-only
             // groups are gated by inter_score_ok in the loop)
             if constexpr (GM == GapModel::Linear)
@@ -985,13 +993,13 @@ private:
     struct OwnedParams {
         AlignParams p;
         std::vector<T> stack, gaps;
-        T step_max = T(-1);   // integer T: the largest step (nw_int_prepare); -1 = not prepared
+        NwIntBound<T> ib;     // integer T: the bound facts (nw_int_prepare); step_max -1 = not prepared
         const T* stack_or_null() const noexcept { return stack.empty() ? nullptr : stack.data(); }
     };
     std::shared_ptr<const OwnedParams> own_params_(const AlignParams& p) const {
-        auto o = std::make_shared<OwnedParams>(OwnedParams{p, {}, {}, T(-1)});
+        auto o = std::make_shared<OwnedParams>(OwnedParams{p, {}, {}, {}});
         if constexpr (nw_is_int<T>) {
-            nw_int_prepare<T>(p, p.num_sets(), o->stack, o->gaps, o->step_max);
+            nw_int_prepare<T>(p, p.num_sets(), o->stack, o->gaps, o->ib);
             return o;
         }
         if (!tracked_) return o;   // untracked (and standalone SeqPair): no allocation
@@ -1651,10 +1659,10 @@ private:
     [[gnu::always_inline]] inline void problem_(Al& al, size_t i, const OwnedParams& o, int band,
                                                 std::vector<int>&& guide) const {
         if (tracked_) al.set_problem(codes_a(i), codes_b(i), o.p, band, std::move(guide),
-                                     track(i), gap_track(i), o.stack_or_null(), o.gaps.data(), o.step_max);
+                                     track(i), gap_track(i), o.stack_or_null(), o.gaps.data(), &o.ib);
         else if constexpr (nw_is_int<T>)   // the prepared stack, gaps and step_max (no tracks)
             al.set_problem(codes_a(i), codes_b(i), o.p, band, std::move(guide), {}, {},
-                           o.stack_or_null(), o.gaps.data(), o.step_max);
+                           o.stack_or_null(), o.gaps.data(), &o.ib);
         else          al.set_problem(codes_a(i), codes_b(i), o.p, band, std::move(guide));
     }
     // The hard gradient and guide of the DP `al` just ran, into pair i, in one walk —
@@ -2075,6 +2083,11 @@ private:
     // Whether pair i joins an inter-pair fill on `backend` (else: its own fill).
     bool inter_eligible_(size_t i, const LevelKernels& K) const {
         if (len_a(i) == 0 || len_b(i) == 0) return false;
+        // An nw_sat pair past the quarter-range bound runs the saturating regime, which the
+        // inter-pair kernels do not have: its own fill (nw_int_bound_check, aligner.hpp).
+        if constexpr (nw_sat<T>)
+            if (nw_int_bound_check<T, AM == AlignMode::Local, false>(params_->ib, static_cast<int>(len_a(i)), static_cast<int>(len_b(i))) != 0)
+                return false;
         if (!inter_pair_fits(len_a(i), len_b(i), GM == GapModel::Affine,
                              grad_mode_ == GradMode::Soft, inter_w_(K), sizeof(T), K.d.inter_w))
             return false;

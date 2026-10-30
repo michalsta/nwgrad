@@ -190,11 +190,14 @@ def test_overflow_bound_per_width():
     alpha = "ACGT"
     m = np.where(np.eye(4, dtype=bool), 100.0, -100.0)
     p = nwgrad.AlignParams(nwgrad.SubstMatrix(m, alphabet=alpha), 50.0, 10.0, 50.0, 10.0)
-    a, b = "A" * 60, "C" * 60     # (60 + 60 + 66) * 100 > 8191: int16 refuses, int32 takes it
+    a, b = "A" * 200, "C" * 200   # 2 * 200 * 100 > 32767 (int16's value range); int32 takes it
     with pytest.raises(OverflowError, match="int16"):
         nwgrad.nw_score_affine_int16(a, b, p)
     with pytest.raises(OverflowError, match="int16"):
         nwgrad.SeqPairBatchInt16([a], [b], p).score_and_grad()
+    # within the value range, the old move-count rule no longer applies
+    a60, b60 = "A" * 60, "C" * 60   # (60 + 60 + 66) * 100 > 8191 once refused it
+    assert nwgrad.nw_score_affine_int16(a60, b60, p) == nwgrad.nw_score_affine_double(a60, b60, p)
     assert nwgrad.nw_score_affine_int32(a, b, p) == nwgrad.nw_score_affine_double(a, b, p)
     assert nwgrad.nw_score_affine_int64(a, b, p) == nwgrad.nw_score_affine_double(a, b, p)
     # a short problem fits int16
