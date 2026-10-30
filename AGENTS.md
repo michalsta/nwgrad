@@ -2114,6 +2114,12 @@ protein hard / stream float32 0.905 / 0.907 (avx2), 0.866 / 0.860 (sse4); double
 int16 hard 0.978 / 0.974, score-only 0.942 / 0.930, stream 0.999 / 0.972; DNA float32 /
 double / int32 0.96-1.014, but double stream avx2 1.034 -- `perf stat` on that arm: +0.1 %
 instructions, +1.1 % cycles in a direct rerun, i.e. placement and noise, not code.
+**Then the streaming `align()`** (`e22a827`): an integer T's params were prepared per pair
+(`nw_int_prepare`: the checked casts, now the bound facts too), 7 % of a 22 x 50 int16 DNA
+streaming step; a `StreamPrep` per worker prepares them once and every `set_problem()` of
+the loop takes them, as the batch's pairs do.  Stream arms, same harness (A/B, B/A): DNA
+int16 0.918 (avx2) / 0.900 (sse4), int32 0.942 / 0.940; protein int16 0.863 / 0.881, int32
+0.948 / 0.935; float32 / double DNA 0.99-1.01 (unchanged code); no other arm moved.
 
 **The four together** (`perf/smallint`, nighthaven, 1 thread, B/A against main `b0a075a`,
 controls 0.99-1.01; the `bench_int.py` arms: protein = 2000 30 %-mutated L200 BLOSUM62 11/1
