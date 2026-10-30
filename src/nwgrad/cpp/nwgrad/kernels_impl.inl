@@ -751,8 +751,11 @@ static inline void striped_profile_row_idx(T* dst, const T* row, const unsigned 
 // row's as the fill reaches it, into the single row reserved); untracked, one per
 // alphabet symbol — exactly the loop the untracked kernels always ran.  The slot index
 // lives past the rows, in `prof`'s own tail (sw bytes).
+// Not inlined: a separate function in every measured profile; inlined into a kernel's
+// entry (as gcc chose once its row lookup grew the shuffle form) it cost the float32
+// score-only step 3 % (nighthaven, perf: the build's symbol gone, the kernel 3 % longer).
 template <class T, bool Tr>
-static inline void striped_profile_build(typename DpBufferT<T>::TVec& prof, const T* blk,
+[[gnu::noinline]] static void striped_profile_build(typename DpBufferT<T>::TVec& prof, const T* blk,
                                          int nalpha, const unsigned char* b, int n, int seg, int W,
                                          const TrackJob<T>& tr) {
     const std::size_t sw = (std::size_t)seg * W;

@@ -292,7 +292,7 @@ void nw_int_prepare(const AlignParams& p, int K, std::vector<T>& stack, std::vec
 //   scan are Global sub-problems; its clamped cells are >= 0 and its negative gap cells
 //   never matter), which must stay above lowest().  A guide-banded Global value's paths
 //   are confined to the band, so it takes the move-count bound -(m + n + 66) * step_max.
-//   Finally the sentinel, lowest() in this regime (the aligner's NINF, nw_ninf_s in the
+//   Finally the sentinel, lowest() in this regime (the aligner's NINF(), nw_ninf_s in the
 //   kernels): it climbs by at most Hi + max(ramp, gob_pos) + goneg (it can only come to
 //   rest at lowest() below), and lowest() + that must stay below Lo.
 template <class T, bool Local, bool Banded>
@@ -1101,7 +1101,13 @@ private:
     // The soft path's sentinel (always double) and the hard path's (in T; see
     // scalar_traits.hpp: -inf for floating T, lowest()/2 for an integer T).
     static constexpr double NEG_INF = -std::numeric_limits<double>::infinity();
-    T                       NINF    = nw_ninf<T>;   // per problem: lowest() in the saturating regime (sat_)
+    // The problem's sentinel: a constant for every type but an nw_sat one, whose
+    // saturating regime (sat_) has its own -- a function, so the floating types keep it
+    // folded into the code (a member in its place cost the float32 score-only step 2 %).
+    [[gnu::always_inline]] T NINF() const noexcept {
+        if constexpr (nw_sat<T>) return sat_ ? std::numeric_limits<T>::lowest() : nw_ninf<T>;
+        else return nw_ninf<T>;
+    }
 
     // ── Problem state ─────────────────────────────────────────────────────────
     std::span<const uint8_t> a_idx_, b_idx_;   // alphabet indices, not characters
@@ -1596,7 +1602,6 @@ private:
     void int_bound_check_() {
         const int why = nw_int_bound_check<T, AM == AlignMode::Local, AB == AlignBand::GuideBanded>(ib_, m_, n_);
         sat_ = why == 1;
-        NINF = sat_ ? std::numeric_limits<T>::lowest() : nw_ninf<T>;
         if (why >= 0) return;
         const char* what = why == -1 ? "((m + n + 2 + 64 padding columns) * step exceeds the type's quarter range)"
                          : why == -2 ? "(the values a path can collect exceed the type's top)"
@@ -1928,14 +1933,14 @@ private:
                 int lo, hi; band_row_span(i, lo, hi);
                 auto* row = vec.data() + static_cast<size_t>(i) * stride_;
                 using E = typename V::value_type;   // the problem's sentinel for its own T
-                std::fill(row + lo, row + hi + 1, std::is_same_v<E, T> ? static_cast<E>(NINF) : nw_ninf<E>);
+                std::fill(row + lo, row + hi + 1, std::is_same_v<E, T> ? static_cast<E>(NINF()) : nw_ninf<E>);
             }
         }
     }
 
     // Fill `vec` with `value`.  Full: the whole (m+1)×(n+1) table.  GuideBanded:
     // only the band region (O(m·band)).  Element-generic: `value` is the table's own
-    // element type (NINF for the T tables, NEG_INF for the double soft tables).
+    // element type (NINF() for the T tables, NEG_INF for the double soft tables).
     template <class V> void band_fill(V& vec, typename V::value_type value) const {
         if constexpr (AB == AlignBand::Full) {
             std::fill(vec.begin(), vec.begin() + static_cast<ptrdiff_t>(sz_), value);
@@ -2853,11 +2858,11 @@ private:
 
         // ── row 0 ────────────────────────────────────────────────────────────
         for (std::size_t j = 0; j <= static_cast<std::size_t>(n_); ++j) {
-            if constexpr (AM == AlignMode::Local) { pM[j] = 0; pX[j] = NINF; pY[j] = NINF; }
+            if constexpr (AM == AlignMode::Local) { pM[j] = 0; pX[j] = NINF(); pY[j] = NINF(); }
             else {
-                pM[j] = (j == 0) ? static_cast<T>(0) : NINF;
-                pX[j] = NINF;
-                pY[j] = (j == 0) ? NINF : -(go_a + static_cast<T>(j) * ge_a);
+                pM[j] = (j == 0) ? static_cast<T>(0) : NINF();
+                pX[j] = NINF();
+                pY[j] = (j == 0) ? NINF() : -(go_a + static_cast<T>(j) * ge_a);
             }
             // row 0 is a start (M 3, X 0); Y along it extends leftward: (0,1) opens from
             // M(0,0), the rest extend Y.
@@ -2876,10 +2881,10 @@ private:
                 srow = blkT_ + static_cast<size_t>(rs_[static_cast<size_t>(i) - 1]) * static_cast<size_t>(nalpha_);
             }
             // column 0 of this row
-            if constexpr (AM == AlignMode::Local) { cM[0] = 0; cX[0] = NINF; }
-            else if constexpr (Tr) { cM[0] = NINF; cX[0] = tbx0_[static_cast<size_t>(i)]; }
-            else { cM[0] = NINF; cX[0] = -(go_b + static_cast<T>(i) * ge_b); }
-            cY[0] = NINF;
+            if constexpr (AM == AlignMode::Local) { cM[0] = 0; cX[0] = NINF(); }
+            else if constexpr (Tr) { cM[0] = NINF(); cX[0] = tbx0_[static_cast<size_t>(i)]; }
+            else { cM[0] = NINF(); cX[0] = -(go_b + static_cast<T>(i) * ge_b); }
+            cY[0] = NINF();
             D[rb] = (i <= 1) ? 3 : 3 | 1 << 2;   // M 3, Y 0; X: (1,0) opens from M(0,0), deeper rows extend
             T rowmax = static_cast<T>(0);   // Local: see local_row_best_
 
@@ -3016,14 +3021,14 @@ private:
         const int W = j1 - j0;
 
         // Row i0: the block's origin, then Y moves rightward along it.
-        pM[0] = in_x ? NINF : static_cast<T>(0);
+        pM[0] = in_x ? NINF() : static_cast<T>(0);
         // An inherited X run (in_x) may only CONTINUE: the origin feeds nothing but the
         // first row's column-0 X (below) — see hb_solve's note on boundary states.
-        pX[0] = NINF;
-        pY[0] = NINF;
+        pX[0] = NINF();
+        pY[0] = NINF();
         for (int c = 1; c <= W; ++c) {
-            pM[c] = NINF;
-            pX[c] = NINF;
+            pM[c] = NINF();
+            pX[c] = NINF();
             pY[c] = std::max({nw_sub(nw_sub(pM[c-1], go_a), ge_a), nw_sub(nw_sub(pX[c-1], go_a), ge_a), nw_sub(pY[c-1], ge_a)});
         }
 
@@ -3033,10 +3038,10 @@ private:
                 go_a = hb_go_a(r); ge_a = hb_ge_a(r); go_b = hb_go_b(r, false); ge_b = hb_ge_b(r, false);
                 if constexpr (Pmax) for (int k = 0; k <= W; ++k) rr[k] = static_cast<T>(k) * ge_a;
             }
-            cM[0] = NINF;
+            cM[0] = NINF();
             cX[0] = std::max({nw_sub(nw_sub(pM[0], go_b), ge_b), nw_sub(pX[0], ge_b), nw_sub(nw_sub(pY[0], go_b), ge_b)});
             if (in_x && r == i0 + 1) cX[0] = nw_sub(static_cast<T>(0), ge_b);   // the run continues
-            cY[0] = NINF;
+            cY[0] = NINF();
             // The running prefix max over Q[k] = g[k] + k*ge_a, seeded with the column-0
             // border folded in as k = -1.  Unused (and cold) when Pmax is false.
             T P = nw_sub(cY[0], ge_a);
@@ -3076,14 +3081,14 @@ private:
         const int W = j1 - j0;
 
         // Reversed column offset d = j1 - j, so d grows leftward from the block's end.
-        pM[0] = out_x ? NINF : static_cast<T>(0);
+        pM[0] = out_x ? NINF() : static_cast<T>(0);
         // A run continuing past the corner (out_x) must ENTER it vertically: the corner
         // feeds nothing but the first reversed row's column-0 X (below).
-        pX[0] = NINF;
-        pY[0] = NINF;
+        pX[0] = NINF();
+        pY[0] = NINF();
         for (int d = 1; d <= W; ++d) {
-            pM[d] = NINF;
-            pX[d] = NINF;
+            pM[d] = NINF();
+            pX[d] = NINF();
             pY[d] = std::max({nw_sub(nw_sub(pM[d-1], go_a), ge_a), nw_sub(nw_sub(pX[d-1], go_a), ge_a), nw_sub(pY[d-1], ge_a)});
         }
 
@@ -3093,10 +3098,10 @@ private:
                 go_a = hb_go_a(r); ge_a = hb_ge_a(r); go_b = hb_go_b(r + 1, true); ge_b = hb_ge_b(r + 1, true);
                 if constexpr (Pmax) for (int k = 0; k <= W; ++k) rr[k] = static_cast<T>(k) * ge_a;
             }
-            cM[0] = NINF;
+            cM[0] = NINF();
             cX[0] = std::max({nw_sub(nw_sub(pM[0], go_b), ge_b), nw_sub(pX[0], ge_b), nw_sub(nw_sub(pY[0], go_b), ge_b)});
             if (out_x && r == i1 - 1) cX[0] = nw_sub(static_cast<T>(0), ge_b);   // enters the corner vertically
-            cY[0] = NINF;
+            cY[0] = NINF();
             T P = nw_sub(cY[0], ge_a);
             for (int d = 1; d <= W; ++d) {
                 // Mirrored diagonal: this step pairs a[r] with b[j1-d], i.e. subT(r+1, j1-d+1).
@@ -3204,13 +3209,13 @@ private:
             return (vx >= vy) ? 1 : 2;
         };
 
-        pM[0] = in_x ? NINF : static_cast<T>(0);
-        pX[0] = NINF;   // in_x: only the first row's column-0 X continues it
-        pY[0] = NINF;
+        pM[0] = in_x ? NINF() : static_cast<T>(0);
+        pX[0] = NINF();   // in_x: only the first row's column-0 X continues it
+        pY[0] = NINF();
         D[0] = pack(3, 3, 3);
         for (int c = 1; c <= W; ++c) {
-            pM[c] = NINF;
-            pX[c] = NINF;
+            pM[c] = NINF();
+            pX[c] = NINF();
             const T uy = nw_sub(nw_sub(pM[c-1], go_a), ge_a), vy = nw_sub(nw_sub(pX[c-1], go_a), ge_a), wy = nw_sub(pY[c-1], ge_a);
             pY[c] = std::max({uy, vy, wy});
             D[c] = pack(3, 3, pick(uy, vy, wy));
@@ -3223,9 +3228,9 @@ private:
                 go_b = hb_go_b(i0 + r, false); ge_b = hb_ge_b(i0 + r, false);
             }
             const T ux0 = nw_sub(nw_sub(pM[0], go_b), ge_b), vx0 = nw_sub(pX[0], ge_b), wx0 = nw_sub(nw_sub(pY[0], go_b), ge_b);
-            cM[0] = NINF;
+            cM[0] = NINF();
             cX[0] = std::max({ux0, vx0, wx0});
-            cY[0] = NINF;
+            cY[0] = NINF();
             D[rb] = pack(3, pick(ux0, vx0, wx0), 3);
             if (in_x && r == 1) { cX[0] = nw_sub(static_cast<T>(0), ge_b); D[rb] = pack(3, 1, 3); }   // continues the run
             for (int c = 1; c <= W; ++c) {
@@ -3353,7 +3358,7 @@ private:
         // Tracked: the open refunded is that of the first row below the cut, DP row p+1
         // (see hb_reverse_rows_).
         const T go_b = tr_ ? tgob_[static_cast<size_t>(p) + 1] : static_cast<T>(params_->gap_open_b);
-        T best = NINF;
+        T best = NINF();
         int cstar = 0;
         bool span = false;
         for (int c = 0; c <= W; ++c) {
@@ -3362,7 +3367,7 @@ private:
             const T g = std::max({rM[d], rX[d], rY[d]});
             const T plain = nw_add(f, g);
             if (plain > best) { best = plain; cstar = c; span = false; }
-            if (FX[c] > NINF && rX[d] > NINF) {
+            if (FX[c] > NINF() && rX[d] > NINF()) {
                 const T joined = nw_add(nw_add(FX[c], rX[d]), go_b);
                 if (joined > best) { best = joined; cstar = c; span = true; }
             }
@@ -3487,11 +3492,11 @@ private:
 
         // Row 0.  Local: M = 0 for every column (fresh start anywhere).  Global: the
         // Y-gap-open series, so the reverse pass computes the suffixes' global alignment.
-        pM[0] = static_cast<T>(0); pX[0] = NINF; pY[0] = NINF;
+        pM[0] = static_cast<T>(0); pX[0] = NINF(); pY[0] = NINF();
         for (int c = 1; c <= NC; ++c) {
-            if (local) { pM[c] = static_cast<T>(0); pX[c] = NINF; pY[c] = NINF; }
+            if (local) { pM[c] = static_cast<T>(0); pX[c] = NINF(); pY[c] = NINF(); }
             else {
-                pM[c] = NINF; pX[c] = NINF;
+                pM[c] = NINF(); pX[c] = NINF();
                 pY[c] = std::max(nw_sub(nw_sub(std::max(pM[c-1], pX[c-1]), go_a), ge_a), nw_sub(pY[c-1], ge_a));
             }
         }
@@ -3505,9 +3510,9 @@ private:
                 go_b = hb_go_b(arow + 1, reverse); ge_b = hb_ge_b(arow + 1, reverse);
                 if (pmax) for (int k = 0; k < NC; ++k) rmp[k] = static_cast<T>(k) * ge_a;
             }
-            cM[0] = local ? static_cast<T>(0) : NINF;
+            cM[0] = local ? static_cast<T>(0) : NINF();
             cX[0] = std::max(std::max(nw_sub(nw_sub(pM[0], go_b), ge_b), nw_sub(pX[0], ge_b)), nw_sub(nw_sub(pY[0], go_b), ge_b));
-            cY[0] = NINF;
+            cY[0] = NINF();
             T P = nw_sub(cY[0], ge_a);   // Pmax: the running prefix max, the border as its seed
             for (int c = 1; c <= NC; ++c) {
                 const int bcol = b_start + (c - 1) * b_step;       // 0-based sequence col
@@ -3791,7 +3796,7 @@ private:
         lhb_sweep(buf, false, i0, p, j0, j1, buf.hsM.data());
         lhb_sweep(buf, true, p, i1, j0, j1, buf.hra.data());
         const T* F = buf.hsM.data(); const T* R = buf.hra.data();
-        T best = NINF;
+        T best = NINF();
         int cstar = 0;
         for (int c = 0; c <= W; ++c) {
             const T v = nw_add(F[c], R[W - c]);
@@ -4230,7 +4235,7 @@ private:
         T* pM = buf.qM.data(); T* pX = buf.qX.data(); T* pY = buf.qY.data();
         T* cM = buf.rM.data(); T* cX = buf.rX.data(); T* cY = buf.rY.data();
         constexpr bool local = AM == AlignMode::Local;
-        const T ninf = NINF;
+        const T ninf = NINF();
         pM[0] = static_cast<T>(0); pX[0] = ninf; pY[0] = ninf;
         for (int j = 1; j <= n_; ++j) {
             pM[j] = local ? static_cast<T>(0) : ninf;
@@ -4352,9 +4357,9 @@ private:
     }
     template <bool Tr>
     void viterbi_affine_impl(DpBuffer& buf) {
-        band_fill(buf.VM, NINF);
-        band_fill(buf.VX, NINF);
-        band_fill(buf.VY, NINF);
+        band_fill(buf.VM, NINF());
+        band_fill(buf.VX, NINF());
+        band_fill(buf.VY, NINF());
 
         // Gap penalties in the Viterbi precision T.  Converting once, up front, is what
         // makes this scalar fill bit-exact with the T-typed simd kernel: both then do
