@@ -206,6 +206,30 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
     T bM = 0, bX = K_NINF, bY = K_NINF;
     T best_local = 0; int best_i = 0, best_j = 0, best_tbl = 0;
     const T* pad = Local ? striped_pad_into(rows + 10 * rs, n, seg, W) : nullptr;
+    // Local with non-negative gap parameters (every row, when tracked): the row's best
+    // cell is an M cell, and the FIRST cell reaching the row's maximum (column order) is
+    // an M cell too -- a gap cell never exceeds the cell it extends from (X from the cell
+    // above, already <= the running best; Y from the cell to its left, an earlier column
+    // of this row), so a cell equal to the row's maximum that is not an M has an earlier
+    // one that is.  So the maximum and its first segment are tracked per lane on the M
+    // values pass 1 has in registers (a compare, a blend and a max per segment), and
+    // the row is reduced only when it beats the running best; striped_row_best's
+    // separate pass over M, X, Y and the padding mask (17 % of an int16 Local L200 hard
+    // step on AVX2: nighthaven, perf, 2026-10-30) runs only for negative gap parameters.
+    // The padding M (an imaginary column scoring 0) is at most the cell above it, which
+    // is at most the running best, so it never wins a strict comparison and needs no mask.
+    bool monly = false;
+    if constexpr (Local) {
+        if constexpr (Tr) {
+            monly = true;
+            for (int r = 0; r <= m; ++r) {
+                monly = monly && tr.go_a[r] >= T(0) && tr.ge_a[r] >= T(0);
+                if (r > 0) monly = monly && tr.go_b[r] >= T(0) && tr.ge_b[r] >= T(0);
+            }
+        } else {
+            monly = go_a >= T(0) && ge_a >= T(0) && go_b >= T(0) && ge_b >= T(0);
+        }
+    }
 
     for (int i = 1; i <= m; ++i) {
         if constexpr (Tr) {
@@ -240,6 +264,7 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                 dgY = lane_shift_in(lY, bY);
             }
             vd accM = vzero, accX = vzero;   // Dense: this group's M / X codes so far
+            [[maybe_unused]] vd lmax(K_NINF), ls(vzero), vs(vzero);   // monly: per-lane row best over M
             // One segment of pass 1.  R: its place in a dense group.  kWeighted: the codes come out
             // already weighted for the group's byte (segment R at shift 2*(3-R), dense_code_at), so
             // accumulating costs one add a plane where 4*acc + k cost three dependent adds (NEON
@@ -293,6 +318,18 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
 #endif
                 }
                 vmv.copy_to(cM + off + (std::size_t)s * W, stdx::element_aligned);
+                if constexpr (Local) {
+                    if (monly) {
+#if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
+                        if constexpr (sizeof(T) == 8) ls = avx512d_blend(avx512d_gt(vmv, lmax), ls, vs);
+                        else                          stdx::where(vmv > lmax, ls) = vs;
+#else
+                        stdx::where(vmv > lmax, ls) = vs;
+#endif
+                        lmax = stdx::max(lmax, vmv);
+                        vs += vone;
+                    }
+                }
 
                 vd uM, uX, uY;
                 uM.copy_from(pM + off + (std::size_t)s * W, stdx::element_aligned);
@@ -480,9 +517,35 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                 store_codes<T, W>(kmx + k, dP + (std::size_t)s * W);
             }
 
-            if constexpr (Local)
-                striped_row_best<T>(cM + off, cX + off, cY + off, pad, seg, i,
-                                    best_local, best_i, best_j, best_tbl);
+            if constexpr (Local) {
+                if (monly) {
+                    // the row's maximum over M and its first cell (striped_row_best's
+                    // reduction; floating T keeps the scalar form, whose std::max keeps the
+                    // first of two equal values and so the sign of a zero)
+                    T rmax; int l;
+#if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
+                    constexpr bool vec_reduce = nw_is_int<T> && sizeof(T) != 8;
+#else
+                    constexpr bool vec_reduce = nw_is_int<T>;
+#endif
+                    if constexpr (vec_reduce) {
+                        rmax = stdx::hmax(lmax);
+                        l = (rmax > best_local) ? stdx::find_first_set(lmax == rmax) : -1;
+                    } else {
+                        rmax = lmax[0];
+                        for (int q = 1; q < W; ++q) rmax = std::max(rmax, T(lmax[q]));
+                        l = -1;
+                        if (rmax > best_local) { l = 0; while (!(lmax[l] == rmax)) ++l; }
+                    }
+                    if (l >= 0) {
+                        const int sb = (int)ls[l];
+                        best_local = rmax; best_i = i; best_j = l * seg + sb + 1; best_tbl = 0;
+                    }
+                } else {
+                    striped_row_best<T>(cM + off, cX + off, cY + off, pad, seg, i,
+                                        best_local, best_i, best_j, best_tbl);
+                }
+            }
         }
         bM = nbM; bX = nbX; bY = K_NINF;
         std::swap(pM, cM); std::swap(pX, cX); std::swap(pY, cY);
