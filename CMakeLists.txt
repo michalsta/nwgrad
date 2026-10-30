@@ -73,13 +73,21 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
     # gcc it comes with its own loop/jump alignment off, which otherwise pins small loops to
     # fixed offsets and, combined with the padding, cost nighthaven float32 cells 6-9%; as here,
     # nighthaven geomean 1.002 over 116 cells (worst 0.966), solace 0.98-1.02.
-    set(NWGRAD_JCC_OPTS
-        "$<$<CXX_COMPILER_ID:GNU>:-Wa,-mbranches-within-32B-boundaries;-falign-functions=32;-falign-loops=1;-falign-jumps=1;-falign-labels=1>"
-        "$<$<CXX_COMPILER_ID:Clang,AppleClang>:-mbranches-within-32B-boundaries>")
+    #
+    # Under gcc it covers every TU of the extension (applied to the target below), not only
+    # the level TUs: the scalar fills in py_exports.cpp have the same exposure, and padding
+    # only the level TUs moves them by itself.  Every TU vs level TUs only: oldsolace 1.007
+    # (42 cells faster, none slower), nighthaven 1.000 (worst 0.986).  Under clang it stays on
+    # the level TUs: its padding is NOPs, some inside hot loops, and the gain is a reshuffle —
+    # level TUs vs none, oldsolace 1.001 (28 faster, 16 slower), nighthaven 0.997 (worst 0.94);
+    # every TU, nighthaven float32 cells down to 0.952.
+    set(NWGRAD_JCC_GNU_OPTS
+        "-Wa,-mbranches-within-32B-boundaries;-falign-functions=32;-falign-loops=1;-falign-jumps=1;-falign-labels=1")
+    set(NWGRAD_JCC_CLANG_OPTS "$<$<CXX_COMPILER_ID:Clang,AppleClang>:-mbranches-within-32B-boundaries>")
     set_source_files_properties(${NWGRAD_LEVEL_DIR}/level_avx2.cpp    PROPERTIES
-        COMPILE_OPTIONS "-mavx2;-mfma;${NWGRAD_JCC_OPTS}")
+        COMPILE_OPTIONS "-mavx2;-mfma;${NWGRAD_JCC_CLANG_OPTS}")
     set_source_files_properties(${NWGRAD_LEVEL_DIR}/level_avx512.cpp  PROPERTIES
-        COMPILE_OPTIONS "-mavx512f;-mavx512dq;-mavx512vl;-mavx512bw;${NWGRAD_JCC_OPTS}")
+        COMPILE_OPTIONS "-mavx512f;-mavx512dq;-mavx512vl;-mavx512bw;${NWGRAD_JCC_CLANG_OPTS}")
 elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
     # NEON is mandatory baseline on AArch64 — one level, no runtime dispatch.
     set(NWGRAD_LEVEL_SOURCES
@@ -92,6 +100,9 @@ nanobind_add_module(nwgrad_ext
     src/nwgrad/cpp/nwgrad/py_exports.cpp
     src/nwgrad/cpp/nwgrad/logistic/py_logistic.cpp
     ${NWGRAD_LEVEL_SOURCES})
+if (DEFINED NWGRAD_JCC_GNU_OPTS)
+    target_compile_options(nwgrad_ext PRIVATE "$<$<CXX_COMPILER_ID:GNU>:${NWGRAD_JCC_GNU_OPTS}>")
+endif()
 # clang's SLP vectorizer, in the TU that holds the scalar code (every Aligner fill,
 # traceback and walk; scalar_fallback; the linear Pointers fill at every level): it packs
 # pairs of independent scalar chains (the X and Y updates, the argmax operands) into
