@@ -2107,11 +2107,26 @@ pairs, DNA = 20k related 22 x 50 pairs, Local affine):
 | DNA stream | 1.003 / 1.026 / 0.999 / 1.005 / 0.999 | 1.010 / 0.997 / 0.997 / 1.013 / 0.975 | 1.002 / 1.003 / 1.016 / 0.996 / 0.995 |
 
 The hard-step gains on every type are the Local row best; the int16 score-only gain the
-profile build; the DNA int16 gains the mask build.  The DNA cells above 1.01 (double stream
-avx2 1.026, float32 score sse4 1.020, int16 stream sse2 1.016) were re-measured with five
-rounds: see the paragraph after the 12-thread table.  Checks on the combined branch:
-the C++ suite (2.93 M assertions, 201 cases) and the Python suite (4497) on skynet, ASan +
-UBSan on the integer cases, `tools/fuzz_ab.py` main vs branch (300 seeds, 0 differ).
+profile build; the DNA int16 gains the mask build.  The DNA cells above 1.01 were
+re-measured with five rounds (A'/A 0.997-1.005): double stream avx2 1.021, float32 score /
+stream sse4 1.016 / 1.013, the rest 0.98-1.01 -- the mask build at FOUR lanes (double on
+AVX2, float32 at 128 bits), which gained nothing there; it is now taken from 8 lanes on,
+and those types keep their old code.  12 threads (avx2; the control arm itself read
+1.07-1.13 across the two rounds, so +-10 %): protein hard / stream float32 0.94 / 0.95,
+double 0.94 / 0.94, int16 0.90 / 0.92, int32 0.95 / 0.95; int16 score-only 0.87; DNA
+0.97-1.01.  Global mode (1 thread, avx2): int16 protein hard 0.928, score-only 0.913,
+stream 0.958; float32 / double / int32 0.99-1.01 (no row best in Global); DNA int16
+score-only 0.932.  Linear gaps: int16 protein hard 0.911, score-only 0.862, stream 0.938;
+DNA int16 hard 0.961, score-only 0.929; the rest 0.98-1.01.
+**Against parasail** (`tools/bench_parasail.py`, nighthaven avx2, 1 thread, parasail
+time / nwgrad time): L1000 BLOSUM62 11/1, int16 score-only -- the fixture parasail used to
+win because nwgrad refused int16 there -- Global 93.5 us a pair (10.7 Gcell/s) against
+scan16 145 (1.55x) and striped16 512 (5.5x); Local 109 against 175 (1.60x) and 360 (3.3x);
+int16 path + gradient 275 / 330 against striped16 trace 1978 / 1509 (7.2x / 4.6x).  L200:
+int16 score 5.3 / 5.6 us against scan16 12.1 / 13.7 (2.3x / 2.4x).
+Checks on the combined branch: the C++ suite (2.93 M assertions, 201 cases) and the Python
+suite (4497) on skynet, ASan + UBSan on the integer cases, `tools/fuzz_ab.py` main vs
+branch (300 seeds, 0 differ).
 
 ### The soft path: scaled probability space (2026-10-05)
 

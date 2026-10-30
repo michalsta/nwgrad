@@ -134,8 +134,10 @@ struct InterCommon {
         // Two loops, not one: the W byte stores of a column followed at once by one
         // W-byte load of the same bytes is a store-forwarding stall per column (3-6 % of
         // a 22 x 50 DNA step at 4-8 lanes, nighthaven 2026-10-30); transposed in full
-        // first, the loads find their bytes in L1.
-        if constexpr (IW >= 4) {
+        // first, the loads find their bytes in L1.  From 8 lanes: at 4 (double on AVX2,
+        // float32 / int32 at 128 bits) the lane-by-lane build is as cheap, and this form
+        // read 1.01-1.02 on the DNA double / float32 arms (5 rounds, nighthaven).
+        if constexpr (IW >= 8) {
             using E = std::remove_cvref_t<decltype(ivl{}[0])>;
             typedef unsigned char u8v __attribute__((vector_size(IW)));
             constexpr int EB = 8 * sizeof(E);
