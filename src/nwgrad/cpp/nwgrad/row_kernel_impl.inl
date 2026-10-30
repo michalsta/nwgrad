@@ -55,17 +55,17 @@ inline constexpr int ROW_BLOCK = (KW >= 4) ? 64 : 256;
             T d = vm_prev[j - 1];                                         \
             d = std::max(d, vx_prev[j - 1]);                                   \
             d = std::max(d, vy_prev[j - 1]);                                   \
-            T mv = nw_add<T>(d, subrow[j]);                               \
+            T mv = SUB_ADD(d, subrow[j]);                                 \
             if (LOCAL) mv = std::max(mv, T(0));                                 \
-            T x = nw_sub<T>(nw_sub<T>(vm_prev[j], go_b), ge_b);             \
-            x = std::max<T>(x, nw_sub<T>(vx_prev[j], ge_b));                   \
-            x = std::max<T>(x, nw_sub<T>(nw_sub<T>(vy_prev[j], go_b), ge_b));  \
+            T x = SUB_SUB(SUB_SUB(vm_prev[j], go_b), ge_b);                \
+            x = std::max<T>(x, SUB_SUB(vx_prev[j], ge_b));                     \
+            x = std::max<T>(x, SUB_SUB(SUB_SUB(vy_prev[j], go_b), ge_b));      \
             vm_cur[j] = mv;                                                    \
             vx_cur[j] = x;                                                     \
         }                                                                     \
         for (int j = base; j <= end; ++j) {          /* serial VY carry */     \
-            T open = nw_sub<T>(nw_sub<T>(std::max(vm_cur[j - 1], vx_cur[j - 1]), go_a), ge_a); \
-            vy_cur[j] = std::max<T>(open, nw_sub<T>(vy_cur[j - 1], ge_a));      \
+            T open = SUB_SUB(SUB_SUB(std::max(vm_cur[j - 1], vx_cur[j - 1]), go_a), ge_a); \
+            vy_cur[j] = std::max<T>(open, SUB_SUB(vy_cur[j - 1], ge_a));        \
         }                                                                     \
     }                                                                         \
     if (LOCAL) {                                                              \
@@ -78,9 +78,13 @@ inline constexpr int ROW_BLOCK = (KW >= 4) ? 64 : 256;
     return nw_ninf<T>;
 
 // Templated on the scalar type T (double, float, the integer types); the body is the
-// same max/add/subtract per T.
-template <class T>
-static T banded_row_global(
+// same max/add/subtract per T.  Sat: the saturating regime of an nw_sat T (the row's
+// values clamp at the bottom, nw_sub / nw_add); the plain body otherwise, so the loops
+// the compiler vectorizes are the ones they always were.
+#define SUB_SUB(a, b) (Sat ? nw_sub<T>((a), (b)) : static_cast<T>((a) - (b)))
+#define SUB_ADD(a, b) (Sat ? nw_add<T>((a), (b)) : static_cast<T>((a) + (b)))
+template <class T, bool Sat>
+static T banded_row_global_(
     T* __restrict vm_cur, T* __restrict vx_cur, T* __restrict vy_cur,
     const T* __restrict vm_prev, const T* __restrict vx_prev,
     const T* __restrict vy_prev, const T* __restrict subrow,
@@ -89,14 +93,42 @@ static T banded_row_global(
     NWGRAD_BANDED_ROW_BODY(0)
 }
 
-template <class T>
-static T banded_row_local(
+template <class T, bool Sat>
+static T banded_row_local_(
     T* __restrict vm_cur, T* __restrict vx_cur, T* __restrict vy_cur,
     const T* __restrict vm_prev, const T* __restrict vx_prev,
     const T* __restrict vy_prev, const T* __restrict subrow,
     int lo, int hi, int blk,
     T go_a, T ge_a, T go_b, T ge_b) noexcept {
     NWGRAD_BANDED_ROW_BODY(1)
+}
+#undef SUB_SUB
+#undef SUB_ADD
+
+// The registered entries: `sat` (the aligner's regime) picks the saturating body for an
+// nw_sat T; every other T has only the plain one.
+template <class T>
+static T banded_row_global(
+    T* __restrict vm_cur, T* __restrict vx_cur, T* __restrict vy_cur,
+    const T* __restrict vm_prev, const T* __restrict vx_prev,
+    const T* __restrict vy_prev, const T* __restrict subrow,
+    int lo, int hi, int blk,
+    T go_a, T ge_a, T go_b, T ge_b, bool sat) noexcept {
+    if constexpr (nw_sat<T>) { if (sat) return banded_row_global_<T, true>(vm_cur, vx_cur, vy_cur, vm_prev, vx_prev, vy_prev, subrow, lo, hi, blk, go_a, ge_a, go_b, ge_b); }
+    else (void)sat;
+    return banded_row_global_<T, false>(vm_cur, vx_cur, vy_cur, vm_prev, vx_prev, vy_prev, subrow, lo, hi, blk, go_a, ge_a, go_b, ge_b);
+}
+
+template <class T>
+static T banded_row_local(
+    T* __restrict vm_cur, T* __restrict vx_cur, T* __restrict vy_cur,
+    const T* __restrict vm_prev, const T* __restrict vx_prev,
+    const T* __restrict vy_prev, const T* __restrict subrow,
+    int lo, int hi, int blk,
+    T go_a, T ge_a, T go_b, T ge_b, bool sat) noexcept {
+    if constexpr (nw_sat<T>) { if (sat) return banded_row_local_<T, true>(vm_cur, vx_cur, vy_cur, vm_prev, vx_prev, vy_prev, subrow, lo, hi, blk, go_a, ge_a, go_b, ge_b); }
+    else (void)sat;
+    return banded_row_local_<T, false>(vm_cur, vx_cur, vy_cur, vm_prev, vx_prev, vy_prev, subrow, lo, hi, blk, go_a, ge_a, go_b, ge_b);
 }
 
 #undef NWGRAD_BANDED_ROW_BODY

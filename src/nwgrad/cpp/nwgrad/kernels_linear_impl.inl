@@ -37,7 +37,7 @@
 
 // Local: the best cell of one striped row of ONE table — striped_row_best over H alone
 // (same contract: topmost row by strict `>`, leftmost column; padding masked by pad[]).
-template <class T>
+template <class T, bool Sat = false>
 static inline void striped_row_best1(const T* cH, const T* pad, int seg, int i,
                                      T& best, int& bi, int& bj) {
     using vt = stdx::native_simd<T>;
@@ -50,7 +50,7 @@ static inline void striped_row_best1(const T* cH, const T* pad, int seg, int i,
         vt h, vp;
         h.copy_from(cH + o, stdx::element_aligned);
         vp.copy_from(pad + o, stdx::element_aligned);
-        h = vadd(h, vp);
+        h = vadd<Sat>(h, vp);
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
         if constexpr (sizeof(T) == 8) ls = avx512d_blend(avx512d_gt(h, lmax), ls, vs);
         else                          stdx::where(h > lmax, ls) = vs;
@@ -87,7 +87,7 @@ static inline void striped_row_best1(const T* cH, const T* pad, int seg, int i,
 // Dense (Ptr only): the same codes, four segments' worth a byte (dense_codes_row_bytes,
 // simd_levels.hpp: 0.25 B/cell), for the memory-bound regime -- each lane accumulates its
 // 2-bit codes by Horner over a group of four segments and stores one byte per lane a group.
-template <class T, bool Local, bool Ptr, bool Tr, bool Dense = false>
+template <class T, bool Local, bool Ptr, bool Tr, bool Dense = false, bool Sat = false>
 static void striped_linear_full(ViterbiJob<T>& job) {
     static_assert(!Dense || (Ptr && sizeof(T) >= 4), "dense codes: pointer fill, lanes >= 32 bits");
     using vd = stdx::native_simd<T>;
@@ -205,9 +205,9 @@ static void striped_linear_full(ViterbiJob<T>& job) {
                 // length and thread count) and bought nothing on AVX2 (0.99-1.01, nighthaven).
                 if constexpr (nw_is_int<T>)
                     if (s > 0) dg.copy_from(pH + off + (std::size_t)(s - 1) * W, stdx::element_aligned);
-                const vd d0 = vadd(dg, sb);
+                const vd d0 = vadd<Sat>(dg, sb);
                 if constexpr (!nw_is_int<T>) dg = up;   // the next segment's diagonal
-                const vd u  = vsub(up, vge_b);
+                const vd u  = vsub<Sat>(up, vge_b);
                 vd t = stdx::max(d0, u);
                 if constexpr (Ptr) {
                     vd k = vzero;                        // diagonal unless up is STRICTLY larger
@@ -222,7 +222,7 @@ static void striped_linear_full(ViterbiJob<T>& job) {
                 if constexpr (Local) t = stdx::max(t, vzero);
                 t.copy_to(cH + off + (std::size_t)s * W, stdx::element_aligned);
                 if constexpr (nw_is_int<T> && W >= 4)   // the integer carry reads the opens; the floating one recomputes them
-                    (vsub(t, vge_a)).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
+                    (vsub<Sat>(t, vge_a)).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
             }
 
             // ── the carry: Y[c] = max(open[c-1], Y[c-1] - ge_a) along each lane ──
@@ -234,10 +234,10 @@ static void striped_linear_full(ViterbiJob<T>& job) {
                 // bits pass 1 stores in `ov` for the integer carry; one stream fewer per segment.
                 auto open_at = [&](int q) __attribute__((always_inline)) {
                     vd t; t.copy_from(cH + off + (std::size_t)q * W, stdx::element_aligned);
-                    return vd(vsub(t, vge_a));
+                    return vd(vsub<Sat>(t, vge_a));
                 };
                 vd prev = vninf;                         // column 0 holds no Y
-                prev = carry_pass(seg, prev, vge_a,
+                prev = carry_pass<Sat>(seg, prev, vge_a,
                     [&](int s) NWGRAD_ALWAYS_INLINE_LAMBDA {
                         const int q = s == 0 ? seg - 1 : s - 1;
                         const vd O = open_at(q);
@@ -248,7 +248,7 @@ static void striped_linear_full(ViterbiJob<T>& job) {
                     });
                 for (int r = 0; r < W; ++r) {            // lazy-F: extend across the lane boundary
                     vd last; last.copy_from(yv + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                    vd F = vsub(lane_shift_in(last, K_NINF), vge_a);
+                    vd F = vsub<Sat>(lane_shift_in(last, K_NINF), vge_a);
                     bool changed = false;
                     for (int s = 0; s < seg; ++s) {
                         vd v; v.copy_from(yv + (std::size_t)s * W, stdx::element_aligned);
@@ -260,7 +260,7 @@ static void striped_linear_full(ViterbiJob<T>& job) {
 #endif
                         v = stdx::max(v, F);
                         v.copy_to(yv + (std::size_t)s * W, stdx::element_aligned);
-                        F = lazy_f_next(F, v, vge_a);
+                        F = lazy_f_next<Sat>(F, v, vge_a);
                         changed = true;
                     }
                     if (!changed) break;
@@ -312,7 +312,7 @@ static void striped_linear_full(ViterbiJob<T>& job) {
                 acc = vzero;
             }
             }   // groups
-            if constexpr (Local) striped_row_best1<T>(cH + off, pad, seg, i, best_local, best_i, best_j);
+            if constexpr (Local) striped_row_best1<T, Sat>(cH + off, pad, seg, i, best_local, best_i, best_j);
         }
 
         if constexpr (Ptr) std::swap(pH, cH);
@@ -344,38 +344,38 @@ static constexpr bool linear_kernel_pays() {
     return !(nw_is_int<T> && sizeof(T) == 8 && stdx::native_simd<T>::size() < 8);
 }
 
-template <class T>
-static void striped_linear_entry(ViterbiJob<T>& job) {
+template <class T, bool Sat>
+static void striped_linear_entry_impl(ViterbiJob<T>& job) {
     if (job.tr.on()) {
-        if (job.align_mode) striped_linear_full<T, true, false, true>(job);
-        else                striped_linear_full<T, false, false, true>(job);
+        if (job.align_mode) striped_linear_full<T, true, false, true, false, Sat>(job);
+        else                striped_linear_full<T, false, false, true, false, Sat>(job);
         return;
     }
-    if (job.align_mode) striped_linear_full<T, true, false, false>(job);
-    else                striped_linear_full<T, false, false, false>(job);
+    if (job.align_mode) striped_linear_full<T, true, false, false, false, Sat>(job);
+    else                striped_linear_full<T, false, false, false, false, Sat>(job);
 }
-template <class T>
-static void striped_linear_ptr_entry(ViterbiJob<T>& job) {
+template <class T, bool Sat>
+static void striped_linear_ptr_entry_impl(ViterbiJob<T>& job) {
     if constexpr (sizeof(T) >= 4) {
         if (job.dense) {
             if (job.tr.on()) {
-                if (job.align_mode) striped_linear_full<T, true, true, true, true>(job);
-                else                striped_linear_full<T, false, true, true, true>(job);
+                if (job.align_mode) striped_linear_full<T, true, true, true, true, Sat>(job);
+                else                striped_linear_full<T, false, true, true, true, Sat>(job);
             } else {
-                if (job.align_mode) striped_linear_full<T, true, true, false, true>(job);
-                else                striped_linear_full<T, false, true, false, true>(job);
+                if (job.align_mode) striped_linear_full<T, true, true, false, true, Sat>(job);
+                else                striped_linear_full<T, false, true, false, true, Sat>(job);
             }
             return;
         }
     }
     job.dense = 0;
     if (job.tr.on()) {
-        if (job.align_mode) striped_linear_full<T, true, true, true>(job);
-        else                striped_linear_full<T, false, true, true>(job);
+        if (job.align_mode) striped_linear_full<T, true, true, true, false, Sat>(job);
+        else                striped_linear_full<T, false, true, true, false, Sat>(job);
         return;
     }
-    if (job.align_mode) striped_linear_full<T, true, true, false>(job);
-    else                striped_linear_full<T, false, true, false>(job);
+    if (job.align_mode) striped_linear_full<T, true, true, false, false, Sat>(job);
+    else                striped_linear_full<T, false, true, false, false, Sat>(job);
 }
 
 // ── Linear Hirschberg: the sweeps, the base case and the Local endpoint scans ──────
@@ -390,7 +390,17 @@ static void striped_linear_ptr_entry(ViterbiJob<T>& job) {
 // 2 left where Y strictly exceeds U.  Argmax as the scalar scans run it: strict `>`, rows
 // in order, column 0 first (argmax == 2), then columns left to right.
 template <class T>
-static void lhb_striped(LhbJob<T>& job) {
+static void striped_linear_entry(ViterbiJob<T>& job) {
+    if constexpr (nw_sat<T>) { if (job.sat) { striped_linear_entry_impl<T, true>(job); return; } }
+    striped_linear_entry_impl<T, false>(job);
+}
+template <class T>
+static void striped_linear_ptr_entry(ViterbiJob<T>& job) {
+    if constexpr (nw_sat<T>) { if (job.sat) { striped_linear_ptr_entry_impl<T, true>(job); return; } }
+    striped_linear_ptr_entry_impl<T, false>(job);
+}
+template <class T, bool Sat>
+static void lhb_striped_impl(LhbJob<T>& job) {
     using vd = stdx::native_simd<T>;
     constexpr int W = (int)vd::size();
     const T K_NINF = nw_ninf<T>;
@@ -475,9 +485,9 @@ static void lhb_striped(LhbJob<T>& job) {
                 // length and thread count) and bought nothing on AVX2 (0.99-1.01, nighthaven).
                 if constexpr (nw_is_int<T>)
                     if (s > 0) dg.copy_from(pH + off + (std::size_t)(s - 1) * W, stdx::element_aligned);
-                const vd d0 = vadd(dg, sb);
+                const vd d0 = vadd<Sat>(dg, sb);
                 if constexpr (!nw_is_int<T>) dg = up;   // the next segment's diagonal
-                const vd u = vsub(up, vgb);
+                const vd u = vsub<Sat>(up, vgb);
                 vd t = stdx::max(d0, u);
                 if (D) {
                     vd k = vzero;
@@ -492,7 +502,7 @@ static void lhb_striped(LhbJob<T>& job) {
                 if (job.clamp) t = stdx::max(t, vzero);
                 t.copy_to(cH + off + (std::size_t)s * W, stdx::element_aligned);
                 if constexpr (nw_is_int<T> && W >= 4)   // the integer carry reads the opens; the floating one recomputes them
-                    (vsub(t, vga)).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
+                    (vsub<Sat>(t, vga)).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
             }
 
             if constexpr (nw_is_int<T> && W >= 4) {
@@ -503,10 +513,10 @@ static void lhb_striped(LhbJob<T>& job) {
                 // bits pass 1 stores in `ov` for the integer carry; one stream fewer per segment.
                 auto open_at = [&](int q) __attribute__((always_inline)) {
                     vd t; t.copy_from(cH + off + (std::size_t)q * W, stdx::element_aligned);
-                    return vd(vsub(t, vga));
+                    return vd(vsub<Sat>(t, vga));
                 };
                 vd prev = vninf;
-                prev = carry_pass(seg, prev, vga,
+                prev = carry_pass<Sat>(seg, prev, vga,
                     [&](int s) NWGRAD_ALWAYS_INLINE_LAMBDA {
                         const int q = s == 0 ? seg - 1 : s - 1;
                         const vd O = open_at(q);
@@ -517,7 +527,7 @@ static void lhb_striped(LhbJob<T>& job) {
                     });
                 for (int rr = 0; rr < W; ++rr) {
                     vd last; last.copy_from(yv + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                    vd F = vsub(lane_shift_in(last, K_NINF), vga);
+                    vd F = vsub<Sat>(lane_shift_in(last, K_NINF), vga);
                     bool changed = false;
                     for (int s = 0; s < seg; ++s) {
                         vd v; v.copy_from(yv + (std::size_t)s * W, stdx::element_aligned);
@@ -529,7 +539,7 @@ static void lhb_striped(LhbJob<T>& job) {
 #endif
                         v = stdx::max(v, F);
                         v.copy_to(yv + (std::size_t)s * W, stdx::element_aligned);
-                        F = lazy_f_next(F, v, vga);
+                        F = lazy_f_next<Sat>(F, v, vga);
                         changed = true;
                     }
                     if (!changed) break;
@@ -554,7 +564,7 @@ static void lhb_striped(LhbJob<T>& job) {
             if (job.argmax) {
                 int ri = 0, rj = 0;
                 const T before = best;
-                striped_row_best1<T>(cH + off, pad, seg, r, best, ri, rj);
+                striped_row_best1<T, Sat>(cH + off, pad, seg, r, best, ri, rj);
                 if (best > before) { bi = ri; bj = rj; }
             }
         }
@@ -567,4 +577,10 @@ static void lhb_striped(LhbJob<T>& job) {
     }
     job.best = best; job.bi = bi; job.bj = bj;
     job.seg = seg; job.width = W;
+}
+
+template <class T>
+static void lhb_striped(LhbJob<T>& job) {
+    if constexpr (nw_sat<T>) { if (job.sat) { lhb_striped_impl<T, true>(job); return; } }
+    lhb_striped_impl<T, false>(job);
 }

@@ -67,48 +67,11 @@ template <class V> static inline V ivmax(V a, V b) noexcept {
     return a < b ? b : a;
 }
 template <class L, class V> static inline V ivsel(L m, V a, V b) noexcept { return m ? a : b; }
-// Lane-wise add / subtract: saturating for the nw_sat lane type (int16; the packed
-// saturating instructions, kernels_impl.inl's vadd / vsub for std::simd), plain otherwise.
-template <class V> [[gnu::always_inline]] static inline V ivsub(V a, V b) noexcept {
-    using E = std::remove_cvref_t<decltype(a[0])>;
-    if constexpr (nw_sat<E>) {
-#if defined(__AVX512BW__)
-        if constexpr (sizeof(V) == 64) return (V)_mm512_subs_epi16((__m512i)a, (__m512i)b);
-#endif
-#if defined(__AVX2__)
-        if constexpr (sizeof(V) == 32) return (V)_mm256_subs_epi16((__m256i)a, (__m256i)b);
-#endif
-#if defined(__SSE2__)
-        if constexpr (sizeof(V) == 16) return (V)_mm_subs_epi16((__m128i)a, (__m128i)b);
-#endif
-#if defined(__ARM_NEON)
-        if constexpr (sizeof(V) == 16) return (V)vqsubq_s16((int16x8_t)a, (int16x8_t)b);
-#endif
-        V r; for (unsigned l = 0; l < sizeof(V) / sizeof(E); ++l) r[l] = nw_sub<E>(a[l], b[l]); return r;
-    } else {
-        return a - b;
-    }
-}
-template <class V> [[gnu::always_inline]] static inline V ivadd(V a, V b) noexcept {
-    using E = std::remove_cvref_t<decltype(a[0])>;
-    if constexpr (nw_sat<E>) {
-#if defined(__AVX512BW__)
-        if constexpr (sizeof(V) == 64) return (V)_mm512_adds_epi16((__m512i)a, (__m512i)b);
-#endif
-#if defined(__AVX2__)
-        if constexpr (sizeof(V) == 32) return (V)_mm256_adds_epi16((__m256i)a, (__m256i)b);
-#endif
-#if defined(__SSE2__)
-        if constexpr (sizeof(V) == 16) return (V)_mm_adds_epi16((__m128i)a, (__m128i)b);
-#endif
-#if defined(__ARM_NEON)
-        if constexpr (sizeof(V) == 16) return (V)vqaddq_s16((int16x8_t)a, (int16x8_t)b);
-#endif
-        V r; for (unsigned l = 0; l < sizeof(V) / sizeof(E); ++l) r[l] = nw_add<E>(a[l], b[l]); return r;
-    } else {
-        return a + b;
-    }
-}
+// Lane-wise add / subtract (plain: the inter-pair kernels never run a problem past the
+// quarter-range bound -- the engine keeps such pairs on their own fill, whose kernels
+// have a saturating variant; see nw_sat in scalar_traits.hpp).
+template <class V> [[gnu::always_inline]] static inline V ivsub(V a, V b) noexcept { return a - b; }
+template <class V> [[gnu::always_inline]] static inline V ivadd(V a, V b) noexcept { return a + b; }
 // Every lane = x.  Not `ivd{} + x`: +0 + -0 is +0, so that idiom loses the sign of a
 // zero border (-0 when a gap extend is 0), which the scalar fill keeps.
 template <class V, class S> static inline V ivsplat(S x) noexcept {

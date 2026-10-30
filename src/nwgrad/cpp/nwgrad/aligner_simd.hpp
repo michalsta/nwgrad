@@ -295,7 +295,7 @@ void Aligner<GM, AM, AB, T>::viterbi_affine_simd(DpBuffer& buf, const LevelKerne
         if constexpr (AM == AlignMode::Local) {
             const T rowmax = KT.banded_row_local(
                 vm_cur, vx_cur, vy_cur, vm_prev, vx_prev, vy_prev, sr, lo, hi, blk,
-                go_a, ge_a, go_b, ge_b);
+                go_a, ge_a, go_b, ge_b, sat_);
             if (rowmax > best_local) {
                 // The new best is the FIRST cell of the row whose max3 equals rowmax: a
                 // strict-> running scan stops updating once it reaches the maximum.  So
@@ -315,7 +315,7 @@ void Aligner<GM, AM, AB, T>::viterbi_affine_simd(DpBuffer& buf, const LevelKerne
         } else {
             KT.banded_row_global(
                 vm_cur, vx_cur, vy_cur, vm_prev, vx_prev, vy_prev, sr, lo, hi, blk,
-                go_a, ge_a, go_b, ge_b);
+                go_a, ge_a, go_b, ge_b, sat_);
         }
     }
 

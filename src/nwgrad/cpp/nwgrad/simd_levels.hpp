@@ -169,6 +169,7 @@ struct TrackJob {
 // are all T, the reported score too.
 template <class T>
 struct ViterbiJob {
+    bool sat = false;   // nw_sat T past the quarter-range bound: the saturating kernel variant
     // problem (sequences already encoded to alphabet indices)
     const unsigned char* a; int m;
     const unsigned char* b; int n;
@@ -228,6 +229,7 @@ inline unsigned dense_code_at(const unsigned char* row, int seg, int width, int 
 // bit) — see Aligner::compute_score.  Scratch (profile, rolling rows) lives in buf.
 template <class T>
 struct ScoreJob {
+    bool sat = false;   // nw_sat T past the quarter-range bound: the saturating kernel variant
     const unsigned char* a; int m;
     const unsigned char* b; int n;
     const T* blk; int nalpha;
@@ -278,6 +280,7 @@ struct GridFwdJob {
 // logic in exactly one place.
 template <class T>
 struct HbJob {
+    bool sat = false;   // nw_sat T past the quarter-range bound: the saturating kernel variant
     const unsigned char* a;                 // full encoded sequences; the block is
     const unsigned char* b;                 // addressed by start/step below
     const T* blk; int nalpha;
@@ -310,6 +313,7 @@ struct HbJob {
 // block-1-based, and the caller maps them to absolute end/start cells.
 template <class T>
 struct HbScanJob {
+    bool sat = false;   // nw_sat T past the quarter-range bound: the saturating kernel variant
     const unsigned char* a;
     const unsigned char* b;
     const T* blk; int nalpha;
@@ -338,6 +342,7 @@ struct HbScanJob {
 // walk-back stays on the aligner side (O(H+ncols), negligible) and reads hbD striped.
 template <class T>
 struct HbBaseJob {
+    bool sat = false;   // nw_sat T past the quarter-range bound: the saturating kernel variant
     const unsigned char* a;
     const unsigned char* b;
     const T* blk; int nalpha;
@@ -609,7 +614,7 @@ template <class T>
 using banded_row_fn_t = T (*)(T* __restrict, T* __restrict, T* __restrict,
                               const T* __restrict, const T* __restrict,
                               const T* __restrict, const T* __restrict,
-                              int, int, int, T, T, T, T);
+                              int, int, int, T, T, T, T, bool /* sat */);
 
 // ── The kernels of one scalar type T (double, float, int16_t, int32_t, int64_t) ──
 //
@@ -626,6 +631,7 @@ using banded_row_fn_t = T (*)(T* __restrict, T* __restrict, T* __restrict,
 // bit for bit the scalar loops' rows.  Rows r = 1..h; columns c = 1..n.
 template <class T>
 struct LhbJob {
+    bool sat = false;   // nw_sat T past the quarter-range bound: the saturating kernel variant
     const unsigned char* b; int n;          // B codes in sweep order (column c: b[c-1])
     const T* blk; int nalpha;               // substitution stack
     const uint32_t* srow; int h;            // row r: stacked substitution row srow[r-1]

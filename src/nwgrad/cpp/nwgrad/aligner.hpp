@@ -273,33 +273,36 @@ void nw_int_prepare(const AlignParams& p, int K, std::vector<T>& stack, std::vec
     ib.gea_pos = static_cast<T>(gea); ib.geb_pos = static_cast<T>(geb);
 }
 
-// The a-priori overflow bound of an m x n problem in an integer T (scalar_traits.hpp).
-//   int32 / int64 (wrapping arithmetic, the quarter rule): (m + n + 2 + 64) * step_max
-//     must not exceed nw_int_cap.
-//   int16 (saturating, sentinel = lowest()): every REACHABLE value must stay in range and
-//     every sentinel-derived value below every reachable one.  With Hi = the most a path
-//     can collect (min(m, n + 64) diagonal moves of smax_pos, at most m + n + 66 gap moves
-//     of `gain`), the values formed are at most max(Hi + ramp, 2 Hi + gob_pos) + goneg
-//     (ramp = (n + 64) * gea_pos: the prefix-max carry's open + k * ge_a; 2 Hi + go: a
-//     Hirschberg join's forward + reverse, the straddling open refunded; goneg: the
-//     intermediate (v - go) of a negative open) -- that must fit below the top.  A
-//     reachable Global value is at least the all-gap alignment's, Lo = -(goa_pos + gob_pos
-//     + m * geb_pos + (n + 64) * gea_pos + smax_neg) (Local keeps the same Lo: its Hirschberg
-//     box solve and suffix scan are Global sub-problems; its clamped cells are >= 0 and its
-//     negative gap cells never matter), which must stay above lowest().  A guide-banded
-//     Global value's paths are confined to the band, so it takes the move-count bound
-//     -(m + n + 66) * step_max.  Finally the sentinel: it climbs by at most Hi + max(ramp,
-//     gob_pos) + goneg (lowest() is self-preserving under the saturating penalties), and
-//     lowest() + that must stay below Lo.
-// Returns 0 when the problem fits, else the bound that failed (for the message).
+// The a-priori overflow bound of an m x n problem in an integer T (scalar_traits.hpp),
+// and the regime it runs in.  Returns 0: the quarter rule holds, (m + n + 2 + 64) *
+// step_max <= nw_int_cap, so the plain (wrapping) kernels run as they always did; 1 (an
+// nw_sat T only): past the quarter rule but within the SATURATING regime's bound, so the
+// saturating kernel variants run; a negative value: refused, -(the bound that failed).
+//   The saturating regime (int16; sentinel lowest() / 2, every penalty clamping at
+//   lowest()): every REACHABLE value must stay in range and every sentinel-derived value
+//   below every reachable one.  With Hi = the most a path can collect (min(m, n + 64)
+//   diagonal moves of smax_pos, at most m + n + 66 gap moves of `gain`), the values
+//   formed are at most max(Hi + ramp, 2 Hi + gob_pos) + goneg (ramp = (n + 64) *
+//   gea_pos: the prefix-max carry's open + k * ge_a; 2 Hi + go: a Hirschberg join's
+//   forward + reverse, the straddling open refunded; goneg: the intermediate (v - go) of
+//   a negative open) -- that must fit below the top.  A reachable Global value is at
+//   least the all-gap alignment's, Lo = -(goa_pos + gob_pos + m * geb_pos + (n + 64) *
+//   gea_pos + smax_neg) (Local keeps the same Lo: its Hirschberg box solve and suffix
+//   scan are Global sub-problems; its clamped cells are >= 0 and its negative gap cells
+//   never matter), which must stay above lowest().  A guide-banded Global value's paths
+//   are confined to the band, so it takes the move-count bound -(m + n + 66) * step_max.
+//   Finally the sentinel: it climbs by at most Hi + max(ramp, gob_pos) + goneg (it can
+//   only come to rest at lowest() below), and lowest() / 2 + that must stay below Lo.
 template <class T, bool Local, bool Banded>
-inline long long nw_int_bound_check(const NwIntBound<T>& ib, int m, int n) noexcept {
+inline int nw_int_bound_check(const NwIntBound<T>& ib, int m, int n) noexcept {
     if (!ib.prepared() || ib.step_max <= T(0)) return 0;
     const long long M = m, N = n, pad = nw_int_pad_cols;
+    if (M + N + 2 + pad <= static_cast<long long>(nw_int_cap<T> / ib.step_max)) return 0;
     if constexpr (!nw_sat<T>) {
-        return (M + N + 2 + pad > static_cast<long long>(nw_int_cap<T> / ib.step_max)) ? 1 : 0;
+        return -1;
     } else {
         const long long top = std::numeric_limits<T>::max();        // 32767
+        const long long sent = -static_cast<long long>(nw_ninf<T>); // 16384: the sentinel's depth
         const long long hi = std::min(M, N + pad) * ib.smax_pos + (M + N + 2 + pad) * ib.gain;
         const long long ramp = (N + pad) * ib.gea_pos;
         const long long hi_top = std::max(hi + ramp, 2 * hi + ib.gob_pos) + ib.goneg;
@@ -307,10 +310,10 @@ inline long long nw_int_bound_check(const NwIntBound<T>& ib, int m, int n) noexc
         if constexpr (Banded && !Local) lo = -(M + N + 2 + pad) * ib.step_max;
         else lo = -(static_cast<long long>(ib.goa_pos) + ib.gob_pos + M * ib.geb_pos + (N + pad) * ib.gea_pos + ib.smax_neg);
         const long long hi_sent = hi + std::max(ramp, static_cast<long long>(ib.gob_pos)) + ib.goneg;
-        if (hi_top > top) return 2;
-        if (lo < -top) return 3;
-        if (hi_sent - lo > top) return 4;
-        return 0;
+        if (hi_top > top) return -2;
+        if (lo < -top) return -3;
+        if (hi_sent - lo >= sent) return -4;
+        return 1;
     }
 }
 
@@ -881,7 +884,7 @@ struct Aligner {
             if (backend != kBackendScalar) {
                 const auto fn = level_kernels(backend).template of<T>().score;
                 if (fn) {
-                    ScoreJob<T> job{};
+                    ScoreJob<T> job{}; job.sat = sat_;
                     job.a = a_idx_.data(); job.m = m_;
                     job.b = b_idx_.data(); job.n = n_;
                     job.blk = blkT_; job.nalpha = nalpha_;
@@ -1586,13 +1589,15 @@ private:
     // bound (m+n+2) * step_max_ must not exceed the cap, step_max_ being the largest
     // magnitude any one move can add: max |s| over the block, |go| + |ge| per side.
     NwIntBound<T> ib_;
+    bool sat_ = false;   // nw_sat T: this problem runs the saturating regime (past the quarter rule)
     mutable std::vector<T> int_gaps_scratch_;   // nw_int_prepare's gaps, when run here
-    void int_bound_check_() const {
-        const long long why = nw_int_bound_check<T, AM == AlignMode::Local, AB == AlignBand::GuideBanded>(ib_, m_, n_);
-        if (why == 0) return;
-        const char* what = why == 1 ? "((m + n + 2 + 64 padding columns) * step exceeds the type's quarter range)"
-                         : why == 2 ? "(the values a path can collect exceed the type's top)"
-                         : why == 3 ? "(the values a path can lose exceed the type's bottom)"
+    void int_bound_check_() {
+        const int why = nw_int_bound_check<T, AM == AlignMode::Local, AB == AlignBand::GuideBanded>(ib_, m_, n_);
+        sat_ = why == 1;
+        if (why >= 0) return;
+        const char* what = why == -1 ? "((m + n + 2 + 64 padding columns) * step exceeds the type's quarter range)"
+                         : why == -2 ? "(the values a path can collect exceed the type's top)"
+                         : why == -3 ? "(the values a path can lose exceed the type's bottom)"
                          : "(the range of values is too wide for the sentinel to stay below them)";
         throw std::overflow_error(
             "nwgrad: a " + std::to_string(m_) + " x " + std::to_string(n_) + " problem with a largest "
@@ -2423,7 +2428,7 @@ private:
     // and copy its scalar results back.  The kernel fills buf.VM/VX/VY in STRIPED layout
     // (table_layout == 1) and reports seg/width; rat/at then read them striped.
     void run_dispatched_affine(DpBuffer& buf, const LevelKernels& K, bool use_ptr = false) {
-        ViterbiJob<T> job{};
+        ViterbiJob<T> job{}; job.sat = sat_;
         job.a = a_idx_.data(); job.m = m_;
         job.b = b_idx_.data(); job.n = n_;
         // blkT_ is the substitution block already in the Viterbi precision T (= blk_ when
@@ -2483,7 +2488,7 @@ private:
     // The leveled linear kernel (Full): H in STRIPED layout (or direction bytes in it),
     // read back through cell_index like the affine tables.  No gap opens in the job.
     void run_dispatched_linear(DpBuffer& buf, const LevelKernels& K, bool use_ptr) {
-        ViterbiJob<T> job{};
+        ViterbiJob<T> job{}; job.sat = sat_;
         job.a = a_idx_.data(); job.m = m_;
         job.b = b_idx_.data(); job.n = n_;
         job.blk = blkT_;       job.nalpha = nalpha_;
@@ -2968,7 +2973,7 @@ private:
     void hb_run_level(const LevelKernels& K, DpBuffer& buf, int a_start, int a_step,
                       int b_start, int b_step, int H, int ncols, bool in_x,
                       T* oM, T* oX, T* oY) const {
-        HbJob<T> job{};
+        HbJob<T> job{}; job.sat = sat_;
         job.a = a_idx_.data(); job.b = b_idx_.data();
         job.blk = blkT_; job.nalpha = nalpha_;
         job.go_a = static_cast<T>(params_->gap_open_a);
@@ -3126,7 +3131,7 @@ private:
     void hb_base_striped_run(const LevelKernels& K, DpBuffer& buf,
                              int i0, int i1, int j0, int j1, bool in_x, bool out_x) {
         const int H = i1 - i0, NC = j1 - j0;
-        HbBaseJob<T> job{};
+        HbBaseJob<T> job{}; job.sat = sat_;
         job.a = a_idx_.data(); job.b = b_idx_.data();
         job.blk = blkT_; job.nalpha = nalpha_;
         job.go_a = static_cast<T>(params_->gap_open_a);
@@ -3426,7 +3431,7 @@ private:
                  T& best, int& bi, int& bj) {
         const int H = i1 - i0, NC = j1 - j0;
         if (const LevelKernels* K = hb_scan_level()) {
-            HbScanJob<T> job{};
+            HbScanJob<T> job{}; job.sat = sat_;
             job.a = a_idx_.data(); job.b = b_idx_.data();
             job.blk = blkT_; job.nalpha = nalpha_;
             job.go_a = static_cast<T>(params_->gap_open_a);
@@ -3606,7 +3611,7 @@ private:
     std::vector<T> lhb_ga_, lhb_gb_, lhb_r0_, lhb_c0_;
     int lhb_runs_ = 0;   // kernel calls, for the tests' liveness check
     LhbJob<T> lhb_job_(DpBuffer& buf, int ncols, int nrows) {
-        LhbJob<T> job{};
+        LhbJob<T> job{}; job.sat = sat_;
         job.b = lhb_b_.data(); job.n = ncols;
         job.blk = blkT_; job.nalpha = nalpha_;
         job.srow = lhb_rows_.data(); job.h = nrows;

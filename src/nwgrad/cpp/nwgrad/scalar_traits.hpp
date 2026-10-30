@@ -31,6 +31,7 @@
 // carry's rounding) is moot for an integer T: every traceback mode, every ISA level
 // and the prefix-max carry are then bit-identical by construction.
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <type_traits>
@@ -53,41 +54,42 @@ template <class T>
     return v;
 }
 
-// int16 is SATURATING (nw_sat): every add / subtract on a DP value clamps to the type's
-// range (scalar: nw_add / nw_sub below; vector: vadd / vsub in the level kernels, the
-// packed saturating instructions -- vpaddsw / vpsubsw, sqadd / sqsub -- at the cost of the
-// plain ones).  Its sentinel is then lowest() itself, self-preserving under any penalty:
-// an unreachable value can never wrap, however it drifts, and climbs at most by the gains
-// a path can collect.  The bound (nw_int_bound, aligner.hpp) then asks only that no
-// REACHABLE value leaves the range and that a sentinel-derived value stays below every
-// reachable one -- a range of 2^15 for the problem's values instead of the quarter rule,
-// which takes BLOSUM62 pairs from ~370 to ~1300 residues.  int32 / int64 keep the
-// wrapping arithmetic (x86 has no 32/64-bit saturating vector ops) and the quarter rule.
+// int16 (nw_sat) has a second regime past the quarter rule: SATURATING arithmetic.  Every
+// add / subtract on a DP value then clamps at the type's bottom (vector: vadd / vsub in
+// the level kernels, the packed saturating instructions vpaddsw / vpsubsw, sqadd / sqsub;
+// scalar: nw_add / nw_sub below), so an unreachable value can never wrap, however far it
+// drifts -- it comes to rest at lowest() -- and climbs at most by the gains a path can
+// collect.  The bound (nw_int_bound_check, aligner.hpp) then asks only that no REACHABLE
+// value leaves the range and that a sentinel-derived value stays below every reachable
+// one, which takes BLOSUM62 pairs from ~370 to ~1000 residues.  The regime is chosen per
+// problem (Aligner::sat_, ViterbiJob::sat ...): a problem inside the quarter rule runs
+// the plain kernels it always ran, bit for bit (the saturating instructions issue on
+// fewer ports on Intel cores: 6-19 % on the int16 kernels, nighthaven 2026-10-30), a
+// problem past it the saturating variant of the same kernel.  The sentinel is the same
+// in both: lowest() / 2, below which a saturating penalty can only drift to lowest().
+// The scalar fills saturate always (a clamp at the bottom: a compare and a cmov), so a
+// table is the same bits at every level in either regime.  int32 / int64 have no
+// saturating regime (x86 has no 32 / 64-bit saturating vector ops): the quarter rule.
 template <class T>
 inline constexpr bool nw_sat = std::is_integral_v<T> && sizeof(T) == 2;
 
 template <class T>
 inline constexpr T nw_ninf = std::is_floating_point_v<T>
     ? -std::numeric_limits<T>::infinity()
-    : nw_sat<T> ? std::numeric_limits<T>::lowest()
-                : static_cast<T>(std::numeric_limits<T>::lowest() / 2);
+    : static_cast<T>(std::numeric_limits<T>::lowest() / 2);
 
-// Scalar add / subtract on DP values: saturating for nw_sat types (computed in int, then
-// clamped -- the value vpaddsw / vpsubsw give), the plain operation otherwise.  The
-// floating types pass through unchanged, so a kernel can spell every site with these.
-template <class T>
-[[gnu::always_inline]] inline constexpr T nw_sat_cast(int v) noexcept {
-    return static_cast<T>(v < int(std::numeric_limits<T>::lowest()) ? int(std::numeric_limits<T>::lowest())
-         : v > int(std::numeric_limits<T>::max()) ? int(std::numeric_limits<T>::max()) : v);
-}
+// Scalar add / subtract on DP values: for nw_sat types computed in int and clamped at the
+// bottom (the top is never reached: the bound keeps every reachable value below it, and
+// a sentinel-derived value below those), the plain operation otherwise.  The floating
+// types pass through unchanged, so a kernel can spell every site with these.
 template <class T>
 [[gnu::always_inline]] inline constexpr T nw_add(T a, T b) noexcept {
-    if constexpr (nw_sat<T>) return nw_sat_cast<T>(int(a) + int(b));
+    if constexpr (nw_sat<T>) return static_cast<T>(std::max(int(a) + int(b), int(std::numeric_limits<T>::lowest())));
     else return static_cast<T>(a + b);
 }
 template <class T>
 [[gnu::always_inline]] inline constexpr T nw_sub(T a, T b) noexcept {
-    if constexpr (nw_sat<T>) return nw_sat_cast<T>(int(a) - int(b));
+    if constexpr (nw_sat<T>) return static_cast<T>(std::max(int(a) - int(b), int(std::numeric_limits<T>::lowest())));
     else return static_cast<T>(a - b);
 }
 
