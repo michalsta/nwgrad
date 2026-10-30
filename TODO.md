@@ -167,16 +167,22 @@ DiscrimAlign does: it passes the logical core count.
   The v3 regression this caused (int16 Global Scores 1.02-1.06) is FIXED by the
   in-register lane scan (AGENTS), on every level (NEON int16 too, once its shifts compiled
   as `ext`). Not yet timed on spot under Fedora Asahi (macOS only).
-- **int16 saturating arithmetic, with a number**: at L1000 BLOSUM62 nwgrad refuses int16
-  and runs int32 (261 us a pair, score-only, AVX2) where parasail's saturating scan16 takes
-  145 us — the one fixture in the comparison parasail wins.
+- **int16 saturating arithmetic: DONE as a per-problem regime (2026-10-30, AGENTS
+  "Small-integer round")**: int16 L1000 BLOSUM62 Local score-only 114 us a pair on AVX2
+  (int32 188, float32 307; parasail scan16 was 145), hard 350 (int32 813).  Left: (1) the
+  regime's reach is the sentinel's depth (lowest() / 2 = 16384 for the values' whole range:
+  ~L1150 for BLOSUM62 11/1, ~L430 guide-banded Global); a sentinel of lowest() would double
+  it but needs the plain kernels to saturate too (6-19 % on Intel: the saturating ops issue
+  on p01 only), or a sentinel that is a runtime value; (2) NEON and AVX-512 not yet run
+  (spot / solace were off limits for the round): `vqaddq_s16` / `vqsubq_s16` and
+  `_mm512_adds_epi16` are written, untested; (3) the scalar fills saturate always (a clamp
+  per op): the short-row scalar linear fill and `scalar_fallback` of int16 carry it,
+  unmeasured.
 - The streaming `align()` validates integer params per pair (the aligner's `nw_int_prepare`
   on the caller's params, O(K * nalpha^2) a pair); prepare once per call as the batch does.
 - `score()` / `scores()` stay double: exact below 2^53, so an int64 score above that
   (parameters ~2^40) loses bits in the report.
-- int16 with saturating arithmetic would remove the (m + n + 66) * step bound (the sentinel
-  then self-preserving under `psubsw`); std::simd has no saturating ops, so intrinsics per
-  level. Not started; measure int16 first.
+- (int16 saturating arithmetic: done, above.)
 - AVX-512: verified and measured 2026-10-22 (solace under WSL, gcc 15.2 / clang 21.1; AGENTS
   "Integer scalar types"). gcc's AVX-512 integer Pointers kernels: after the always_inline
   round and the row-argmax broadcast fix (both 2026-10-23) gcc is at 1.10-1.23x clang on

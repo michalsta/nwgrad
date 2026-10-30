@@ -2015,6 +2015,104 @@ L200 = 2000 30 %-mutated BLOSUM62 pairs, L1000 = 200, DNA = 20k related 22×50 p
 | local affine | 1.58 / 2.29 / 2.11 | 1.51 / 1.67 / 1.65 | 8.18 / 12.70 / 9.81 |
 | local linear | 1.80* / 3.06 / 2.57 | 1.36* / 2.03 / 2.14 | 8.16 / 14.05 / 13.44 |
 
+### Small-integer round (branch `perf/smallint`, 2026-10-30; from four prototype branches)
+
+Four changes, each measured alone against main `b0a075a` on nighthaven (i5-12500) (AVX2 and the sse4
+level, 1 thread, `tools/bench_int.py` arms through the A/B harness: alternating processes,
+best of 3, control arm A'/A 0.99-1.01 throughout; time B/A, below 1 = faster) and then
+together.  Every one is bit-exact (the C++ integer oracle at every level, the Python suite
+on skynet and nighthaven).  spot and solace were not used (the user's instruction for this
+round): NEON and AVX-512 are to be checked before merging.
+
+- **The int16 striped profile build as byte shuffles** (`striped_profile_row_idx_i16`,
+  kernels_impl.inl).  The build was a scalar lookup per slot (a byte load, a word load, a
+  word store) and 18.5 % of the int16 L200 score-only time (perf).  For alphabets up to 32
+  symbols the row is split into its low and high byte planes and 16 / 32 symbol indices at
+  a time select from them (two `pshufb` and an OR per plane on x86 -- an index + 0x70 sets
+  bit 7, a zero lane, for symbols >= 16 and an index - 16 does so for symbols < 16; one
+  `tbl2` on NEON, compiled but not yet run), then the planes are interleaved into words.
+  int16 protein L200: score-only 0.86 (avx2) / 0.90 (sse4), hard 0.95 / 0.96; nothing else
+  moves (DNA uses the inter-pair kernels, which build no profile).  The other types keep the
+  scalar loop (float32 / int32 would need a 4-byte lookup: `vpermd` for <= 8 symbols,
+  gathers otherwise; not done).
+- **The Local row best over M alone, in registers** (`monly`, kernels_pointers_impl.inl).
+  With non-negative gap parameters (every row, when tracked) the row's maximum is an M
+  cell and so is the FIRST cell reaching it in column order (a gap cell never exceeds the
+  cell it extends from: X the cell above, already <= the running best; Y the cell to its
+  left), so the per-lane maximum and its first segment are tracked on the M vector pass 1
+  has in registers (a compare, a blend, a max) and reduced once per row; the padding M is
+  at most the cell above it, so it needs no mask.  `striped_row_best` -- a separate pass
+  over M, X, Y and the mask, 17 % of an int16 L200 Local hard step -- runs only for
+  negative gap parameters.  Local hard / stream, L200: float32 0.90 (avx2) / 0.865 (sse4),
+  double 0.876 / 0.829, int16 0.974 / 0.962, int32 0.975 / 0.949; score-only and DNA 1.00.
+  (First tried instead: the whole Pointers kernel fused into two passes -- the carry into
+  pass 1, codes, packing and row best into pass 2.  1.05-1.06x SLOWER on int16 / int32
+  at both levels: the kernel is ALU-bound, not pass-bound, and recomputing the opens in
+  pass 2 cost more than the rows it saved.  Reverted.)
+- **The inter-pair B masks built by a byte transpose and vector shifts**
+  (`InterCommon`, inter_kernel_impl.inl).  Each mask vector was built lane by lane (a
+  shift, a test and an insert per lane), 14 % of a 22 x 50 int16 DNA score-only step at
+  16 lanes.  Now every column's W residues are gathered as bytes first (one transposed
+  row), then each column is widened in one convert and each bit's mask is an arithmetic
+  shift pair.  Two loops, not one: W byte stores followed at once by a W-byte load of them
+  is a store-forwarding stall per column, which cost float32 / double / int32 3-6 % in the
+  first form.  DNA int16: score 0.955 (avx2) / 0.983 (sse4), hard 0.969 / 0.965; the other
+  types 0.98-1.01.
+- **int16 past the quarter rule: a saturating regime** (`nw_sat`, scalar_traits.hpp;
+  `Sat` on every int16 kernel, `job.sat`, `Aligner::sat_`; `NwIntBound` /
+  `nw_int_bound_check`, aligner.hpp).  See the paragraph below.
+
+**int16 past the quarter rule: the saturating regime (2026-10-30).**  An int16 problem that
+fails the quarter-range bound ((m + n + 2 + 64) * step_max > 8191: BLOSUM62 11/1 pairs past
+~L300) used to be refused.  Now it runs a second regime, chosen per problem by
+`nw_int_bound_check` (aligner.hpp) in `set_problem` and carried as `Aligner::sat_` /
+`job.sat`: every add and subtract on a DP value SATURATES at the type's bottom -- the
+packed saturating instructions (`vpaddsw` / `vpsubsw`, `sqadd` / `sqsub`: `vadd` / `vsub`
+in kernels_impl.inl, `Sat` on every int16 kernel and on the banded row functions) -- so an
+unreachable value can drift no lower than lowest() and never wraps, and the bound asks
+only that every REACHABLE value fits the range and that a sentinel-derived value stays
+below every reachable one (`NwIntBound`: the facts of the params; the comment at
+`nw_int_bound_check` has the terms).  The sentinel stays lowest() / 2 (-16384) in both
+regimes, so the plain kernels are untouched: a problem inside the quarter rule runs the
+code it always ran, bit for bit -- deliberately, because the saturating instructions issue
+on fewer ports on Intel cores (p01 against p015 for the plain ones: ungated, int16 lost
+6 % on the AVX2 score kernel and 19 % at sse4, nighthaven).  The sentinel's depth is what
+bounds the new regime: the values' whole range (the top a path can collect plus the
+prefix-max ramp, down to the all-gap floor) must fit under 16384, i.e. BLOSUM62 11/1 to
+~L1150 (Global and Local), guide-banded Global to ~L430 (its floor is the move-count
+bound: a band confines the paths).  The scalar fills saturate always (a clamp at the
+bottom, one compare and a cmov; `nw_add` / `nw_sub`), so a table is the same bits at every
+level in either regime; the inter-pair kernels have no saturating variant, so the engine
+keeps such pairs on their own fill (`inter_eligible_`, the streaming loop).  int32 / int64
+keep the quarter rule (no 32 / 64-bit saturating vector ops on x86).
+Measured (nighthaven, `bench_int.py`, protein BLOSUM62 11/1 30 %-mutated, Local, 1 thread,
+avx2): L1000 int16 hard 338 us a pair, 0.37 of float32 and 0.41 of int32 (823); score-only
+114 us, 0.36 of float32 and 0.61 of int32 (188).  Inside the quarter rule nothing moved
+(A/B 0.99-1.01 on every arm).  Verified: `tests/cpp/test_integer.cpp` (the oracle sweep
+at L <= 500, every level; the refusal test), `tests/Python/test_int16_long.py` (L1000
+pairs at every traceback mode, both modes, banded, streaming, score-only, every level; the
+bound's edges), the full suites, ASan + UBSan on the integer cases.
+
+**The four together** (`perf/smallint`, nighthaven, 1 thread, B/A against main `b0a075a`,
+controls 0.99-1.01; the `bench_int.py` arms: protein = 2000 30 %-mutated L200 BLOSUM62 11/1
+pairs, DNA = 20k related 22 x 50 pairs, Local affine):
+
+| arm | avx2: f32 / f64 / int16 / int32 / int64 | sse4 | sse2 |
+|---|---|---|---|
+| protein hard | 0.905 / 0.882 / 0.921 / 0.978 / 0.896 | 0.866 / 0.829 / 0.946 / 0.947 / 0.877 | 0.886 / 0.869 / 0.957 / 0.906 / 0.942 |
+| protein score-only | 1.000 / 1.000 / **0.863** / 1.004 / 1.000 | 1.016 / 1.000 / 0.900 / 0.998 / 0.988 | 1.008 / 1.002 / 0.989 / 1.000 / 1.001 |
+| protein stream | 0.905 / 0.879 / 0.939 / 0.981 / 0.897 | 0.864 / 0.831 / 0.955 / 0.953 / 0.884 | 0.888 / 0.865 / 0.963 / 0.902 / 0.943 |
+| DNA hard | 0.998 / 1.003 / 0.984 / 0.997 / 1.000 | 1.004 / 0.996 / 0.977 / 1.002 / 0.966 | 0.996 / 1.000 / 0.981 / 0.990 / 0.991 |
+| DNA score-only | 0.994 / 1.012 / **0.948** / 0.996 / 1.002 | 1.020 / 0.983 / 0.971 / 0.992 / 0.997 | 1.007 / 0.993 / 1.002 / 0.997 / 0.978 |
+| DNA stream | 1.003 / 1.026 / 0.999 / 1.005 / 0.999 | 1.010 / 0.997 / 0.997 / 1.013 / 0.975 | 1.002 / 1.003 / 1.016 / 0.996 / 0.995 |
+
+The hard-step gains on every type are the Local row best; the int16 score-only gain the
+profile build; the DNA int16 gains the mask build.  The DNA cells above 1.01 (double stream
+avx2 1.026, float32 score sse4 1.020, int16 stream sse2 1.016) were re-measured with five
+rounds: see the paragraph after the 12-thread table.  Checks on the combined branch:
+the C++ suite (2.93 M assertions, 201 cases) and the Python suite (4497) on skynet, ASan +
+UBSan on the integer cases, `tools/fuzz_ab.py` main vs branch (300 seeds, 0 differ).
+
 ### The soft path: scaled probability space (2026-10-05)
 
 **The soft path is NOT bit-exact** — across `soft_impl`, ISA levels, compilers, `fill`,
