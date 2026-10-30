@@ -2111,7 +2111,13 @@ profile build; the DNA int16 gains the mask build.  The DNA cells above 1.01 wer
 re-measured with five rounds (A'/A 0.997-1.005): double stream avx2 1.021, float32 score /
 stream sse4 1.016 / 1.013, the rest 0.98-1.01 -- the mask build at FOUR lanes (double on
 AVX2, float32 at 128 bits), which gained nothing there; it is now taken from 8 lanes on,
-and those types keep their old code.  12 threads (avx2; the control arm itself read
+and those types keep their old code.  Re-measured after that gate (five rounds, A'/A
+0.994-1.016): every DNA float32 / double / int32 arm 0.987-1.015, int16 hard 0.971-0.981,
+score-only 0.943-0.945.  gcc against clang on the branch (`bench_int_cc.sh`, avx2, 1
+thread, clang / gcc): the int16 / int32 score-only arms now favour gcc (1.11 / 1.07: the
+shuffle build and the fused carry under clang's unrolling), the Pointers arms tie
+(0.98-1.02); float32 / double hard still 0.92-0.94 and int64 0.90-0.94 under clang, the
+same residue as before the round.  12 threads (avx2; the control arm itself read
 1.07-1.13 across the two rounds, so +-10 %): protein hard / stream float32 0.94 / 0.95,
 double 0.94 / 0.94, int16 0.90 / 0.92, int32 0.95 / 0.95; int16 score-only 0.87; DNA
 0.97-1.01.  Global mode (1 thread, avx2): int16 protein hard 0.928, score-only 0.913,
