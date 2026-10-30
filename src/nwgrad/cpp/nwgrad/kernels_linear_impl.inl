@@ -50,7 +50,7 @@ static inline void striped_row_best1(const T* cH, const T* pad, int seg, int i,
         vt h, vp;
         h.copy_from(cH + o, stdx::element_aligned);
         vp.copy_from(pad + o, stdx::element_aligned);
-        h = h + vp;
+        h = vadd(h, vp);
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
         if constexpr (sizeof(T) == 8) ls = avx512d_blend(avx512d_gt(h, lmax), ls, vs);
         else                          stdx::where(h > lmax, ls) = vs;
@@ -180,7 +180,7 @@ static void striped_linear_full(ViterbiJob<T>& job) {
         else              nb = Local ? static_cast<T>(0) : -static_cast<T>(i) * ge_b;
         const T bprev = pH[0];
         cH[0] = nb;
-        const T nbOpen = nb - ge_a;                     // the open into column 1
+        const T nbOpen = nw_sub(nb, ge_a);                     // the open into column 1
         const T* sub = striped_row_profile<T, Tr>(buf.sprof.data(), blk, nalpha, a, b, n, seg, W, i, tr);
         unsigned char* dM = nullptr;
         if constexpr (Ptr) {
@@ -205,9 +205,9 @@ static void striped_linear_full(ViterbiJob<T>& job) {
                 // length and thread count) and bought nothing on AVX2 (0.99-1.01, nighthaven).
                 if constexpr (nw_is_int<T>)
                     if (s > 0) dg.copy_from(pH + off + (std::size_t)(s - 1) * W, stdx::element_aligned);
-                const vd d0 = dg + sb;
+                const vd d0 = vadd(dg, sb);
                 if constexpr (!nw_is_int<T>) dg = up;   // the next segment's diagonal
-                const vd u  = up - vge_b;
+                const vd u  = vsub(up, vge_b);
                 vd t = stdx::max(d0, u);
                 if constexpr (Ptr) {
                     vd k = vzero;                        // diagonal unless up is STRICTLY larger
@@ -222,7 +222,7 @@ static void striped_linear_full(ViterbiJob<T>& job) {
                 if constexpr (Local) t = stdx::max(t, vzero);
                 t.copy_to(cH + off + (std::size_t)s * W, stdx::element_aligned);
                 if constexpr (nw_is_int<T> && W >= 4)   // the integer carry reads the opens; the floating one recomputes them
-                    (t - vge_a).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
+                    (vsub(t, vge_a)).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
             }
 
             // ── the carry: Y[c] = max(open[c-1], Y[c-1] - ge_a) along each lane ──
@@ -234,7 +234,7 @@ static void striped_linear_full(ViterbiJob<T>& job) {
                 // bits pass 1 stores in `ov` for the integer carry; one stream fewer per segment.
                 auto open_at = [&](int q) __attribute__((always_inline)) {
                     vd t; t.copy_from(cH + off + (std::size_t)q * W, stdx::element_aligned);
-                    return vd(t - vge_a);
+                    return vd(vsub(t, vge_a));
                 };
                 vd prev = vninf;                         // column 0 holds no Y
                 prev = carry_pass(seg, prev, vge_a,
@@ -248,7 +248,7 @@ static void striped_linear_full(ViterbiJob<T>& job) {
                     });
                 for (int r = 0; r < W; ++r) {            // lazy-F: extend across the lane boundary
                     vd last; last.copy_from(yv + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                    vd F = lane_shift_in(last, K_NINF) - vge_a;
+                    vd F = vsub(lane_shift_in(last, K_NINF), vge_a);
                     bool changed = false;
                     for (int s = 0; s < seg; ++s) {
                         vd v; v.copy_from(yv + (std::size_t)s * W, stdx::element_aligned);
@@ -475,9 +475,9 @@ static void lhb_striped(LhbJob<T>& job) {
                 // length and thread count) and bought nothing on AVX2 (0.99-1.01, nighthaven).
                 if constexpr (nw_is_int<T>)
                     if (s > 0) dg.copy_from(pH + off + (std::size_t)(s - 1) * W, stdx::element_aligned);
-                const vd d0 = dg + sb;
+                const vd d0 = vadd(dg, sb);
                 if constexpr (!nw_is_int<T>) dg = up;   // the next segment's diagonal
-                const vd u = up - vgb;
+                const vd u = vsub(up, vgb);
                 vd t = stdx::max(d0, u);
                 if (D) {
                     vd k = vzero;
@@ -492,7 +492,7 @@ static void lhb_striped(LhbJob<T>& job) {
                 if (job.clamp) t = stdx::max(t, vzero);
                 t.copy_to(cH + off + (std::size_t)s * W, stdx::element_aligned);
                 if constexpr (nw_is_int<T> && W >= 4)   // the integer carry reads the opens; the floating one recomputes them
-                    (t - vga).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
+                    (vsub(t, vga)).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
             }
 
             if constexpr (nw_is_int<T> && W >= 4) {
@@ -503,7 +503,7 @@ static void lhb_striped(LhbJob<T>& job) {
                 // bits pass 1 stores in `ov` for the integer carry; one stream fewer per segment.
                 auto open_at = [&](int q) __attribute__((always_inline)) {
                     vd t; t.copy_from(cH + off + (std::size_t)q * W, stdx::element_aligned);
-                    return vd(t - vga);
+                    return vd(vsub(t, vga));
                 };
                 vd prev = vninf;
                 prev = carry_pass(seg, prev, vga,
@@ -517,7 +517,7 @@ static void lhb_striped(LhbJob<T>& job) {
                     });
                 for (int rr = 0; rr < W; ++rr) {
                     vd last; last.copy_from(yv + (std::size_t)(seg - 1) * W, stdx::element_aligned);
-                    vd F = lane_shift_in(last, K_NINF) - vga;
+                    vd F = vsub(lane_shift_in(last, K_NINF), vga);
                     bool changed = false;
                     for (int s = 0; s < seg; ++s) {
                         vd v; v.copy_from(yv + (std::size_t)s * W, stdx::element_aligned);

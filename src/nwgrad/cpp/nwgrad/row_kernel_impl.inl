@@ -55,17 +55,17 @@ inline constexpr int ROW_BLOCK = (KW >= 4) ? 64 : 256;
             T d = vm_prev[j - 1];                                         \
             d = std::max(d, vx_prev[j - 1]);                                   \
             d = std::max(d, vy_prev[j - 1]);                                   \
-            T mv = d + subrow[j];                                         \
+            T mv = nw_add<T>(d, subrow[j]);                               \
             if (LOCAL) mv = std::max(mv, T(0));                                 \
-            T x = (vm_prev[j] - go_b) - ge_b;                             \
-            x = std::max<T>(x, vx_prev[j] - ge_b);                             \
-            x = std::max<T>(x, (vy_prev[j] - go_b) - ge_b);                     \
+            T x = nw_sub<T>(nw_sub<T>(vm_prev[j], go_b), ge_b);             \
+            x = std::max<T>(x, nw_sub<T>(vx_prev[j], ge_b));                   \
+            x = std::max<T>(x, nw_sub<T>(nw_sub<T>(vy_prev[j], go_b), ge_b));  \
             vm_cur[j] = mv;                                                    \
             vx_cur[j] = x;                                                     \
         }                                                                     \
         for (int j = base; j <= end; ++j) {          /* serial VY carry */     \
-            T open = (std::max(vm_cur[j - 1], vx_cur[j - 1]) - go_a) - ge_a; \
-            vy_cur[j] = std::max<T>(open, vy_cur[j - 1] - ge_a);                \
+            T open = nw_sub<T>(nw_sub<T>(std::max(vm_cur[j - 1], vx_cur[j - 1]), go_a), ge_a); \
+            vy_cur[j] = std::max<T>(open, nw_sub<T>(vy_cur[j - 1], ge_a));      \
         }                                                                     \
     }                                                                         \
     if (LOCAL) {                                                              \

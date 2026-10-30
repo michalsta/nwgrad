@@ -214,23 +214,41 @@ T nw_int_checked(double x, const char* what) {
             " scalar type takes integral parameters only; quantize them first)");
     return static_cast<T>(x);
 }
+// The parameter facts an integer T's overflow bound needs (nw_int_bound_check):
+//   step_max   the largest magnitude one move can add (int32 / int64: the quarter rule)
+//   smax_pos   the largest substitution score, >= 0;  smax_neg  the largest |negative| one
+//   gain       the most a GAP move can gain (negative penalties; 0 otherwise)
+//   goa/gob/gea/geb_pos   each gap parameter's positive part, max over the sets
+//   goneg      the largest |negative open| (an intermediate (v - go) rises by it)
+template <class T>
+struct NwIntBound {
+    T step_max = T(-1);   // -1: not prepared
+    T smax_pos = T(0), smax_neg = T(0), gain = T(0), goneg = T(0);
+    T goa_pos = T(0), gob_pos = T(0), gea_pos = T(0), geb_pos = T(0);
+    bool prepared() const noexcept { return step_max >= T(0); }
+};
 template <class T>
 void nw_int_prepare(const AlignParams& p, int K, std::vector<T>& stack, std::vector<T>& gaps,
-                    T& step_max) {
+                    NwIntBound<T>& ib) {
     static_assert(nw_is_int<T>);
     auto abs_t = [](T v) noexcept { return v < T(0) ? static_cast<T>(-v) : v; };
+    auto pos = [](long long v) noexcept { return v > 0 ? v : 0LL; };
     const std::size_t nn = static_cast<std::size_t>(p.matrix.size()) * p.matrix.size() *
                            static_cast<std::size_t>(K);
     stack.resize(nn);
     T smax = T(0);
+    long long spos = 0, sneg = 0;
     const double* src = p.matrix.data();
     for (std::size_t k = 0; k < nn; ++k) {
         const T v = nw_int_checked<T>(src[k], "substitution score");
         stack[k] = v;
         smax = std::max(smax, abs_t(v));
+        spos = std::max(spos, static_cast<long long>(v));
+        sneg = std::max(sneg, -static_cast<long long>(v));
     }
     gaps.resize(4 * static_cast<std::size_t>(K));
     const long long cap = static_cast<long long>(nw_int_cap<T>);
+    long long gain = 0, goneg = 0, goa = 0, gob = 0, gea = 0, geb = 0;
     for (int k = 0; k < K; ++k) {
         T* g = gaps.data() + 4 * static_cast<std::size_t>(k);
         g[AlignParams::kOpenA]   = nw_int_checked<T>(p.gap(k, AlignParams::kOpenA), "gap_open_a");
@@ -239,11 +257,61 @@ void nw_int_prepare(const AlignParams& p, int K, std::vector<T>& stack, std::vec
         g[AlignParams::kExtendB] = nw_int_checked<T>(p.gap(k, AlignParams::kExtendB), "gap_extend_b");
         // |go| + |ge| <= 2 * cap fits a long long; clamped to the cap (the bound check
         // then refuses all but the smallest problems).
-        const long long sa = static_cast<long long>(abs_t(g[0])) + abs_t(g[1]);
-        const long long sb = static_cast<long long>(abs_t(g[2])) + abs_t(g[3]);
+        const long long oa = g[0], ea = g[1], ob = g[2], eb = g[3];
+        const long long sa = std::llabs(oa) + std::llabs(ea);
+        const long long sb = std::llabs(ob) + std::llabs(eb);
         smax = std::max(smax, static_cast<T>(std::min(cap, std::max(sa, sb))));
+        gain  = std::max({gain, pos(-ea), pos(-eb), pos(-(oa + ea)), pos(-(ob + eb))});
+        goneg = std::max({goneg, pos(-oa), pos(-ob)});
+        goa = std::max(goa, pos(oa)); gob = std::max(gob, pos(ob));
+        gea = std::max(gea, pos(ea)); geb = std::max(geb, pos(eb));
     }
-    step_max = smax;
+    ib.step_max = smax;
+    ib.smax_pos = static_cast<T>(spos); ib.smax_neg = static_cast<T>(sneg);
+    ib.gain = static_cast<T>(std::min(cap, gain)); ib.goneg = static_cast<T>(std::min(cap, goneg));
+    ib.goa_pos = static_cast<T>(goa); ib.gob_pos = static_cast<T>(gob);
+    ib.gea_pos = static_cast<T>(gea); ib.geb_pos = static_cast<T>(geb);
+}
+
+// The a-priori overflow bound of an m x n problem in an integer T (scalar_traits.hpp).
+//   int32 / int64 (wrapping arithmetic, the quarter rule): (m + n + 2 + 64) * step_max
+//     must not exceed nw_int_cap.
+//   int16 (saturating, sentinel = lowest()): every REACHABLE value must stay in range and
+//     every sentinel-derived value below every reachable one.  With Hi = the most a path
+//     can collect (min(m, n + 64) diagonal moves of smax_pos, at most m + n + 66 gap moves
+//     of `gain`), the values formed are at most max(Hi + ramp, 2 Hi + gob_pos) + goneg
+//     (ramp = (n + 64) * gea_pos: the prefix-max carry's open + k * ge_a; 2 Hi + go: a
+//     Hirschberg join's forward + reverse, the straddling open refunded; goneg: the
+//     intermediate (v - go) of a negative open) -- that must fit below the top.  A
+//     reachable Global value is at least the all-gap alignment's, Lo = -(goa_pos + gob_pos
+//     + m * geb_pos + (n + 64) * gea_pos + smax_neg) (Local keeps the same Lo: its Hirschberg
+//     box solve and suffix scan are Global sub-problems; its clamped cells are >= 0 and its
+//     negative gap cells never matter), which must stay above lowest().  A guide-banded
+//     Global value's paths are confined to the band, so it takes the move-count bound
+//     -(m + n + 66) * step_max.  Finally the sentinel: it climbs by at most Hi + max(ramp,
+//     gob_pos) + goneg (lowest() is self-preserving under the saturating penalties), and
+//     lowest() + that must stay below Lo.
+// Returns 0 when the problem fits, else the bound that failed (for the message).
+template <class T, bool Local, bool Banded>
+inline long long nw_int_bound_check(const NwIntBound<T>& ib, int m, int n) noexcept {
+    if (!ib.prepared() || ib.step_max <= T(0)) return 0;
+    const long long M = m, N = n, pad = nw_int_pad_cols;
+    if constexpr (!nw_sat<T>) {
+        return (M + N + 2 + pad > static_cast<long long>(nw_int_cap<T> / ib.step_max)) ? 1 : 0;
+    } else {
+        const long long top = std::numeric_limits<T>::max();        // 32767
+        const long long hi = std::min(M, N + pad) * ib.smax_pos + (M + N + 2 + pad) * ib.gain;
+        const long long ramp = (N + pad) * ib.gea_pos;
+        const long long hi_top = std::max(hi + ramp, 2 * hi + ib.gob_pos) + ib.goneg;
+        long long lo;
+        if constexpr (Banded && !Local) lo = -(M + N + 2 + pad) * ib.step_max;
+        else lo = -(static_cast<long long>(ib.goa_pos) + ib.gob_pos + M * ib.geb_pos + (N + pad) * ib.gea_pos + ib.smax_neg);
+        const long long hi_sent = hi + std::max(ramp, static_cast<long long>(ib.gob_pos)) + ib.goneg;
+        if (hi_top > top) return 2;
+        if (lo < -top) return 3;
+        if (hi_sent - lo > top) return 4;
+        return 0;
+    }
 }
 
 // The per-pair scaled soft kernels at the baseline ISA (scalar_fallback, header-only
@@ -374,18 +442,18 @@ struct Aligner {
                      const AlignParams& params,
                      int band = 0,
                      std::vector<int> guide_j = {}) {
-        problem_common_(a, b, params, band, std::move(guide_j), params.num_sets() > 1, nullptr, T(-1));
+        problem_common_(a, b, params, band, std::move(guide_j), params.num_sets() > 1, nullptr, nullptr);
         if (tr_) setup_tracks_({}, {}, nullptr);
         problem_set_      = true;
     }
-    // `step_max` (integer T, with blkT and gapsT): the params' largest step, prepared by the
-    // batch with the casts; T(-1) = compute it here (floating T: ignored).
+    // `ib` (integer T, with blkT and gapsT): the params' bound facts (NwIntBound), prepared
+    // by the batch with the casts; nullptr = compute them here (floating T: ignored).
     void set_problem(std::span<const uint8_t> a, std::span<const uint8_t> b,
                      const AlignParams& params, int band, std::vector<int> guide_j,
                      std::span<const uint16_t> track, std::span<const uint16_t> gap_track,
-                     const T* blkT = nullptr, const T* gapsT = nullptr, T step_max = T(-1)) {
+                     const T* blkT = nullptr, const T* gapsT = nullptr, const NwIntBound<T>* ib = nullptr) {
         problem_common_(a, b, params, band, std::move(guide_j),
-                        params.num_sets() > 1 || !track.empty() || !gap_track.empty(), blkT, step_max);
+                        params.num_sets() > 1 || !track.empty() || !gap_track.empty(), blkT, ib);
         if (tr_) setup_tracks_(track, gap_track, gapsT);
         problem_set_      = true;
     }
@@ -1053,7 +1121,7 @@ private:
     [[gnu::always_inline]] inline void problem_common_(std::span<const uint8_t> a, std::span<const uint8_t> b,
                                                        const AlignParams& params, int band,
                                                        std::vector<int>&& guide_j, bool tracked,
-                                                       const T* blkT, T step_max) {
+                                                       const T* blkT, const NwIntBound<T>* ib) {
         // Invalidate first: a guide rejected below must not leave the previous
         // problem's results readable against this problem's sequences.
         problem_set_      = false;
@@ -1072,22 +1140,22 @@ private:
         // tracked).  T=double aliases the master (no copy); float32 converts once per
         // problem into blkT_storage_, unless the caller prepared it.
         if constexpr (std::is_same_v<T, double>) {
-            (void)blkT; (void)step_max;
+            (void)blkT; (void)ib;
             blkT_ = blk_;
         } else if constexpr (nw_is_int<T>) {
             // The batch prepared the stack, the gaps and step_max once per params
             // (nw_int_prepare) and hands them to every pair, tracked or not; a standalone
             // problem prepares its own (the sets it reads: K when tracked, else set 0).
-            if (blkT && step_max >= T(0)) {
+            if (blkT && ib && ib->prepared()) {
                 blkT_ = blkT;
-                step_max_ = step_max;
+                ib_ = *ib;
             } else {
                 nw_int_prepare<T>(params, tr_ ? params.num_sets() : 1, blkT_storage_,
-                                  int_gaps_scratch_, step_max_);
+                                  int_gaps_scratch_, ib_);
                 blkT_ = blkT_storage_.data();
             }
         } else {
-            (void)step_max;
+            (void)ib;
             if (tr_ && blkT) {
                 blkT_ = blkT;
             } else {
@@ -1517,16 +1585,19 @@ private:
     // silent truncation of 0.5 to 0 would be the alternative), and the problem's a-priori
     // bound (m+n+2) * step_max_ must not exceed the cap, step_max_ being the largest
     // magnitude any one move can add: max |s| over the block, |go| + |ge| per side.
-    T step_max_ = T(0);
+    NwIntBound<T> ib_;
     mutable std::vector<T> int_gaps_scratch_;   // nw_int_prepare's gaps, when run here
     void int_bound_check_() const {
-        if (step_max_ > T(0) &&
-            static_cast<long long>(m_) + n_ + 2 + nw_int_pad_cols > static_cast<long long>(nw_int_cap<T> / step_max_))
-            throw std::overflow_error(
-                "nwgrad: a " + std::to_string(m_) + " x " + std::to_string(n_) + " problem with a largest "
-                "step of " + std::to_string(static_cast<long long>(step_max_)) + " could overflow the " +
-                nw_type_name<T>() + " scalar type ((m + n + 2 + 64 padding columns) * step exceeds " +
-                std::to_string(static_cast<long long>(nw_int_cap<T>)) + "); use a wider type");
+        const long long why = nw_int_bound_check<T, AM == AlignMode::Local, AB == AlignBand::GuideBanded>(ib_, m_, n_);
+        if (why == 0) return;
+        const char* what = why == 1 ? "((m + n + 2 + 64 padding columns) * step exceeds the type's quarter range)"
+                         : why == 2 ? "(the values a path can collect exceed the type's top)"
+                         : why == 3 ? "(the values a path can lose exceed the type's bottom)"
+                         : "(the range of values is too wide for the sentinel to stay below them)";
+        throw std::overflow_error(
+            "nwgrad: a " + std::to_string(m_) + " x " + std::to_string(n_) + " problem with a largest "
+            "step of " + std::to_string(static_cast<long long>(ib_.step_max)) + " could overflow the " +
+            nw_type_name<T>() + " scalar type " + what + "; use a wider type");
     }
 
     // Throw if own buffer shell has never been allocated.
@@ -2095,18 +2166,18 @@ private:
                 if constexpr (Tr) { go_b = tgob_[static_cast<size_t>(i)]; ge_b = tgeb_[static_cast<size_t>(i)]; }
                 if constexpr (Ptr) prev = from_code((c >> 2) & 3);
                 else { const size_t k = cell_index(i-1, j);
-                       prev = argmax(buf.VM[k] - go_b - ge_b,
-                                     buf.VX[k]        - ge_b,
-                                     buf.VY[k] - go_b - ge_b); }
+                       prev = argmax(nw_sub(nw_sub(buf.VM[k], go_b), ge_b),
+                                     nw_sub(buf.VX[k], ge_b),
+                                     nw_sub(nw_sub(buf.VY[k], go_b), ge_b)); }
                 emit(TBTable::X, i, j, prev != TBTable::X);
                 --i;
             } else {                          // gap in A: advance j, gap_a penalties
                 if constexpr (Tr) { go_a = tgoa_[static_cast<size_t>(i)]; ge_a = tgea_[static_cast<size_t>(i)]; }
                 if constexpr (Ptr) prev = from_code(c >> 4);
                 else { const size_t k = cell_index(i, j-1);
-                       prev = argmax(buf.VM[k] - go_a - ge_a,
-                                     buf.VX[k] - go_a - ge_a,
-                                     buf.VY[k]        - ge_a); }
+                       prev = argmax(nw_sub(nw_sub(buf.VM[k], go_a), ge_a),
+                                     nw_sub(nw_sub(buf.VX[k], go_a), ge_a),
+                                     nw_sub(buf.VY[k], ge_a)); }
                 emit(TBTable::Y, i, j, prev != TBTable::Y);
                 --j;
             }
@@ -2523,16 +2594,16 @@ private:
                     // the clamp off the left carry, the same value (see nw_opaque); the carry
                     // a local, not hc[j-1]: with the pin, clang reloaded it from the store
                     // just made (a store-forward on the chain: 0.41x gcc)
-                    const T t = std::max<T>(std::max<T>(hp[j-1] + srow[bcode[static_cast<size_t>(j) - 1]],
-                                                        hp[j] - ge_b_r), static_cast<T>(0));
-                    v = std::max<T>(nw_opaque(t), left - ge_a_r);
+                    const T t = std::max<T>(std::max<T>(nw_add<T>(hp[j-1], srow[bcode[static_cast<size_t>(j) - 1]]),
+                                                        nw_sub<T>(hp[j], ge_b_r)), static_cast<T>(0));
+                    v = std::max<T>(nw_opaque(t), nw_sub<T>(left, ge_a_r));
                     left = v;
                     rowmax = std::max(rowmax, v);
                 } else {
                     v = std::max({
-                        hp[j-1] + srow[bcode[static_cast<size_t>(j) - 1]],
-                        hp[j]   - ge_b_r,
-                        hc[j-1] - ge_a_r,
+                        nw_add<T>(hp[j-1], srow[bcode[static_cast<size_t>(j) - 1]]),
+                        nw_sub<T>(hp[j], ge_b_r),
+                        nw_sub<T>(hc[j-1], ge_a_r),
                     });
                     if constexpr (AM == AlignMode::Local) {
                         v = std::max(v, static_cast<T>(0));
@@ -2609,15 +2680,15 @@ private:
             // reading the codes off the values was slower still: 2x).  The values are the
             // same std::max calls in the same order, so bit-exact.
             for (int j = 1; j <= n; ++j) {
-                const T d0 = pv[j - 1] + prow[bcode[j - 1]];
-                const T u = pv[j] - ge_b;
+                const T d0 = nw_add<T>(pv[j - 1], prow[bcode[j - 1]]);
+                const T u = nw_sub<T>(pv[j], ge_b);
                 cv[j] = std::max(d0, u);
                 d[j] = static_cast<unsigned char>(d0 < u);
             }
             T left = cv[0];
             int hit = 0;
             for (int j = 1; j <= n; ++j) {
-                const T t = cv[j], l = left - ge_a;
+                const T t = cv[j], l = nw_sub<T>(left, ge_a);
                 T v = std::max(t, l);
                 const int tl = t < l;
                 unsigned char c = static_cast<unsigned char>(d[j] + tl * (2 - d[j]));
@@ -2807,15 +2878,15 @@ private:
                 const std::size_t k = static_cast<std::size_t>(j);
                 const T dgM = pM[k-1], dgX = pX[k-1], dgY = pY[k-1];
                 T m_val;
-                if constexpr (Tr) m_val = std::max({dgM, dgX, dgY}) + srow[b_idx_[k - 1]];
-                else              m_val = std::max({dgM, dgX, dgY}) + subTu(i, j);
+                if constexpr (Tr) m_val = nw_add<T>(std::max({dgM, dgX, dgY}), srow[b_idx_[k - 1]]);
+                else              m_val = nw_add<T>(std::max({dgM, dgX, dgY}), subTu(i, j));
                 unsigned char km = pick(dgM, dgX, dgY);
 
-                const T ux = pM[k] - go_b - ge_b, vx = pX[k] - ge_b, wx = pY[k] - go_b - ge_b;
+                const T ux = nw_sub(nw_sub(pM[k], go_b), ge_b), vx = nw_sub(pX[k], ge_b), wx = nw_sub(nw_sub(pY[k], go_b), ge_b);
                 const T x_val = std::max({ux, vx, wx});
                 const unsigned char kx = pick(ux, vx, wx);
 
-                const T uy = cM[k-1] - go_a - ge_a, vy = cX[k-1] - go_a - ge_a, wy = cY[k-1] - ge_a;
+                const T uy = nw_sub(nw_sub(cM[k-1], go_a), ge_a), vy = nw_sub(nw_sub(cX[k-1], go_a), ge_a), wy = nw_sub(cY[k-1], ge_a);
                 const T y_val = std::max({uy, vy, wy});
                 const unsigned char ky = pick(uy, vy, wy);
 
@@ -2944,7 +3015,7 @@ private:
         for (int c = 1; c <= W; ++c) {
             pM[c] = NINF;
             pX[c] = NINF;
-            pY[c] = std::max({pM[c-1] - go_a - ge_a, pX[c-1] - go_a - ge_a, pY[c-1] - ge_a});
+            pY[c] = std::max({nw_sub(nw_sub(pM[c-1], go_a), ge_a), nw_sub(nw_sub(pX[c-1], go_a), ge_a), nw_sub(pY[c-1], ge_a)});
         }
 
         T* rr = const_cast<T*>(rmp);
@@ -2954,25 +3025,25 @@ private:
                 if constexpr (Pmax) for (int k = 0; k <= W; ++k) rr[k] = static_cast<T>(k) * ge_a;
             }
             cM[0] = NINF;
-            cX[0] = std::max({pM[0] - go_b - ge_b, pX[0] - ge_b, pY[0] - go_b - ge_b});
-            if (in_x && r == i0 + 1) cX[0] = static_cast<T>(0) - ge_b;   // the run continues
+            cX[0] = std::max({nw_sub(nw_sub(pM[0], go_b), ge_b), nw_sub(pX[0], ge_b), nw_sub(nw_sub(pY[0], go_b), ge_b)});
+            if (in_x && r == i0 + 1) cX[0] = nw_sub(static_cast<T>(0), ge_b);   // the run continues
             cY[0] = NINF;
             // The running prefix max over Q[k] = g[k] + k*ge_a, seeded with the column-0
             // border folded in as k = -1.  Unused (and cold) when Pmax is false.
-            T P = cY[0] - ge_a;
+            T P = nw_sub(cY[0], ge_a);
             for (int c = 1; c <= W; ++c) {
                 // subT is 1-based over the full sequences; row r consumes a[r-1].
                 cM[c] = std::max({pM[c-1], pX[c-1], pY[c-1]}) + (tr_ ? subT(r, j0 + c) : subTu(r, j0 + c));
-                cX[c] = std::max({pM[c] - go_b - ge_b, pX[c] - ge_b, pY[c] - go_b - ge_b});
+                cX[c] = std::max({nw_sub(nw_sub(pM[c], go_b), ge_b), nw_sub(pX[c], ge_b), nw_sub(nw_sub(pY[c], go_b), ge_b)});
                 if constexpr (Pmax) {
                     // g[k] for k = c-1.  Max-then-subtract mirrors the kernel's `ov`
                     // exactly (subtracting a common value is order-preserving, so this is
                     // bit-identical to the three-way form the exact branch uses).
-                    const T g = (std::max(cM[c-1], cX[c-1]) - go_a) - ge_a;
+                    const T g = nw_sub(nw_sub(std::max(cM[c-1], cX[c-1]), go_a), ge_a);
                     P = std::max<T>(g + rmp[c-1], P);
                     cY[c] = P - rmp[c-1];
                 } else {
-                    cY[c] = std::max({cM[c-1] - go_a - ge_a, cX[c-1] - go_a - ge_a, cY[c-1] - ge_a});
+                    cY[c] = std::max({nw_sub(nw_sub(cM[c-1], go_a), ge_a), nw_sub(nw_sub(cX[c-1], go_a), ge_a), nw_sub(cY[c-1], ge_a)});
                 }
             }
             std::swap(pM, cM); std::swap(pX, cX); std::swap(pY, cY);
@@ -3004,7 +3075,7 @@ private:
         for (int d = 1; d <= W; ++d) {
             pM[d] = NINF;
             pX[d] = NINF;
-            pY[d] = std::max({pM[d-1] - go_a - ge_a, pX[d-1] - go_a - ge_a, pY[d-1] - ge_a});
+            pY[d] = std::max({nw_sub(nw_sub(pM[d-1], go_a), ge_a), nw_sub(nw_sub(pX[d-1], go_a), ge_a), nw_sub(pY[d-1], ge_a)});
         }
 
         T* rr = const_cast<T*>(rmp);
@@ -3014,20 +3085,20 @@ private:
                 if constexpr (Pmax) for (int k = 0; k <= W; ++k) rr[k] = static_cast<T>(k) * ge_a;
             }
             cM[0] = NINF;
-            cX[0] = std::max({pM[0] - go_b - ge_b, pX[0] - ge_b, pY[0] - go_b - ge_b});
-            if (out_x && r == i1 - 1) cX[0] = static_cast<T>(0) - ge_b;   // enters the corner vertically
+            cX[0] = std::max({nw_sub(nw_sub(pM[0], go_b), ge_b), nw_sub(pX[0], ge_b), nw_sub(nw_sub(pY[0], go_b), ge_b)});
+            if (out_x && r == i1 - 1) cX[0] = nw_sub(static_cast<T>(0), ge_b);   // enters the corner vertically
             cY[0] = NINF;
-            T P = cY[0] - ge_a;
+            T P = nw_sub(cY[0], ge_a);
             for (int d = 1; d <= W; ++d) {
                 // Mirrored diagonal: this step pairs a[r] with b[j1-d], i.e. subT(r+1, j1-d+1).
                 cM[d] = std::max({pM[d-1], pX[d-1], pY[d-1]}) + (tr_ ? subT(r + 1, j1 - d + 1) : subTu(r + 1, j1 - d + 1));
-                cX[d] = std::max({pM[d] - go_b - ge_b, pX[d] - ge_b, pY[d] - go_b - ge_b});
+                cX[d] = std::max({nw_sub(nw_sub(pM[d], go_b), ge_b), nw_sub(pX[d], ge_b), nw_sub(nw_sub(pY[d], go_b), ge_b)});
                 if constexpr (Pmax) {
-                    const T g = (std::max(cM[d-1], cX[d-1]) - go_a) - ge_a;
+                    const T g = nw_sub(nw_sub(std::max(cM[d-1], cX[d-1]), go_a), ge_a);
                     P = std::max<T>(g + rmp[d-1], P);
                     cY[d] = P - rmp[d-1];
                 } else {
-                    cY[d] = std::max({cM[d-1] - go_a - ge_a, cX[d-1] - go_a - ge_a, cY[d-1] - ge_a});
+                    cY[d] = std::max({nw_sub(nw_sub(cM[d-1], go_a), ge_a), nw_sub(nw_sub(cX[d-1], go_a), ge_a), nw_sub(cY[d-1], ge_a)});
                 }
             }
             std::swap(pM, cM); std::swap(pX, cX); std::swap(pY, cY);
@@ -3131,7 +3202,7 @@ private:
         for (int c = 1; c <= W; ++c) {
             pM[c] = NINF;
             pX[c] = NINF;
-            const T uy = pM[c-1] - go_a - ge_a, vy = pX[c-1] - go_a - ge_a, wy = pY[c-1] - ge_a;
+            const T uy = nw_sub(nw_sub(pM[c-1], go_a), ge_a), vy = nw_sub(nw_sub(pX[c-1], go_a), ge_a), wy = nw_sub(pY[c-1], ge_a);
             pY[c] = std::max({uy, vy, wy});
             D[c] = pack(3, 3, pick(uy, vy, wy));
         }
@@ -3142,18 +3213,18 @@ private:
                 go_a = hb_go_a(i0 + r); ge_a = hb_ge_a(i0 + r);
                 go_b = hb_go_b(i0 + r, false); ge_b = hb_ge_b(i0 + r, false);
             }
-            const T ux0 = pM[0] - go_b - ge_b, vx0 = pX[0] - ge_b, wx0 = pY[0] - go_b - ge_b;
+            const T ux0 = nw_sub(nw_sub(pM[0], go_b), ge_b), vx0 = nw_sub(pX[0], ge_b), wx0 = nw_sub(nw_sub(pY[0], go_b), ge_b);
             cM[0] = NINF;
             cX[0] = std::max({ux0, vx0, wx0});
             cY[0] = NINF;
             D[rb] = pack(3, pick(ux0, vx0, wx0), 3);
-            if (in_x && r == 1) { cX[0] = static_cast<T>(0) - ge_b; D[rb] = pack(3, 1, 3); }   // continues the run
+            if (in_x && r == 1) { cX[0] = nw_sub(static_cast<T>(0), ge_b); D[rb] = pack(3, 1, 3); }   // continues the run
             for (int c = 1; c <= W; ++c) {
                 const T dgM = pM[c-1], dgX = pX[c-1], dgY = pY[c-1];
                 cM[c] = std::max({dgM, dgX, dgY}) + (tr_ ? subT(i0 + r, j0 + c) : subTu(i0 + r, j0 + c));
-                const T ux = pM[c] - go_b - ge_b, vx = pX[c] - ge_b, wx = pY[c] - go_b - ge_b;
+                const T ux = nw_sub(nw_sub(pM[c], go_b), ge_b), vx = nw_sub(pX[c], ge_b), wx = nw_sub(nw_sub(pY[c], go_b), ge_b);
                 cX[c] = std::max({ux, vx, wx});
-                const T uy = cM[c-1] - go_a - ge_a, vy = cX[c-1] - go_a - ge_a, wy = cY[c-1] - ge_a;
+                const T uy = nw_sub(nw_sub(cM[c-1], go_a), ge_a), vy = nw_sub(nw_sub(cX[c-1], go_a), ge_a), wy = nw_sub(cY[c-1], ge_a);
                 cY[c] = std::max({uy, vy, wy});
                 D[rb + c] = pack(pick(dgM, dgX, dgY), pick(ux, vx, wx), pick(uy, vy, wy));
             }
@@ -3280,10 +3351,10 @@ private:
             const int d = W - c;                       // reverse sweep is indexed leftward
             const T f = std::max({FM[c], FX[c], FY[c]});
             const T g = std::max({rM[d], rX[d], rY[d]});
-            const T plain = f + g;
+            const T plain = nw_add(f, g);
             if (plain > best) { best = plain; cstar = c; span = false; }
             if (FX[c] > NINF && rX[d] > NINF) {
-                const T joined = FX[c] + rX[d] + go_b;
+                const T joined = nw_add(nw_add(FX[c], rX[d]), go_b);
                 if (joined > best) { best = joined; cstar = c; span = true; }
             }
         }
@@ -3412,7 +3483,7 @@ private:
             if (local) { pM[c] = static_cast<T>(0); pX[c] = NINF; pY[c] = NINF; }
             else {
                 pM[c] = NINF; pX[c] = NINF;
-                pY[c] = std::max((std::max(pM[c-1], pX[c-1]) - go_a) - ge_a, pY[c-1] - ge_a);
+                pY[c] = std::max(nw_sub(nw_sub(std::max(pM[c-1], pX[c-1]), go_a), ge_a), nw_sub(pY[c-1], ge_a));
             }
         }
 
@@ -3426,21 +3497,21 @@ private:
                 if (pmax) for (int k = 0; k < NC; ++k) rmp[k] = static_cast<T>(k) * ge_a;
             }
             cM[0] = local ? static_cast<T>(0) : NINF;
-            cX[0] = std::max(std::max((pM[0] - go_b) - ge_b, pX[0] - ge_b), (pY[0] - go_b) - ge_b);
+            cX[0] = std::max(std::max(nw_sub(nw_sub(pM[0], go_b), ge_b), nw_sub(pX[0], ge_b)), nw_sub(nw_sub(pY[0], go_b), ge_b));
             cY[0] = NINF;
-            T P = cY[0] - ge_a;   // Pmax: the running prefix max, the border as its seed
+            T P = nw_sub(cY[0], ge_a);   // Pmax: the running prefix max, the border as its seed
             for (int c = 1; c <= NC; ++c) {
                 const int bcol = b_start + (c - 1) * b_step;       // 0-based sequence col
                 T m = std::max({pM[c-1], pX[c-1], pY[c-1]}) + (tr_ ? subT(arow + 1, bcol + 1) : subTu(arow + 1, bcol + 1));
                 if (local) m = std::max(m, static_cast<T>(0));
-                const T x = std::max(std::max((pM[c] - go_b) - ge_b, pX[c] - ge_b), (pY[c] - go_b) - ge_b);
+                const T x = std::max(std::max(nw_sub(nw_sub(pM[c], go_b), ge_b), nw_sub(pX[c], ge_b)), nw_sub(nw_sub(pY[c], go_b), ge_b));
                 T y;
                 if (pmax) {
-                    const T g = (std::max(cM[c-1], cX[c-1]) - go_a) - ge_a;
+                    const T g = nw_sub(nw_sub(std::max(cM[c-1], cX[c-1]), go_a), ge_a);
                     P = std::max<T>(g + rmp[c-1], P);
                     y = P - rmp[c-1];
                 } else {
-                    y = std::max(std::max((cM[c-1] - go_a) - ge_a, (cX[c-1] - go_a) - ge_a), cY[c-1] - ge_a);
+                    y = std::max(std::max(nw_sub(nw_sub(cM[c-1], go_a), ge_a), nw_sub(nw_sub(cX[c-1], go_a), ge_a)), nw_sub(cY[c-1], ge_a));
                 }
                 cM[c] = m; cX[c] = x; cY[c] = y;
                 const T here = std::max({m, x, y});
@@ -3585,7 +3656,7 @@ private:
         T ge_a = hb_ge_a(rev ? i1 : i0);
         T ge_b = static_cast<T>(params_->gap_extend_b);
         row[0] = static_cast<T>(0);
-        for (int c = 1; c <= W; ++c) row[c] = row[c - 1] - ge_a;
+        for (int c = 1; c <= W; ++c) row[c] = nw_sub(row[c - 1], ge_a);
         // The direction and the substitution row are resolved outside the column loop
         // (gcc unswitched them, clang did not: clang/gcc 1.65x); the same arithmetic.
         auto sweep = [&](auto step) {
@@ -3604,7 +3675,7 @@ private:
                 // stored, a store-forward on the serial chain.
                 T left = row[0];
                 for (int c = 1; c <= W; ++c) {
-                    T v = diag + srow[bc[jb + S * c]];
+                    T v = nw_add(diag, srow[bc[jb + S * c]]);
                     const T u = row[c] - gb, l = left - ga;
                     if (v < u) v = u;
                     if (v < l) v = l;
@@ -3673,17 +3744,17 @@ private:
         T ge_a = hb_ge_a(i0);
         T ge_b = static_cast<T>(params_->gap_extend_b);
         prev[0] = static_cast<T>(0);
-        for (int c = 1; c <= W; ++c) { prev[c] = prev[c - 1] - ge_a; D[c] = 2; }
+        for (int c = 1; c <= W; ++c) { prev[c] = nw_sub(prev[c - 1], ge_a); D[c] = 2; }
         for (int r = 1; r <= H; ++r) {
             unsigned char* d = D + static_cast<std::size_t>(r) * st;
             if (tr_) { ge_a = tgea_[static_cast<size_t>(i0 + r)]; ge_b = tgeb_[static_cast<size_t>(i0 + r)]; }
-            cur[0] = prev[0] - ge_b; d[0] = 1;
+            cur[0] = nw_sub(prev[0], ge_b); d[0] = 1;
             const T* srow = sub_row_(i0 + r);
             const uint8_t* bc = b_idx_.data();
             const T gb = ge_b, ga = ge_a;
             T left = cur[0];   // in a register, as in lhb_sweep
             for (int c = 1; c <= W; ++c) {
-                T v = prev[c - 1] + srow[bc[j0 + c - 1]];
+                T v = nw_add(prev[c - 1], srow[bc[j0 + c - 1]]);
                 unsigned char k = 0;
                 const T u = prev[c] - gb, l = left - ga;
                 if (v < u) { v = u; k = 1; }
@@ -3760,7 +3831,7 @@ private:
                 const T ge_a = ga(i), ge_b = gb(i);
                 for (int j = 1; j <= n_; ++j) {
                     T v = diag + (tr_ ? subT(i, j) : subTu(i, j));
-                    const T u = row[j] - ge_b, l = row[j - 1] - ge_a;
+                    const T u = nw_sub(row[j], ge_b), l = nw_sub(row[j - 1], ge_a);
                     if (v < u) v = u;
                     if constexpr (nw_is_int<T>) {   // the clamp off the left carry (see nw_opaque)
                         v = nw_opaque(std::max<T>(v, static_cast<T>(0)));
@@ -3818,11 +3889,11 @@ private:
                 // gaps in A lie in row pi
                 const T ge_a = ga(pi), ge_b = gb(pi + 1);
                 T diag = g[je];
-                g[je] = g[je] - ge_b;
+                g[je] = nw_sub(g[je], ge_b);
                 if (g[je] > sbest) { sbest = g[je]; is = pi; js = je; }
                 for (int q = je - 1; q >= 0; --q) {
                     T v = diag + (tr_ ? subT(pi + 1, q + 1) : subTu(pi + 1, q + 1));
-                    const T u = g[q] - ge_b, l = g[q + 1] - ge_a;
+                    const T u = nw_sub(g[q], ge_b), l = nw_sub(g[q + 1], ge_a);
                     if (v < u) v = u;
                     if (v < l) v = l;
                     diag = g[q];
@@ -4077,11 +4148,11 @@ private:
             for (int jj = c0 + 1; jj <= c1; ++jj) {
                 const std::size_t k = at(ii, jj), up = k - bw, dg = up - 1, lf = k - 1;
                 const T dgM = bM[dg], dgX = bX[dg], dgY = bY[dg];
-                bM[k] = std::max({dgM, dgX, dgY}) + subTu(ii, jj);
+                bM[k] = nw_add<T>(std::max({dgM, dgX, dgY}), subTu(ii, jj));
                 dM[k] = pick(dgM, dgX, dgY);
-                const T ux = bM[up] - go_b - ge_b, vx = bX[up] - ge_b, wx = bY[up] - go_b - ge_b;
+                const T ux = nw_sub(nw_sub(bM[up], go_b), ge_b), vx = nw_sub(bX[up], ge_b), wx = nw_sub(nw_sub(bY[up], go_b), ge_b);
                 bX[k] = std::max({ux, vx, wx}); dX[k] = pick(ux, vx, wx);
-                const T uy = bM[lf] - go_a - ge_a, vy = bX[lf] - go_a - ge_a, wy = bY[lf] - ge_a;
+                const T uy = nw_sub(nw_sub(bM[lf], go_a), ge_a), vy = nw_sub(nw_sub(bX[lf], go_a), ge_a), wy = nw_sub(bY[lf], ge_a);
                 bY[k] = std::max({uy, vy, wy}); dY[k] = pick(uy, vy, wy);
             }
         }
@@ -4177,13 +4248,13 @@ private:
             T lM = cM[0], lX = cX[0], lY = cY[0];
             const uint8_t* bcode = b_idx_.data();
             for (int j = 1; j <= n_; ++j) {
-                T m_val = std::max({pM[j-1], pX[j-1], pY[j-1]}) + sub[bcode[j - 1]];
+                T m_val = nw_add<T>(std::max({pM[j-1], pX[j-1], pY[j-1]}), sub[bcode[j - 1]]);
                 // The open from max(M, Y) / max(M, X) first: (v - go) - ge is monotone in v,
                 // so this is the three-way max's value exactly (the inter-pair kernels' form),
                 // and it leaves clang's SLP vectorizer no isomorphic pairs to pack onto the
                 // Y chain (it did, with shuffles: 2.3x gcc on scalar Global).
-                const T x_val = std::max((std::max(pM[j], pY[j]) - go_b) - ge_b, pX[j] - ge_b);
-                const T y_val = std::max((std::max(lM, lX) - go_a) - ge_a, lY - ge_a);
+                const T x_val = std::max(nw_sub(nw_sub(std::max(pM[j], pY[j]), go_b), ge_b), nw_sub(pX[j], ge_b));
+                const T y_val = std::max(nw_sub(nw_sub(std::max(lM, lX), go_a), ge_a), nw_sub(lY, ge_a));
                 if constexpr (local) {
                     m_val = std::max(m_val, static_cast<T>(0));
                     best = std::max(best, std::max({m_val, x_val, y_val}));
@@ -4229,11 +4300,11 @@ private:
             for (int j = 1; j <= n_; ++j) {
                 T v;
                 if constexpr (local && nw_is_int<T>) {   // the clamp off the left carry (see nw_opaque)
-                    const T t = std::max<T>(std::max<T>(prev[j-1] + sub[bcode[j - 1]], prev[j] - ge_b), static_cast<T>(0));
-                    v = std::max<T>(nw_opaque(t), left - ge_a);
+                    const T t = std::max<T>(std::max<T>(nw_add<T>(prev[j-1], sub[bcode[j - 1]]), nw_sub<T>(prev[j], ge_b)), static_cast<T>(0));
+                    v = std::max<T>(nw_opaque(t), nw_sub<T>(left, ge_a));
                     rowmax = std::max(rowmax, v);
                 } else {
-                    v = std::max({prev[j-1] + sub[bcode[j - 1]], prev[j] - ge_b, left - ge_a});
+                    v = std::max({nw_add<T>(prev[j-1], sub[bcode[j - 1]]), nw_sub<T>(prev[j], ge_b), nw_sub<T>(left, ge_a)});
                     if constexpr (local) {
                         v = std::max(v, static_cast<T>(0));
                         rowmax = std::max(rowmax, v);
@@ -4332,14 +4403,14 @@ private:
             T rowmax = static_cast<T>(0);   // Local: see local_row_best_
             for (int j = j0; j <= j1; ++j) {
                 T diag  = std::max({pM[j-1], pX[j-1], pY[j-1]});
-                T m_val = diag + srow[bcode[static_cast<size_t>(j) - 1]];
+                T m_val = nw_add<T>(diag, srow[bcode[static_cast<size_t>(j) - 1]]);
                 // X state: gap in B (advance i), uses gap_b params.  Y: gap in A, gap_a.
                 // The open from the max of the two opening states first: (v - go) - ge is
                 // monotone in v, so the value is the three-way max's exactly (the
                 // inter-pair kernels' form), and clang's SLP vectorizer finds no isomorphic
                 // subtraction pairs to pack onto the Y chain (it did, with shuffles).
-                T x_val = std::max((std::max(pM[j], pY[j]) - go_b) - ge_b, pX[j] - ge_b);
-                T y_val = std::max((std::max(lM, lX) - go_a) - ge_a, lY - ge_a);
+                T x_val = std::max(nw_sub(nw_sub(std::max(pM[j], pY[j]), go_b), ge_b), nw_sub(pX[j], ge_b));
+                T y_val = std::max(nw_sub(nw_sub(std::max(lM, lX), go_a), ge_a), nw_sub(lY, ge_a));
 
                 if constexpr (AM == AlignMode::Local) {
                     m_val = std::max(m_val, static_cast<T>(0));

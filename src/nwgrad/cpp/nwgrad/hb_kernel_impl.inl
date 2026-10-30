@@ -121,8 +121,8 @@ static void hb_sweep_striped(HbJob<T>& job) {
     for (int c = 1; c <= NC; ++c) {
         r0M[c] = NINF;
         r0X[c] = NINF;
-        const T open = (std::max(r0M[c - 1], r0X[c - 1]) - go_a) - ge_a;
-        r0Y[c] = std::max<T>(open, r0Y[c - 1] - ge_a);
+        const T open = nw_sub(nw_sub(std::max(r0M[c - 1], r0X[c - 1]), go_a), ge_a);
+        r0Y[c] = std::max<T>(open, nw_sub(r0Y[c - 1], ge_a));
     }
     if (H == 0) return;                 // nothing to sweep: row 0 IS the answer, in place
 
@@ -183,10 +183,10 @@ static void hb_sweep_striped(HbJob<T>& job) {
         // Column 0 of this row.  M cannot happen there (no column to pair with) and Y
         // cannot either (Y consumes a column); only X, extending downward.
         const T nbM = NINF;
-        T nbX = std::max(std::max((bM - go_b) - ge_b, bX - ge_b), (bY - go_b) - ge_b);
-        if (job.in_x && t == 0) nbX = T(0) - ge_b;   // the inherited run continues
+        T nbX = std::max(std::max(nw_sub(nw_sub(bM, go_b), ge_b), nw_sub(bX, ge_b)), nw_sub(nw_sub(bY, go_b), ge_b));
+        if (job.in_x && t == 0) nbX = nw_sub(T(0), ge_b);   // the inherited run continues
         const T nbY = NINF;
-        const T nbOpen = (std::max(nbM, nbX) - go_a) - ge_a;
+        const T nbOpen = nw_sub(nw_sub(std::max(nbM, nbX), go_a), ge_a);
 
         // ── carry-free half: VM (diagonal) and VX (same column) ──────────────
         // Both read only the previous row, so every lane is independent.  The s == 0
@@ -209,7 +209,7 @@ static void hb_sweep_striped(HbJob<T>& job) {
         }
         for (int s = 0; s < seg; ++s) {
             vd sb; sb.copy_from(sub + (std::size_t)s * W, stdx::element_aligned);
-            const vd vmv = stdx::max(stdx::max(dM, dX), dY) + sb;
+            const vd vmv = vadd(stdx::max(stdx::max(dM, dX), dY), sb);
             vmv.copy_to(cM + (std::size_t)s * W, stdx::element_aligned);
 
             vd uM, uX, uY;
@@ -217,8 +217,8 @@ static void hb_sweep_striped(HbJob<T>& job) {
             uX.copy_from(pX + (std::size_t)s * W, stdx::element_aligned);
             uY.copy_from(pY + (std::size_t)s * W, stdx::element_aligned);
             dM = uM; dX = uX; dY = uY;   // the next segment's diagonal
-            const vd vxv = stdx::max(stdx::max((uM - vgo_b) - vge_b, uX - vge_b),
-                                     (uY - vgo_b) - vge_b);
+            const vd vxv = stdx::max(stdx::max(vsub(vsub(uM, vgo_b), vge_b), vsub(uX, vge_b)),
+                                     vsub(vsub(uY, vgo_b), vge_b));
             vxv.copy_to(cX + (std::size_t)s * W, stdx::element_aligned);
         }
         // The open into Y at segment q: what pass 1 once stored in `ov`, recomputed from the
@@ -228,7 +228,7 @@ static void hb_sweep_striped(HbJob<T>& job) {
             vd vm, vx;
             vm.copy_from(cM + (std::size_t)q * W, stdx::element_aligned);
             vx.copy_from(cX + (std::size_t)q * W, stdx::element_aligned);
-            return vd((stdx::max(vm, vx) - vgo_a) - vge_a);
+            return vd(vsub(vsub(stdx::max(vm, vx), vgo_a), vge_a));
         };
 
         // ── the carry: VY, same-lane striped chain, then lazy-F ──────────────
@@ -255,7 +255,7 @@ static void hb_sweep_striped(HbJob<T>& job) {
         if (seg > 0) for (int r = 0; r < W; ++r) {
             vd last; last.copy_from(cY + (std::size_t)(seg - 1) * W, stdx::element_aligned);
             vd F = lane_shift_in(last, bY);
-            F = F - vge_a;
+            F = vsub(F, vge_a);
             bool changed = false;
             for (int s = 0; s < seg; ++s) {
                 vd v; v.copy_from(cY + (std::size_t)s * W, stdx::element_aligned);
@@ -370,8 +370,8 @@ static void hb_sweep_striped_pmax(HbJob<T>& job) {
     for (int c = 1; c <= NC; ++c) {
         r0M[c] = NINF;
         r0X[c] = NINF;
-        const T open = (std::max(r0M[c - 1], r0X[c - 1]) - go_a) - ge_a;
-        r0Y[c] = std::max<T>(open, r0Y[c - 1] - ge_a);
+        const T open = nw_sub(nw_sub(std::max(r0M[c - 1], r0X[c - 1]), go_a), ge_a);
+        r0Y[c] = std::max<T>(open, nw_sub(r0Y[c - 1], ge_a));
     }
     if (H == 0) return;                 // nothing to sweep: row 0 IS the answer, in place
 
@@ -436,10 +436,10 @@ static void hb_sweep_striped_pmax(HbJob<T>& job) {
         }
 
         const T nbM = NINF;
-        T nbX = std::max(std::max((bM - go_b) - ge_b, bX - ge_b), (bY - go_b) - ge_b);
-        if (job.in_x && t == 0) nbX = T(0) - ge_b;   // the inherited run continues
+        T nbX = std::max(std::max(nw_sub(nw_sub(bM, go_b), ge_b), nw_sub(bX, ge_b)), nw_sub(nw_sub(bY, go_b), ge_b));
+        if (job.in_x && t == 0) nbX = nw_sub(T(0), ge_b);   // the inherited run continues
         const T nbY = NINF;
-        const T nbOpen = (std::max(nbM, nbX) - go_a) - ge_a;
+        const T nbOpen = nw_sub(nw_sub(std::max(nbM, nbX), go_a), ge_a);
 
         // ── carry-free half: VM (diagonal) and VX (same column) ──────────────
         // Byte-for-byte the exact sweep's; pmax changes only what comes after.
@@ -458,7 +458,7 @@ static void hb_sweep_striped_pmax(HbJob<T>& job) {
         }
         for (int s = 0; s < seg; ++s) {
             vd sb; sb.copy_from(sub + (std::size_t)s * W, stdx::element_aligned);
-            const vd vmv = stdx::max(stdx::max(dM, dX), dY) + sb;
+            const vd vmv = vadd(stdx::max(stdx::max(dM, dX), dY), sb);
             vmv.copy_to(cM + (std::size_t)s * W, stdx::element_aligned);
 
             vd uM, uX, uY;
@@ -466,8 +466,8 @@ static void hb_sweep_striped_pmax(HbJob<T>& job) {
             uX.copy_from(pX + (std::size_t)s * W, stdx::element_aligned);
             uY.copy_from(pY + (std::size_t)s * W, stdx::element_aligned);
             dM = uM; dX = uX; dY = uY;   // the next segment's diagonal
-            const vd vxv = stdx::max(stdx::max((uM - vgo_b) - vge_b, uX - vge_b),
-                                     (uY - vgo_b) - vge_b);
+            const vd vxv = stdx::max(stdx::max(vsub(vsub(uM, vgo_b), vge_b), vsub(uX, vge_b)),
+                                     vsub(vsub(uY, vgo_b), vge_b));
             vxv.copy_to(cX + (std::size_t)s * W, stdx::element_aligned);
         }
         // The open into Y at segment q: what pass 1 once stored in `ov`, recomputed from the
@@ -477,7 +477,7 @@ static void hb_sweep_striped_pmax(HbJob<T>& job) {
             vd vm, vx;
             vm.copy_from(cM + (std::size_t)q * W, stdx::element_aligned);
             vx.copy_from(cX + (std::size_t)q * W, stdx::element_aligned);
-            return vd((stdx::max(vm, vx) - vgo_a) - vge_a);
+            return vd(vsub(vsub(stdx::max(vm, vx), vgo_a), vge_a));
         };
 
         // ── pass 1: Q[k] = g[k] + k*ge_a, then a LANE-LOCAL prefix max ───────
@@ -495,7 +495,7 @@ static void hb_sweep_striped_pmax(HbJob<T>& job) {
                 O = open_at(s - 1);
             }
             vd rq; rq.copy_from(rmp + (std::size_t)s * W, stdx::element_aligned);
-            P = stdx::max(O + rq, P);
+            P = stdx::max(vadd(O, rq), P);
             P.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
         }
 
@@ -505,7 +505,7 @@ static void hb_sweep_striped_pmax(HbJob<T>& job) {
         // rounds nor cares about association.  This is what lazy-F cost W sweeps to do.
         T tot[64], cin[64];                     // 64 >= any native_simd width we build
         P.copy_to(tot, stdx::element_aligned);
-        T run = bY - ge_a;                      // the border, folded in as the seed
+        T run = nw_sub(bY, ge_a);                      // the border, folded in as the seed
         for (int l = 0; l < W; ++l) { cin[l] = run; run = std::max(run, tot[l]); }
         vd vcin; vcin.copy_from(cin, stdx::element_aligned);
 
@@ -514,7 +514,7 @@ static void hb_sweep_striped_pmax(HbJob<T>& job) {
         for (int s = 0; s < seg; ++s) {
             vd p; p.copy_from(cY + (std::size_t)s * W, stdx::element_aligned);
             vd rq; rq.copy_from(rmp + (std::size_t)s * W, stdx::element_aligned);
-            (stdx::max(p, vcin) - rq).copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
+            (vsub(stdx::max(p, vcin), rq)).copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
         }
 
         std::swap(pM, cM); std::swap(pX, cX); std::swap(pY, cY);
@@ -639,8 +639,8 @@ static void hb_scan_impl(HbScanJob<T>& job) {
             // column-0 border (M=0, X=-inf), giving open = (max(0,-inf) - go_a) - ge_a.
             const T pm = (c == 1) ? T(0) : NINF;
             const T px = NINF;
-            const T open = (std::max(pm, px) - go_a) - ge_a;
-            prevY = std::max<T>(open, prevY - ge_a);
+            const T open = nw_sub(nw_sub(std::max(pm, px), go_a), ge_a);
+            prevY = std::max<T>(open, nw_sub(prevY, ge_a));
             const int cc = c;
             const std::size_t k = (std::size_t)((cc - 1) % seg) * W + (cc - 1) / seg;
             pM[k] = NINF; pX[k] = NINF; pY[k] = prevY;
@@ -684,9 +684,9 @@ static void hb_scan_impl(HbScanJob<T>& job) {
         // downward from the previous row's column 0 in both modes; Y cannot occur (no
         // column to consume).
         const T nbM = Local ? T(0) : NINF;
-        const T nbX = std::max(std::max((bM - go_b) - ge_b, bX - ge_b), (bY - go_b) - ge_b);
+        const T nbX = std::max(std::max(nw_sub(nw_sub(bM, go_b), ge_b), nw_sub(bX, ge_b)), nw_sub(nw_sub(bY, go_b), ge_b));
         const T nbY = NINF;
-        const T nbOpen = (std::max(nbM, nbX) - go_a) - ge_a;
+        const T nbOpen = nw_sub(nw_sub(std::max(nbM, nbX), go_a), ge_a);
 
         // ── carry-free: VM (diagonal, clamped to 0 for Local), VX (same column) ──
         // The diagonal predecessors: the previous iteration's up vectors, rotated in
@@ -704,7 +704,7 @@ static void hb_scan_impl(HbScanJob<T>& job) {
         }
         for (int s = 0; s < seg; ++s) {
             vd sb; sb.copy_from(sub + (std::size_t)s * W, stdx::element_aligned);
-            vd vmv = stdx::max(stdx::max(dM, dX), dY) + sb;
+            vd vmv = vadd(stdx::max(stdx::max(dM, dX), dY), sb);
             if constexpr (Local) vmv = stdx::max(vmv, vzero);
             vmv.copy_to(cM + (std::size_t)s * W, stdx::element_aligned);
 
@@ -713,8 +713,8 @@ static void hb_scan_impl(HbScanJob<T>& job) {
             uX.copy_from(pX + (std::size_t)s * W, stdx::element_aligned);
             uY.copy_from(pY + (std::size_t)s * W, stdx::element_aligned);
             dM = uM; dX = uX; dY = uY;   // the next segment's diagonal
-            const vd vxv = stdx::max(stdx::max((uM - vgo_b) - vge_b, uX - vge_b),
-                                     (uY - vgo_b) - vge_b);
+            const vd vxv = stdx::max(stdx::max(vsub(vsub(uM, vgo_b), vge_b), vsub(uX, vge_b)),
+                                     vsub(vsub(uY, vgo_b), vge_b));
             vxv.copy_to(cX + (std::size_t)s * W, stdx::element_aligned);
         }
         // The open into Y at segment q: what pass 1 once stored in `ov`, recomputed from the
@@ -724,7 +724,7 @@ static void hb_scan_impl(HbScanJob<T>& job) {
             vd vm, vx;
             vm.copy_from(cM + (std::size_t)q * W, stdx::element_aligned);
             vx.copy_from(cX + (std::size_t)q * W, stdx::element_aligned);
-            return vd((stdx::max(vm, vx) - vgo_a) - vge_a);
+            return vd(vsub(vsub(stdx::max(vm, vx), vgo_a), vge_a));
         };
 
         if constexpr (Pmax) {
@@ -739,18 +739,18 @@ static void hb_scan_impl(HbScanJob<T>& job) {
                     O = open_at(s - 1);
                 }
                 vd rq; rq.copy_from(rmp + (std::size_t)s * W, stdx::element_aligned);
-                P = stdx::max(O + rq, P);
+                P = stdx::max(vadd(O, rq), P);
                 P.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
             }
             T tot[64], cin[64];
             P.copy_to(tot, stdx::element_aligned);
-            T run = bY - ge_a;
+            T run = nw_sub(bY, ge_a);
             for (int l = 0; l < W; ++l) { cin[l] = run; run = std::max(run, tot[l]); }
             vd vcin; vcin.copy_from(cin, stdx::element_aligned);
             for (int s = 0; s < seg; ++s) {
                 vd p; p.copy_from(cY + (std::size_t)s * W, stdx::element_aligned);
                 vd rq; rq.copy_from(rmp + (std::size_t)s * W, stdx::element_aligned);
-                (stdx::max(p, vcin) - rq).copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
+                (vsub(stdx::max(p, vcin), rq)).copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
             }
         } else {
         // ── the carry: VY, same-lane striped chain, then lazy-F (exact) ──────────
@@ -767,7 +767,7 @@ static void hb_scan_impl(HbScanJob<T>& job) {
         for (int r = 0; r < W; ++r) {
             vd last; last.copy_from(cY + (std::size_t)(seg - 1) * W, stdx::element_aligned);
             vd F = lane_shift_in(last, bY);
-            F = F - vge_a;
+            F = vsub(F, vge_a);
             bool changed = false;
             for (int s = 0; s < seg; ++s) {
                 vd v; v.copy_from(cY + (std::size_t)s * W, stdx::element_aligned);
@@ -793,7 +793,7 @@ static void hb_scan_impl(HbScanJob<T>& job) {
             vd xx; xx.copy_from(cX + (std::size_t)s * W, stdx::element_aligned);
             vd yy; yy.copy_from(cY + (std::size_t)s * W, stdx::element_aligned);
             vd here = stdx::max(stdx::max(mm, xx), yy);
-            if constexpr (nw_is_int<T>) { vd pv; pv.copy_from(padm + (std::size_t)s * W, stdx::element_aligned); here = here + pv; }
+            if constexpr (nw_is_int<T>) { vd pv; pv.copy_from(padm + (std::size_t)s * W, stdx::element_aligned); here = vadd(here, pv); }
             const vd colv = vlane * T(seg) + T(s + 1);     // column l*seg + s + 1, per lane
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
             if constexpr (sizeof(T) == 8) {
@@ -918,7 +918,7 @@ static void hb_base_striped(HbBaseJob<T>& job) {
         cM[0] = pM[0]; cX[0] = pX[0]; cY[0] = pY[0];  // temp scalars via cM/cX/cY[0]
         T prevM = pM[0], prevX = pX[0], prevY = pY[0];
         for (int c = 1; c <= NC; ++c) {
-            const T uy = prevM - go_a - ge_a, vy = prevX - go_a - ge_a, wy = prevY - ge_a;
+            const T uy = nw_sub(nw_sub(prevM, go_a), ge_a), vy = nw_sub(nw_sub(prevX, go_a), ge_a), wy = nw_sub(prevY, ge_a);
             const T y = std::max({uy, vy, wy});
             const unsigned char code = (uy >= vy && uy >= wy) ? 0 : ((vy >= wy) ? 1 : 2);
             const std::size_t k = off + scol(c);
@@ -951,16 +951,16 @@ static void hb_base_striped(HbBaseJob<T>& job) {
         unsigned char* dP = D + (std::size_t)r * rowsz + off;
 
         // column 0 of this row: carried X gap down the left edge
-        const T ax0 = (bM - go_b) - ge_b, bx0 = bX - ge_b, cx0 = (bY - go_b) - ge_b;
+        const T ax0 = nw_sub(nw_sub(bM, go_b), ge_b), bx0 = nw_sub(bX, ge_b), cx0 = nw_sub(nw_sub(bY, go_b), ge_b);
         const T nbM = NINF;
         T nbX = std::max({ax0, bx0, cx0});
         const T nbY = NINF;
         unsigned char cx0code = (ax0 >= bx0 && ax0 >= cx0) ? 0 : ((bx0 >= cx0) ? 1 : 2);
-        if (job.in_x && r == 1) { nbX = T(0) - ge_b; cx0code = 1; }   // the inherited run continues
+        if (job.in_x && r == 1) { nbX = nw_sub(T(0), ge_b); cx0code = 1; }   // the inherited run continues
         cM[0] = nbM; cX[0] = nbX; cY[0] = nbY;
         D[(std::size_t)r * rowsz] = static_cast<unsigned char>(3 | cx0code << 2 | 3 << 4);
-        const T nbOpen = (std::max(nbM, nbX) - go_a) - ge_a;
-        const T nbOpenK = ((nbM - go_a) - ge_a >= (nbX - go_a) - ge_a) ? T(0) : T(16);   // Y's open codes, pre-shifted
+        const T nbOpen = nw_sub(nw_sub(std::max(nbM, nbX), go_a), ge_a);
+        const T nbOpenK = (nw_sub(nw_sub(nbM, go_a), ge_a) >= nw_sub(nw_sub(nbX, go_a), ge_a)) ? T(0) : T(16);   // Y's open codes, pre-shifted
 
         // The diagonal predecessors: segment s-1 of the previous row, i.e. the up vectors
         // of the previous iteration, rotated in registers (each previous-row vector is
@@ -978,7 +978,7 @@ static void hb_base_striped(HbBaseJob<T>& job) {
         for (int s = 0; s < seg; ++s) {
             vd sb; sb.copy_from(sub + (std::size_t)s * W, stdx::element_aligned);
             const vd mx3 = stdx::max(stdx::max(dgM, dgX), dgY);
-            vd vmv = mx3 + sb;
+            vd vmv = vadd(mx3, sb);
             vd km = vtwo;
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
             if constexpr (sizeof(T) == 8) {
@@ -997,7 +997,7 @@ static void hb_base_striped(HbBaseJob<T>& job) {
             uX.copy_from(pX + off + (std::size_t)s * W, stdx::element_aligned);
             uY.copy_from(pY + off + (std::size_t)s * W, stdx::element_aligned);
             dgM = uM; dgX = uX; dgY = uY;   // the next segment's diagonal
-            const vd ax = (uM - vgo_b) - vge_b, bx = uX - vge_b, cx = (uY - vgo_b) - vge_b;
+            const vd ax = vsub(vsub(uM, vgo_b), vge_b), bx = vsub(uX, vge_b), cx = vsub(vsub(uY, vgo_b), vge_b);
             vd vxv = stdx::max(stdx::max(ax, bx), cx);
             vd kx = veight;                     // X's code, already shifted: 0 / 4 / 8
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
@@ -1020,7 +1020,7 @@ static void hb_base_striped(HbBaseJob<T>& job) {
             // (Floating T: the carry recomputes both from cM / cX instead -- the same bits --
             // which saves two T-typed rows, a store and a load each, per segment.)
             if constexpr (kOpenRows) {
-                const vd om = (vmv - vgo_a) - vge_a, ox = (vxv - vgo_a) - vge_a;
+                const vd om = vsub(vsub(vmv, vgo_a), vge_a), ox = vsub(vsub(vxv, vgo_a), vge_a);
                 stdx::max(om, ox).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
                 vd okv = vsixteen;                  // open from X: Y's code 1, shifted
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
@@ -1048,7 +1048,7 @@ static void hb_base_striped(HbBaseJob<T>& job) {
             vd vm, vx;
             vm.copy_from(cM + off + (std::size_t)q * W, stdx::element_aligned);
             vx.copy_from(cX + off + (std::size_t)q * W, stdx::element_aligned);
-            const vd om = (vm - vgo_a) - vge_a, ox = (vx - vgo_a) - vge_a;
+            const vd om = vsub(vsub(vm, vgo_a), vge_a), ox = vsub(vsub(vx, vgo_a), vge_a);
             O = stdx::max(om, ox);
             OK = vsixteen;
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
@@ -1089,7 +1089,7 @@ static void hb_base_striped(HbBaseJob<T>& job) {
         if (seg > 0) for (int rr = 0; rr < W; ++rr) {   // seg==0 (NC==0): nothing to correct
             vd last; last.copy_from(cY + off + (std::size_t)(seg - 1) * W, stdx::element_aligned);
             vd F = lane_shift_in(last, bY);
-            F = F - vge_a;
+            F = vsub(F, vge_a);
             bool changed = false;
             for (int s = 0; s < seg; ++s) {
                 vd v; v.copy_from(cY + off + (std::size_t)s * W, stdx::element_aligned);

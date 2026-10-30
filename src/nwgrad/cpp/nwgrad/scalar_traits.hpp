@@ -53,10 +53,43 @@ template <class T>
     return v;
 }
 
+// int16 is SATURATING (nw_sat): every add / subtract on a DP value clamps to the type's
+// range (scalar: nw_add / nw_sub below; vector: vadd / vsub in the level kernels, the
+// packed saturating instructions -- vpaddsw / vpsubsw, sqadd / sqsub -- at the cost of the
+// plain ones).  Its sentinel is then lowest() itself, self-preserving under any penalty:
+// an unreachable value can never wrap, however it drifts, and climbs at most by the gains
+// a path can collect.  The bound (nw_int_bound, aligner.hpp) then asks only that no
+// REACHABLE value leaves the range and that a sentinel-derived value stays below every
+// reachable one -- a range of 2^15 for the problem's values instead of the quarter rule,
+// which takes BLOSUM62 pairs from ~370 to ~1300 residues.  int32 / int64 keep the
+// wrapping arithmetic (x86 has no 32/64-bit saturating vector ops) and the quarter rule.
+template <class T>
+inline constexpr bool nw_sat = std::is_integral_v<T> && sizeof(T) == 2;
+
 template <class T>
 inline constexpr T nw_ninf = std::is_floating_point_v<T>
     ? -std::numeric_limits<T>::infinity()
-    : static_cast<T>(std::numeric_limits<T>::lowest() / 2);
+    : nw_sat<T> ? std::numeric_limits<T>::lowest()
+                : static_cast<T>(std::numeric_limits<T>::lowest() / 2);
+
+// Scalar add / subtract on DP values: saturating for nw_sat types (computed in int, then
+// clamped -- the value vpaddsw / vpsubsw give), the plain operation otherwise.  The
+// floating types pass through unchanged, so a kernel can spell every site with these.
+template <class T>
+[[gnu::always_inline]] inline constexpr T nw_sat_cast(int v) noexcept {
+    return static_cast<T>(v < int(std::numeric_limits<T>::lowest()) ? int(std::numeric_limits<T>::lowest())
+         : v > int(std::numeric_limits<T>::max()) ? int(std::numeric_limits<T>::max()) : v);
+}
+template <class T>
+[[gnu::always_inline]] inline constexpr T nw_add(T a, T b) noexcept {
+    if constexpr (nw_sat<T>) return nw_sat_cast<T>(int(a) + int(b));
+    else return static_cast<T>(a + b);
+}
+template <class T>
+[[gnu::always_inline]] inline constexpr T nw_sub(T a, T b) noexcept {
+    if constexpr (nw_sat<T>) return nw_sat_cast<T>(int(a) - int(b));
+    else return static_cast<T>(a - b);
+}
 
 // The largest magnitude the a-priori bound (m+n+2) * max step may reach for an integer
 // T (see above).  Floating types have no cap (infinity).

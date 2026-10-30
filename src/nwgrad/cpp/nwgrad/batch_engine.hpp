@@ -985,13 +985,13 @@ private:
     struct OwnedParams {
         AlignParams p;
         std::vector<T> stack, gaps;
-        T step_max = T(-1);   // integer T: the largest step (nw_int_prepare); -1 = not prepared
+        NwIntBound<T> ib;     // integer T: the bound facts (nw_int_prepare); step_max -1 = not prepared
         const T* stack_or_null() const noexcept { return stack.empty() ? nullptr : stack.data(); }
     };
     std::shared_ptr<const OwnedParams> own_params_(const AlignParams& p) const {
-        auto o = std::make_shared<OwnedParams>(OwnedParams{p, {}, {}, T(-1)});
+        auto o = std::make_shared<OwnedParams>(OwnedParams{p, {}, {}, {}});
         if constexpr (nw_is_int<T>) {
-            nw_int_prepare<T>(p, p.num_sets(), o->stack, o->gaps, o->step_max);
+            nw_int_prepare<T>(p, p.num_sets(), o->stack, o->gaps, o->ib);
             return o;
         }
         if (!tracked_) return o;   // untracked (and standalone SeqPair): no allocation
@@ -1651,10 +1651,10 @@ private:
     [[gnu::always_inline]] inline void problem_(Al& al, size_t i, const OwnedParams& o, int band,
                                                 std::vector<int>&& guide) const {
         if (tracked_) al.set_problem(codes_a(i), codes_b(i), o.p, band, std::move(guide),
-                                     track(i), gap_track(i), o.stack_or_null(), o.gaps.data(), o.step_max);
+                                     track(i), gap_track(i), o.stack_or_null(), o.gaps.data(), &o.ib);
         else if constexpr (nw_is_int<T>)   // the prepared stack, gaps and step_max (no tracks)
             al.set_problem(codes_a(i), codes_b(i), o.p, band, std::move(guide), {}, {},
-                           o.stack_or_null(), o.gaps.data(), o.step_max);
+                           o.stack_or_null(), o.gaps.data(), &o.ib);
         else          al.set_problem(codes_a(i), codes_b(i), o.p, band, std::move(guide));
     }
     // The hard gradient and guide of the DP `al` just ran, into pair i, in one walk —
