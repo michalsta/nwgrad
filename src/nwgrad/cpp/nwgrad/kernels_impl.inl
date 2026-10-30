@@ -610,10 +610,89 @@ static inline void striped_profile_index(unsigned char* idx, const unsigned char
             idx[(std::size_t)s * W + l] = (j <= n) ? b[j - 1] : 0;
         }
 }
+// int16 rows over alphabets of up to 32 symbols: the lookup as byte shuffles.  The row is
+// split into its low and high byte planes (two 32-entry byte tables each); 16 / 32 symbol
+// indices at a time select from them (pshufb / tbl: a 16-entry table per 128-bit lane, so
+// two shuffles and an OR per plane on x86, where an index + 0x70 sets bit 7 -- a zero
+// lane -- for symbols >= 16 and an index - 16 does so for symbols < 16; one tbl2 on NEON)
+// and the planes are interleaved back into words.  The scalar form (one byte load, one
+// word load and one word store per slot, ~4 instructions) was 18 % of the int16 L200
+// score-only time on AVX2 (nighthaven, perf, 2026-10-30).  Same values: a lookup is a
+// lookup.  Alphabets over 32 symbols, and SSE2 (no pshufb), keep the scalar loop.
+#if (defined(__SSSE3__) || defined(__ARM_NEON)) && !defined(NWGRAD_SCALAR_PROFILE_BUILD)
+#define NWGRAD_PROFILE_SHUFFLE 1
+static inline void striped_profile_row_idx_i16(std::int16_t* dst, const std::int16_t* row,
+                                               const unsigned char* idx, int nalpha, std::size_t sw) {
+    // the byte planes, 32 entries each (symbols past nalpha are never indexed)
+    alignas(32) unsigned char lo[32], hi[32];
+    for (int c = 0; c < 32; ++c) {
+        const std::uint16_t v = c < nalpha ? static_cast<std::uint16_t>(row[c]) : 0;
+        lo[c] = static_cast<unsigned char>(v & 0xFF);
+        hi[c] = static_cast<unsigned char>(v >> 8);
+    }
+    std::size_t k = 0;
+#if defined(__AVX2__)
+    const __m256i loA = _mm256_broadcastsi128_si256(_mm_load_si128((const __m128i*)lo));
+    const __m256i loB = _mm256_broadcastsi128_si256(_mm_load_si128((const __m128i*)(lo + 16)));
+    const __m256i hiA = _mm256_broadcastsi128_si256(_mm_load_si128((const __m128i*)hi));
+    const __m256i hiB = _mm256_broadcastsi128_si256(_mm_load_si128((const __m128i*)(hi + 16)));
+    const __m256i c70 = _mm256_set1_epi8(0x70), c16 = _mm256_set1_epi8(16);
+    for (; k + 32 <= sw; k += 32) {
+        const __m256i ix = _mm256_loadu_si256((const __m256i*)(idx + k));
+        const __m256i ia = _mm256_add_epi8(ix, c70), ib = _mm256_sub_epi8(ix, c16);
+        const __m256i l = _mm256_or_si256(_mm256_shuffle_epi8(loA, ia), _mm256_shuffle_epi8(loB, ib));
+        const __m256i h = _mm256_or_si256(_mm256_shuffle_epi8(hiA, ia), _mm256_shuffle_epi8(hiB, ib));
+        const __m256i w0 = _mm256_unpacklo_epi8(l, h);   // words 0-7 | 16-23
+        const __m256i w1 = _mm256_unpackhi_epi8(l, h);   // words 8-15 | 24-31
+        _mm256_storeu_si256((__m256i*)(dst + k), _mm256_permute2x128_si256(w0, w1, 0x20));
+        _mm256_storeu_si256((__m256i*)(dst + k + 16), _mm256_permute2x128_si256(w0, w1, 0x31));
+    }
+#endif
+#if defined(__SSSE3__)
+    {
+        const __m128i loA = _mm_load_si128((const __m128i*)lo), loB = _mm_load_si128((const __m128i*)(lo + 16));
+        const __m128i hiA = _mm_load_si128((const __m128i*)hi), hiB = _mm_load_si128((const __m128i*)(hi + 16));
+        const __m128i c70 = _mm_set1_epi8(0x70), c16 = _mm_set1_epi8(16);
+        for (; k + 16 <= sw; k += 16) {
+            const __m128i ix = _mm_loadu_si128((const __m128i*)(idx + k));
+            const __m128i ia = _mm_add_epi8(ix, c70), ib = _mm_sub_epi8(ix, c16);
+            const __m128i l = _mm_or_si128(_mm_shuffle_epi8(loA, ia), _mm_shuffle_epi8(loB, ib));
+            const __m128i h = _mm_or_si128(_mm_shuffle_epi8(hiA, ia), _mm_shuffle_epi8(hiB, ib));
+            _mm_storeu_si128((__m128i*)(dst + k), _mm_unpacklo_epi8(l, h));
+            _mm_storeu_si128((__m128i*)(dst + k + 8), _mm_unpackhi_epi8(l, h));
+        }
+    }
+#elif defined(__ARM_NEON)
+    {
+        const uint8x16x2_t lt = {vld1q_u8(lo), vld1q_u8(lo + 16)};
+        const uint8x16x2_t ht = {vld1q_u8(hi), vld1q_u8(hi + 16)};
+        for (; k + 16 <= sw; k += 16) {
+            const uint8x16_t ix = vld1q_u8(idx + k);
+            const uint8x16_t l = vqtbl2q_u8(lt, ix), h = vqtbl2q_u8(ht, ix);
+            vst1q_u8((std::uint8_t*)(dst + k), vzip1q_u8(l, h));
+            vst1q_u8((std::uint8_t*)(dst + k + 8), vzip2q_u8(l, h));
+        }
+    }
+#endif
+    for (; k < sw; ++k) dst[k] = row[idx[k]];
+}
+#endif
 template <class T>
 static inline void striped_profile_row_idx(T* dst, const T* row, const unsigned char* idx,
-                                           int n, int seg, int W) {
+                                           int n, int seg, int W, int nalpha) {
     const std::size_t sw = (std::size_t)seg * W;
+#ifdef NWGRAD_PROFILE_SHUFFLE
+    if constexpr (std::is_same_v<T, std::int16_t>) {
+        if (nalpha <= 32) {
+            striped_profile_row_idx_i16(dst, row, idx, nalpha, sw);
+            for (int j = n + 1; j <= seg * W; ++j)
+                dst[(std::size_t)((j - 1) % seg) * W + (std::size_t)((j - 1) / seg)] = nw_pad<T>;
+            return;
+        }
+    }
+#else
+    (void)nalpha;
+#endif
     for (std::size_t k = 0; k < sw; ++k) dst[k] = row[idx[k]];
     for (int j = n + 1; j <= seg * W; ++j)
         dst[(std::size_t)((j - 1) % seg) * W + (std::size_t)((j - 1) / seg)] = nw_pad<T>;
@@ -637,7 +716,7 @@ static inline void striped_profile_build(typename DpBufferT<T>::TVec& prof, cons
             striped_profile_index(idx, b, n, seg, W);
             for (int c = 0; c < tr.nrow; ++c)
                 striped_profile_row_idx(prof.data() + (std::size_t)c * sw,
-                                        blk + (std::size_t)tr.crow[c] * nalpha, idx, n, seg, W);
+                                        blk + (std::size_t)tr.crow[c] * nalpha, idx, n, seg, W, nalpha);
         } else if (prof.size() < sw) {
             prof.resize(sw);
         }
@@ -649,7 +728,7 @@ static inline void striped_profile_build(typename DpBufferT<T>::TVec& prof, cons
         striped_profile_index(idx, b, n, seg, W);
         for (int c = 0; c < nalpha; ++c)
             striped_profile_row_idx(prof.data() + (std::size_t)c * sw, blk + (std::size_t)c * nalpha,
-                                    idx, n, seg, W);
+                                    idx, n, seg, W, nalpha);
     }
 }
 // DP row i's profile row (1-based i).
