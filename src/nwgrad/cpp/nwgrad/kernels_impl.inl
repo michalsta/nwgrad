@@ -163,7 +163,7 @@ static inline void striped_row_best(const T* cM, const T* cX, const T* cY, const
                                     int seg, int i, T& best, int& bi, int& bj, int& btbl) {
     using vt = stdx::native_simd<T>;
     constexpr int W = (int)vt::size();
-    vt lmax(nw_ninf<T>), ls(T(0));
+    vt lmax(nw_ninf_s<T, Sat>), ls(T(0));
     // The segment index as a vector, carried and incremented — NOT `vt(T(s))` in the loop:
     // for 64-bit lanes at AVX-512 gcc lowered that broadcast to eight merge-masked
     // `vpbroadcastq`, one per lane and each dependent on the last, an 8-deep chain per
@@ -220,19 +220,19 @@ static inline void striped_row_best(const T* cM, const T* cX, const T* cY, const
 
 // pad[s*W + l] = 0 for a real column (l*seg + s + 1 <= n), -inf for padding.
 // The same mask into a row the caller owns (a spread_rows row: dp_buffer.hpp).
-template <class T>
+template <class T, bool Sat = false>
 static inline const T* striped_pad_into(T* v, int n, int seg, int W) {
     for (int l = 0; l < W; ++l)
         for (int s = 0; s < seg; ++s)
-            v[(std::size_t)s * W + l] = (l * seg + s + 1 <= n) ? T(0) : nw_ninf<T>;
+            v[(std::size_t)s * W + l] = (l * seg + s + 1 <= n) ? T(0) : nw_ninf_s<T, Sat>;
     return v;
 }
 
-template <class V>
+template <bool Sat = false, class V>
 static inline const typename V::value_type* striped_pad(V& v, int n, int seg, int W) {
     const std::size_t sw = (std::size_t)seg * W;
     if (v.size() < sw) v.resize(sw);
-    return striped_pad_into(v.data(), n, seg, W);
+    return striped_pad_into<typename V::value_type, Sat>(v.data(), n, seg, W);
 }
 
 using vd = stdx::native_simd<double>;
@@ -405,12 +405,12 @@ template <class NV, int W, int K>
 #define NWGRAD_LANE_SCAN_REG 1
 #endif
 #endif
-template <class vd, int W>
+template <class vd, int W, bool Sat = false>
 [[gnu::always_inline]] static inline vd int_lane_carry_in(const vd& P, typename vd::value_type seed) {
     using T = typename vd::value_type;
 #ifdef NWGRAD_LANE_SCAN_REG
     using NV = typename NVecOf<T, (int)(sizeof(T) * W)>::type;
-    const NV ninf = static_cast<NV>(vd(nw_ninf<T>));
+    const NV ninf = static_cast<NV>(vd(nw_ninf_s<T, Sat>));
     NV x = static_cast<NV>(P);
     auto mx = [](NV a, NV b) __attribute__((always_inline)) { return a > b ? a : b; };
     x = mx(x, nv_shift_up<NV, W, 1>(x, ninf));
@@ -472,7 +472,7 @@ template <class T, int W, bool RowRamp = false, int Ext = 2, bool Sat = false>
     const vd vge(ge_a);
     const vd rbase([&](int l) { return static_cast<T>(static_cast<T>(l * seg) * ge_a); });
     vd rq = rbase;                          // k*ge_a for k = l*seg + s
-    vd P(nw_ninf<T>);
+    vd P(nw_ninf_s<T, Sat>);
     for (int s = 0; s < seg; ++s) {
         vd O;
         if (s == 0) {
@@ -489,7 +489,7 @@ template <class T, int W, bool RowRamp = false, int Ext = 2, bool Sat = false>
         nv_store(cY + (std::size_t)s * W, P);
     }
     rq = rbase;
-    const vd vcin = int_lane_carry_in<vd, W>(P, nw_sub<T>(bY, ge_a));
+    const vd vcin = int_lane_carry_in<vd, W, Sat>(P, nw_sub<T>(bY, ge_a));
     vd before = vcin;                       // the prefix before this segment's open
     // Two ramps a step apart, each advanced by 2*ge_a: this pass has no other loop-carried
     // value, and one ramp's add chain bound it on NEON (2-cycle integer add: 1.04-1.07x the
@@ -805,7 +805,7 @@ template <class T, bool Local, bool Tr = false, bool Sat = false>
 static void striped_affine_full(ViterbiJob<T>& job) {
     using vd = stdx::native_simd<T>;
     const int W = (int)vd::size();                       // native T-lane count for this level
-    const T K_NINF = nw_ninf<T>;
+    const T K_NINF = nw_ninf_s<T, Sat>;
 
     const int m = job.m, n = job.n;
     const int nalpha = job.nalpha;
@@ -886,7 +886,7 @@ static void striped_affine_full(ViterbiJob<T>& job) {
     T bM = 0, bX = K_NINF, bY = K_NINF;
 
     T best_local = 0; int best_i = 0, best_j = 0, best_tbl = 0;
-    const T* pad = Local ? striped_pad(buf.spad, n, seg, W) : nullptr;
+    const T* pad = Local ? striped_pad<Sat>(buf.spad, n, seg, W) : nullptr;
 
     for (int i = 1; i <= m; ++i) {
         if constexpr (Tr) {
@@ -918,7 +918,7 @@ static void striped_affine_full(ViterbiJob<T>& job) {
             // The diagonal predecessors: the previous iteration's up vectors, rotated in
             // registers (each previous-row vector loaded once, not twice); at s = 0 the last
             // segment, shifted one lane in.
-            vd dM(nw_ninf<T>), dX(nw_ninf<T>), dY(nw_ninf<T>);
+            vd dM(K_NINF), dX(K_NINF), dY(K_NINF);
             if (seg > 0) {
                 vd lM, lX, lY;
                 lM.copy_from(pM + (std::size_t)(seg - 1) * W, stdx::element_aligned);

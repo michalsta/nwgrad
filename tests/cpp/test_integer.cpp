@@ -276,10 +276,10 @@ TEST_CASE("integer aligners refuse problems that could overflow; a wider type ta
     for (int i = 0; i < 4; ++i) m[static_cast<size_t>(i) * 5] = 100.0;
     AlignParams p(SubstMatrix(m.data(), alpha));
     p.gap_open_a = 50; p.gap_extend_a = 10; p.gap_open_b = 50; p.gap_extend_b = 10;
-    // int16 saturates and is bounded by the VALUES a path can collect: 2 * 200 * 100 + 50
-    // (a Hirschberg join of two halves) exceeds 32767, so 200 x 200 is refused; 60 x 60
-    // (once refused by the quarter rule, (60 + 60 + 66) * 100 > 8191) now fits.
-    const auto ea = alpha.encode(std::string(200, 'A')), eb = alpha.encode(std::string(200, 'C'));
+    // int16 saturates and is bounded by the VALUES a path can collect: 400 * 100 exceeds
+    // 32767, so 400 x 400 is refused; 60 x 60 (once refused by the quarter rule,
+    // (60 + 60 + 66) * 100 > 8191) now fits.
+    const auto ea = alpha.encode(std::string(400, 'A')), eb = alpha.encode(std::string(400, 'C'));
     const auto sa = alpha.encode(std::string(60, 'A')), sb = alpha.encode(std::string(60, 'C'));
 
     Aligner<GapModel::Affine, AlignMode::Global, AlignBand::Full, int16_t> a16;

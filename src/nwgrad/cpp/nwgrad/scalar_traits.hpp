@@ -65,8 +65,10 @@ template <class T>
 // problem (Aligner::sat_, ViterbiJob::sat ...): a problem inside the quarter rule runs
 // the plain kernels it always ran, bit for bit (the saturating instructions issue on
 // fewer ports on Intel cores: 6-19 % on the int16 kernels, nighthaven 2026-10-30), a
-// problem past it the saturating variant of the same kernel.  The sentinel is the same
-// in both: lowest() / 2, below which a saturating penalty can only drift to lowest().
+// problem past it the saturating variant of the same kernel.  The saturating regime's
+// sentinel is lowest() itself (nw_ninf_s; the aligner's NINF member follows the regime),
+// self-preserving under any penalty, so the whole range below the reachable values is the
+// sentinel's depth; the plain regime keeps lowest() / 2.
 // The scalar fills saturate always (a clamp at the bottom: a compare and a cmov), so a
 // table is the same bits at every level in either regime.  int32 / int64 have no
 // saturating regime (x86 has no 32 / 64-bit saturating vector ops): the quarter rule.
@@ -77,6 +79,11 @@ template <class T>
 inline constexpr T nw_ninf = std::is_floating_point_v<T>
     ? -std::numeric_limits<T>::infinity()
     : static_cast<T>(std::numeric_limits<T>::lowest() / 2);
+
+// The sentinel of a kernel variant: lowest() in the saturating regime (Sat, an nw_sat T),
+// nw_ninf<T> otherwise.
+template <class T, bool Sat>
+inline constexpr T nw_ninf_s = (Sat && nw_sat<T>) ? std::numeric_limits<T>::lowest() : nw_ninf<T>;
 
 // Scalar add / subtract on DP values: for nw_sat types computed in int and clamped at the
 // bottom (the top is never reached: the bound keeps every reachable value below it, and

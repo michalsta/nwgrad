@@ -69,13 +69,13 @@ inline constexpr int ROW_BLOCK = (KW >= 4) ? 64 : 256;
         }                                                                     \
     }                                                                         \
     if (LOCAL) {                                                              \
-        T best = nw_ninf<T>;                                            \
+        T best = nw_ninf_s<T, Sat>;                                     \
         for (int j = lo; j <= hi; ++j)                                        \
             best = std::max(best,                                             \
                             std::max(vm_cur[j], std::max(vx_cur[j], vy_cur[j]))); \
         return best;                                                          \
     }                                                                         \
-    return nw_ninf<T>;
+    return nw_ninf_s<T, Sat>;
 
 // Templated on the scalar type T (double, float, the integer types); the body is the
 // same max/add/subtract per T.  Sat: the saturating regime of an nw_sat T (the row's

@@ -36,7 +36,7 @@ template <class T, bool Local, bool Fused, bool Tr = false, bool Sat = false>
 static void score_affine_striped(ScoreJob<T>& job) {
     using vd = stdx::native_simd<T>;
     const int W = (int)vd::size();
-    const T NINF = nw_ninf<T>;
+    const T NINF = nw_ninf_s<T, Sat>;
 
     const int m = job.m, n = job.n, nalpha = job.nalpha;
     T go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;
@@ -67,7 +67,7 @@ static void score_affine_striped(ScoreJob<T>& job) {
     // cell (the fill's argmax scans real columns only).  Added, not selected: x + 0 = x
     // exactly, x + -inf = -inf, and no mask op (see kernels_impl.inl's AVX-512/clang note).
     const T* pad = nullptr;
-    if constexpr (Local) pad = striped_pad_into(rows + 7 * rs, n, seg, W);
+    if constexpr (Local) pad = striped_pad_into<T, Sat>(rows + 7 * rs, n, seg, W);
     auto padded = [&](const vd& v, int s) {
         vd p; p.copy_from(pad + (std::size_t)s * W, stdx::element_aligned);
         return vadd<Sat>(v, p);
@@ -127,7 +127,7 @@ static void score_affine_striped(ScoreJob<T>& job) {
             // The diagonal predecessors: the previous iteration's up vectors, rotated in
             // registers (each previous-row vector loaded once, not twice); at s = 0 the last
             // segment, shifted one lane in.
-            vd dM(nw_ninf<T>), dX(nw_ninf<T>), dY(nw_ninf<T>);
+            vd dM(NINF), dX(NINF), dY(NINF);
             if (seg > 0) {
                 vd lM, lX, lY;
                 lM.copy_from(pM + (std::size_t)(seg - 1) * W, stdx::element_aligned);
@@ -169,7 +169,7 @@ static void score_affine_striped(ScoreJob<T>& job) {
             // The diagonal predecessors: the previous iteration's up vectors, rotated in
             // registers (each previous-row vector loaded once, not twice); at s = 0 the last
             // segment, shifted one lane in.
-            vd dM(nw_ninf<T>), dX(nw_ninf<T>), dY(nw_ninf<T>);
+            vd dM(NINF), dX(NINF), dY(NINF);
             if (seg > 0) {
                 vd lM, lX, lY;
                 lM.copy_from(pM + (std::size_t)(seg - 1) * W, stdx::element_aligned);
@@ -303,7 +303,7 @@ template <class T, bool Local, bool MOnly, bool Tr = false, bool Sat = false>
 static void score_affine_striped_pos(ScoreJob<T>& job) {
     using vd = stdx::native_simd<T>;
     const int W = (int)vd::size();
-    const T NINF = nw_ninf<T>;
+    const T NINF = nw_ninf_s<T, Sat>;
 
     const int m = job.m, n = job.n, nalpha = job.nalpha;
     T go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;
@@ -328,7 +328,7 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
     // (MOnly's M padding is clamped to exactly 0 for floating T — the padding profile is
     // -inf — but an integer T pads the profile with 0 (nw_pad), so its padding M is a
     // real value and needs the mask too.)
-    if constexpr (Local && (!MOnly || nw_is_int<T>)) pad = striped_pad_into(rows + 5 * rs, n, seg, W);
+    if constexpr (Local && (!MOnly || nw_is_int<T>)) pad = striped_pad_into<T, Sat>(rows + 5 * rs, n, seg, W);
     auto padded = [&](const vd& v, int s) {
         vd p; p.copy_from(pad + (std::size_t)s * W, stdx::element_aligned);
         return vadd<Sat>(v, p);
@@ -446,7 +446,7 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
             // scalar scan: int32 0.91-1.03 across the three (v3 Global L300 1.027).
             vd vcin;
             if constexpr (sizeof(T) == 2) {
-                vcin = int_lane_carry_in<vd, (int)vd::size()>(stdx::max(Q0, fP), nw_sub<T>(NINF, ge_a));
+                vcin = int_lane_carry_in<vd, (int)vd::size(), Sat>(stdx::max(Q0, fP), nw_sub<T>(NINF, ge_a));
             } else {
                 alignas(64) T tot[64], cin[64];
                 stdx::max(Q0, fP).copy_to(tot, stdx::element_aligned);

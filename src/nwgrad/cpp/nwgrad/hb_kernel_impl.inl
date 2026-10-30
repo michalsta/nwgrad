@@ -91,7 +91,7 @@ template <class T, bool Tr = false, bool Sat = false>
 static void hb_sweep_striped(HbJob<T>& job) {
     using vd = stdx::native_simd<T>;
     const int W = (int)vd::size();
-    const T NINF = nw_ninf<T>;
+    const T NINF = nw_ninf_s<T, Sat>;
 
     const int H = job.H, NC = job.ncols;
     T go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;
@@ -197,7 +197,7 @@ static void hb_sweep_striped(HbJob<T>& job) {
         // The diagonal predecessors: the previous iteration's up vectors, rotated in
         // registers (each previous-row vector loaded once, not twice); at s = 0 the last
         // segment, shifted one lane in.
-        vd dM(nw_ninf<T>), dX(nw_ninf<T>), dY(nw_ninf<T>);
+        vd dM(NINF), dX(NINF), dY(NINF);
         if (seg > 0) {
             vd lM, lX, lY;
             lM.copy_from(pM + (std::size_t)(seg - 1) * W, stdx::element_aligned);
@@ -347,7 +347,7 @@ template <class T, bool Tr = false, bool Sat = false>
 static void hb_sweep_striped_pmax(HbJob<T>& job) {
     using vd = stdx::native_simd<T>;
     const int W = (int)vd::size();
-    const T NINF = nw_ninf<T>;
+    const T NINF = nw_ninf_s<T, Sat>;
 
     const int H = job.H, NC = job.ncols;
     T go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;
@@ -449,7 +449,7 @@ static void hb_sweep_striped_pmax(HbJob<T>& job) {
         // The diagonal predecessors: the previous iteration's up vectors, rotated in
         // registers (each previous-row vector loaded once, not twice); at s = 0 the last
         // segment, shifted one lane in.
-        vd dM(nw_ninf<T>), dX(nw_ninf<T>), dY(nw_ninf<T>);
+        vd dM(NINF), dX(NINF), dY(NINF);
         if (seg > 0) {
             vd lM, lX, lY;
             lM.copy_from(pM + (std::size_t)(seg - 1) * W, stdx::element_aligned);
@@ -575,7 +575,7 @@ template <class T, bool Local, bool Pmax, bool Tr = false, bool Sat = false>
 static void hb_scan_impl(HbScanJob<T>& job) {
     using vd = stdx::native_simd<T>;
     constexpr int W = (int)vd::size();
-    const T NINF = nw_ninf<T>;
+    const T NINF = nw_ninf_s<T, Sat>;
 
     const int H = job.H, NC = job.ncols;
     T go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;
@@ -669,7 +669,7 @@ static void hb_scan_impl(HbScanJob<T>& job) {
     // plus the sentinel cannot wrap, and lands below every real value).
     const T* padm = nullptr;
     if constexpr (nw_is_int<T>) {
-        padm = striped_pad_into(rows + 8 * rs, NC, seg, W);
+        padm = striped_pad_into<T, Sat>(rows + 8 * rs, NC, seg, W);
     }
 
     T gbest = T(0); int gi = 0, gj = 0;
@@ -698,7 +698,7 @@ static void hb_scan_impl(HbScanJob<T>& job) {
         // The diagonal predecessors: the previous iteration's up vectors, rotated in
         // registers (each previous-row vector loaded once, not twice); at s = 0 the last
         // segment, shifted one lane in.
-        vd dM(nw_ninf<T>), dX(nw_ninf<T>), dY(nw_ninf<T>);
+        vd dM(NINF), dX(NINF), dY(NINF);
         if (seg > 0) {
             vd lM, lX, lY;
             lM.copy_from(pM + (std::size_t)(seg - 1) * W, stdx::element_aligned);
@@ -864,7 +864,7 @@ static void hb_base_striped(HbBaseJob<T>& job) {
     using vd = stdx::native_simd<T>;
     constexpr int W = (int)vd::size();
     constexpr bool kOpenRows = nw_is_int<T> && W >= 4;   // see striped_affine_full_ptr
-    const T NINF = nw_ninf<T>;
+    const T NINF = nw_ninf_s<T, Sat>;
 
     const int H = job.H, NC = job.ncols;
     T go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;

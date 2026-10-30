@@ -282,17 +282,19 @@ void nw_int_prepare(const AlignParams& p, int K, std::vector<T>& stack, std::vec
 //   lowest()): every REACHABLE value must stay in range and every sentinel-derived value
 //   below every reachable one.  With Hi = the most a path can collect (min(m, n + 64)
 //   diagonal moves of smax_pos, at most m + n + 66 gap moves of `gain`), the values
-//   formed are at most max(Hi + ramp, 2 Hi + gob_pos) + goneg (ramp = (n + 64) *
-//   gea_pos: the prefix-max carry's open + k * ge_a; 2 Hi + go: a Hirschberg join's
-//   forward + reverse, the straddling open refunded; goneg: the intermediate (v - go) of
-//   a negative open) -- that must fit below the top.  A reachable Global value is at
+//   formed are at most Hi + max(ramp, gob_pos) + goneg (ramp = (n + 64) * gea_pos: the
+//   prefix-max carry's open + k * ge_a; gob_pos: a Hirschberg join's straddling sum with
+//   the open refunded -- a join's forward + reverse is a real alignment's score, so at
+//   most Hi; goneg: the intermediate (v - go) of a negative open) -- that must fit below
+//   the top.  A reachable Global value is at
 //   least the all-gap alignment's, Lo = -(goa_pos + gob_pos + m * geb_pos + (n + 64) *
 //   gea_pos + smax_neg) (Local keeps the same Lo: its Hirschberg box solve and suffix
 //   scan are Global sub-problems; its clamped cells are >= 0 and its negative gap cells
 //   never matter), which must stay above lowest().  A guide-banded Global value's paths
 //   are confined to the band, so it takes the move-count bound -(m + n + 66) * step_max.
-//   Finally the sentinel: it climbs by at most Hi + max(ramp, gob_pos) + goneg (it can
-//   only come to rest at lowest() below), and lowest() / 2 + that must stay below Lo.
+//   Finally the sentinel, lowest() in this regime (the aligner's NINF, nw_ninf_s in the
+//   kernels): it climbs by at most Hi + max(ramp, gob_pos) + goneg (it can only come to
+//   rest at lowest() below), and lowest() + that must stay below Lo.
 template <class T, bool Local, bool Banded>
 inline int nw_int_bound_check(const NwIntBound<T>& ib, int m, int n) noexcept {
     if (!ib.prepared() || ib.step_max <= T(0)) return 0;
@@ -302,10 +304,10 @@ inline int nw_int_bound_check(const NwIntBound<T>& ib, int m, int n) noexcept {
         return -1;
     } else {
         const long long top = std::numeric_limits<T>::max();        // 32767
-        const long long sent = -static_cast<long long>(nw_ninf<T>); // 16384: the sentinel's depth
+        const long long sent = -static_cast<long long>(std::numeric_limits<T>::lowest());   // 32768: the regime's sentinel, lowest(), is its depth
         const long long hi = std::min(M, N + pad) * ib.smax_pos + (M + N + 2 + pad) * ib.gain;
         const long long ramp = (N + pad) * ib.gea_pos;
-        const long long hi_top = std::max(hi + ramp, 2 * hi + ib.gob_pos) + ib.goneg;
+        const long long hi_top = hi + std::max(ramp, static_cast<long long>(ib.gob_pos)) + ib.goneg;
         long long lo;
         if constexpr (Banded && !Local) lo = -(M + N + 2 + pad) * ib.step_max;
         else lo = -(static_cast<long long>(ib.goa_pos) + ib.gob_pos + M * ib.geb_pos + (N + pad) * ib.gea_pos + ib.smax_neg);
@@ -1099,7 +1101,7 @@ private:
     // The soft path's sentinel (always double) and the hard path's (in T; see
     // scalar_traits.hpp: -inf for floating T, lowest()/2 for an integer T).
     static constexpr double NEG_INF = -std::numeric_limits<double>::infinity();
-    static constexpr T      NINF    = nw_ninf<T>;
+    T                       NINF    = nw_ninf<T>;   // per problem: lowest() in the saturating regime (sat_)
 
     // ── Problem state ─────────────────────────────────────────────────────────
     std::span<const uint8_t> a_idx_, b_idx_;   // alphabet indices, not characters
@@ -1594,6 +1596,7 @@ private:
     void int_bound_check_() {
         const int why = nw_int_bound_check<T, AM == AlignMode::Local, AB == AlignBand::GuideBanded>(ib_, m_, n_);
         sat_ = why == 1;
+        NINF = sat_ ? std::numeric_limits<T>::lowest() : nw_ninf<T>;
         if (why >= 0) return;
         const char* what = why == -1 ? "((m + n + 2 + 64 padding columns) * step exceeds the type's quarter range)"
                          : why == -2 ? "(the values a path can collect exceed the type's top)"
@@ -1924,7 +1927,8 @@ private:
             for (int i = 0; i <= m_; ++i) {
                 int lo, hi; band_row_span(i, lo, hi);
                 auto* row = vec.data() + static_cast<size_t>(i) * stride_;
-                std::fill(row + lo, row + hi + 1, nw_ninf<typename V::value_type>);
+                using E = typename V::value_type;   // the problem's sentinel for its own T
+                std::fill(row + lo, row + hi + 1, std::is_same_v<E, T> ? static_cast<E>(NINF) : nw_ninf<E>);
             }
         }
     }

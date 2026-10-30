@@ -190,7 +190,7 @@ def test_overflow_bound_per_width():
     alpha = "ACGT"
     m = np.where(np.eye(4, dtype=bool), 100.0, -100.0)
     p = nwgrad.AlignParams(nwgrad.SubstMatrix(m, alphabet=alpha), 50.0, 10.0, 50.0, 10.0)
-    a, b = "A" * 200, "C" * 200   # 2 * 200 * 100 > 32767 (int16's value range); int32 takes it
+    a, b = "A" * 400, "C" * 400   # 400 * 100 > 32767 (int16's value range); int32 takes it
     with pytest.raises(OverflowError, match="int16"):
         nwgrad.nw_score_affine_int16(a, b, p)
     with pytest.raises(OverflowError, match="int16"):

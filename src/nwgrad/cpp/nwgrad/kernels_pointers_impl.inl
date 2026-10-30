@@ -125,7 +125,7 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
     // the integer carry (int_pmax_carry) reads the opens and their codes from rows; the
     // floating one recomputes them from cM / cX
     constexpr bool kOpenRows = nw_is_int<T> && W >= 4;
-    const T K_NINF = nw_ninf<T>;
+    const T K_NINF = nw_ninf_s<T, Sat>;
 
     const int m = job.m, n = job.n;
     const int nalpha = job.nalpha;
@@ -205,7 +205,7 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
     const vd kYX = Dense ? vone : vsixteen, kYE = Dense ? vtwo : vthirtytwo;
     T bM = 0, bX = K_NINF, bY = K_NINF;
     T best_local = 0; int best_i = 0, best_j = 0, best_tbl = 0;
-    const T* pad = Local ? striped_pad_into(rows + 10 * rs, n, seg, W) : nullptr;
+    const T* pad = Local ? striped_pad_into<T, Sat>(rows + 10 * rs, n, seg, W) : nullptr;
     // Local with non-negative gap parameters (every row, when tracked): the row's best
     // cell is an M cell, and the FIRST cell reaching the row's maximum (column order) is
     // an M cell too -- a gap cell never exceeds the cell it extends from (X from the cell

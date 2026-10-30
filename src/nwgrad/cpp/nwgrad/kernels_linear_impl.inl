@@ -42,7 +42,7 @@ static inline void striped_row_best1(const T* cH, const T* pad, int seg, int i,
                                      T& best, int& bi, int& bj) {
     using vt = stdx::native_simd<T>;
     constexpr int W = (int)vt::size();
-    vt lmax(nw_ninf<T>), ls(T(0));
+    vt lmax(nw_ninf_s<T, Sat>), ls(T(0));
     vt vs(T(0));
     const vt one(T(1));
     for (int s = 0; s < seg; ++s, vs += one) {
@@ -92,7 +92,7 @@ static void striped_linear_full(ViterbiJob<T>& job) {
     static_assert(!Dense || (Ptr && sizeof(T) >= 4), "dense codes: pointer fill, lanes >= 32 bits");
     using vd = stdx::native_simd<T>;
     constexpr int W = (int)vd::size();
-    const T K_NINF = nw_ninf<T>;
+    const T K_NINF = nw_ninf_s<T, Sat>;
 
     const int m = job.m, n = job.n;
     const int nalpha = job.nalpha;
@@ -167,7 +167,7 @@ static void striped_linear_full(ViterbiJob<T>& job) {
     const vd vthree(static_cast<T>(3));
     const vd vninf(K_NINF);
     T best_local = static_cast<T>(0); int best_i = 0, best_j = 0;
-    const T* pad = Local ? striped_pad_into(rows + 2 * rs, n, seg, W) : nullptr;
+    const T* pad = Local ? striped_pad_into<T, Sat>(rows + 2 * rs, n, seg, W) : nullptr;
 
     for (int i = 1; i <= m; ++i) {
         if constexpr (Tr) {
@@ -193,7 +193,7 @@ static void striped_linear_full(ViterbiJob<T>& job) {
             // ── pass 1: U = max(diag + s, up - ge_b) (Local: and 0), its code, the open ──
             // the diagonal: floating T, the previous iteration's up vector, rotated in a register
             // (each previous-row vector loaded once); at s = 0 the last segment, shifted one lane in
-            vd dg(nw_ninf<T>);
+            vd dg(K_NINF);
             if (seg > 0) {
                 vd last; last.copy_from(pH + off + (std::size_t)(seg - 1) * W, stdx::element_aligned);
                 dg = lane_shift_in(last, bprev);
@@ -403,7 +403,7 @@ template <class T, bool Sat>
 static void lhb_striped_impl(LhbJob<T>& job) {
     using vd = stdx::native_simd<T>;
     constexpr int W = (int)vd::size();
-    const T K_NINF = nw_ninf<T>;
+    const T K_NINF = nw_ninf_s<T, Sat>;
     const int n = job.n, h = job.h, nalpha = job.nalpha;
     const unsigned char* b = job.b;
     DpBufferT<T>& buf = *job.buf;
@@ -434,7 +434,7 @@ static void lhb_striped_impl(LhbJob<T>& job) {
     T* kc = rows + 2 * rs;
     T* pH = rows + 3 * rs; T* cH = rows + 4 * rs;
     unsigned char* D = job.codes;
-    const T* pad = job.argmax ? striped_pad_into(rows + 5 * rs, n, seg, W) : nullptr;
+    const T* pad = job.argmax ? striped_pad_into<T, Sat>(rows + 5 * rs, n, seg, W) : nullptr;
 
     // row 0
     pH[0] = job.row0[0];
@@ -473,7 +473,7 @@ static void lhb_striped_impl(LhbJob<T>& job) {
         if (seg > 0) {
             // the diagonal: floating T, the previous iteration's up vector, rotated in a register
             // (each previous-row vector loaded once); at s = 0 the last segment, shifted one lane in
-            vd dg(nw_ninf<T>);
+            vd dg(K_NINF);
             if (seg > 0) {
                 vd last; last.copy_from(pH + off + (std::size_t)(seg - 1) * W, stdx::element_aligned);
                 dg = lane_shift_in(last, bprev);
