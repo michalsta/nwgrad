@@ -3316,11 +3316,11 @@ private:
                              buf.hfa.data(), buf.hfb.data(), buf.hfc.data(),
                              buf.hfd.data(), buf.hfe.data(), buf.hff.data(), sM, sX, sY, rmp);
         } else if (reverse)
-            hb_rev<Sat>(i0, i1, j0, j1, flag,
+            hb_rev<false, Sat>(i0, i1, j0, j1, flag,
                    buf.hfa.data(), buf.hfb.data(), buf.hfc.data(),
                    buf.hfd.data(), buf.hfe.data(), buf.hff.data(), sM, sX, sY);
         else
-            hb_fwd<Sat>(i0, i1, j0, j1, flag,
+            hb_fwd<false, Sat>(i0, i1, j0, j1, flag,
                    buf.hfa.data(), buf.hfb.data(), buf.hfc.data(),
                    buf.hfd.data(), buf.hfe.data(), buf.hff.data(), sM, sX, sY);
         std::copy(sM, sM + NC + 1, oM);
@@ -3470,7 +3470,7 @@ private:
             job.pmax = hb_pmax() ? 1 : 0;
             job.buf = &buf;
             if (tr_) { hb_reverse_rows_(); fill_track_job_(job.tr, false, 0); }
-            K->template of<T>().hb_scan<Sat>(job);
+            K->template of<T>().hb_scan(job);
             best = job.best; bi = job.best_i; bj = job.best_j;
             return;
         }
