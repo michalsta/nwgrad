@@ -778,7 +778,8 @@ private:
             sj.scratch = scr.data(); sj.iscratch = iscr.data();
             sj.logz = logz; sj.counts = counts; sj.gaps = gaps; sj.ok = ok; sj.gpost = gpost;
             sj.rs = rs; sj.rw = rw;
-            K.template inter_soft_of<SFx>()(sj);
+            if constexpr (std::is_same_v<SFx, float>) { FlushDenormalsScope ftz; K.template inter_soft_of<SFx>()(sj); }
+            else K.template inter_soft_of<SFx>()(sj);
         }
     };
     int stream_inter_backend_(const AlignParams& params, int kernel, bool banded) const {

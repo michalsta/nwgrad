@@ -5114,7 +5114,8 @@ private:
             auto f = K.template soft_pair_of<SF>(lin);
             if (f) fn = f;
         }
-        fn(J);
+        if constexpr (std::is_same_v<SF, float>) { FlushDenormalsScope ftz; fn(J); }
+        else fn(J);
         if (!J.ok) return false;
         log_z_ = J.log_z;
         sg_go_a_ = J.g_oa; sg_ge_a_ = J.g_ea; sg_go_b_ = J.g_ob; sg_ge_b_ = J.g_eb;
