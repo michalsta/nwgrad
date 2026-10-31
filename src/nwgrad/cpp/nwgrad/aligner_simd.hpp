@@ -219,13 +219,13 @@ void Aligner<GM, AM, AB, T>::viterbi_affine_simd(DpBuffer& buf, const LevelKerne
         // Measured on 22x50 pairs: -12% time for fill="rowwise".
         for (auto* v : {&buf.VM, &buf.VX, &buf.VY}) {
             T* t = v->data();
-            std::fill(t, t + stride_, NINF);                                         // row 0
-            for (int i = 1; i <= m_; ++i) t[static_cast<size_t>(i) * stride_] = NINF;  // column 0
+            std::fill(t, t + stride_, NINF());                                         // row 0
+            for (int i = 1; i <= m_; ++i) t[static_cast<size_t>(i) * stride_] = NINF();  // column 0
         }
     } else {
-        band_fill(buf.VM, NINF);
-        band_fill(buf.VX, NINF);
-        band_fill(buf.VY, NINF);
+        band_fill(buf.VM, NINF());
+        band_fill(buf.VX, NINF());
+        band_fill(buf.VY, NINF());
     }
 
     if constexpr (AM == AlignMode::Global) {
@@ -295,7 +295,7 @@ void Aligner<GM, AM, AB, T>::viterbi_affine_simd(DpBuffer& buf, const LevelKerne
         if constexpr (AM == AlignMode::Local) {
             const T rowmax = KT.banded_row_local(
                 vm_cur, vx_cur, vy_cur, vm_prev, vx_prev, vy_prev, sr, lo, hi, blk,
-                go_a, ge_a, go_b, ge_b);
+                go_a, ge_a, go_b, ge_b, sat_);
             if (rowmax > best_local) {
                 // The new best is the FIRST cell of the row whose max3 equals rowmax: a
                 // strict-> running scan stops updating once it reaches the maximum.  So
@@ -315,7 +315,7 @@ void Aligner<GM, AM, AB, T>::viterbi_affine_simd(DpBuffer& buf, const LevelKerne
         } else {
             KT.banded_row_global(
                 vm_cur, vx_cur, vy_cur, vm_prev, vx_prev, vy_prev, sr, lo, hi, blk,
-                go_a, ge_a, go_b, ge_b);
+                go_a, ge_a, go_b, ge_b, sat_);
         }
     }
 

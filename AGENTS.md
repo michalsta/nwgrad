@@ -2015,6 +2015,206 @@ L200 = 2000 30 %-mutated BLOSUM62 pairs, L1000 = 200, DNA = 20k related 22×50 p
 | local affine | 1.58 / 2.29 / 2.11 | 1.51 / 1.67 / 1.65 | 8.18 / 12.70 / 9.81 |
 | local linear | 1.80* / 3.06 / 2.57 | 1.36* / 2.03 / 2.14 | 8.16 / 14.05 / 13.44 |
 
+### Small-integer round (branch `perf/smallint`, 2026-10-30; from four prototype branches)
+
+Four changes, each measured alone against main `b0a075a` on nighthaven (i5-12500) (AVX2 and the sse4
+level, 1 thread, `tools/bench_int.py` arms through the A/B harness: alternating processes,
+best of 3, control arm A'/A 0.99-1.01 throughout; time B/A, below 1 = faster) and then
+together.  Every one is bit-exact (the C++ integer oracle at every level, the Python suite
+on skynet and nighthaven).  spot and solace were not used (the user's instruction for this
+round): NEON and AVX-512 are to be checked before merging.
+
+- **The int16 striped profile build as byte shuffles** (`striped_profile_row_idx_i16`,
+  kernels_impl.inl).  The build was a scalar lookup per slot (a byte load, a word load, a
+  word store) and 18.5 % of the int16 L200 score-only time (perf).  For alphabets up to 32
+  symbols the row is split into its low and high byte planes and 16 / 32 symbol indices at
+  a time select from them (two `pshufb` and an OR per plane on x86 -- an index + 0x70 sets
+  bit 7, a zero lane, for symbols >= 16 and an index - 16 does so for symbols < 16; one
+  `tbl2` on NEON, compiled but not yet run), then the planes are interleaved into words.
+  int16 protein L200: score-only 0.86 (avx2) / 0.90 (sse4), hard 0.95 / 0.96; nothing else
+  moves (DNA uses the inter-pair kernels, which build no profile).  The other types keep the
+  scalar loop (float32 / int32 would need a 4-byte lookup: `vpermd` for <= 8 symbols,
+  gathers otherwise; not done).
+- **The Local row best over M alone, in registers** (`monly`, kernels_pointers_impl.inl).
+  With non-negative gap parameters (every row, when tracked) the row's maximum is an M
+  cell and so is the FIRST cell reaching it in column order (a gap cell never exceeds the
+  cell it extends from: X the cell above, already <= the running best; Y the cell to its
+  left), so the per-lane maximum and its first segment are tracked on the M vector pass 1
+  has in registers (a compare, a blend, a max) and reduced once per row; the padding M is
+  at most the cell above it, so it needs no mask.  `striped_row_best` -- a separate pass
+  over M, X, Y and the mask, 17 % of an int16 L200 Local hard step -- runs only for
+  negative gap parameters.  Local hard / stream, L200: float32 0.90 (avx2) / 0.865 (sse4),
+  double 0.876 / 0.829, int16 0.974 / 0.962, int32 0.975 / 0.949; score-only and DNA 1.00.
+  (First tried instead: the whole Pointers kernel fused into two passes -- the carry into
+  pass 1, codes, packing and row best into pass 2.  1.05-1.06x SLOWER on int16 / int32
+  at both levels: the kernel is ALU-bound, not pass-bound, and recomputing the opens in
+  pass 2 cost more than the rows it saved.  Reverted.)
+- **The inter-pair B masks built by a byte transpose and vector shifts**
+  (`InterCommon`, inter_kernel_impl.inl).  Each mask vector was built lane by lane (a
+  shift, a test and an insert per lane), 14 % of a 22 x 50 int16 DNA score-only step at
+  16 lanes.  Now every column's W residues are gathered as bytes first (one transposed
+  row), then each column is widened in one convert and each bit's mask is an arithmetic
+  shift pair.  Two loops, not one: W byte stores followed at once by a W-byte load of them
+  is a store-forwarding stall per column, which cost float32 / double / int32 3-6 % in the
+  first form.  DNA int16: score 0.955 (avx2) / 0.983 (sse4), hard 0.969 / 0.965; the other
+  types 0.98-1.01.
+- **int16 past the quarter rule: a saturating regime** (`nw_sat`, scalar_traits.hpp;
+  `Sat` on every int16 kernel, `job.sat`, `Aligner::sat_`; `NwIntBound` /
+  `nw_int_bound_check`, aligner.hpp).  See the paragraph below.
+
+**int16 past the quarter rule: the saturating regime (2026-10-30).**  An int16 problem that
+fails the quarter-range bound ((m + n + 2 + 64) * step_max > 8191: BLOSUM62 11/1 pairs past
+~L300) used to be refused.  Now it runs a second regime, chosen per problem by
+`nw_int_bound_check` (aligner.hpp) in `set_problem` and carried as `Aligner::sat_` /
+`job.sat`: every add and subtract on a DP value SATURATES at the type's bottom -- the
+packed saturating instructions (`vpaddsw` / `vpsubsw`, `sqadd` / `sqsub`: `vadd` / `vsub`
+in kernels_impl.inl, `Sat` on every int16 kernel and on the banded row functions) -- so an
+unreachable value can drift no lower than lowest() and never wraps, and the bound asks
+only that every REACHABLE value fits the range and that a sentinel-derived value stays
+below every reachable one (`NwIntBound`: the facts of the params; the comment at
+`nw_int_bound_check` has the terms).  The sentinel stays lowest() / 2 (-16384) in both
+-- the saturating instructions issue on fewer ports on Intel cores (p01 against p015 for
+the plain ones: ungated, int16 lost 6 % on the AVX2 score kernel and 19 % at sse4,
+nighthaven), so a problem inside the quarter rule runs the plain kernels it always ran,
+with their sentinel lowest() / 2, bit for bit.  The saturating regime's sentinel is
+lowest() itself (`nw_ninf_s<T, Sat>` in the kernels; the aligner's `NINF()` -- a function,
+not a member: a member cost the float32 score-only step 2 % by losing the constant fold),
+self-preserving under the saturating penalties, so its depth, 32768, is the room for the
+values' whole range (the top a path can collect plus the prefix-max ramp, down to the
+all-gap floor): BLOSUM62 11/1 to ~L2300 (Global and Local), guide-banded Global to ~L880
+(its floor is the move-count bound: a band confines the paths).  A Hirschberg join's sum
+is a real alignment's score, so it costs the top bound nothing (the first form charged
+2 Hi).  The scalar fills saturate always (a clamp at the bottom, one compare and a cmov;
+`nw_add` / `nw_sub`; they also saturate in the plain regime, where the clamp never fires),
+so a table is the same bits at every level in either regime; the inter-pair kernels have
+no saturating variant, so the engine keeps such pairs on their own fill
+(`inter_eligible_`, the streaming loop).  int32 / int64 keep the quarter rule (no 32 /
+64-bit saturating vector ops on x86).
+Measured (nighthaven, `bench_int.py`, protein BLOSUM62 11/1 30 %-mutated, 1 thread, avx2;
+us a pair, and the ratio to float32 / int32): L1000 Local hard 350 (0.39 / 0.43), score-only
+114 (0.37 / 0.61); L2000 Local hard 1483 (0.47 / 0.40), score-only 435 (0.28 / 0.32), Global
+hard 1267 (0.64 / 0.53), score-only 385 (0.22 / 0.36).  Against parasail at L2000 (its
+`scan16` the fastest 16-bit form): int16 score-only 364 / 433 us (Global / Local) against
+525 / 645 (1.44x / 1.49x), path + gradient 1300 / 1500 against `striped16` trace 7604 /
+5880.  Inside the quarter rule nothing moved (A/B 0.99-1.01 on every arm).  Verified:
+`tests/cpp/test_integer.cpp` (the oracle sweep at L <= 500, every level; the refusal
+test), `tests/Python/test_int16_long.py` (L1000 pairs at every traceback mode, both
+modes, banded, streaming, score-only, every level; L2000; the bound's edges), the full
+suites, ASan + UBSan on the integer cases, `fuzz_ab.py` against main.
+A caution on the A/B harness: a stripped release build's loops are not aligned
+(`-falign-loops=1`, the JCC padding), so an unrelated change moves a hot loop's
+placement; the DNA int16 streaming arm read 1.06 on one build of this branch with the
+inter-pair fill's code byte-for-byte unchanged (same size, same instruction mix), and
+0.99-1.00 on the builds before and after.  Judge a cell by its instruction count
+(`perf stat`) and its code before believing a few per cent either way.
+**The branch's final A/B** (`4ff7775`, nighthaven, 1 thread, 3 rounds, controls 0.99-1.00):
+protein hard / stream float32 0.905 / 0.907 (avx2), 0.866 / 0.860 (sse4); double 0.880 /
+0.879, 0.829 / 0.829; int16 0.926 / 0.940, 0.930 / 0.942; int32 0.974 / 0.982, 0.951 /
+0.951; every protein score-only arm 1.000-1.007 but int16 0.858 (avx2) / 0.908 (sse4); DNA
+int16 hard 0.978 / 0.974, score-only 0.942 / 0.930, stream 0.999 / 0.972; DNA float32 /
+double / int32 0.96-1.014, but double stream avx2 1.034 -- `perf stat` on that arm: +0.1 %
+instructions, +1.1 % cycles in a direct rerun, i.e. placement and noise, not code.
+**Then the streaming `align()`** (`e22a827`): an integer T's params were prepared per pair
+(`nw_int_prepare`: the checked casts, now the bound facts too), 7 % of a 22 x 50 int16 DNA
+streaming step; a `StreamPrep` per worker prepares them once and every `set_problem()` of
+the loop takes them, as the batch's pairs do.  Stream arms, same harness (A/B, B/A): DNA
+int16 0.918 (avx2) / 0.900 (sse4), int32 0.942 / 0.940; protein int16 0.863 / 0.881, int32
+0.948 / 0.935; float32 / double DNA 0.99-1.01 (unchanged code); no other arm moved.
+
+**The four together** (`perf/smallint`, nighthaven, 1 thread, B/A against main `b0a075a`,
+controls 0.99-1.01; the `bench_int.py` arms: protein = 2000 30 %-mutated L200 BLOSUM62 11/1
+pairs, DNA = 20k related 22 x 50 pairs, Local affine):
+
+| arm | avx2: f32 / f64 / int16 / int32 / int64 | sse4 | sse2 |
+|---|---|---|---|
+| protein hard | 0.905 / 0.882 / 0.921 / 0.978 / 0.896 | 0.866 / 0.829 / 0.946 / 0.947 / 0.877 | 0.886 / 0.869 / 0.957 / 0.906 / 0.942 |
+| protein score-only | 1.000 / 1.000 / **0.863** / 1.004 / 1.000 | 1.016 / 1.000 / 0.900 / 0.998 / 0.988 | 1.008 / 1.002 / 0.989 / 1.000 / 1.001 |
+| protein stream | 0.905 / 0.879 / 0.939 / 0.981 / 0.897 | 0.864 / 0.831 / 0.955 / 0.953 / 0.884 | 0.888 / 0.865 / 0.963 / 0.902 / 0.943 |
+| DNA hard | 0.998 / 1.003 / 0.984 / 0.997 / 1.000 | 1.004 / 0.996 / 0.977 / 1.002 / 0.966 | 0.996 / 1.000 / 0.981 / 0.990 / 0.991 |
+| DNA score-only | 0.994 / 1.012 / **0.948** / 0.996 / 1.002 | 1.020 / 0.983 / 0.971 / 0.992 / 0.997 | 1.007 / 0.993 / 1.002 / 0.997 / 0.978 |
+| DNA stream | 1.003 / 1.026 / 0.999 / 1.005 / 0.999 | 1.010 / 0.997 / 0.997 / 1.013 / 0.975 | 1.002 / 1.003 / 1.016 / 0.996 / 0.995 |
+
+The hard-step gains on every type are the Local row best; the int16 score-only gain the
+profile build; the DNA int16 gains the mask build.  The DNA cells above 1.01 were
+re-measured with five rounds (A'/A 0.997-1.005): double stream avx2 1.021, float32 score /
+stream sse4 1.016 / 1.013, the rest 0.98-1.01 -- the mask build at FOUR lanes (double on
+AVX2, float32 at 128 bits), which gained nothing there; it is now taken from 8 lanes on,
+and those types keep their old code.  Re-measured after that gate (five rounds, A'/A
+0.994-1.016): every DNA float32 / double / int32 arm 0.987-1.015, int16 hard 0.971-0.981,
+score-only 0.943-0.945.  gcc against clang on the branch (`bench_int_cc.sh`, avx2, 1
+thread, clang / gcc): the int16 / int32 score-only arms now favour gcc (1.11 / 1.07: the
+shuffle build and the fused carry under clang's unrolling), the Pointers arms tie
+(0.98-1.02); float32 / double hard still 0.92-0.94 and int64 0.90-0.94 under clang, the
+same residue as before the round.  12 threads (avx2; the control arm itself read
+1.07-1.13 across the two rounds, so +-10 %): protein hard / stream float32 0.94 / 0.95,
+double 0.94 / 0.94, int16 0.90 / 0.92, int32 0.95 / 0.95; int16 score-only 0.87; DNA
+0.97-1.01.  Global mode (1 thread, avx2): int16 protein hard 0.928, score-only 0.913,
+stream 0.958; float32 / double / int32 0.99-1.01 (no row best in Global); DNA int16
+score-only 0.932.  Linear gaps: int16 protein hard 0.911, score-only 0.862, stream 0.938;
+DNA int16 hard 0.961, score-only 0.929; the rest 0.98-1.01.
+**Against parasail** (`tools/bench_parasail.py`, nighthaven avx2, 1 thread, parasail
+time / nwgrad time): L1000 BLOSUM62 11/1, int16 score-only -- the fixture parasail used to
+win because nwgrad refused int16 there -- Global 93.5 us a pair (10.7 Gcell/s) against
+scan16 145 (1.55x) and striped16 512 (5.5x); Local 109 against 175 (1.60x) and 360 (3.3x);
+int16 path + gradient 275 / 330 against striped16 trace 1978 / 1509 (7.2x / 4.6x).  L200:
+int16 score 5.3 / 5.6 us against scan16 12.1 / 13.7 (2.3x / 2.4x).
+Checks on the combined branch: the C++ suite (2.93 M assertions, 201 cases) and the Python
+suite (4497) on skynet, ASan + UBSan on the integer cases, `tools/fuzz_ab.py` main vs
+branch (300 seeds, 0 differ).
+**The fleet round (2026-10-31; spot under macOS, solace under Gentoo).** Builds as the
+wheels': spot Homebrew g++-16 (no injected hardening, `-static-libstdc++`), solace gcc 16.2 and
+clang 22 with the release flags; A = main, B = the branch, `ab_int.py` (1 thread, best of
+3, control arm A'/A 0.98-1.02 unless noted).  **solace avx512**: protein int16 hard 0.828,
+score-only 0.801, stream 0.754; float32 hard 0.945, double 0.936, int32 0.934 / stream
+0.869; DNA int16 score-only 0.937, stream 0.898, int32 stream 0.908, float32 score 0.953;
+avx2 and sse4 on the same box as nighthaven's (int16 protein 0.81-0.90, float32 / double hard
+0.87-0.93); 8 threads the same picture (int16 protein 0.77-0.83); Global mode int16 protein
+0.80-0.88.  L1000 int16 Local at avx512: hard 205 us a pair (0.26x float32, int32 0.51x), score-only 110 (0.19x; int32 139); L2000 score-only 417 (0.19x; int32 969).  **spot neon** (M1, the user at the
+desktop): protein int16 hard 0.898, score-only 0.872, stream 0.863; float32 hard 0.933,
+double 0.910, int32 0.946; Global mode int16 0.936 / 0.863 / 0.899; L1000 int16 Local 550 us
+(0.37x float32, int32 0.83x), L2000 2152 (0.37x) -- the int16 ratio on M1 is the same as
+on AVX2.  Two regressions the nighthaven round could not see, both fixed on the branch:
+(1) **the `scalar_fallback` backend at int16 was 1.36-1.57x SLOWER** (every fixture, every
+arm, x86 and NEON alike): the aligner's scalar fills had taken `nw_add` / `nw_sub` at every
+site, a compare and cmov per step whether the regime needed them or not.  They are now
+`nw_add_s<Sat>` / `nw_sub_s<Sat>` -- the clamp only in the saturating regime, the plain
+operation otherwise (the same bits: inside the quarter rule the clamp never fires) --
+with the fills, the Hirschberg sweeps / bases / scans and the linear ones templated on
+`Sat` and dispatched once per problem (`sat_dispatch_`).  After: scalar_fallback int16 hard
+0.985-0.993, stream 0.969-0.983, score-only 0.80-0.82 (nighthaven, main = 1).
+(2) **DNA int16 on NEON 1.02-1.06** (hard and score-only, Local and Global): the inter-pair
+mask transposition at EIGHT lanes.  Measured with the transposition gated from 16 lanes instead (same tree, `IW >= 16`;
+B / A = from 16 / from 8, A'/A 0.98-1.02): spot neon int16 0.963-0.978 (Local and Global),
+float32 / int32 untouched -- so on NEON the lane-by-lane build wins at 8 lanes; nighthaven
+sse4 int16 1.040 / 1.056 / 1.035 (hard / score / stream; Global 1.04 / 1.06 / 1.03) -- the
+transposition WINS at 8 lanes there, avx2 float32 / int32 (8 lanes too) 0.99-1.02 either
+way; solace sse4 int16 1.041 / 0.991 / 1.038 (Global 1.02 / 0.97 / 1.02), avx2 float32
+score-only 0.972 (Global 0.943) and int32 score-only 0.923 (Global 0.960), hard / stream
+1.00 -- on Tiger Lake the 8-lane transposition LOSES for the 4-byte lanes, where nighthaven
+read a tie.  So the gate is now `kMaskTranspose`: from 16 lanes everywhere, and from 8
+lanes only for 2-byte lanes on x86 (SSE int16); NEON int16 and AVX2 float32 / int32 keep
+the lane-by-lane build.  The branch's final head against main, after both fixes (1 thread,
+3 rounds, A'/A 0.996-1.019): spot neon DNA int16 0.998 / 1.000 / 0.938 (hard / score /
+stream), scalar_fallback int16 DNA 0.993 / 0.945 / 0.988 and protein 1.004 / 0.961 / 0.997,
+protein neon int16 0.884 / 0.873 / 0.859, float32 0.926, double 0.896, int32 0.945, every
+other cell 0.97-1.01; nighthaven (avx2 / sse4 / sse2 / scalar_fallback) protein int16
+hard 0.922 / 0.936 / 0.957 / 0.982, score-only 0.859 / 0.898 / 0.994 / 0.808, stream
+0.861 / 0.887 / 0.922 / 0.983, float32 hard 0.906 / 0.870 / 0.894 / 1.003, double 0.876 /
+0.829 / 0.871 / 0.999, int32 0.977 / 0.959 / 0.901 / 0.996; DNA int16 score-only 0.955 /
+0.932 / 1.002 / 0.799, stream 0.897 / 0.901 / 0.912 / 0.984; no cell above 1.017 (A'/A
+0.989-1.011); solace (avx512 / avx2 / sse4 / scalar_fallback) protein int16 hard 0.840 /
+0.880 / 0.911 / 0.997, score-only 0.807 / 0.816 / 0.858 / 0.900, stream 0.770 / 0.823 /
+0.878 / 0.998, float32 and double hard 0.88-0.95, int32 stream 0.86-0.88, DNA int16
+score-only 0.941 / 0.963 / 0.975 / 0.905, stream 0.900 / 0.911 / 0.921 / 0.998; its one
+cell above 1.015, protein sse4 double score-only 1.03-1.04 in both runs, executes the same
+instructions on both builds (`perf stat`, 30.15 G against 30.12 G; nighthaven reads 1.00),
+so it is placement, not code.
+Checks on the final head (`62a3278`): the Python suite on skynet (4499), spot (4433) and
+solace (4623); the C++ suite on skynet (sse4, 2.93 M assertions), spot (neon, gcc 16:
+2.86 M) and solace (avx512, gcc: 3.11 M; the branch also builds and passes the integer
+tests under clang 22 at avx512), with the integer tag at sse2 / sse4 / scalar_fallback;
+`tools/fuzz_ab.py` main vs branch 300 seeds, 0 differ (skynet).
+
 ### The soft path: scaled probability space (2026-10-05)
 
 **The soft path is NOT bit-exact** — across `soft_impl`, ISA levels, compilers, `fill`,

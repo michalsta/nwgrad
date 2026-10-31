@@ -167,16 +167,24 @@ DiscrimAlign does: it passes the logical core count.
   The v3 regression this caused (int16 Global Scores 1.02-1.06) is FIXED by the
   in-register lane scan (AGENTS), on every level (NEON int16 too, once its shifts compiled
   as `ext`). Not yet timed on spot under Fedora Asahi (macOS only).
-- **int16 saturating arithmetic, with a number**: at L1000 BLOSUM62 nwgrad refuses int16
-  and runs int32 (261 us a pair, score-only, AVX2) where parasail's saturating scan16 takes
-  145 us — the one fixture in the comparison parasail wins.
-- The streaming `align()` validates integer params per pair (the aligner's `nw_int_prepare`
-  on the caller's params, O(K * nalpha^2) a pair); prepare once per call as the batch does.
+- **int16 saturating arithmetic: DONE as a per-problem regime (2026-10-30, AGENTS
+  "Small-integer round")**: int16 L1000 BLOSUM62 Local score-only 114 us a pair on AVX2
+  (int32 188, float32 307; parasail scan16 was 145), hard 350 (int32 813); L2000 score-only
+  435 (int32 1345), 1.44-1.49x parasail's scan16.  Left: (1) the regime's reach is the
+  sentinel's depth, 32768 for the values' whole range: ~L2300 for BLOSUM62 11/1, ~L880
+  guide-banded Global (the band's floor is the move-count bound; a bound from the guide
+  path's own prefix scores would lift it).  (2) and (3) of the first round are closed by the
+  fleet round (2026-10-31, AGENTS "The fleet round"): NEON (spot) and AVX-512 (solace, gcc
+  and clang) build, pass the suites and gain the same way (solace avx512 int16 protein
+  hard 0.83, score-only 0.80; spot neon 0.90 / 0.87); the scalar fills clamp only in the
+  saturating regime now (`nw_add_s<Sat>`; `scalar_fallback` int16 had been 1.4-1.6x slower
+  with the unconditional clamp), and the inter-pair mask transposition is gated per lane
+  width and architecture (`kMaskTranspose`).
+- (The streaming `align()` prepares integer params once per worker since 2026-10-30,
+  `StreamPrep`: AGENTS "Small-integer round".)
 - `score()` / `scores()` stay double: exact below 2^53, so an int64 score above that
   (parameters ~2^40) loses bits in the report.
-- int16 with saturating arithmetic would remove the (m + n + 66) * step bound (the sentinel
-  then self-preserving under `psubsw`); std::simd has no saturating ops, so intrinsics per
-  level. Not started; measure int16 first.
+- (int16 saturating arithmetic: done, above.)
 - AVX-512: verified and measured 2026-10-22 (solace under WSL, gcc 15.2 / clang 21.1; AGENTS
   "Integer scalar types"). gcc's AVX-512 integer Pointers kernels: after the always_inline
   round and the row-argmax broadcast fix (both 2026-10-23) gcc is at 1.10-1.23x clang on

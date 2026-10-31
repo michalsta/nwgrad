@@ -67,6 +67,11 @@ template <class V> static inline V ivmax(V a, V b) noexcept {
     return a < b ? b : a;
 }
 template <class L, class V> static inline V ivsel(L m, V a, V b) noexcept { return m ? a : b; }
+// Lane-wise add / subtract (plain: the inter-pair kernels never run a problem past the
+// quarter-range bound -- the engine keeps such pairs on their own fill, whose kernels
+// have a saturating variant; see nw_sat in scalar_traits.hpp).
+template <class V> [[gnu::always_inline]] static inline V ivsub(V a, V b) noexcept { return a - b; }
+template <class V> [[gnu::always_inline]] static inline V ivadd(V a, V b) noexcept { return a + b; }
 // Every lane = x.  Not `ivd{} + x`: +0 + -0 is +0, so that idiom loses the sign of a
 // zero border (-0 when a gap extend is 0), which the scalar fill keeps.
 template <class V, class S> static inline V ivsplat(S x) noexcept {
@@ -112,6 +117,11 @@ template <class T>
 struct InterCommon {
     using ivd = typename IVT<T>::v; using ivl = typename IVT<T>::l;
     static constexpr int IW = IVT<T>::W;
+#if defined(__ARM_NEON)
+    static constexpr bool kMaskTranspose = IW >= 16;
+#else
+    static constexpr bool kMaskTranspose = IW >= 16 || (IW >= 8 && sizeof(T) == 2);
+#endif
     const InterJobT<T>& J;
     int levels;
     std::vector<ivl>& bits;
@@ -121,6 +131,38 @@ struct InterCommon {
         levels = na <= 1 ? 0 : na <= 2 ? 1 : na <= 4 ? 2 : na <= 8 ? 3 : -1;
         if (levels < 0 && srow.size() < static_cast<size_t>(n + 1)) srow.resize(n + 1);
         if (bits.size() < static_cast<size_t>(3 * (n + 1))) bits.resize(3 * (n + 1));
+        // The masks from the lanes' residues: the W residues of column j gathered as bytes
+        // (one byte load and store per lane), widened to the lane width in one convert, and
+        // each bit's mask as an arithmetic shift pair -- where building each mask vector
+        // lane by lane (a shift, a test and an insert per lane) was 14 % of a 22 x 50 DNA
+        // score-only step at 16 lanes (nighthaven, perf, 2026-10-30).  Same masks.
+        // Two loops, not one: the W byte stores of a column followed at once by one
+        // W-byte load of the same bytes is a store-forwarding stall per column (3-6 % of
+        // a 22 x 50 DNA step at 4-8 lanes, nighthaven 2026-10-30); transposed in full
+        // first, the loads find their bytes in L1.  From 8 lanes: at 4 (double on AVX2,
+        // float32 / int32 at 128 bits) the lane-by-lane build is as cheap, and this form
+        // read 1.01-1.02 on the DNA double / float32 arms (5 rounds, nighthaven).  At 8
+        // lanes it is a win only for 2-byte lanes on x86 (SSE int16: 4-6 % on nighthaven and
+        // solace); NEON int16 LOST 2-6 % (spot, M1) and AVX2 float32 / int32 read a tie on
+        // nighthaven and 3-8 % slower score-only on solace (Tiger Lake), so those keep the
+        // lane-by-lane build (2026-10-31, the fleet round).
+        if constexpr (kMaskTranspose) {
+            using E = std::remove_cvref_t<decltype(ivl{}[0])>;
+            typedef unsigned char u8v __attribute__((vector_size(IW)));
+            constexpr int EB = 8 * sizeof(E);
+            std::vector<unsigned char>& bt = bt_buf();
+            if (bt.size() < static_cast<size_t>(n + 1) * IW) bt.resize(static_cast<size_t>(n + 1) * IW);
+            unsigned char* btp = bt.data();
+            for (int j = 1; j <= n; ++j)
+                for (int l = 0; l < IW; ++l)
+                    btp[static_cast<size_t>(j) * IW + l] = (!J.nb || j <= J.nb[l]) ? J.b[l][j - 1] : 0;   // ragged: pad
+            for (int j = 1; j <= n; ++j) {
+                u8v bv; std::memcpy(&bv, btp + static_cast<size_t>(j) * IW, IW);
+                const ivl wv = __builtin_convertvector(bv, ivl);
+                for (int k = 0; k < levels; ++k)
+                    bits[3 * j + k] = (wv << (EB - 1 - k)) >> (EB - 1);   // bit k, as 0 / -1
+            }
+        } else
         for (int j = 1; j <= n; ++j)
             for (int k = 0; k < levels; ++k) {
                 bits[3 * j + k] = ivlanes<ivl, IW>([&](int l) {
@@ -133,6 +175,7 @@ struct InterCommon {
     }
     typename IVT<T>::v nbv{};   // ragged: each lane's B length, as T
     static std::vector<ivl>& bits_buf() { static thread_local std::vector<ivl> b; return b; }
+    static std::vector<unsigned char>& bt_buf() { static thread_local std::vector<unsigned char> b; return b; }
     static std::vector<ivd>& srow_buf() { static thread_local std::vector<ivd> b; return b; }
     // The row of `blk` lane l reads at DP row i: its residue's (tracked: its stacked row),
     // row 0 past the lane's own A (those cells are computed and ignored).
@@ -318,9 +361,9 @@ static void inter_fill_linear(InterJobT<T>& J) noexcept {
         ivd rb = ninf, rj = z;
         ivd jc = z + static_cast<T>(j0);   // column j as T (exact): no per-column int->T convert
         for (int j = j0; j <= j1; ++j) {
-            ivd v = p[j - 1] + sub(P, j);
-            v = ivmax(v, p[j] - ge_b);
-            v = ivmax(v, lh - ge_a);
+            ivd v = ivadd(p[j - 1], sub(P, j));
+            v = ivmax(v, ivsub(p[j], ge_b));
+            v = ivmax(v, ivsub(lh, ge_a));
             if constexpr (Local) v = ivmax(v, z);
             if constexpr (Banded) { v = ivsel((jv >= lo) & (jv <= hi), v, ninf); jv += one; }
             h[j] = v;
@@ -408,13 +451,13 @@ static void inter_fill_affine(InterJobT<T>& J) noexcept {
             ivd d = pm[j - 1];
             d = ivmax(d, px[j - 1]);
             d = ivmax(d, py[j - 1]);
-            ivd mv = d + s;
+            ivd mv = ivadd(d, s);
             if constexpr (Local) mv = ivmax(mv, z);
-            ivd x = (pm[j] - go_b) - ge_b;
-            x = ivmax(x, px[j] - ge_b);
-            x = ivmax(x, (py[j] - go_b) - ge_b);
-            ivd open = (ivmax(lm, lx) - go_a) - ge_a;
-            ivd y = ivmax(open, ly - ge_a);
+            ivd x = ivsub(ivsub(pm[j], go_b), ge_b);
+            x = ivmax(x, ivsub(px[j], ge_b));
+            x = ivmax(x, ivsub(ivsub(py[j], go_b), ge_b));
+            ivd open = ivsub(ivsub(ivmax(lm, lx), go_a), ge_a);
+            ivd y = ivmax(open, ivsub(ly, ge_a));
             if constexpr (Banded) {
                 const ivl inb = (jv >= lo) & (jv <= hi);
                 mv = ivsel(inb, mv, ninf); x = ivsel(inb, x, ninf); y = ivsel(inb, y, ninf);
@@ -531,13 +574,13 @@ static void inter_score_affine(InterJobT<T>& J) noexcept {
             ivd d = dm;
             d = ivmax(d, dx);
             d = ivmax(d, dy);
-            ivd mv = d + s;
+            ivd mv = ivadd(d, s);
             if (local) mv = ivmax(mv, z);
-            ivd x = (um - go_b) - ge_b;
-            x = ivmax(x, ux - ge_b);
-            x = ivmax(x, (uy - go_b) - ge_b);
-            const ivd open = (ivmax(lm, lx) - go_a) - ge_a;
-            const ivd y = ivmax(open, ly - ge_a);
+            ivd x = ivsub(ivsub(um, go_b), ge_b);
+            x = ivmax(x, ivsub(ux, ge_b));
+            x = ivmax(x, ivsub(ivsub(uy, go_b), ge_b));
+            const ivd open = ivsub(ivsub(ivmax(lm, lx), go_a), ge_a);
+            const ivd y = ivmax(open, ivsub(ly, ge_a));
             VM[j] = mv; VX[j] = x; VY[j] = y;
             dm = um; dx = ux; dy = uy;
             lm = mv; lx = x; ly = y;
@@ -588,9 +631,9 @@ static void inter_score_linear(InterJobT<T>& J) noexcept {
         H[0] = lh;
         for (int j = 1; j <= n; ++j) {
             const ivd up = H[j];
-            ivd v = d + sub(P, j);
-            v = ivmax(v, up - ge_b);
-            v = ivmax(v, lh - ge_a);
+            ivd v = ivadd(d, sub(P, j));
+            v = ivmax(v, ivsub(up, ge_b));
+            v = ivmax(v, ivsub(lh, ge_a));
             if (local) v = ivmax(v, z);
             H[j] = v;
             d = up;
@@ -663,11 +706,11 @@ static void inter_score_affine_pos(InterJobT<T>& J) noexcept {
         for (int j = 1; j <= n; ++j) {
             const ivd s = sub(P, j);
             const ivd du = D[j], xu = X[j];                      // row i-1, column j
-            ivd mv = dd + s;
+            ivd mv = ivadd(dd, s);
             if (local) mv = ivmax(mv, z);
-            const ivd x = ivmax((du - go_b) - ge_b, xu - ge_b);
+            const ivd x = ivmax(ivsub(ivsub(du, go_b), ge_b), ivsub(xu, ge_b));
             const ivd mx = ivmax(mv, x);
-            const ivd y = ivmax((lmx - go_a) - ge_a, ly - ge_a);
+            const ivd y = ivmax(ivsub(ivsub(lmx, go_a), ge_a), ivsub(ly, ge_a));
             const ivd dn = ivmax(mx, y);
             D[j] = dn; X[j] = x;
             dd = du; lmx = mx; ly = y;

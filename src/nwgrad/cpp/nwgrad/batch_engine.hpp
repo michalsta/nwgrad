@@ -630,8 +630,9 @@ private:
         const Alphabet& alpha = params.matrix.alphabet();
         std::vector<uint8_t> a_enc, b_enc;
         const size_t N = problems.size();
+        const StreamPrep pp(params);
         for (size_t idx; (idx = work_idx.fetch_add(1, std::memory_order_relaxed)) < N; )
-            stream_one_(al, problems, idx, alpha, params, band, buf, a_enc, b_enc, scores, local_grad, st);
+            stream_one_(al, problems, idx, alpha, params, band, buf, a_enc, b_enc, scores, local_grad, st, pp);
     }
     // A problem's effective tracks: as given, or the defaults (all zeros; derived).
     static void effective_tracks_(std::span<const uint16_t> tk, std::span<const uint16_t> gk, size_t m,
@@ -689,16 +690,32 @@ private:
             }
         }
     }
+    // An integer T's params, prepared ONCE per streaming worker (nw_int_prepare: the checked
+    // casts of the stack and the gaps, the bound facts) and handed to every pair's
+    // set_problem() -- which otherwise prepares them per pair: 7 % of a 22 x 50 int16 DNA
+    // streaming step (nighthaven, perf, 2026-10-30).  Empty (null) for a floating T.
+    struct StreamPrep {
+        std::vector<T> stack, gaps;
+        NwIntBound<T> ib;
+        const T* st() const noexcept { return nw_is_int<T> ? stack.data() : nullptr; }
+        const T* gp() const noexcept { return nw_is_int<T> ? gaps.data() : nullptr; }
+        const NwIntBound<T>* ibp() const noexcept { return nw_is_int<T> ? &ib : nullptr; }
+        explicit StreamPrep(const AlignParams& p) {
+            if constexpr (nw_is_int<T>) nw_int_prepare<T>(p, p.num_sets(), stack, gaps, ib);
+        }
+    };
     // One streaming problem on its own path: encode, set up, fill, score, gradient.
     template<class Al>
     void stream_one_(Al& al, const std::vector<ProblemInstance>& problems, size_t i,
                      const Alphabet& alpha, const AlignParams& params, int band, DpBuffer& buf,
                      std::vector<uint8_t>& a_enc, std::vector<uint8_t>& b_enc,
-                     std::vector<double>& scores, AlignParams& local_grad, const StreamTracks& st) const {
+                     std::vector<double>& scores, AlignParams& local_grad, const StreamTracks& st,
+                     const StreamPrep& pp) const {
         const auto& p = problems[i];
         stream_encode_(alpha, p.seq_a, a_enc, i, 'a');
         stream_encode_(alpha, p.seq_b, b_enc, i, 'b');
-        al.set_problem(a_enc, b_enc, params, band, p.guide_j, st.track(i), st.gap_track(i));
+        al.set_problem(a_enc, b_enc, params, band, p.guide_j, st.track(i), st.gap_track(i),
+                       pp.st(), pp.gp(), pp.ibp());
         if (grad_mode_ == GradMode::Hard) {
             al.compute_viterbi(buf); scores[i] = al.score(); al.hard_grad(buf, local_grad);
         } else if (grad_mode_ == GradMode::Soft) {
@@ -739,12 +756,20 @@ private:
         const bool hb_case = !soft && AB == AlignBand::Full && is_hirschberg(tb_resolved_);
         std::vector<size_t> other, elig;
         size_t maxa = 0, maxb = 0;
+        // an nw_sat T: the params' bound facts, to keep pairs of the saturating regime off
+        // the inter-pair fill (inter_eligible_)
+        [[maybe_unused]] NwIntBound<T> sib;
+        if constexpr (nw_sat<T>) { std::vector<T> st, gp; nw_int_prepare<T>(params, params.num_sets(), st, gp, sib); }
         for (size_t i = 0; i < N; ++i) {
             const size_t la = problems[i].seq_a.size(), lb = problems[i].seq_b.size();
             if (la == 0 || lb == 0 || (hb_case && hb_splits(tb_resolved_, s_.traceback == TracebackMode::Default ? FullAl::kAutoPointerCells : 0, s_.hb_cutoff, la, lb)) ||
                 !inter_pair_fits(la, lb, GM == GapModel::Affine, soft, inter_w_(K), sizeof(T), K.d.inter_w)) {
                 other.push_back(i); continue;
             }
+            if constexpr (nw_sat<T>)
+                if (nw_int_bound_check<T, AM == AlignMode::Local, false>(sib, static_cast<int>(la), static_cast<int>(lb)) != 0) {
+                    other.push_back(i); continue;
+                }
             // the integer linear gather gate of inter_eligible_ (hard fills only; score-only
             // groups are gated by inter_score_ok in the loop)
             if constexpr (GM == GapModel::Linear)
@@ -815,6 +840,7 @@ private:
         const size_t nn = static_cast<size_t>(params.matrix.size()) * params.matrix.size();
         const size_t na = static_cast<size_t>(params.matrix.size());
         if (!soft) cast_block_(params, blkT);   // params are fixed for the call: once per worker
+        const StreamPrep pp(params);            // an integer T: prepared once, for every set_problem below
         // Tracked lanes: each lane's effective tracks, its TrackJob (hard / none) or soft rows.
         std::vector<std::vector<uint16_t>> lt(W), lg(W);
         std::vector<TrackJob<T>> tj(W);
@@ -823,7 +849,7 @@ private:
         std::vector<const uint32_t*> lrsp(W);
         std::vector<const double*> lrwp(W);
         auto own = [&](size_t i) {
-            stream_one_(al[0], problems, i, alpha, params, band, buf, ae[0], be[0], scores, local_grad, st);
+            stream_one_(al[0], problems, i, alpha, params, band, buf, ae[0], be[0], scores, local_grad, st, pp);
         };
         const size_t G = groups.size(), tasks = G + other.size();
         for (size_t t; (t = idx.fetch_add(1, std::memory_order_relaxed)) < tasks; ) {
@@ -905,7 +931,7 @@ private:
                         for (int l = 0; l < W; ++l) {
                             const size_t lr = std::min<size_t>(l, real - 1);
                             if (static_cast<size_t>(l) == lr) {
-                                al[l].set_problem(ae[l], be[l], params, band, {}, lt[l], lg[l]);
+                                al[l].set_problem(ae[l], be[l], params, band, {}, lt[l], lg[l], pp.st(), pp.gp(), pp.ibp());
                                 al[l].track_job(tj[l]);
                             } else {
                                 tj[l] = tj[lr];
@@ -928,10 +954,12 @@ private:
             }
             for (size_t l = 0; l < real; ++l) {
                 if (trk) {
-                    al[l].set_problem(ae[l], be[l], params, band, problems[elig[s + l]].guide_j, lt[l], lg[l]);
+                    al[l].set_problem(ae[l], be[l], params, band, problems[elig[s + l]].guide_j, lt[l], lg[l],
+                                      pp.st(), pp.gp(), pp.ibp());
                     al[l].track_job(tj[l]);
                 } else {
-                    al[l].set_problem(ae[l], be[l], params, band, problems[elig[s + l]].guide_j);
+                    al[l].set_problem(ae[l], be[l], params, band, problems[elig[s + l]].guide_j, {}, {},
+                                      pp.st(), pp.gp(), pp.ibp());
                 }
                 if constexpr (AB == AlignBand::GuideBanded)
                     al[l].banded_lane_rows(W, static_cast<int>(l), M, blo.data(), bhi.data(),
@@ -985,13 +1013,13 @@ private:
     struct OwnedParams {
         AlignParams p;
         std::vector<T> stack, gaps;
-        T step_max = T(-1);   // integer T: the largest step (nw_int_prepare); -1 = not prepared
+        NwIntBound<T> ib;     // integer T: the bound facts (nw_int_prepare); step_max -1 = not prepared
         const T* stack_or_null() const noexcept { return stack.empty() ? nullptr : stack.data(); }
     };
     std::shared_ptr<const OwnedParams> own_params_(const AlignParams& p) const {
-        auto o = std::make_shared<OwnedParams>(OwnedParams{p, {}, {}, T(-1)});
+        auto o = std::make_shared<OwnedParams>(OwnedParams{p, {}, {}, {}});
         if constexpr (nw_is_int<T>) {
-            nw_int_prepare<T>(p, p.num_sets(), o->stack, o->gaps, o->step_max);
+            nw_int_prepare<T>(p, p.num_sets(), o->stack, o->gaps, o->ib);
             return o;
         }
         if (!tracked_) return o;   // untracked (and standalone SeqPair): no allocation
@@ -1651,10 +1679,10 @@ private:
     [[gnu::always_inline]] inline void problem_(Al& al, size_t i, const OwnedParams& o, int band,
                                                 std::vector<int>&& guide) const {
         if (tracked_) al.set_problem(codes_a(i), codes_b(i), o.p, band, std::move(guide),
-                                     track(i), gap_track(i), o.stack_or_null(), o.gaps.data(), o.step_max);
+                                     track(i), gap_track(i), o.stack_or_null(), o.gaps.data(), &o.ib);
         else if constexpr (nw_is_int<T>)   // the prepared stack, gaps and step_max (no tracks)
             al.set_problem(codes_a(i), codes_b(i), o.p, band, std::move(guide), {}, {},
-                           o.stack_or_null(), o.gaps.data(), o.step_max);
+                           o.stack_or_null(), o.gaps.data(), &o.ib);
         else          al.set_problem(codes_a(i), codes_b(i), o.p, band, std::move(guide));
     }
     // The hard gradient and guide of the DP `al` just ran, into pair i, in one walk —
@@ -2075,6 +2103,11 @@ private:
     // Whether pair i joins an inter-pair fill on `backend` (else: its own fill).
     bool inter_eligible_(size_t i, const LevelKernels& K) const {
         if (len_a(i) == 0 || len_b(i) == 0) return false;
+        // An nw_sat pair past the quarter-range bound runs the saturating regime, which the
+        // inter-pair kernels do not have: its own fill (nw_int_bound_check, aligner.hpp).
+        if constexpr (nw_sat<T>)
+            if (nw_int_bound_check<T, AM == AlignMode::Local, false>(params_->ib, static_cast<int>(len_a(i)), static_cast<int>(len_b(i))) != 0)
+                return false;
         if (!inter_pair_fits(len_a(i), len_b(i), GM == GapModel::Affine,
                              grad_mode_ == GradMode::Soft, inter_w_(K), sizeof(T), K.d.inter_w))
             return false;

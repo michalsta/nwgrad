@@ -101,6 +101,55 @@ template <class V>
 static inline bool avx512d_any_gt(const V& F, const V& v) { return avx512d_gt(F, v) != 0; }
 #endif
 
+// ── Saturating vector add / subtract for the nw_sat types (int16), plain otherwise ──
+// The packed saturating instructions cost what the plain ones do (vpaddsw / vpsubsw,
+// sqadd / sqsub), so every arithmetic site of the integer kernels goes through these;
+// scalar_traits.hpp's nw_add / nw_sub are the scalar twins, and the scalar fills use them,
+// so a table is the same bits at every level.  std::simd (V a std::experimental::simd)
+// and the GCC vector types (ivadd / ivsub, inter_kernel_impl.inl) both.
+template <bool Sat, class V>
+[[gnu::always_inline]] static inline V vsub(const V& a, const V& b) {
+    using T = typename V::value_type;
+    if constexpr (Sat && nw_sat<T>) {
+#if defined(__AVX512BW__)
+        if constexpr (V::size() == 32) return V((__v32hi)_mm512_subs_epi16((__m512i)static_cast<__v32hi>(a), (__m512i)static_cast<__v32hi>(b)));
+#endif
+#if defined(__AVX2__)
+        if constexpr (V::size() == 16) return V((__v16hi)_mm256_subs_epi16((__m256i)static_cast<__v16hi>(a), (__m256i)static_cast<__v16hi>(b)));
+#endif
+#if defined(__SSE2__)
+        if constexpr (V::size() == 8) return V((__v8hi)_mm_subs_epi16((__m128i)static_cast<__v8hi>(a), (__m128i)static_cast<__v8hi>(b)));
+#endif
+#if defined(__ARM_NEON)
+        if constexpr (V::size() == 8) return V(vqsubq_s16(static_cast<int16x8_t>(a), static_cast<int16x8_t>(b)));
+#endif
+        // no packed form at this width: lane by lane
+        return V([&](int q) { return nw_sub<T>(a[q], b[q]); });
+    } else {
+        return a - b;
+    }
+}
+template <bool Sat, class V>
+[[gnu::always_inline]] static inline V vadd(const V& a, const V& b) {
+    using T = typename V::value_type;
+    if constexpr (Sat && nw_sat<T>) {
+#if defined(__AVX512BW__)
+        if constexpr (V::size() == 32) return V((__v32hi)_mm512_adds_epi16((__m512i)static_cast<__v32hi>(a), (__m512i)static_cast<__v32hi>(b)));
+#endif
+#if defined(__AVX2__)
+        if constexpr (V::size() == 16) return V((__v16hi)_mm256_adds_epi16((__m256i)static_cast<__v16hi>(a), (__m256i)static_cast<__v16hi>(b)));
+#endif
+#if defined(__SSE2__)
+        if constexpr (V::size() == 8) return V((__v8hi)_mm_adds_epi16((__m128i)static_cast<__v8hi>(a), (__m128i)static_cast<__v8hi>(b)));
+#endif
+#if defined(__ARM_NEON)
+        if constexpr (V::size() == 8) return V(vqaddq_s16(static_cast<int16x8_t>(a), static_cast<int16x8_t>(b)));
+#endif
+        return V([&](int q) { return nw_add<T>(a[q], b[q]); });
+    } else {
+        return a + b;
+    }
+}
 // ── Local: the best cell of one striped row, vectorized ──────────────────────
 // Exactly the scalar scan in column order (max(M,X,Y), strict `>` against the running
 // best, M>X>Y for the table): each lane keeps its largest value and the FIRST segment
@@ -109,12 +158,12 @@ static inline bool avx512d_any_gt(const V& F, const V& v) { return avx512d_gt(F,
 // scalar form compiled under gcc to compare-and-branch on every cell, mispredicted
 // (~30% of a Local Pointers fill).  pad[k] = 0 for a real column, -inf for padding: with
 // a negative gap extend a Y run GAINS score into the padding, so it must be masked.
-template <class T>
+template <class T, bool Sat = false>
 static inline void striped_row_best(const T* cM, const T* cX, const T* cY, const T* pad,
                                     int seg, int i, T& best, int& bi, int& bj, int& btbl) {
     using vt = stdx::native_simd<T>;
     constexpr int W = (int)vt::size();
-    vt lmax(nw_ninf<T>), ls(T(0));
+    vt lmax(nw_ninf_s<T, Sat>), ls(T(0));
     // The segment index as a vector, carried and incremented — NOT `vt(T(s))` in the loop:
     // for 64-bit lanes at AVX-512 gcc lowered that broadcast to eight merge-masked
     // `vpbroadcastq`, one per lane and each dependent on the last, an 8-deep chain per
@@ -129,7 +178,7 @@ static inline void striped_row_best(const T* cM, const T* cX, const T* cY, const
         vx.copy_from(cX + o, stdx::element_aligned);
         vy.copy_from(cY + o, stdx::element_aligned);
         vp.copy_from(pad + o, stdx::element_aligned);
-        const vt h = stdx::max(stdx::max(vm, vx), vy) + vp;
+        const vt h = vadd<Sat>(stdx::max(stdx::max(vm, vx), vy), vp);
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
         if constexpr (sizeof(T) == 8) ls = avx512d_blend(avx512d_gt(h, lmax), ls, vs);
         else                                      stdx::where(h > lmax, ls) = vs;
@@ -171,19 +220,19 @@ static inline void striped_row_best(const T* cM, const T* cX, const T* cY, const
 
 // pad[s*W + l] = 0 for a real column (l*seg + s + 1 <= n), -inf for padding.
 // The same mask into a row the caller owns (a spread_rows row: dp_buffer.hpp).
-template <class T>
+template <class T, bool Sat = false>
 static inline const T* striped_pad_into(T* v, int n, int seg, int W) {
     for (int l = 0; l < W; ++l)
         for (int s = 0; s < seg; ++s)
-            v[(std::size_t)s * W + l] = (l * seg + s + 1 <= n) ? T(0) : nw_ninf<T>;
+            v[(std::size_t)s * W + l] = (l * seg + s + 1 <= n) ? T(0) : nw_ninf_s<T, Sat>;
     return v;
 }
 
-template <class V>
+template <bool Sat = false, class V>
 static inline const typename V::value_type* striped_pad(V& v, int n, int seg, int W) {
     const std::size_t sw = (std::size_t)seg * W;
     if (v.size() < sw) v.resize(sw);
-    return striped_pad_into(v.data(), n, seg, W);
+    return striped_pad_into<typename V::value_type, Sat>(v.data(), n, seg, W);
 }
 
 using vd = stdx::native_simd<double>;
@@ -206,9 +255,9 @@ static constexpr double K_NINF = -std::numeric_limits<double>::infinity();
 // go + ge could overflow where the original did not), so it paid two subtractions per
 // open on the carry; clang folds them.  (-fwrapv lets gcc fold them too, but costs it
 // 10-20 % on the inter-pair kernels: sse4, cudak, 2026-10-27.)
-template <class V>
+template <bool Sat = false, class V>
 [[gnu::always_inline]] static inline V open_pen(const V& v, const V& go, const V& ge, const V& goe) {
-    if constexpr (std::is_integral_v<typename V::value_type>) { (void)go; (void)ge; return v - goe; }
+    if constexpr (std::is_integral_v<typename V::value_type>) { (void)go; (void)ge; return vsub<Sat>(v, goe); }
     else { (void)goe; return (v - go) - ge; }
 }
 template <class V>
@@ -356,12 +405,12 @@ template <class NV, int W, int K>
 #define NWGRAD_LANE_SCAN_REG 1
 #endif
 #endif
-template <class vd, int W>
+template <class vd, int W, bool Sat = false>
 [[gnu::always_inline]] static inline vd int_lane_carry_in(const vd& P, typename vd::value_type seed) {
     using T = typename vd::value_type;
 #ifdef NWGRAD_LANE_SCAN_REG
     using NV = typename NVecOf<T, (int)(sizeof(T) * W)>::type;
-    const NV ninf = static_cast<NV>(vd(nw_ninf<T>));
+    const NV ninf = static_cast<NV>(vd(nw_ninf_s<T, Sat>));
     NV x = static_cast<NV>(P);
     auto mx = [](NV a, NV b) __attribute__((always_inline)) { return a > b ? a : b; };
     x = mx(x, nv_shift_up<NV, W, 1>(x, ninf));
@@ -412,7 +461,7 @@ template <class T> struct IntRampRow {
 // than the kernel body around it.  RowRamp: the ramp loaded from `rr`'s row (int_row_ramp).
 // Ext: the code recorded for an extension (the Pointers kernels pass 32, Y's field of the
 // packed byte already shifted, the open codes in `ok` then 0 / 16; dense codes 2).
-template <class T, int W, bool RowRamp = false, int Ext = 2>
+template <class T, int W, bool RowRamp = false, int Ext = 2, bool Sat = false>
 [[gnu::always_inline]] static inline void int_pmax_carry(const T* ov, const T* ok, T nbOpen, T nbOpenK,
                                   T bY, T ge_a, int seg, T* cY, T* yc, T* qbuf,
                                   IntRampRow<T>* rr = nullptr) {
@@ -423,7 +472,7 @@ template <class T, int W, bool RowRamp = false, int Ext = 2>
     const vd vge(ge_a);
     const vd rbase([&](int l) { return static_cast<T>(static_cast<T>(l * seg) * ge_a); });
     vd rq = rbase;                          // k*ge_a for k = l*seg + s
-    vd P(nw_ninf<T>);
+    vd P(nw_ninf_s<T, Sat>);
     for (int s = 0; s < seg; ++s) {
         vd O;
         if (s == 0) {
@@ -433,14 +482,14 @@ template <class T, int W, bool RowRamp = false, int Ext = 2>
             O = nv_load<vd>(ov + (std::size_t)(s - 1) * W);
         }
         vd Q;
-        if constexpr (RowRamp) { Q = O + nv_load<vd>(rmp + (std::size_t)s * W); }
-        else                   { Q = O + rq; rq += vge; }
+        if constexpr (RowRamp) { Q = vadd<Sat>(O, nv_load<vd>(rmp + (std::size_t)s * W)); }
+        else                   { Q = vadd<Sat>(O, rq); rq += vge; }
         if (yc) nv_store(qbuf + (std::size_t)s * W, Q);
         P = stdx::max(Q, P);
         nv_store(cY + (std::size_t)s * W, P);
     }
     rq = rbase;
-    const vd vcin = int_lane_carry_in<vd, W>(P, static_cast<T>(bY - ge_a));
+    const vd vcin = int_lane_carry_in<vd, W, Sat>(P, nw_sub<T>(bY, ge_a));
     vd before = vcin;                       // the prefix before this segment's open
     // Two ramps a step apart, each advanced by 2*ge_a: this pass has no other loop-carried
     // value, and one ramp's add chain bound it on NEON (2-cycle integer add: 1.04-1.07x the
@@ -450,7 +499,7 @@ template <class T, int W, bool RowRamp = false, int Ext = 2>
     auto step = [&](int s, const vd& r) __attribute__((always_inline)) {
         vd p; p = nv_load<vd>(cY + (std::size_t)s * W);
         const vd pc = stdx::max(p, vcin);
-        nv_store(cY + (std::size_t)s * W, pc - r);
+        nv_store(cY + (std::size_t)s * W, vsub<Sat>(pc, r));
         if (yc) {
             vd OK, q;
             if (s == 0) {
@@ -535,10 +584,10 @@ static inline V carry_pin(V v) {
 // the same per-lane F > v masks (Pointers' revised codes included) and the same exit; the
 // loop-carried chain loses its max.  Integer T keeps v - ge: its sentinel stepped by - ge
 // once per segment could wrap.  (Measured: AGENTS.md, "The gap carry, shortened".)
-template <class V>
+template <bool Sat = false, class V>
 static inline V lazy_f_next(const V& F, const V& v, const V& ge) {
     if constexpr (std::is_floating_point_v<typename V::value_type>) return F - ge;
-    else                                                             return v - ge;
+    else                                                             return vsub<Sat>(v, ge);
 }
 
 // The fills' carry pass along a row: Y(s) = max(O(s), Y(s-1) - ge), O(s) from load_o(s),
@@ -557,16 +606,16 @@ static inline V lazy_f_next(const V& F, const V& v, const V& ge) {
 // The callers feed it opens recomputed from the rows they sit beside (load_o), not rows pass
 // 1 stored: both together measured 0.71-0.95 of the stored-opens form on AVX2 and 0.76-0.86
 // for the linear fills (AGENTS.md, "Merging the shortened carry").
-template <class V, class LoadO, class Put>
+template <bool Sat, class V, class LoadO, class Put>
 static NWGRAD_FORCE_INLINE V carry_pass(int seg, V prev, const V& ge, LoadO&& load_o, Put&& put) {
     int s = 0;
     if constexpr (std::is_floating_point_v<typename V::value_type>) {
         for (; s + 1 < seg; s += 2) {
             const V O0 = load_o(s), O1 = load_o(s + 1);
-            const V t = prev - ge;                                   // chain
-            const V O0g = O0 - ge;
+            const V t = vsub<Sat>(prev, ge);                              // chain
+            const V O0g = vsub<Sat>(O0, ge);
             const V v0 = stdx::max(O0, t);
-            const V t2 = t - ge;                                     // chain
+            const V t2 = vsub<Sat>(t, ge);                                // chain
             const V v1 = stdx::max(carry_pin(stdx::max(O1, O0g)), t2);   // chain: one max
             put(s, O0, t, v0);
             put(s + 1, O1, stdx::max(O0g, t2), v1);
@@ -575,7 +624,7 @@ static NWGRAD_FORCE_INLINE V carry_pass(int seg, V prev, const V& ge, LoadO&& lo
     }
     for (; s < seg; ++s) {
         const V O = load_o(s);
-        const V ext = prev - ge;
+        const V ext = vsub<Sat>(prev, ge);
         const V v = stdx::max(O, ext);
         put(s, O, ext, v);
         prev = v;
@@ -610,10 +659,89 @@ static inline void striped_profile_index(unsigned char* idx, const unsigned char
             idx[(std::size_t)s * W + l] = (j <= n) ? b[j - 1] : 0;
         }
 }
+// int16 rows over alphabets of up to 32 symbols: the lookup as byte shuffles.  The row is
+// split into its low and high byte planes (two 32-entry byte tables each); 16 / 32 symbol
+// indices at a time select from them (pshufb / tbl: a 16-entry table per 128-bit lane, so
+// two shuffles and an OR per plane on x86, where an index + 0x70 sets bit 7 -- a zero
+// lane -- for symbols >= 16 and an index - 16 does so for symbols < 16; one tbl2 on NEON)
+// and the planes are interleaved back into words.  The scalar form (one byte load, one
+// word load and one word store per slot, ~4 instructions) was 18 % of the int16 L200
+// score-only time on AVX2 (nighthaven, perf, 2026-10-30).  Same values: a lookup is a
+// lookup.  Alphabets over 32 symbols, and SSE2 (no pshufb), keep the scalar loop.
+#if (defined(__SSSE3__) || defined(__ARM_NEON)) && !defined(NWGRAD_SCALAR_PROFILE_BUILD)
+#define NWGRAD_PROFILE_SHUFFLE 1
+static inline void striped_profile_row_idx_i16(std::int16_t* dst, const std::int16_t* row,
+                                               const unsigned char* idx, int nalpha, std::size_t sw) {
+    // the byte planes, 32 entries each (symbols past nalpha are never indexed)
+    alignas(32) unsigned char lo[32], hi[32];
+    for (int c = 0; c < 32; ++c) {
+        const std::uint16_t v = c < nalpha ? static_cast<std::uint16_t>(row[c]) : 0;
+        lo[c] = static_cast<unsigned char>(v & 0xFF);
+        hi[c] = static_cast<unsigned char>(v >> 8);
+    }
+    std::size_t k = 0;
+#if defined(__AVX2__)
+    const __m256i loA = _mm256_broadcastsi128_si256(_mm_load_si128((const __m128i*)lo));
+    const __m256i loB = _mm256_broadcastsi128_si256(_mm_load_si128((const __m128i*)(lo + 16)));
+    const __m256i hiA = _mm256_broadcastsi128_si256(_mm_load_si128((const __m128i*)hi));
+    const __m256i hiB = _mm256_broadcastsi128_si256(_mm_load_si128((const __m128i*)(hi + 16)));
+    const __m256i c70 = _mm256_set1_epi8(0x70), c16 = _mm256_set1_epi8(16);
+    for (; k + 32 <= sw; k += 32) {
+        const __m256i ix = _mm256_loadu_si256((const __m256i*)(idx + k));
+        const __m256i ia = _mm256_add_epi8(ix, c70), ib = _mm256_sub_epi8(ix, c16);
+        const __m256i l = _mm256_or_si256(_mm256_shuffle_epi8(loA, ia), _mm256_shuffle_epi8(loB, ib));
+        const __m256i h = _mm256_or_si256(_mm256_shuffle_epi8(hiA, ia), _mm256_shuffle_epi8(hiB, ib));
+        const __m256i w0 = _mm256_unpacklo_epi8(l, h);   // words 0-7 | 16-23
+        const __m256i w1 = _mm256_unpackhi_epi8(l, h);   // words 8-15 | 24-31
+        _mm256_storeu_si256((__m256i*)(dst + k), _mm256_permute2x128_si256(w0, w1, 0x20));
+        _mm256_storeu_si256((__m256i*)(dst + k + 16), _mm256_permute2x128_si256(w0, w1, 0x31));
+    }
+#endif
+#if defined(__SSSE3__)
+    {
+        const __m128i loA = _mm_load_si128((const __m128i*)lo), loB = _mm_load_si128((const __m128i*)(lo + 16));
+        const __m128i hiA = _mm_load_si128((const __m128i*)hi), hiB = _mm_load_si128((const __m128i*)(hi + 16));
+        const __m128i c70 = _mm_set1_epi8(0x70), c16 = _mm_set1_epi8(16);
+        for (; k + 16 <= sw; k += 16) {
+            const __m128i ix = _mm_loadu_si128((const __m128i*)(idx + k));
+            const __m128i ia = _mm_add_epi8(ix, c70), ib = _mm_sub_epi8(ix, c16);
+            const __m128i l = _mm_or_si128(_mm_shuffle_epi8(loA, ia), _mm_shuffle_epi8(loB, ib));
+            const __m128i h = _mm_or_si128(_mm_shuffle_epi8(hiA, ia), _mm_shuffle_epi8(hiB, ib));
+            _mm_storeu_si128((__m128i*)(dst + k), _mm_unpacklo_epi8(l, h));
+            _mm_storeu_si128((__m128i*)(dst + k + 8), _mm_unpackhi_epi8(l, h));
+        }
+    }
+#elif defined(__ARM_NEON)
+    {
+        const uint8x16x2_t lt = {vld1q_u8(lo), vld1q_u8(lo + 16)};
+        const uint8x16x2_t ht = {vld1q_u8(hi), vld1q_u8(hi + 16)};
+        for (; k + 16 <= sw; k += 16) {
+            const uint8x16_t ix = vld1q_u8(idx + k);
+            const uint8x16_t l = vqtbl2q_u8(lt, ix), h = vqtbl2q_u8(ht, ix);
+            vst1q_u8((std::uint8_t*)(dst + k), vzip1q_u8(l, h));
+            vst1q_u8((std::uint8_t*)(dst + k + 8), vzip2q_u8(l, h));
+        }
+    }
+#endif
+    for (; k < sw; ++k) dst[k] = row[idx[k]];
+}
+#endif
 template <class T>
 static inline void striped_profile_row_idx(T* dst, const T* row, const unsigned char* idx,
-                                           int n, int seg, int W) {
+                                           int n, int seg, int W, int nalpha) {
     const std::size_t sw = (std::size_t)seg * W;
+#ifdef NWGRAD_PROFILE_SHUFFLE
+    if constexpr (std::is_same_v<T, std::int16_t>) {
+        if (nalpha <= 32) {
+            striped_profile_row_idx_i16(dst, row, idx, nalpha, sw);
+            for (int j = n + 1; j <= seg * W; ++j)
+                dst[(std::size_t)((j - 1) % seg) * W + (std::size_t)((j - 1) / seg)] = nw_pad<T>;
+            return;
+        }
+    }
+#else
+    (void)nalpha;
+#endif
     for (std::size_t k = 0; k < sw; ++k) dst[k] = row[idx[k]];
     for (int j = n + 1; j <= seg * W; ++j)
         dst[(std::size_t)((j - 1) % seg) * W + (std::size_t)((j - 1) / seg)] = nw_pad<T>;
@@ -623,8 +751,11 @@ static inline void striped_profile_row_idx(T* dst, const T* row, const unsigned 
 // row's as the fill reaches it, into the single row reserved); untracked, one per
 // alphabet symbol — exactly the loop the untracked kernels always ran.  The slot index
 // lives past the rows, in `prof`'s own tail (sw bytes).
+// Not inlined: a separate function in every measured profile; inlined into a kernel's
+// entry (as gcc chose once its row lookup grew the shuffle form) it cost the float32
+// score-only step 3 % (nighthaven, perf: the build's symbol gone, the kernel 3 % longer).
 template <class T, bool Tr>
-static inline void striped_profile_build(typename DpBufferT<T>::TVec& prof, const T* blk,
+[[gnu::noinline]] static void striped_profile_build(typename DpBufferT<T>::TVec& prof, const T* blk,
                                          int nalpha, const unsigned char* b, int n, int seg, int W,
                                          const TrackJob<T>& tr) {
     const std::size_t sw = (std::size_t)seg * W;
@@ -637,7 +768,7 @@ static inline void striped_profile_build(typename DpBufferT<T>::TVec& prof, cons
             striped_profile_index(idx, b, n, seg, W);
             for (int c = 0; c < tr.nrow; ++c)
                 striped_profile_row_idx(prof.data() + (std::size_t)c * sw,
-                                        blk + (std::size_t)tr.crow[c] * nalpha, idx, n, seg, W);
+                                        blk + (std::size_t)tr.crow[c] * nalpha, idx, n, seg, W, nalpha);
         } else if (prof.size() < sw) {
             prof.resize(sw);
         }
@@ -649,7 +780,7 @@ static inline void striped_profile_build(typename DpBufferT<T>::TVec& prof, cons
         striped_profile_index(idx, b, n, seg, W);
         for (int c = 0; c < nalpha; ++c)
             striped_profile_row_idx(prof.data() + (std::size_t)c * sw, blk + (std::size_t)c * nalpha,
-                                    idx, n, seg, W);
+                                    idx, n, seg, W, nalpha);
     }
 }
 // DP row i's profile row (1-based i).
@@ -673,11 +804,11 @@ static inline const T* striped_row_profile(T* prof, const T* blk, int nalpha, co
 // sentinel are all local to T here, shadowing the file-scope double versions above.
 // Tr: a tracked problem (job.tr) — each row's penalties, border and profile row from
 // the track arrays, in the same expressions, so equal sets give the untracked tables.
-template <class T, bool Local, bool Tr = false>
+template <class T, bool Local, bool Tr = false, bool Sat = false>
 static void striped_affine_full(ViterbiJob<T>& job) {
     using vd = stdx::native_simd<T>;
     const int W = (int)vd::size();                       // native T-lane count for this level
-    const T K_NINF = nw_ninf<T>;
+    const T K_NINF = nw_ninf_s<T, Sat>;
 
     const int m = job.m, n = job.n;
     const int nalpha = job.nalpha;
@@ -758,7 +889,7 @@ static void striped_affine_full(ViterbiJob<T>& job) {
     T bM = 0, bX = K_NINF, bY = K_NINF;
 
     T best_local = 0; int best_i = 0, best_j = 0, best_tbl = 0;
-    const T* pad = Local ? striped_pad(buf.spad, n, seg, W) : nullptr;
+    const T* pad = Local ? striped_pad<Sat>(buf.spad, n, seg, W) : nullptr;
 
     for (int i = 1; i <= m; ++i) {
         if constexpr (Tr) {
@@ -770,7 +901,7 @@ static void striped_affine_full(ViterbiJob<T>& job) {
         T nbX;
         if constexpr (Tr) nbX = Local ? K_NINF : tr.bx0[i];
         else              nbX = Local ? K_NINF : -(go_b + i * ge_b);
-        const T nbOpen = (std::max(nbM, nbX) - go_a) - ge_a;
+        const T nbOpen = nw_sub(nw_sub(std::max(nbM, nbX), go_a), ge_a);
         const T* sub = striped_row_profile<T, Tr>(buf.sprof.data(), blk, nalpha, a, b, n, seg, W, i, tr);
 
         // this row and the previous row, striped, written in place in the tables
@@ -790,7 +921,7 @@ static void striped_affine_full(ViterbiJob<T>& job) {
             // The diagonal predecessors: the previous iteration's up vectors, rotated in
             // registers (each previous-row vector loaded once, not twice); at s = 0 the last
             // segment, shifted one lane in.
-            vd dM(nw_ninf<T>), dX(nw_ninf<T>), dY(nw_ninf<T>);
+            vd dM(K_NINF), dX(K_NINF), dY(K_NINF);
             if (seg > 0) {
                 vd lM, lX, lY;
                 lM.copy_from(pM + (std::size_t)(seg - 1) * W, stdx::element_aligned);
@@ -802,7 +933,7 @@ static void striped_affine_full(ViterbiJob<T>& job) {
             }
             for (int s = 0; s < seg; ++s) {
                 vd sb; sb.copy_from(sub + (std::size_t)s * W, stdx::element_aligned);
-                vd vmv = stdx::max(stdx::max(dM, dX), dY) + sb;
+                vd vmv = vadd<Sat>(stdx::max(stdx::max(dM, dX), dY), sb);
                 if constexpr (Local) vmv = stdx::max(vmv, vzero);
                 vmv.copy_to(cM + (std::size_t)s * W, stdx::element_aligned);
 
@@ -811,7 +942,7 @@ static void striped_affine_full(ViterbiJob<T>& job) {
                 uX.copy_from(pX + (std::size_t)s * W, stdx::element_aligned);
                 uY.copy_from(pY + (std::size_t)s * W, stdx::element_aligned);
                 dM = uM; dX = uX; dY = uY;   // the next segment's diagonal
-                vd vxv = stdx::max(stdx::max((uM - vgo_b) - vge_b, uX - vge_b), (uY - vgo_b) - vge_b);
+                vd vxv = stdx::max(stdx::max(vsub<Sat>(vsub<Sat>(uM, vgo_b), vge_b), vsub<Sat>(uX, vge_b)), vsub<Sat>(vsub<Sat>(uY, vgo_b), vge_b));
                 vxv.copy_to(cX + (std::size_t)s * W, stdx::element_aligned);
                 // The opens stay a row of their own here (buf.sopenv), unlike
                 // the Pointers / Hirschberg / linear kernels, which recompute them from M and X:
@@ -819,17 +950,17 @@ static void striped_affine_full(ViterbiJob<T>& job) {
                 // (table_spread() off) share one 4 KB offset, and a carry loading cM[s-1] /
                 // cX[s-1] right after storing cY[s-1] hit the store-to-load 4 KB alias on every
                 // segment -- 2.05-2.26x the time (nighthaven AVX2, double, 1 thread, 2026-10-25).
-                ((stdx::max(vmv, vxv) - vgo_a) - vge_a).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
+                (vsub<Sat>(vsub<Sat>(stdx::max(vmv, vxv), vgo_a), vge_a)).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
             }
 
             // ── the carry: VY, same-lane striped chain + lazy-F (integer T: the exact
             // prefix max, int_pmax_carry) ──
             if constexpr (nw_is_int<T> && W >= 4) {
-                int_pmax_carry<T, W, int_row_ramp<T, W> && !Local>(ov, nullptr, nbOpen, T(0), bY,
+                int_pmax_carry<T, W, int_row_ramp<T, W> && !Local, 2, Sat>(ov, nullptr, nbOpen, T(0), bY,
                                      ge_a, seg, cY, nullptr, nullptr, &irr);
             } else {
             vd prev([&](int q) { return q == 0 ? bY : K_NINF; });
-            prev = carry_pass(seg, prev, vge_a,
+            prev = carry_pass<Sat>(seg, prev, vge_a,
                 [&](int s) NWGRAD_ALWAYS_INLINE_LAMBDA {
                     vd O;
                     if (s == 0) {
@@ -846,7 +977,7 @@ static void striped_affine_full(ViterbiJob<T>& job) {
             for (int r = 0; r < W; ++r) {
                 vd last; last.copy_from(cY + (std::size_t)(seg - 1) * W, stdx::element_aligned);
                 vd F = lane_shift_in(last, bY);
-                F = F - vge_a;
+                F = vsub<Sat>(F, vge_a);
                 bool changed = false;
                 for (int s = 0; s < seg; ++s) {
                     vd v; v.copy_from(cY + (std::size_t)s * W, stdx::element_aligned);
@@ -876,7 +1007,7 @@ static void striped_affine_full(ViterbiJob<T>& job) {
 #endif
                     v = stdx::max(v, F);
                     v.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
-                    F = lazy_f_next(F, v, vge_a);
+                    F = lazy_f_next<Sat>(F, v, vge_a);
                     changed = true;
                 }
                 if (!changed) break;
@@ -886,7 +1017,7 @@ static void striped_affine_full(ViterbiJob<T>& job) {
             // ── Local: argmax over this row, j ascending, reading the striped cells,
             // with the scalar kernel's M>X>Y tie-break and strict > (bit-exact path) ──
             if constexpr (Local)
-                striped_row_best<T>(cM, cX, cY, pad, seg, i, best_local, best_i, best_j, best_tbl);
+                striped_row_best<T, Sat>(cM, cX, cY, pad, seg, i, best_local, best_i, best_j, best_tbl);
         }
         bM = nbM; bX = nbX; bY = K_NINF;
     }
@@ -912,13 +1043,19 @@ static void striped_affine_full(ViterbiJob<T>& job) {
 
 // The registered entry for a level, per precision: dispatch Full by mode.  GuideBanded
 // is not handled here (the caller routes it to the row-wise kernel).
-template <class T>
-static void striped_full_entry(ViterbiJob<T>& job) {
+template <class T, bool Sat>
+static void striped_full_entry_impl(ViterbiJob<T>& job) {
     if (job.tr.on()) {
-        if (job.align_mode) striped_affine_full<T, true, true>(job);
-        else                striped_affine_full<T, false, true>(job);
+        if (job.align_mode) striped_affine_full<T, true, true, Sat>(job);
+        else                striped_affine_full<T, false, true, Sat>(job);
         return;
     }
-    if (job.align_mode) striped_affine_full<T, true>(job);
-    else                striped_affine_full<T, false>(job);
+    if (job.align_mode) striped_affine_full<T, true, false, Sat>(job);
+    else                striped_affine_full<T, false, false, Sat>(job);
+}
+// job.sat (an nw_sat type past the quarter-range bound): the saturating variant.
+template <class T>
+static void striped_full_entry(ViterbiJob<T>& job) {
+    if constexpr (nw_sat<T>) { if (job.sat) { striped_full_entry_impl<T, true>(job); return; } }
+    striped_full_entry_impl<T, false>(job);
 }
