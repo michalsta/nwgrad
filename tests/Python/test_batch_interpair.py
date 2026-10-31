@@ -13,6 +13,10 @@ from conftest import StreamAligner, StreamAlignerDouble
 
 DNA = "ACGT"
 REL = 1e-11
+
+
+def _rel(prec):   # a float32 batch's soft pass runs in float32: ~1e-6 relative
+    return 2e-4 if prec == "float32" else REL
 CLS = {"double": StreamAlignerDouble, "float32": StreamAligner}
 
 
@@ -113,7 +117,7 @@ def test_soft_matches(prec, gm, mode, T):
     r0 = _align(prec, p, gm, mode, "soft", A, B, "striped", T=T)
     r1 = _align(prec, p, gm, mode, "soft", A, B, "interpair", T=T)
     for x, y in zip(r0, r1):
-        np.testing.assert_allclose(x, y, rtol=REL, atol=REL)
+        np.testing.assert_allclose(x, y, rtol=_rel(prec), atol=_rel(prec))
 
 
 @pytest.mark.parametrize("prec", ["double", "float32"])
@@ -187,7 +191,7 @@ def test_ragged_b(prec, gm, mode, grad):
         if grad == "hard":
             assert np.array_equal(x, y)
         else:
-            np.testing.assert_allclose(x, y, rtol=REL, atol=REL)
+            np.testing.assert_allclose(x, y, rtol=_rel(prec), atol=_rel(prec))
     if gm == "affine" and grad == "hard":
         r0 = _align(prec, p, gm, mode, grad, A, B, "striped", band=3)
         r1 = _align(prec, p, gm, mode, grad, A, B, "interpair", band=3)
@@ -215,7 +219,7 @@ def test_protein(prec, gm, mode, grad):
         if grad == "hard":
             assert np.array_equal(x, y)
         else:
-            np.testing.assert_allclose(x, y, rtol=REL, atol=REL)
+            np.testing.assert_allclose(x, y, rtol=_rel(prec), atol=_rel(prec))
 
 
 def test_long_local_float32_pairs_keep_their_hirschberg_default():
@@ -247,5 +251,5 @@ def test_soft_guided_band0_align_ignores_no_guide(prec):
             b = cls(1, grad_mode=gd)
             b.fill = fill
             got[gd, fill] = np.asarray(b.align(A, B, p, 0, ga, gb).scores)
-    np.testing.assert_allclose(got["soft", "interpair"], got["soft", "striped"], rtol=1e-11)
-    np.testing.assert_allclose(got["soft", "striped"], got["hard", "striped"], rtol=1e-11)
+    np.testing.assert_allclose(got["soft", "interpair"], got["soft", "striped"], rtol=_rel(prec))
+    np.testing.assert_allclose(got["soft", "striped"], got["hard", "striped"], rtol=_rel(prec))

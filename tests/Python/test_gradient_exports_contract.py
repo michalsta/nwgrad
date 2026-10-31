@@ -16,6 +16,9 @@ def test_weighted_soft_grad_matches_composed_objective_finite_difference(
     """Check the chain rule against scores, independently of cached gradients."""
     batch, params = make_batch(getattr(nwgrad, class_name), gap_model, mode,
                               grad_mode="soft", n_threads=1)
+    # Finite differences at step 1e-5 need the double soft pass (a float32 batch's own
+    # soft pass is float32, ~1e-6 relative, which the quotient amplifies to ~0.1).
+    batch.soft_precision = "double"
     batch.score_and_grad()
     scores = batch.scores()
     # L = log(sum(exp(score_i))); dL/dscore_i is the softmax weight.

@@ -136,6 +136,8 @@ def test_soft_batch_matches_per_pair(case, fill, prec, guide):
     gaps = rng.uniform(0.3, 1.5, size=(K, 4))
     P = to_params(mats, gaps)
     cls = nwgrad.SeqPairBatchDouble if prec == "_double" else nwgrad.SeqPairBatch
+    # A float32 batch runs its soft pass in float32: ~1e-6 relative of the double path.
+    rel, atol = (1e-11, 1e-11) if prec == "_double" else (2e-4, 1e-5)
     batch = cls(A, B, P,
                 n_threads=4, gap_model=case[0], mode=case[1], grad_mode="soft", tracks=tracks, gap_tracks=gtracks)
     batch.fill = fill
@@ -149,9 +151,9 @@ def test_soft_batch_matches_per_pair(case, fill, prec, guide):
     accm, accg = np.zeros((K, N, N)), np.zeros((K, 4))
     for k, (a, b) in enumerate(zip(A, B)):
         s, g = soft(case, a, b, P, tracks[k], gtracks[k], "scaled", 0.9)
-        assert sc[k] == pytest.approx(s, rel=1e-11, abs=1e-11)
-        np.testing.assert_allclose(gm[k], g.matrices, rtol=1e-9, atol=1e-11)
-        np.testing.assert_allclose(gg[k], g.gaps, rtol=1e-9, atol=1e-11)
+        assert sc[k] == pytest.approx(s, rel=rel, abs=atol)
+        np.testing.assert_allclose(gm[k], g.matrices, rtol=rel, atol=atol)
+        np.testing.assert_allclose(gg[k], g.gaps, rtol=rel, atol=atol)
         accm += w[k] * gm[k]
         accg += w[k] * gg[k]
     np.testing.assert_allclose(G.matrices, accm, rtol=1e-12, atol=1e-12)

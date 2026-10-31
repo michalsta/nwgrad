@@ -204,7 +204,7 @@ def test_soft_gradient_expected_counts_match_bruteforce(
         generic_matrix, a, b, oa, ea, ob, eb):
     # asymmetric matrix *and* asymmetric gaps at once
     p = params(generic_matrix, oa, ea, ob, eb)
-    _, grad = nwgrad.nw_affine_soft_grad(a, b, p)
+    _, grad = nwgrad.nw_affine_soft_grad_double(a, b, p)   # (the plain one runs float32)
     got_matrix, got_oa, got_ea, got_ob, got_eb = _grad_arrays(grad)
     pairs, exp_oa, exp_ea, exp_ob, exp_eb = bf.global_soft_counts(a, b, p, affine=True)
 

@@ -95,6 +95,8 @@ def test_grad_nonneg_and_bounded(a, b, name, soft_fn, score_fn, gap_extend, gap_
                           ids=[x[0] for x in SOFT_ALIGNERS])
 @pytest.mark.parametrize("a,b", [("ACDE", "ACDE"), ("PLEASANTLY", "MEANLY")])
 def test_numerical_gradient(a, b, name, soft_fn, score_fn, gap_extend, gap_open):
+    # Finite differences need the double soft pass (the plain functions run float32).
+    soft_fn = getattr(nwgrad, soft_fn.__name__ + "_double")
     p0 = make_params(BLOSUM62, gap_extend, gap_open)
     log_z0, g = soft_fn(a, b, p0)
     g = g.matrix.to_matrix()

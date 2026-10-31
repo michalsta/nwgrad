@@ -41,9 +41,11 @@ def fixture(nwgrad, name, n, length, seed):
             A.append("".join(a)); B.append("".join(b))
         return p, A, B
     from nwgrad import matrices
-    p = nwgrad.AlignParams(matrices.BLOSUM62 * 0.3, 11.0 * 0.3, 1.0 * 0.3, 11.0 * 0.3, 1.0 * 0.3)
-    alpha = p.matrix.alphabet
-    syms = np.array(list(alpha.symbols if hasattr(alpha, "symbols") else alpha))
+    M = np.asarray(matrices.BLOSUM62.to_matrix(), dtype=float) * 0.3   # BLOSUM62 x 0.3, 11/1 x 0.3 (bench_soft_protein.py)
+    alpha = matrices.BLOSUM62.alphabet
+    symbols = alpha.symbols if hasattr(alpha, "symbols") else str(alpha)
+    p = nwgrad.AlignParams(nwgrad.SubstMatrix(M, alphabet=symbols), 11.0 * 0.3, 1.0 * 0.3, 11.0 * 0.3, 1.0 * 0.3)
+    syms = np.array(list(symbols))
     A, B = [], []
     for _ in range(n):
         a = syms[rng.integers(0, len(syms), length)]
@@ -102,13 +104,14 @@ def main():
                 for cfg in args.configs:
                     mode, gm = cfg.split("-")
                     for fill in args.fills:
-                        kw = dict(gap_model=gm, mode=mode, n_threads=th, kernel=isa, grad_mode="soft", fill=fill)
+                        kw = dict(gap_model=gm, mode=mode, n_threads=th, kernel=isa, grad_mode="soft")
                         arms = {}
                         for name, cls, prec in [("ctrl", nwgrad.SeqPairBatch, "double"),
                                                 ("A", nwgrad.SeqPairBatch, "double"),
                                                 ("B", nwgrad.SeqPairBatch, "float32"),
                                                 ("C", nwgrad.SeqPairBatchDouble, None)]:
                             b = cls(A, B, p, **kw)
+                            b.fill = fill
                             b.soft_impl = "scaled_or_log"
                             if prec: b.soft_precision = prec
                             b.score_and_grad()
