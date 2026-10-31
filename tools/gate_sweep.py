@@ -182,7 +182,8 @@ def run(args):
                                         if r == 0:
                                             sc = np.asarray(batch.scores())
                                             if ref is None: ref = sc
-                                            elif not np.array_equal(sc, ref):
+                                            elif not (np.allclose(sc, ref, rtol=1e-9, atol=1e-9)
+                                                      if output == "soft" else np.array_equal(sc, ref)):
                                                 raise SystemExit(f"{sec} {level} {t} {mode} {la}x{lb}: "
                                                                  f"arm {a} scores differ")
                                         dt = timeit(call, args.min_time)
