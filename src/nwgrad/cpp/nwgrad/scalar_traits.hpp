@@ -100,6 +100,21 @@ template <class T>
     else return static_cast<T>(a - b);
 }
 
+// The regime-selected form: Sat clamps (the saturating regime), !Sat is the plain
+// operation (the quarter rule guarantees it never leaves the range, so the clamp would
+// never fire: the same bits, without the compare and cmov per step -- which cost the
+// scalar fills 1.4-1.5x at int16 when every site clamped, nighthaven and spot 2026-10-31).
+template <bool Sat, class T>
+[[gnu::always_inline]] inline constexpr T nw_add_s(T a, T b) noexcept {
+    if constexpr (Sat && nw_sat<T>) return nw_add<T>(a, b);
+    else return static_cast<T>(a + b);
+}
+template <bool Sat, class T>
+[[gnu::always_inline]] inline constexpr T nw_sub_s(T a, T b) noexcept {
+    if constexpr (Sat && nw_sat<T>) return nw_sub<T>(a, b);
+    else return static_cast<T>(a - b);
+}
+
 // The largest magnitude the a-priori bound (m+n+2) * max step may reach for an integer
 // T (see above).  Floating types have no cap (infinity).
 template <class T>

@@ -1108,6 +1108,15 @@ private:
         if constexpr (nw_sat<T>) return sat_ ? std::numeric_limits<T>::lowest() : nw_ninf<T>;
         else return nw_ninf<T>;
     }
+    // Runs f<Tr, Sat>() for this problem's track flag and integer regime: the scalar fills
+    // are instantiated per regime (nw_add_s / nw_sub_s), the plain one for every T but an
+    // nw_sat T past the quarter rule.
+    template <class F>
+    [[gnu::always_inline]] decltype(auto) sat_dispatch_(F&& f) const {
+        if constexpr (nw_sat<T>)
+            if (sat_) return tr_ ? f.template operator()<true, true>() : f.template operator()<false, true>();
+        return tr_ ? f.template operator()<true, false>() : f.template operator()<false, false>();
+    }
 
     // ── Problem state ─────────────────────────────────────────────────────────
     std::span<const uint8_t> a_idx_, b_idx_;   // alphabet indices, not characters
@@ -2554,12 +2563,11 @@ private:
     // to "gap in A", and the returned path was not the one scored (-18.7 vs -7.9).
     // At T=double every cast here is the identity: results are unchanged bit for bit.
     void viterbi_linear(DpBuffer& buf) {
-        if (tr_) viterbi_linear_impl<true>(buf);
-        else     viterbi_linear_impl<false>(buf);
+        sat_dispatch_([&]<bool Tr, bool Sat>() { viterbi_linear_impl<Tr, Sat>(buf); });
     }
     // Tr: each row's penalties and substitution row from the track arrays (the same
     // expressions with the row's values, so equal sets reproduce the untracked fill).
-    template <bool Tr>
+    template <bool Tr, bool Sat>
     void viterbi_linear_impl(DpBuffer& buf) {
         banded_fill(buf.H);
 
@@ -2608,14 +2616,14 @@ private:
                     // the clamp off the left carry, the same value (see nw_opaque); the carry
                     // a local, not hc[j-1]: with the pin, clang reloaded it from the store
                     // just made (a store-forward on the chain: 0.41x gcc)
-                    const T t = std::max<T>(std::max<T>(nw_add<T>(hp[j-1], srow[bcode[static_cast<size_t>(j) - 1]]),
+                    const T t = std::max<T>(std::max<T>(nw_add_s<Sat, T>(hp[j-1], srow[bcode[static_cast<size_t>(j) - 1]]),
                                                         nw_sub<T>(hp[j], ge_b_r)), static_cast<T>(0));
                     v = std::max<T>(nw_opaque(t), nw_sub<T>(left, ge_a_r));
                     left = v;
                     rowmax = std::max(rowmax, v);
                 } else {
                     v = std::max({
-                        nw_add<T>(hp[j-1], srow[bcode[static_cast<size_t>(j) - 1]]),
+                        nw_add_s<Sat, T>(hp[j-1], srow[bcode[static_cast<size_t>(j) - 1]]),
                         nw_sub<T>(hp[j], ge_b_r),
                         nw_sub<T>(hc[j-1], ge_a_r),
                     });
@@ -2647,10 +2655,9 @@ private:
     // equality — so both pick the first largest.  Local: stop where the clamped value is
     // <= 0 (the H walk's stop test); borders stop (Local), go up / left (Global).
     void viterbi_linear_ptr(DpBuffer& buf) {
-        if (tr_) viterbi_linear_ptr_impl<true>(buf);
-        else     viterbi_linear_ptr_impl<false>(buf);
+        sat_dispatch_([&]<bool Tr, bool Sat>() { viterbi_linear_ptr_impl<Tr, Sat>(buf); });
     }
-    template <bool Tr>
+    template <bool Tr, bool Sat>
     void viterbi_linear_ptr_impl(DpBuffer& buf) {
         const size_t st = stride_;
         const size_t dsz = static_cast<size_t>(m_ + 1) * st;
@@ -2694,7 +2701,7 @@ private:
             // reading the codes off the values was slower still: 2x).  The values are the
             // same std::max calls in the same order, so bit-exact.
             for (int j = 1; j <= n; ++j) {
-                const T d0 = nw_add<T>(pv[j - 1], prow[bcode[j - 1]]);
+                const T d0 = nw_add_s<Sat, T>(pv[j - 1], prow[bcode[j - 1]]);
                 const T u = nw_sub<T>(pv[j], ge_b);
                 cv[j] = std::max(d0, u);
                 d[j] = static_cast<unsigned char>(d0 < u);
@@ -2825,10 +2832,9 @@ private:
     // walks column 0 and row 0 (X at (1,0) resolves to M, at (i>1,0) to X), and
     // those cells are border-initialised, never visited by the main loop.
     void viterbi_affine_ptr(DpBuffer& buf) {
-        if (tr_) viterbi_affine_ptr_impl<true>(buf);
-        else     viterbi_affine_ptr_impl<false>(buf);
+        sat_dispatch_([&]<bool Tr, bool Sat>() { viterbi_affine_ptr_impl<Tr, Sat>(buf); });
     }
-    template <bool Tr>
+    template <bool Tr, bool Sat>
     void viterbi_affine_ptr_impl(DpBuffer& buf) {
         T go_a = static_cast<T>(params_->gap_open_a);
         T ge_a = static_cast<T>(params_->gap_extend_a);
@@ -2892,15 +2898,15 @@ private:
                 const std::size_t k = static_cast<std::size_t>(j);
                 const T dgM = pM[k-1], dgX = pX[k-1], dgY = pY[k-1];
                 T m_val;
-                if constexpr (Tr) m_val = nw_add<T>(std::max({dgM, dgX, dgY}), srow[b_idx_[k - 1]]);
-                else              m_val = nw_add<T>(std::max({dgM, dgX, dgY}), subTu(i, j));
+                if constexpr (Tr) m_val = nw_add_s<Sat, T>(std::max({dgM, dgX, dgY}), srow[b_idx_[k - 1]]);
+                else              m_val = nw_add_s<Sat, T>(std::max({dgM, dgX, dgY}), subTu(i, j));
                 unsigned char km = pick(dgM, dgX, dgY);
 
-                const T ux = nw_sub(nw_sub(pM[k], go_b), ge_b), vx = nw_sub(pX[k], ge_b), wx = nw_sub(nw_sub(pY[k], go_b), ge_b);
+                const T ux = nw_sub_s<Sat>(nw_sub_s<Sat>(pM[k], go_b), ge_b), vx = nw_sub_s<Sat>(pX[k], ge_b), wx = nw_sub_s<Sat>(nw_sub_s<Sat>(pY[k], go_b), ge_b);
                 const T x_val = std::max({ux, vx, wx});
                 const unsigned char kx = pick(ux, vx, wx);
 
-                const T uy = nw_sub(nw_sub(cM[k-1], go_a), ge_a), vy = nw_sub(nw_sub(cX[k-1], go_a), ge_a), wy = nw_sub(cY[k-1], ge_a);
+                const T uy = nw_sub_s<Sat>(nw_sub_s<Sat>(cM[k-1], go_a), ge_a), vy = nw_sub_s<Sat>(nw_sub_s<Sat>(cX[k-1], go_a), ge_a), wy = nw_sub_s<Sat>(cY[k-1], ge_a);
                 const T y_val = std::max({uy, vy, wy});
                 const unsigned char ky = pick(uy, vy, wy);
 
@@ -4220,9 +4226,9 @@ private:
     }
 
     double score_affine_scalar(DpBuffer& buf) const {
-        return tr_ ? score_affine_scalar_impl<true>(buf) : score_affine_scalar_impl<false>(buf);
+        return sat_dispatch_([&]<bool Tr, bool Sat>() { return score_affine_scalar_impl<Tr, Sat>(buf); });
     }
-    template <bool Tr>
+    template <bool Tr, bool Sat>
     double score_affine_scalar_impl(DpBuffer& buf) const {
         T go_a = static_cast<T>(params_->gap_open_a);
         T ge_a = static_cast<T>(params_->gap_extend_a);
@@ -4262,13 +4268,13 @@ private:
             T lM = cM[0], lX = cX[0], lY = cY[0];
             const uint8_t* bcode = b_idx_.data();
             for (int j = 1; j <= n_; ++j) {
-                T m_val = nw_add<T>(std::max({pM[j-1], pX[j-1], pY[j-1]}), sub[bcode[j - 1]]);
+                T m_val = nw_add_s<Sat, T>(std::max({pM[j-1], pX[j-1], pY[j-1]}), sub[bcode[j - 1]]);
                 // The open from max(M, Y) / max(M, X) first: (v - go) - ge is monotone in v,
                 // so this is the three-way max's value exactly (the inter-pair kernels' form),
                 // and it leaves clang's SLP vectorizer no isomorphic pairs to pack onto the
                 // Y chain (it did, with shuffles: 2.3x gcc on scalar Global).
-                const T x_val = std::max(nw_sub(nw_sub(std::max(pM[j], pY[j]), go_b), ge_b), nw_sub(pX[j], ge_b));
-                const T y_val = std::max(nw_sub(nw_sub(std::max(lM, lX), go_a), ge_a), nw_sub(lY, ge_a));
+                const T x_val = std::max(nw_sub_s<Sat>(nw_sub_s<Sat>(std::max(pM[j], pY[j]), go_b), ge_b), nw_sub_s<Sat>(pX[j], ge_b));
+                const T y_val = std::max(nw_sub_s<Sat>(nw_sub_s<Sat>(std::max(lM, lX), go_a), ge_a), nw_sub_s<Sat>(lY, ge_a));
                 if constexpr (local) {
                     m_val = std::max(m_val, static_cast<T>(0));
                     best = std::max(best, std::max({m_val, x_val, y_val}));
@@ -4283,9 +4289,9 @@ private:
     }
 
     double score_linear_scalar(DpBuffer& buf) const {
-        return tr_ ? score_linear_scalar_impl<true>(buf) : score_linear_scalar_impl<false>(buf);
+        return sat_dispatch_([&]<bool Tr, bool Sat>() { return score_linear_scalar_impl<Tr, Sat>(buf); });
     }
-    template <bool Tr>
+    template <bool Tr, bool Sat>
     double score_linear_scalar_impl(DpBuffer& buf) const {
         T ge_a = static_cast<T>(params_->gap_extend_a);
         T ge_b = static_cast<T>(params_->gap_extend_b);
@@ -4314,11 +4320,11 @@ private:
             for (int j = 1; j <= n_; ++j) {
                 T v;
                 if constexpr (local && nw_is_int<T>) {   // the clamp off the left carry (see nw_opaque)
-                    const T t = std::max<T>(std::max<T>(nw_add<T>(prev[j-1], sub[bcode[j - 1]]), nw_sub<T>(prev[j], ge_b)), static_cast<T>(0));
+                    const T t = std::max<T>(std::max<T>(nw_add_s<Sat, T>(prev[j-1], sub[bcode[j - 1]]), nw_sub<T>(prev[j], ge_b)), static_cast<T>(0));
                     v = std::max<T>(nw_opaque(t), nw_sub<T>(left, ge_a));
                     rowmax = std::max(rowmax, v);
                 } else {
-                    v = std::max({nw_add<T>(prev[j-1], sub[bcode[j - 1]]), nw_sub<T>(prev[j], ge_b), nw_sub<T>(left, ge_a)});
+                    v = std::max({nw_add_s<Sat, T>(prev[j-1], sub[bcode[j - 1]]), nw_sub<T>(prev[j], ge_b), nw_sub<T>(left, ge_a)});
                     if constexpr (local) {
                         v = std::max(v, static_cast<T>(0));
                         rowmax = std::max(rowmax, v);
@@ -4352,10 +4358,9 @@ private:
     }
 
     void viterbi_affine(DpBuffer& buf) {
-        if (tr_) viterbi_affine_impl<true>(buf);
-        else     viterbi_affine_impl<false>(buf);
+        sat_dispatch_([&]<bool Tr, bool Sat>() { viterbi_affine_impl<Tr, Sat>(buf); });
     }
-    template <bool Tr>
+    template <bool Tr, bool Sat>
     void viterbi_affine_impl(DpBuffer& buf) {
         band_fill(buf.VM, NINF());
         band_fill(buf.VX, NINF());
@@ -4417,14 +4422,14 @@ private:
             T rowmax = static_cast<T>(0);   // Local: see local_row_best_
             for (int j = j0; j <= j1; ++j) {
                 T diag  = std::max({pM[j-1], pX[j-1], pY[j-1]});
-                T m_val = nw_add<T>(diag, srow[bcode[static_cast<size_t>(j) - 1]]);
+                T m_val = nw_add_s<Sat, T>(diag, srow[bcode[static_cast<size_t>(j) - 1]]);
                 // X state: gap in B (advance i), uses gap_b params.  Y: gap in A, gap_a.
                 // The open from the max of the two opening states first: (v - go) - ge is
                 // monotone in v, so the value is the three-way max's exactly (the
                 // inter-pair kernels' form), and clang's SLP vectorizer finds no isomorphic
                 // subtraction pairs to pack onto the Y chain (it did, with shuffles).
-                T x_val = std::max(nw_sub(nw_sub(std::max(pM[j], pY[j]), go_b), ge_b), nw_sub(pX[j], ge_b));
-                T y_val = std::max(nw_sub(nw_sub(std::max(lM, lX), go_a), ge_a), nw_sub(lY, ge_a));
+                T x_val = std::max(nw_sub_s<Sat>(nw_sub_s<Sat>(std::max(pM[j], pY[j]), go_b), ge_b), nw_sub_s<Sat>(pX[j], ge_b));
+                T y_val = std::max(nw_sub_s<Sat>(nw_sub_s<Sat>(std::max(lM, lX), go_a), ge_a), nw_sub_s<Sat>(lY, ge_a));
 
                 if constexpr (AM == AlignMode::Local) {
                     m_val = std::max(m_val, static_cast<T>(0));
