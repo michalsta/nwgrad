@@ -742,8 +742,17 @@ static void score_affine_striped_pos_fp(ScoreJob<T>& job) {
 // are >= 0 (else fused three-state), 1 = two-pass, 2 = fused three-state (for measuring
 // the forms in one binary; NWGRAD_SCORE_VARIANT=twopass / fused3).
 // NWGRAD_SCORE_UNROLL=0 runs the rolled integer row pass (an A/B switch, one binary).
+// Off on NEON by default: the M1 lost 25 % on int16 Global with it (spot, gcc 16, 2026-10-31);
+// NWGRAD_SCORE_UNROLL=1 forces it on there.
 static bool score_unroll2() noexcept {
-    static const bool on = [] { const char* e = std::getenv("NWGRAD_SCORE_UNROLL"); return !(e && e[0] == '0'); }();
+    static const bool on = [] {
+        const char* e = std::getenv("NWGRAD_SCORE_UNROLL");
+#if defined(__aarch64__) || defined(_M_ARM64)
+        return e && e[0] == '1';
+#else
+        return !(e && e[0] == '0');
+#endif
+    }();
     return on;
 }
 template <class T, bool Tr, bool Sat = false>
