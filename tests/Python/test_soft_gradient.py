@@ -69,7 +69,7 @@ def test_log_z_geq_hard_score(a, b, name, soft_fn, score_fn, gap_extend, gap_ope
     p = make_params(BLOSUM62, gap_extend, gap_open)
     log_z, _ = soft_fn(a, b, p)
     score    = score_fn(a, b, p)
-    assert log_z >= score - 1e-9, (
+    assert log_z >= score - 1e-4, (   # float32 soft pass: ~1e-6 relative
         f"{name} ({a!r},{b!r}): log_Z={log_z:.6g} < score={score:.6g}"
     )
 
@@ -165,6 +165,7 @@ def test_batch_soft_grad_matches_single():
         expected_grad += g.matrix.to_matrix()
         expected_scores.append(log_z)
 
-    assert np.array(res.scores) == pytest.approx(expected_scores, rel=1e-9)
+    # Both float32 soft passes (the shared and the per-pair kernel): tolerance-equal.
+    assert np.array(res.scores) == pytest.approx(expected_scores, rel=2e-4)
     np.testing.assert_allclose(res.grad.matrix.to_matrix(), expected_grad,
-                                rtol=1e-9, atol=1e-12)
+                                rtol=2e-4, atol=1e-6)

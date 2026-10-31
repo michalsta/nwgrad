@@ -261,7 +261,7 @@ A failed pair computation invalidates its cached score and gradient.
 | `traceback` | `str` | The traceback mode the pair *resolved* to (never `"auto"`) |
 | `hb_cutoff` | `int` | Hirschberg base-case size in rows (settable on a standalone pair; default 512) |
 | `fill` | `str` | Full-DP simd fill at double precision: `"striped"` (default) or `"rowwise"` (settable on a standalone pair; see `SeqPairBatch.fill`) |
-| `soft_impl`, `soft_temperature` | | As on `SeqPairBatch` (settable on a standalone pair) |
+| `soft_impl`, `soft_temperature`, `soft_precision` | | As on `SeqPairBatch` (settable on a standalone pair) |
 
 **Gradient modes:**
 
@@ -376,6 +376,7 @@ keeps its batch alive, so it stays usable after the batch itself is dropped.
 | `fill` | `str` | How `score_and_grad()` / `banded_grad()` / `align()` vectorize the DP: `"interpair"` (default), `"striped"` or `"rowwise"`. Hard results are bit-identical whichever fill runs. See below. |
 | `soft_impl` | `str` | Soft-path evaluation: `"scaled"` (default; scaled probability space, raises `ValueError` for a pair out of its range), `"scaled_or_log"` (falls back to log space per pair, silently) or `"log"` (the log-space recurrences). |
 | `soft_temperature` | `float` | Soft score `T·log Z(θ/T)`; the gradient is the expected counts under `θ/T`. Default 1. |
+| `soft_precision` | `str` | The scaled soft path's precision: `"float32"` (default on `SeqPairBatch`: twice the simd lanes and half the tables of double, results to ~1e-5 relative of the double path) or `"double"` (the only choice of `SeqPairBatchDouble`). A float32 pair whose weights or lost-mass bound do not fit float32 (a step score past ~88 nats, a very low temperature) reruns in double by itself, before `soft_impl` decides anything. |
 | `track_storage` | `str` | How a [tracked](#parameter-sets-and-tracks) batch keeps its hard gradients: `"paths"` (default; each pair's path, 2 bits a move, replayed through the tracks on every `weighted_grad()` / `grads()`) or `"counts"` (each pair's per-set field counts, counted during the traceback: a training step measured 5–15% faster with linear gaps and about the same with affine, at ~10× the memory — 120–370 B a miRNA-sized pair against ~35 B). Results are identical. A change drops the stored hard gradients (scores and guides stay) until the next `score_and_grad()` / `banded_grad()`. No effect on untracked batches or soft gradients. |
 | `soft_guide` | `str` | When soft pairs get the guide path that `banded_grad()` bands around: `"eager"` (default; `score_and_grad()` runs the guide Viterbi), `"lazy"` (computed on first use, under the params current then) or `"posterior"` (no Viterbi: per row of A the column where the posterior path most likely leaves the row, made non-decreasing — a band centre from the soft pass itself, under the params scored). |
 

@@ -254,11 +254,28 @@ struct DpBufferT {
     GVec gbM, gbX, gbY;
     GBVec gdM, gdX, gdY;
 
-    // Scaled soft path (SoftImpl::Scaled): rolling backward rows (current/next, per
-    // state) and the per-row power-of-two exponents of the forward tables.  The forward
-    // tables reuse F / FM,FX,FY; the B tables are not used at all.
-    // sqp is the soft query profile, exp(score(a, b[j-1])) laid out per residue a.
-    DVec sb0, sb1, sb2, sb3, sb4, sb5, sqp;
+    // Scaled soft path (SoftImpl::Scaled), in its soft type SF — float for a float32
+    // pair (soft_float_t), double otherwise, and double again when a float32 pair's range
+    // does not fit float32 and it reruns in double: its forward tables (F linear; FM, FX,
+    // FY affine — its own, not the log path's B-less tables above), six rolling backward
+    // rows, the exp'd query profile qp (exp(score(a, b[j-1]) / T) per residue a), the
+    // row sums and maxima, the tracked per-row weights and the match-scatter row.  sexp:
+    // the per-row power-of-two exponents of the forward tables.
+    template <class SF>
+    struct SoftScratch {
+        using V = std::vector<SF, AlignedAllocator<SF>>;
+        V F, FM, FX, FY, r0, r1, r2, r3, r4, r5, qp, rs, mf, srow, rw;
+        void clear() noexcept {
+            for (V* v : {&F, &FM, &FX, &FY, &r0, &r1, &r2, &r3, &r4, &r5, &qp, &rs, &mf, &srow, &rw}) {
+                v->clear(); v->shrink_to_fit();
+            }
+        }
+    };
+    SoftScratch<double> sd;
+    SoftScratch<float>  sf;
+    template <class SF> SoftScratch<SF>& soft() noexcept {
+        if constexpr (std::is_same_v<SF, float>) return sf; else return sd;
+    }
     std::vector<int> sexp;
 
     void clear() noexcept {
@@ -285,7 +302,7 @@ struct DpBufferT {
         for (GVec* v : {&gtop, &gleft, &gbM, &gbX, &gbY}) { v->clear(); v->shrink_to_fit(); }
         for (GBVec* v : {&gdM, &gdX, &gdY}) { v->clear(); v->shrink_to_fit(); }
         gbuilt.clear(); gbuilt.shrink_to_fit();
-        clrD(sb0); clrD(sb1); clrD(sb2); clrD(sb3); clrD(sb4); clrD(sb5); clrD(sqp);
+        sd.clear(); sf.clear();
         sexp.clear(); sexp.shrink_to_fit();
     }
 };

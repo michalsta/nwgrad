@@ -64,10 +64,15 @@ NWGRAD_INSTANTIATE_REGISTER(int64_t)
 #undef NWGRAD_INSTANTIATE_REGISTER
 
 void register_level_common(SimdLevel l, int row_block, inter_soft_fn inter_soft,
-                           soft_pair_fn soft_pair_linear, soft_pair_fn soft_pair_affine) {
+                           soft_pair_fn soft_pair_linear, soft_pair_fn soft_pair_affine,
+                           inter_soft_fn_f inter_soft_f, soft_pair_fn_f soft_pair_linear_f,
+                           soft_pair_fn_f soft_pair_affine_f) {
     LevelKernels& k = level_table()[(int)l];
-    k.row_block        = row_block;
-    k.inter_soft       = inter_soft;
-    k.soft_pair_linear = soft_pair_linear;
-    k.soft_pair_affine = soft_pair_affine;
+    k.row_block          = row_block;
+    k.inter_soft         = inter_soft;
+    k.soft_pair_linear   = soft_pair_linear;
+    k.soft_pair_affine   = soft_pair_affine;
+    k.inter_soft_f       = inter_soft_f;
+    k.soft_pair_linear_f = soft_pair_linear_f;
+    k.soft_pair_affine_f = soft_pair_affine_f;
 }

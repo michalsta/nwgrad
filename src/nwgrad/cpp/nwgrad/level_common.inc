@@ -113,7 +113,10 @@ struct NwgradLevelRegistrar {
                               NWGRAD_LVL_NAME::ROW_BLOCK,
                               &NWGRAD_LVL_NAME::inter_soft_entry,     // inter-pair soft pass, double
                               &NWGRAD_LVL_NAME::soft_pair_linear,     // per-pair soft, linear
-                              &NWGRAD_LVL_NAME::soft_pair_affine);    // per-pair soft, affine
+                              &NWGRAD_LVL_NAME::soft_pair_affine,     // per-pair soft, affine
+                              &NWGRAD_LVL_NAME::inter_soft_entry_f,   // ... the three in float32
+                              &NWGRAD_LVL_NAME::soft_pair_linear_f,
+                              &NWGRAD_LVL_NAME::soft_pair_affine_f);
     }
 };
 const NwgradLevelRegistrar nwgrad_level_registrar_instance;

@@ -129,7 +129,7 @@ def test_single_char_nw_linear_closed_form(a, b, pair):
     z_exp     = math.log(denom)
     grad_exp  = math.exp(s) / denom
 
-    log_z, g = nwgrad.nw_soft_grad(a, b, make_params(BLOSUM62, ge))
+    log_z, g = nwgrad.nw_soft_grad_double(a, b, make_params(BLOSUM62, ge))
     g = g.matrix.to_matrix()
 
     assert log_z == pytest.approx(z_exp, rel=1e-9)
@@ -148,7 +148,7 @@ def test_single_char_nw_affine_closed_form(a, b, pair):
     z_exp    = math.log(denom)
     grad_exp = math.exp(s) / denom
 
-    log_z, g = nwgrad.nw_affine_soft_grad(a, b, make_params(BLOSUM62, ge, go))
+    log_z, g = nwgrad.nw_affine_soft_grad_double(a, b, make_params(BLOSUM62, ge, go))
     g = g.matrix.to_matrix()
 
     assert log_z == pytest.approx(z_exp, rel=1e-9)
@@ -170,7 +170,7 @@ def test_closed_form_aa_vs_aa_zero_matrix(g):
     z_expected    = math.log(1 + 6 * e2 + 6 * e4)
     grad_expected = (2 + 6 * e2) / (1 + 6 * e2 + 6 * e4)
 
-    log_z, grad = nwgrad.nw_soft_grad("AA", "AA", zero_params(g))
+    log_z, grad = nwgrad.nw_soft_grad_double("AA", "AA", zero_params(g))
     grad = grad.matrix.to_matrix()
 
     assert log_z == pytest.approx(z_expected, rel=1e-9)
@@ -221,7 +221,7 @@ def test_brute_force_nw_linear(a, b, mat_label, gap):
     mat20 = _mat_by_label(mat_label)
 
     ref_logz, ref_counts = brute_force_nw_linear_soft_grad(a, b, mat20, gap)
-    impl_logz, impl_grad = nwgrad.nw_soft_grad(a, b, make_params(mat20, gap))
+    impl_logz, impl_grad = nwgrad.nw_soft_grad_double(a, b, make_params(mat20, gap))
     impl_dict = grad_to_dict(impl_grad.matrix.to_matrix())
 
     assert impl_logz == pytest.approx(ref_logz, rel=1e-9, abs=1e-12), \
@@ -253,7 +253,7 @@ def test_single_char_sw_linear_closed_form(char, s_val, g):
     mat20 = np.zeros((20, 20))
     mat20[aa(char), aa(char)] = s_val
 
-    log_z, grad = nwgrad.sw_soft_grad(char, char, make_params(mat20, g))
+    log_z, grad = nwgrad.sw_soft_grad_double(char, char, make_params(mat20, g))
     grad = grad.matrix.to_matrix()
 
     assert log_z == pytest.approx(z_expected, rel=1e-9)
@@ -278,7 +278,7 @@ def test_disjoint_alphabet_large_gap_nw_linear():
     mat20[aa("C"), aa("G")] = b_val
     mat20[aa("G"), aa("C")] = b_val
 
-    log_z, grad = nwgrad.nw_soft_grad("AC", "DG", make_params(mat20, g))
+    log_z, grad = nwgrad.nw_soft_grad_double("AC", "DG", make_params(mat20, g))
     grad = grad.matrix.to_matrix()
 
     assert grad[aa("A"), aa("D")] == pytest.approx(1.0, abs=1e-6)
@@ -299,7 +299,7 @@ def test_disjoint_alphabet_exact_nw_linear():
 
     ref_logz, ref_counts = brute_force_nw_linear_soft_grad("AC", "DG", mat20, g)
 
-    log_z, grad = nwgrad.nw_soft_grad("AC", "DG", make_params(mat20, g))
+    log_z, grad = nwgrad.nw_soft_grad_double("AC", "DG", make_params(mat20, g))
     grad = grad.matrix.to_matrix()
 
     assert log_z == pytest.approx(ref_logz, rel=1e-9)

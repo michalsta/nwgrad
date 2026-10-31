@@ -134,6 +134,7 @@ public:
     bool rowwise_full() const { return settings().rowwise_full; }
     bool inter_fill() const { return settings().inter_fill; }
     SoftImpl soft_impl() const { return settings().soft_impl; }
+    bool soft_f32() const { return settings().soft_f32; }
     double soft_temperature() const { return settings().soft_temperature; }
     bool soft_guide_lazy() const { return settings().soft_guide_lazy; }
     bool soft_guide_posterior() const { return settings().soft_guide_posterior; }
@@ -151,6 +152,7 @@ public:
     NWGRAD_BATCH_SETTER(set_hb_cutoff, int)
     NWGRAD_BATCH_SETTER(set_soft_temperature, double)
     NWGRAD_BATCH_SETTER(set_soft_impl, SoftImpl)
+    NWGRAD_BATCH_SETTER(set_soft_f32, bool)
     NWGRAD_BATCH_SETTER(set_sorted_schedule, bool)
     NWGRAD_BATCH_SETTER(set_reserve_frac, double)
     NWGRAD_BATCH_SETTER(set_long_cost_ratio, double)
@@ -285,6 +287,8 @@ public:
     void set_rowwise_full(bool on) { standalone_("fill"); own_->set_fill(on, false); }
     SoftImpl soft_impl() const { return b_->soft_impl(); }
     void set_soft_impl(SoftImpl s) { standalone_("soft_impl"); own_->set_soft_impl(s); }
+    bool soft_f32() const { return b_->soft_f32(); }
+    void set_soft_f32(bool v) { standalone_("soft_precision"); own_->set_soft_f32(v); }
     double soft_temperature() const { return b_->soft_temperature(); }
     void set_soft_temperature(double t) { standalone_("soft_temperature"); own_->set_soft_temperature(t); }
 

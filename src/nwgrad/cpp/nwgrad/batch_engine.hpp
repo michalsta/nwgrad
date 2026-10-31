@@ -69,6 +69,7 @@ struct BatchSettings {
     SoftImpl soft_impl = SoftImpl::Scaled;
     double soft_temperature = 1.0;
     bool soft_guide_lazy = false, soft_guide_posterior = false;   // at most one set
+    bool soft_f32 = true;                                // float32 batch: its soft pass in float32
     // Scheduling (own fills): see BatchEngine::run_sorted_phase_ / banded_grad_lpt_.
     bool   sorted_schedule = false;
     double reserve_frac = 0.0;
@@ -235,6 +236,7 @@ public:
     // soft_impl changes results within tolerance only and invalidates nothing (as
     // SeqPair::set_soft_impl); a new temperature changes the soft score.
     void set_soft_impl(SoftImpl v) noexcept { s_.soft_impl = v; }
+    void set_soft_f32(bool v) noexcept { s_.soft_f32 = v; }
     void set_soft_temperature(double t) {
         s_.set_soft_temperature(t);
         if (grad_mode_ == GradMode::Soft)
@@ -568,8 +570,13 @@ public:
         if (s_.inter_fill) {
             const int be = stream_inter_backend_(params, kernel, banded);
             if (be >= 0) {
-                if (banded) stream_inter_<AlignBand::GuideBanded>(problems, params, band, kernel, result, be, st);
-                else        stream_inter_<AlignBand::Full>(problems, params, band, kernel, result, be, st);
+                if (soft_f32_()) {
+                    if (banded) stream_inter_<AlignBand::GuideBanded, float>(problems, params, band, kernel, result, be, st);
+                    else        stream_inter_<AlignBand::Full, float>(problems, params, band, kernel, result, be, st);
+                } else {
+                    if (banded) stream_inter_<AlignBand::GuideBanded, double>(problems, params, band, kernel, result, be, st);
+                    else        stream_inter_<AlignBand::Full, double>(problems, params, band, kernel, result, be, st);
+                }
                 return result;
             }
         }
@@ -613,6 +620,7 @@ private:
     void configure_stream_(Aligner<GM, AM, AB, T>& al, int kernel) const {
         al.set_kernel(kernel);
         al.set_soft_impl(s_.soft_impl);
+        al.set_soft_f32(s_.soft_f32);
         al.set_soft_temperature(s_.soft_temperature);
         if constexpr (AB == AlignBand::Full) {
             al.set_traceback(s_.traceback);
@@ -648,27 +656,31 @@ private:
     }
     // Tracked soft lane rows (InterSoftJob::rs / rw) of one problem: its stacked rows and
     // the exp'd penalties of each row at temperature T.  False when a weight overflows.
+    template <class SFx>
     static bool soft_rows_of_(std::span<const uint8_t> ca, std::span<const uint16_t> tk,
                               std::span<const uint16_t> gk, const AlignParams& P, double temp,
-                              std::vector<uint32_t>& rs, std::vector<double>& rw) {
+                              std::vector<uint32_t>& rs, std::vector<SFx>& rw) {
         constexpr bool lin = GM == GapModel::Linear;
-        const double it = 1.0 / temp, big = std::numeric_limits<double>::max();
+        const double it = 1.0 / temp, big = static_cast<double>(std::numeric_limits<SFx>::max());
         const uint32_t na = static_cast<uint32_t>(P.matrix.size());
         const size_t m = ca.size();
         rs.resize(m);
         for (size_t r = 0; r < m; ++r) rs[r] = static_cast<uint32_t>(tk[r]) * na + ca[r];
-        rw.assign(4 * (m + 1), 0.0);
+        rw.assign(4 * (m + 1), SFx(0));
         bool ok = true;
+        double v[4];
         for (size_t r = 0; r <= m; ++r) {
             const int g = gk[r];
-            rw[4 * r + 1] = std::exp(-P.gap(g, AlignParams::kExtendA) * it);
-            if (!lin) rw[4 * r] = std::exp(-(P.gap(g, AlignParams::kOpenA) + P.gap(g, AlignParams::kExtendA)) * it);
+            v[0] = v[2] = 0.0;
+            v[1] = std::exp(-P.gap(g, AlignParams::kExtendA) * it);
+            if (!lin) v[0] = std::exp(-(P.gap(g, AlignParams::kOpenA) + P.gap(g, AlignParams::kExtendA)) * it);
+            v[3] = 0.0;
             if (r > 0) {
                 const int t = tk[r - 1];
-                rw[4 * r + 3] = std::exp(-P.gap(t, AlignParams::kExtendB) * it);
-                if (!lin) rw[4 * r + 2] = std::exp(-(P.gap(t, AlignParams::kOpenB) + P.gap(t, AlignParams::kExtendB)) * it);
+                v[3] = std::exp(-P.gap(t, AlignParams::kExtendB) * it);
+                if (!lin) v[2] = std::exp(-(P.gap(t, AlignParams::kOpenB) + P.gap(t, AlignParams::kExtendB)) * it);
             }
-            for (int f = 0; f < 4; ++f) ok &= rw[4 * r + static_cast<size_t>(f)] <= big;
+            for (int f = 0; f < 4; ++f) { ok &= v[f] <= big; rw[4 * r + static_cast<size_t>(f)] = static_cast<SFx>(v[f]); }
         }
         return ok;
     }
@@ -730,12 +742,51 @@ private:
     // (GuideBanded at width 0): the shared soft pass is Full-only, and it used to be
     // admitted there — ignoring every guide and returning the unbanded log Z, so
     // fill="interpair" and fill="striped" disagreed (inherited from BatchAligner).
+    // ── The shared soft pass's precision ─────────────────────────────────────
+    // A float32 batch runs the inter-pair soft pass (and each pair's own) in float32 unless
+    // soft_f32 is off; every other batch in double.  Lanes whose range does not fit go to
+    // their own path, which for a float32 pair tries float32 and then double.
+    bool soft_f32_() const noexcept { return std::is_same_v<T, float> && s_.soft_f32; }
+    bool soft_fn_ok_(const LevelKernels& K) const noexcept {
+        return soft_f32_() ? K.inter_soft_f != nullptr : K.inter_soft != nullptr;
+    }
+    int soft_lanes_of_(const LevelKernels& K) const noexcept {
+        return soft_f32_() ? K.f.inter_w : K.d.inter_w;
+    }
+    // One group's shared soft pass in soft type SFx: the exp'd weights (once per call),
+    // the kernel's scratch and the call itself, for SW lanes at a time.
+    template <class SFx>
+    struct SoftGroup {
+        using type = SFx;
+        std::vector<SFx> es;
+        std::vector<SFx, AlignedAllocator<SFx>> scr;
+        std::vector<int> iscr;
+        InterSoftJobT<SFx> sj{};
+        bool weights(const AlignParams& P, double temp, bool lin) {
+            return inter_soft_weights<SFx>(P, temp, lin, es, sj);
+        }
+        static int lanes(const LevelKernels& K) noexcept { return K.template of<SFx>().inter_w; }
+        void run(const LevelKernels& K, int n, int Mc, int SW, const unsigned char* const* a,
+                 const int* m, const unsigned char* const* b, const int* nb, int align_mode,
+                 double* logz, double* counts, double* gaps, int* ok, int* gpost,
+                 const uint32_t* const* rs, const SFx* const* rw) {
+            const size_t need = inter_soft_scratch(n, Mc, SW);
+            if (scr.size() < need) scr.resize(need);
+            iscr.resize(static_cast<size_t>(Mc + 1) * SW);
+            sj.a = a; sj.m = m; sj.b = b; sj.n = n; sj.M = Mc; sj.nb = nb;
+            sj.align_mode = align_mode;
+            sj.scratch = scr.data(); sj.iscratch = iscr.data();
+            sj.logz = logz; sj.counts = counts; sj.gaps = gaps; sj.ok = ok; sj.gpost = gpost;
+            sj.rs = rs; sj.rw = rw;
+            K.template inter_soft_of<SFx>()(sj);
+        }
+    };
     int stream_inter_backend_(const AlignParams& params, int kernel, bool banded) const {
         const int backend = (kernel == kBackendAuto) ? global_default_backend() : kernel;
         if (backend < 0) return -1;
         const LevelKernels& K = level_kernels(backend);
         if (grad_mode_ == GradMode::Soft)
-            return (K.inter_soft && K.d.inter_w > 0 && s_.soft_impl != SoftImpl::Log && !banded) ? backend : -1;
+            return (soft_fn_ok_(K) && soft_lanes_of_(K) > 0 && s_.soft_impl != SoftImpl::Log && !banded) ? backend : -1;
         if (inter_w_(K) <= 0) return -1;
         if (GM == GapModel::Linear &&
             (banded || (AM == AlignMode::Global && (inter_w_(K) < 4 || params.matrix.size() > 8))))
@@ -746,13 +797,13 @@ private:
     // brings new problems, nothing is cached).  The rest run their own path in the same
     // pass: empty sequences, and Full pairs the traceback would split (Hirschberg past
     // the cutoff).  A guided band-0 call is GuideBanded and stays so.
-    template<AlignBand AB>
+    template<AlignBand AB, class SFx>
     void stream_inter_(const std::vector<ProblemInstance>& problems, const AlignParams& params,
                        int band, int kernel, BatchResult& result, int backend, const StreamTracks& st) const {
         const size_t N = problems.size();
         const LevelKernels& K = level_kernels(backend);
         const bool soft = grad_mode_ == GradMode::Soft;
-        const int W = soft ? K.d.inter_w : inter_w_(K);
+        const int W = soft ? SoftGroup<SFx>::lanes(K) : inter_w_(K);
         const bool hb_case = !soft && AB == AlignBand::Full && is_hirschberg(tb_resolved_);
         std::vector<size_t> other, elig;
         size_t maxa = 0, maxb = 0;
@@ -804,7 +855,7 @@ private:
         std::mutex grad_mutex;
         auto worker = [&]() {
             AlignParams local_grad = AlignParams::zeros_like(params);
-            stream_inter_loop_<AB>(problems, params, band, kernel, elig, groups, other, idx,
+            stream_inter_loop_<AB, SFx>(problems, params, band, kernel, elig, groups, other, idx,
                                    result.scores, local_grad, K, W, trk, st);
             if (grad_mode_ != GradMode::None) {
                 std::lock_guard<std::mutex> lock(grad_mutex);
@@ -814,8 +865,8 @@ private:
         const size_t tasks = groups.size() + other.size();
         run_workers_guarded(std::min<int>(s_.n_threads, static_cast<int>(std::max<size_t>(tasks, 1))), worker);
     }
-    template<AlignBand AB>
-    void stream_inter_loop_(const std::vector<ProblemInstance>& problems, const AlignParams& params,
+    template<AlignBand AB, class SFx>
+        void stream_inter_loop_(const std::vector<ProblemInstance>& problems, const AlignParams& params,
                             int band, int kernel, const std::vector<size_t>& elig,
                             const std::vector<std::pair<size_t, size_t>>& groups,
                             const std::vector<size_t>& other, std::atomic<size_t>& idx,
@@ -832,11 +883,10 @@ private:
         std::vector<T> best(W), blkT;
         constexpr bool lin = GM == GapModel::Linear;
         const bool soft = grad_mode_ == GradMode::Soft;
-        std::vector<double> es, slogz, scnt, sgap;
-        DVec sscr;
-        std::vector<int> siscr, sok;
-        InterSoftJob sj{};
-        const bool soft_ok = soft && inter_soft_weights(params, s_.soft_temperature, lin, es, sj);
+        std::vector<double> slogz, scnt, sgap;
+        std::vector<int> sok;
+        SoftGroup<SFx> sg;
+        const bool soft_ok = soft && sg.weights(params, s_.soft_temperature, lin);
         const size_t nn = static_cast<size_t>(params.matrix.size()) * params.matrix.size();
         const size_t na = static_cast<size_t>(params.matrix.size());
         if (!soft) cast_block_(params, blkT);   // params are fixed for the call: once per worker
@@ -845,9 +895,9 @@ private:
         std::vector<std::vector<uint16_t>> lt(W), lg(W);
         std::vector<TrackJob<T>> tj(W);
         std::vector<std::vector<uint32_t>> lrs(W);
-        std::vector<std::vector<double>> lrw(W);
+        std::vector<std::vector<SFx>> lrw(W);
         std::vector<const uint32_t*> lrsp(W);
-        std::vector<const double*> lrwp(W);
+        std::vector<const SFx*> lrwp(W);
         auto own = [&](size_t i) {
             stream_one_(al[0], problems, i, alpha, params, band, buf, ae[0], be[0], scores, local_grad, st, pp);
         };
@@ -885,21 +935,13 @@ private:
                         lrsp[l] = lrs[lr].data(); lrwp[l] = lrw[lr].data();
                     }
                     if (!fin) { for (size_t k = s; k < e; ++k) own(elig[k]); continue; }
-                    sj.rs = lrsp.data(); sj.rw = lrwp.data();
                 }
                 const size_t ccnt = trk ? static_cast<size_t>(M) * na : nn;
                 const size_t cgap = trk ? 4 * (static_cast<size_t>(M) + 1) : 4;
-                const size_t need = inter_soft_scratch(n, M, W);
-                if (sscr.size() < need) sscr.resize(need);
-                siscr.resize(static_cast<size_t>(M + 1) * W);
                 slogz.resize(W); scnt.resize(W * ccnt); sgap.resize(W * cgap); sok.resize(W);
-                sj.a = a.data(); sj.m = m.data(); sj.b = b.data(); sj.n = n; sj.M = M;
-                sj.nb = ragged ? nb.data() : nullptr;
-                sj.align_mode = (AM == AlignMode::Local) ? 1 : 0;
-                sj.scratch = sscr.data(); sj.iscratch = siscr.data();
-                sj.logz = slogz.data(); sj.counts = scnt.data(); sj.gaps = sgap.data();
-                sj.ok = sok.data();
-                K.inter_soft(sj);
+                sg.run(K, n, M, W, a.data(), m.data(), b.data(), ragged ? nb.data() : nullptr,
+                       (AM == AlignMode::Local) ? 1 : 0, slogz.data(), scnt.data(), sgap.data(),
+                       sok.data(), nullptr, trk ? lrsp.data() : nullptr, trk ? lrwp.data() : nullptr);
                 for (size_t l = 0; l < real; ++l) {
                     const size_t i = elig[s + l];
                     if (!sok[l]) { own(i); continue; }
@@ -1594,9 +1636,15 @@ private:
         std::vector<BandAl> blanes;
         std::vector<TrackJob<T>> tjobs;
         std::vector<std::vector<uint32_t>> srs;   // tracked inter-pair soft: per lane, rows
-        std::vector<std::vector<double>> srw;     // ... and weights (InterSoftJob::rs / rw)
+        std::vector<std::vector<double>> srw;     // ... and weights (InterSoftJob::rs / rw), double
+        std::vector<std::vector<float>>  srwf;    // ... or float32 (a float32 batch's soft pass)
         std::vector<const uint32_t*> srsp;
         std::vector<const double*> srwp;
+        std::vector<const float*>  srwfp;
+        template <class SFx> auto& srw_of() noexcept {
+            if constexpr (std::is_same_v<SFx, float>) return srwf; else return srw; }
+        template <class SFx> auto& srwp_of() noexcept {
+            if constexpr (std::is_same_v<SFx, float>) return srwfp; else return srwp; }
         // ... and each set's four weights, of params *swp: valid for one call (inter-pair
         // groups run on the call's own Works, never on the persistent solo_).
         const AlignParams* swp = nullptr;
@@ -1612,11 +1660,13 @@ private:
             full.set_hb_cutoff(e.s_.hb_cutoff);
             full.set_rowwise_full(e.s_.rowwise_full);
             full.set_soft_impl(e.s_.soft_impl);
+            full.set_soft_f32(e.s_.soft_f32);
             full.set_soft_temperature(e.s_.soft_temperature);
             // Only the Full aligner can use pointers; the banded one needs its score
             // tables and its footprint is O(m*band) already.
             band.set_traceback(TracebackMode::Scores);
             band.set_soft_impl(e.s_.soft_impl);
+            band.set_soft_f32(e.s_.soft_f32);
             band.set_soft_temperature(e.s_.soft_temperature);
         }
         // State valid for one call only, reset when a pooled Work starts a new one: swp is
@@ -1986,11 +2036,13 @@ private:
     // Tracked inter-pair soft: lane l's rows (its stacked rows) and weights (exp of each
     // row's penalties at the batch temperature), the group's last pair in spare lanes.
     // False when a weight overflows (the group then runs its pairs' own paths).
+    template <class SFx>
     bool soft_lanes_(Work& w, int W, size_t real, const std::vector<size_t>& order, size_t s,
                      const AlignParams& P) const {
-        w.srs.resize(static_cast<size_t>(W)); w.srw.resize(static_cast<size_t>(W));
-        w.srsp.assign(static_cast<size_t>(W), nullptr); w.srwp.assign(static_cast<size_t>(W), nullptr);
-        const double it = 1.0 / s_.soft_temperature, big = std::numeric_limits<double>::max();
+        auto& srw = w.template srw_of<SFx>(); auto& srwp = w.template srwp_of<SFx>();
+        w.srs.resize(static_cast<size_t>(W)); srw.resize(static_cast<size_t>(W));
+        w.srsp.assign(static_cast<size_t>(W), nullptr); srwp.assign(static_cast<size_t>(W), nullptr);
+        const double it = 1.0 / s_.soft_temperature, big = static_cast<double>(std::numeric_limits<SFx>::max());
         const uint32_t na = static_cast<uint32_t>(alpha_->size());
         constexpr bool lin = GM == GapModel::Linear;
         if (w.swp != &P) {   // each set's four weights, once per params and call
@@ -2010,7 +2062,7 @@ private:
             const size_t ll = std::min<size_t>(static_cast<size_t>(l), real - 1);
             const size_t i = order[s + ll], m = len_a(i);
             auto& rs = w.srs[static_cast<size_t>(l)];
-            auto& rw = w.srw[static_cast<size_t>(l)];
+            auto& rw = srw[static_cast<size_t>(l)];
             const auto ca = codes_a(i);
             const auto tk = track(i), gk = gap_track(i);
             rs.resize(m);
@@ -2019,17 +2071,15 @@ private:
             const double* sw = w.sw.data();
             for (size_t r = 0; r <= m; ++r) {
                 const size_t g = 4 * static_cast<size_t>(gk[r]);
-                rw[4 * r] = sw[g]; rw[4 * r + 1] = sw[g + 1];
+                double v[4] = {sw[g], sw[g + 1], 0.0, 0.0};
                 if (r > 0) {
                     const size_t t = 4 * static_cast<size_t>(tk[r - 1]);
-                    rw[4 * r + 2] = sw[t + 2]; rw[4 * r + 3] = sw[t + 3];
-                } else {
-                    rw[2] = rw[3] = 0.0;
+                    v[2] = sw[t + 2]; v[3] = sw[t + 3];
                 }
-                for (int f = 0; f < 4; ++f) ok &= rw[4 * r + static_cast<size_t>(f)] <= big;
+                for (int f = 0; f < 4; ++f) { ok &= v[f] <= big; rw[4 * r + static_cast<size_t>(f)] = static_cast<SFx>(v[f]); }
             }
             w.srsp[static_cast<size_t>(l)] = rs.data();
-            w.srwp[static_cast<size_t>(l)] = rw.data();
+            srwp[static_cast<size_t>(l)] = rw.data();
         }
         return ok;
     }
@@ -2038,11 +2088,13 @@ private:
         al.set_hb_cutoff(s_.hb_cutoff);
         al.set_rowwise_full(s_.rowwise_full);
         al.set_soft_impl(s_.soft_impl);
+        al.set_soft_f32(s_.soft_f32);
         al.set_soft_temperature(s_.soft_temperature);
     }
     void configure_lane_(BandAl& al) const {
         al.set_traceback(TracebackMode::Scores);
         al.set_soft_impl(s_.soft_impl);
+        al.set_soft_f32(s_.soft_f32);
         al.set_soft_temperature(s_.soft_temperature);
     }
     static void set_inter_params_(InterJobT<T>& job, const AlignParams& P, const std::vector<T>& blkT) {
@@ -2215,9 +2267,9 @@ private:
             std::vector<const unsigned char*> a, b;
             std::vector<int> m, bi, bj, nb;
             std::vector<T> best, blkT;
-            DVec sscr;
-            std::vector<int> siscr, sok, sgp;
-            std::vector<double> ses, slogz, scnt, sgap;
+            SoftGroup<double> sgd; SoftGroup<float> sgf;
+            std::vector<int> sok, sgp;
+            std::vector<double> slogz, scnt, sgap;
             std::vector<int> cM_;   // tracked soft: each lane's chunk M (its row stride)
             while (true) {
                 const size_t t = idx.fetch_add(1, std::memory_order_relaxed);
@@ -2264,52 +2316,45 @@ private:
                 }
                 // Soft lanes share the forward-backward too (one soft_impl, not "log",
                 // one temperature — batch-wide here), when the weights fit.
-                bool soft_group = K.inter_soft != nullptr && soft && s_.soft_impl != SoftImpl::Log;
+                bool soft_group = soft_fn_ok_(K) && soft && s_.soft_impl != SoftImpl::Log;
                 const size_t nnk = nn_;
+                int SW = 0;   // the soft pass's lanes (a float32 batch's double pass: W / SW chunks)
                 if (soft_group) {
-                    InterSoftJob sj{};
-                    bool fin = inter_soft_weights(P, s_.soft_temperature, lin, ses, sj);
-                    if (fin && tracked_) fin = soft_lanes_(w, W, real, elig, s, P);
-                    soft_group = fin;
                     // Tracked: outputs per lane and row; chunk c's at c*M rows (its own M
                     // is the stride inside it).
                     const size_t ccnt = tracked_ ? static_cast<size_t>(M) * alpha_->size() : nnk;
                     const size_t cgap = tracked_ ? 4 * (static_cast<size_t>(M) + 1) : 4;
-                    if (fin) {
-                        // The soft pass is double, K.inter_w lanes: a float32 group runs
-                        // it in W / SW chunks.
-                        const int SW = K.d.inter_w;
+                    auto run = [&](auto& sg) {
+                        using SFx = typename std::remove_reference_t<decltype(sg)>::type;
+                        bool fin = sg.weights(P, s_.soft_temperature, lin);
+                        if (fin && tracked_) fin = soft_lanes_<SFx>(w, W, real, elig, s, P);
+                        soft_group = fin;
+                        if (!fin) return;
+                        SW = sg.lanes(K);
                         slogz.resize(W); scnt.resize(W * ccnt); sgap.resize(W * cgap); sok.assign(W, 0);
                         cM_.assign(static_cast<size_t>(W), 0);
                         if (want_post) sgp.assign(static_cast<size_t>(M + 1) * W, 0);
-                        sj.n = n;
-                        sj.align_mode = job.align_mode;
                         for (int c = 0; c < W && static_cast<size_t>(c) < real; c += SW) {
                             int Mc = 0;
                             for (int l = c; l < c + SW; ++l) Mc = std::max(Mc, m[l]);
-                            const size_t need = inter_soft_scratch(n, Mc, SW);
-                            if (sscr.size() < need) sscr.resize(need);
-                            siscr.resize(static_cast<size_t>(Mc + 1) * SW);
-                            sj.a = a.data() + c; sj.m = m.data() + c; sj.b = b.data() + c; sj.M = Mc;
-                            sj.nb = ragged ? nb.data() + c : nullptr;
-                            sj.scratch = sscr.data(); sj.iscratch = siscr.data();
-                            sj.logz = slogz.data() + c; sj.counts = scnt.data() + c * ccnt;
-                            sj.gaps = sgap.data() + c * cgap; sj.ok = sok.data() + c;
-                            if (tracked_) {
-                                sj.rs = w.srsp.data() + c; sj.rw = w.srwp.data() + c;
-                                for (int l = c; l < c + SW; ++l) cM_[static_cast<size_t>(l)] = Mc;
-                            }
-                            sj.gpost = want_post ? sgp.data() + static_cast<size_t>(c) * (M + 1) : nullptr;
-                            K.inter_soft(sj);
+                            if (tracked_) for (int l = c; l < c + SW; ++l) cM_[static_cast<size_t>(l)] = Mc;
+                            sg.run(K, n, Mc, SW, a.data() + c, m.data() + c, b.data() + c,
+                                   ragged ? nb.data() + c : nullptr, job.align_mode,
+                                   slogz.data() + c, scnt.data() + c * ccnt, sgap.data() + c * cgap,
+                                   sok.data() + c,
+                                   want_post ? sgp.data() + static_cast<size_t>(c) * (M + 1) : nullptr,
+                                   tracked_ ? w.srsp.data() + c : nullptr,
+                                   tracked_ ? w.template srwp_of<SFx>().data() + c : nullptr);
                         }
-                    }
+                    };
+                    if (soft_f32_()) run(sgf); else run(sgd);
                 }
                 for (size_t l = 0; l < real; ++l) {
                     const size_t i = elig[s + l];
                     SoftLane lane{};
                     const bool use = soft_group && sok[l];
                     if (use && tracked_) {
-                        const int SW = K.d.inter_w, c = static_cast<int>(l) / SW * SW, Mc = cM_[l];
+                        const int c = static_cast<int>(l) / SW * SW, Mc = cM_[l];
                         const size_t na = alpha_->size();
                         lane = {slogz[l],
                                 scnt.data() + static_cast<size_t>(c) * static_cast<size_t>(M) * na +
@@ -2323,7 +2368,7 @@ private:
                     } else if (use) {
                         lane = {slogz[l], scnt.data() + l * nnk, sgap.data() + l * 4};
                         if (want_post) {
-                            const int SW = K.d.inter_w, c = static_cast<int>(l) / SW * SW;
+                            const int c = static_cast<int>(l) / SW * SW;
                             lane.gpost = sgp.data() + static_cast<size_t>(c) * (M + 1) + (l - c);
                             lane.gstride = SW;
                         }
