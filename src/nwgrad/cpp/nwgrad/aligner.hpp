@@ -1112,6 +1112,12 @@ private:
     // are instantiated per regime (nw_add_s / nw_sub_s), the plain one for every T but an
     // nw_sat T past the quarter rule.
     template <class F>
+    [[gnu::always_inline]] decltype(auto) sat_dispatch1_(F&& f) const {
+        if constexpr (nw_sat<T>)
+            if (sat_) return f.template operator()<true>();
+        return f.template operator()<false>();
+    }
+    template <class F>
     [[gnu::always_inline]] decltype(auto) sat_dispatch_(F&& f) const {
         if constexpr (nw_sat<T>)
             if (sat_) return tr_ ? f.template operator()<true, true>() : f.template operator()<false, true>();
@@ -2366,9 +2372,9 @@ private:
                 // Linear: one exact sweep for both "hirschberg" and "hirschberg_pmax" —
                 // the prefix-max carry exists to remove affine's lazy-F fixpoint, and the
                 // scalar linear sweep has none.
-                if constexpr (GM == GapModel::Linear) { viterbi_linear_hirschberg(buf); return; }
-                else if constexpr (AM == AlignMode::Local) { viterbi_affine_hirschberg_local(buf); return; }
-                else { viterbi_affine_hirschberg(buf); return; }
+                if constexpr (GM == GapModel::Linear) { sat_dispatch1_([&]<bool Sat>() { viterbi_linear_hirschberg<Sat>(buf); }); return; }
+                else if constexpr (AM == AlignMode::Local) { sat_dispatch1_([&]<bool Sat>() { viterbi_affine_hirschberg_local<Sat>(buf); }); return; }
+                else { sat_dispatch1_([&]<bool Sat>() { viterbi_affine_hirschberg<Sat>(buf); }); return; }
             }
             // A pair no longer than hb_cutoff never splits, so it is run AS Pointers —
             // the same fill, table and traceback, hence bit-exact with traceback=
@@ -2617,15 +2623,15 @@ private:
                     // a local, not hc[j-1]: with the pin, clang reloaded it from the store
                     // just made (a store-forward on the chain: 0.41x gcc)
                     const T t = std::max<T>(std::max<T>(nw_add_s<Sat, T>(hp[j-1], srow[bcode[static_cast<size_t>(j) - 1]]),
-                                                        nw_sub<T>(hp[j], ge_b_r)), static_cast<T>(0));
-                    v = std::max<T>(nw_opaque(t), nw_sub<T>(left, ge_a_r));
+                                                        nw_sub_s<Sat, T>(hp[j], ge_b_r)), static_cast<T>(0));
+                    v = std::max<T>(nw_opaque(t), nw_sub_s<Sat, T>(left, ge_a_r));
                     left = v;
                     rowmax = std::max(rowmax, v);
                 } else {
                     v = std::max({
                         nw_add_s<Sat, T>(hp[j-1], srow[bcode[static_cast<size_t>(j) - 1]]),
-                        nw_sub<T>(hp[j], ge_b_r),
-                        nw_sub<T>(hc[j-1], ge_a_r),
+                        nw_sub_s<Sat, T>(hp[j], ge_b_r),
+                        nw_sub_s<Sat, T>(hc[j-1], ge_a_r),
                     });
                     if constexpr (AM == AlignMode::Local) {
                         v = std::max(v, static_cast<T>(0));
@@ -2702,14 +2708,14 @@ private:
             // same std::max calls in the same order, so bit-exact.
             for (int j = 1; j <= n; ++j) {
                 const T d0 = nw_add_s<Sat, T>(pv[j - 1], prow[bcode[j - 1]]);
-                const T u = nw_sub<T>(pv[j], ge_b);
+                const T u = nw_sub_s<Sat, T>(pv[j], ge_b);
                 cv[j] = std::max(d0, u);
                 d[j] = static_cast<unsigned char>(d0 < u);
             }
             T left = cv[0];
             int hit = 0;
             for (int j = 1; j <= n; ++j) {
-                const T t = cv[j], l = nw_sub<T>(left, ge_a);
+                const T t = cv[j], l = nw_sub_s<Sat, T>(left, ge_a);
                 T v = std::max(t, l);
                 const int tl = t < l;
                 unsigned char c = static_cast<unsigned char>(d[j] + tl * (2 - d[j]));
@@ -3017,7 +3023,7 @@ private:
     // kernel on any -mfma level.  Row 0 stays exact in both variants.
     // Tracked: row r reads its own penalties (hb_go_a etc.) and substitution row, and the
     // pmax ramp is that row's (`rmp` then a scratch of W+1 the sweep refills per row).
-    template <bool Pmax = false>
+    template <bool Pmax = false, bool Sat>
     void hb_fwd(int i0, int i1, int j0, int j1, bool in_x,
                 T* pM, T* pX, T* pY, T* cM, T* cX, T* cY,
                 T*& oM, T*& oX, T*& oY, const T* rmp = nullptr) const {
@@ -3035,7 +3041,7 @@ private:
         for (int c = 1; c <= W; ++c) {
             pM[c] = NINF();
             pX[c] = NINF();
-            pY[c] = std::max({nw_sub(nw_sub(pM[c-1], go_a), ge_a), nw_sub(nw_sub(pX[c-1], go_a), ge_a), nw_sub(pY[c-1], ge_a)});
+            pY[c] = std::max({nw_sub_s<Sat>(nw_sub_s<Sat>(pM[c-1], go_a), ge_a), nw_sub_s<Sat>(nw_sub_s<Sat>(pX[c-1], go_a), ge_a), nw_sub_s<Sat>(pY[c-1], ge_a)});
         }
 
         T* rr = const_cast<T*>(rmp);
@@ -3045,25 +3051,25 @@ private:
                 if constexpr (Pmax) for (int k = 0; k <= W; ++k) rr[k] = static_cast<T>(k) * ge_a;
             }
             cM[0] = NINF();
-            cX[0] = std::max({nw_sub(nw_sub(pM[0], go_b), ge_b), nw_sub(pX[0], ge_b), nw_sub(nw_sub(pY[0], go_b), ge_b)});
-            if (in_x && r == i0 + 1) cX[0] = nw_sub(static_cast<T>(0), ge_b);   // the run continues
+            cX[0] = std::max({nw_sub_s<Sat>(nw_sub_s<Sat>(pM[0], go_b), ge_b), nw_sub_s<Sat>(pX[0], ge_b), nw_sub_s<Sat>(nw_sub_s<Sat>(pY[0], go_b), ge_b)});
+            if (in_x && r == i0 + 1) cX[0] = nw_sub_s<Sat>(static_cast<T>(0), ge_b);   // the run continues
             cY[0] = NINF();
             // The running prefix max over Q[k] = g[k] + k*ge_a, seeded with the column-0
             // border folded in as k = -1.  Unused (and cold) when Pmax is false.
-            T P = nw_sub(cY[0], ge_a);
+            T P = nw_sub_s<Sat>(cY[0], ge_a);
             for (int c = 1; c <= W; ++c) {
                 // subT is 1-based over the full sequences; row r consumes a[r-1].
-                cM[c] = nw_add<T>(std::max({pM[c-1], pX[c-1], pY[c-1]}), tr_ ? subT(r, j0 + c) : subTu(r, j0 + c));
-                cX[c] = std::max({nw_sub(nw_sub(pM[c], go_b), ge_b), nw_sub(pX[c], ge_b), nw_sub(nw_sub(pY[c], go_b), ge_b)});
+                cM[c] = nw_add_s<Sat, T>(std::max({pM[c-1], pX[c-1], pY[c-1]}), tr_ ? subT(r, j0 + c) : subTu(r, j0 + c));
+                cX[c] = std::max({nw_sub_s<Sat>(nw_sub_s<Sat>(pM[c], go_b), ge_b), nw_sub_s<Sat>(pX[c], ge_b), nw_sub_s<Sat>(nw_sub_s<Sat>(pY[c], go_b), ge_b)});
                 if constexpr (Pmax) {
                     // g[k] for k = c-1.  Max-then-subtract mirrors the kernel's `ov`
                     // exactly (subtracting a common value is order-preserving, so this is
                     // bit-identical to the three-way form the exact branch uses).
-                    const T g = nw_sub(nw_sub(std::max(cM[c-1], cX[c-1]), go_a), ge_a);
-                    P = std::max<T>(nw_add(g, rmp[c-1]), P);
-                    cY[c] = nw_sub(P, rmp[c-1]);
+                    const T g = nw_sub_s<Sat>(nw_sub_s<Sat>(std::max(cM[c-1], cX[c-1]), go_a), ge_a);
+                    P = std::max<T>(nw_add_s<Sat>(g, rmp[c-1]), P);
+                    cY[c] = nw_sub_s<Sat>(P, rmp[c-1]);
                 } else {
-                    cY[c] = std::max({nw_sub(nw_sub(cM[c-1], go_a), ge_a), nw_sub(nw_sub(cX[c-1], go_a), ge_a), nw_sub(cY[c-1], ge_a)});
+                    cY[c] = std::max({nw_sub_s<Sat>(nw_sub_s<Sat>(cM[c-1], go_a), ge_a), nw_sub_s<Sat>(nw_sub_s<Sat>(cX[c-1], go_a), ge_a), nw_sub_s<Sat>(cY[c-1], ge_a)});
                 }
             }
             std::swap(pM, cM); std::swap(pX, cX); std::swap(pY, cY);
@@ -3077,7 +3083,7 @@ private:
     // out_x seeds the far end exactly as in_x seeds the near one.
     // Tracked: the mirror's rows (see hb_reverse_rows_) — reversed row r (consuming a[r])
     // holds DP row r's gaps in A and DP row r+1's rewritten vertical move.
-    template <bool Pmax = false>
+    template <bool Pmax = false, bool Sat>
     void hb_rev(int i0, int i1, int j0, int j1, bool out_x,
                 T* pM, T* pX, T* pY, T* cM, T* cX, T* cY,
                 T*& oM, T*& oX, T*& oY, const T* rmp = nullptr) const {
@@ -3095,7 +3101,7 @@ private:
         for (int d = 1; d <= W; ++d) {
             pM[d] = NINF();
             pX[d] = NINF();
-            pY[d] = std::max({nw_sub(nw_sub(pM[d-1], go_a), ge_a), nw_sub(nw_sub(pX[d-1], go_a), ge_a), nw_sub(pY[d-1], ge_a)});
+            pY[d] = std::max({nw_sub_s<Sat>(nw_sub_s<Sat>(pM[d-1], go_a), ge_a), nw_sub_s<Sat>(nw_sub_s<Sat>(pX[d-1], go_a), ge_a), nw_sub_s<Sat>(pY[d-1], ge_a)});
         }
 
         T* rr = const_cast<T*>(rmp);
@@ -3105,20 +3111,20 @@ private:
                 if constexpr (Pmax) for (int k = 0; k <= W; ++k) rr[k] = static_cast<T>(k) * ge_a;
             }
             cM[0] = NINF();
-            cX[0] = std::max({nw_sub(nw_sub(pM[0], go_b), ge_b), nw_sub(pX[0], ge_b), nw_sub(nw_sub(pY[0], go_b), ge_b)});
-            if (out_x && r == i1 - 1) cX[0] = nw_sub(static_cast<T>(0), ge_b);   // enters the corner vertically
+            cX[0] = std::max({nw_sub_s<Sat>(nw_sub_s<Sat>(pM[0], go_b), ge_b), nw_sub_s<Sat>(pX[0], ge_b), nw_sub_s<Sat>(nw_sub_s<Sat>(pY[0], go_b), ge_b)});
+            if (out_x && r == i1 - 1) cX[0] = nw_sub_s<Sat>(static_cast<T>(0), ge_b);   // enters the corner vertically
             cY[0] = NINF();
-            T P = nw_sub(cY[0], ge_a);
+            T P = nw_sub_s<Sat>(cY[0], ge_a);
             for (int d = 1; d <= W; ++d) {
                 // Mirrored diagonal: this step pairs a[r] with b[j1-d], i.e. subT(r+1, j1-d+1).
-                cM[d] = nw_add<T>(std::max({pM[d-1], pX[d-1], pY[d-1]}), tr_ ? subT(r + 1, j1 - d + 1) : subTu(r + 1, j1 - d + 1));
-                cX[d] = std::max({nw_sub(nw_sub(pM[d], go_b), ge_b), nw_sub(pX[d], ge_b), nw_sub(nw_sub(pY[d], go_b), ge_b)});
+                cM[d] = nw_add_s<Sat, T>(std::max({pM[d-1], pX[d-1], pY[d-1]}), tr_ ? subT(r + 1, j1 - d + 1) : subTu(r + 1, j1 - d + 1));
+                cX[d] = std::max({nw_sub_s<Sat>(nw_sub_s<Sat>(pM[d], go_b), ge_b), nw_sub_s<Sat>(pX[d], ge_b), nw_sub_s<Sat>(nw_sub_s<Sat>(pY[d], go_b), ge_b)});
                 if constexpr (Pmax) {
-                    const T g = nw_sub(nw_sub(std::max(cM[d-1], cX[d-1]), go_a), ge_a);
-                    P = std::max<T>(nw_add(g, rmp[d-1]), P);
-                    cY[d] = nw_sub(P, rmp[d-1]);
+                    const T g = nw_sub_s<Sat>(nw_sub_s<Sat>(std::max(cM[d-1], cX[d-1]), go_a), ge_a);
+                    P = std::max<T>(nw_add_s<Sat>(g, rmp[d-1]), P);
+                    cY[d] = nw_sub_s<Sat>(P, rmp[d-1]);
                 } else {
-                    cY[d] = std::max({nw_sub(nw_sub(cM[d-1], go_a), ge_a), nw_sub(nw_sub(cX[d-1], go_a), ge_a), nw_sub(cY[d-1], ge_a)});
+                    cY[d] = std::max({nw_sub_s<Sat>(nw_sub_s<Sat>(cM[d-1], go_a), ge_a), nw_sub_s<Sat>(nw_sub_s<Sat>(cX[d-1], go_a), ge_a), nw_sub_s<Sat>(cY[d-1], ge_a)});
                 }
             }
             std::swap(pM, cM); std::swap(pX, cX); std::swap(pY, cY);
@@ -3184,6 +3190,7 @@ private:
         std::reverse(hops_.begin() + static_cast<std::ptrdiff_t>(first), hops_.end());
     }
 
+    template <bool Sat>
     void hb_base(DpBuffer& buf, int i0, int i1, int j0, int j1,
                  bool in_x, bool out_x) {
         T go_a = hb_go_a(i0), ge_a = hb_ge_a(i0);
@@ -3222,7 +3229,7 @@ private:
         for (int c = 1; c <= W; ++c) {
             pM[c] = NINF();
             pX[c] = NINF();
-            const T uy = nw_sub(nw_sub(pM[c-1], go_a), ge_a), vy = nw_sub(nw_sub(pX[c-1], go_a), ge_a), wy = nw_sub(pY[c-1], ge_a);
+            const T uy = nw_sub_s<Sat>(nw_sub_s<Sat>(pM[c-1], go_a), ge_a), vy = nw_sub_s<Sat>(nw_sub_s<Sat>(pX[c-1], go_a), ge_a), wy = nw_sub_s<Sat>(pY[c-1], ge_a);
             pY[c] = std::max({uy, vy, wy});
             D[c] = pack(3, 3, pick(uy, vy, wy));
         }
@@ -3233,18 +3240,18 @@ private:
                 go_a = hb_go_a(i0 + r); ge_a = hb_ge_a(i0 + r);
                 go_b = hb_go_b(i0 + r, false); ge_b = hb_ge_b(i0 + r, false);
             }
-            const T ux0 = nw_sub(nw_sub(pM[0], go_b), ge_b), vx0 = nw_sub(pX[0], ge_b), wx0 = nw_sub(nw_sub(pY[0], go_b), ge_b);
+            const T ux0 = nw_sub_s<Sat>(nw_sub_s<Sat>(pM[0], go_b), ge_b), vx0 = nw_sub_s<Sat>(pX[0], ge_b), wx0 = nw_sub_s<Sat>(nw_sub_s<Sat>(pY[0], go_b), ge_b);
             cM[0] = NINF();
             cX[0] = std::max({ux0, vx0, wx0});
             cY[0] = NINF();
             D[rb] = pack(3, pick(ux0, vx0, wx0), 3);
-            if (in_x && r == 1) { cX[0] = nw_sub(static_cast<T>(0), ge_b); D[rb] = pack(3, 1, 3); }   // continues the run
+            if (in_x && r == 1) { cX[0] = nw_sub_s<Sat>(static_cast<T>(0), ge_b); D[rb] = pack(3, 1, 3); }   // continues the run
             for (int c = 1; c <= W; ++c) {
                 const T dgM = pM[c-1], dgX = pX[c-1], dgY = pY[c-1];
-                cM[c] = nw_add<T>(std::max({dgM, dgX, dgY}), tr_ ? subT(i0 + r, j0 + c) : subTu(i0 + r, j0 + c));
-                const T ux = nw_sub(nw_sub(pM[c], go_b), ge_b), vx = nw_sub(pX[c], ge_b), wx = nw_sub(nw_sub(pY[c], go_b), ge_b);
+                cM[c] = nw_add_s<Sat, T>(std::max({dgM, dgX, dgY}), tr_ ? subT(i0 + r, j0 + c) : subTu(i0 + r, j0 + c));
+                const T ux = nw_sub_s<Sat>(nw_sub_s<Sat>(pM[c], go_b), ge_b), vx = nw_sub_s<Sat>(pX[c], ge_b), wx = nw_sub_s<Sat>(nw_sub_s<Sat>(pY[c], go_b), ge_b);
                 cX[c] = std::max({ux, vx, wx});
-                const T uy = nw_sub(nw_sub(cM[c-1], go_a), ge_a), vy = nw_sub(nw_sub(cX[c-1], go_a), ge_a), wy = nw_sub(cY[c-1], ge_a);
+                const T uy = nw_sub_s<Sat>(nw_sub_s<Sat>(cM[c-1], go_a), ge_a), vy = nw_sub_s<Sat>(nw_sub_s<Sat>(cX[c-1], go_a), ge_a), wy = nw_sub_s<Sat>(cY[c-1], ge_a);
                 cY[c] = std::max({uy, vy, wy});
                 D[rb + c] = pack(pick(dgM, dgX, dgY), pick(ux, vx, wx), pick(uy, vy, wy));
             }
@@ -3279,6 +3286,7 @@ private:
     // final row contiguously into (oM,oX,oY).  The two are bit-identical by construction
     // — same operations, same order, same left-association — so which one runs is a
     // speed decision and never a correctness one, exactly as with the Viterbi backends.
+    template <bool Sat>
     void hb_half(DpBuffer& buf, bool reverse, int i0, int i1, int j0, int j1,
                  bool flag, T* oM, T* oX, T* oY) {
         const int H = i1 - i0, NC = j1 - j0;
@@ -3300,19 +3308,19 @@ private:
             T* rmp = buf.hramp.data();
             for (int k = 0; k <= NC; ++k) rmp[k] = static_cast<T>(k) * ge_a;
             if (reverse)
-                hb_rev<true>(i0, i1, j0, j1, flag,
+                hb_rev<true, Sat>(i0, i1, j0, j1, flag,
                              buf.hfa.data(), buf.hfb.data(), buf.hfc.data(),
                              buf.hfd.data(), buf.hfe.data(), buf.hff.data(), sM, sX, sY, rmp);
             else
-                hb_fwd<true>(i0, i1, j0, j1, flag,
+                hb_fwd<true, Sat>(i0, i1, j0, j1, flag,
                              buf.hfa.data(), buf.hfb.data(), buf.hfc.data(),
                              buf.hfd.data(), buf.hfe.data(), buf.hff.data(), sM, sX, sY, rmp);
         } else if (reverse)
-            hb_rev(i0, i1, j0, j1, flag,
+            hb_rev<Sat>(i0, i1, j0, j1, flag,
                    buf.hfa.data(), buf.hfb.data(), buf.hfc.data(),
                    buf.hfd.data(), buf.hfe.data(), buf.hff.data(), sM, sX, sY);
         else
-            hb_fwd(i0, i1, j0, j1, flag,
+            hb_fwd<Sat>(i0, i1, j0, j1, flag,
                    buf.hfa.data(), buf.hfb.data(), buf.hfc.data(),
                    buf.hfd.data(), buf.hfe.data(), buf.hff.data(), sM, sX, sY);
         std::copy(sM, sM + NC + 1, oM);
@@ -3322,9 +3330,10 @@ private:
 
     // The recursion.  Splits the block's rows in half, sweeps to the split row from both
     // ends, and joins the two halves to find the column the optimal path crosses at.
+    template <bool Sat>
     void hb_solve(DpBuffer& buf, int i0, int i1, int j0, int j1, bool in_x, bool out_x) {
         const int H = i1 - i0, W = j1 - j0;
-        if (H <= hb_cutoff_) { hb_base(buf, i0, i1, j0, j1, in_x, out_x); return; }
+        if (H <= hb_cutoff_) { hb_base<Sat>(buf, i0, i1, j0, j1, in_x, out_x); return; }
 
         const int p = i0 + H / 2;
         const std::size_t stride = static_cast<std::size_t>(W) + 1;
@@ -3337,11 +3346,11 @@ private:
         // Both halves land in their own contiguous output rows — hs* for the forward,
         // hr{a,b,c} for the reverse — so the two never contend for scratch and the
         // simd and scalar paths deliver their results in the same place.
-        hb_half(buf, false, i0, p, j0, j1, in_x,
+        hb_half<Sat>(buf, false, i0, p, j0, j1, in_x,
                 buf.hsM.data(), buf.hsX.data(), buf.hsY.data());
         const T* FM = buf.hsM.data(); const T* FX = buf.hsX.data(); const T* FY = buf.hsY.data();
 
-        hb_half(buf, true, p, i1, j0, j1, out_x,
+        hb_half<Sat>(buf, true, p, i1, j0, j1, out_x,
                 buf.hra.data(), buf.hrb.data(), buf.hrc.data());
         const T* rM = buf.hra.data(); const T* rX = buf.hrb.data(); const T* rY = buf.hrc.data();
 
@@ -3371,27 +3380,28 @@ private:
             const int d = W - c;                       // reverse sweep is indexed leftward
             const T f = std::max({FM[c], FX[c], FY[c]});
             const T g = std::max({rM[d], rX[d], rY[d]});
-            const T plain = nw_add(f, g);
+            const T plain = nw_add_s<Sat>(f, g);
             if (plain > best) { best = plain; cstar = c; span = false; }
             if (FX[c] > NINF() && rX[d] > NINF()) {
-                const T joined = nw_add(nw_add(FX[c], rX[d]), go_b);
+                const T joined = nw_add_s<Sat>(nw_add_s<Sat>(FX[c], rX[d]), go_b);
                 if (joined > best) { best = joined; cstar = c; span = true; }
             }
         }
 
         const int jstar = j0 + cstar;
-        hb_solve(buf, i0, p, j0, jstar, in_x, span);
-        hb_solve(buf, p, i1, jstar, j1, span, out_x);
+        hb_solve<Sat>(buf, i0, p, j0, jstar, in_x, span);
+        hb_solve<Sat>(buf, p, i1, jstar, j1, span, out_x);
     }
 
     // Entry point: recover the whole path, then read the score back off it.  The score is
     // recomputed from the path rather than taken from the join, which is a genuine check
     // and not bookkeeping — if the affine boundary handling were wrong the two would
     // disagree, and the tests compare this score against the other tracebacks'.
+    template <bool Sat>
     void viterbi_affine_hirschberg(DpBuffer& buf) {
         hops_.clear();
         hops_.reserve(static_cast<std::size_t>(m_ + n_));
-        hb_solve(buf, 0, m_, 0, n_, false, false);
+        hb_solve<Sat>(buf, 0, m_, 0, n_, false, false);
 
         // Replay for the score.  Also fixes best_i_/best_j_/best_tbl_, which the shared
         // accessors still expect even though no table backs them here.
@@ -3442,6 +3452,7 @@ private:
     // walk.  Reports the best cell in BLOCK-1-based coords (row 1..H, col 1..NC) and its
     // score.  The two paths are bit-identical by construction — same recurrence, same
     // topmost/leftmost tie-break — so which runs is a speed choice, exactly as elsewhere.
+    template <bool Sat>
     void hb_scan(DpBuffer& buf, bool local, bool reverse, int i0, int i1, int j0, int j1,
                  T& best, int& bi, int& bj) {
         const int H = i1 - i0, NC = j1 - j0;
@@ -3459,17 +3470,18 @@ private:
             job.pmax = hb_pmax() ? 1 : 0;
             job.buf = &buf;
             if (tr_) { hb_reverse_rows_(); fill_track_job_(job.tr, false, 0); }
-            K->template of<T>().hb_scan(job);
+            K->template of<T>().hb_scan<Sat>(job);
             best = job.best; bi = job.best_i; bj = job.best_j;
             return;
         }
-        hb_scan_scalar(buf, local, reverse, i0, i1, j0, j1, best, bi, bj);
+        hb_scan_scalar<Sat>(buf, local, reverse, i0, i1, j0, j1, best, bi, bj);
     }
 
     // Scalar reference endpoint scan.  Rolling rows only; the borders and the M-clamp
     // switch on `local`, the walk direction on `reverse`.  The argmax is topmost-row /
     // leftmost-column, strict > — the SAME tie-break the simd kernel uses, so the two
     // agree to the bit (the property NWGRAD_ISA relies on).
+    template <bool Sat>
     void hb_scan_scalar(DpBuffer& buf, bool local, bool reverse, int i0, int i1, int j0, int j1,
                         T& best, int& bi, int& bj) {
         const int H = i1 - i0, NC = j1 - j0;
@@ -3503,7 +3515,7 @@ private:
             if (local) { pM[c] = static_cast<T>(0); pX[c] = NINF(); pY[c] = NINF(); }
             else {
                 pM[c] = NINF(); pX[c] = NINF();
-                pY[c] = std::max(nw_sub(nw_sub(std::max(pM[c-1], pX[c-1]), go_a), ge_a), nw_sub(pY[c-1], ge_a));
+                pY[c] = std::max(nw_sub_s<Sat>(nw_sub_s<Sat>(std::max(pM[c-1], pX[c-1]), go_a), ge_a), nw_sub_s<Sat>(pY[c-1], ge_a));
             }
         }
 
@@ -3517,21 +3529,21 @@ private:
                 if (pmax) for (int k = 0; k < NC; ++k) rmp[k] = static_cast<T>(k) * ge_a;
             }
             cM[0] = local ? static_cast<T>(0) : NINF();
-            cX[0] = std::max(std::max(nw_sub(nw_sub(pM[0], go_b), ge_b), nw_sub(pX[0], ge_b)), nw_sub(nw_sub(pY[0], go_b), ge_b));
+            cX[0] = std::max(std::max(nw_sub_s<Sat>(nw_sub_s<Sat>(pM[0], go_b), ge_b), nw_sub_s<Sat>(pX[0], ge_b)), nw_sub_s<Sat>(nw_sub_s<Sat>(pY[0], go_b), ge_b));
             cY[0] = NINF();
-            T P = nw_sub(cY[0], ge_a);   // Pmax: the running prefix max, the border as its seed
+            T P = nw_sub_s<Sat>(cY[0], ge_a);   // Pmax: the running prefix max, the border as its seed
             for (int c = 1; c <= NC; ++c) {
                 const int bcol = b_start + (c - 1) * b_step;       // 0-based sequence col
-                T m = nw_add<T>(std::max({pM[c-1], pX[c-1], pY[c-1]}), tr_ ? subT(arow + 1, bcol + 1) : subTu(arow + 1, bcol + 1));
+                T m = nw_add_s<Sat, T>(std::max({pM[c-1], pX[c-1], pY[c-1]}), tr_ ? subT(arow + 1, bcol + 1) : subTu(arow + 1, bcol + 1));
                 if (local) m = std::max(m, static_cast<T>(0));
-                const T x = std::max(std::max(nw_sub(nw_sub(pM[c], go_b), ge_b), nw_sub(pX[c], ge_b)), nw_sub(nw_sub(pY[c], go_b), ge_b));
+                const T x = std::max(std::max(nw_sub_s<Sat>(nw_sub_s<Sat>(pM[c], go_b), ge_b), nw_sub_s<Sat>(pX[c], ge_b)), nw_sub_s<Sat>(nw_sub_s<Sat>(pY[c], go_b), ge_b));
                 T y;
                 if (pmax) {
-                    const T g = nw_sub(nw_sub(std::max(cM[c-1], cX[c-1]), go_a), ge_a);
-                    P = std::max<T>(nw_add(g, rmp[c-1]), P);
-                    y = nw_sub(P, rmp[c-1]);
+                    const T g = nw_sub_s<Sat>(nw_sub_s<Sat>(std::max(cM[c-1], cX[c-1]), go_a), ge_a);
+                    P = std::max<T>(nw_add_s<Sat>(g, rmp[c-1]), P);
+                    y = nw_sub_s<Sat>(P, rmp[c-1]);
                 } else {
-                    y = std::max(std::max(nw_sub(nw_sub(cM[c-1], go_a), ge_a), nw_sub(nw_sub(cX[c-1], go_a), ge_a)), nw_sub(cY[c-1], ge_a));
+                    y = std::max(std::max(nw_sub_s<Sat>(nw_sub_s<Sat>(cM[c-1], go_a), ge_a), nw_sub_s<Sat>(nw_sub_s<Sat>(cX[c-1], go_a), ge_a)), nw_sub_s<Sat>(cY[c-1], ge_a));
                 }
                 cM[c] = m; cX[c] = x; cY[c] = y;
                 const T here = std::max({m, x, y});
@@ -3548,12 +3560,13 @@ private:
     // Everything is O(n) memory.  Below hb_cutoff the box never splits and the fill is the
     // exact Pointers one, so short local pairs are bit-exact; longer ones return a valid
     // (equal-score) but possibly different optimal path at ties, like Global Hirschberg.
+    template <bool Sat>
     void viterbi_affine_hirschberg_local(DpBuffer& buf) {
         hops_.clear();
         hb_start_i_ = 0; hb_start_j_ = 0;
 
         T s_fwd; int ie, je;
-        hb_scan(buf, /*local=*/true, /*reverse=*/false, 0, m_, 0, n_, s_fwd, ie, je);
+        hb_scan<Sat>(buf, /*local=*/true, /*reverse=*/false, 0, m_, 0, n_, s_fwd, ie, je);
 
         // No positive-scoring local alignment: the empty alignment (score 0) is optimal.
         if (s_fwd <= static_cast<T>(0) || ie <= 0 || je <= 0) {
@@ -3564,10 +3577,10 @@ private:
         }
 
         T s_rev; int p, q;
-        hb_scan(buf, /*local=*/false, /*reverse=*/true, 0, ie, 0, je, s_rev, p, q);
+        hb_scan<Sat>(buf, /*local=*/false, /*reverse=*/true, 0, ie, 0, je, s_rev, p, q);
         const int is = ie - p, js = je - q;
 
-        hb_solve(buf, is, ie, js, je, false, false);
+        hb_solve<Sat>(buf, is, ie, js, je, false, false);
         hb_start_i_ = is; hb_start_j_ = js;
 
         // Replay for the score, seeded at the local start (subT is 1-based).  Same order
@@ -3640,6 +3653,7 @@ public:
     int lhb_kernel_runs() const noexcept { return lhb_runs_; }
 private:
 
+    template <bool Sat>
     void lhb_sweep(DpBuffer& buf, bool rev, int i0, int i1, int j0, int j1, T* out) {
         const int W = j1 - j0;
         if (const lhb_fn_t fn = lhb_kernel_(W); fn && i1 > i0 && W > 0) {
@@ -3654,14 +3668,14 @@ private:
             T ga = hb_ge_a(rev ? i1 : i0), gb = static_cast<T>(params_->gap_extend_b);
             lhb_r0_.resize(static_cast<size_t>(W) + 1); lhb_c0_.resize(static_cast<size_t>(Hh) + 1);
             lhb_r0_[0] = static_cast<T>(0);
-            for (int c = 1; c <= W; ++c) lhb_r0_[static_cast<size_t>(c)] = nw_sub(lhb_r0_[static_cast<size_t>(c) - 1], ga);
+            for (int c = 1; c <= W; ++c) lhb_r0_[static_cast<size_t>(c)] = nw_sub_s<Sat>(lhb_r0_[static_cast<size_t>(c) - 1], ga);
             lhb_c0_[0] = lhb_r0_[0];
             for (int r = 1; r <= Hh; ++r) {
                 const int i = rev ? i1 - r + 1 : i0 + r;
                 if (tr_) { gb = tgeb_[static_cast<size_t>(i)]; ga = hb_ge_a(rev ? i - 1 : i); }
                 lhb_rows_[static_cast<size_t>(r) - 1] = lhb_srow_(i);
                 lhb_ga_[static_cast<size_t>(r) - 1] = ga; lhb_gb_[static_cast<size_t>(r) - 1] = gb;
-                lhb_c0_[static_cast<size_t>(r)] = nw_sub(lhb_c0_[static_cast<size_t>(r) - 1], gb);
+                lhb_c0_[static_cast<size_t>(r)] = nw_sub_s<Sat>(lhb_c0_[static_cast<size_t>(r) - 1], gb);
             }
             LhbJob<T> job = lhb_job_(buf, W, Hh);
             job.out = out;
@@ -3676,7 +3690,7 @@ private:
         T ge_a = hb_ge_a(rev ? i1 : i0);
         T ge_b = static_cast<T>(params_->gap_extend_b);
         row[0] = static_cast<T>(0);
-        for (int c = 1; c <= W; ++c) row[c] = nw_sub(row[c - 1], ge_a);
+        for (int c = 1; c <= W; ++c) row[c] = nw_sub_s<Sat>(row[c - 1], ge_a);
         // The direction and the substitution row are resolved outside the column loop
         // (gcc unswitched them, clang did not: clang/gcc 1.65x); the same arithmetic.
         auto sweep = [&](auto step) {
@@ -3690,13 +3704,13 @@ private:
                 const int jb = S < 0 ? j1 : j0 - 1;
                 const T gb = ge_b, ga = ge_a;
                 T diag = row[0];
-                row[0] = nw_sub(row[0], gb);
+                row[0] = nw_sub_s<Sat>(row[0], gb);
                 // The left neighbour rides in a register: clang re-loaded row[c-1] just
                 // stored, a store-forward on the serial chain.
                 T left = row[0];
                 for (int c = 1; c <= W; ++c) {
-                    T v = nw_add(diag, srow[bc[jb + S * c]]);
-                    const T u = nw_sub(row[c], gb), l = nw_sub(left, ga);
+                    T v = nw_add_s<Sat>(diag, srow[bc[jb + S * c]]);
+                    const T u = nw_sub_s<Sat>(row[c], gb), l = nw_sub_s<Sat>(left, ga);
                     if (v < u) v = u;
                     if (v < l) v = l;
                     diag = row[c];
@@ -3712,6 +3726,7 @@ private:
 
     // Base case: Pointers on the sub-rectangle, Global borders, walked back from
     // (i1, j1) to (i0, j0); the moves appended to hops_ in forward order.
+    template <bool Sat>
     void lhb_base(DpBuffer& buf, int i0, int i1, int j0, int j1) {
         const int H = i1 - i0, W = j1 - j0;
         if (const lhb_fn_t fn = lhb_kernel_(W); fn && H > 0 && W > 0) {
@@ -3722,13 +3737,13 @@ private:
             T ga = hb_ge_a(i0), gb = static_cast<T>(params_->gap_extend_b);
             lhb_r0_.resize(static_cast<size_t>(W) + 1); lhb_c0_.resize(static_cast<size_t>(H) + 1);
             lhb_r0_[0] = static_cast<T>(0);
-            for (int c = 1; c <= W; ++c) lhb_r0_[static_cast<size_t>(c)] = nw_sub(lhb_r0_[static_cast<size_t>(c) - 1], ga);
+            for (int c = 1; c <= W; ++c) lhb_r0_[static_cast<size_t>(c)] = nw_sub_s<Sat>(lhb_r0_[static_cast<size_t>(c) - 1], ga);
             lhb_c0_[0] = lhb_r0_[0];
             for (int r = 1; r <= H; ++r) {
                 if (tr_) { ga = tgea_[static_cast<size_t>(i0 + r)]; gb = tgeb_[static_cast<size_t>(i0 + r)]; }
                 lhb_rows_[static_cast<size_t>(r) - 1] = lhb_srow_(i0 + r);
                 lhb_ga_[static_cast<size_t>(r) - 1] = ga; lhb_gb_[static_cast<size_t>(r) - 1] = gb;
-                lhb_c0_[static_cast<size_t>(r)] = nw_sub(lhb_c0_[static_cast<size_t>(r) - 1], gb);
+                lhb_c0_[static_cast<size_t>(r)] = nw_sub_s<Sat>(lhb_c0_[static_cast<size_t>(r) - 1], gb);
             }
             // rowsz = (seg + 1) * lanes <= W + 2 * 64 for every level's lane count
             const std::size_t cap = (static_cast<std::size_t>(H) + 1) * (static_cast<std::size_t>(W) + 130);
@@ -3764,19 +3779,19 @@ private:
         T ge_a = hb_ge_a(i0);
         T ge_b = static_cast<T>(params_->gap_extend_b);
         prev[0] = static_cast<T>(0);
-        for (int c = 1; c <= W; ++c) { prev[c] = nw_sub(prev[c - 1], ge_a); D[c] = 2; }
+        for (int c = 1; c <= W; ++c) { prev[c] = nw_sub_s<Sat>(prev[c - 1], ge_a); D[c] = 2; }
         for (int r = 1; r <= H; ++r) {
             unsigned char* d = D + static_cast<std::size_t>(r) * st;
             if (tr_) { ge_a = tgea_[static_cast<size_t>(i0 + r)]; ge_b = tgeb_[static_cast<size_t>(i0 + r)]; }
-            cur[0] = nw_sub(prev[0], ge_b); d[0] = 1;
+            cur[0] = nw_sub_s<Sat>(prev[0], ge_b); d[0] = 1;
             const T* srow = sub_row_(i0 + r);
             const uint8_t* bc = b_idx_.data();
             const T gb = ge_b, ga = ge_a;
             T left = cur[0];   // in a register, as in lhb_sweep
             for (int c = 1; c <= W; ++c) {
-                T v = nw_add(prev[c - 1], srow[bc[j0 + c - 1]]);
+                T v = nw_add_s<Sat>(prev[c - 1], srow[bc[j0 + c - 1]]);
                 unsigned char k = 0;
-                const T u = nw_sub(prev[c], gb), l = nw_sub(left, ga);
+                const T u = nw_sub_s<Sat>(prev[c], gb), l = nw_sub_s<Sat>(left, ga);
                 if (v < u) { v = u; k = 1; }
                 if (v < l) { v = l; k = 2; }
                 cur[c] = v; d[c] = k; left = v;
@@ -3793,25 +3808,27 @@ private:
         std::reverse(hops_.begin() + static_cast<std::ptrdiff_t>(at), hops_.end());
     }
 
+    template <bool Sat>
     void lhb_solve(DpBuffer& buf, int i0, int i1, int j0, int j1) {
         const int H = i1 - i0, W = j1 - j0;
-        if (H <= hb_cutoff_) { lhb_base(buf, i0, i1, j0, j1); return; }
+        if (H <= hb_cutoff_) { lhb_base<Sat>(buf, i0, i1, j0, j1); return; }
         const int p = i0 + H / 2;
         hb_fit(buf.hsM, static_cast<std::size_t>(W) + 1);
         hb_fit(buf.hra, static_cast<std::size_t>(W) + 1);
-        lhb_sweep(buf, false, i0, p, j0, j1, buf.hsM.data());
-        lhb_sweep(buf, true, p, i1, j0, j1, buf.hra.data());
+        lhb_sweep<Sat>(buf, false, i0, p, j0, j1, buf.hsM.data());
+        lhb_sweep<Sat>(buf, true, p, i1, j0, j1, buf.hra.data());
         const T* F = buf.hsM.data(); const T* R = buf.hra.data();
         T best = NINF();
         int cstar = 0;
         for (int c = 0; c <= W; ++c) {
-            const T v = nw_add(F[c], R[W - c]);
+            const T v = nw_add_s<Sat>(F[c], R[W - c]);
             if (v > best) { best = v; cstar = c; }
         }
-        lhb_solve(buf, i0, p, j0, j0 + cstar);
-        lhb_solve(buf, p, i1, j0 + cstar, j1);
+        lhb_solve<Sat>(buf, i0, p, j0, j0 + cstar);
+        lhb_solve<Sat>(buf, p, i1, j0 + cstar, j1);
     }
 
+    template <bool Sat>
     void viterbi_linear_hirschberg(DpBuffer& buf) {
         hops_.clear();
         hb_start_i_ = 0; hb_start_j_ = 0;
@@ -3850,8 +3867,8 @@ private:
                 T diag = row[0];
                 const T ge_a = ga(i), ge_b = gb(i);
                 for (int j = 1; j <= n_; ++j) {
-                    T v = nw_add<T>(diag, tr_ ? subT(i, j) : subTu(i, j));
-                    const T u = nw_sub(row[j], ge_b), l = nw_sub(row[j - 1], ge_a);
+                    T v = nw_add_s<Sat, T>(diag, tr_ ? subT(i, j) : subTu(i, j));
+                    const T u = nw_sub_s<Sat>(row[j], ge_b), l = nw_sub_s<Sat>(row[j - 1], ge_a);
                     if (v < u) v = u;
                     if constexpr (nw_is_int<T>) {   // the clamp off the left carry (see nw_opaque)
                         v = nw_opaque(std::max<T>(v, static_cast<T>(0)));
@@ -3873,7 +3890,7 @@ private:
             hb_fit(buf.hfb, static_cast<std::size_t>(je) + 1);
             T* g = buf.hfb.data();                       // g[q] = score from (p, q) to (ie, je)
             g[je] = static_cast<T>(0);
-            for (int q = je - 1; q >= 0; --q) g[q] = nw_sub(g[q + 1], ga(ie));
+            for (int q = je - 1; q >= 0; --q) g[q] = nw_sub_s<Sat>(g[q + 1], ga(ie));
             T sbest = g[0]; int is = ie, js = 0;
             for (int q = 0; q <= je; ++q) if (g[q] > sbest) { sbest = g[q]; js = q; }
             // Leveled: the suffix scan is a reverse sweep in mirrored coordinates (row r =
@@ -3895,7 +3912,7 @@ private:
                     const int pi = ie - r;
                     lhb_rows_[static_cast<size_t>(r) - 1] = lhb_srow_(pi + 1);
                     lhb_ga_[static_cast<size_t>(r) - 1] = ga(pi); lhb_gb_[static_cast<size_t>(r) - 1] = gb(pi + 1);
-                    lhb_c0_[static_cast<size_t>(r)] = nw_sub(lhb_c0_[static_cast<size_t>(r) - 1], gb(pi + 1));
+                    lhb_c0_[static_cast<size_t>(r)] = nw_sub_s<Sat>(lhb_c0_[static_cast<size_t>(r) - 1], gb(pi + 1));
                 }
                 LhbJob<T> job = lhb_job_(buf, je, ie);
                 job.argmax = 2;
@@ -3909,11 +3926,11 @@ private:
                 // gaps in A lie in row pi
                 const T ge_a = ga(pi), ge_b = gb(pi + 1);
                 T diag = g[je];
-                g[je] = nw_sub(g[je], ge_b);
+                g[je] = nw_sub_s<Sat>(g[je], ge_b);
                 if (g[je] > sbest) { sbest = g[je]; is = pi; js = je; }
                 for (int q = je - 1; q >= 0; --q) {
-                    T v = nw_add<T>(diag, tr_ ? subT(pi + 1, q + 1) : subTu(pi + 1, q + 1));
-                    const T u = nw_sub(g[q], ge_b), l = nw_sub(g[q + 1], ge_a);
+                    T v = nw_add_s<Sat, T>(diag, tr_ ? subT(pi + 1, q + 1) : subTu(pi + 1, q + 1));
+                    const T u = nw_sub_s<Sat>(g[q], ge_b), l = nw_sub_s<Sat>(g[q + 1], ge_a);
                     if (v < u) v = u;
                     if (v < l) v = l;
                     diag = g[q];
@@ -3923,9 +3940,9 @@ private:
             }
             hb_start_i_ = is; hb_start_j_ = js;
             i_end = ie; j_end = je;
-            lhb_solve(buf, is, ie, js, je);
+            lhb_solve<Sat>(buf, is, ie, js, je);
         } else {
-            lhb_solve(buf, 0, m_, 0, n_);
+            lhb_solve<Sat>(buf, 0, m_, 0, n_);
         }
         // Replay for the score, in T and in path order (the tests compare it exactly).
         T sc = static_cast<T>(0);
@@ -4320,11 +4337,11 @@ private:
             for (int j = 1; j <= n_; ++j) {
                 T v;
                 if constexpr (local && nw_is_int<T>) {   // the clamp off the left carry (see nw_opaque)
-                    const T t = std::max<T>(std::max<T>(nw_add_s<Sat, T>(prev[j-1], sub[bcode[j - 1]]), nw_sub<T>(prev[j], ge_b)), static_cast<T>(0));
-                    v = std::max<T>(nw_opaque(t), nw_sub<T>(left, ge_a));
+                    const T t = std::max<T>(std::max<T>(nw_add_s<Sat, T>(prev[j-1], sub[bcode[j - 1]]), nw_sub_s<Sat, T>(prev[j], ge_b)), static_cast<T>(0));
+                    v = std::max<T>(nw_opaque(t), nw_sub_s<Sat, T>(left, ge_a));
                     rowmax = std::max(rowmax, v);
                 } else {
-                    v = std::max({nw_add_s<Sat, T>(prev[j-1], sub[bcode[j - 1]]), nw_sub<T>(prev[j], ge_b), nw_sub<T>(left, ge_a)});
+                    v = std::max({nw_add_s<Sat, T>(prev[j-1], sub[bcode[j - 1]]), nw_sub_s<Sat, T>(prev[j], ge_b), nw_sub_s<Sat, T>(left, ge_a)});
                     if constexpr (local) {
                         v = std::max(v, static_cast<T>(0));
                         rowmax = std::max(rowmax, v);
