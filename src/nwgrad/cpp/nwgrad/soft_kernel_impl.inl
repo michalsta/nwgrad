@@ -60,7 +60,9 @@
 // loop over the row they just wrote (NWGRAD_SP_SPLIT_MAX): the same values, the same
 // order of additions.  The values are mass, never NaN or -0, so fmax equals the select.
 #  if !defined(NWGRAD_SP_VMAX) && defined(__GNUC__) && !defined(__clang__) && defined(__aarch64__)
-#    define NWGRAD_SP_VMAX(m, v) __builtin_fmax((m), (v))
+// Type-generic: __builtin_fmax on float operands promotes to double and the loop runs
+// scalar (the float32 soft pass was 1.3-2x slower than double on the M1, 2026-10-31).
+#    define NWGRAD_SP_VMAX(m, v) sp_fmax((m), (v))
 #    define NWGRAD_SP_SPLIT_MAX 1
 #  endif
 #  ifndef NWGRAD_SP_VMAX
@@ -141,6 +143,9 @@ static inline int sp_lazy(SF& mx, int lo, int hi, bool& bad, SF* r0, SF* r1 = nu
 // kSpTermsLinear (~7.5 here: the cell sum and the four-cell carry) and kSpTermsAffine,
 // the same counts the inter-pair soft kernels (inter_soft_impl.inl) charge, so a pair
 // passes or fails the range check whichever fill computes it.
+template <class SF> static inline SF sp_fmax(SF m, SF v) noexcept {
+    if constexpr (std::is_same_v<SF, float>) return __builtin_fmaxf(m, v); else return __builtin_fmax(m, v);
+}
 static constexpr double kSpTermsLinear = 16.0, kSpTermsAffine = 32.0;
 template <class SF>
 static inline double sp_loss(double terms, int n, int kf, int kb, SF mxf, SF mxb,
