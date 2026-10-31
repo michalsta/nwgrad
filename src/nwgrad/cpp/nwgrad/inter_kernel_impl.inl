@@ -117,6 +117,11 @@ template <class T>
 struct InterCommon {
     using ivd = typename IVT<T>::v; using ivl = typename IVT<T>::l;
     static constexpr int IW = IVT<T>::W;
+#if defined(__ARM_NEON)
+    static constexpr bool kMaskTranspose = IW >= 16;
+#else
+    static constexpr bool kMaskTranspose = IW >= 16 || (IW >= 8 && sizeof(T) == 2);
+#endif
     const InterJobT<T>& J;
     int levels;
     std::vector<ivl>& bits;
@@ -136,8 +141,12 @@ struct InterCommon {
         // a 22 x 50 DNA step at 4-8 lanes, nighthaven 2026-10-30); transposed in full
         // first, the loads find their bytes in L1.  From 8 lanes: at 4 (double on AVX2,
         // float32 / int32 at 128 bits) the lane-by-lane build is as cheap, and this form
-        // read 1.01-1.02 on the DNA double / float32 arms (5 rounds, nighthaven).
-        if constexpr (IW >= 8) {
+        // read 1.01-1.02 on the DNA double / float32 arms (5 rounds, nighthaven).  At 8
+        // lanes it is a win only for 2-byte lanes on x86 (SSE int16: 4-6 % on nighthaven and
+        // solace); NEON int16 LOST 2-6 % (spot, M1) and AVX2 float32 / int32 read a tie on
+        // nighthaven and 3-8 % slower score-only on solace (Tiger Lake), so those keep the
+        // lane-by-lane build (2026-10-31, the fleet round).
+        if constexpr (kMaskTranspose) {
             using E = std::remove_cvref_t<decltype(ivl{}[0])>;
             typedef unsigned char u8v __attribute__((vector_size(IW)));
             constexpr int EB = 8 * sizeof(E);
