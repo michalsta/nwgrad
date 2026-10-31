@@ -162,9 +162,10 @@ def run(args):
                         for t in types:
                             kw = dict(gap_model=gap, mode=mode, n_threads=th, kernel=level)
                             if output == "score": kw["grad_mode"] = "none"
-                            if output == "soft": kw.update(grad_mode="soft", soft_impl="scaled_or_log")
+                            if output == "soft": kw["grad_mode"] = "soft"
                             try:
                                 batch = cls_of(nwgrad, t)(A, B, p, **kw)
+                                if output == "soft": batch.soft_impl = "scaled_or_log"
                             except (ValueError, TypeError, RuntimeError) as e:
                                 emit(dict(level=level, threads=th, section=sec, fixture=fx, type=t,
                                           gap=gap, mode=mode, output=output, la=la, lb=lb, n=n,
