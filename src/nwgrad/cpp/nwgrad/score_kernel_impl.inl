@@ -299,7 +299,8 @@ static void score_affine_striped(ScoreJob<T>& job) {
 // (skynet) 0.60-0.95; int64 (AVX2 / AVX-512) 0.56-0.82; int16 0.74-0.93.  Bit-identical:
 // max is exact and associative, so Y is the separate carry's.  (A middle form, the ramp
 // in registers but the opens row kept, moved the cliff only and lost 3-10 % on NEON.)
-template <class T, bool Local, bool MOnly, bool Tr = false, bool Sat = false>
+// U2 (integer T): the row pass two segments a trip (see the loop).
+template <class T, bool Local, bool MOnly, bool Tr = false, bool Sat = false, bool U2 = false>
 static void score_affine_striped_pos(ScoreJob<T>& job) {
     using vd = stdx::native_simd<T>;
     const int W = (int)vd::size();
@@ -392,6 +393,63 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
             // loop — gcc kept that test on every segment (sse4: 3 branches per segment).
             fOprev = vsub<Sat>(vninf, fBase);   // nw_sat: stays -inf; its Q is then -inf + base, a drifted sentinel below every real value
         }
+        if constexpr (nw_is_int<T> && W >= 4 && U2) {
+            // Two segments a trip: both segments' loads first, the two cells, then the two
+            // carry steps.  The same operations in the same order per cell (bit-identical);
+            // what changes is the instruction order gcc emits -- it schedules a loop body
+            // as written and issued one segment's chain at a time, where clang unrolls the
+            // rolled loop by two and interleaves the iterations itself.  The diagonal of
+            // segment s is segment s-1's up vector, carried in a register (the rolled form
+            // reloads it).
+            auto cell = [&](const vd& dD, const vd& uD, const vd& uX, const vd& sb, int s,
+                            vd& mx, vd& vmv) __attribute__((always_inline)) {
+                vmv = vadd<Sat>(dD, sb);
+                if constexpr (Local) vmv = stdx::max(vmv, vzero);
+                const vd vxv = stdx::max(open_pen<Sat>(uD, vgo_b, vge_b, vgoe_b), vsub<Sat>(uX, vge_b));
+                mx = stdx::max(vmv, vxv);
+                vxv.copy_to(cX + (std::size_t)s * W, stdx::element_aligned);
+                mx.copy_to(cD + (std::size_t)s * W, stdx::element_aligned);
+            };
+            auto carry = [&](const vd& mx, const vd& vmv, int s) __attribute__((always_inline)) {
+                fP = stdx::max(fP, vadd<Sat>(fOprev, fR));
+                nv_store(cY + (std::size_t)s * W, fP);
+                fOprev = open_pen<Sat>(mx, vgo_a, vge_a, vgoe_a);
+                fR += vge_a;
+                if constexpr (Local) {
+                    if constexpr (MOnly) vbest = stdx::max(vbest, padded(vmv, s));
+                    else                 vbest = stdx::max(vbest, padded(mx, s));
+                }
+            };
+            vd dD;
+            {
+                vd lD; lD.copy_from(pD + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                dD = lane_shift_in(lD, bD);
+            }
+            int s = 0;
+            for (; s + 1 < seg; s += 2) {
+                vd sb0, sb1, uD0, uX0, uD1, uX1;
+                sb0.copy_from(sub + (std::size_t)s * W, stdx::element_aligned);
+                sb1.copy_from(sub + (std::size_t)(s + 1) * W, stdx::element_aligned);
+                uD0.copy_from(pD + (std::size_t)s * W, stdx::element_aligned);
+                uX0.copy_from(pX + (std::size_t)s * W, stdx::element_aligned);
+                uD1.copy_from(pD + (std::size_t)(s + 1) * W, stdx::element_aligned);
+                uX1.copy_from(pX + (std::size_t)(s + 1) * W, stdx::element_aligned);
+                vd mx0, vmv0, mx1, vmv1;
+                cell(dD, uD0, uX0, sb0, s, mx0, vmv0);
+                cell(uD0, uD1, uX1, sb1, s + 1, mx1, vmv1);
+                carry(mx0, vmv0, s);
+                carry(mx1, vmv1, s + 1);
+                dD = uD1;
+            }
+            if (s < seg) {
+                vd sb0, uD0, uX0, mx0, vmv0;
+                sb0.copy_from(sub + (std::size_t)s * W, stdx::element_aligned);
+                uD0.copy_from(pD + (std::size_t)s * W, stdx::element_aligned);
+                uX0.copy_from(pX + (std::size_t)s * W, stdx::element_aligned);
+                cell(dD, uD0, uX0, sb0, s, mx0, vmv0);
+                carry(mx0, vmv0, s);
+            }
+        } else
         for (int s = 0; s < seg; ++s) {
             vd dD;
             if (s == 0) {
@@ -683,6 +741,11 @@ static void score_affine_striped_pos_fp(ScoreJob<T>& job) {
 // The registered entry: Global or Local; job.variant 0 = the D/X form when both opens
 // are >= 0 (else fused three-state), 1 = two-pass, 2 = fused three-state (for measuring
 // the forms in one binary; NWGRAD_SCORE_VARIANT=twopass / fused3).
+// NWGRAD_SCORE_UNROLL=0 runs the rolled integer row pass (an A/B switch, one binary).
+static bool score_unroll2() noexcept {
+    static const bool on = [] { const char* e = std::getenv("NWGRAD_SCORE_UNROLL"); return !(e && e[0] == '0'); }();
+    return on;
+}
 template <class T, bool Tr, bool Sat = false>
 static void score_entry_impl(ScoreJob<T>& job) {
     if (job.variant == 1) {
@@ -711,6 +774,13 @@ static void score_entry_impl(ScoreJob<T>& job) {
                 else         score_affine_striped_pos_fp<T, true, false, Tr>(job);
             } else {
                 score_affine_striped_pos_fp<T, false, false, Tr>(job);
+            }
+        } else if (score_unroll2()) {
+            if (job.local) {
+                if (pos_ext) score_affine_striped_pos<T, true, true, Tr, Sat, true>(job);
+                else         score_affine_striped_pos<T, true, false, Tr, Sat, true>(job);
+            } else {
+                score_affine_striped_pos<T, false, false, Tr, Sat, true>(job);
             }
         } else {
             if (job.local) {
