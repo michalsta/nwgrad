@@ -155,6 +155,20 @@ static inline double sp_loss(double terms, int n, int kf, int kb, SF mxf, SF mxb
     const double lb = kb < 0 ? std::ldexp(1.0, -kb) : 1.0;
     return terms * (n + 1) * static_cast<double>(std::numeric_limits<SF>::min()) * (lf * mxb + lb * mxf) * g;
 }
+// The gradient pass multiplies table values -- F̂·P·B̂ for the match posteriors, F̂·B̂ for
+// the gap sums -- with B̂ taken from the backward row BEFORE its rescale, so B̂ reaches
+// mxpre, the row's pre-rescale max, which a row that overshot the window puts 2^kb above
+// the max sp_loss sees.  An intermediate of such a product can flush below MIN while the
+// posterior it carries is not small: at most MIN·B̂·g per product and cell.  Charged here
+// with the pre-rescale factors (gh0 / gv0); the constant covers the products per cell
+// with margin (the inter-pair kernels charge the same).  float32 found it (window 2^32,
+// T = 0.05, a 31 x 4 Global pair lost 20 % of a count with the bound at 5e-7); in double
+// the same term is ~2^-700.
+template <class SF>
+static inline double sp_loss_products(int n, SF mxpre, double gh0, double gv0) noexcept {
+    return 8.0 * (n + 1) * static_cast<double>(std::numeric_limits<SF>::min()) *
+           (static_cast<double>(mxpre) * gv0 + gh0 + gv0);
+}
 static inline double sp_post(int e, double izr, bool& bad) noexcept {
     const double f = std::ldexp(izr, e);
     if (!(f <= std::numeric_limits<double>::max())) bad = true;
@@ -349,6 +363,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear_t(SoftPairJobT<SF>& J) noexcept {
             }
             J.gpost[i] = bj;
         }
+        const SF mxpre = mx;
         const int kb = sp_lazy(mx, lo0, hi0, bad, cur);
         if (bad) return;
         const int Ti = Tn + kb;
@@ -356,6 +371,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear_t(SoftPairJobT<SF>& J) noexcept {
         const double gh0 = sp_post(S[i] + Tn - ze, izr, bad);
         const double gh = sp_post(S[i] + Ti - ze, izr, bad);
         loss += sp_loss(kSpTermsLinear, n, i > 0 ? S[i] - S[i - 1] : 0, kb, mf[i], mx, gh);
+        loss += sp_loss_products<SF>(n, mxpre, gh0, i >= 1 ? sp_post(S[i - 1] + Tn - ze, izr, bad) : 0.0);
         if (i >= kmin) {
             g_ea += sa * ea * gh0;
             if constexpr (Tr) J.grow[4 * i + 1] = -(sa * ea * gh0);
@@ -370,6 +386,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear_t(SoftPairJobT<SF>& J) noexcept {
         Tn = Ti;
         std::swap(cur, nxt); std::swap(clo, nlo); std::swap(chi, nhi);
     }
+    J.loss = loss;
     if (!(loss <= SoftRange<SF>::tol)) return;
     J.g_oa = 0.0; J.g_ea = -g_ea; J.g_ob = 0.0; J.g_eb = -g_eb;
     J.ok = 1;
@@ -596,12 +613,14 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine_t(SoftPairJobT<SF>& J) noexcept {
             }
             J.gpost[i] = bj;
         }
+        const SF mxpre = mx;
         const int kb = sp_lazy(mx, lo0, hi0, bad, cM, cX, cY);
         if (bad) return;
         const int Ti = Tn + kb;
         const double gh0 = sp_post(S[i] + Tn - ze, izr, bad);
         const double gh = sp_post(S[i] + Ti - ze, izr, bad);
         loss += sp_loss(kSpTermsAffine, n, i > 0 ? S[i] - S[i - 1] : 0, kb, mf[i], mx, gh);
+        loss += sp_loss_products<SF>(n, mxpre, gh0, i >= 1 ? sp_post(S[i - 1] + Tn - ze, izr, bad) : 0.0);
         g_eb += sx * gh0;
         g_ea += sy * gh0;
         if (i >= kmin) g_oa += so * oa * gh0;
@@ -621,6 +640,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine_t(SoftPairJobT<SF>& J) noexcept {
         std::swap(cM, nM); std::swap(cX, nX);
         std::swap(clo, nlo); std::swap(chi, nhi);
     }
+    J.loss = loss;
     if (!(loss <= SoftRange<SF>::tol)) return;
     J.g_oa = -g_oa; J.g_ea = -g_ea; J.g_ob = -g_ob; J.g_eb = -g_eb;
     J.ok = 1;

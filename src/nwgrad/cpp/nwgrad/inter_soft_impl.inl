@@ -374,6 +374,7 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_affine(InterSoftJobT<SF>& J) noexcept 
         }
         if (post)
             for (int l = 0; l < IW; ++l) J.gpost[static_cast<size_t>(i) * IW + l] = static_cast<int>(pbj[l]);
+        const ivd mxpre = mx;   // the backward row's max BEFORE its rescale (sp_loss_products)
         mx = rescale(cM, cX, cY, nullptr, mx);
         for (int l = 0; l < IW; ++l)
             if (kv[l]) {
@@ -398,6 +399,8 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_affine(InterSoftJobT<SF>& J) noexcept 
             const double lb = kb < 0 ? std::ldexp(1.0, -kb) : 1.0;
             // 32 terms per cell: sp_loss's kSpTermsAffine (both fills must agree).
             loss[l] += 32.0 * (n + 1) * DMIN * (lf * mx[l] + lb * mf[i][l]) * gh[l];
+            // the gradient products' lost intermediates, in the pre-rescale units (soft_kernel_impl.inl, sp_loss_products)
+            loss[l] += 8.0 * (n + 1) * DMIN * std::ldexp(static_cast<double>(mxpre[l]) * gv[l] + gh[l] + gv[l], kv[l]);
         }
         for (int l = 0; l < IW; ++l) {
             if (i > J.m[l]) continue;
@@ -666,6 +669,7 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_linear(InterSoftJobT<SF>& J) noexcept 
         else         cols(std::integral_constant<int, -1>{});
         if (post)
             for (int l = 0; l < IW; ++l) J.gpost[static_cast<size_t>(i) * IW + l] = static_cast<int>(pbj[l]);
+        const ivd mxpre = mx;
         mx = rescale(cur, mx);
         for (int l = 0; l < IW; ++l)
             if (kv[l]) {
@@ -684,6 +688,7 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_linear(InterSoftJobT<SF>& J) noexcept 
             const double lb = kb < 0 ? std::ldexp(1.0, -kb) : 1.0;
             // 16 terms per cell: sp_loss's kSpTermsLinear (both fills must agree).
             loss[l] += 16.0 * (n + 1) * DMIN * (lf * mx[l] + lb * mf[i][l]) * gh;
+            loss[l] += 4.0 * (n + 1) * DMIN * std::ldexp(static_cast<double>(mxpre[l]) * gv + gh + gv, kv[l]);
             const SF eal = Tr ? ea[l] : J.ea, ebl = Tr ? eb[l] : J.eb;
             if (i >= kmin) g_ea[l] += sa[l] * eal * gh;
             if constexpr (Tr) {

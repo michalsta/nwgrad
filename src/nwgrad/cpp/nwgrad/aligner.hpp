@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <string>
 #include <cstdlib>
+#include <cstdio>
 #include <string_view>
 #include <type_traits>
 #include <utility>
@@ -5116,6 +5117,10 @@ private:
         }
         if constexpr (std::is_same_v<SF, float>) { FlushDenormalsScope ftz; fn(J); }
         else fn(J);
+        if (std::getenv("NWGRAD_SOFT_DEBUG"))
+            std::fprintf(stderr, "soft<%s> m=%d n=%d ok=%d loss=%.3e tol=%.3e logz=%.6f\n",
+                         std::is_same_v<SF, float> ? "float" : "double", m_, n_, J.ok, J.loss,
+                         SoftRange<SF>::tol, J.log_z);
         if (!J.ok) return false;
         log_z_ = J.log_z;
         sg_go_a_ = J.g_oa; sg_ge_a_ = J.g_ea; sg_go_b_ = J.g_ob; sg_ge_b_ = J.g_eb;

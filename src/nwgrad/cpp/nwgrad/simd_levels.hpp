@@ -469,6 +469,7 @@ struct SoftPairJobT {
     double* scnt; F* srow;          // nalpha^2 (double: the counts accumulate across rows), nalpha
     double log_z, g_oa, g_ea, g_ob, g_eb;
     int ok;
+    double loss = 0.0;              // the lost-mass bound the run accumulated (diagnostics)
     // soft_guide="posterior" (nullptr = not wanted): m+1 entries, row i's column of
     // greatest EXIT mass (first on ties) — the posterior that the path leaves row i at
     // column j: the cell's posterior minus the mass moving on left into (i, j+1) (the Y
@@ -495,10 +496,13 @@ template <class T>
 using soft_float_t = std::conditional_t<std::is_same_v<T, float>, float, double>;
 // Per soft type: the lazy-rescale window [1/win, win] a row max may roam before its
 // row is rescaled (powers of two, exact), and the lost-mass tolerance (see
-// Aligner::run_fwdbwd).  float32: exponents reach 2^127, so the window is 2^32 (a
-// row grows by at most the largest weight per step, which itself is below 2^128);
-// the tolerance 2^-20 sits above the bound any normal pair accumulates (~1e-34 with
-// FLT_MIN terms) and below float32's own rounding, 2^-24 per operation.
+// Aligner::run_fwdbwd).  float32: the window is 2^8, not wider -- the gradient pass
+// multiplies a backward row BEFORE its rescale, so the row's pre-rescale max (the window
+// times one row's growth, up to 2^43 at low temperature) bounds what an intermediate of
+// those products can lose below FLT_MIN (sp_loss_products); at 2^32 a 31 x 4 Global pair
+// at T = 0.05 lost 20 % of a count with the bound at 5e-7.  The tolerance 2^-20 sits
+// above the bound any ordinary pair accumulates and below float32's own rounding, 2^-24
+// per operation.
 // The float32 soft pass runs with subnormals flushed to zero (x86 MXCSR FTZ + DAZ, AArch64
 // FPCR.FZ), restored on exit.  Below the lazy-rescale window a float32 cell far from the
 // alignment holds mass ~2^-100 of its row's max, subnormal in float32 (not in double,
@@ -527,7 +531,7 @@ struct FlushDenormalsScope {
 };
 template <class F> struct SoftRange;
 template <> struct SoftRange<double> { static constexpr double win = 0x1p256;  static constexpr double tol = 0x1p-45; };
-template <> struct SoftRange<float>  { static constexpr float  win = 0x1p32f;  static constexpr double tol = 0x1p-20; };
+template <> struct SoftRange<float>  { static constexpr float  win = 0x1p8f;   static constexpr double tol = 0x1p-20; };
 
 // ── Runtime overrides of the fill gates (nwgrad._tuning) ─────────────────────────
 // The gates below (and Aligner::linear_striped_min_n) are thresholds measured on one

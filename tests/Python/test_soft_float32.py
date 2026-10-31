@@ -7,6 +7,8 @@ the same way.  A float32 pair whose weights or lost-mass bound do not fit float3
 in double by itself, before soft_impl decides anything, so soft_impl="scaled" does not
 raise for it and the result is the double path's.
 """
+import zlib
+
 import numpy as np
 import pytest
 
@@ -19,6 +21,11 @@ RELD = 1e-9     # a float32 pair that fell back to double, against the double pa
 MODES = [(g, m) for g in ("linear", "affine") for m in ("global", "local")]
 ALPHA = "ACGT"
 PROT = nwgrad.PROTEIN.symbols
+
+
+def seed(*parts):
+    """A seed that does not change from one pytest process to the next (hash() is salted)."""
+    return zlib.crc32("|".join(map(str, parts)).encode())
 
 
 def dna_params(rng, scale=1.0, gaps=(1.0, 0.5, 1.5, 0.3)):
@@ -84,7 +91,7 @@ def test_default_precision_per_class():
 @pytest.mark.parametrize("alpha", ["ACGT", "protein"])
 @pytest.mark.parametrize("fill", ["interpair", "striped"])
 def test_float32_matches_double(gm, mode, alpha, fill):
-    rng = np.random.default_rng(hash((gm, mode, alpha, fill)) % 2**32)
+    rng = np.random.default_rng(seed(gm, mode, alpha, fill))
     params, sym = (dna_params(rng), ALPHA) if alpha == "ACGT" else (protein_params(rng), PROT)
     A, B = pairs(rng, sym)
     s32, m32, g32, b32 = run(nwgrad.SeqPairBatch, A, B, params, gm, mode, fill=fill)
@@ -99,7 +106,7 @@ def test_float32_matches_double(gm, mode, alpha, fill):
 
 @pytest.mark.parametrize("gm,mode", MODES)
 def test_float32_inter_matches_own(gm, mode):
-    rng = np.random.default_rng(hash(("inter", gm, mode)) % 2**32)
+    rng = np.random.default_rng(seed("inter", gm, mode))
     params = dna_params(rng)
     A, B = pairs(rng, ALPHA, 40)
     si, mi, gi, bi = run(nwgrad.SeqPairBatch, A, B, params, gm, mode, fill="interpair")
@@ -114,7 +121,7 @@ def test_out_of_range_falls_back_to_double(gm, mode):
     # Step scores of ~100 nats: exp overflows float32 (max ~88 nats) but not double, so
     # the float32 pass is refused and the pair reruns in double: soft_impl="scaled" does
     # not raise, and the result is the double path's.
-    rng = np.random.default_rng(hash(("range", gm, mode)) % 2**32)
+    rng = np.random.default_rng(seed("range", gm, mode))
     M = rng.normal(0.0, 1.0, (4, 4)) + 100.0 * np.eye(4)
     params = nwgrad.AlignParams(nwgrad.SubstMatrix(M, ALPHA), 1.0, 0.5, 1.5, 0.3)
     # Short pairs only: with 100-nat steps the double bound itself refuses a 50 x 22 pair.
@@ -127,18 +134,23 @@ def test_out_of_range_falls_back_to_double(gm, mode):
 
 @pytest.mark.parametrize("gm,mode", MODES)
 def test_low_temperature_in_range(gm, mode):
-    rng = np.random.default_rng(hash(("temp", gm, mode)) % 2**32)
-    params = dna_params(rng, scale=0.5)
-    A, B = pairs(rng, ALPHA, 20)
-    for T in (0.5, 0.2, 0.05):
-        s32, m32, g32, _ = run(nwgrad.SeqPairBatch, A, B, params, gm, mode, impl="scaled_or_log", T=T)
-        s64, m64, g64, _ = run(nwgrad.SeqPairBatchDouble, A, B, params, gm, mode, impl="scaled_or_log", T=T)
-        close(s32, s64, 5e-4, 1e-5); close(m32, m64, 5e-4, 1e-5); close(g32, g64, 5e-4, 1e-5)
+    # Several draws: at T = 0.05 a 31 x 4 Global pair once lost 20 % of a count inside the
+    # float32 pass with its lost-mass bound at 5e-7 (the gradient products' intermediates
+    # on the pre-rescale backward row; sp_loss_products in soft_kernel_impl.inl).  The
+    # float32 pass must either be accurate or hand the pair to double.
+    for draw in range(8):
+        rng = np.random.default_rng(seed("temp", gm, mode, draw))
+        params = dna_params(rng, scale=0.5)
+        A, B = pairs(rng, ALPHA, 20)
+        for T in (0.5, 0.2, 0.05, 0.04):
+            s32, m32, g32, _ = run(nwgrad.SeqPairBatch, A, B, params, gm, mode, impl="scaled_or_log", T=T)
+            s64, m64, g64, _ = run(nwgrad.SeqPairBatchDouble, A, B, params, gm, mode, impl="scaled_or_log", T=T)
+            close(s32, s64, 5e-4, 1e-5); close(m32, m64, 5e-4, 1e-5); close(g32, g64, 5e-4, 1e-5)
 
 
 @pytest.mark.parametrize("gm,mode", MODES)
 def test_posterior_guide_agrees(gm, mode):
-    rng = np.random.default_rng(hash(("post", gm, mode)) % 2**32)
+    rng = np.random.default_rng(seed("post", gm, mode))
     params = dna_params(rng)
     A, B = pairs(rng, ALPHA, 20, 5, 40)
     *_, b32 = run(nwgrad.SeqPairBatch, A, B, params, gm, mode, guide="posterior")
@@ -153,7 +165,7 @@ def test_posterior_guide_agrees(gm, mode):
 
 @pytest.mark.parametrize("gm,mode", MODES)
 def test_stream_float32_matches_double(gm, mode):
-    rng = np.random.default_rng(hash(("stream", gm, mode)) % 2**32)
+    rng = np.random.default_rng(seed("stream", gm, mode))
     params = protein_params(rng)
     A, B = pairs(rng, PROT, 20)
     for fill in ("interpair", "striped"):
