@@ -2161,6 +2161,59 @@ int16 score 5.3 / 5.6 us against scan16 12.1 / 13.7 (2.3x / 2.4x).
 Checks on the combined branch: the C++ suite (2.93 M assertions, 201 cases) and the Python
 suite (4497) on skynet, ASan + UBSan on the integer cases, `tools/fuzz_ab.py` main vs
 branch (300 seeds, 0 differ).
+**The fleet round (2026-10-31; spot under macOS, solace under Gentoo).** Builds as the
+wheels': spot Homebrew g++-16 (no injected hardening, `-static-libstdc++`), solace gcc 16.2 and
+clang 22 with the release flags; A = main, B = the branch, `ab_int.py` (1 thread, best of
+3, control arm A'/A 0.98-1.02 unless noted).  **solace avx512**: protein int16 hard 0.828,
+score-only 0.801, stream 0.754; float32 hard 0.945, double 0.936, int32 0.934 / stream
+0.869; DNA int16 score-only 0.937, stream 0.898, int32 stream 0.908, float32 score 0.953;
+avx2 and sse4 on the same box as nighthaven's (int16 protein 0.81-0.90, float32 / double hard
+0.87-0.93); 8 threads the same picture (int16 protein 0.77-0.83); Global mode int16 protein
+0.80-0.88.  L1000 int16 Local at avx512: hard 205 us a pair (0.26x float32, int32 0.51x), score-only 110 (0.19x; int32 139); L2000 score-only 417 (0.19x; int32 969).  **spot neon** (M1, the user at the
+desktop): protein int16 hard 0.898, score-only 0.872, stream 0.863; float32 hard 0.933,
+double 0.910, int32 0.946; Global mode int16 0.936 / 0.863 / 0.899; L1000 int16 Local 550 us
+(0.37x float32, int32 0.83x), L2000 2152 (0.37x) -- the int16 ratio on M1 is the same as
+on AVX2.  Two regressions the nighthaven round could not see, both fixed on the branch:
+(1) **the `scalar_fallback` backend at int16 was 1.36-1.57x SLOWER** (every fixture, every
+arm, x86 and NEON alike): the aligner's scalar fills had taken `nw_add` / `nw_sub` at every
+site, a compare and cmov per step whether the regime needed them or not.  They are now
+`nw_add_s<Sat>` / `nw_sub_s<Sat>` -- the clamp only in the saturating regime, the plain
+operation otherwise (the same bits: inside the quarter rule the clamp never fires) --
+with the fills, the Hirschberg sweeps / bases / scans and the linear ones templated on
+`Sat` and dispatched once per problem (`sat_dispatch_`).  After: scalar_fallback int16 hard
+0.985-0.993, stream 0.969-0.983, score-only 0.80-0.82 (nighthaven, main = 1).
+(2) **DNA int16 on NEON 1.02-1.06** (hard and score-only, Local and Global): the inter-pair
+mask transposition at EIGHT lanes.  Measured with the transposition gated from 16 lanes instead (same tree, `IW >= 16`;
+B / A = from 16 / from 8, A'/A 0.98-1.02): spot neon int16 0.963-0.978 (Local and Global),
+float32 / int32 untouched -- so on NEON the lane-by-lane build wins at 8 lanes; nighthaven
+sse4 int16 1.040 / 1.056 / 1.035 (hard / score / stream; Global 1.04 / 1.06 / 1.03) -- the
+transposition WINS at 8 lanes there, avx2 float32 / int32 (8 lanes too) 0.99-1.02 either
+way; solace sse4 int16 1.041 / 0.991 / 1.038 (Global 1.02 / 0.97 / 1.02), avx2 float32
+score-only 0.972 (Global 0.943) and int32 score-only 0.923 (Global 0.960), hard / stream
+1.00 -- on Tiger Lake the 8-lane transposition LOSES for the 4-byte lanes, where nighthaven
+read a tie.  So the gate is now `kMaskTranspose`: from 16 lanes everywhere, and from 8
+lanes only for 2-byte lanes on x86 (SSE int16); NEON int16 and AVX2 float32 / int32 keep
+the lane-by-lane build.  The branch's final head against main, after both fixes (1 thread,
+3 rounds, A'/A 0.996-1.019): spot neon DNA int16 0.998 / 1.000 / 0.938 (hard / score /
+stream), scalar_fallback int16 DNA 0.993 / 0.945 / 0.988 and protein 1.004 / 0.961 / 0.997,
+protein neon int16 0.884 / 0.873 / 0.859, float32 0.926, double 0.896, int32 0.945, every
+other cell 0.97-1.01; nighthaven (avx2 / sse4 / sse2 / scalar_fallback) protein int16
+hard 0.922 / 0.936 / 0.957 / 0.982, score-only 0.859 / 0.898 / 0.994 / 0.808, stream
+0.861 / 0.887 / 0.922 / 0.983, float32 hard 0.906 / 0.870 / 0.894 / 1.003, double 0.876 /
+0.829 / 0.871 / 0.999, int32 0.977 / 0.959 / 0.901 / 0.996; DNA int16 score-only 0.955 /
+0.932 / 1.002 / 0.799, stream 0.897 / 0.901 / 0.912 / 0.984; no cell above 1.017 (A'/A
+0.989-1.011); solace (avx512 / avx2 / sse4 / scalar_fallback) protein int16 hard 0.840 /
+0.880 / 0.911 / 0.997, score-only 0.807 / 0.816 / 0.858 / 0.900, stream 0.770 / 0.823 /
+0.878 / 0.998, float32 and double hard 0.88-0.95, int32 stream 0.86-0.88, DNA int16
+score-only 0.941 / 0.963 / 0.975 / 0.905, stream 0.900 / 0.911 / 0.921 / 0.998; its one
+cell above 1.015, protein sse4 double score-only 1.03-1.04 in both runs, executes the same
+instructions on both builds (`perf stat`, 30.15 G against 30.12 G; nighthaven reads 1.00),
+so it is placement, not code.
+Checks on the final head (`62a3278`): the Python suite on skynet (4499), spot (4433) and
+solace (4623); the C++ suite on skynet (sse4, 2.93 M assertions), spot (neon, gcc 16:
+2.86 M) and solace (avx512, gcc: 3.11 M; the branch also builds and passes the integer
+tests under clang 22 at avx512), with the integer tag at sse2 / sse4 / scalar_fallback;
+`tools/fuzz_ab.py` main vs branch 300 seeds, 0 differ (skynet).
 
 ### The soft path: scaled probability space (2026-10-05)
 

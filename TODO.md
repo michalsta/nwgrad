@@ -173,13 +173,15 @@ DiscrimAlign does: it passes the logical core count.
   435 (int32 1345), 1.44-1.49x parasail's scan16.  Left: (1) the regime's reach is the
   sentinel's depth, 32768 for the values' whole range: ~L2300 for BLOSUM62 11/1, ~L880
   guide-banded Global (the band's floor is the move-count bound; a bound from the guide
-  path's own prefix scores would lift it); (2) NEON and AVX-512 not yet run
-  (spot / solace were off limits for the round): `vqaddq_s16` / `vqsubq_s16` and
-  `_mm512_adds_epi16` are written, untested; (3) the scalar fills saturate always (a clamp
-  per op): the short-row scalar linear fill and `scalar_fallback` of int16 carry it,
-  unmeasured.
-- The streaming `align()` validates integer params per pair (the aligner's `nw_int_prepare`
-  on the caller's params, O(K * nalpha^2) a pair); prepare once per call as the batch does.
+  path's own prefix scores would lift it).  (2) and (3) of the first round are closed by the
+  fleet round (2026-10-31, AGENTS "The fleet round"): NEON (spot) and AVX-512 (solace, gcc
+  and clang) build, pass the suites and gain the same way (solace avx512 int16 protein
+  hard 0.83, score-only 0.80; spot neon 0.90 / 0.87); the scalar fills clamp only in the
+  saturating regime now (`nw_add_s<Sat>`; `scalar_fallback` int16 had been 1.4-1.6x slower
+  with the unconditional clamp), and the inter-pair mask transposition is gated per lane
+  width and architecture (`kMaskTranspose`).
+- (The streaming `align()` prepares integer params once per worker since 2026-10-30,
+  `StreamPrep`: AGENTS "Small-integer round".)
 - `score()` / `scores()` stay double: exact below 2^53, so an int64 score above that
   (parameters ~2^40) loses bits in the report.
 - (int16 saturating arithmetic: done, above.)
