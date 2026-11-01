@@ -179,10 +179,12 @@ static inline double sp_loss_products(SF lb, SF lc, double gh0, double gv0) noex
 // (sse4, 2026-11-01).  kSpCount: the float32 instantiation only.
 // NWGRAD_SP_NOCOUNT / NWGRAD_SP_NOFMA: timing probes only (the bound is unsound without
 // the counts).
-#ifndef NWGRAD_SP_NOCOUNT
-#  define NWGRAD_SP_COUNT_F32 1
-#else
-#  define NWGRAD_SP_COUNT_F32 0
+#ifndef NWGRAD_SP_COUNT_F32
+#  ifndef NWGRAD_SP_NOCOUNT
+#    define NWGRAD_SP_COUNT_F32 1
+#  else
+#    define NWGRAD_SP_COUNT_F32 0
+#  endif
 #endif
 #if (defined(__FMA__) || defined(__ARM_FEATURE_FMA)) && !defined(NWGRAD_SP_NOFMA)
 #  define NWGRAD_SP_MAC(acc, a, b) do { if constexpr (kSpCount) (acc) = std::fma((a), (b), (acc)); else (acc) += (a) * (b); } while (0)

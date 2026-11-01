@@ -59,6 +59,15 @@
 
 // Tracked lanes (J.rs): weight f (0 oa, 1 ea, 2 ob, 3 eb) of DP row i, per lane — each
 // lane's own row, clamped to its last row past its A (rows it computes and ignores).
+// NWGRAD_SP_COUNT_F32: the float32 kernels count their flushed products (soft_kernel_impl.inl
+// defines it too; NWGRAD_SP_NOCOUNT is a timing probe that turns the counting off).
+#ifndef NWGRAD_SP_COUNT_F32
+#  ifndef NWGRAD_SP_NOCOUNT
+#    define NWGRAD_SP_COUNT_F32 1
+#  else
+#    define NWGRAD_SP_COUNT_F32 0
+#  endif
+#endif
 template <class SF>
 static inline typename IVT<SF>::v isj_w(const InterSoftJobT<SF>& J, int i, int f) noexcept {
 NWGRAD_IS_LANES;
