@@ -43,7 +43,7 @@ def batch_results(A, B, params, gm, mode, impl, threads=2):
 
 def close(x, y, cls=nwgrad.SeqPairBatchDouble):
     # The float32 class runs its soft pass in float32: ~1e-6 relative of double.
-    f32 = cls is nwgrad.SeqPairBatch
+    f32 = "Double" not in getattr(cls, "__name__", "")   # (by name: the forced-kernel conftest wraps the class)
     np.testing.assert_allclose(x, y, rtol=2e-4 if f32 else REL, atol=1e-5 if f32 else ABS)
 
 
@@ -454,7 +454,7 @@ def test_soft_guide_posterior(gm, mode, cls):
     rows = sum(len(g) for g in guides[0])
     for other in guides[1:]:
         same = sum(x == y for g, h in zip(guides[0], other) for x, y in zip(g, h))
-        assert same / rows >= (0.95 if cls is nwgrad.SeqPairBatch else 0.97)
+        assert same / rows >= (0.95 if "Double" not in getattr(cls, "__name__", "") else 0.97)
     for a, b, g in zip(A, B, guides[0]):
         assert len(g) == len(a) + 1 and g == sorted(g) and 0 <= g[0] and g[-1] <= len(b)
     runs[2].banded_grad(4)   # usable as a band centre

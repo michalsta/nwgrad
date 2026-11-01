@@ -347,29 +347,32 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_affine(InterSoftJobT<SF>& J) noexcept 
             for (int j = n; j >= 1; --j) {
                 const auto [mv, xv] = cell(j);
                 const ivd y = c;
-                ivd t;
                 if constexpr (std::is_same_v<SF, float>) {
                     // float32: the products named, their flushes counted (sp_loss_products,
-                    // soft_kernel_impl.inl); double keeps the plain statements below.
+                    // soft_kernel_impl.inl); the double body below is the original, untouched
+                    // (a shared `t` across the two branches cost it a spilled accumulator).
                     const ivd ax = fX[j], ay = fY[j], ao = fM[j - 1] + fX[j - 1], aob = qM[j] + qY[j];
                     const ivd px = ax * xv, py = ay * y, po = ao * y, pob = aob * xv;
                     sx += px; sy += py; so += po; sob += pob;
                     const ivd qs = qM[j - 1] + qX[j - 1] + qY[j - 1], t1 = qs * Ec[j];
-                    t = t1 * mv;
+                    const ivd t = t1 * mv;
                     lbv += ivsel((qs > z) & (t1 == z), mv, z);
                     lcv += ivsel((px == z) & (ax > z) & (xv > z), one, z) + ivsel((py == z) & (ay > z) & (y > z), one, z)
                          + ivsel((po == z) & (ao > z) & (y > z), one, z) + ivsel((pob == z) & (aob > z) & (xv > z), one, z)
                          + ivsel((t == z) & (t1 > z) & (mv > z), one, z);
+                    if (big) trow[j] = t;
+                    const ivl* mk = eqm + static_cast<size_t>(j) * k;
+                    for (int cc = 0; cc < k; ++cc) acc[cc] += ivsel(mk[cc], t, z);
                 } else {
                     sx += fX[j] * xv;
                     sy += fY[j] * y;
                     so += (fM[j - 1] + fX[j - 1]) * y;
                     sob += (qM[j] + qY[j]) * xv;
-                    t = (qM[j - 1] + qX[j - 1] + qY[j - 1]) * Ec[j] * mv;
+                    const ivd t = (qM[j - 1] + qX[j - 1] + qY[j - 1]) * Ec[j] * mv;
+                    if (big) trow[j] = t;
+                    const ivl* mk = eqm + static_cast<size_t>(j) * k;
+                    for (int cc = 0; cc < k; ++cc) acc[cc] += ivsel(mk[cc], t, z);
                 }
-                if (big) trow[j] = t;
-                const ivl* mk = eqm + static_cast<size_t>(j) * k;
-                for (int cc = 0; cc < k; ++cc) acc[cc] += ivsel(mk[cc], t, z);
             }
             };
             if (nm == 4) cols(std::integral_constant<int, 4>{});
@@ -679,15 +682,19 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_linear(InterSoftJobT<SF>& J) noexcept 
                     else sb += q[j] * b;
                 }
                 if (j >= 1) {
-                    ivd t;
                     if constexpr (kc) {
-                        const ivd t1 = q[j - 1] * Ec[j]; t = t1 * b;
+                        const ivd t1 = q[j - 1] * Ec[j], t = t1 * b;
                         lbv += ivsel((q[j - 1] > z) & (t1 == z), b, z);
                         lcv += ivsel((t == z) & (t1 > z) & (b > z), one, z);
-                    } else t = q[j - 1] * Ec[j] * b;
-                    if (big) trow[j] = t;
-                    const ivl* mk = eqm + static_cast<size_t>(j) * k;
-                    for (int cc = 0; cc < k; ++cc) acc[cc] += ivsel(mk[cc], t, z);
+                        if (big) trow[j] = t;
+                        const ivl* mk = eqm + static_cast<size_t>(j) * k;
+                        for (int cc = 0; cc < k; ++cc) acc[cc] += ivsel(mk[cc], t, z);
+                    } else {
+                        const ivd t = q[j - 1] * Ec[j] * b;
+                        if (big) trow[j] = t;
+                        const ivl* mk = eqm + static_cast<size_t>(j) * k;
+                        for (int cc = 0; cc < k; ++cc) acc[cc] += ivsel(mk[cc], t, z);
+                    }
                 }
             }
         }
