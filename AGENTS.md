@@ -2308,7 +2308,18 @@ sends everything to the own fill; the small-alphabet caps have no override), so
 `gate_sweep.py` and `_tuning.defaults()` (which now shows the default backend's float32
 values) still work.
 
-**Verified.** [the validation sweep: the new defaults against the better arm per host]
+**Verified.** The reduced sweep rerun with the compiled table as the default arm (every
+level, 1 thread and all, 1148 / 3600 / 4800 configurations), default / better arm:
+- spot (NEON): median 1.003; 36 configurations over 1.08 (3.1 %; the first table 63), 8
+  over 1.15 (35), 2 over 1.3 (13), the worst 1.38 (1.64) -- single lengths, none in a run.
+- nighthaven (AVX2 / SSE4 / SSE2): median 1.001; at its default level, AVX2, 16 of 1148
+  over 1.08 (1.4 %; the first table 43), none over 1.15 (14), the worst 1.15 (1.58); SSE4
+  18 / 7 / 1 over 1.08 / 1.15 / 1.3 (106 / 67 / 21), SSE2 30 / 21 / 5 (129 / 102 / 54; its
+  own int16 and int64 kernels are slower than SSE4's and the SSE table is SSE4's).
+- solace (AVX-512 / AVX2 / SSE4 / SSE2): median 1.001; at its default level, AVX-512, 4 of
+  1148 over 1.08 (0.3 %; the first table 34), 2 over 1.15 (31), none over 1.3 (21), the
+  worst 1.18 (1.94); AVX2 24 / 11 / 1 (36 / 14 / 3), SSE4 19 / 3 / 0 (89 / 53 / 19), SSE2
+  12 / 1 / 0 of 948 (123 / 101 / 47).
 
 ### The soft path: scaled probability space (2026-10-05)
 
