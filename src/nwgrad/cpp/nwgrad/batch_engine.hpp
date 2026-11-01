@@ -763,7 +763,7 @@ private:
         for (size_t i = 0; i < N; ++i) {
             const size_t la = problems[i].seq_a.size(), lb = problems[i].seq_b.size();
             if (la == 0 || lb == 0 || (hb_case && hb_splits(tb_resolved_, s_.traceback == TracebackMode::Default ? FullAl::kAutoPointerCells : 0, s_.hb_cutoff, la, lb)) ||
-                !inter_pair_fits(la, lb, GM == GapModel::Affine, soft, inter_w_(K), sizeof(T), K.d.inter_w)) {
+                !inter_pair_fits<T>(la, lb, GM == GapModel::Affine, soft, inter_w_(K), K.d.inter_w, s_.n_threads == 1, backend)) {
                 other.push_back(i); continue;
             }
             if constexpr (nw_sat<T>)
@@ -774,7 +774,7 @@ private:
             // groups are gated by inter_score_ok in the loop)
             if constexpr (GM == GapModel::Linear)
                 if (grad_mode_ == GradMode::Hard && params.matrix.size() > 8 &&
-                    (la + 1) * (lb + 1) > inter_linear_gather_cap<T, AM == AlignMode::Global>()) {
+                    (la + 1) * (lb + 1) > inter_linear_gather_cap<T, AM == AlignMode::Global>(backend)) {
                     other.push_back(i); continue;
                 }
             elig.push_back(i);
@@ -917,7 +917,7 @@ private:
             }
             if constexpr (AB == AlignBand::Full) {
                 if (grad_mode_ == GradMode::None && has_inter_score_(K)) {
-                    if (!inter_score_ok(na, M, n)) {   // the gather: short pairs only
+                    if (!inter_score_ok<T>(na, M, n, GM == GapModel::Affine, K.level)) {   // the gather: short pairs only
                         for (size_t l = 0; l < real; ++l) own(elig[s + l]);
                         continue;
                     }
@@ -2108,8 +2108,8 @@ private:
         if constexpr (nw_sat<T>)
             if (nw_int_bound_check<T, AM == AlignMode::Local, false>(params_->ib, static_cast<int>(len_a(i)), static_cast<int>(len_b(i))) != 0)
                 return false;
-        if (!inter_pair_fits(len_a(i), len_b(i), GM == GapModel::Affine,
-                             grad_mode_ == GradMode::Soft, inter_w_(K), sizeof(T), K.d.inter_w))
+        if (!inter_pair_fits<T>(len_a(i), len_b(i), GM == GapModel::Affine,
+                                grad_mode_ == GradMode::Soft, inter_w_(K), K.d.inter_w, s_.n_threads == 1, K.level))
             return false;
         // Linear, integer T, alphabet over 8: the inter-pair fill gathers per lane-cell,
         // and the leveled striped linear kernel now beats it past ~L120 (inter / own, Local
@@ -2120,7 +2120,7 @@ private:
         // (floating T: capped on AArch64 only, inter_linear_gather_cap — simd_levels.hpp)
         if constexpr (GM == GapModel::Linear)
             if (alpha_->size() > 8 && grad_mode_ != GradMode::Soft &&
-                (len_a(i) + 1) * (len_b(i) + 1) > inter_linear_gather_cap<T, AM == AlignMode::Global>())
+                (len_a(i) + 1) * (len_b(i) + 1) > inter_linear_gather_cap<T, AM == AlignMode::Global>(K.level))
                 return false;
         // Hirschberg pairs past the cutoff split: no shared fill.
         return !hb_splits(tb_resolved_, s_.traceback == TracebackMode::Default ? FullAl::kAutoPointerCells : 0, s_.hb_cutoff, len_a(i), len_b(i));
@@ -2516,7 +2516,7 @@ private:
                     n = std::max(n, nb[l]);
                     ragged |= nb[l] != nb[0];
                 }
-                if (!inter_score_ok(alpha_->size(), M, n)) {   // the gather: short pairs only
+                if (!inter_score_ok<T>(alpha_->size(), M, n, GM == GapModel::Affine, plan_.backend)) {   // the gather: short pairs only
                     for (size_t l = 0; l < real; ++l) own(plan_.elig[s + l]);
                     continue;
                 }
