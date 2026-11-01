@@ -890,7 +890,7 @@ struct Aligner {
             const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
             if (backend != kBackendScalar) {
                 const auto fn = level_kernels(backend).template of<T>().score;
-                if (fn && AM != AlignMode::Glocal) {   // Glocal: the scalar fill, until its kernel exists
+                if (fn) {
                     ScoreJob<T> job{}; job.sat = sat_;
                     job.a = a_idx_.data(); job.m = m_;
                     job.b = b_idx_.data(); job.n = n_;

@@ -318,3 +318,22 @@ def test_band_around_the_alignment(generic_matrix):
 def test_mode_name_rejected_elsewhere():
     with pytest.raises(ValueError, match="glocal"):
         nwgrad.SeqPairBatch(n_threads=1, mode="glocla")
+
+
+# ── The score-only kernels against the scalar fill, bit for bit ─────────────
+
+@pytest.mark.parametrize("cls,fn_aff,fn_lin", [
+    (nwgrad.SeqPairDouble, nwgrad.glocal_score_affine_double, nwgrad.glocal_score_double),
+    (nwgrad.SeqPair, nwgrad.glocal_score_affine, nwgrad.glocal_score),
+])
+def test_score_only_equals_the_pointer_fill(generic_matrix, cls, fn_aff, fn_lin):
+    # the score-only kernel of the running backend vs the traceback fill: the exact
+    # optimum, bit-identical (as test_score_only pins it for the other modes)
+    rng = random.Random(77)
+    for oa, ea, ob, eb in ((2.0, 1.0, 1.5, 0.5), (0.0, 0.5, 0.0, 1.0), (3.0, 0.0, 1.0, 0.0)):
+        p = params(generic_matrix, oa, ea, ob, eb)
+        for _ in range(25):
+            a = "".join(rng.choice(ALPHABET) for _ in range(rng.randint(0, 40)))
+            b = "".join(rng.choice(ALPHABET) for _ in range(rng.randint(0, 70)))
+            assert fn_aff(a, b, p) == cls(a, b, p, mode="glocal", traceback="pointers").align()
+            assert fn_lin(a, b, p) == cls(a, b, p, gap_model="linear", mode="glocal").align()

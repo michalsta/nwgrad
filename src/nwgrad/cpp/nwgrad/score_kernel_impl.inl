@@ -32,7 +32,10 @@
 
 // Tr: a tracked problem (job.tr; see striped_affine_full) — each row's penalties,
 // border and profile row from the track arrays.
-template <class T, bool Local, bool Fused, bool Tr = false, bool Sat = false>
+// Glocal (Local false): row 0 is a free start (M = 0 at every column, no Y series), column
+// 0 Global's chain, and the score is the best cell of the last row in any state (the
+// padding masked, as Local's maximum).
+template <class T, bool Local, bool Fused, bool Tr = false, bool Sat = false, bool Glocal = false>
 static void score_affine_striped(ScoreJob<T>& job) {
     using vd = stdx::native_simd<T>;
     const int W = (int)vd::size();
@@ -67,7 +70,7 @@ static void score_affine_striped(ScoreJob<T>& job) {
     // cell (the fill's argmax scans real columns only).  Added, not selected: x + 0 = x
     // exactly, x + -inf = -inf, and no mask op (see kernels_impl.inl's AVX-512/clang note).
     const T* pad = nullptr;
-    if constexpr (Local) pad = striped_pad_into<T, Sat>(rows + 7 * rs, n, seg, W);
+    if constexpr (Local || Glocal) pad = striped_pad_into<T, Sat>(rows + 7 * rs, n, seg, W);
     auto padded = [&](const vd& v, int s) {
         vd p; p.copy_from(pad + (std::size_t)s * W, stdx::element_aligned);
         return vadd<Sat>(v, p);
@@ -86,8 +89,8 @@ static void score_affine_striped(ScoreJob<T>& job) {
             const int j = l * seg + s + 1;
             if (j <= n) {
                 const std::size_t k = (std::size_t)s * W + l;
-                if constexpr (Local) pM[k] = 0;
-                else                 pY[k] = -(go_a + j * ge_a);
+                if constexpr (Local || Glocal) pM[k] = 0;
+                else                           pY[k] = -(go_a + j * ge_a);
             }
         }
 
@@ -267,6 +270,19 @@ static void score_affine_striped(ScoreJob<T>& job) {
         T best = 0;
         for (int q = 0; q < W; ++q) best = std::max(best, static_cast<T>(vbest[q]));
         job.score = best;
+    } else if constexpr (Glocal) {
+        // the best cell of the last row computed (row 0 when m == 0), any state
+        vd vb = vninf;
+        for (int s = 0; s < seg; ++s) {
+            vd vm, vx, vy;
+            vm.copy_from(pM + (std::size_t)s * W, stdx::element_aligned);
+            vx.copy_from(pX + (std::size_t)s * W, stdx::element_aligned);
+            vy.copy_from(pY + (std::size_t)s * W, stdx::element_aligned);
+            vb = stdx::max(vb, padded(stdx::max(stdx::max(vm, vx), vy), s));
+        }
+        T best = NINF;
+        for (int q = 0; q < W; ++q) best = std::max(best, static_cast<T>(vb[q]));
+        job.score = best;
     } else {
         // (m, n) in the last row computed (row 0 when m == 0), striped
         const std::size_t k = (std::size_t)((n - 1) % seg) * W + (std::size_t)((n - 1) / seg);
@@ -299,7 +315,7 @@ static void score_affine_striped(ScoreJob<T>& job) {
 // (skynet) 0.60-0.95; int64 (AVX2 / AVX-512) 0.56-0.82; int16 0.74-0.93.  Bit-identical:
 // max is exact and associative, so Y is the separate carry's.  (A middle form, the ramp
 // in registers but the opens row kept, moved the cliff only and lost 3-10 % on NEON.)
-template <class T, bool Local, bool MOnly, bool Tr = false, bool Sat = false>
+template <class T, bool Local, bool MOnly, bool Tr = false, bool Sat = false, bool Glocal = false>
 static void score_affine_striped_pos(ScoreJob<T>& job) {
     using vd = stdx::native_simd<T>;
     const int W = (int)vd::size();
@@ -328,7 +344,7 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
     // (MOnly's M padding is clamped to exactly 0 for floating T — the padding profile is
     // -inf — but an integer T pads the profile with 0 (nw_pad), so its padding M is a
     // real value and needs the mask too.)
-    if constexpr (Local && (!MOnly || nw_is_int<T>)) pad = striped_pad_into<T, Sat>(rows + 5 * rs, n, seg, W);
+    if constexpr ((Local && (!MOnly || nw_is_int<T>)) || Glocal) pad = striped_pad_into<T, Sat>(rows + 5 * rs, n, seg, W);
     auto padded = [&](const vd& v, int s) {
         vd p; p.copy_from(pad + (std::size_t)s * W, stdx::element_aligned);
         return vadd<Sat>(v, p);
@@ -346,8 +362,8 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
             const int j = l * seg + s + 1;
             if (j <= n) {
                 const std::size_t k = (std::size_t)s * W + l;
-                if constexpr (Local) pD[k] = 0;
-                else                 pD[k] = -(go_a + j * ge_a);
+                if constexpr (Local || Glocal) pD[k] = 0;
+                else                           pD[k] = -(go_a + j * ge_a);
             }
         }
 
@@ -497,6 +513,15 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
         T best = 0;
         for (int q = 0; q < W; ++q) best = std::max(best, static_cast<T>(vbest[q]));
         job.score = best;
+    } else if constexpr (Glocal) {
+        vd vb = vninf;   // the best cell of the last row (D = every state), padding masked
+        for (int s = 0; s < seg; ++s) {
+            vd v; v.copy_from(pD + (std::size_t)s * W, stdx::element_aligned);
+            vb = stdx::max(vb, padded(v, s));
+        }
+        T best = NINF;
+        for (int q = 0; q < W; ++q) best = std::max(best, static_cast<T>(vb[q]));
+        job.score = best;
     } else {
         const std::size_t k = (std::size_t)((n - 1) % seg) * W + (std::size_t)((n - 1) / seg);
         job.score = pD[k];
@@ -511,7 +536,7 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
 // AGENTS.md ("The gap carry, shortened").  Floating T only: -inf - ge stays -inf, where an
 // integer sentinel stepped by - ge per segment could wrap (the integer types take the exact
 // prefix-max carry in score_affine_striped_pos instead).
-template <class T, bool Local, bool MOnly, bool Tr = false>
+template <class T, bool Local, bool MOnly, bool Tr = false, bool Glocal = false>
 static void score_affine_striped_pos_fp(ScoreJob<T>& job) {
     using vd = stdx::native_simd<T>;
     const int W = (int)vd::size();
@@ -537,7 +562,7 @@ static void score_affine_striped_pos_fp(ScoreJob<T>& job) {
     // six rolling rows and Local's padding mask: one block (spread_rows, dp_buffer.hpp)
     std::size_t rs; T* const rows = spread_rows<T>(buf.srows, sw, 7, rs);
     const T* pad = nullptr;
-    if constexpr (Local && !MOnly) pad = striped_pad_into(rows + 6 * rs, n, seg, W);
+    if constexpr ((Local && !MOnly) || Glocal) pad = striped_pad_into(rows + 6 * rs, n, seg, W);
     auto padded = [&](const vd& v, int s) {
         vd p; p.copy_from(pad + (std::size_t)s * W, stdx::element_aligned);
         return v + p;
@@ -558,8 +583,8 @@ static void score_affine_striped_pos_fp(ScoreJob<T>& job) {
             const int j = l * seg + s + 1;
             if (j <= n) {
                 const std::size_t k = (std::size_t)s * W + l;
-                if constexpr (Local) pA[k] = 0;
-                else                 pY[k] = -(go_a + j * ge_a);
+                if constexpr (Local || Glocal) pA[k] = 0;
+                else                           pY[k] = -(go_a + j * ge_a);
             }
         }
 
@@ -674,6 +699,17 @@ static void score_affine_striped_pos_fp(ScoreJob<T>& job) {
         T best = 0;
         for (int q = 0; q < W; ++q) best = std::max(best, static_cast<T>(vbest[q]));
         job.score = best;
+    } else if constexpr (Glocal) {
+        vd vb(NINF);     // the best cell of the last row (A = max(M, X), Y), padding masked
+        for (int s = 0; s < seg; ++s) {
+            vd va, vy;
+            va.copy_from(pA + (std::size_t)s * W, stdx::element_aligned);
+            vy.copy_from(pY + (std::size_t)s * W, stdx::element_aligned);
+            vb = stdx::max(vb, padded(stdx::max(va, vy), s));
+        }
+        T best = NINF;
+        for (int q = 0; q < W; ++q) best = std::max(best, static_cast<T>(vb[q]));
+        job.score = best;
     } else {
         const std::size_t k = (std::size_t)((n - 1) % seg) * W + (std::size_t)((n - 1) / seg);
         job.score = std::max(pA[k], pY[k]);
@@ -685,9 +721,11 @@ static void score_affine_striped_pos_fp(ScoreJob<T>& job) {
 // the forms in one binary; NWGRAD_SCORE_VARIANT=twopass / fused3).
 template <class T, bool Tr, bool Sat = false>
 static void score_entry_impl(ScoreJob<T>& job) {
+    const bool glocal = job.local == 2;   // 0 Global, 1 Local, 2 Glocal (ScoreJob::local)
     if (job.variant == 1) {
-        if (job.local) score_affine_striped<T, true, false, Tr, Sat>(job);
-        else           score_affine_striped<T, false, false, Tr, Sat>(job);
+        if (glocal)         score_affine_striped<T, false, false, Tr, Sat, true>(job);
+        else if (job.local) score_affine_striped<T, true, false, Tr, Sat>(job);
+        else                score_affine_striped<T, false, false, Tr, Sat>(job);
         return;
     }
     // Tracked: the forms' conditions must hold on every row (NaN: false).
@@ -706,14 +744,16 @@ static void score_entry_impl(ScoreJob<T>& job) {
     }
     if (job.variant == 0 && pos_open) {
         if constexpr (std::is_floating_point_v<T>) {
-            if (job.local) {
+            if (glocal) score_affine_striped_pos_fp<T, false, false, Tr, true>(job);
+            else if (job.local) {
                 if (pos_ext) score_affine_striped_pos_fp<T, true, true, Tr>(job);
                 else         score_affine_striped_pos_fp<T, true, false, Tr>(job);
             } else {
                 score_affine_striped_pos_fp<T, false, false, Tr>(job);
             }
         } else {
-            if (job.local) {
+            if (glocal) score_affine_striped_pos<T, false, false, Tr, Sat, true>(job);
+            else if (job.local) {
                 if (pos_ext) score_affine_striped_pos<T, true, true, Tr, Sat>(job);
                 else         score_affine_striped_pos<T, true, false, Tr, Sat>(job);
             } else {
@@ -722,8 +762,9 @@ static void score_entry_impl(ScoreJob<T>& job) {
         }
         return;
     }
-    if (job.local) score_affine_striped<T, true, true, Tr, Sat>(job);
-    else           score_affine_striped<T, false, true, Tr, Sat>(job);
+    if (glocal)         score_affine_striped<T, false, true, Tr, Sat, true>(job);
+    else if (job.local) score_affine_striped<T, true, true, Tr, Sat>(job);
+    else                score_affine_striped<T, false, true, Tr, Sat>(job);
 }
 template <class T>
 static void score_entry(ScoreJob<T>& job) {
