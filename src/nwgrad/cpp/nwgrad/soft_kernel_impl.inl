@@ -178,8 +178,8 @@ static inline double sp_loss(double terms, int n, int kf, int kb, SF mxf, SF mxb
 // pass itself never counts: the counting is a second pass over the finished row
 // (sp_count_*, below), run only where sp_loss_products_max says it could matter.
 // Not under clang: LLVM's vectorizer does not take an llvm.fma recurrence as a reduction,
-// so every float32 gradient loop carrying one stayed scalar (-Wpass-failed, AVX2 / AVX-512
-// / NEON: Apple's toolchain builds the macOS wheels). clang takes the plain product and
+// so every float32 gradient loop carrying one stayed scalar (-Wpass-failed at AVX2,
+// AVX-512 and NEON; the wheels are gcc's, a clang build is not). clang takes the plain product and
 // counts its flush, as the targets without FMA do (sound whether or not the backend
 // fuses it: a fused product cannot flush, so the count can only overcharge).
 #if (defined(__FMA__) || defined(__ARM_FEATURE_FMA)) && !defined(NWGRAD_SP_NOFMA) && !defined(__clang__)
