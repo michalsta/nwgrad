@@ -177,7 +177,12 @@ static inline double sp_loss(double terms, int n, int kf, int kb, SF mxf, SF mxb
 // NWGRAD_SP_NOFMA: a timing probe (the plain product on an FMA target).  The gradient
 // pass itself never counts: the counting is a second pass over the finished row
 // (sp_count_*, below), run only where sp_loss_products_max says it could matter.
-#if (defined(__FMA__) || defined(__ARM_FEATURE_FMA)) && !defined(NWGRAD_SP_NOFMA)
+// Not under clang: LLVM's vectorizer does not take an llvm.fma recurrence as a reduction,
+// so every float32 gradient loop carrying one stayed scalar (-Wpass-failed, AVX2 / AVX-512
+// / NEON: Apple's toolchain builds the macOS wheels). clang takes the plain product and
+// counts its flush, as the targets without FMA do (sound whether or not the backend
+// fuses it: a fused product cannot flush, so the count can only overcharge).
+#if (defined(__FMA__) || defined(__ARM_FEATURE_FMA)) && !defined(NWGRAD_SP_NOFMA) && !defined(__clang__)
 #  define NWGRAD_SP_MAC(acc, a, b) do { if constexpr (kSpCountF) (acc) = std::fma((a), (b), (acc)); else (acc) += (a) * (b); } while (0)
 #  define NWGRAD_SP_MAC_COUNTS 0
 #else
