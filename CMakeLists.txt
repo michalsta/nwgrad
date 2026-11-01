@@ -57,11 +57,16 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
         ${NWGRAD_LEVEL_DIR}/level_baseline.cpp
         ${NWGRAD_LEVEL_DIR}/level_sse4.cpp
         ${NWGRAD_LEVEL_DIR}/level_avx2.cpp
-        ${NWGRAD_LEVEL_DIR}/level_avx512.cpp)
+        ${NWGRAD_LEVEL_DIR}/level_avx512.cpp
+        # the soft kernels of each level, their own TU (level_common.inc, NWGRAD_LEVEL_SOFT_TU)
+        ${NWGRAD_LEVEL_DIR}/level_baseline_soft.cpp
+        ${NWGRAD_LEVEL_DIR}/level_sse4_soft.cpp
+        ${NWGRAD_LEVEL_DIR}/level_avx2_soft.cpp
+        ${NWGRAD_LEVEL_DIR}/level_avx512_soft.cpp)
     # baseline is the x86-64 default (SSE2); the other levels get their flags per-file.
     # sse4 is the x86-64-v2 feature set (SSE4.2 + POPCNT), spelled as -m flags like the
     # others so no -march/-mtune change rides along.
-    set_source_files_properties(${NWGRAD_LEVEL_DIR}/level_sse4.cpp    PROPERTIES
+    set_source_files_properties(${NWGRAD_LEVEL_DIR}/level_sse4.cpp ${NWGRAD_LEVEL_DIR}/level_sse4_soft.cpp PROPERTIES
         COMPILE_OPTIONS "-msse4.2;-mpopcnt")
     # The avx2 and avx512 levels are the ones Skylake-derived cores run (6th-10th gen Core,
     # Skylake-SP/Cascade Lake Xeons), whose JCC-erratum microcode keeps any jump that crosses
@@ -84,15 +89,16 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
     set(NWGRAD_JCC_GNU_OPTS
         "-Wa,-mbranches-within-32B-boundaries;-falign-functions=32;-falign-loops=1;-falign-jumps=1;-falign-labels=1")
     set(NWGRAD_JCC_CLANG_OPTS "$<$<CXX_COMPILER_ID:Clang,AppleClang>:-mbranches-within-32B-boundaries>")
-    set_source_files_properties(${NWGRAD_LEVEL_DIR}/level_avx2.cpp    PROPERTIES
+    set_source_files_properties(${NWGRAD_LEVEL_DIR}/level_avx2.cpp ${NWGRAD_LEVEL_DIR}/level_avx2_soft.cpp PROPERTIES
         COMPILE_OPTIONS "-mavx2;-mfma;${NWGRAD_JCC_CLANG_OPTS}")
-    set_source_files_properties(${NWGRAD_LEVEL_DIR}/level_avx512.cpp  PROPERTIES
+    set_source_files_properties(${NWGRAD_LEVEL_DIR}/level_avx512.cpp ${NWGRAD_LEVEL_DIR}/level_avx512_soft.cpp PROPERTIES
         COMPILE_OPTIONS "-mavx512f;-mavx512dq;-mavx512vl;-mavx512bw;${NWGRAD_JCC_CLANG_OPTS}")
 elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
     # NEON is mandatory baseline on AArch64 — one level, no runtime dispatch.
     set(NWGRAD_LEVEL_SOURCES
         ${NWGRAD_LEVEL_DIR}/simd_levels.cpp
-        ${NWGRAD_LEVEL_DIR}/level_neon.cpp)
+        ${NWGRAD_LEVEL_DIR}/level_neon.cpp
+        ${NWGRAD_LEVEL_DIR}/level_neon_soft.cpp)
 endif()
 
 nanobind_add_module(nwgrad_ext

@@ -469,7 +469,7 @@ struct SoftPairJobT {
     double* scnt; F* srow;          // nalpha^2 (double: the counts accumulate across rows), nalpha
     double log_z, g_oa, g_ea, g_ob, g_eb;
     int ok;
-    double loss = 0.0;              // the lost-mass bound the run accumulated (diagnostics)
+    double loss = 0.0;              // the lost-mass bound the run accumulated (NWGRAD_SOFT_DEBUG)
     // soft_guide="posterior" (nullptr = not wanted): m+1 entries, row i's column of
     // greatest EXIT mass (first on ties) — the posterior that the path leaves row i at
     // column j: the cell's posterior minus the mass moving on left into (i, j+1) (the Y
@@ -818,10 +818,13 @@ NWGRAD_BASELINE_ONLY
 void register_level_grid(SimdLevel l, typename TypedKernels<T>::grid_fn grid_fwd);
 
 NWGRAD_BASELINE_ONLY
-void register_level_common(SimdLevel l, int row_block, inter_soft_fn inter_soft,
-                           soft_pair_fn soft_pair_linear, soft_pair_fn soft_pair_affine,
-                           inter_soft_fn_f inter_soft_f, soft_pair_fn_f soft_pair_linear_f,
-                           soft_pair_fn_f soft_pair_affine_f);
+void register_level_common(SimdLevel l, int row_block);
+// The soft kernels, from the level's soft TU (level_<name>_soft.cpp; see level_common.inc).
+NWGRAD_BASELINE_ONLY
+void register_level_soft(SimdLevel l, inter_soft_fn inter_soft,
+                         soft_pair_fn soft_pair_linear, soft_pair_fn soft_pair_affine,
+                         inter_soft_fn_f inter_soft_f, soft_pair_fn_f soft_pair_linear_f,
+                         soft_pair_fn_f soft_pair_affine_f);
 
 // ── The global default backend ────────────────────────────────────────────────
 //

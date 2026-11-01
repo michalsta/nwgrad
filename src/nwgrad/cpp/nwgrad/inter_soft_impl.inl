@@ -307,7 +307,7 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_affine(InterSoftJobT<SF>& J) noexcept 
         // values, so they are taken before any rescale and the (rare) rescale is
         // applied to them afterwards.
         ivd c = z, mx = z;
-        ivd sx = z, sy = z, so = z, sob = z, acc[8];
+        ivd sx = z, sy = z, so = z, sob = z, lbv = z, lcv = z, acc[8];
         for (int cc = 0; cc < nm; ++cc) acc[cc] = z;
         // soft_guide="posterior": each lane's row argmax of the posterior; the loop runs
         // right to left, so >= keeps the leftmost (as the per-pair kernel's first >).
@@ -347,11 +347,26 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_affine(InterSoftJobT<SF>& J) noexcept 
             for (int j = n; j >= 1; --j) {
                 const auto [mv, xv] = cell(j);
                 const ivd y = c;
-                sx += fX[j] * xv;
-                sy += fY[j] * y;
-                so += (fM[j - 1] + fX[j - 1]) * y;
-                sob += (qM[j] + qY[j]) * xv;
-                const ivd t = (qM[j - 1] + qX[j - 1] + qY[j - 1]) * Ec[j] * mv;
+                ivd t;
+                if constexpr (std::is_same_v<SF, float>) {
+                    // float32: the products named, their flushes counted (sp_loss_products,
+                    // soft_kernel_impl.inl); double keeps the plain statements below.
+                    const ivd ax = fX[j], ay = fY[j], ao = fM[j - 1] + fX[j - 1], aob = qM[j] + qY[j];
+                    const ivd px = ax * xv, py = ay * y, po = ao * y, pob = aob * xv;
+                    sx += px; sy += py; so += po; sob += pob;
+                    const ivd qs = qM[j - 1] + qX[j - 1] + qY[j - 1], t1 = qs * Ec[j];
+                    t = t1 * mv;
+                    lbv += ivsel((qs > z) & (t1 == z), mv, z);
+                    lcv += ivsel((px == z) & (ax > z) & (xv > z), one, z) + ivsel((py == z) & (ay > z) & (y > z), one, z)
+                         + ivsel((po == z) & (ao > z) & (y > z), one, z) + ivsel((pob == z) & (aob > z) & (xv > z), one, z)
+                         + ivsel((t == z) & (t1 > z) & (mv > z), one, z);
+                } else {
+                    sx += fX[j] * xv;
+                    sy += fY[j] * y;
+                    so += (fM[j - 1] + fX[j - 1]) * y;
+                    sob += (qM[j] + qY[j]) * xv;
+                    t = (qM[j - 1] + qX[j - 1] + qY[j - 1]) * Ec[j] * mv;
+                }
                 if (big) trow[j] = t;
                 const ivl* mk = eqm + static_cast<size_t>(j) * k;
                 for (int cc = 0; cc < k; ++cc) acc[cc] += ivsel(mk[cc], t, z);
@@ -374,7 +389,6 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_affine(InterSoftJobT<SF>& J) noexcept 
         }
         if (post)
             for (int l = 0; l < IW; ++l) J.gpost[static_cast<size_t>(i) * IW + l] = static_cast<int>(pbj[l]);
-        const ivd mxpre = mx;   // the backward row's max BEFORE its rescale (sp_loss_products)
         mx = rescale(cM, cX, cY, nullptr, mx);
         for (int l = 0; l < IW; ++l)
             if (kv[l]) {
@@ -399,8 +413,9 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_affine(InterSoftJobT<SF>& J) noexcept 
             const double lb = kb < 0 ? std::ldexp(1.0, -kb) : 1.0;
             // 32 terms per cell: sp_loss's kSpTermsAffine (both fills must agree).
             loss[l] += 32.0 * (n + 1) * DMIN * (lf * mx[l] + lb * mf[i][l]) * gh[l];
-            // the gradient products' lost intermediates, in the pre-rescale units (soft_kernel_impl.inl, sp_loss_products)
-            loss[l] += 8.0 * (n + 1) * DMIN * std::ldexp(static_cast<double>(mxpre[l]) * gv[l] + gh[l] + gv[l], kv[l]);
+            // the gradient products' flushed intermediates (lb) and the two-factor flushes, in the
+            // pre-rescale units (soft_kernel_impl.inl, sp_loss_products)
+            loss[l] += DMIN * std::ldexp(2.0 * static_cast<double>(lbv[l]) * gv[l] + 2.0 * static_cast<double>(lcv[l]) * (gh[l] + gv[l]), kv[l]);
         }
         for (int l = 0; l < IW; ++l) {
             if (i > J.m[l]) continue;
@@ -631,7 +646,7 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_linear(InterSoftJobT<SF>& J) noexcept 
         ivd ebn = eb;   // the move down into row i+1 (Tr: that row's)
         if constexpr (Tr) { ea = isj_w(J, i, 1); eb = isj_w(J, i, 3); if (i < M) ebn = isj_w(J, i + 1, 3); }
         const ivd* Ec = ER + static_cast<size_t>(i) * w2;
-        ivd c = z, mx = z, sa = z, sb = z, acc[8];
+        ivd c = z, mx = z, sa = z, sb = z, lbv = z, lcv = z, acc[8];
         for (int cc = 0; cc < nm; ++cc) acc[cc] = z;
         const bool post = J.gpost != nullptr;   // as in inter_soft_affine
         ivd pbv = z - SF(1), pbj = z;
@@ -653,11 +668,23 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_linear(InterSoftJobT<SF>& J) noexcept 
                 pbv = ivsel(up, pv, pbv);
                 pbj = ivsel(up, z + static_cast<SF>(j), pbj);
             }
-            if (j >= 1) sa += f[j - 1] * b;
+            constexpr bool kc = std::is_same_v<SF, float>;   // flushed products counted (sp_loss_products)
+            if (j >= 1) {
+                if constexpr (kc) { const ivd pa = f[j - 1] * b; sa += pa; lcv += ivsel((pa == z) & (f[j - 1] > z) & (b > z), one, z); }
+                else sa += f[j - 1] * b;
+            }
             if (i >= 1) {
-                if (j >= kmin) sb += q[j] * b;
+                if (j >= kmin) {
+                    if constexpr (kc) { const ivd pb = q[j] * b; sb += pb; lcv += ivsel((pb == z) & (q[j] > z) & (b > z), one, z); }
+                    else sb += q[j] * b;
+                }
                 if (j >= 1) {
-                    const ivd t = q[j - 1] * Ec[j] * b;
+                    ivd t;
+                    if constexpr (kc) {
+                        const ivd t1 = q[j - 1] * Ec[j]; t = t1 * b;
+                        lbv += ivsel((q[j - 1] > z) & (t1 == z), b, z);
+                        lcv += ivsel((t == z) & (t1 > z) & (b > z), one, z);
+                    } else t = q[j - 1] * Ec[j] * b;
                     if (big) trow[j] = t;
                     const ivl* mk = eqm + static_cast<size_t>(j) * k;
                     for (int cc = 0; cc < k; ++cc) acc[cc] += ivsel(mk[cc], t, z);
@@ -669,7 +696,6 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_linear(InterSoftJobT<SF>& J) noexcept 
         else         cols(std::integral_constant<int, -1>{});
         if (post)
             for (int l = 0; l < IW; ++l) J.gpost[static_cast<size_t>(i) * IW + l] = static_cast<int>(pbj[l]);
-        const ivd mxpre = mx;
         mx = rescale(cur, mx);
         for (int l = 0; l < IW; ++l)
             if (kv[l]) {
@@ -688,7 +714,7 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_linear(InterSoftJobT<SF>& J) noexcept 
             const double lb = kb < 0 ? std::ldexp(1.0, -kb) : 1.0;
             // 16 terms per cell: sp_loss's kSpTermsLinear (both fills must agree).
             loss[l] += 16.0 * (n + 1) * DMIN * (lf * mx[l] + lb * mf[i][l]) * gh;
-            loss[l] += 4.0 * (n + 1) * DMIN * std::ldexp(static_cast<double>(mxpre[l]) * gv + gh + gv, kv[l]);
+            loss[l] += DMIN * std::ldexp(2.0 * static_cast<double>(lbv[l]) * gv + 2.0 * static_cast<double>(lcv[l]) * (gh + gv), kv[l]);
             const SF eal = Tr ? ea[l] : J.ea, ebl = Tr ? eb[l] : J.eb;
             if (i >= kmin) g_ea[l] += sa[l] * eal * gh;
             if constexpr (Tr) {

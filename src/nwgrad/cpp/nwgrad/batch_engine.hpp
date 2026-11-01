@@ -888,6 +888,7 @@ private:
         std::vector<int> sok;
         SoftGroup<SFx> sg;
         const bool soft_ok = soft && sg.weights(params, s_.soft_temperature, lin);
+        int f32_refused = 0;   // whole groups refused in float32, consecutively (as BatchEngine::Work::f32_refused)
         const size_t nn = static_cast<size_t>(params.matrix.size()) * params.matrix.size();
         const size_t na = static_cast<size_t>(params.matrix.size());
         if (!soft) cast_block_(params, blkT);   // params are fixed for the call: once per worker
@@ -907,7 +908,7 @@ private:
             if (t >= G) { own(other[t - G]); continue; }
             const auto [s, e] = groups[t];
             const size_t real = e - s;
-            if (soft && !soft_ok) { for (size_t k = s; k < e; ++k) own(elig[k]); continue; }
+            if (soft && (!soft_ok || f32_refused >= 2)) { for (size_t k = s; k < e; ++k) own(elig[k]); continue; }
             int M = 0, n = 0;
             bool ragged = false;
             for (int l = 0; l < W; ++l) {
@@ -943,6 +944,11 @@ private:
                 sg.run(K, n, M, W, a.data(), m.data(), b.data(), ragged ? nb.data() : nullptr,
                        (AM == AlignMode::Local) ? 1 : 0, slogz.data(), scnt.data(), sgap.data(),
                        sok.data(), nullptr, trk ? lrsp.data() : nullptr, trk ? lrwp.data() : nullptr);
+                if constexpr (std::is_same_v<SFx, float>) {
+                    bool any = false;
+                    for (size_t l = 0; l < real; ++l) any |= sok[l] != 0;
+                    f32_refused = any ? 0 : f32_refused + 1;
+                }
                 for (size_t l = 0; l < real; ++l) {
                     const size_t i = elig[s + l];
                     if (!sok[l]) { own(i); continue; }
@@ -1672,7 +1678,8 @@ private:
         }
         // State valid for one call only, reset when a pooled Work starts a new one: swp is
         // compared by ADDRESS (a new call's params may sit where the last one's did).
-        void new_call() noexcept { swp = nullptr; tcbuf = nullptr; }
+        void new_call() noexcept { swp = nullptr; tcbuf = nullptr; f32_refused = 0; }
+        int f32_refused = 0;   // shared soft groups refused whole in float32, consecutively (soft_group_)
     };
     // The workers' Works, kept between calls and leased one per worker per call, as
     // solo_ is for single pairs: a fresh Work per call first-touched its DP buffers (the
@@ -2347,8 +2354,15 @@ private:
                                    tracked_ ? w.srsp.data() + c : nullptr,
                                    tracked_ ? w.template srwp_of<SFx>().data() + c : nullptr);
                         }
+                        if constexpr (std::is_same_v<SFx, float>) {
+                            bool any = false;
+                            for (size_t l = 0; l < real; ++l) any |= sok[l] != 0;
+                            w.f32_refused = any ? 0 : w.f32_refused + 1;
+                        }
                     };
-                    if (soft_f32_()) run(sgf); else run(sgd);
+                    // Two whole groups refused in float32 in a row: the rest of this call runs
+                    // the double pass (diffuse problems refuse every lane; see Aligner::run_fwdbwd).
+                    if (soft_f32_() && w.f32_refused < 2) run(sgf); else run(sgd);
                 }
                 for (size_t l = 0; l < real; ++l) {
                     const size_t i = elig[s + l];

@@ -55,7 +55,9 @@ template <> struct IVT<int64_t> { using v = ivi64; using l = ivi64; static const
 #    define NWGRAD_IVMAX_X86 1
 #  endif
 #endif
-template <class V> static inline V ivmax(V a, V b) noexcept {
+// always_inline: gcc left ivsel out of line once the soft kernels added call sites (2026-11-01),
+// and every blend of the hard shared fill then paid a call and a mask normalisation (2.9x).
+template <class V> [[gnu::always_inline]] static inline V ivmax(V a, V b) noexcept {
 #ifdef NWGRAD_IVMAX_X86
     using E = std::remove_cvref_t<decltype(a[0])>;
     if constexpr (sizeof(V) == 16 && std::is_same_v<E, double>)
@@ -66,7 +68,7 @@ template <class V> static inline V ivmax(V a, V b) noexcept {
 #endif
     return a < b ? b : a;
 }
-template <class L, class V> static inline V ivsel(L m, V a, V b) noexcept { return m ? a : b; }
+template <class L, class V> [[gnu::always_inline]] static inline V ivsel(L m, V a, V b) noexcept { return m ? a : b; }
 // Lane-wise add / subtract (plain: the inter-pair kernels never run a problem past the
 // quarter-range bound -- the engine keeps such pairs on their own fill, whose kernels
 // have a saturating variant; see nw_sat in scalar_traits.hpp).

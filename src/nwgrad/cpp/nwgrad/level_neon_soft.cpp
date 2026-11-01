@@ -1,0 +1,5 @@
+// The neon level's soft kernels, in their own TU (see level_common.inc, NWGRAD_LEVEL_SOFT_TU).
+#define NWGRAD_LEVEL_SOFT_TU 1
+#define NWGRAD_LVL_NAME lvl_neon_soft
+#define NWGRAD_LVL_ENUM SimdLevel::Neon
+#include "level_common.inc"

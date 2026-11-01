@@ -1088,7 +1088,7 @@ struct Aligner {
     // float32 T only: whether the scaled path runs in float32 (default) before double.
     // A pair whose range does not fit float32 reruns in double, silently; soft_f32_used()
     // tells which precision the most recent compute_forward_back() ended in.
-    void set_soft_f32(bool v) noexcept { soft_f32_ = v; }
+    void set_soft_f32(bool v) noexcept { soft_f32_ = v; soft_f32_refused_ = 0; }
     bool soft_f32() const noexcept { return soft_f32_; }
     bool soft_f32_used() const noexcept { return soft_f32_used_; }
 
@@ -1555,6 +1555,8 @@ private:
     SoftImpl soft_impl_ = SoftImpl::Scaled;
     bool     soft_scaled_used_ = false;
     bool     soft_f32_ = true;             // float32 T: run the scaled path in float32 first
+    int      soft_f32_refused_ = 0;        // consecutive float32 refusals; past kSoftF32Patience, double directly
+    static constexpr int kSoftF32Patience = 3;
     bool     soft_f32_used_ = false;       // the most recent run was the float32 scaled pass
     bool     soft_counts_ready_ = false;   // scnt_/sg_* hold this run's gradient
     double   soft_temp_ = 1.0;
@@ -4777,7 +4779,14 @@ private:
             // float32 pairs: the float32 scaled pass first; a pair whose weights or lost-mass
             // bound do not fit float32 (a step score past ~88 nats, or very low T) reruns
             // in double before SoftImpl decides anything.
-            if constexpr (std::is_same_v<T, float>) if (soft_f32_) ok = fwdbwd_scaled<float>(buf);
+            // A worker whose pairs keep refusing float32 (diffuse long problems: the bound
+            // rejects them all) stops paying for the attempt until one succeeds again or the
+            // batch reconfigures it (set_soft_f32).
+            if constexpr (std::is_same_v<T, float>)
+                if (soft_f32_ && soft_f32_refused_ < kSoftF32Patience) {
+                    ok = fwdbwd_scaled<float>(buf);
+                    soft_f32_refused_ = ok ? 0 : soft_f32_refused_ + 1;
+                }
             if (!ok) ok = fwdbwd_scaled<double>(buf);
             if (ok) {
                 soft_scaled_used_ = soft_counts_ready_ = true;
