@@ -523,30 +523,43 @@ inline size_t gate_value(Gate g, size_t def) {
 // Per ISA level and scalar type, measured by tools/gate_sweep.py (2026-10-31 / 11-01) on
 // nighthaven (AVX2, 12 threads), solace (AVX-512 / AVX2 / SSE4, 16), spot (NEON, M1, 8)
 // and skynet (SSE4, Piledriver): each gate's two fills timed in one process at every
-// length, the crossover read off (AGENTS.md, "The fill gates, per level and type").
-// Every fill is bit-identical, so a gate moves only speed and memory.
+// length, the crossover read off, the table replayed over every record (AGENTS.md, "The
+// fill gates, per level and type").  Every hard fill is bit-identical, so a gate moves
+// only speed and memory.  The level that decides a table is the one a host runs by
+// default: nighthaven's AVX2, solace's AVX-512, the M1's NEON; the SSE table (SSE2 and
+// SSE4 share it) follows nighthaven's and solace's SSE4 runs.
 //
 // The hard shared fill keeps W pairs' DP tables (3 affine / 1 linear, of T) interleaved
 // per thread, and loses once they stream from memory instead of cache.  The crossover
 // is a BYTE budget per thread, the same ~3 MiB on every level and host for float32,
 // double and int64 with the other threads busy (nighthaven L180, solace avx2 L160-200
 // and avx512 L120-140, the M1 L250: three different lane widths, one byte count) and
-// far wider -- L300 and beyond, 8-12 MiB -- when one thread has the shared cache to
+// far wider -- L300 and beyond, 8-18 MiB -- when one thread has the shared cache to
 // itself; so the cap takes n_threads == 1 into account.  int16 and int32 cross earlier
-// (their own striped fills are fast): ~0.9 MiB / 1.2 MiB with threads, 0.45 / 1-2 MiB
-// alone -- except on the M1, where int16 and int32 keep winning to L250 (3 MiB).
+// (their own striped fills are fast): ~1 MiB on x86 -- except on the M1, where int16 and
+// int32 keep winning to L250-300 (3-4.5 MiB).  A score-only call keeps one row per
+// table, so the byte budget does not apply to it (inter_eligible_, stream_inter_).
 //
 // The score-only and linear hard shared fills of alphabets over 8 letters gather one
 // scalar per lane-cell where the own striped kernels read a profile row, so they pay
 // only for short pairs: cell caps per type, where the own kernel's speed sets the
-// crossover (int16 / int32 from L40-60, float32 to L120-250).  0 = never shared.
+// crossover (int16 / int32 from L40-60, float32 to L150 on AVX2 and beyond L250 on
+// AVX-512).  0 = never shared, kGateNoCap = always.  Alphabets of up to 8 letters
+// (DNA) take the mask-blend kernels instead, which never gather: those have caps of
+// their own -- the shared score kernel loses to the own fill from 22 x 80 for double
+// and int32 on AVX2 (the own kernel's single profile row wins once B is long), and in
+// Local mode sooner than in Global, so they are per mode; the shared linear fill of
+// int64 loses at SSE and NEON at every length.
 //
 // The shared soft pass's 5 (affine) or 2 (linear) double tables of Ws lanes: affine ~3
-// MiB per thread (8 with one thread), linear ~L140 (20000 cells) on every level.
+// MiB per thread (8 with one thread), linear ~L140 (20000 cells) on AVX2 / AVX-512 /
+// NEON and ~L180 (33000) at SSE.
 struct GateTypeCaps {
-    uint32_t score_affine, score_linear;   // score-only gather, cells (M+1)(n+1); 0 = never
+    uint32_t score_affine, score_linear;   // score-only gather (alphabets > 8), cells (M+1)(n+1); 0 = never
     uint32_t linear_gather;                // hard linear shared fill (alphabets > 8), cells; 0 = never
     uint32_t group_kb, group_kb_1;         // hard shared fill: KiB of tables per thread, n_threads > 1 / == 1
+    uint32_t score_small_local, score_small_global;   // score-only shared kernel, alphabets <= 8: cells, per mode
+    uint32_t linear_small;                 // hard linear shared fill, alphabets <= 8: cells
 };
 struct GateLevelCaps {
     GateTypeCaps f32, f64, i16, i32, i64;
@@ -561,30 +574,30 @@ struct GateLevelCaps {
     }
 };
 inline constexpr uint32_t kGateNoCap = 0xFFFFFFFFu;
-//                                        score_aff score_lin lin_gather group_kb group_kb_1
-inline constexpr GateLevelCaps kGateCapsSse    { {  6600,  3700, 12000, 3072, 12288 },   // float32
-                                                 {     0,     0,  8000, 3072, 12288 },   // double
-                                                 {     0,     0,  4000,  900,   450 },   // int16
-                                                 {     0,     0, kGateNoCap, 1200, 2048 },   // int32 (its own linear fill is slow at W=2: shared to L400)
-                                                 {     0,     0,     0, 3072, 12288 },   // int64
+//                                        score_aff score_lin lin_gather  group_kb  group_kb_1  small_loc  small_glob  lin_small
+inline constexpr GateLevelCaps kGateCapsSse    { {  6600,  3800,      20000,  3072, 12288,  1900, kGateNoCap, kGateNoCap },   // float32
+                                                 {     0,     0,       8000,  3072, 12288,     0,       1200, kGateNoCap },   // double
+                                                 {     0,  1700,       4000,  1024,  1024,  1900,       1900, kGateNoCap },   // int16
+                                                 {     0,  1700, kGateNoCap,  3072, 12288,  1200,        800, kGateNoCap },   // int32 (its own linear fill is slow at W=4: shared to L400)
+                                                 {     0,  1700,          0,  3072, 12288,     0,          0,          0 },   // int64
+                                                 3072, 8192, 33000 };
+inline constexpr GateLevelCaps kGateCapsAvx2   { { 31000, 10300,      20000,  3072, 12288,  4700, kGateNoCap, kGateNoCap },
+                                                 {  6600,  3800,      20000,  3072, 12288,  1900, kGateNoCap, kGateNoCap },
+                                                 {  1700,  1700,       4000,  1024,   450,  4700,       4700, kGateNoCap },
+                                                 {  1700,  3800,       4000,  2560,  2048,  1900,       1900, kGateNoCap },
+                                                 {  3800,  1700,       2500,  3072, 12288,  2800,       1900, kGateNoCap },
                                                  3072, 8192, 20000 };
-inline constexpr GateLevelCaps kGateCapsAvx2   { { 22000,  8300, 14600, 3072, 12288 },
-                                                 {  6600,  3700, 12000, 3072, 12288 },
-                                                 {  1700,  1700,  4000,  900,   450 },
-                                                 {  1700,  2600,  4000, 1200,  2048 },
-                                                 {  2600,  1700,  2500, 3072, 12288 },
+inline constexpr GateLevelCaps kGateCapsAvx512 { { kGateNoCap, 31000, 33000,  3072, 18432, kGateNoCap, kGateNoCap, kGateNoCap },
+                                                 { 160000, 23000,     33000,  3072, 18432, kGateNoCap, kGateNoCap, kGateNoCap },
+                                                 {  1700,  1700,       4000,  1024,  1024, kGateNoCap, kGateNoCap, kGateNoCap },
+                                                 {  2600,  3800,       4000,  1024,  1024, kGateNoCap, kGateNoCap, kGateNoCap },
+                                                 {  1700,  3800,       6600,  1500,  2048,  4700, kGateNoCap, kGateNoCap },
                                                  3072, 8192, 20000 };
-inline constexpr GateLevelCaps kGateCapsAvx512 { { 60000, 22000, 22000, 3072, 12288 },
-                                                 { 60000, 15000, 22000, 3072, 12288 },
-                                                 {  1700,  1700,  4000,  900,   450 },
-                                                 {  2600,  3700,  4000, 1200,  2048 },
-                                                 {  1700,  2600,  3700, 1500,  2048 },
-                                                 3072, 8192, 20000 };
-inline constexpr GateLevelCaps kGateCapsNeon   { { 10000,  3700,  8000, 3072, 12288 },
-                                                 {     0,     0,  3000, 3072, 12288 },
-                                                 {  1700,  1700,  5000, 3072,  1400 },
-                                                 {  1700,  1700,  5000, 3072,  6144 },
-                                                 { 10000,     0,     0, 3072, 12288 },
+inline constexpr GateLevelCaps kGateCapsNeon   { { 10300,  3800,       8000,  5120, 12288,  2800, kGateNoCap, kGateNoCap },
+                                                 {     0,     0,       3000,  3072, 12288,   800,       1900, kGateNoCap },
+                                                 {  1700,  1700,       8000,  3072,  1400,  4700,       4700, kGateNoCap },
+                                                 {  1700,  1700,       8000,  4608,  6144,  4700,       4700, kGateNoCap },
+                                                 { 63100,     0,          0,  4608, 12288,  2800, kGateNoCap,          0 },
                                                  3072, 8192, 20000 };
 inline const GateLevelCaps& gate_caps(int level) noexcept {
 #if defined(__aarch64__) || defined(_M_ARM64)
@@ -602,21 +615,25 @@ inline size_t gate_cap(Gate g, size_t def) noexcept {
     const int64_t o = gate_override(g);
     return o < 0 ? def : static_cast<size_t>(o);
 }
-// Score only, alphabets over 8 (the gather): the shared score pays only for short pairs.
-// Hard fills are not gated by this: there the shared fill replaces the own LINEAR fill,
-// gated by inter_linear_gather_cap below.
+// Score only: the shared score kernel pays only for short pairs -- over 8 letters it
+// gathers (the InterScoreGatherCells override applies), up to 8 it blends on masks and
+// loses to the own fill from a length of its own, per mode.  Hard fills are not gated
+// by this: there the shared fill replaces the own LINEAR fill, gated by inter_linear_cap.
 template <class T>
-inline bool inter_score_ok(size_t nalpha, int M, int n, bool affine, int level) noexcept {
-    if (nalpha <= 8) return true;
+inline bool inter_score_ok(size_t nalpha, int M, int n, bool affine, bool local, int level) noexcept {
     const GateTypeCaps& c = gate_caps(level).of<T>();
-    const size_t cap = gate_cap(Gate::InterScoreGatherCells, affine ? c.score_affine : c.score_linear);
+    const size_t cap = nalpha <= 8 ? size_t(local ? c.score_small_local : c.score_small_global)
+                                   : gate_cap(Gate::InterScoreGatherCells, affine ? c.score_affine : c.score_linear);
     return static_cast<size_t>(M + 1) * static_cast<size_t>(n + 1) <= cap;
 }
-// The gather cap for a linear hard pair of T over an alphabet over 8 letters: the
-// level's per-type cap (0: never), under the overrides that apply (the type's, Global's).
+// The cell cap for a linear hard pair of T: over 8 letters the level's per-type gather
+// cap (0: never) under the overrides that apply (the type's, Global's); up to 8 letters
+// the mask-blend fill's own cap (no override: it never gathers).
 template <class T, bool Global>
-inline size_t inter_linear_gather_cap(int level) noexcept {
-    const uint32_t def = gate_caps(level).of<T>().linear_gather;
+inline size_t inter_linear_cap(size_t nalpha, int level) noexcept {
+    const GateTypeCaps& c = gate_caps(level).of<T>();
+    if (nalpha <= 8) return c.linear_small == kGateNoCap ? SIZE_MAX : c.linear_small;
+    const uint32_t def = c.linear_gather;
     size_t cap = def == kGateNoCap ? SIZE_MAX : def;
     auto take = [&cap](Gate g) {
         const int64_t o = gate_override(g);
@@ -634,7 +651,7 @@ inline size_t inter_linear_gather_cap(int level) noexcept {
 // Whether a pair of lengths (la, lb) may join a shared group on `level`: its W lanes'
 // tables within the byte budget (single: n_threads == 1), and for a soft pair the soft
 // pass's tables (Ws lanes of double; the float32 pass has twice the lanes of half the
-// size, the same bytes) too.
+// size, the same bytes) too.  Not for a score-only call, which keeps rows, not tables.
 template <class T>
 inline bool inter_pair_fits(size_t la, size_t lb, bool affine, bool soft, int W, int Ws,
                             bool single, int level) noexcept {
