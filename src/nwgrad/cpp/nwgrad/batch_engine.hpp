@@ -895,7 +895,7 @@ private:
                 slogz.resize(W); scnt.resize(W * ccnt); sgap.resize(W * cgap); sok.resize(W);
                 sj.a = a.data(); sj.m = m.data(); sj.b = b.data(); sj.n = n; sj.M = M;
                 sj.nb = ragged ? nb.data() : nullptr;
-                sj.align_mode = (AM == AlignMode::Local) ? 1 : 0;
+                sj.align_mode = (AM == AlignMode::Local) ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
                 sj.scratch = sscr.data(); sj.iscratch = siscr.data();
                 sj.logz = slogz.data(); sj.counts = scnt.data(); sj.gaps = sgap.data();
                 sj.ok = sok.data();
@@ -924,7 +924,7 @@ private:
                     // Score only: one row per table, no adopt / traceback.
                     InterJobT<T> job{};
                     job.a = a.data(); job.m = m.data(); job.b = b.data(); job.n = n; job.M = M;
-                    job.align_mode = (AM == AlignMode::Local) ? 1 : 0;
+                    job.align_mode = (AM == AlignMode::Local) ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
                     if (ragged) job.nb = nb.data();
                     set_inter_params_(job, params, blkT);
                     if (trk) {
@@ -967,7 +967,7 @@ private:
             }
             InterJobT<T> job{};
             job.a = a.data(); job.m = m.data(); job.b = b.data(); job.n = n; job.M = M;
-            job.align_mode = (AM == AlignMode::Local) ? 1 : 0;
+            job.align_mode = (AM == AlignMode::Local) ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
             if (ragged) job.nb = nb.data();
             if (trk) {
                 for (size_t l = real; l < static_cast<size_t>(W); ++l) tj[l] = tj[real - 1];
@@ -2093,6 +2093,7 @@ private:
     // The vector backend the batch's inter-pair fills run on, or -1 (every pair its own
     // fill).
     int inter_backend_() const {
+        if constexpr (AM == AlignMode::Glocal) return -1;   // no shared fill yet: every pair its own
         const int backend = (kernel_ == kBackendAuto) ? global_default_backend() : kernel_;
         if (backend < 0) return -1;
         const LevelKernels& K = level_kernels(backend);
@@ -2248,7 +2249,7 @@ private:
                 const bool skip_fill = no_viterbi || !linear_fill_ok_(K);
                 InterJobT<T> job{};
                 job.a = a.data(); job.m = m.data(); job.b = b.data(); job.n = n; job.M = M;
-                job.align_mode = (AM == AlignMode::Local) ? 1 : 0;
+                job.align_mode = (AM == AlignMode::Local) ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
                 if (ragged) job.nb = nb.data();
                 auto& buf = w.buf;
                 const bool tl = tracked_ && !skip_fill;   // tracked lanes, set up before the fill
@@ -2446,7 +2447,7 @@ private:
                 }
                 InterJobT<T> job{};
                 job.a = a.data(); job.m = m.data(); job.b = b.data(); job.n = n; job.M = M;
-                job.align_mode = (AM == AlignMode::Local) ? 1 : 0;
+                job.align_mode = (AM == AlignMode::Local) ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
                 if (tracked_) job.tr = w.tjobs.data();
                 block_for_(job, blkT);   // affine: this path runs for affine only
                 wire_inter_tables_(job, w.buf, static_cast<size_t>(M + 1) * (n + 1) * W);
@@ -2522,7 +2523,7 @@ private:
                 }
                 InterJobT<T> job{};
                 job.a = a.data(); job.m = m.data(); job.b = b.data(); job.n = n; job.M = M;
-                job.align_mode = (AM == AlignMode::Local) ? 1 : 0;
+                job.align_mode = (AM == AlignMode::Local) ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
                 if (ragged) job.nb = nb.data();
                 if (tracked_) {
                     tracked_lanes_(w, w.lanes, W, real, plan_.elig, s);

@@ -31,7 +31,9 @@
 template<class T> class SeqPairT;
 
 inline const char* gap_model_name(GapModel g) { return g == GapModel::Linear ? "linear" : "affine"; }
-inline const char* align_mode_name(AlignMode a) { return a == AlignMode::Local ? "local" : "global"; }
+inline const char* align_mode_name(AlignMode a) {
+    return a == AlignMode::Local ? "local" : a == AlignMode::Glocal ? "glocal" : "global";
+}
 inline const char* grad_mode_name(GradMode g) {
     return g == GradMode::Hard ? "hard" : g == GradMode::Soft ? "soft" : "none";
 }
@@ -43,7 +45,9 @@ public:
     using Var = std::variant<Engine<GapModel::Linear, AlignMode::Global>,
                              Engine<GapModel::Linear, AlignMode::Local>,
                              Engine<GapModel::Affine, AlignMode::Global>,
-                             Engine<GapModel::Affine, AlignMode::Local>>;
+                             Engine<GapModel::Affine, AlignMode::Local>,
+                             Engine<GapModel::Linear, AlignMode::Glocal>,
+                             Engine<GapModel::Affine, AlignMode::Glocal>>;
     using SeqPair = SeqPairT<T>;
 
     // The pairs (seqs_a[i], seqs_b[i]) under an owned copy of params, validated and
@@ -195,9 +199,11 @@ private:
                             const Args&... args) {
         if (gm == GapModel::Linear) {
             if (am == AlignMode::Global) return Var(std::in_place_index<0>, settings, gd, args...);
+            if (am == AlignMode::Glocal) return Var(std::in_place_index<4>, settings, gd, args...);
             return Var(std::in_place_index<1>, settings, gd, args...);
         }
         if (am == AlignMode::Global) return Var(std::in_place_index<2>, settings, gd, args...);
+        if (am == AlignMode::Glocal) return Var(std::in_place_index<5>, settings, gd, args...);
         return Var(std::in_place_index<3>, settings, gd, args...);
     }
 

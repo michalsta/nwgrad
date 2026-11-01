@@ -279,9 +279,10 @@ static GapModel parse_gap_model(const std::string& name) {
 static AlignMode parse_align_mode(const std::string& name) {
     if (name == "global") return AlignMode::Global;
     if (name == "local")  return AlignMode::Local;
+    if (name == "glocal") return AlignMode::Glocal;
     throw nb::value_error(
         ("nwgrad: unknown mode \"" + name +
-         "\" (expected \"global\" or \"local\")").c_str());
+         "\" (expected \"global\", \"local\" or \"glocal\")").c_str());
 }
 
 template<class Mode>
@@ -466,6 +467,12 @@ static void bind_convenience(nb::module_& m, const std::string& sfx) {
     NWG_HARD("sw_grad", Linear, Local,  "SW local: returns (score, AlignParams grad) — hard subgradient (linear gap).");
     NWG_HARD("nw_affine_grad", Affine, Global, "NW global: returns (score, AlignParams grad) — hard subgradient (affine gap).");
     NWG_HARD("sw_affine_grad", Affine, Local,  "SW local: returns (score, AlignParams grad) — hard subgradient (affine gap).");
+    // Glocal: global in seq_a, local in seq_b (seq_b's leading and trailing residues are
+    // free; every residue of seq_a is aligned or pays a gap) -- "seq_a within seq_b".
+    NWG_SCORE("glocal_score", Linear, Glocal, "Glocal (global in seq_a, local in seq_b) alignment score (linear gap penalty).");
+    NWG_SCORE("glocal_score_affine", Affine, Glocal, "Glocal (global in seq_a, local in seq_b) alignment score (affine gap penalty).");
+    NWG_HARD("glocal_grad", Linear, Glocal, "Glocal: returns (score, AlignParams grad) — hard subgradient (linear gap).");
+    NWG_HARD("glocal_affine_grad", Affine, Glocal, "Glocal: returns (score, AlignParams grad) — hard subgradient (affine gap).");
     // The soft path has no integer form (it is a computation in exp/log space), so an
     // integer T binds no soft function at all rather than one that always raises.
     if constexpr (std::is_floating_point_v<T>) {
@@ -473,6 +480,8 @@ static void bind_convenience(nb::module_& m, const std::string& sfx) {
     NWG_SOFT("sw_soft_grad", Linear, Local,  "SW local: returns (log_Z, AlignParams grad) — soft gradient (linear gap).");
     NWG_SOFT("nw_affine_soft_grad", Affine, Global, "NW global: returns (log_Z, AlignParams grad) — soft gradient (affine gap).");
     NWG_SOFT("sw_affine_soft_grad", Affine, Local,  "SW local: returns (log_Z, AlignParams grad) — soft gradient (affine gap).");
+    NWG_SOFT("glocal_soft_grad", Linear, Glocal, "Glocal: returns (log_Z, AlignParams grad) — soft gradient (linear gap).");
+    NWG_SOFT("glocal_affine_soft_grad", Affine, Glocal, "Glocal: returns (log_Z, AlignParams grad) — soft gradient (affine gap).");
     }
 #undef NWG_SCORE
 #undef NWG_HARD

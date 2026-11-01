@@ -22,6 +22,8 @@ from .nwgrad_ext import (
     nw_score, sw_score, nw_score_affine, sw_score_affine,
     nw_grad, sw_grad, nw_affine_grad, sw_affine_grad,
     nw_soft_grad, sw_soft_grad, nw_affine_soft_grad, sw_affine_soft_grad,
+    glocal_score, glocal_score_affine, glocal_grad, glocal_affine_grad,
+    glocal_soft_grad, glocal_affine_soft_grad,
     BatchResult,
     SeqPair, SeqPairBatch,
     # double (explicit)
@@ -29,6 +31,8 @@ from .nwgrad_ext import (
     nw_grad_double, sw_grad_double, nw_affine_grad_double, sw_affine_grad_double,
     nw_soft_grad_double, sw_soft_grad_double,
     nw_affine_soft_grad_double, sw_affine_soft_grad_double,
+    glocal_score_double, glocal_score_affine_double, glocal_grad_double, glocal_affine_grad_double,
+    glocal_soft_grad_double, glocal_affine_soft_grad_double,
     SeqPairDouble, SeqPairBatchDouble,
     # integer scalar types (explicit): integral parameters only, no soft path.  Every
     # hard-path result equals the double one on the same parameters, bit for bit; the
@@ -42,6 +46,9 @@ from .nwgrad_ext import (
     nw_grad_int32, sw_grad_int32, nw_affine_grad_int32, sw_affine_grad_int32,
     nw_score_int64, sw_score_int64, nw_score_affine_int64, sw_score_affine_int64,
     nw_grad_int64, sw_grad_int64, nw_affine_grad_int64, sw_affine_grad_int64,
+    glocal_score_int16, glocal_score_affine_int16, glocal_grad_int16, glocal_affine_grad_int16,
+    glocal_score_int32, glocal_score_affine_int32, glocal_grad_int32, glocal_affine_grad_int32,
+    glocal_score_int64, glocal_score_affine_int64, glocal_grad_int64, glocal_affine_grad_int64,
     SeqPairInt16, SeqPairBatchInt16,
     SeqPairInt32, SeqPairBatchInt32,
     SeqPairInt64, SeqPairBatchInt64,
