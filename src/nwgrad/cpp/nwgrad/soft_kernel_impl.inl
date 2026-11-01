@@ -389,7 +389,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear_t(SoftPairJobT<SF>& J) noexcept {
         const double gh0 = sp_post(S[i] + Tn - ze, izr, bad);
         const double gh = sp_post(S[i] + Ti - ze, izr, bad);
         loss += sp_loss(kSpTermsLinear, n, i > 0 ? S[i] - S[i - 1] : 0, kb, mf[i], mx, gh);
-        loss += sp_loss_products<SF>(lb, lc, gh0, i >= 1 ? sp_post(S[i - 1] + Tn - ze, izr, bad) : 0.0);
+        if constexpr (kSpCount) loss += sp_loss_products<SF>(lb, lc, gh0, i >= 1 ? sp_post(S[i - 1] + Tn - ze, izr, bad) : 0.0);
         if (i >= kmin) {
             g_ea += sa * ea * gh0;
             if constexpr (Tr) J.grow[4 * i + 1] = -(sa * ea * gh0);
@@ -643,7 +643,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine_t(SoftPairJobT<SF>& J) noexcept {
         const double gh0 = sp_post(S[i] + Tn - ze, izr, bad);
         const double gh = sp_post(S[i] + Ti - ze, izr, bad);
         loss += sp_loss(kSpTermsAffine, n, i > 0 ? S[i] - S[i - 1] : 0, kb, mf[i], mx, gh);
-        loss += sp_loss_products<SF>(lb, lc, gh0, i >= 1 ? sp_post(S[i - 1] + Tn - ze, izr, bad) : 0.0);
+        if constexpr (kSpCount) loss += sp_loss_products<SF>(lb, lc, gh0, i >= 1 ? sp_post(S[i - 1] + Tn - ze, izr, bad) : 0.0);
         g_eb += sx * gh0;
         g_ea += sy * gh0;
         if (i >= kmin) g_oa += so * oa * gh0;
