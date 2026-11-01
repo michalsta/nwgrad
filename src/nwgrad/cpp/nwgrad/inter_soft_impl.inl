@@ -59,15 +59,6 @@
 
 // Tracked lanes (J.rs): weight f (0 oa, 1 ea, 2 ob, 3 eb) of DP row i, per lane — each
 // lane's own row, clamped to its last row past its A (rows it computes and ignores).
-// NWGRAD_SP_COUNT_F32: the float32 kernels count their flushed products (soft_kernel_impl.inl
-// defines it too; NWGRAD_SP_NOCOUNT is a timing probe that turns the counting off).
-#ifndef NWGRAD_SP_COUNT_F32
-#  ifndef NWGRAD_SP_NOCOUNT
-#    define NWGRAD_SP_COUNT_F32 1
-#  else
-#    define NWGRAD_SP_COUNT_F32 0
-#  endif
-#endif
 template <class SF>
 static inline typename IVT<SF>::v isj_w(const InterSoftJobT<SF>& J, int i, int f) noexcept {
 NWGRAD_IS_LANES;
@@ -318,13 +309,12 @@ for (int i = M; i >= 0; --i) {
     // terms, AND every gradient sum.  The sums are linear in this row's backward
     // values, so they are taken before any rescale and the (rare) rescale is
     // applied to them afterwards.
-    ivd c = z, mx = z;
-    ivd sx = z, sy = z, so = z, sob = z, lbv = z, lcv = z, acc[8];
-    for (int cc = 0; cc < nm; ++cc) acc[cc] = z;
+    ivd c, mx;
+    ivd sx, sy, so, sob, lbv, lcv, acc[8];
     // soft_guide="posterior": each lane's row argmax of the posterior; the loop runs
     // right to left, so >= keeps the leftmost (as the per-pair kernel's first >).
     const bool post = J.gpost != nullptr;
-    ivd pbv = z - SF(1), pbj = z, pyn = z;   // pyn: the Y posterior at j+1 (exit mass)
+    ivd pbv, pbj, pyn;   // pyn: the Y posterior at j+1 (exit mass)
     auto cell = [&](int j) {
         const ivd d = (En ? En[j + 1] * nM[j + 1] : z) + init;
         const ivd v = nX[j];
@@ -349,17 +339,25 @@ for (int i = M; i >= 0; --i) {
         }
         return std::make_pair(mv, xv);
     };
+    // The row pass, with or without the counters (simd_levels.hpp, sp_loss_products_max):
+    // the row is computed from row i+1 and the forward tables, so the counted rerun is a
+    // plain recomputation.
+    auto row = [&](auto Cnt) {
+    c = z; mx = z; sx = z; sy = z; so = z; sob = z; lbv = z; lcv = z;
+    for (int cc = 0; cc < nm; ++cc) acc[cc] = z;
+    pbv = z - SF(1); pbj = z; pyn = z;
     if (i >= 1) {
         // The per-letter sums at a compile-time trip count for nm = 4 (DNA/RNA), so
         // acc[0..3] can live in registers; with a runtime nm both compilers kept the
         // loop rolled over acc[] in memory, in the hottest loop of the pass.
         auto cols = [&](auto NMc) {
         constexpr int NM = decltype(NMc)::value;
+        constexpr bool kc = std::is_same_v<SF, float> && NWGRAD_SP_COUNT_F32 && decltype(Cnt)::value;
         const int k = NM >= 0 ? NM : nm;
         for (int j = n; j >= 1; --j) {
             const auto [mv, xv] = cell(j);
             const ivd y = c;
-            if constexpr (std::is_same_v<SF, float> && NWGRAD_SP_COUNT_F32) {
+            if constexpr (kc) {
                 // float32: the products named, their flushes counted (sp_loss_products,
                 // soft_kernel_impl.inl); the double body below is the original, untouched
                 // (a shared `t` across the two branches cost it a spilled accumulator).
@@ -402,6 +400,31 @@ for (int i = M; i >= 0; --i) {
         }
         cell(0);
     }
+    };
+    row(std::false_type{});
+    // The flushed products' term (simd_levels.hpp, sp_loss_products_max): the worst case
+    // from this pass's row max, or the counted rerun where that would eat into the
+    // tolerance.  In the pre-rescale units with their posterior factors (Tn), as the
+    // per-pair kernel: both fills decide alike.
+    double lossp[IW];
+    for (int l = 0; l < IW; ++l) lossp[l] = 0.0;
+    if constexpr (std::is_same_v<SF, float> && NWGRAD_SP_COUNT_F32) {
+        bool need = false;
+        double gh0[IW], gv0[IW];
+        for (int l = 0; l < IW; ++l) {
+            gh0[l] = gv0[l] = 0.0;
+            if (i > J.m[l]) continue;
+            gh0[l] = std::ldexp(izr[l], S[i * IW + l] + Tn[l] - ze[l]);
+            if (i >= 1) gv0[l] = std::ldexp(izr[l], S[(i - 1) * IW + l] + Tn[l] - ze[l]);
+            lossp[l] = sp_loss_products_max<SF>(n + 1, 5, mx[l], gh0[l], gv0[l]);
+            need |= !(loss[l] + lossp[l] <= kSpCountBudget * SoftRange<SF>::tol);
+        }
+        if (need) {
+            row(std::true_type{});
+            for (int l = 0; l < IW; ++l)
+                lossp[l] = (i > J.m[l]) ? 0.0 : sp_loss_products<SF>(lbv[l], lcv[l], gh0[l], gv0[l]);
+        }
+    }
     if (post)
         for (int l = 0; l < IW; ++l) J.gpost[static_cast<size_t>(i) * IW + l] = static_cast<int>(pbj[l]);
     mx = rescale(cM, cX, cY, nullptr, mx);
@@ -428,10 +451,7 @@ for (int i = M; i >= 0; --i) {
         const double lb = kb < 0 ? std::ldexp(1.0, -kb) : 1.0;
         // 32 terms per cell: sp_loss's kSpTermsAffine (both fills must agree).
         loss[l] += 32.0 * (n + 1) * DMIN * (lf * mx[l] + lb * mf[i][l]) * gh[l];
-        // the gradient products' flushed intermediates (lb) and the two-factor flushes, in the
-        // pre-rescale units (soft_kernel_impl.inl, sp_loss_products)
-        if constexpr (std::is_same_v<SF, float> && NWGRAD_SP_COUNT_F32)
-            loss[l] += DMIN * std::ldexp(2.0 * static_cast<double>(lbv[l]) * gv[l] + 2.0 * static_cast<double>(lcv[l]) * (gh[l] + gv[l]), kv[l]);
+        loss[l] += lossp[l];   // the gradient products' flushes (above)
     }
     for (int l = 0; l < IW; ++l) {
         if (i > J.m[l]) continue;
@@ -663,12 +683,16 @@ for (int i = M; i >= 0; --i) {
     ivd ebn = eb;   // the move down into row i+1 (Tr: that row's)
     if constexpr (Tr) { ea = isj_w(J, i, 1); eb = isj_w(J, i, 3); if (i < M) ebn = isj_w(J, i + 1, 3); }
     const ivd* Ec = ER + static_cast<size_t>(i) * w2;
-    ivd c = z, mx = z, sa = z, sb = z, lbv = z, lcv = z, acc[8];
-    for (int cc = 0; cc < nm; ++cc) acc[cc] = z;
+    ivd c, mx, sa, sb, lbv, lcv, acc[8];
     const bool post = J.gpost != nullptr;   // as in inter_soft_affine
-    ivd pbv = z - SF(1), pbj = z;
+    ivd pbv, pbj;
+    auto row = [&](auto Cnt) {   // the row pass, with or without the counters (see inter_soft_affine)
+    c = z; mx = z; sa = z; sb = z; lbv = z; lcv = z;
+    for (int cc = 0; cc < nm; ++cc) acc[cc] = z;
+    pbv = z - SF(1); pbj = z;
     auto cols = [&](auto NMc) {   // nm = 4 at a compile-time trip count (see inter_soft_affine)
     constexpr int NM = decltype(NMc)::value;
+    constexpr bool kc = std::is_same_v<SF, float> && NWGRAD_SP_COUNT_F32 && decltype(Cnt)::value;   // flushed products counted (sp_loss_products)
     const int k = NM >= 0 ? NM : nm;
     for (int j = n; j >= 0; --j) {
         const ivd bn = c;   // B at j+1 (exit mass)
@@ -685,7 +709,6 @@ for (int i = M; i >= 0; --i) {
             pbv = ivsel(up, pv, pbv);
             pbj = ivsel(up, z + static_cast<SF>(j), pbj);
         }
-        constexpr bool kc = std::is_same_v<SF, float> && NWGRAD_SP_COUNT_F32;   // flushed products counted (sp_loss_products)
         if (j >= 1) {
             if constexpr (kc) { const ivd pa = f[j - 1] * b; sa += pa; lcv += ivsel((pa == z) & (f[j - 1] > z) & (b > z), one, z); }
             else sa += f[j - 1] * b;
@@ -715,6 +738,31 @@ for (int i = M; i >= 0; --i) {
     };
     if (nm == 4) cols(std::integral_constant<int, 4>{});
     else         cols(std::integral_constant<int, -1>{});
+    };
+    row(std::false_type{});
+    // The flushed products' term (simd_levels.hpp, sp_loss_products_max): the worst case
+    // from this pass's row max, or the counted rerun where that would eat into the
+    // tolerance.  In the pre-rescale units with their posterior factors (Tn), as the
+    // per-pair kernel: both fills decide alike.
+    double lossp[IW];
+    for (int l = 0; l < IW; ++l) lossp[l] = 0.0;
+    if constexpr (std::is_same_v<SF, float> && NWGRAD_SP_COUNT_F32) {
+        bool need = false;
+        double gh0[IW], gv0[IW];
+        for (int l = 0; l < IW; ++l) {
+            gh0[l] = gv0[l] = 0.0;
+            if (i > J.m[l]) continue;
+            gh0[l] = std::ldexp(izr[l], S[i * IW + l] + Tn[l] - ze[l]);
+            if (i >= 1) gv0[l] = std::ldexp(izr[l], S[(i - 1) * IW + l] + Tn[l] - ze[l]);
+            lossp[l] = sp_loss_products_max<SF>(n + 1, 3, mx[l], gh0[l], gv0[l]);
+            need |= !(loss[l] + lossp[l] <= kSpCountBudget * SoftRange<SF>::tol);
+        }
+        if (need) {
+            row(std::true_type{});
+            for (int l = 0; l < IW; ++l)
+                lossp[l] = (i > J.m[l]) ? 0.0 : sp_loss_products<SF>(lbv[l], lcv[l], gh0[l], gv0[l]);
+        }
+    }
     if (post)
         for (int l = 0; l < IW; ++l) J.gpost[static_cast<size_t>(i) * IW + l] = static_cast<int>(pbj[l]);
     mx = rescale(cur, mx);
@@ -735,8 +783,7 @@ for (int i = M; i >= 0; --i) {
         const double lb = kb < 0 ? std::ldexp(1.0, -kb) : 1.0;
         // 16 terms per cell: sp_loss's kSpTermsLinear (both fills must agree).
         loss[l] += 16.0 * (n + 1) * DMIN * (lf * mx[l] + lb * mf[i][l]) * gh;
-        if constexpr (std::is_same_v<SF, float> && NWGRAD_SP_COUNT_F32)
-            loss[l] += DMIN * std::ldexp(2.0 * static_cast<double>(lbv[l]) * gv + 2.0 * static_cast<double>(lcv[l]) * (gh + gv), kv[l]);
+        loss[l] += lossp[l];   // the gradient products' flushes (above)
         const SF eal = Tr ? ea[l] : J.ea, ebl = Tr ? eb[l] : J.eb;
         if (i >= kmin) g_ea[l] += sa[l] * eal * gh;
         if constexpr (Tr) {
