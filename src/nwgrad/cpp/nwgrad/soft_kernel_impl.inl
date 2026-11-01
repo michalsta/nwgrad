@@ -165,7 +165,8 @@ static inline double sp_loss(double terms, int n, int kf, int kb, SF mxf, SF mxb
 // the products that flushed as a whole with nonzero factors (lost < MIN·g each).  A bound
 // through the row maxima instead refused every long diffuse pair (max·max·g reaches
 // 2^185 where gaps cost 0.3 nats).  In double every term here is ~2^-700.
-// (sp_loss_products and the counting budget: simd_levels.hpp, shared with the inter-pair kernels.)
+// (sp_loss_products, sp_loss_products_max and the counting budget: simd_levels.hpp, shared
+// with the inter-pair kernels.)
 // A product that flushed to zero although both factors were not.
 #define NWGRAD_SP_FLUSHED(prod, a, b) (((prod) == SF(0) && (a) > SF(0) && (b) > SF(0)) ? SF(1) : SF(0))
 // acc += a * b for the gap sums.  With a fused multiply-add the product is exact inside the
@@ -173,16 +174,59 @@ static inline double sp_loss(double terms, int n, int kf, int kb, SF mxf, SF mxb
 // count nothing; the others take the plain product and count its flush into lc.
 // Double counts nothing anywhere: its terms are ~2^-700, and the tests cost it 1.2-1.9x
 // (sse4, 2026-11-01).  kSpCount: the float32 instantiation only.
-// NWGRAD_SP_NOFMA: a timing probe (the plain product and its count on an FMA target).
-// kSpCount names the pass's counting flag at each use (the gradient pass runs without the
-// counters first; see sp_loss_products_max).
+// NWGRAD_SP_NOFMA: a timing probe (the plain product on an FMA target).  The gradient
+// pass itself never counts: the counting is a second pass over the finished row
+// (sp_count_*, below), run only where sp_loss_products_max says it could matter.
 #if (defined(__FMA__) || defined(__ARM_FEATURE_FMA)) && !defined(NWGRAD_SP_NOFMA)
 #  define NWGRAD_SP_MAC(acc, a, b) do { if constexpr (kSpCountF) (acc) = std::fma((a), (b), (acc)); else (acc) += (a) * (b); } while (0)
 #  define NWGRAD_SP_MAC_COUNTS 0
 #else
-#  define NWGRAD_SP_MAC(acc, a, b) do { if constexpr (kSpCount) { const SF p_ = (a) * (b); (acc) += p_; lc += NWGRAD_SP_FLUSHED(p_, (a), (b)); } else (acc) += (a) * (b); } while (0)
+#  define NWGRAD_SP_MAC(acc, a, b) do { (acc) += (a) * (b); } while (0)
 #  define NWGRAD_SP_MAC_COUNTS 1
 #endif
+// The flushed products of a FINISHED row, counted from the stored rows and tables: lc the
+// two-factor products a[j + AO] * b[j] (sp_count_prod; sp_count_prod2: (a1 + a2) * b),
+// and for the match products q[j-1] * P[j] * b[j] (sp_count_match: one q row,
+// sp_count_match3: the three affine rows summed) lb the b of a flushed intermediate and
+// lc the flushed whole product.  Only the float32 kernels call these, and only for a
+// row whose worst case (sp_loss_products_max) would eat into the tolerance.
+template <class SF, int AO>
+static inline void sp_count_prod(const SF* __restrict a, const SF* __restrict b, int j1, int hi0, SF& lc) noexcept {
+    SF c = 0;
+    NWGRAD_SP_SUM(c)
+    for (int j = j1; j <= hi0; ++j) { const SF av = a[j + AO], p = av * b[j]; c += NWGRAD_SP_FLUSHED(p, av, b[j]); }
+    lc += c;
+}
+template <class SF, int AO>
+static inline void sp_count_prod2(const SF* __restrict a1, const SF* __restrict a2, const SF* __restrict b, int j1, int hi0, SF& lc) noexcept {
+    SF c = 0;
+    NWGRAD_SP_SUM(c)
+    for (int j = j1; j <= hi0; ++j) { const SF av = a1[j + AO] + a2[j + AO], p = av * b[j]; c += NWGRAD_SP_FLUSHED(p, av, b[j]); }
+    lc += c;
+}
+template <class SF>
+static inline void sp_count_match(const SF* __restrict q, const SF* __restrict pr, const SF* __restrict b, int j1, int hi0, SF& lb, SF& lc) noexcept {
+    SF cb = 0, cc = 0;
+    NWGRAD_SP_SUM(cb, cc)
+    for (int j = j1; j <= hi0; ++j) {
+        const SF qs = q[j - 1], t1 = qs * pr[j], tt = t1 * b[j];
+        cb += (qs > SF(0) && t1 == SF(0)) ? b[j] : SF(0);
+        cc += NWGRAD_SP_FLUSHED(tt, t1, b[j]);
+    }
+    lb += cb; lc += cc;
+}
+template <class SF>
+static inline void sp_count_match3(const SF* __restrict q1, const SF* __restrict q2, const SF* __restrict q3, const SF* __restrict pr,
+                                   const SF* __restrict b, int j1, int hi0, SF& lb, SF& lc) noexcept {
+    SF cb = 0, cc = 0;
+    NWGRAD_SP_SUM(cb, cc)
+    for (int j = j1; j <= hi0; ++j) {
+        const SF qs = q1[j - 1] + q2[j - 1] + q3[j - 1], t1 = qs * pr[j], tt = t1 * b[j];
+        cb += (qs > SF(0) && t1 == SF(0)) ? b[j] : SF(0);
+        cc += NWGRAD_SP_FLUSHED(tt, t1, b[j]);
+    }
+    lb += cb; lc += cc;
+}
 static inline double sp_post(int e, double izr, bool& bad) noexcept {
     const double f = std::ldexp(izr, e);
     if (!(f <= std::numeric_limits<double>::max())) bad = true;
@@ -233,7 +277,7 @@ static inline bool sp_log_z(SoftPairJobT<SF>& J, const int* S, const SF* rowsum_
 template <class SF, bool Tr>
 NWGRAD_SP_FMA_FN static void soft_pair_linear_t(SoftPairJobT<SF>& J) noexcept {
     NWGRAD_SP_FMA_BODY
-    constexpr bool kSpCountF = std::is_same_v<SF, float> && NWGRAD_SP_COUNT_F32;   // the float32 instantiation counts flushed products (sp_loss_products)
+    constexpr bool kSpCountF = std::is_same_v<SF, float> && NWGRAD_SP_COUNT_F32;   // the float32 instantiation accounts for flushed products (sp_count_*)
     const int m = J.m, n = J.n;
     const bool L = J.local != 0;
     const int kmin = L ? 1 : 0;
@@ -334,67 +378,34 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear_t(SoftPairJobT<SF>& J) noexcept {
         const SF* __restrict cb = cur;
         const int j1 = std::max(1, lo0);
         SF mx = 0.0, sa = 0.0, sb = 0.0;
-        double lossp = 0.0;   // the flushed products' term (sp_loss_products), float32 only
         const double gh0 = sp_post(S[i] + Tn - ze, izr, bad);   // the pre-rescale units' posterior factor
+        double lossp = 0.0;                                       // the gradient products' flushes (float32)
         if (lo0 == 0) { mx = cb[0]; if (i >= 1 && kmin == 0) sb += (Fi - st)[0] * cb[0]; }
         if (i >= 1) {
             const SF* __restrict Fp = Fi - st;
             const SF* __restrict pr = P + sp_row<Tr>(J, i) * w;
             SF* __restrict t = tmp;
-            const SF mx0 = mx, sa0 = sa, sb0 = sb;
-            SF lb = 0.0, lc = 0.0;
-            // The pass, with or without the counters (sp_loss_products_max): the same
-            // values either way, so the counted rerun is a plain recomputation.
-            auto pass = [&](auto cnt) {
-                constexpr bool kSpCount = kSpCountF && decltype(cnt)::value;
-                SF mx_ = mx0, sa_ = sa0, sb_ = sb0, lb_ = 0.0, lc_ = 0.0;
-                {
-                SF& lc = lc_;   // NWGRAD_SP_MAC counts into `lc`
-#if NWGRAD_SP_SPLIT_MAX
-                for (int j = j1; j <= hi0; ++j) mx_ = NWGRAD_SP_VMAX(mx_, cb[j]);
-                NWGRAD_SP_PRAGMA_(omp simd reduction(+:sa_, sb_, lb_, lc))
-#else
-                NWGRAD_SP_PRAGMA_(omp simd reduction(+:sa_, sb_, lb_, lc) reduction(max:mx_))
-#endif
-                for (int j = j1; j <= hi0; ++j) {
-                    const SF b = cb[j];
-#if !NWGRAD_SP_SPLIT_MAX
-                    mx_ = NWGRAD_SP_VMAX(mx_, b);
-#endif
-                    NWGRAD_SP_MAC(sa_, Fi[j - 1], b);
-                    NWGRAD_SP_MAC(sb_, Fp[j], b);
-                    const SF fp = Fp[j - 1], t1 = fp * pr[j], tt = t1 * b;
-                    t[j] = tt;
-                    if constexpr (kSpCount) {   // flushed products (sp_loss_products)
-                        lb_ += (fp > SF(0) && t1 == SF(0)) ? b : SF(0);
-                        lc += NWGRAD_SP_FLUSHED(tt, t1, b);
-                    }
-                }
-                }
-                mx = mx_; sa = sa_; sb = sb_; lb = lb_; lc = lc_;
-            };
-            auto pass_counted = [&]() __attribute__((noinline)) { pass(std::true_type{}); };   // out of line (see inter_soft_impl.inl)
-            pass(std::false_type{});
-            if constexpr (kSpCountF) {
-                const double gv0 = sp_post(S[i - 1] + Tn - ze, izr, bad);
-                lossp = sp_loss_products_max<SF>(hi0 - j1 + 1, 1 + 2 * NWGRAD_SP_MAC_COUNTS, mx, gh0, gv0);
-#ifdef NWGRAD_SP_RERUN_STATS
-                { static std::atomic<long> rows_{0}, reruns_{0}; const long r = ++rows_; if (!(loss + lossp <= kSpCountBudget * SoftRange<SF>::tol)) ++reruns_;
-                  if (r % 100000 == 0) std::fprintf(stderr, "pair rows %ld reruns %ld\n", r, reruns_.load()); }
-#endif
-                if (!(loss + lossp <= kSpCountBudget * SoftRange<SF>::tol)) {   // near rejection: count
-                    pass_counted();
-                    lossp = sp_loss_products<SF>(lb, lc, gh0, gv0);
-                }
-            }
-        } else {
-            constexpr bool kSpCount = kSpCountF;   // row 0: counted always (one row)
-            SF lc = 0.0;
 #if NWGRAD_SP_SPLIT_MAX
             for (int j = j1; j <= hi0; ++j) mx = NWGRAD_SP_VMAX(mx, cb[j]);
-            NWGRAD_SP_SUM(sa, lc)
+            NWGRAD_SP_PRAGMA_(omp simd reduction(+:sa, sb))
 #else
-            NWGRAD_SP_PRAGMA_(omp simd reduction(+:sa, lc) reduction(max:mx))
+            NWGRAD_SP_PRAGMA_(omp simd reduction(+:sa, sb) reduction(max:mx))
+#endif
+            for (int j = j1; j <= hi0; ++j) {
+                const SF b = cb[j];
+#if !NWGRAD_SP_SPLIT_MAX
+                mx = NWGRAD_SP_VMAX(mx, b);
+#endif
+                NWGRAD_SP_MAC(sa, Fi[j - 1], b);
+                NWGRAD_SP_MAC(sb, Fp[j], b);
+                t[j] = Fp[j - 1] * pr[j] * b;
+            }
+        } else {
+#if NWGRAD_SP_SPLIT_MAX
+            for (int j = j1; j <= hi0; ++j) mx = NWGRAD_SP_VMAX(mx, cb[j]);
+            NWGRAD_SP_SUM(sa)
+#else
+            NWGRAD_SP_PRAGMA_(omp simd reduction(+:sa) reduction(max:mx))
 #endif
             for (int j = j1; j <= hi0; ++j) {
                 const SF b = cb[j];
@@ -403,7 +414,20 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear_t(SoftPairJobT<SF>& J) noexcept {
 #endif
                 NWGRAD_SP_MAC(sa, Fi[j - 1], b);
             }
-            if constexpr (kSpCountF) lossp = sp_loss_products<SF>(SF(0), lc, gh0, 0.0);
+        }
+        if constexpr (kSpCountF) {   // the flushed products: the worst case, or the count where it could matter
+            const double gv0 = i >= 1 ? sp_post(S[i - 1] + Tn - ze, izr, bad) : 0.0;
+            const int kinds = (i >= 1 ? 1 : 0) + (i >= 1 ? 2 : 1) * NWGRAD_SP_MAC_COUNTS;
+            lossp = sp_loss_products_max<SF>(hi0 - j1 + 1, kinds, mx, gh0, gv0);
+            if (!(loss + lossp <= kSpCountBudget * SoftRange<SF>::tol)) {
+                SF lb = 0.0, lc = 0.0;
+                if (i >= 1) {
+                    const SF* Fp = Fi - st;
+                    sp_count_match<SF>(Fp, P + sp_row<Tr>(J, i) * w, cb, j1, hi0, lb, lc);
+                    if (NWGRAD_SP_MAC_COUNTS) { sp_count_prod<SF, -1>(Fi, cb, j1, hi0, lc); sp_count_prod<SF, 0>(Fp, cb, j1, hi0, lc); }
+                } else if (NWGRAD_SP_MAC_COUNTS) sp_count_prod<SF, -1>(Fi, cb, j1, hi0, lc);
+                lossp = sp_loss_products<SF>(lb, lc, gh0, gv0);
+            }
         }
         if (J.gpost) {   // row argmax of the EXIT mass (see SoftPairJob::gpost)
             int bj = lo0; SF bv = -1.0;
@@ -444,7 +468,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear_t(SoftPairJobT<SF>& J) noexcept {
 template <class SF, bool Tr>
 NWGRAD_SP_FMA_FN static void soft_pair_affine_t(SoftPairJobT<SF>& J) noexcept {
     NWGRAD_SP_FMA_BODY
-    constexpr bool kSpCountF = std::is_same_v<SF, float> && NWGRAD_SP_COUNT_F32;   // the float32 instantiation counts flushed products (sp_loss_products)
+    constexpr bool kSpCountF = std::is_same_v<SF, float> && NWGRAD_SP_COUNT_F32;   // the float32 instantiation accounts for flushed products (sp_count_*)
     const int m = J.m, n = J.n;
     const bool L = J.local != 0;
     const int kmin = L ? 1 : 0;
@@ -594,8 +618,8 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine_t(SoftPairJobT<SF>& J) noexcept {
         const SF* __restrict bY = cY;
         const int j1 = std::max(1, lo0);
         SF mx = 0.0, sx = 0.0, sy = 0.0, so = 0.0, sob = 0.0;
-        double lossp = 0.0;   // the flushed products' term (sp_loss_products), float32 only
         const double gh0 = sp_post(S[i] + Tn - ze, izr, bad);   // the pre-rescale units' posterior factor
+        double lossp = 0.0;                                       // the gradient products' flushes (float32)
         if (lo0 == 0) {
             const SF h = bY[1] * oa;
             const SF mv = bM[0] + h, xv = bX[0] + h;
@@ -611,71 +635,34 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine_t(SoftPairJobT<SF>& J) noexcept {
             const SF* __restrict qY = fY - st;
             const SF* __restrict pr = P + sp_row<Tr>(J, i) * w;
             SF* __restrict t = tmp;
-            const SF mx0 = mx, sx0 = sx, sy0 = sy, so0 = so, sob0 = sob;
-            SF lb = 0.0, lc = 0.0;
-            // The pass, with or without the counters (sp_loss_products_max).  The first
-            // pass finishes the backward row's M / X in place (the Y-open term h); the
-            // counted rerun reads them finished and recomputes everything else.
-            auto pass = [&](auto cnt) {
-                constexpr bool kSpCount = kSpCountF && decltype(cnt)::value;
-                SF mx_ = mx0, sx_ = sx0, sy_ = sy0, so_ = so0, sob_ = sob0, lb_ = 0.0, lc_ = 0.0;
-                {
-                SF& lc = lc_;   // NWGRAD_SP_MAC counts into `lc`
 #if NWGRAD_SP_SPLIT_MAX
-                NWGRAD_SP_SUM(sx_, sy_, so_, sob_, lb_, lc)
+            NWGRAD_SP_SUM(sx, sy, so, sob)
 #else
-                NWGRAD_SP_PRAGMA_(omp simd reduction(+:sx_, sy_, so_, sob_, lb_, lc) reduction(max:mx_))
+            NWGRAD_SP_PRAGMA_(omp simd reduction(+:sx, sy, so, sob) reduction(max:mx))
 #endif
-                for (int j = j1; j <= hi0; ++j) {
-                    const SF y = bY[j];
-                    SF mv, xv;
-                    if constexpr (!decltype(cnt)::value) {
-                        const SF h = bY[j + 1] * oa;
-                        mv = bM[j] + h; xv = bX[j] + h;
-                        bM[j] = mv; bX[j] = xv;
-                    } else { mv = bM[j]; xv = bX[j]; }
+            for (int j = j1; j <= hi0; ++j) {
+                const SF y = bY[j];
+                const SF h = bY[j + 1] * oa;
+                const SF mv = bM[j] + h, xv = bX[j] + h;
+                bM[j] = mv; bX[j] = xv;
 #if !NWGRAD_SP_SPLIT_MAX
-                    const SF tot = mv + xv + y;
-                    mx_ = NWGRAD_SP_VMAX(mx_, tot);
+                const SF tot = mv + xv + y;
+                mx = NWGRAD_SP_VMAX(mx, tot);
 #endif
-                    NWGRAD_SP_MAC(sx_, fX[j], xv);
-                    NWGRAD_SP_MAC(sy_, fY[j], y);
-                    NWGRAD_SP_MAC(so_, fM[j - 1] + fX[j - 1], y);
-                    NWGRAD_SP_MAC(sob_, qM[j] + qY[j], xv);
-                    const SF qs = qM[j - 1] + qX[j - 1] + qY[j - 1], t1 = qs * pr[j], tt = t1 * mv;
-                    t[j] = tt;
-                    if constexpr (kSpCount) {   // flushed products (sp_loss_products)
-                        lb_ += (qs > SF(0) && t1 == SF(0)) ? mv : SF(0);
-                        lc += NWGRAD_SP_FLUSHED(tt, t1, mv);
-                    }
-                }
-#if NWGRAD_SP_SPLIT_MAX
-                for (int j = j1; j <= hi0; ++j) mx_ = NWGRAD_SP_VMAX(mx_, bM[j] + bX[j] + bY[j]);
-#endif
-                }
-                mx = mx_; sx = sx_; sy = sy_; so = so_; sob = sob_; lb = lb_; lc = lc_;
-            };
-            auto pass_counted = [&]() __attribute__((noinline)) { pass(std::true_type{}); };   // out of line (see inter_soft_impl.inl)
-            pass(std::false_type{});
-            if constexpr (kSpCountF) {
-                const double gv0 = sp_post(S[i - 1] + Tn - ze, izr, bad);
-                lossp = sp_loss_products_max<SF>(hi0 - j1 + 1, 1 + 4 * NWGRAD_SP_MAC_COUNTS, mx, gh0, gv0);
-#ifdef NWGRAD_SP_RERUN_STATS
-                { static std::atomic<long> rows_{0}, reruns_{0}; const long r = ++rows_; if (!(loss + lossp <= kSpCountBudget * SoftRange<SF>::tol)) ++reruns_;
-                  if (r % 100000 == 0) std::fprintf(stderr, "pair rows %ld reruns %ld\n", r, reruns_.load()); }
-#endif
-                if (!(loss + lossp <= kSpCountBudget * SoftRange<SF>::tol)) {   // near rejection: count
-                    pass_counted();
-                    lossp = sp_loss_products<SF>(lb, lc, gh0, gv0);
-                }
+                NWGRAD_SP_MAC(sx, fX[j], xv);
+                NWGRAD_SP_MAC(sy, fY[j], y);
+                NWGRAD_SP_MAC(so, fM[j - 1] + fX[j - 1], y);
+                NWGRAD_SP_MAC(sob, qM[j] + qY[j], xv);
+                t[j] = (qM[j - 1] + qX[j - 1] + qY[j - 1]) * pr[j] * mv;
             }
-        } else {
-            constexpr bool kSpCount = kSpCountF;   // row 0: counted always (one row)
-            SF lc = 0.0;
 #if NWGRAD_SP_SPLIT_MAX
-            NWGRAD_SP_SUM(sy, so, lc)
+            for (int j = j1; j <= hi0; ++j) mx = NWGRAD_SP_VMAX(mx, bM[j] + bX[j] + bY[j]);
+#endif
+        } else {
+#if NWGRAD_SP_SPLIT_MAX
+            NWGRAD_SP_SUM(sy, so)
 #else
-            NWGRAD_SP_PRAGMA_(omp simd reduction(+:sy, so, lc) reduction(max:mx))
+            NWGRAD_SP_PRAGMA_(omp simd reduction(+:sy, so) reduction(max:mx))
 #endif
             for (int j = j1; j <= hi0; ++j) {
                 const SF y = bY[j];
@@ -692,7 +679,23 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine_t(SoftPairJobT<SF>& J) noexcept {
 #if NWGRAD_SP_SPLIT_MAX
             for (int j = j1; j <= hi0; ++j) mx = NWGRAD_SP_VMAX(mx, bM[j] + bX[j] + bY[j]);
 #endif
-            if constexpr (kSpCountF) lossp = sp_loss_products<SF>(SF(0), lc, gh0, 0.0);
+        }
+        if constexpr (kSpCountF) {   // the flushed products: the worst case, or the count where it could matter
+            const double gv0 = i >= 1 ? sp_post(S[i - 1] + Tn - ze, izr, bad) : 0.0;
+            const int kinds = (i >= 1 ? 1 : 0) + (i >= 1 ? 4 : 2) * NWGRAD_SP_MAC_COUNTS;
+            lossp = sp_loss_products_max<SF>(hi0 - j1 + 1, kinds, mx, gh0, gv0);
+            if (!(loss + lossp <= kSpCountBudget * SoftRange<SF>::tol)) {
+                SF lb = 0.0, lc = 0.0;
+                if (i >= 1) {
+                    const SF* qM = fM - st; const SF* qX = fX - st; const SF* qY = fY - st;
+                    sp_count_match3<SF>(qM, qX, qY, P + sp_row<Tr>(J, i) * w, bM, j1, hi0, lb, lc);
+                    if (NWGRAD_SP_MAC_COUNTS) {
+                        sp_count_prod<SF, 0>(fX, bX, j1, hi0, lc); sp_count_prod<SF, 0>(fY, bY, j1, hi0, lc);
+                        sp_count_prod2<SF, -1>(fM, fX, bY, j1, hi0, lc); sp_count_prod2<SF, 0>(qM, qY, bX, j1, hi0, lc);
+                    }
+                } else if (NWGRAD_SP_MAC_COUNTS) { sp_count_prod<SF, 0>(fY, bY, j1, hi0, lc); sp_count_prod2<SF, -1>(fM, fX, bY, j1, hi0, lc); }
+                lossp = sp_loss_products<SF>(lb, lc, gh0, gv0);
+            }
         }
         if (J.gpost) {   // row argmax of the EXIT mass (see SoftPairJob::gpost)
             int bj = lo0; SF bv = -1.0;
