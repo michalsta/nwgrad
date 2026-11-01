@@ -816,18 +816,19 @@ private:
         for (size_t i = 0; i < N; ++i) {
             const size_t la = problems[i].seq_a.size(), lb = problems[i].seq_b.size();
             if (la == 0 || lb == 0 || (hb_case && hb_splits(tb_resolved_, s_.traceback == TracebackMode::Default ? FullAl::kAutoPointerCells : 0, s_.hb_cutoff, la, lb)) ||
-                !inter_pair_fits(la, lb, GM == GapModel::Affine, soft, inter_w_(K), sizeof(T), K.d.inter_w)) {
+                (grad_mode_ != GradMode::None &&   // score only: rows, not tables
+                 !inter_pair_fits<T>(la, lb, GM == GapModel::Affine, soft, inter_w_(K), K.d.inter_w, s_.n_threads == 1, backend))) {
                 other.push_back(i); continue;
             }
             if constexpr (nw_sat<T>)
                 if (nw_int_bound_check<T, AM == AlignMode::Local, false>(sib, static_cast<int>(la), static_cast<int>(lb)) != 0) {
                     other.push_back(i); continue;
                 }
-            // the integer linear gather gate of inter_eligible_ (hard fills only; score-only
-            // groups are gated by inter_score_ok in the loop)
+            // the linear cell gate of inter_eligible_ (hard fills only; score-only groups
+            // are gated by inter_score_ok in the loop)
             if constexpr (GM == GapModel::Linear)
-                if (grad_mode_ == GradMode::Hard && params.matrix.size() > 8 &&
-                    (la + 1) * (lb + 1) > inter_linear_gather_cap<T, AM == AlignMode::Global>()) {
+                if (grad_mode_ == GradMode::Hard &&
+                    (la + 1) * (lb + 1) > inter_linear_cap<T, AM == AlignMode::Global>(params.matrix.size(), backend)) {
                     other.push_back(i); continue;
                 }
             elig.push_back(i);
@@ -964,7 +965,7 @@ private:
             }
             if constexpr (AB == AlignBand::Full) {
                 if (grad_mode_ == GradMode::None && has_inter_score_(K)) {
-                    if (!inter_score_ok(na, M, n)) {   // the gather: short pairs only
+                    if (!inter_score_ok<T>(na, M, n, GM == GapModel::Affine, AM == AlignMode::Local, K.level)) {   // short pairs only
                         for (size_t l = 0; l < real; ++l) own(elig[s + l]);
                         continue;
                     }
@@ -2181,19 +2182,17 @@ private:
         if constexpr (nw_sat<T>)
             if (nw_int_bound_check<T, AM == AlignMode::Local, false>(params_->ib, static_cast<int>(len_a(i)), static_cast<int>(len_b(i))) != 0)
                 return false;
-        if (!inter_pair_fits(len_a(i), len_b(i), GM == GapModel::Affine,
-                             grad_mode_ == GradMode::Soft, inter_w_(K), sizeof(T), K.d.inter_w))
+        // The byte budget: not for a score-only batch, whose shared kernel keeps rows.
+        if (grad_mode_ != GradMode::None &&
+            !inter_pair_fits<T>(len_a(i), len_b(i), GM == GapModel::Affine,
+                                grad_mode_ == GradMode::Soft, inter_w_(K), K.d.inter_w, s_.n_threads == 1, K.level))
             return false;
-        // Linear, integer T, alphabet over 8: the inter-pair fill gathers per lane-cell,
-        // and the leveled striped linear kernel now beats it past ~L120 (inter / own, Local
-        // protein, hard, 1 thread: L100 0.85-0.99, L150 1.12-1.22, L200 1.14-1.33; nighthaven
-        // AVX2 and spot NEON agree).  Floating T keeps the shared fill: on AVX2 it still wins
-        // through L200 (0.63-0.84), and the NEON loss there (1.08-1.18 from L150) does not
-        // justify costing the primary target.
-        // (floating T: capped on AArch64 only, inter_linear_gather_cap — simd_levels.hpp)
+        // Linear hard fill: the shared fill gathers per lane-cell over 8 letters (the own
+        // striped kernel reads a profile row) and blends on masks up to 8; its cell cap per
+        // level and type, inter_linear_cap (simd_levels.hpp).
         if constexpr (GM == GapModel::Linear)
-            if (alpha_->size() > 8 && grad_mode_ != GradMode::Soft &&
-                (len_a(i) + 1) * (len_b(i) + 1) > inter_linear_gather_cap<T, AM == AlignMode::Global>())
+            if (grad_mode_ != GradMode::Soft &&
+                (len_a(i) + 1) * (len_b(i) + 1) > inter_linear_cap<T, AM == AlignMode::Global>(alpha_->size(), K.level))
                 return false;
         // Hirschberg pairs past the cutoff split: no shared fill.
         return !hb_splits(tb_resolved_, s_.traceback == TracebackMode::Default ? FullAl::kAutoPointerCells : 0, s_.hb_cutoff, len_a(i), len_b(i));
@@ -2613,7 +2612,7 @@ private:
                     n = std::max(n, nb[l]);
                     ragged |= nb[l] != nb[0];
                 }
-                if (!inter_score_ok(alpha_->size(), M, n)) {   // the gather: short pairs only
+                if (!inter_score_ok<T>(alpha_->size(), M, n, GM == GapModel::Affine, AM == AlignMode::Local, plan_.backend)) {   // short pairs only
                     for (size_t l = 0; l < real; ++l) own(plan_.elig[s + l]);
                     continue;
                 }

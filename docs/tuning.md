@@ -94,10 +94,14 @@ with.
 ## Fill gates
 
 Which fill a pair runs (shared inter-pair groups or its own fill, striped or scalar
-linear kernel) is decided by thresholds measured on one host per ISA level. Results
-never depend on them, since every fill is bit-identical; only speed and memory do.
-For measuring them on other hardware, `nwgrad._tuning` overrides them at runtime,
-process-wide. It is **unstable**, not part of the API:
+linear kernel) is decided by thresholds compiled per ISA level (SSE, AVX2, AVX-512,
+NEON) and scalar type, measured on one host per level with `tools/gate_sweep.py`
+(the shared fill's byte budget per thread, wider when the batch runs one thread; the
+score-only and linear shared fills' cell caps, for alphabets over 8 letters and up
+to 8 separately). Results never depend on them, since every hard fill is
+bit-identical; only speed and memory do. For measuring them on other hardware,
+`nwgrad._tuning` overrides them at runtime, process-wide: an override replaces the
+compiled cap for every type and level. It is **unstable**, not part of the API:
 
 ```python
 from nwgrad import _tuning

@@ -1446,15 +1446,19 @@ NB_MODULE(nwgrad_ext, m) {
     // The compiled defaults of the single-valued caps (0 = no cap);
     // linear_striped_min_n is per mode, type and level (Aligner::kLinearStripedMinN).
     m.def("_gate_defaults", []() {
+        // The compiled caps are per level and type (simd_levels.hpp, GateLevelCaps); shown:
+        // the default backend's, float32 (double for the f64 entry), with the other threads busy.
+        const int be = global_default_backend();
+        const GateLevelCaps& c = gate_caps(be < 0 ? 0 : be);
         return std::vector<std::pair<std::string, int64_t>>{
-            {"inter_group_bytes", int64_t(kInterGroupBytes)},
-            {"inter_soft_bytes", int64_t(kInterSoftBytes)},
-            {"inter_score_gather_cells", int64_t(kInterScoreGatherCells)},
-            {"inter_linear_int_gather_cells", int64_t(kInterLinearIntGatherCells)},
-            {"inter_linear_f32_gather_cells", int64_t(kInterLinearF32GatherCells)},
-            {"inter_linear_f64_gather_cells", int64_t(kInterLinearF64GatherCells)},
-            {"inter_global_linear_int_cells", int64_t(kInterGlobalLinearIntCells)},
-            {"inter_global_linear_f32_cells", int64_t(kInterGlobalLinearF32Cells)}};
+            {"inter_group_bytes", int64_t(c.f32.group_kb) << 10},
+            {"inter_soft_bytes", int64_t(c.soft_kb) << 10},
+            {"inter_score_gather_cells", int64_t(c.f32.score_affine)},
+            {"inter_linear_int_gather_cells", int64_t(c.i16.linear_gather)},
+            {"inter_linear_f32_gather_cells", int64_t(c.f32.linear_gather == kGateNoCap ? 0 : c.f32.linear_gather)},
+            {"inter_linear_f64_gather_cells", int64_t(c.f64.linear_gather)},
+            {"inter_global_linear_int_cells", int64_t(c.i16.linear_gather)},
+            {"inter_global_linear_f32_cells", int64_t(c.f32.linear_gather == kGateNoCap ? 0 : c.f32.linear_gather)}};
     });
 
     m.def(

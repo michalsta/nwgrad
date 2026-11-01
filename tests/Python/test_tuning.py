@@ -54,7 +54,7 @@ def _params():
 def test_api_roundtrip():
     assert set(_tuning.GATES) == set(OWN)
     d = _tuning.defaults()
-    assert d["inter_score_gather_cells"] == 8192 and d["linear_striped_min_n"] == "per type"
+    assert d["inter_score_gather_cells"] > 0 and d["linear_striped_min_n"] == "per type"
     assert all(v == "default" for v in _tuning.gates().values())
     _tuning.set_gate("inter_score_gather_cells", 100)
     assert _tuning.get_gate("inter_score_gather_cells") == 100
@@ -81,9 +81,11 @@ def test_override_restores():
 
 
 def test_plan_follows_the_gates():
-    # 30-250 aa: the default byte cap sends the long pairs to their own fill
-    A, B = _pairs(60, 30, 250, seed=1)
-    b = nwgrad.SeqPairBatch(A, B, _params(), n_threads=1)
+    # 30-500 aa: the default byte cap sends the long pairs to their own fill (with the
+    # other threads busy -- n_threads 2; one thread alone has a wider budget; at W = 4
+    # lanes the 3 MiB budget reaches L250)
+    A, B = _pairs(60, 30, 500, seed=1)
+    b = nwgrad.SeqPairBatch(A, B, _params(), n_threads=2)
     elig, other, _ = b._inter_plan()
     assert elig > 0 and other > 0 and elig + other == len(A)
     _tuning.set_gate("inter_group_bytes", None)           # the same batch regroups

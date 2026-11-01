@@ -211,27 +211,27 @@ DiscrimAlign does: it passes the logical core count.
   (nighthaven protein int16/int32: gcc at 0.80-0.96 of clang's time at avx2, 0.78-0.94 at
   sse4; Piledriver int16 score 0.70). What is left is clang's x2 unrolling and interleaved
   scheduling of the segment loops, the same residue the float kernels show at W=2
-  (AGENTS "Toolchain"); `#pragma GCC unroll` did not close it there either. Not pursued.
+  (AGENTS "Toolchain"); `#pragma GCC unroll` did not close it there either. A hand
+  unroll of the score kernel's row pass (two segments a trip, `U2`, 2026-10-31) gained
+  2-5 % on AVX2 with gcc and left the gcc / clang ratio where it was (AGENTS "Score-only
+  integer kernel: two segments a trip"); the residue is clang's scheduling of the whole
+  kernel. Not pursued further.
 - int64 at AVX2 costs 1.5-2.6x float32 (no packed 64-bit max: `vpcmpgtq` + `vpblendvb`,
   the same 4 lanes as double) and 4-5x at sse2 (no 64-bit compare at all). It is headroom
   for huge parameters, not a speed type; nothing cheap left to do for it.
 
-## Per-ISA default gates: a large benchmark sweep
+## Per-ISA default gates: a large benchmark sweep — DONE 2026-11-01 (branch `perf/gates`)
 
-The fill gates are thresholds measured on one host per ISA. `inter_score_ok` /
-`kInterScoreGatherCells` (8192 cells, ~L90), `kInterLinearIntGatherCells`, the
-`inter_pair_fits` byte caps and `kLinearStripedMinN` all come from nighthaven (AVX2),
-with spot (NEON) as a check. They do not carry over. On wloczykij (Piledriver, sse4 level,
-2026-10-25, nwgrad vs SeqAn3 run, `integer` 1f48c1e), float32 Global affine score-only
-at L100 runs striped at 55.5 ms a batch (2000 pairs, 1 thread). Forced through
-`interpair` on `main` (no gate there), it takes 36.5 ms: the gate costs 1.5x on that host.
-Sweep every gate per ISA level (sse2, sse4, avx2, avx512, neon) on the fleet, over
-length, every scalar type, mode, gap model and output (score / path / hard grad), at
-1 thread and all cores. Then make the thresholds per level, with a table instead of one
-constant. The integer types pass the same score-only gate; check whether they are
-penalised the same way. The knob exists now: `nwgrad._tuning` overrides every gate at
-runtime (docs/tuning.md "Fill gates"), and `SeqPairBatch._inter_plan()` shows where the
-plan routed the pairs.
+Swept on nighthaven (AVX2 / SSE4 / SSE2), solace (AVX-512 / AVX2 / SSE4 / SSE2), spot
+(NEON) and skynet (SSE4), 1 thread and all, every type, mode, gap model and output;
+the gates are now a table per level and type (`GateLevelCaps`, simd_levels.hpp;
+AGENTS.md "The fill gates, per level and type"). Left open: Piledriver's shared Local
+affine fills and shared int16 score kernel lose 1.2-3x to the own fills at every
+length while the Intel SSE4 runs win 0.5-0.7 (a kernel-level anomaly on that
+microarchitecture, not a gate one); SSE2 shares the SSE table although its own int16
+and int64 kernels are slower than SSE4's (the shared fills win further there); and
+the sweep only has square protein pairs and 22 x L DNA pairs, so a short-A shape
+(`la` under the lane count) is not separated from the alphabet effect.
 
 ## Per-pair gradients stored contiguously (weighted_grad, grads)
 

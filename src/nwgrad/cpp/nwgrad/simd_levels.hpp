@@ -599,79 +599,157 @@ inline size_t gate_value(Gate g, size_t def) {
     const int64_t v = gate_override(g);
     return v < 0 ? def : static_cast<size_t>(v);
 }
-// Whether a pair of lengths (la, lb) may join an inter-pair group: the group's
-// interleaved tables must stay in L2.  Measured (nighthaven, i5-12500, Golden Cove: 1.25
-// MiB L2 per core; protein pairs, 12 threads): affine Viterbi wins up to 100-130
-// residues (tables ~1.3 MB per group) and loses 2x at 130-160 (~1.6 MB); linear, one
-// table, still wins at 160-200 and loses at 150-300 — the same byte crossover.  Past
-// it W pairs' tables stream from L3/DRAM while the per-pair fills keep 3 B/cell
-// (pointers) and win by up to 11x.  Viterbi: 3 (affine) / 1 (linear) T-tables of W
-// lanes, capped at 1.25 MiB.  The soft pass crosses over lower: 30-60 residues (~0.3
-// MB per group) win 0.51-0.70x at 12 threads, 60-120 (~1.3 MB) lose up to 1.95x — so
-// its 5 (affine: 3 forward tables, the per-row weights, rows) / 2 (linear) double
-// tables of Ws lanes are capped at 512 KiB.
-inline constexpr size_t kInterGroupBytes = size_t(5) << 18;   // 1.25 MiB
-inline constexpr size_t kInterSoftBytes  = size_t(1) << 19;   // 512 KiB
-// Score only, alphabets over 8 (the gather): the inter-pair score kernel loads one scalar
-// per lane-cell where the striped per-pair score kernel loads 1/W of a profile row per
-// cell, so the shared score pays only for short pairs — measured on nighthaven (AVX2,
-// BLOSUM62, 1 thread, inter / striped): L60 0.46-0.85, L100 0.80-1.14, L150 1.13-1.38,
-// L200 1.25-1.57, for int16, int32, float32 and double alike (the crossover ~L100 is
-// independent of the type and the lane count).  Hard fills are not gated by this: there
-// the shared fill replaces the own LINEAR fill, which is slower at every length.
-inline constexpr size_t kInterScoreGatherCells = size_t(8192);   // (M + 1) * (n + 1) of the group
-// Hard fills, linear, integer T, alphabets over 8 (batch_engine.hpp, inter_eligible_): ~L120.
-inline constexpr size_t kInterLinearIntGatherCells = size_t(15000);
-// The same for FLOATING T on AArch64 (NEON, the only simd level there): the inter-pair
-// gather loses to the leveled linear kernel from ~L120 (float32) / ~L90 (double) on the
-// M1 (inter / own, Local protein, hard: float32 L100 0.87, L150 1.14, L200 1.18; double
-// L60 0.95, L100 1.02, L150 1.11), while on AVX2 it still wins through L200 (0.63-0.84),
-// so x86 keeps no cap.  0 = no cap.
+// ── The fill gates: which pairs join a shared (inter-pair) fill ────────────────
+//
+// Per ISA level and scalar type, measured by tools/gate_sweep.py (2026-10-31 / 11-01) on
+// nighthaven (AVX2, 12 threads), solace (AVX-512 / AVX2 / SSE4, 16), spot (NEON, M1, 8)
+// and skynet (SSE4, Piledriver): each gate's two fills timed in one process at every
+// length, the crossover read off, the table replayed over every record (AGENTS.md, "The
+// fill gates, per level and type").  Every hard fill is bit-identical, so a gate moves
+// only speed and memory.  The level that decides a table is the one a host runs by
+// default: nighthaven's AVX2, solace's AVX-512, the M1's NEON; the SSE table (SSE2 and
+// SSE4 share it) follows nighthaven's and solace's SSE4 runs.
+//
+// The hard shared fill keeps W pairs' DP tables (3 affine / 1 linear, of T) interleaved
+// per thread, and loses once they stream from memory instead of cache.  The crossover
+// is a BYTE budget per thread, the same ~3 MiB on every level and host for float32,
+// double and int64 with the other threads busy (nighthaven L180, solace avx2 L160-200
+// and avx512 L120-140, the M1 L250: three different lane widths, one byte count) and
+// far wider -- L300 and beyond, 8-18 MiB -- when one thread has the shared cache to
+// itself; so the cap takes n_threads == 1 into account.  int16 and int32 cross earlier
+// (their own striped fills are fast): ~1 MiB on x86 -- except on the M1, where int16 and
+// int32 keep winning to L250-300 (3-4.5 MiB).  A score-only call keeps one row per
+// table, so the byte budget does not apply to it (inter_eligible_, stream_inter_).
+//
+// The score-only and linear hard shared fills of alphabets over 8 letters gather one
+// scalar per lane-cell where the own striped kernels read a profile row, so they pay
+// only for short pairs: cell caps per type, where the own kernel's speed sets the
+// crossover (int16 / int32 from L40-60, float32 to L150 on AVX2 and beyond L250 on
+// AVX-512).  0 = never shared, kGateNoCap = always.  Alphabets of up to 8 letters
+// (DNA) take the mask-blend kernels instead, which never gather: those have caps of
+// their own -- the shared score kernel loses to the own fill from 22 x 80 for double
+// and int32 on AVX2 (the own kernel's single profile row wins once B is long), and in
+// Local mode sooner than in Global, so they are per mode; the shared linear fill of
+// int64 loses at SSE and NEON at every length.
+//
+// The shared soft pass's 5 (affine) or 2 (linear) double tables of Ws lanes: affine ~3
+// MiB per thread (8 with one thread), linear ~L140 (20000 cells) on AVX2 / AVX-512 /
+// NEON and ~L180 (33000) at SSE.
+struct GateTypeCaps {
+    uint32_t score_affine, score_linear;   // score-only gather (alphabets > 8), cells (M+1)(n+1); 0 = never
+    uint32_t linear_gather;                // hard linear shared fill (alphabets > 8), cells; 0 = never
+    uint32_t group_kb, group_kb_1;         // hard shared fill: KiB of tables per thread, n_threads > 1 / == 1
+    uint32_t score_small_local, score_small_global;   // score-only shared kernel, alphabets <= 8: cells, per mode
+    uint32_t linear_small;                 // hard linear shared fill, alphabets <= 8: cells
+};
+struct GateLevelCaps {
+    GateTypeCaps f32, f64, i16, i32, i64;
+    uint32_t soft_kb, soft_kb_1;           // shared soft pass, affine: KiB of its 5 tables per thread
+    uint32_t soft_linear_cells;            // shared soft pass, linear: cells
+    template <class T> const GateTypeCaps& of() const noexcept {
+        if constexpr (std::is_same_v<T, float>)        return f32;
+        else if constexpr (std::is_same_v<T, double>)  return f64;
+        else if constexpr (std::is_same_v<T, int16_t>) return i16;
+        else if constexpr (std::is_same_v<T, int32_t>) return i32;
+        else                                           return i64;
+    }
+};
+inline constexpr uint32_t kGateNoCap = 0xFFFFFFFFu;
+//                                        score_aff score_lin lin_gather  group_kb  group_kb_1  small_loc  small_glob  lin_small
+inline constexpr GateLevelCaps kGateCapsSse    { {  6600,  3800,      20000,  3072, 12288,  1900, kGateNoCap, kGateNoCap },   // float32
+                                                 {     0,     0,       8000,  3072, 12288,     0,       1200, kGateNoCap },   // double
+                                                 {     0,  1700,       4000,  1024,  1024,  1900,       1900, kGateNoCap },   // int16
+                                                 {     0,  1700, kGateNoCap,  3072, 12288,  1200,        800, kGateNoCap },   // int32 (its own linear fill is slow at W=4: shared to L400)
+                                                 {     0,  1700,          0,  3072, 12288,     0,          0,          0 },   // int64
+                                                 3072, 8192, 33000 };
+inline constexpr GateLevelCaps kGateCapsAvx2   { { 31000, 10300,      20000,  3072, 12288,  4700, kGateNoCap, kGateNoCap },
+                                                 {  6600,  3800,      20000,  3072, 12288,  1900, kGateNoCap, kGateNoCap },
+                                                 {  1700,  1700,       4000,  1024,   450,  4700,       4700, kGateNoCap },
+                                                 {  1700,  3800,       4000,  2560,  2048,  1900,       1900, kGateNoCap },
+                                                 {  3800,  1700,       2500,  3072, 12288,  2800,       1900, kGateNoCap },
+                                                 3072, 8192, 20000 };
+inline constexpr GateLevelCaps kGateCapsAvx512 { { kGateNoCap, 31000, 33000,  3072, 18432, kGateNoCap, kGateNoCap, kGateNoCap },
+                                                 { 160000, 23000,     33000,  3072, 18432, kGateNoCap, kGateNoCap, kGateNoCap },
+                                                 {  1700,  1700,       4000,  1024,  1024, kGateNoCap, kGateNoCap, kGateNoCap },
+                                                 {  2600,  3800,       4000,  1024,  1024, kGateNoCap, kGateNoCap, kGateNoCap },
+                                                 {  1700,  3800,       6600,  1500,  2048,  4700, kGateNoCap, kGateNoCap },
+                                                 3072, 8192, 20000 };
+inline constexpr GateLevelCaps kGateCapsNeon   { { 10300,  3800,       8000,  5120, 12288,  2800, kGateNoCap, kGateNoCap },
+                                                 {     0,     0,       3000,  3072, 12288,   800,       1900, kGateNoCap },
+                                                 {  1700,  1700,       8000,  3072,  1400,  4700,       4700, kGateNoCap },
+                                                 {  1700,  1700,       8000,  4608,  6144,  4700,       4700, kGateNoCap },
+                                                 { 63100,     0,          0,  4608, 12288,  2800, kGateNoCap,          0 },
+                                                 3072, 8192, 20000 };
+inline const GateLevelCaps& gate_caps(int level) noexcept {
 #if defined(__aarch64__) || defined(_M_ARM64)
-inline constexpr size_t kInterLinearF32GatherCells = size_t(15000);
-inline constexpr size_t kInterLinearF64GatherCells = size_t(8000);
+    (void)level; return kGateCapsNeon;
 #else
-inline constexpr size_t kInterLinearF32GatherCells = 0;
-inline constexpr size_t kInterLinearF64GatherCells = 0;
+    switch (static_cast<SimdLevel>(level)) {
+        case SimdLevel::Avx2:   return kGateCapsAvx2;
+        case SimdLevel::Avx512: return kGateCapsAvx512;
+        default:                return kGateCapsSse;
+    }
 #endif
-// Global linear, alphabets over 8 (admitted to the shared fill 2026-10-23): it wins L20-80
-// for every type, but at 12 threads (nighthaven AVX2, inter / own, hard) loses for the
-// integers at L80-100 (1.04-1.20; 1 thread 0.82-1.01) and for float32 at L160-200
-// (1.02-1.11; 1 thread 0.80-0.87) — the threaded case is a batch's default, so those
-// bands are capped: ~L75 and ~L140.  double wins through L200 (0.77-0.93).
-inline constexpr size_t kInterGlobalLinearIntCells = size_t(6000);
-inline constexpr size_t kInterGlobalLinearF32Cells = size_t(20000);
-// The gather cap for a linear hard pair of T over an alphabet over 8 letters, or
-// SIZE_MAX (none): the smallest of the caps that apply (the mode's, the type's,
-// AArch64's for floats).  A compiled default of 0 means no cap; an override is literal.
+}
+// A compiled cap with its override: < 0 = none set (the default), kGateOff = no cap, else literal.
+inline size_t gate_cap(Gate g, size_t def) noexcept {
+    const int64_t o = gate_override(g);
+    return o < 0 ? def : static_cast<size_t>(o);
+}
+// Score only: the shared score kernel pays only for short pairs -- over 8 letters it
+// gathers (the InterScoreGatherCells override applies), up to 8 it blends on masks and
+// loses to the own fill from a length of its own, per mode.  Hard fills are not gated
+// by this: there the shared fill replaces the own LINEAR fill, gated by inter_linear_cap.
+template <class T>
+inline bool inter_score_ok(size_t nalpha, int M, int n, bool affine, bool local, int level) noexcept {
+    const GateTypeCaps& c = gate_caps(level).of<T>();
+    const size_t cap = nalpha <= 8 ? size_t(local ? c.score_small_local : c.score_small_global)
+                                   : gate_cap(Gate::InterScoreGatherCells, affine ? c.score_affine : c.score_linear);
+    return static_cast<size_t>(M + 1) * static_cast<size_t>(n + 1) <= cap;
+}
+// The cell cap for a linear hard pair of T: over 8 letters the level's per-type gather
+// cap (0: never) under the overrides that apply (the type's, Global's); up to 8 letters
+// the mask-blend fill's own cap (no override: it never gathers).
 template <class T, bool Global>
-inline size_t inter_linear_gather_cap() {
-    size_t cap = SIZE_MAX;
-    auto take = [&cap](Gate g, size_t def) {
-        const size_t c = gate_override(g) < 0 ? (def > 0 ? def : SIZE_MAX) : gate_value(g, def);
-        if (c < cap) cap = c;
+inline size_t inter_linear_cap(size_t nalpha, int level) noexcept {
+    const GateTypeCaps& c = gate_caps(level).of<T>();
+    if (nalpha <= 8) return c.linear_small == kGateNoCap ? SIZE_MAX : c.linear_small;
+    const uint32_t def = c.linear_gather;
+    size_t cap = def == kGateNoCap ? SIZE_MAX : def;
+    auto take = [&cap](Gate g) {
+        const int64_t o = gate_override(g);
+        if (o >= 0 && static_cast<size_t>(o) < cap) cap = static_cast<size_t>(o);
     };
-    if constexpr (std::is_integral_v<T>) take(Gate::InterLinearIntGatherCells, kInterLinearIntGatherCells);
-    else if constexpr (std::is_same_v<T, float>) take(Gate::InterLinearF32GatherCells, kInterLinearF32GatherCells);
-    else take(Gate::InterLinearF64GatherCells, kInterLinearF64GatherCells);
+    if constexpr (std::is_integral_v<T>) take(Gate::InterLinearIntGatherCells);
+    else if constexpr (std::is_same_v<T, float>) take(Gate::InterLinearF32GatherCells);
+    else take(Gate::InterLinearF64GatherCells);
     if constexpr (Global) {
-        if constexpr (std::is_integral_v<T>) take(Gate::InterGlobalLinearIntCells, kInterGlobalLinearIntCells);
-        else if constexpr (std::is_same_v<T, float>) take(Gate::InterGlobalLinearF32Cells, kInterGlobalLinearF32Cells);
+        if constexpr (std::is_integral_v<T>) take(Gate::InterGlobalLinearIntCells);
+        else if constexpr (std::is_same_v<T, float>) take(Gate::InterGlobalLinearF32Cells);
     }
     return cap;
 }
-inline bool inter_score_ok(size_t nalpha, int M, int n) {
-    return nalpha <= 8 ||
-           static_cast<size_t>(M + 1) * static_cast<size_t>(n + 1) <=
-               gate_value(Gate::InterScoreGatherCells, kInterScoreGatherCells);
-}
-inline bool inter_pair_fits(size_t la, size_t lb, bool affine, bool soft, int W,
-                            size_t tsize, int Ws) {
+// Whether a pair of lengths (la, lb) may join a shared group on `level`: its W lanes'
+// tables within the byte budget (single: n_threads == 1), and for a soft pair the soft
+// pass's tables (Ws lanes of double; the float32 pass has twice the lanes of half the
+// size, the same bytes) too.  Not for a score-only call, which keeps rows, not tables.
+template <class T>
+inline bool inter_pair_fits(size_t la, size_t lb, bool affine, bool soft, int W, int Ws,
+                            bool single, int level) noexcept {
     const size_t cells = (la + 1) * (lb + 1);
-    if (cells * static_cast<size_t>(W) * (affine ? 3 : 1) * tsize >
-        gate_value(Gate::InterGroupBytes, kInterGroupBytes)) return false;
-    return !soft || cells * static_cast<size_t>(Ws) * (affine ? 5 : 2) * sizeof(double) <=
-                        gate_value(Gate::InterSoftBytes, kInterSoftBytes);
+    const GateLevelCaps& lc = gate_caps(level);
+    const GateTypeCaps& tc = lc.template of<T>();
+    const size_t cap = gate_cap(Gate::InterGroupBytes, size_t(single ? tc.group_kb_1 : tc.group_kb) << 10);
+    if (cells * static_cast<size_t>(W) * (affine ? 3 : 1) * sizeof(T) > cap) return false;
+    if (!soft) return true;
+    if (affine) {
+        const size_t scap = gate_cap(Gate::InterSoftBytes, size_t(single ? lc.soft_kb_1 : lc.soft_kb) << 10);
+        return cells * static_cast<size_t>(Ws) * 5 * sizeof(double) <= scap;
+    }
+    const int64_t o = gate_override(Gate::InterSoftBytes);   // an override is bytes, as for affine
+    const size_t ccap = o < 0 ? lc.soft_linear_cells
+                      : static_cast<size_t>(o) / (static_cast<size_t>(Ws) * 2 * sizeof(double));
+    return cells <= ccap;
 }
 
 // Doubles of scratch the inter-pair soft pass needs for W lanes (the caller allocates it,
@@ -768,6 +846,7 @@ struct LevelKernels {
     TypedKernels<int32_t> i32;
     TypedKernels<int64_t> i64;
     int           row_block = 0;                // columns per interleaved block (per-µarch)
+    int           level = 0;                    // this level's SimdLevel id (the gates read it)
     inter_soft_fn inter_soft = nullptr;         // inter-pair soft pass, double (W = d.inter_w)
     soft_pair_fn  soft_pair_linear = nullptr;   // per-pair scaled forward-backward ↓
     soft_pair_fn  soft_pair_affine = nullptr;
