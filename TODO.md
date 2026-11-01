@@ -1,13 +1,19 @@
 # TODO
 
-## A float32 soft path (requested 2026-10-27)
+## A float32 soft path (requested 2026-10-27) — DONE 2026-11-01 (branch `perf/soft-f32`)
 
-The soft (forward–backward) path runs in float64 at both precisions: `SeqPair` and the
-`_double` soft functions compute the same thing (tuning.md, "Precision"). Wanted: a real
-float32 soft implementation, so the soft gradient gets float32's lane width like the
-Viterbi kernels do. Found while planning the fleet-wide competitor benchmark, which
-compares only within one dtype: DeepBLAST's default float32 soft gradient has no nwgrad
-counterpart to be compared with.
+The float32 classes run the scaled forward-backward in float32 (AGENTS.md "The float32
+soft path"; `soft_precision` switches a batch back to double). Left open:
+- An all-refusing batch (diffuse long linear pairs: the lost-mass bound rejects float32
+  for every pair) pays one float32 attempt per thread per call before the batch's
+  patience count stops the attempts: 8 threads, 40 L1000 linear pairs, 1.1-1.2x the
+  double class on the M1 (1.06 at one thread; AVX2 1.04). A per-pair memory of the
+  refusal across calls (a flag bit beside `kStored`, cleared when the temperature or the
+  parameters move far) would remove it.
+- The per-pair float32 kernels at protein L100 on AVX2 are only level with double
+  (0.9-1.0; the shared pass 0.8-0.9, L300 0.78-0.86): the double kernel is latency-bound
+  there and float32's wider lanes buy little until the rows are long. Unprofiled.
+- The log-space fallback (`soft_impl="log"`) stays double.
 
 ## Denser direction codes for the multithreaded memory wall (requested 2026-10-25) — DONE, gated: AVX2, AVX-512, NEON (linear float32 / int32); sse4 measured and off (2026-10-26; AGENTS.md "Dense direction codes, gated")
 
