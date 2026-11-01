@@ -310,7 +310,8 @@ for (int i = M; i >= 0; --i) {
     // values, so they are taken before any rescale and the (rare) rescale is
     // applied to them afterwards.
     ivd c, mx;
-    ivd sx, sy, so, sob, lbv, lcv, acc[8];
+    ivd sx, sy, so, sob, acc[8];
+    ivd lbv_out, lcv_out;   // the counted pass's flush counters (written by that instantiation only)
     // soft_guide="posterior": each lane's row argmax of the posterior; the loop runs
     // right to left, so >= keeps the leftmost (as the per-pair kernel's first >).
     const bool post = J.gpost != nullptr;
@@ -343,9 +344,12 @@ for (int i = M; i >= 0; --i) {
     // the row is computed from row i+1 and the forward tables, so the counted rerun is a
     // plain recomputation.
     auto row = [&](auto Cnt) {
-    c = z; mx = z; sx = z; sy = z; so = z; sob = z; lbv = z; lcv = z;
+    c = z; mx = z; sx = z; sy = z; so = z; sob = z;
     for (int cc = 0; cc < nm; ++cc) acc[cc] = z;
     pbv = z - SF(1); pbj = z; pyn = z;
+    // the counters as locals of the counted instantiation: live zero vectors across the
+    // column loop cost the uncounted pass a register (as the double pass once, AGENTS.md)
+    [[maybe_unused]] ivd lbv = z, lcv = z;
     if (i >= 1) {
         // The per-letter sums at a compile-time trip count for nm = 4 (DNA/RNA), so
         // acc[0..3] can live in registers; with a runtime nm both compilers kept the
@@ -400,6 +404,7 @@ for (int i = M; i >= 0; --i) {
         }
         cell(0);
     }
+    if constexpr (decltype(Cnt)::value) { lbv_out = lbv; lcv_out = lcv; }
     };
     row(std::false_type{});
     // The flushed products' term (simd_levels.hpp, sp_loss_products_max): the worst case
@@ -419,10 +424,14 @@ for (int i = M; i >= 0; --i) {
             lossp[l] = sp_loss_products_max<SF>(n + 1, 5, mx[l], gh0[l], gv0[l]);
             need |= !(loss[l] + lossp[l] <= kSpCountBudget * SoftRange<SF>::tol);
         }
+#ifdef NWGRAD_SP_RERUN_STATS
+        { static std::atomic<long> rows_{0}, reruns_{0}; const long r = ++rows_; if (need) ++reruns_;
+          if (r % 100000 == 0) std::fprintf(stderr, "inter rows %ld reruns %ld\n", r, reruns_.load()); }
+#endif
         if (need) {
             row(std::true_type{});
             for (int l = 0; l < IW; ++l)
-                lossp[l] = (i > J.m[l]) ? 0.0 : sp_loss_products<SF>(lbv[l], lcv[l], gh0[l], gv0[l]);
+                lossp[l] = (i > J.m[l]) ? 0.0 : sp_loss_products<SF>(lbv_out[l], lcv_out[l], gh0[l], gv0[l]);
         }
     }
     if (post)
@@ -683,13 +692,15 @@ for (int i = M; i >= 0; --i) {
     ivd ebn = eb;   // the move down into row i+1 (Tr: that row's)
     if constexpr (Tr) { ea = isj_w(J, i, 1); eb = isj_w(J, i, 3); if (i < M) ebn = isj_w(J, i + 1, 3); }
     const ivd* Ec = ER + static_cast<size_t>(i) * w2;
-    ivd c, mx, sa, sb, lbv, lcv, acc[8];
+    ivd c, mx, sa, sb, acc[8];
+    ivd lbv_out, lcv_out;   // the counted pass's flush counters (see inter_soft_affine)
     const bool post = J.gpost != nullptr;   // as in inter_soft_affine
     ivd pbv, pbj;
     auto row = [&](auto Cnt) {   // the row pass, with or without the counters (see inter_soft_affine)
-    c = z; mx = z; sa = z; sb = z; lbv = z; lcv = z;
+    c = z; mx = z; sa = z; sb = z;
     for (int cc = 0; cc < nm; ++cc) acc[cc] = z;
     pbv = z - SF(1); pbj = z;
+    [[maybe_unused]] ivd lbv = z, lcv = z;
     auto cols = [&](auto NMc) {   // nm = 4 at a compile-time trip count (see inter_soft_affine)
     constexpr int NM = decltype(NMc)::value;
     constexpr bool kc = std::is_same_v<SF, float> && NWGRAD_SP_COUNT_F32 && decltype(Cnt)::value;   // flushed products counted (sp_loss_products)
@@ -738,6 +749,7 @@ for (int i = M; i >= 0; --i) {
     };
     if (nm == 4) cols(std::integral_constant<int, 4>{});
     else         cols(std::integral_constant<int, -1>{});
+    if constexpr (decltype(Cnt)::value) { lbv_out = lbv; lcv_out = lcv; }
     };
     row(std::false_type{});
     // The flushed products' term (simd_levels.hpp, sp_loss_products_max): the worst case
@@ -757,10 +769,14 @@ for (int i = M; i >= 0; --i) {
             lossp[l] = sp_loss_products_max<SF>(n + 1, 3, mx[l], gh0[l], gv0[l]);
             need |= !(loss[l] + lossp[l] <= kSpCountBudget * SoftRange<SF>::tol);
         }
+#ifdef NWGRAD_SP_RERUN_STATS
+        { static std::atomic<long> rows_{0}, reruns_{0}; const long r = ++rows_; if (need) ++reruns_;
+          if (r % 100000 == 0) std::fprintf(stderr, "inter rows %ld reruns %ld\n", r, reruns_.load()); }
+#endif
         if (need) {
             row(std::true_type{});
             for (int l = 0; l < IW; ++l)
-                lossp[l] = (i > J.m[l]) ? 0.0 : sp_loss_products<SF>(lbv[l], lcv[l], gh0[l], gv0[l]);
+                lossp[l] = (i > J.m[l]) ? 0.0 : sp_loss_products<SF>(lbv_out[l], lcv_out[l], gh0[l], gv0[l]);
         }
     }
     if (post)

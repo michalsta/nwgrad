@@ -377,6 +377,10 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear_t(SoftPairJobT<SF>& J) noexcept {
             if constexpr (kSpCountF) {
                 const double gv0 = sp_post(S[i - 1] + Tn - ze, izr, bad);
                 lossp = sp_loss_products_max<SF>(hi0 - j1 + 1, 1 + 2 * NWGRAD_SP_MAC_COUNTS, mx, gh0, gv0);
+#ifdef NWGRAD_SP_RERUN_STATS
+                { static std::atomic<long> rows_{0}, reruns_{0}; const long r = ++rows_; if (!(loss + lossp <= kSpCountBudget * SoftRange<SF>::tol)) ++reruns_;
+                  if (r % 100000 == 0) std::fprintf(stderr, "pair rows %ld reruns %ld\n", r, reruns_.load()); }
+#endif
                 if (!(loss + lossp <= kSpCountBudget * SoftRange<SF>::tol)) {   // near rejection: count
                     pass(std::true_type{});
                     lossp = sp_loss_products<SF>(lb, lc, gh0, gv0);
@@ -654,6 +658,10 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine_t(SoftPairJobT<SF>& J) noexcept {
             if constexpr (kSpCountF) {
                 const double gv0 = sp_post(S[i - 1] + Tn - ze, izr, bad);
                 lossp = sp_loss_products_max<SF>(hi0 - j1 + 1, 1 + 4 * NWGRAD_SP_MAC_COUNTS, mx, gh0, gv0);
+#ifdef NWGRAD_SP_RERUN_STATS
+                { static std::atomic<long> rows_{0}, reruns_{0}; const long r = ++rows_; if (!(loss + lossp <= kSpCountBudget * SoftRange<SF>::tol)) ++reruns_;
+                  if (r % 100000 == 0) std::fprintf(stderr, "pair rows %ld reruns %ld\n", r, reruns_.load()); }
+#endif
                 if (!(loss + lossp <= kSpCountBudget * SoftRange<SF>::tol)) {   // near rejection: count
                     pass(std::true_type{});
                     lossp = sp_loss_products<SF>(lb, lc, gh0, gv0);
