@@ -101,9 +101,10 @@ Build dependencies: `scikit-build-core`, `nanobind>=3.0` (the bindings call its 
   repeated call at len 50 (stores the path eagerly). Batches are faster; only loops over
   standalone pairs pay it.
 - Default thread count for short pairs: see `TODO.md`.
-- **Per-ISA fill gates**: every threshold was measured on nighthaven (AVX2), with spot as a check,
-  and does not carry over (Piledriver float32 score-only L100 loses 1.5x to its gate). The sweep
-  is in `TODO.md`; the knob is `nwgrad._tuning` ("Every fill gate is runtime-overridable" below).
+- **Per-ISA fill gates**: done 2026-11-01, a table per level and type from a fleet sweep
+  ("The fill gates, per level and type" below); the knob is `nwgrad._tuning` ("Every fill
+  gate is runtime-overridable" below). Piledriver's Local shared affine fills still lose
+  (a kernel problem there, `TODO.md`).
 - **Soft path: what is left** (see "The soft path" below). Done since the last list:
   the guide without a Viterbi (`soft_guide="posterior"`), the inter-pair soft pass for
   alphabets > 8 and for mixed B lengths, float32 batches sharing the soft pass.
@@ -2215,6 +2216,110 @@ solace (4623); the C++ suite on skynet (sse4, 2.93 M assertions), spot (neon, gc
 tests under clang 22 at avx512), with the integer tag at sse2 / sse4 / scalar_fallback;
 `tools/fuzz_ab.py` main vs branch 300 seeds, 0 differ (skynet).
 
+### The fill gates, per level and type (branch `perf/gates`, 2026-10-31 / 11-01)
+
+**Why.** Every gate's threshold had been measured once, on nighthaven at AVX2, most of them
+before the kernels they gate were rewritten (the striped int16 profile build, the fused
+integer score kernels, the inter-pair bit masks, the dense direction codes). The sweep
+(`tools/gate_sweep.py`: for each level, thread count, section, fixture, gap model, mode,
+type and length, the three arms `inter` / `own` / `default` -- every inter-pair cap off,
+every pair on its own fill, the compiled gates -- in ONE process, interleaved, best of
+--reps, scores checked equal across arms) ran on nighthaven (AVX2 / SSE4 / SSE2, 12
+threads), solace (AVX-512 / AVX2 / SSE4 / SSE2, 16), spot (NEON, M1, 8) and skynet (SSE4,
+Piledriver), 1 thread and all: 4344 / 5792 / 1448 / 1148 configurations. `--summary`
+prints the tables; `scratchpad/gate_cross.py` read the crossovers off, and
+`scratchpad/cap_check.py` replayed a candidate table over every record (what the table
+would choose, against the better arm) until the losses were single isolated lengths. On
+the box the gates came from, 304 of ~2200 configurations ran a default more than 8 %
+slower than the better arm, up to 2.65x. What the data said, gate by gate:
+
+- **`inter_group_bytes` (hard shared fill, affine and linear, 1.25 MiB of W pairs' tables
+  per thread).** The crossover is a byte budget, and it is ~3 MiB on every level and host
+  for float32, double and int64 with the other threads busy -- nighthaven avx2 L160 wins /
+  L200 loses, solace avx2 L160-200 and avx512 L120-140, the M1 L250-300: three lane widths
+  (8 / 16 / 4 float32 lanes), one byte count -- and far wider alone: one thread wins
+  through L300 everywhere, 0.58-0.92 (12 MiB; 18 on AVX-512, whose L300 still wins
+  0.74-0.84). int16 and int32 cross much earlier on x86 (their own striped fills are
+  fast): ~1 MiB; the M1 keeps every type shared to L250-300 (3-5 MiB). So the cap is per
+  type and knows `n_threads == 1`. Before, L120-160 float32 / double / int64 affine ran
+  1.4-1.7x slower than the shared fill at 12 threads, L200-300 at 1 thread 1.3-1.7x.
+- **A score-only call is exempt from the byte budget.** Its shared kernel keeps one row
+  per table, so the budget (sized for W pairs' full tables) had been sending every
+  score-only pair past ~L120 (AVX2) or ~L80 (AVX-512, 16 lanes) to its own fill, where the
+  shared score kernel wins to L250 and beyond: AVX-512 float32 score-only L150-250 ran
+  1.3-1.8x slower than it could.
+- **`inter_score_gather_cells` (score only, alphabets over 8; one cap, 8192 cells ~ L90).**
+  Per type now, and per level: int16 and int32 own score kernels win from L40-60 (the cap
+  sent L60-80 to the gather at 1.7-2x), float32's gather wins to L150 on AVX2 and past
+  L250 on AVX-512 (the cap stopped it at L90, 1.2-1.5x), double to L80 on AVX2 (L400 on
+  AVX-512), never at SSE4 or NEON. Affine and linear separately (linear's gather crosses
+  ~L60 lower).
+- **Alphabets of up to 8 letters (DNA) were never gated**, and their shared score kernel
+  (mask blends, no gather) loses too, from a length of its own: the own kernel builds one
+  profile row per DP row and wins once B is long. 22 x L pairs, shared / own: double Local
+  22x80 1.00 / 22x200 1.34 on AVX2 (Global 0.88 at 22x200: still winning), int32 L80-120,
+  int64 Local 22x120; float32 and int16 win to 22x200 on AVX2 and AVX-512, never cross
+  there; at SSE double and int64 lose from 22x30 (1.0-1.2 Local). Local crosses sooner than
+  Global in every type, so these caps are per mode (`score_small_local` / `_global`); the
+  gather caps stay one value per gap model. And the shared LINEAR hard fill of int64 over
+  small alphabets loses at SSE (sse4 1.06-1.2, sse2 2-2.5x) and on the M1 (1.15-1.34):
+  `linear_small` = 0 there, no cap elsewhere.
+- **The linear hard gather caps (`inter_linear_*_gather_cells`, `inter_global_linear_*`).**
+  The integer caps (15000 / 6000 cells) were too high: int16 and int32 cross at L60-80
+  (4000 cells) on every x86 level, int64 at L40-60 on AVX2 (2500; solace's avx2 run has
+  it winning to L400, nighthaven's losing from L60 -- nighthaven decides) and L60-80 on
+  AVX-512; float32 and double, uncapped on x86, cross at L120-160 (20000 cells on AVX2,
+  33000 on AVX-512) -- except SSE4 int32, whose own linear fill is slow at W=4: shared to
+  L400 and beyond. NEON: float32 L80-100, double L40-60, int16 / int32 L80-100.
+- **`inter_soft_bytes` (shared soft pass, 512 KiB).** Four times too low: affine wins to
+  L120 busy on AVX2 (3 MiB of its five tables), L80-100 on AVX-512 (the same bytes), L160
+  alone (8 MiB), and loses sharply past that (1.5-3x at L160 busy); linear ~L140 on AVX2 /
+  AVX-512 / NEON (20000 cells, not bytes) and L160+ at SSE (33000).
+- **`linear_striped_min_n`** (the striped vs scalar linear fill, per type and mode): the
+  compiled values hold within one length step on every level; unchanged.
+
+**The levels.** A table per level: SSE (SSE2 and SSE4 share it), AVX2, AVX-512, NEON. The
+host that decides a table is the one that runs that level by default -- nighthaven's
+AVX2, solace's AVX-512, the M1's NEON; the SSE table follows nighthaven's and solace's
+SSE4 runs, which agree with each other. Where a second host's run of the same level
+disagrees (solace's avx2 int64 linear fill, the M1's 1-thread configurations that an
+efficiency core caught), the default host wins. **Piledriver (skynet) disagrees with the
+SSE table in one way that is not a gate problem**: its shared Local affine fills of
+float32, double and int64 run 1.2-1.8x SLOWER than the own fills at every length (Global
+wins 0.6-0.8 as elsewhere), and its shared int16 score kernel 1.8-3x at 22 x 30-80 (0.4-0.7
+on the Intel hosts). A kernel on that microarchitecture is paying for something the
+others do not (the Local max blends? its 16 KB L1D?); untraced. `nwgrad._tuning` turns
+any of it off at runtime.
+
+**Measured caps are cells at the sweep's own lengths**: a cap written "3700" for L60
+excluded 61² = 3721 and put 60 x 60 pairs on the wrong side (score-linear float32 Global
+on NEON 1.37x, int64 score-only L100 on NEON 1.29x, in the first validation); every cap
+now sits between two sweep lengths (1700, 3800, 6600, 10300, 20000, 31000, 33000, ...).
+
+**Code.** `GateLevelCaps` / `GateTypeCaps` (simd_levels.hpp): one table per level of
+per-type caps -- score-only cells (affine / linear, alphabets over 8), the linear gather
+cells, the shared-fill KiB busy / alone, the small-alphabet score cells per mode and
+linear cells -- plus the soft caps; `gate_caps(level)` picks the table, `inter_pair_fits<T>`
+(not called for a score-only batch) / `inter_score_ok<T>` / `inter_linear_cap<T, Global>`
+take the level and, for the byte caps, whether the batch runs one thread; `LevelKernels::
+level` carries the id. The `nwgrad._tuning` overrides keep their names and semantics (an
+override replaces the compiled cap for every type and level; `None` turns the cap off, `0`
+sends everything to the own fill; the small-alphabet caps have no override), so
+`gate_sweep.py` and `_tuning.defaults()` (which now shows the default backend's float32
+values) still work.
+
+**Verified.** The reduced sweep rerun with the compiled table as the default arm (every
+level, 1 thread and all, 1148 / 3600 / 4800 configurations), default / better arm:
+- spot (NEON): median 1.003; 36 configurations over 1.08 (3.1 %; the first table 63), 8
+  over 1.15 (35), 2 over 1.3 (13), the worst 1.38 (1.64) -- single lengths, none in a run.
+- nighthaven (AVX2 / SSE4 / SSE2): median 1.001; at its default level, AVX2, 16 of 1148
+  over 1.08 (1.4 %; the first table 43), none over 1.15 (14), the worst 1.15 (1.58); SSE4
+  18 / 7 / 1 over 1.08 / 1.15 / 1.3 (106 / 67 / 21), SSE2 30 / 21 / 5 (129 / 102 / 54; its
+  own int16 and int64 kernels are slower than SSE4's and the SSE table is SSE4's).
+- solace (AVX-512 / AVX2 / SSE4 / SSE2): median 1.001; at its default level, AVX-512, 4 of
+  1148 over 1.08 (0.3 %; the first table 34), 2 over 1.15 (31), none over 1.3 (21), the
+  worst 1.18 (1.94); AVX2 24 / 11 / 1 (36 / 14 / 3), SSE4 19 / 3 / 0 (89 / 53 / 19), SSE2
+  12 / 1 / 0 of 948 (123 / 101 / 47).
 ### Score-only integer kernel: two segments a trip (branch `perf/int-unroll`, 2026-10-31)
 
 **Why.** The gcc-vs-clang residue on the integer striped kernels (clang 4-20 % faster on
