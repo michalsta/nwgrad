@@ -128,17 +128,20 @@ Expected reference(std::string_view a, std::string_view b, const AlignParams& p,
     return r;
 }
 
+// Soft results are tolerance-equal across fills; a float32 engine's soft pass runs in
+// float32 (shared and per-pair kernels ~1e-6 apart), so its tolerances are scaled up.
+template <class T> constexpr double soft_scale = std::is_same_v<T, float> ? 2e5 : 1.0;
 void check_number(double expected, double actual, bool soft, double tolerance = 1e-10) {
     if (soft) CHECK(std::abs(expected - actual) <= tolerance * (1.0 + std::abs(expected)));
     else CHECK(same(expected, actual));
 }
-void check_grad(const AlignParams& expected, const AlignParams& actual, bool soft) {
+void check_grad(const AlignParams& expected, const AlignParams& actual, bool soft, double scale = 1.0) {
     for (size_t k = 0; k < static_cast<size_t>(expected.matrix.size()) * expected.matrix.size(); ++k)
-        check_number(expected.matrix.data()[k], actual.matrix.data()[k], soft, 1e-9);
-    check_number(expected.gap_open_a, actual.gap_open_a, soft, 1e-9);
-    check_number(expected.gap_extend_a, actual.gap_extend_a, soft, 1e-9);
-    check_number(expected.gap_open_b, actual.gap_open_b, soft, 1e-9);
-    check_number(expected.gap_extend_b, actual.gap_extend_b, soft, 1e-9);
+        check_number(expected.matrix.data()[k], actual.matrix.data()[k], soft, 1e-9 * scale);
+    check_number(expected.gap_open_a, actual.gap_open_a, soft, 1e-9 * scale);
+    check_number(expected.gap_extend_a, actual.gap_extend_a, soft, 1e-9 * scale);
+    check_number(expected.gap_open_b, actual.gap_open_b, soft, 1e-9 * scale);
+    check_number(expected.gap_extend_b, actual.gap_extend_b, soft, 1e-9 * scale);
 }
 
 // SIMD and per-pair soft passes may choose different posterior argmax columns
@@ -189,7 +192,7 @@ void check_posterior_guide(std::string_view a, std::string_view b,
         const double chosen = guide[i] == previous
             ? *std::max_element(exit.begin(), exit.begin()+previous+1) : exit[guide[i]];
         INFO("posterior row " << i << " chosen " << guide[i] << " mass " << chosen << " best " << best);
-        CHECK(best - chosen <= 1e-10 * (1.0 + std::abs(best)));
+        CHECK(best - chosen <= 1e-10 * soft_scale<T> * (1.0 + std::abs(best)));
         previous = guide[i];
     }
 }
@@ -226,7 +229,7 @@ void run_case(unsigned seed, const Cfg& c) {
             p1, c, kernel(i), false));
         sum += expected.back().score;
     }
-    check_number(sum, eng.score_and_grad(), soft);
+    check_number(sum, eng.score_and_grad(), soft, 1e-10 * soft_scale<T>);
     AlignParams plain(alpha), weighted(alpha);
     std::vector<double> weights(N);
     for (auto& w : weights) w = std::uniform_real_distribution<double>(-2, 2)(rng);
@@ -234,7 +237,7 @@ void run_case(unsigned seed, const Cfg& c) {
         INFO("full pair " << i);
         REQUIRE(eng.score_valid(i)); REQUIRE(eng.path_valid(i)); REQUIRE_FALSE(eng.path_stored(i));
         REQUIRE(eng.grad_valid(i) == (c.gd != GradMode::None));
-        check_number(expected[i].score, eng.score(i), soft);
+        check_number(expected[i].score, eng.score(i), soft, 1e-10 * soft_scale<T>);
         const bool pending = c.gd == GradMode::None || (soft && c.soft_guide == 1);
         REQUIRE(eng.guide_pending(i) == pending);
         if (!(soft && c.soft_guide == 1)) {
@@ -245,13 +248,13 @@ void run_case(unsigned seed, const Cfg& c) {
             } else CHECK(expected[i].guide == actual_guide);
         }
         if (c.gd != GradMode::None) {
-            check_grad(expected[i].grad, eng.grad(i), soft);
+            check_grad(expected[i].grad, eng.grad(i), soft, soft_scale<T>);
             plain += expected[i].grad; weighted += weights[i] * expected[i].grad;
         }
     }
     if (c.gd != GradMode::None) {
-        check_grad(plain, eng.compute_grad(), soft);
-        check_grad(weighted, eng.weighted_grad(weights.data(), N), soft);
+        check_grad(plain, eng.compute_grad(), soft, soft_scale<T>);
+        check_grad(weighted, eng.weighted_grad(weights.data(), N), soft, soft_scale<T>);
     }
     eng.set_params(p2);
     sum = 0;
@@ -263,12 +266,12 @@ void run_case(unsigned seed, const Cfg& c) {
                             kernel(i), false, c.bw, expected[i].guide);
         sum += expected[i].score;
     }
-    check_number(sum, eng.banded_grad(c.bw), soft);
+    check_number(sum, eng.banded_grad(c.bw), soft, 1e-10 * soft_scale<T>);
     for (size_t i = 0; i < N; ++i) {
         INFO("banded pair " << i);
-        check_number(expected[i].score, eng.score(i), soft);
+        check_number(expected[i].score, eng.score(i), soft, 1e-10 * soft_scale<T>);
         CHECK(expected[i].guide == eng.guide_raw(i));
-        if (c.gd != GradMode::None) check_grad(expected[i].grad, eng.grad(i), soft);
+        if (c.gd != GradMode::None) check_grad(expected[i].grad, eng.grad(i), soft, soft_scale<T>);
     }
     for (bool banded : {false, true}) {
         sum = 0;
@@ -278,15 +281,15 @@ void run_case(unsigned seed, const Cfg& c) {
                 : reference<T, GM, AM, AlignBand::Full>(A[i], B[i], p2, c, kernel(i), true);
             sum += expected[i].score;
         }
-        check_number(sum, banded ? eng.banded_grad(c.bw, true) : eng.score_and_grad(true), soft);
+        check_number(sum, banded ? eng.banded_grad(c.bw, true) : eng.score_and_grad(true), soft, 1e-10 * soft_scale<T>);
         for (size_t i = 0; i < N; ++i) {
             INFO("stored paths pair " << i << " banded " << banded);
             REQUIRE(eng.path_stored(i));
-            check_number(expected[i].score, eng.score(i), soft);
+            check_number(expected[i].score, eng.score(i), soft, 1e-10 * soft_scale<T>);
             CHECK(expected[i].aligned == eng.aligned(i));
             CHECK(expected[i].coordinates == eng.coordinates(i));
             CHECK(expected[i].guide == eng.guide_raw(i));
-            if (c.gd != GradMode::None) check_grad(expected[i].grad, eng.grad(i), soft);
+            if (c.gd != GradMode::None) check_grad(expected[i].grad, eng.grad(i), soft, soft_scale<T>);
         }
     }
     eng.drop_paths();
@@ -399,13 +402,13 @@ void stream_sweep(int n) {
         for (int i = 0; i < N; ++i) {
             INFO("problem " << i);
             if (gds[gi] == GradMode::Soft)
-                CHECK(std::abs(ro.scores[i] - re.scores[i]) <= 1e-11 * (1 + std::abs(ro.scores[i])));
+                CHECK(std::abs(ro.scores[i] - re.scores[i]) <= 1e-11 * soft_scale<T> * (1 + std::abs(ro.scores[i])));
             else
                 CHECK(same(ro.scores[i], re.scores[i]));
         }
         for (int q = 0; q < alpha.size() * alpha.size(); ++q) {
             const double x = ro.grad.matrix.data()[q], y = re.grad.matrix.data()[q];
-            if (gds[gi] == GradMode::Soft) CHECK(std::abs(x - y) <= 1e-9 * (1 + std::abs(x)));
+            if (gds[gi] == GradMode::Soft) CHECK(std::abs(x - y) <= 1e-9 * soft_scale<T> * (1 + std::abs(x)));
             else                           CHECK(same(x, y));
         }
     }

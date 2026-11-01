@@ -41,8 +41,10 @@ def batch_results(A, B, params, gm, mode, impl, threads=2):
     return b.scores(), mats, gaps
 
 
-def close(x, y):
-    np.testing.assert_allclose(x, y, rtol=REL, atol=ABS)
+def close(x, y, cls=nwgrad.SeqPairBatchDouble):
+    # The float32 class runs its soft pass in float32: ~1e-6 relative of double.
+    f32 = "Double" not in getattr(cls, "__name__", "")   # (by name: the forced-kernel conftest wraps the class)
+    np.testing.assert_allclose(x, y, rtol=2e-4 if f32 else REL, atol=1e-5 if f32 else ABS)
 
 
 @pytest.mark.parametrize("gm,mode", MODES)
@@ -218,9 +220,9 @@ def test_soft_interpair_identical(mode, cls):
         guides = [list(b[i].guide_j) for i in range(len(b))]
         banded = b.banded_grad(3)
         out.append((b.scores(), mats, gaps, guides, banded))
-    close(out[0][0], out[1][0])
-    close(out[0][1], out[1][1])
-    close(out[0][2], out[1][2])
+    close(out[0][0], out[1][0], cls)
+    close(out[0][1], out[1][1], cls)
+    close(out[0][2], out[1][2], cls)
     assert out[0][3] == out[1][3]
     assert out[0][4] == out[1][4]
 
@@ -333,9 +335,9 @@ def test_soft_interpair_linear(mode, T, cls):
         b.score_and_grad()
         mats, gaps = b.grads()
         out.append((b.scores(), mats, gaps, [list(b[i].guide_j) for i in range(len(b))]))
-    close(out[0][0], out[1][0])
-    close(out[0][1], out[1][1])
-    close(out[0][2], out[1][2])
+    close(out[0][0], out[1][0], cls)
+    close(out[0][1], out[1][1], cls)
+    close(out[0][2], out[1][2], cls)
     assert out[0][3] == out[1][3]
 
 
@@ -443,16 +445,16 @@ def test_soft_guide_posterior(gm, mode, cls):
             for f, i in (("striped", "scaled"), ("striped", "log"), ("interpair", "scaled"))]
     assert runs[0].soft_guide == "posterior"
     for r in runs:
-        close(e.scores(), r.scores())
-        close(e.grads()[0], r.grads()[0])
-        close(e.grads()[1], r.grads()[1])
+        close(e.scores(), r.scores(), cls)
+        close(e.grads()[0], r.grads()[0], cls)
+        close(e.grads()[1], r.grads()[1], cls)
     guides = [[list(r[i].guide_j) for i in range(len(A))] for r in runs]
     # Not bit-exact: an exact tie in exact arithmetic (two exits scoring alike) may round
     # either way per implementation, as the soft path does everywhere.
     rows = sum(len(g) for g in guides[0])
     for other in guides[1:]:
         same = sum(x == y for g, h in zip(guides[0], other) for x, y in zip(g, h))
-        assert same / rows >= 0.97
+        assert same / rows >= (0.95 if "Double" not in getattr(cls, "__name__", "") else 0.97)
     for a, b, g in zip(A, B, guides[0]):
         assert len(g) == len(a) + 1 and g == sorted(g) and 0 <= g[0] and g[-1] <= len(b)
     runs[2].banded_grad(4)   # usable as a band centre

@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <string>
 #include <cstdlib>
+#include <cstdio>
 #include <string_view>
 #include <type_traits>
 #include <utility>
@@ -1084,6 +1085,15 @@ struct Aligner {
     SoftImpl soft_impl() const noexcept { return soft_impl_; }
     // Whether the most recent compute_forward_back() ran the scaled path (false: log).
     bool soft_scaled_used() const noexcept { return soft_scaled_used_; }
+    // float32 T only: whether the scaled path runs in float32 (default) before double.
+    // A pair whose range does not fit float32 reruns in double, silently; soft_f32_used()
+    // tells which precision the most recent compute_forward_back() ended in.
+    // Every run tries float32 afresh: the aligner keeps no refusal state between runs, so
+    // a pair's precision depends on that pair alone.  (A batch remembers its pairs'
+    // refusals itself, per pair, and turns float32 off here for a pair that refused.)
+    void set_soft_f32(bool v) noexcept { soft_f32_ = v; }
+    bool soft_f32() const noexcept { return soft_f32_; }
+    bool soft_f32_used() const noexcept { return soft_f32_used_; }
 
     // Soft temperature T > 0 (default 1).  The soft path then evaluates the smoothed
     // score T·log Z(θ/T) — log_z() returns that — and its gradient with respect to θ,
@@ -1547,11 +1557,13 @@ private:
     // ── Scaled soft path state ────────────────────────────────────────────────
     SoftImpl soft_impl_ = SoftImpl::Scaled;
     bool     soft_scaled_used_ = false;
+    bool     soft_f32_ = true;             // float32 T: run the scaled path in float32 first
+    bool     soft_f32_used_ = false;       // the most recent run was the float32 scaled pass
     bool     soft_counts_ready_ = false;   // scnt_/sg_* hold this run's gradient
     double   soft_temp_ = 1.0;
     // exp(substitution block), and the expected counts the scaled backward pass
     // accumulated (matrix: +count; gaps: -count, i.e. already the gradient's sign).
-    std::vector<double> es_, scnt_, srow_, srs_;
+    std::vector<double> es_, scnt_, srow_;   // (srow_: the tracked profile's row scratch)
     std::vector<int> sband_;   // per-row band ranges handed to the soft kernel
     double sg_go_a_ = 0, sg_ge_a_ = 0, sg_go_b_ = 0, sg_ge_b_ = 0;
     enum class TBTable { M, X, Y };
@@ -4762,9 +4774,18 @@ private:
     void run_fwdbwd(DpBuffer& buf) {
         soft_counts_ready_ = false;
 
+        soft_f32_used_ = false;
         if (soft_impl_ != SoftImpl::Log) {
-            bool ok;
-            ok = fwdbwd_scaled(buf);
+            bool ok = false;
+            // float32 pairs: the float32 scaled pass first; a pair whose weights or lost-mass
+            // bound do not fit float32 (a step score past ~88 nats, or very low T) reruns
+            // in double before SoftImpl decides anything.
+            // No refusal state is carried between runs (a shared count made a batch's
+            // precision per pair depend on thread timing); a batch skips the attempt for the
+            // pairs that refused it before, by turning soft_f32 off for them.
+            if constexpr (std::is_same_v<T, float>)
+                if (soft_f32_) ok = fwdbwd_scaled<float>(buf);
+            if (!ok) ok = fwdbwd_scaled<double>(buf);
             if (ok) {
                 soft_scaled_used_ = soft_counts_ready_ = true;
                 log_z_ *= soft_temp_;
@@ -4935,32 +4956,32 @@ private:
 
     // Weights only need to be finite: a weight that underflows is lost mass, which
     // the per-row bound accounts for.
-    static bool weight_bad(double w) noexcept {
-        return !(w <= std::numeric_limits<double>::max());
-    }
+    // A weight out of the soft type's range (big = its max): exp overflowed it.
+    static bool weight_bad(double w, double big) noexcept { return !(w <= big); }
     // exp of the substitution block; false if any weight is out of range.
-    bool prepare_scaled() {
+    bool prepare_scaled(double big) {
         const size_t nn = static_cast<size_t>(nalpha_) * nalpha_;
         es_.resize(nn);
         scnt_.assign(nn, 0.0);
-        srow_.resize(static_cast<size_t>(nalpha_));
         sg_go_a_ = sg_ge_a_ = sg_go_b_ = sg_ge_b_ = 0.0;
         bool bad = false;
         const double it = 1.0 / soft_temp_;
-        for (size_t k = 0; k < nn; ++k) { es_[k] = std::exp(blk_[k] * it); bad |= weight_bad(es_[k]); }
+        for (size_t k = 0; k < nn; ++k) { es_[k] = std::exp(blk_[k] * it); bad |= weight_bad(es_[k], big); }
         return !bad;
     }
 
     // Query profile: prof[a·w + j] = exp(score(a, b[j-1]) / T) for j = 1..n, 0 at j = 0
     // and j = n+1, so a row reads its substitution weights contiguously.
-    const double* build_profile(DpBuffer& buf, size_t w) {
+    template <class SF>
+    const SF* build_profile(DpBuffer& buf, size_t w) {
         const size_t na = static_cast<size_t>(nalpha_);
-        buf.sqp.assign(na * w, 0.0);
-        double* P = buf.sqp.data();
+        auto& qp = buf.template soft<SF>().qp;
+        qp.assign(na * w, SF(0));
+        SF* P = qp.data();
         for (size_t a = 0; a < na; ++a) {
             const double* er = es_.data() + a * na;
-            double* pr = P + a * w;
-            for (int j = 1; j <= n_; ++j) pr[j] = er[b_idx_[static_cast<size_t>(j) - 1]];
+            SF* pr = P + a * w;
+            for (int j = 1; j <= n_; ++j) pr[j] = static_cast<SF>(er[b_idx_[static_cast<size_t>(j) - 1]]);
         }
         return P;
     }
@@ -5005,10 +5026,13 @@ private:
     // Both gap models: build the SoftPairJob and run the per-pair kernel of this
     // aligner's backend (soft_kernel_impl.inl; the baseline copy when the backend is
     // scalar_fallback or its level has none).  False: out of range (see run_fwdbwd).
+    template <class SF>
     bool fwdbwd_scaled(DpBuffer& buf) {
         constexpr bool lin = (GM == GapModel::Linear);
         const double it = 1.0 / soft_temp_;
-        SoftPairJob J{};
+        constexpr double big = static_cast<double>(std::numeric_limits<SF>::max());
+        SoftPairJobT<SF> J{};
+        auto& sc = buf.template soft<SF>();
         const size_t w = static_cast<size_t>(n_) + 2;
         if (tr_) {
             // Tracked: each row's weights, and a profile row per DP row (its stacked row,
@@ -5020,43 +5044,48 @@ private:
                 double* r = srw_.data() + 4 * static_cast<size_t>(i);
                 r[1] = std::exp(-drow_ge_a(i) * it);
                 if (!lin) r[0] = std::exp(-(drow_go_a(i) + drow_ge_a(i)) * it);
-                bad |= weight_bad(r[0]) || weight_bad(r[1]);
+                bad |= weight_bad(r[0], big) || weight_bad(r[1], big);
                 if (i > 0) {
                     r[3] = std::exp(-drow_ge_b(i) * it);
                     if (!lin) r[2] = std::exp(-(drow_go_b(i) + drow_ge_b(i)) * it);
-                    bad |= weight_bad(r[2]) || weight_bad(r[3]);
+                    bad |= weight_bad(r[2], big) || weight_bad(r[3], big);
                 }
             }
-            buf.sqp.assign(m * w, 0.0);
+            sc.qp.assign(m * w, SF(0));
             srow_.resize(na);
             for (size_t i = 0; i < m; ++i) {
                 const double* br = blk_ + static_cast<size_t>(rs_[i]) * na;
-                for (size_t c = 0; c < na; ++c) { srow_[c] = std::exp(br[c] * it); bad |= weight_bad(srow_[c]); }
-                double* pr = buf.sqp.data() + i * w;
-                for (int j = 1; j <= n_; ++j) pr[j] = srow_[b_idx_[static_cast<size_t>(j) - 1]];
+                for (size_t c = 0; c < na; ++c) { srow_[c] = std::exp(br[c] * it); bad |= weight_bad(srow_[c], big); }
+                SF* pr = sc.qp.data() + i * w;
+                for (int j = 1; j <= n_; ++j) pr[j] = static_cast<SF>(srow_[b_idx_[static_cast<size_t>(j) - 1]]);
             }
             if (bad) return false;
             scnt_.assign(m * na, 0.0);
             srec_gap_.assign(4 * (m + 1), 0.0);
-            J.rw = srw_.data();
+            sc.rw.resize(4 * (m + 1));
+            for (size_t k = 0; k < 4 * (m + 1); ++k) sc.rw[k] = static_cast<SF>(srw_[k]);
+            J.rw = sc.rw.data();
             J.grow = srec_gap_.data();
         } else {
-            if (!prepare_scaled()) return false;
+            if (!prepare_scaled(big)) return false;
         }
         if (want_post_) { post_rows_.assign(static_cast<size_t>(m_) + 1, 0); J.gpost = post_rows_.data(); }
         if (!tr_) {
-        J.ea = std::exp(-params_->gap_extend_a * it);
-        J.eb = std::exp(-params_->gap_extend_b * it);
-        if (!lin) {
-            J.oa = std::exp(-(params_->gap_open_a + params_->gap_extend_a) * it);
-            J.ob = std::exp(-(params_->gap_open_b + params_->gap_extend_b) * it);
-            if (weight_bad(J.oa) || weight_bad(J.ob)) return false;
+            const double ea = std::exp(-params_->gap_extend_a * it);
+            const double eb = std::exp(-params_->gap_extend_b * it);
+            double oa = 0.0, ob = 0.0;
+            if (!lin) {
+                oa = std::exp(-(params_->gap_open_a + params_->gap_extend_a) * it);
+                ob = std::exp(-(params_->gap_open_b + params_->gap_extend_b) * it);
+                if (weight_bad(oa, big) || weight_bad(ob, big)) return false;
+            }
+            if (weight_bad(ea, big) || weight_bad(eb, big)) return false;
+            J.ea = static_cast<SF>(ea); J.eb = static_cast<SF>(eb);
+            J.oa = static_cast<SF>(oa); J.ob = static_cast<SF>(ob);
         }
-        if (weight_bad(J.ea) || weight_bad(J.eb)) return false;
-        }
-        if constexpr (lin) { if (buf.F.size() < sz_) buf.F.resize(sz_); }
-        else for (auto* v : {&buf.FM, &buf.FX, &buf.FY}) if (v->size() < sz_) v->resize(sz_);
-        for (DVec* r : {&buf.sb0, &buf.sb1, &buf.sb2, &buf.sb3, &buf.sb4, &buf.sb5})
+        if constexpr (lin) { if (sc.F.size() < sz_) sc.F.resize(sz_); }
+        else for (auto* v : {&sc.FM, &sc.FX, &sc.FY}) if (v->size() < sz_) v->resize(sz_);
+        for (auto* r : {&sc.r0, &sc.r1, &sc.r2, &sc.r3, &sc.r4, &sc.r5})
             if (r->size() < w) r->resize(w);
         const size_t mm = static_cast<size_t>(m_) + 1;
         sband_.resize(6 * mm);
@@ -5068,34 +5097,42 @@ private:
             bl[4 * mm + i] = lo; bl[5 * mm + i] = hi;
         }
         buf.sexp.resize(mm);
-        srs_.resize(2 * mm);
+        sc.rs.resize(mm); sc.mf.resize(mm);
+        sc.srow.resize(static_cast<size_t>(nalpha_));
         J.m = m_; J.n = n_; J.nalpha = nalpha_;
         J.a = a_idx_.data(); J.b = b_idx_.data();
-        J.P = tr_ ? buf.sqp.data() : build_profile(buf, w);
+        J.P = tr_ ? sc.qp.data() : build_profile<SF>(buf, w);
         J.local = (AM == AlignMode::Local) ? 1 : 0;
         J.full = (AB == AlignBand::Full) ? 1 : 0;
         J.bi = border_rows(); J.bj = border_cols();
         J.jlo = bl; J.jhi = bl + mm; J.jlo0 = bl + 2 * mm; J.jhi0 = bl + 3 * mm;
         J.slo = bl + 4 * mm; J.shi = bl + 5 * mm;
         J.stride = stride_;
-        if constexpr (lin) J.FM = buf.F.data();
-        else { J.FM = buf.FM.data(); J.FX = buf.FX.data(); J.FY = buf.FY.data(); }
-        J.r0 = buf.sb0.data(); J.r1 = buf.sb1.data(); J.r2 = buf.sb2.data();
-        J.r3 = buf.sb3.data(); J.r4 = buf.sb4.data(); J.r5 = buf.sb5.data();
-        J.S = buf.sexp.data(); J.rowsum = srs_.data(); J.fmax = srs_.data() + mm;
-        J.scnt = scnt_.data(); J.srow = srow_.data();
-        soft_pair_fn fn = lin ? &nwgrad_soft_base::soft_pair_linear : &nwgrad_soft_base::soft_pair_affine;
+        if constexpr (lin) J.FM = sc.F.data();
+        else { J.FM = sc.FM.data(); J.FX = sc.FX.data(); J.FY = sc.FY.data(); }
+        J.r0 = sc.r0.data(); J.r1 = sc.r1.data(); J.r2 = sc.r2.data();
+        J.r3 = sc.r3.data(); J.r4 = sc.r4.data(); J.r5 = sc.r5.data();
+        J.S = buf.sexp.data(); J.rowsum = sc.rs.data(); J.fmax = sc.mf.data();
+        J.scnt = scnt_.data(); J.srow = sc.srow.data();
+        using fn_t = std::conditional_t<std::is_same_v<SF, float>, soft_pair_fn_f, soft_pair_fn>;
+        fn_t fn = nwgrad_soft_base::soft_pair_entry<SF>(lin);
         const int be = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
         if (be >= 0) {
             const LevelKernels& K = level_kernels(be);
-            soft_pair_fn f = lin ? K.soft_pair_linear : K.soft_pair_affine;
+            auto f = K.template soft_pair_of<SF>(lin);
             if (f) fn = f;
         }
-        fn(J);
+        if constexpr (std::is_same_v<SF, float>) { FlushDenormalsScope ftz; fn(J); }
+        else fn(J);
+        if (std::getenv("NWGRAD_SOFT_DEBUG"))
+            std::fprintf(stderr, "soft<%s> m=%d n=%d ok=%d loss=%.3e tol=%.3e logz=%.6f\n",
+                         std::is_same_v<SF, float> ? "float" : "double", m_, n_, J.ok, J.loss,
+                         SoftRange<SF>::tol, J.log_z);
         if (!J.ok) return false;
         log_z_ = J.log_z;
         sg_go_a_ = J.g_oa; sg_ge_a_ = J.g_ea; sg_go_b_ = J.g_ob; sg_ge_b_ = J.g_eb;
         if (tr_) srec_cnt_.swap(scnt_);   // per row: the record (srec_gap_ filled by the kernel)
+        soft_f32_used_ = std::is_same_v<SF, float>;
         return true;
     }
 };
@@ -5104,23 +5141,29 @@ private:
 // temperature T: exp(score / T), exp(-(go+ge)/T), exp(-ge/T).  False when one overflows
 // — the pairs then run their own path (which raises or falls back per soft_impl).
 // Shared by SeqPairBatch and BatchAligner so both batch the same weights.
+template <class SF>
 inline bool inter_soft_weights(const AlignParams& P, double T, bool lin,
-                               std::vector<double>& es, InterSoftJob& sj) {
-    constexpr double big = std::numeric_limits<double>::max();
+                               std::vector<SF>& es, InterSoftJobT<SF>& sj) {
+    constexpr double big = static_cast<double>(std::numeric_limits<SF>::max());
     const double it = 1.0 / T;
     // (The whole matrix stack: a tracked lane reads its stacked row; K = 1 otherwise.)
     const size_t nn = static_cast<size_t>(P.matrix.size()) * P.matrix.size() *
                       static_cast<size_t>(P.num_sets());
     es.resize(nn);
     bool fin = true;
-    for (size_t k = 0; k < nn; ++k) { es[k] = std::exp(P.matrix.data()[k] * it); fin &= es[k] <= big; }
-    sj.oa = std::exp(-(P.gap_open_a + P.gap_extend_a) * it);
-    sj.ea = std::exp(-P.gap_extend_a * it);
-    sj.ob = std::exp(-(P.gap_open_b + P.gap_extend_b) * it);
-    sj.eb = std::exp(-P.gap_extend_b * it);
+    for (size_t k = 0; k < nn; ++k) {
+        const double v = std::exp(P.matrix.data()[k] * it);
+        fin &= v <= big; es[k] = static_cast<SF>(v);
+    }
+    const double oa = std::exp(-(P.gap_open_a + P.gap_extend_a) * it);
+    const double ea = std::exp(-P.gap_extend_a * it);
+    const double ob = std::exp(-(P.gap_open_b + P.gap_extend_b) * it);
+    const double eb = std::exp(-P.gap_extend_b * it);
+    sj.oa = static_cast<SF>(oa); sj.ea = static_cast<SF>(ea);
+    sj.ob = static_cast<SF>(ob); sj.eb = static_cast<SF>(eb);
     sj.linear = lin ? 1 : 0;
     sj.es = es.data(); sj.nalpha = P.matrix.size();
-    return fin && sj.ea <= big && sj.eb <= big && (lin || (sj.oa <= big && sj.ob <= big));
+    return fin && ea <= big && eb <= big && (lin || (oa <= big && ob <= big));
 }
 
 // The Simd kernel's out-of-line definitions.  Included last, once Aligner is a

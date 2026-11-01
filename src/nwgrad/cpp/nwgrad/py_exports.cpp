@@ -346,6 +346,12 @@ static const char* soft_impl_name(SoftImpl s) {
     "  \"scaled_or_log\": \"scaled\", silently falling back per pair to \"log\".\n" \
     "  \"log\": the log-space recurrences; unlimited range, far slower.\n" \
     "Results agree to ~1e-12 relative, not bit-for-bit; the hard path is unaffected."
+#define NWGRAD_SOFT_PREC_DOC \
+    "The scaled soft path's precision: \"float32\" (the default of SeqPair / SeqPairBatch:\n" \
+    "twice the simd lanes and half the tables of double; results to ~1e-5 relative) or\n" \
+    "\"double\" (the only choice of the *Double classes).  A float32 pair whose weights or\n" \
+    "lost-mass bound do not fit float32 (a step score past ~88 nats, a very low\n" \
+    "temperature) reruns in double by itself, before soft_impl decides anything."
 #define NWGRAD_SOFT_TEMP_DOC \
     "Soft temperature T > 0 (default 1).  The soft score becomes T*log Z(params/T)\n" \
     "and the gradient its derivative w.r.t. params: the expected counts under\n" \
@@ -618,6 +624,19 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
             [](const SP& s) { return soft_impl_name(s.soft_impl()); },
             [](SP& s, const std::string& v) { s.set_soft_impl(parse_soft_impl(v)); },
             NWGRAD_SOFT_IMPL_DOC)
+        .def_prop_rw(
+            "soft_precision",
+            [](const SP& s) { return (std::is_same_v<T, float> && s.soft_f32()) ? "float32" : "double"; },
+            [](SP& s, const std::string& v) {
+                if (v == "float32") {
+                    if constexpr (!std::is_same_v<T, float>)
+                        throw std::invalid_argument("nwgrad: soft_precision=\"float32\" needs a float32 "
+                                                    "SeqPair / SeqPairBatch (the *Double classes run double)");
+                    s.set_soft_f32(true);
+                } else if (v == "double") s.set_soft_f32(false);
+                else throw std::invalid_argument("nwgrad: soft_precision must be \"float32\" or \"double\", got \"" + v + "\"");
+            },
+            NWGRAD_SOFT_PREC_DOC)
         .def_prop_rw(
             "soft_temperature",
             [](const SP& s) { return s.soft_temperature(); },
@@ -968,6 +987,19 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             [](const SPB& s) { return soft_impl_name(s.soft_impl()); },
             [](SPB& s, const std::string& v) { s.set_soft_impl(parse_soft_impl(v)); },
             NWGRAD_SOFT_IMPL_DOC "\nApplies to every pair in the batch.")
+        .def_prop_rw(
+            "soft_precision",
+            [](const SPB& s) { return (std::is_same_v<T, float> && s.soft_f32()) ? "float32" : "double"; },
+            [](SPB& s, const std::string& v) {
+                if (v == "float32") {
+                    if constexpr (!std::is_same_v<T, float>)
+                        throw std::invalid_argument("nwgrad: soft_precision=\"float32\" needs a float32 "
+                                                    "SeqPair / SeqPairBatch (the *Double classes run double)");
+                    s.set_soft_f32(true);
+                } else if (v == "double") s.set_soft_f32(false);
+                else throw std::invalid_argument("nwgrad: soft_precision must be \"float32\" or \"double\", got \"" + v + "\"");
+            },
+            NWGRAD_SOFT_PREC_DOC)
         .def_prop_rw(
             "soft_temperature",
             [](const SPB& s) { return s.soft_temperature(); },

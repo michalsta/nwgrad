@@ -709,28 +709,31 @@ def test_large_cutoff_is_bit_exact_with_pointers(params):
                                       gp.grad.to_dict()["matrix"])
 
 
-def test_soft_gradient_unaffected(params):
+@pytest.mark.parametrize("cls", ["SeqPairBatchDouble", "SeqPairBatch"])
+def test_soft_gradient_unaffected(params, cls):
     """Analog of test_soft_gradient_unaffected.
 
-    The soft path is forward-backward in double and never runs a Viterbi traceback, so
-    the traceback mode is a pure no-op for it — pointers and hirschberg exercise
-    identical code.  The comparison is nonetheless tolerant, not exact, and the reason
-    is NOT hirschberg: score_and_grad reduces per-pair contributions across threads in a
-    non-deterministic order, so two batch runs differ in the last ULP whatever the
-    traceback.  (An earlier version asserted exact equality and was flaky under
-    pytest-randomly for exactly this reason — the sibling test in test_traceback_modes.py
-    uses the same tolerance.)
+    The soft path is forward-backward and never runs a Viterbi traceback, so the traceback
+    mode is a pure no-op for it — pointers and hirschberg exercise identical code.  The
+    comparison is nonetheless tolerant, not exact, and the reason is NOT hirschberg:
+    score_and_grad reduces per-pair contributions across threads in a non-deterministic
+    order, so two batch runs differ in the last ULP whatever the traceback.  (An earlier
+    version asserted exact equality and was flaky under pytest-randomly for exactly this
+    reason — the sibling test in test_traceback_modes.py uses the same tolerance.)  The
+    float32 class runs its soft pass in float32, and a pair the Hirschberg mode keeps off
+    the shared fill runs the per-pair kernel instead of the shared one: ~1e-6 relative.
     """
     A = _seqs(40, 5, 200, 37)
     B = _seqs(40, 5, 200, 38)
     out = {}
     for tb in ("pointers", "hirschberg"):
-        batch = nwgrad.SeqPairBatch(A, B, params,
-                                    n_threads=2, traceback=tb, gap_model="affine", mode="global", grad_mode="soft", kernel="auto")
+        batch = getattr(nwgrad, cls)(A, B, params,
+                                     n_threads=2, traceback=tb, gap_model="affine", mode="global", grad_mode="soft", kernel="auto")
         out[tb] = (batch.score_and_grad(), batch.compute_grad().to_dict())
-    assert out["hirschberg"][0] == pytest.approx(out["pointers"][0], rel=1e-12)
+    f32 = cls == "SeqPairBatch"
+    assert out["hirschberg"][0] == pytest.approx(out["pointers"][0], rel=2e-4 if f32 else 1e-12)
     np.testing.assert_allclose(out["hirschberg"][1]["matrix"],
-                               out["pointers"][1]["matrix"], atol=1e-10)
+                               out["pointers"][1]["matrix"], rtol=2e-4 if f32 else 0, atol=1e-5 if f32 else 1e-10)
 
 
 @pytest.mark.parametrize("band", [8, 32])

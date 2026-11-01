@@ -2216,6 +2216,179 @@ solace (4623); the C++ suite on skynet (sse4, 2.93 M assertions), spot (neon, gc
 tests under clang 22 at avx512), with the integer tag at sse2 / sse4 / scalar_fallback;
 `tools/fuzz_ab.py` main vs branch 300 seeds, 0 differ (skynet).
 
+### The float32 soft path (branch `perf/soft-f32`, 2026-10-31 / 11-01)
+
+**What.** The scaled forward-backward runs in float32 for the float32 classes
+(`SeqPair`, `SeqPairBatch`, the plain convenience functions, streaming `align()`): twice
+the simd lanes and half the tables of the double pass it replaces there. The `*Double`
+classes and the `_double` functions keep double. `soft_precision` (`"float32"` default on
+the float32 classes, `"double"` the only choice of the double ones) switches a float32
+batch back to the double pass at runtime — the one-binary A/B switch
+(`tools/bench_soft_f32.py`) and the opt-out. The log-space path (`soft_impl="log"`, and
+the fallback of `"scaled_or_log"`) is double always.
+
+**Precision contract.** A float32 pair whose weights or lost-mass bound do not fit float32
+reruns in double by itself, BEFORE `soft_impl` decides anything: `Aligner::run_fwdbwd`
+tries `fwdbwd_scaled<float>`, then `<double>`, then raises or falls back to log as
+before. So `soft_impl="scaled"` raises for exactly the pairs it raised for in double
+(verified: a step score of 100 nats overflows float32's weights, exp overflows past ~88,
+and the pair comes back bit-identical to the double run). Results: log Z and the expected
+counts within ~1e-6 relative of the double path on pairs of up to a few hundred residues
+(tests use 2e-4; observed 1e-8 on log Z, 1e-6 on counts at L500). The shared (inter-pair)
+and per-pair float32 kernels are tolerance-equal to each other the same way, as the double
+ones always were. Every existing soft test that compared a float32 class against double
+at 1e-11 now takes float32 tolerances for that class (Python and C++); the analytic and
+finite-difference soft tests run the `_double` functions, since float32's ~1e-6 cannot
+resolve a 1e-5 step.
+
+**Code.** `SoftPairJobT<F>` / `InterSoftJobT<F>` (simd_levels.hpp; F = the soft type),
+the per-pair kernels (`soft_kernel_impl.inl`) templated on `SF` with `SoftRange<SF>`
+(window, tolerance), the inter-pair kernel wrapped in `InterSoftK<SF>` with the lane
+types from `IVT<SF>` (float: twice the lanes), both registered per level as
+`soft_pair_*_f` / `inter_soft_f` beside the double entries (`register_level_common`).
+`DpBufferT::SoftScratch<SF>` (`sd` / `sf`) holds the scaled pass's tables, rolling rows,
+exp'd profile, row sums and maxima, tracked weights and scatter row in the soft type; the
+log path's `F / B / FM..BY` stay double and untouched. `BatchEngine::SoftGroup<SFx>` runs
+a group's shared pass in the chosen type (`soft_f32_()`): a float32 batch's group is one
+pass of `f.inter_w` lanes where the double pass took `W / d.inter_w` chunks; the tracked
+lanes' weights (`Work::srw_of<SFx>`) and the stream path (`stream_inter_<AB, SFx>`)
+follow. Outputs (log Z, counts, gaps, the gradient accumulators) stay double; only the
+tables, the rows, the weights and the row-wise reductions are float32.
+
+**Three things float32 needed that double never did.**
+1. **Subnormals flushed to zero** around the float32 kernels (`FlushDenormalsScope`:
+   x86 MXCSR FTZ|DAZ, AArch64 FPCR.FZ, restored on exit). Cells far from the alignment
+   hold mass ~2^-100 of their row's max — subnormal in float32, normal in double — and
+   x86 takes a microcode assist per operation on them: protein L200 ran **6x slower**
+   than double (sse4) before, 0.72 after. Flushing loses exactly the terms the lost-mass
+   bound already charges (below FLT_MIN), so the bound stays rigorous.
+2. **The lost-mass bound had a hole that only float32 can fall through.** The gradient
+   pass multiplies table values (`F̂·P·B̂` for the match posteriors, `F̂·B̂` for the gap
+   sums) with B̂ from the backward row BEFORE its rescale, so a product can flush to zero
+   below FLT_MIN while the posterior it carries is O(1) -- and the bound charged only the
+   tables' lost cells against the post-rescale maxima. Found by
+   `test_low_temperature_in_range` once its random draws varied (pytest salts `hash()`
+   per process): a 31 x 4 Global linear pair at T = 0.05 lost 20 % of a count (2.36 for
+   3.00) with the kernel's loss at 5e-7 under the 2^-20 tolerance; a numpy emulation of
+   the kernel (`scratchpad/emu_lowT.py` at the time) reproduced it exactly. Fix: the
+   float32 kernels COUNT what flushed. Per row, `lc` is the number of products that came
+   out zero with both factors positive, `lb` the sum of the B̂ factors of the `F̂·P`
+   intermediates that did (the product's other factor), and the loss term is exact:
+   `sp_loss_products` = MIN · (2·lb·gv + 2·lc·(gh + gv)) with the row's gradient factors
+   in the row's PRE-rescale units (`Tn`, not `Ti`; the inter-pair kernels first had it
+   with `ldexp(·, k)` on top, a 4^k error either way around a rescale, now the per-pair
+   formula verbatim so both fills decide alike). The gap sums on FMA targets accumulate
+   with `std::fma` -- the product is exact inside the operation and cannot flush, so
+   nothing to count -- and elsewhere take the plain product, whose flush is counted
+   (`NWGRAD_SP_MAC_COUNTS`). A loose bound tried first (`mxpre · gv0` per row from the
+   pre-rescale maximum, with the float32 window cut to 2^8 so that it stayed within
+   range) rejected every diffuse long linear pair -- g reaches 2^185 there legitimately --
+   and went; the 2^8 window stayed. After: the pair is accepted with the count right to
+   9e-8 at T = 0.05 and handed to double at 0.04; the test runs eight fixed draws at
+   T = 0.5 / 0.2 / 0.05 / 0.04; its seeds are `crc32`, not `hash()`.
+   **Counting in the gradient pass cost the M1 15-25 %** (DNA shared 0.70 -> 0.97 of
+   double, protein per-pair 0.82 -> 1.05: three compares, two ands, a select and an add
+   per product, six products a cell, and the M1's kernels are ALU-bound where x86's hide
+   it), and no row of any benchmark ever needed it. So the pass runs without counters;
+   then the row's worst case is charged -- every product of the row flushed (`kinds` per
+   cell), every intermediate with the row's max as its other factor,
+   `sp_loss_products_max` -- and only where that would eat into the tolerance
+   (`kSpCountBudget`, a quarter of it: pairs near rejection, rows with posterior factors
+   of 2^100 and more) a SECOND pass over the FINISHED row recounts exactly from the stored
+   rows and tables (`sp_count_*`, `is_count_*`; every factor of every product is stored).
+   Two designs that recomputed the row with the counters as a template flag of the same
+   loop were tried first and both cost the uncounted pass 15-40 % on the M1 -- inlined,
+   the second instantiation moved code and spilled registers (two builds of IDENTICAL
+   code differed 0.85 vs 0.98 on one cell); out of line as a by-reference lambda, every
+   captured accumulator became address-taken and was reloaded after each row store. A
+   plain function over the finished row touches neither. Double counts nothing (its
+   terms are ~2^-700; counting cost it 1.2-1.9x).
+3. **gcc on AArch64's row max** was `__builtin_fmax`, which promotes float to double and
+   left the float32 loops scalar: the per-pair float32 pass was 1.3-2x SLOWER than double
+   on the M1. `sp_fmax` picks `fmaxf` for float. (The inter-pair kernel never had it.)
+
+4. **gcc's per-unit inlining budget.** With the float32 kernels instantiated beside the
+   double ones in each level TU, the UNTOUCHED hard shared fill of double ran 2.9x slower
+   (DNA 22 x 50 affine, skynet sse4): gcc had spent the unit's inline budget
+   (`--param inline-unit-growth`) on the soft kernels and left `inter_fill_entry<double>`
+   un-inlined. The soft kernels live in their own TU per level now (`level_<lv>_soft.cpp`,
+   `NWGRAD_LEVEL_SOFT_TU`, `register_level_soft`); the hard fill is back at parity (5.90 vs
+   5.96 us). Check an untouched kernel's time after adding a large one to its unit.
+5. **A live zero accumulator costs a register.** The double shared soft pass, its body
+   verbatim, ran 12-15 % more cycles at the same instruction count: the float-only
+   counters `lbv` / `lcv` were zero-initialised vectors read by the loss term after the
+   column loop, so gcc kept them live through the loop and spilled an accumulator. The loss
+   term is now float-only too (and the kernels free function templates, not members of a
+   class template, so each instantiation's dead code is dead); parity by cycles (21.3 vs
+   21.2-21.6 G).
+6. **A pair's precision is its own: no refusal state shared between pairs.** A pair whose
+   weights or bound do not fit float32 costs its float32 attempt before the double rerun.
+   To stop paying that for batches where every pair refuses (diffuse long linear pairs),
+   the branch first counted refusals -- per lane (8 threads over 40 refusing L1000 linear
+   pairs each paid it: 1.41-1.44x the double class on the M1), then per batch: one atomic
+   (`f32_refusals_`) shared by every lane and group, after `kSoftF32Patience` (3)
+   refusals with no acceptance between, double directly for the rest of the call.
+   **That was wrong: it made results depend on thread timing.** Which pairs had tried
+   float32 before the count reached three depended on which thread got where first, so
+   two runs of the same batch differed at float32 precision (CI: `test_stress.py`
+   `test_soft_grad_determinism_large_batch[8]`, 8e-7 on a count, in the ASan, UBSan and
+   plain Python jobs). The library promises results reproducible across runs and thread
+   counts. **Replaced (2026-11-01):** no count anywhere. The `Aligner` keeps no refusal
+   state between runs (every run with `soft_f32` on tries float32, then double); every
+   pair of a shared group tries float32 in the group's float32 pass and falls back by
+   itself (its own path, in double). The cost is paid once per pair instead, and a
+   STORED batch then remembers it: `kF32Refused`, a bit beside `kStored` in `flags_[i]`,
+   set when a pair's own forward-backward ended without float32 (`fwdbwd_`), or when the
+   group's float32 pass refused the lane; a marked pair runs double directly on later
+   calls (`fwdbwd_` turns the lane's `soft_f32` off), and a group whose pairs are all
+   marked runs its double pass directly. A group the float32 pass took no lane of (every
+   lane refused, or the weights or a tracked lane's rows out of float32's range) is
+   rerun in double AT ONCE, all its pairs marked: so the next call's direct double pass
+   gives the same bits, and a group float32 took some lanes of takes the same lanes again
+   and sends the same refused lanes to their own double path. A pair's path thus depends
+   on its own data and the call history, never on the threads (tests:
+   `test_soft_float32.py` `test_every_pair_refuses_float32_deterministic` /
+   `..._fits_...`: three calls at 8 threads and three at 1, bit-equal; the all-refusing
+   batch bit-equal to `soft_precision="double"`). The marks are cleared by `set_params`,
+   `soft_temperature` and `soft_precision`. The streaming `align()` has nothing stored
+   between calls: each pair tries float32 each call. What is left: a training loop calls
+   `set_params` every step, which clears the marks, so an all-refusing batch pays one
+   float32 attempt per PAIR per step (`TODO.md`).
+
+**Measured** (`tools/bench_soft_f32.py`: float32 / double of the SAME class, one binary,
+control arm 0.95-1.06; `scaled_or_log`; DNA = 22 x 50 miRNA-like pairs, DiscrimAlign's
+local DNA matrix; protein = BLOSUM62 x 0.3, 11/1 x 0.3, related pairs):
+
+| host, level | threads | DNA shared | DNA own | protein L100 shared / own | L300 shared / own | L1000 affine / linear |
+|---|---|---|---|---|---|---|
+| skynet sse4 (Piledriver, 4 float lanes) | 1 | 0.63-0.79 | 0.86-0.91 | 0.80-1.01 / 0.76-0.88 | 0.73-0.79 / 0.74-0.82 | 0.21-0.46 / 1.02-1.03 |
+| spot neon (M1, 4 lanes) | 1 | 0.71-0.77 | 0.90-0.94 | 0.81-0.84 / 0.83-0.87 | 0.77-0.79 / 0.77-0.79 | 0.73-0.76 / 1.06-1.07 |
+| spot neon | 8 | 0.71-0.77 | 0.83-0.94 | 0.82-0.85 / 0.83-0.87 | 0.75-0.80 / 0.72-0.80 | 0.61-0.66 / 1.11-1.22 |
+| nighthaven avx2 (8 lanes) | 1 | 0.79-0.91 | 0.96-1.01 | 0.93 / 0.92-0.93, linear 1.01-1.03 | 0.81-0.86 / 0.82-0.86 | 0.24-0.34 / 1.04-1.05 |
+| nighthaven avx2 | 12 | 0.76-0.88 | 0.93-0.98 | 0.92-0.96 / 0.92-0.96 | 0.40-0.42 affine, 0.83 linear / same | 0.50-0.52 / 1.14-1.17 |
+| nighthaven sse4 (4 lanes) | 1 / 12 | 0.69-0.75 | 0.90-0.95 | | | |
+| solace avx512 (16 lanes) | 1 | 0.85-1.00 | 1.00-1.08 | 0.95-0.99 / 0.95-1.01 | 0.86-0.94 / 0.87-0.92 | 0.29-0.43 / 1.03-1.05 |
+| solace avx512 | 16 | 0.84-0.99 | 1.01-1.04 | 0.96-1.01 / 0.96-1.02 | 0.57 affine, 0.90 linear / same | 0.47-0.53 / 1.17-1.22 |
+| solace avx2 (8 lanes) | 1 / 16 | 0.78-0.92 | 0.95-1.03 | 0.92-0.98 / 0.92-0.98 | | |
+
+**AVX-512 is the one level where float32 buys nothing on short pairs**: the per-pair
+kernels (the omp-simd loops of `soft_kernel_impl.inl`) run DNA 22 x 50 at 1.00-1.08 of
+double and protein L100 at 0.95-1.01 -- 16 float lanes against 8 double lanes, with rows
+of 50-100 cells, is mostly loop overhead either way -- and the shared pass gains 0.85
+there where AVX2 gains 0.80 and NEON 0.72. The gains come with length (L300 0.86-0.94,
+L1000 affine 0.29-0.43). A secondary-target finding, left as is: `soft_precision="double"`
+is a property away, and the shared pass is the default at these sizes.
+
+L1000 linear: every pair refuses float32 (the lost-mass bound: diffuse rows); the
+columns above were measured with the batch-wide patience count of the time (item 6), since
+replaced by a per-pair mark, which pays one attempt per pair after each `set_params`.
+L1000 affine: the double pass's three 8-byte tables leave the cache; float32's stay
+(0.2-0.5).
+
+(The C column of the tool, `SeqPairBatchDouble` / the float32 class in double, is the
+double build's own soft pass: 1.0-1.2x of the float32 class at double, the guide Viterbi's
+precision.)
+
 ### The fill gates, per level and type (branch `perf/gates`, 2026-10-31 / 11-01)
 
 **Why.** Every gate's threshold had been measured once, on nighthaven at AVX2, most of them

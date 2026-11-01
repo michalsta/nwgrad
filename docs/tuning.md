@@ -12,8 +12,14 @@ convenience functions — run the Viterbi DP in **float32**. The `*Double` class
 functions run it in **float64**. Inputs and outputs are float64 either way
 (`AlignParams`, scores, gradients); only the DP arithmetic differs. Over 400
 protein pairs measured against a float64 reference, float32 scores deviated by up
-to 8.4e-3 (mean 1.6e-3). The soft-gradient (forward-backward) path is float64 in both,
-so the `_double` soft functions are identical to the plain ones.
+to 8.4e-3 (mean 1.6e-3). The soft-gradient (forward-backward) path follows the class
+too: the plain names run its scaled form in float32 (`soft_precision="float32"`, twice
+the simd lanes and half the tables of double; log Z and the expected counts within
+~1e-5 relative of the double path on pairs of up to a few hundred residues), the
+`_double` ones in float64. A float32 pair whose weights or lost-mass bound do not fit
+float32 reruns in double by itself; the log-space fallback (`soft_impl`) is double
+always. `SeqPairBatch(...).soft_precision = "double"` keeps a float32 batch's Viterbi
+in float32 and its soft pass in double.
 
 The two precisions also have different traceback defaults (next section), so a
 float32 result and a float64 result are not bit-comparable even where the
