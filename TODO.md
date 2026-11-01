@@ -200,7 +200,11 @@ DiscrimAlign does: it passes the logical core count.
   (nighthaven protein int16/int32: gcc at 0.80-0.96 of clang's time at avx2, 0.78-0.94 at
   sse4; Piledriver int16 score 0.70). What is left is clang's x2 unrolling and interleaved
   scheduling of the segment loops, the same residue the float kernels show at W=2
-  (AGENTS "Toolchain"); `#pragma GCC unroll` did not close it there either. Not pursued.
+  (AGENTS "Toolchain"); `#pragma GCC unroll` did not close it there either. A hand
+  unroll of the score kernel's row pass (two segments a trip, `U2`, 2026-10-31) gained
+  2-5 % on AVX2 with gcc and left the gcc / clang ratio where it was (AGENTS "Score-only
+  integer kernel: two segments a trip"); the residue is clang's scheduling of the whole
+  kernel. Not pursued further.
 - int64 at AVX2 costs 1.5-2.6x float32 (no packed 64-bit max: `vpcmpgtq` + `vpblendvb`,
   the same 4 lanes as double) and 4-5x at sse2 (no 64-bit compare at all). It is headroom
   for huge parameters, not a speed type; nothing cheap left to do for it.
