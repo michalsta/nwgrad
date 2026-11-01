@@ -322,13 +322,13 @@ def test_mode_name_rejected_elsewhere():
 
 # ── The score-only kernels against the scalar fill, bit for bit ─────────────
 
-@pytest.mark.parametrize("cls,fn_aff,fn_lin", [
-    (nwgrad.SeqPairDouble, nwgrad.glocal_score_affine_double, nwgrad.glocal_score_double),
-    (nwgrad.SeqPair, nwgrad.glocal_score_affine, nwgrad.glocal_score),
-])
-def test_score_only_equals_the_pointer_fill(generic_matrix, cls, fn_aff, fn_lin):
+@pytest.mark.parametrize("sfx", ["_double", ""])
+def test_score_only_equals_the_pointer_fill(generic_matrix, sfx):
     # the score-only kernel of the running backend vs the traceback fill: the exact
-    # optimum, bit-identical (as test_score_only pins it for the other modes)
+    # optimum, bit-identical (as test_score_only pins it for the other modes).  The
+    # names are resolved here, under the forced-kernel wrapper, not at import.
+    cls = getattr(nwgrad, "SeqPair" + ("Double" if sfx else ""))
+    fn_aff, fn_lin = getattr(nwgrad, "glocal_score_affine" + sfx), getattr(nwgrad, "glocal_score" + sfx)
     rng = random.Random(77)
     for oa, ea, ob, eb in ((2.0, 1.0, 1.5, 0.5), (0.0, 0.5, 0.0, 1.0), (3.0, 0.0, 1.0, 0.0)):
         p = params(generic_matrix, oa, ea, ob, eb)
@@ -337,3 +337,27 @@ def test_score_only_equals_the_pointer_fill(generic_matrix, cls, fn_aff, fn_lin)
             b = "".join(rng.choice(ALPHABET) for _ in range(rng.randint(0, 70)))
             assert fn_aff(a, b, p) == cls(a, b, p, mode="glocal", traceback="pointers").align()
             assert fn_lin(a, b, p) == cls(a, b, p, gap_model="linear", mode="glocal").align()
+
+
+# ── Every simd level against the scalar backend, bit for bit ────────────────
+
+@pytest.mark.parametrize("gap_model", ["affine", "linear"])
+@pytest.mark.parametrize("traceback", ["pointers", "scores"])
+def test_levels_match_scalar(generic_matrix, gap_model, traceback):
+    rng = random.Random(101)
+    p = params(generic_matrix, 2.0, 1.0, 1.5, 0.5)
+    levels = [l for l in nwgrad.available_isa_levels() if l != "scalar_fallback"]
+    cases = [("".join(rng.choice(ALPHABET) for _ in range(rng.randint(0, 60))),
+              "".join(rng.choice(ALPHABET) for _ in range(rng.randint(0, 150)))) for _ in range(40)]
+    pint = params(nwgrad.SubstMatrix(np.rint(np.asarray(generic_matrix.to_matrix()) * 3), alphabet=ALPHABET), 6, 3, 4, 2)
+    for cls, pp in ((nwgrad.SeqPairDouble, p), (nwgrad.SeqPair, p), (nwgrad.SeqPairInt32, pint)):   # explicit kernel= below
+        for a, b in cases:
+            ref = cls(a, b, pp, gap_model=gap_model, mode="glocal", traceback=traceback, kernel="scalar_fallback")
+            s0, g0 = ref.score_and_grad()
+            al0 = ref.aligned()
+            for lv in levels:
+                sp = cls(a, b, pp, gap_model=gap_model, mode="glocal", traceback=traceback, kernel=lv)
+                s1, g1 = sp.score_and_grad()
+                assert s1 == s0, (lv, a, b)
+                assert sp.aligned() == al0, (lv, a, b)
+                assert np.array_equal(np.asarray(g1.to_dict()["matrix"]), np.asarray(g0.to_dict()["matrix"])), (lv, a, b)

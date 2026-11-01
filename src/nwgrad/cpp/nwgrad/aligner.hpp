@@ -2404,16 +2404,6 @@ private:
             // short pairs differed from Pointers.  Same memory (the base case kept
             // a Pointers-sized table too) and the same speed (measured 0.99-1.04x).
         }
-        // Glocal: the scalar fills (its leveled kernels are not written yet).
-        if constexpr (AM == AlignMode::Glocal) {
-            if constexpr (GM == GapModel::Linear) {
-                if (linear_ptr_fill()) viterbi_linear_ptr(buf); else viterbi_linear(buf);
-            } else {
-                const bool ptr = (tb_ == TracebackMode::Pointers || is_hirschberg(tb_) || tb_ == TracebackMode::Grid) && (AB == AlignBand::Full);
-                if (ptr) viterbi_affine_ptr(buf); else viterbi_affine(buf);
-            }
-            return;
-        }
         // Variant B: direction pointers + rolling rows, 1 B/cell instead of 12/24.
         // Full affine only; the banded and linear paths keep their score tables.
         // (the pointer kernels are chosen after the backend is resolved, below: every
@@ -2464,7 +2454,7 @@ private:
         if constexpr (AB == AlignBand::Full) {
             // Opt-in row-wise fill (set_rowwise_full): score tables, row-major, read back
             // by the Scores traceback whatever tb_ says — the paths are identical.
-            if (uses_rowwise_full()) { viterbi_affine_simd(buf, K); return; }
+            if (uses_rowwise_full() && AM != AlignMode::Glocal) { viterbi_affine_simd(buf, K); return; }   // (no Glocal row kernel yet)
             // The striped Full kernel, this level's instantiation for T.
             if (use_ptr && KT.viterbi_ptr) { run_dispatched_affine(buf, K, true);  return; }
             if (KT.viterbi)                { run_dispatched_affine(buf, K, false); return; }
@@ -2472,7 +2462,7 @@ private:
         }
         // The row-wise banded kernel (every T); a level without it falls back to the
         // scalar fill.
-        if (KT.banded_row_local) { viterbi_affine_simd(buf, K); return; }
+        if (KT.banded_row_local && AM != AlignMode::Glocal) { viterbi_affine_simd(buf, K); return; }   // (no Glocal row kernel yet)
         viterbi_affine(buf);
     }
 
@@ -2488,7 +2478,7 @@ private:
         job.blk = blkT_;       job.nalpha = nalpha_;
         job.go_a = static_cast<T>(params_->gap_open_a);   job.ge_a = static_cast<T>(params_->gap_extend_a);
         job.go_b = static_cast<T>(params_->gap_open_b);   job.ge_b = static_cast<T>(params_->gap_extend_b);
-        job.align_mode = (AM == AlignMode::Local) ? 1 : 0;
+        job.align_mode = (AM == AlignMode::Local) ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
         job.align_band = 0; job.band = 0;
         job.guide_j = nullptr; job.guide_len = 0;
         job.buf = &buf;
@@ -2546,7 +2536,7 @@ private:
         job.blk = blkT_;       job.nalpha = nalpha_;
         job.go_a = static_cast<T>(0); job.ge_a = static_cast<T>(params_->gap_extend_a);
         job.go_b = static_cast<T>(0); job.ge_b = static_cast<T>(params_->gap_extend_b);
-        job.align_mode = (AM == AlignMode::Local) ? 1 : 0;
+        job.align_mode = (AM == AlignMode::Local) ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
         job.align_band = 0; job.band = 0;
         job.guide_j = nullptr; job.guide_len = 0;
         job.buf = &buf;

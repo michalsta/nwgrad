@@ -175,7 +175,7 @@ struct ViterbiJob {
     const unsigned char* b; int n;
     const T* blk; int nalpha;               // substitution block, row-major nalpha×nalpha
     T go_a, ge_a, go_b, ge_b;               // gap penalties (in the Viterbi precision)
-    int   align_mode;                       // 0 = Global, 1 = Local
+    int   align_mode;                       // 0 = Global, 1 = Local, 2 = Glocal
     int   align_band;                       // 0 = Full,   1 = GuideBanded
     int   band;                             // half-width (band>0)
     const int* guide_j; int guide_len;      // guide path for GuideBanded (may be null)

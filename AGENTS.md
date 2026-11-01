@@ -2381,23 +2381,25 @@ window, minus the paths opening with a gap in A): scores, log Z, hard and soft c
 the integer types, pointers vs scores, the batch (hard / soft / score-only), the
 streaming `align()`, a guide band (`tests/Python/test_glocal.py`).
 
-**Leveled so far: the score-only kernels** (`score_kernel_impl.inl`, template flag
-`Glocal` on the three forms, `ScoreJob::local` 2): row 0 M = 0 at every column and no Y
-series, column 0 Global's chain, the score the best cell of the last rolling row in any
-state with the padding masked -- bit-identical to the scalar pointer fill
-(`test_score_only_equals_the_pointer_fill`, every level).
+**Leveled: the Full fills and the score-only kernels.** A template flag `Glocal` on the
+striped affine Scores and Pointers kernels (`kernels_impl.inl`, `kernels_pointers_impl.
+inl`), the striped linear kernel (`kernels_linear_impl.inl`) and the three score-only
+forms (`score_kernel_impl.inl`), `ViterbiJob::align_mode` / `ScoreJob::local` 2: row 0
+M = 0 at every column and no Y series, column 0 Global's chain, no clamp, and the end the
+best cell of row m in any state -- column 0 first, then `striped_row_best` over the
+striped columns with the padding masked (row 0's direction codes stay Global's: the walk
+stops at row 0 before reading them). Bit-identical to the scalar fills on every level
+(`test_levels_match_scalar`: scores, alignments and gradients, double / float32 / int32,
+both tracebacks, both gap models; `test_score_only_equals_the_pointer_fill`).
 
 **What is gated to the scalar or log path for this mode** (each a follow-up, in the
-order they pay): the leveled striped Viterbi / pointer / linear kernels (`run_viterbi`
-returns to the scalar fills first: they need `align_mode` 2 = Global's borders with row
-0 = M 0, and the best of row m instead of (m, n) -- `striped_row_best` on the last row,
-with row 0's codes all stops); the inter-pair hard and
+order they pay): the inter-pair hard and
 soft fills (`inter_backend_` / `stream_inter_backend_` return -1); the scaled soft
 kernels (`run_fwdbwd` takes the log path, so `soft_scaled_used()` is false and
 `soft_impl="scaled"` does not raise); Hirschberg (an explicit request throws, `kDefaultTb`
 is Pointers: the form is a glocal forward scan to the best end column, the same scan on
 the reversed sequences for the start column, then the global box, as Local's); Grid; the
-guide-banded row kernels (the scalar banded fill runs instead).
+guide-banded and row-wise row kernels (the scalar banded fill runs instead).
 
 ### Python bindings (`py_exports.cpp`)
 
