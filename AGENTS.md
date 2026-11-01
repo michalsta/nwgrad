@@ -2359,6 +2359,40 @@ Before the leveled kernel the same protein runs were 23–26 ns/cell on skynet a
 7.2 ns/cell on nighthaven (baseline copy). At len 1000 the three forward tables (24
 B/cell, 24 MB) leave L3 and the kernel turns memory-bound (Open TODOs).
 
+### Glocal mode (branch `feat/glocal`, 2026-11-01)
+
+**What.** `AlignMode::Glocal`, `mode="glocal"`: global in A, local in B -- "A within B".
+B's leading and trailing residues are free (left unaligned, not gap moves); every residue
+of A is aligned or pays a gap. In the DP: row 0 is a free start (M = 0 at every column,
+no gap moves along it: VY row 0 = -inf, the linear H row 0 = 0 by fiat), column 0 is
+Global's charged gap chain, no clamp anywhere, and the alignment ends at the best cell of
+row m in ANY state -- the first column holding the row's maximum, the state by M > X > Y
+-- so a path may end with charged gaps in A along the last row. The soft path's ensemble
+is exactly that set of paths: forward row 0 all ones, Z = the sum over row m (all
+states), the backward pass seeded with ones along row m. The gradient's gap targets:
+gaps in B are counted from column 0 (the chain is real), gaps in A from row 1 (row 0's
+are not moves): `kGapTargetMinJ` / `kGapTargetMinI`, which split the old
+`kGapTargetMin` (Local: both 1).  Everything else -- the walkers (which stop at row 0),
+the pointer codes (row 0 all stops), `alignment_end()`, the guide, the gradients, the
+batch variant (`SeqPairBatchT::Var` indices 4 / 5), `glocal_*` functions in every
+precision -- follows from the fills setting `best_i_ = m`, `best_j_` the end column.
+Tested against `bruteforce.py`'s enumeration (every global path of A vs B[j0:j1], every
+window, minus the paths opening with a gap in A): scores, log Z, hard and soft counts,
+the integer types, pointers vs scores, the batch (hard / soft / score-only), the
+streaming `align()`, a guide band (`tests/Python/test_glocal.py`).
+
+**What is gated to the scalar or log path for this mode** (each a follow-up, in the
+order they pay): the leveled striped Viterbi / pointer / linear kernels and the
+score-only kernels (`run_viterbi` returns to the scalar fills first, `compute_score` skips
+the kernel: they need `align_mode` 2 = Global's borders with row 0 = M 0, and the best of
+row m instead of (m, n) -- `striped_row_best` on the last row); the inter-pair hard and
+soft fills (`inter_backend_` / `stream_inter_backend_` return -1); the scaled soft
+kernels (`run_fwdbwd` takes the log path, so `soft_scaled_used()` is false and
+`soft_impl="scaled"` does not raise); Hirschberg (an explicit request throws, `kDefaultTb`
+is Pointers: the form is a glocal forward scan to the best end column, the same scan on
+the reversed sequences for the start column, then the global box, as Local's); Grid; the
+guide-banded row kernels (the scalar banded fill runs instead).
+
 ### Python bindings (`py_exports.cpp`)
 
 nanobind module `nwgrad_ext`, re-exported from `src/nwgrad/__init__.py`. Exposes:

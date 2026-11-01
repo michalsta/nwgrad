@@ -731,6 +731,7 @@ private:
     // admitted there — ignoring every guide and returning the unbanded log Z, so
     // fill="interpair" and fill="striped" disagreed (inherited from BatchAligner).
     int stream_inter_backend_(const AlignParams& params, int kernel, bool banded) const {
+        if constexpr (AM == AlignMode::Glocal) return -1;   // no shared fill yet: every pair its own
         const int backend = (kernel == kBackendAuto) ? global_default_backend() : kernel;
         if (backend < 0) return -1;
         const LevelKernels& K = level_kernels(backend);

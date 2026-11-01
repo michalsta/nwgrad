@@ -140,6 +140,22 @@ For **affine** gap model, a gap of length `k` costs `gap_open + gap_extend * k`.
 
 This matches BioPython's convention where `open` is charged once per gap regardless of length.
 
+### Alignment modes
+
+| `mode` | Starts | Ends | Free |
+|---|---|---|---|
+| `"global"` | (0, 0) | (len A, len B) | nothing: every residue of both sequences is aligned or in a charged gap |
+| `"local"` | anywhere | anywhere | both sequences' flanks (Smith-Waterman; the empty alignment scores 0) |
+| `"glocal"` | row 0, any column | row len A, the best column | B's flanks: every residue of A is aligned or in a charged gap, the residues of B before and after the alignment are left out at no cost ("A within B"; semi-global) |
+
+Glocal is the mode of a query that must align end to end inside a longer subject (a
+miRNA in a target site, a read in a reference). Its score is at least the global score
+and at most the local one for non-negative gap costs. The alignment never starts with a
+gap in A (B's leading residues are free, not gapped) but may end with charged gaps in A
+along the last row; the soft gradient's ensemble is that same set of paths. `aligned()`
+returns the window of B the alignment covers; `coordinates()` starts where the path
+starts.
+
 ### Parameter sets and tracks
 
 An `AlignParams` may hold **K parameter sets**, each a full substitution matrix plus the
@@ -211,7 +227,7 @@ Contracts:
 nwgrad.SeqPair(
     seq_a, seq_b, params,   # params: AlignParams
     gap_model="affine",     # "linear" | "affine"
-    mode="global",          # "global" | "local"
+    mode="global",          # "global" | "local" | "glocal"
     grad_mode="hard",       # "hard" | "soft" | "none"
     kernel="auto",          # Viterbi backend, see tuning.md#kernel-selection
     traceback="auto",       # see tuning.md#traceback-modes
@@ -318,7 +334,7 @@ nwgrad.SeqPairBatch(
     seqs_a, seqs_b, params, *,   # the pairs (seqs_a[i], seqs_b[i]), given once
     n_threads=0, traceback="auto",
     gap_model="affine",     # "linear" | "affine"
-    mode="global",          # "global" | "local"
+    mode="global",          # "global" | "local" | "glocal"
     grad_mode="hard",       # "hard" | "soft" | "none"
     kernel="auto",          # Viterbi backend
     tracks=None, gap_tracks=None,   # see "Parameter sets and tracks"
@@ -518,6 +534,8 @@ a `traceback="pointers"` pair's.
 | `sw_score` | Linear | Local (SW) |
 | `nw_score_affine` | Affine | Global (NW) |
 | `sw_score_affine` | Affine | Local (SW) |
+| `glocal_score` | Linear | Glocal |
+| `glocal_score_affine` | Affine | Glocal |
 
 **Hard gradient** — return `(score: float, grad: AlignParams)`:
 
@@ -527,6 +545,8 @@ a `traceback="pointers"` pair's.
 | `sw_grad` | Linear | Local |
 | `nw_affine_grad` | Affine | Global |
 | `sw_affine_grad` | Affine | Local |
+| `glocal_grad` | Linear | Glocal |
+| `glocal_affine_grad` | Affine | Glocal |
 
 **Soft gradient** — return `(log_z: float, grad: AlignParams)`:
 
@@ -536,6 +556,8 @@ a `traceback="pointers"` pair's.
 | `sw_soft_grad` | Linear | Local |
 | `nw_affine_soft_grad` | Affine | Global |
 | `sw_affine_soft_grad` | Affine | Local |
+| `glocal_soft_grad` | Linear | Glocal |
+| `glocal_affine_soft_grad` | Affine | Glocal |
 
 (Note the naming is irregular: the affine *score* functions suffix `_affine`, while
 the affine *gradient* functions infix it.)

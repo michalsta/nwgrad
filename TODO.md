@@ -319,9 +319,14 @@ Also open from the same work:
 Tracks landed on branch `tracks` (2026-10-11; see AGENTS.md, "Tracks").  Deferred:
 
 - **Glocal mode** (global in A, local in B: free leading and trailing gaps along B) —
-  PosimiR's second DP mode.  A third `AlignMode`, or row-0 / row-m horizontal costs of
-  0 via the gap track (that needs a "free" set whose counts reach no gradient).  Not
-  started; the gap track already prices rows 0 and m on their own, so the hooks exist.
+  PosimiR's second DP mode.  STARTED 2026-11-01 on branch `feat/glocal` as a third
+  `AlignMode` (AGENTS.md "Glocal mode"): the scalar fills, both tracebacks, the log-space
+  soft path, the batch and streaming surfaces and the Python functions are in and tested
+  against an exhaustive oracle.  Not yet: the leveled striped / score / pointer kernels,
+  the inter-pair fills, the scaled soft kernels (per-pair and inter-pair), Hirschberg and
+  Grid, the guide-banded row kernels -- each falls back to the scalar or log path for
+  this mode (or throws, for an explicit Hirschberg request), so glocal is correct but
+  slow until they are ported.
 - **Fleet runs not yet done: spot (neon) and solace (avx512).**  Correctness
   (`ctest`, `NWGRAD_FORCE_KERNEL=simd pytest tests/Python`) and `tools/bench_tracks.py`.
   Everything on the branch was verified on sse2 (skynet, wloczykij) and avx2 (nighthaven).

@@ -162,3 +162,60 @@ def global_soft_counts(a, b, params, affine):
         opens_b += ob * w / z
         extends_b += eb * w / z
     return pairs, opens_a, extends_a, opens_b, extends_b
+
+
+# ── Glocal: global in a, local in b ──────────────────────────────────────────
+#
+# b's leading and trailing residues are free (left unaligned, not gap moves) and every
+# residue of a is aligned or gapped.  The DP (aligner.hpp, AlignMode::Glocal) starts at
+# any cell of row 0 in state M -- so a path's FIRST move is never a gap in a -- and ends
+# at the best (or, for the partition function, every) cell of row m in any state: a path
+# may end with charged gaps in a along row m.  The enumeration below is that set of paths
+# exactly: every global path of a vs b[j0:j1], over every window, minus those opening
+# with a gap in a.
+
+def _glocal_scored_paths(a, b, params, affine):
+    """(path, score, j0) for every glocal alignment of a vs b."""
+    for j0 in range(len(b) + 1):
+        for j1 in range(j0, len(b) + 1):
+            for path, s in _scored_paths(a, b[j0:j1], params, affine):
+                if path and path[0] == Y:
+                    continue
+                yield path, s, j0
+
+
+def glocal_score(a, b, params, affine):
+    """Glocal score by exhaustive enumeration."""
+    return max(s for _, s, _ in _glocal_scored_paths(a, b, params, affine))
+
+
+def glocal_log_z(a, b, params, affine):
+    """log-partition function over every glocal alignment."""
+    scores = [s for _, s, _ in _glocal_scored_paths(a, b, params, affine)]
+    hi = max(scores)
+    return hi + math.log(sum(math.exp(s - hi) for s in scores))
+
+
+def glocal_hard_counts(a, b, params, affine):
+    """Feature counts along the single best glocal alignment (unique optimum only)."""
+    best_path, _, j0 = max(_glocal_scored_paths(a, b, params, affine), key=lambda t: t[1])
+    return _counts(best_path, a, b[j0:], affine)
+
+
+def glocal_soft_counts(a, b, params, affine):
+    """Expected feature counts over the Boltzmann ensemble of glocal alignments."""
+    scored = list(_glocal_scored_paths(a, b, params, affine))
+    hi = max(s for _, s, _ in scored)
+    weights = [math.exp(s - hi) for _, s, _ in scored]
+    z = sum(weights)
+    pairs = {}
+    opens_a = extends_a = opens_b = extends_b = 0.0
+    for (path, _, j0), w in zip(scored, weights):
+        p, oa, ea, ob, eb = _counts(path, a, b[j0:], affine)
+        for key, v in p.items():
+            pairs[key] = pairs.get(key, 0.0) + v * w / z
+        opens_a += oa * w / z
+        extends_a += ea * w / z
+        opens_b += ob * w / z
+        extends_b += eb * w / z
+    return pairs, opens_a, extends_a, opens_b, extends_b
