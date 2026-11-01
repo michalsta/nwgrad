@@ -177,7 +177,14 @@ static inline double sp_loss_products(SF lb, SF lc, double gh0, double gv0) noex
 // count nothing; the others take the plain product and count its flush into lc.
 // Double counts nothing anywhere: its terms are ~2^-700, and the tests cost it 1.2-1.9x
 // (sse4, 2026-11-01).  kSpCount: the float32 instantiation only.
-#if defined(__FMA__) || defined(__ARM_FEATURE_FMA)
+// NWGRAD_SP_NOCOUNT / NWGRAD_SP_NOFMA: timing probes only (the bound is unsound without
+// the counts).
+#ifndef NWGRAD_SP_NOCOUNT
+#  define NWGRAD_SP_COUNT_F32 1
+#else
+#  define NWGRAD_SP_COUNT_F32 0
+#endif
+#if (defined(__FMA__) || defined(__ARM_FEATURE_FMA)) && !defined(NWGRAD_SP_NOFMA)
 #  define NWGRAD_SP_MAC(acc, a, b) do { if constexpr (kSpCount) (acc) = std::fma((a), (b), (acc)); else (acc) += (a) * (b); } while (0)
 #else
 #  define NWGRAD_SP_MAC(acc, a, b) do { if constexpr (kSpCount) { const SF p_ = (a) * (b); (acc) += p_; lc += NWGRAD_SP_FLUSHED(p_, (a), (b)); } else (acc) += (a) * (b); } while (0)
@@ -232,7 +239,7 @@ static inline bool sp_log_z(SoftPairJobT<SF>& J, const int* S, const SF* rowsum_
 template <class SF, bool Tr>
 NWGRAD_SP_FMA_FN static void soft_pair_linear_t(SoftPairJobT<SF>& J) noexcept {
     NWGRAD_SP_FMA_BODY
-    constexpr bool kSpCount = std::is_same_v<SF, float>;   // flushed products counted (sp_loss_products)
+    constexpr bool kSpCount = std::is_same_v<SF, float> && NWGRAD_SP_COUNT_F32;   // flushed products counted (sp_loss_products)
     const int m = J.m, n = J.n;
     const bool L = J.local != 0;
     const int kmin = L ? 1 : 0;
@@ -413,7 +420,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear_t(SoftPairJobT<SF>& J) noexcept {
 template <class SF, bool Tr>
 NWGRAD_SP_FMA_FN static void soft_pair_affine_t(SoftPairJobT<SF>& J) noexcept {
     NWGRAD_SP_FMA_BODY
-    constexpr bool kSpCount = std::is_same_v<SF, float>;   // flushed products counted (sp_loss_products)
+    constexpr bool kSpCount = std::is_same_v<SF, float> && NWGRAD_SP_COUNT_F32;   // flushed products counted (sp_loss_products)
     const int m = J.m, n = J.n;
     const bool L = J.local != 0;
     const int kmin = L ? 1 : 0;

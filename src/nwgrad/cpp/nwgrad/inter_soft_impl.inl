@@ -350,7 +350,7 @@ for (int i = M; i >= 0; --i) {
         for (int j = n; j >= 1; --j) {
             const auto [mv, xv] = cell(j);
             const ivd y = c;
-            if constexpr (std::is_same_v<SF, float>) {
+            if constexpr (std::is_same_v<SF, float> && NWGRAD_SP_COUNT_F32) {
                 // float32: the products named, their flushes counted (sp_loss_products,
                 // soft_kernel_impl.inl); the double body below is the original, untouched
                 // (a shared `t` across the two branches cost it a spilled accumulator).
@@ -421,7 +421,7 @@ for (int i = M; i >= 0; --i) {
         loss[l] += 32.0 * (n + 1) * DMIN * (lf * mx[l] + lb * mf[i][l]) * gh[l];
         // the gradient products' flushed intermediates (lb) and the two-factor flushes, in the
         // pre-rescale units (soft_kernel_impl.inl, sp_loss_products)
-        if constexpr (std::is_same_v<SF, float>)
+        if constexpr (std::is_same_v<SF, float> && NWGRAD_SP_COUNT_F32)
             loss[l] += DMIN * std::ldexp(2.0 * static_cast<double>(lbv[l]) * gv[l] + 2.0 * static_cast<double>(lcv[l]) * (gh[l] + gv[l]), kv[l]);
     }
     for (int l = 0; l < IW; ++l) {
@@ -676,7 +676,7 @@ for (int i = M; i >= 0; --i) {
             pbv = ivsel(up, pv, pbv);
             pbj = ivsel(up, z + static_cast<SF>(j), pbj);
         }
-        constexpr bool kc = std::is_same_v<SF, float>;   // flushed products counted (sp_loss_products)
+        constexpr bool kc = std::is_same_v<SF, float> && NWGRAD_SP_COUNT_F32;   // flushed products counted (sp_loss_products)
         if (j >= 1) {
             if constexpr (kc) { const ivd pa = f[j - 1] * b; sa += pa; lcv += ivsel((pa == z) & (f[j - 1] > z) & (b > z), one, z); }
             else sa += f[j - 1] * b;
@@ -726,7 +726,7 @@ for (int i = M; i >= 0; --i) {
         const double lb = kb < 0 ? std::ldexp(1.0, -kb) : 1.0;
         // 16 terms per cell: sp_loss's kSpTermsLinear (both fills must agree).
         loss[l] += 16.0 * (n + 1) * DMIN * (lf * mx[l] + lb * mf[i][l]) * gh;
-        if constexpr (std::is_same_v<SF, float>)
+        if constexpr (std::is_same_v<SF, float> && NWGRAD_SP_COUNT_F32)
             loss[l] += DMIN * std::ldexp(2.0 * static_cast<double>(lbv[l]) * gv + 2.0 * static_cast<double>(lcv[l]) * (gh + gv), kv[l]);
         const SF eal = Tr ? ea[l] : J.ea, ebl = Tr ? eb[l] : J.eb;
         if (i >= kmin) g_ea[l] += sa[l] * eal * gh;
