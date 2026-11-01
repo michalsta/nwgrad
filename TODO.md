@@ -5,11 +5,16 @@
 The float32 classes run the scaled forward-backward in float32 (AGENTS.md "The float32
 soft path"; `soft_precision` switches a batch back to double). Left open:
 - An all-refusing batch (diffuse long linear pairs: the lost-mass bound rejects float32
-  for every pair) pays one float32 attempt per thread per call before the batch's
-  patience count stops the attempts: 8 threads, 40 L1000 linear pairs, 1.1-1.2x the
-  double class on the M1 (1.06 at one thread; AVX2 1.04). A per-pair memory of the
-  refusal across calls (a flag bit beside `kStored`, cleared when the temperature or the
-  parameters move far) would remove it.
+  for every pair) pays one float32 attempt per PAIR before its double pass. A stored
+  batch remembers the refusal per pair (`kF32Refused` beside `kStored`, 2026-11-01; it
+  replaced a batch-wide patience count that made results depend on thread timing,
+  AGENTS.md "The float32 soft path" item 6), so a repeated call pays nothing, but
+  `set_params`, `soft_temperature` and `soft_precision` clear the marks, and a training
+  loop calls `set_params` every step: there the attempt is paid for every refusing pair
+  every step (the old count paid ~n_threads attempts a call: 1.1-1.2x the double class
+  at 8 threads on the M1, 40 L1000 linear pairs). Keeping the marks across small
+  parameter moves (a criterion on how far the params moved, deterministic) would remove
+  it; unmeasured since the change.
 - The per-pair float32 kernels at protein L100 on AVX2 are only level with double
   (0.9-1.0; the shared pass 0.8-0.9, L300 0.78-0.86): the double kernel is latency-bound
   there and float32's wider lanes buy little until the rows are long. Unprofiled.

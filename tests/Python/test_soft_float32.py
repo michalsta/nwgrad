@@ -202,3 +202,58 @@ def test_tracked_float32_matches_double():
         for k, v in out.items():
             for x, y in zip(v, ref):
                 close(x, y)
+
+
+# ── Determinism of the float32 attempt and its double fallback ───────────────
+# Which pairs run float32 must not depend on thread timing.  It once did: a batch-wide
+# refusal count stopped trying float32 after three refusals, so which pairs had tried it
+# depended on which thread got there first (test_stress's determinism test caught it at
+# 8e-7).  Now every pair tries float32 on its own, a stored batch remembers per pair that
+# it refused (until the params, temperature or precision change), and a pair's path
+# depends on its own data and the call history only.
+
+def _det_runs(A, B, p, threads, fill, T, precision=None, calls=3):
+    b = nwgrad.SeqPairBatch(A, B, p, n_threads=threads, gap_model="affine", mode="global",
+                            grad_mode="soft")
+    b.fill = fill
+    b.soft_impl = "scaled_or_log"
+    b.soft_temperature = T
+    if precision is not None:
+        b.soft_precision = precision
+    out = []
+    for _ in range(calls):
+        b.score_and_grad()
+        mats, gaps = b.grads()
+        out.append((np.array(b.scores()), np.array(mats), np.array(gaps)))
+    return out
+
+
+def _det_case(T, fill):
+    rng = np.random.default_rng(seed("det", T))
+    p = protein_params(rng)
+    A = [rand_seq(rng, PROT, 300) for _ in range(40)]
+    B = [rand_seq(rng, PROT, 300) for _ in range(40)]
+    runs = _det_runs(A, B, p, 8, fill, T) + _det_runs(A, B, p, 1, fill, T)
+    for r in runs[1:]:   # every call, 8 threads and 1: exactly equal
+        for x, y in zip(r, runs[0]):
+            np.testing.assert_array_equal(x, y)
+    dbl = _det_runs(A, B, p, 8, fill, T, precision="double", calls=1)[0]
+    return runs[0], dbl
+
+
+@pytest.mark.parametrize("fill", ["interpair", "striped"])
+def test_every_pair_refuses_float32_deterministic(fill):
+    # T = 0.02 on L300 random protein: no pair fits float32's range, every one runs double,
+    # so the result IS the double-precision batch's, bit for bit (both run the same double
+    # kernels: per pair, or the shared pass for a group whose pairs all refused).
+    got, dbl = _det_case(0.02, fill)
+    for x, y in zip(got, dbl):
+        np.testing.assert_array_equal(x, y)
+
+
+@pytest.mark.parametrize("fill", ["interpair", "striped"])
+def test_every_pair_fits_float32_deterministic(fill):
+    # T = 1: every pair fits float32 (none equals the double-precision result).
+    got, dbl = _det_case(1.0, fill)
+    assert np.all(got[0] != dbl[0])
+    close(got[0], dbl[0]); close(got[1], dbl[1]); close(got[2], dbl[2])

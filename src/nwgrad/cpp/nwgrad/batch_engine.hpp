@@ -236,9 +236,10 @@ public:
     // soft_impl changes results within tolerance only and invalidates nothing (as
     // SeqPair::set_soft_impl); a new temperature changes the soft score.
     void set_soft_impl(SoftImpl v) noexcept { s_.soft_impl = v; }
-    void set_soft_f32(bool v) noexcept { s_.soft_f32 = v; f32_refusals_->store(0, std::memory_order_relaxed); }
+    void set_soft_f32(bool v) noexcept { s_.soft_f32 = v; forget_f32_refusals_(); }
     void set_soft_temperature(double t) {
         s_.set_soft_temperature(t);
+        forget_f32_refusals_();
         if (grad_mode_ == GradMode::Soft)
             for (auto& f : flags_) f &= static_cast<uint8_t>(~(kScore | kGrad));
     }
@@ -390,7 +391,7 @@ public:
                 "\" -> \"" + params.matrix.alphabet().symbols() + "\"); construct new pairs instead");
         check_sets_(params);
         params_ = own_params_(params);
-        for (auto& f : flags_) f &= static_cast<uint8_t>(~(kScore | kGrad | kStored));
+        for (auto& f : flags_) f &= static_cast<uint8_t>(~(kScore | kGrad | kStored | kF32Refused));
     }
 
     // Full DP on every pair: score, guide and (unless grad_mode None) gradient, cached
@@ -621,7 +622,6 @@ private:
         al.set_kernel(kernel);
         al.set_soft_impl(s_.soft_impl);
         al.set_soft_f32(s_.soft_f32);
-        al.set_soft_f32_counter(f32_refusals_.get());
         al.set_soft_temperature(s_.soft_temperature);
         if constexpr (AB == AlignBand::Full) {
             al.set_traceback(s_.traceback);
@@ -802,7 +802,6 @@ private:
     template<AlignBand AB, class SFx>
     void stream_inter_(const std::vector<ProblemInstance>& problems, const AlignParams& params,
                        int band, int kernel, BatchResult& result, int backend, const StreamTracks& st) const {
-        f32_refusals_->store(0, std::memory_order_relaxed);   // a new call: float32 tried afresh
         const size_t N = problems.size();
         const LevelKernels& K = level_kernels(backend);
         const bool soft = grad_mode_ == GradMode::Soft;
@@ -909,8 +908,8 @@ private:
             if (t >= G) { own(other[t - G]); continue; }
             const auto [s, e] = groups[t];
             const size_t real = e - s;
-            if (soft && (!soft_ok || (soft_f32_() && f32_refusals_->load(std::memory_order_relaxed) >= FullAl::kSoftF32Patience))) {
-                for (size_t k = s; k < e; ++k) own(elig[k]);   // the lanes run double directly
+            if (soft && !soft_ok) {
+                for (size_t k = s; k < e; ++k) own(elig[k]);   // weights out of range: each lane its own path
                 continue;
             }
             int M = 0, n = 0;
@@ -948,11 +947,6 @@ private:
                 sg.run(K, n, M, W, a.data(), m.data(), b.data(), ragged ? nb.data() : nullptr,
                        (AM == AlignMode::Local) ? 1 : 0, slogz.data(), scnt.data(), sgap.data(),
                        sok.data(), nullptr, trk ? lrsp.data() : nullptr, trk ? lrwp.data() : nullptr);
-                if constexpr (std::is_same_v<SFx, float>) {
-                    bool any = false;
-                    for (size_t l = 0; l < real; ++l) any |= sok[l] != 0;
-                    if (any) f32_refusals_->store(0, std::memory_order_relaxed); else f32_refusals_->fetch_add(1, std::memory_order_relaxed);
-                }
                 for (size_t l = 0; l < real; ++l) {
                     const size_t i = elig[s + l];
                     if (!sok[l]) { own(i); continue; }
@@ -1054,7 +1048,23 @@ private:
         kPending = 8,      // lazy soft guide not computed yet
         kLastBanded = 16,  // the cached results came from a banded DP
         kStored = 32,      // path_ holds the current alignment
+        kF32Refused = 64,  // the soft pass refused float32 under the current params,
+                           // temperature and precision: later calls run it in double directly
     };
+    void forget_f32_refusals_() noexcept {
+        for (auto& f : flags_) f &= static_cast<uint8_t>(~kF32Refused);
+    }
+    // A stored pair's forward-backward: float32 unless the pair refused it before
+    // (kF32Refused), and a refusal remembered.  Deterministic: the pair's path depends on
+    // its own data and the call history, not on which thread ran what (a batch-wide
+    // refusal count once made it depend on thread timing).
+    template<class Al>
+    void fwdbwd_(size_t i, Al& al, DpBuffer& buf) {
+        const bool f32 = soft_f32_() && !(flags_[i] & kF32Refused);
+        al.set_soft_f32(f32);
+        al.compute_forward_back(buf);
+        if (f32 && s_.soft_impl != SoftImpl::Log && !al.soft_f32_used()) flags_[i] |= kF32Refused;
+    }
     // The batch's own copy of its params, with what a tracked batch prepares from it
     // once: its gap fields cast to T, 4 per set (setup_tracks_ reads them), and (float32,
     // K > 1) its whole matrix stack cast to T (the Aligner would otherwise cast K matrices
@@ -1672,14 +1682,12 @@ private:
             full.set_rowwise_full(e.s_.rowwise_full);
             full.set_soft_impl(e.s_.soft_impl);
             full.set_soft_f32(e.s_.soft_f32);
-            full.set_soft_f32_counter(e.f32_refusals_.get());
             full.set_soft_temperature(e.s_.soft_temperature);
             // Only the Full aligner can use pointers; the banded one needs its score
             // tables and its footprint is O(m*band) already.
             band.set_traceback(TracebackMode::Scores);
             band.set_soft_impl(e.s_.soft_impl);
             band.set_soft_f32(e.s_.soft_f32);
-            band.set_soft_f32_counter(e.f32_refusals_.get());
             band.set_soft_temperature(e.s_.soft_temperature);
         }
         // State valid for one call only, reset when a pooled Work starts a new one: swp is
@@ -1695,11 +1703,6 @@ private:
     // (the mutex through a pointer: SeqPairBatchT moves its engine, and std::mutex cannot)
     mutable std::unique_ptr<std::mutex> pool_mu_ = std::make_unique<std::mutex>();
     mutable std::vector<std::unique_ptr<Work>> pool_;
-    // float32 refusals of the soft pass this call, shared by every lane and shared group
-    // (Aligner::set_soft_f32_counter): past FullAl::kSoftF32Patience, double directly.
-    // (through a pointer, as pool_mu_: SeqPairBatchT moves its engine, and std::atomic cannot;
-    // the lanes keep the atomic's address)
-    mutable std::unique_ptr<std::atomic<int>> f32_refusals_ = std::make_unique<std::atomic<int>>(0);
     struct WorkLease {
         const BatchEngine& e;
         std::unique_ptr<Work> w;
@@ -1822,7 +1825,7 @@ private:
         store_guide_(i, al.guide_j_from_viterbi(w.buf));
         if (keep) store_path_(i, al, w.buf);
         if (grad_mode_ == GradMode::Soft) {
-            al.compute_forward_back(w.buf);
+            fwdbwd_(i, al, w.buf);
             score_[i] = al.log_z();
         } else {
             score_[i] = al.score();
@@ -1830,7 +1833,7 @@ private:
     }
     // Modern fills publish all computed results together.
     void finish_(size_t i, bool banded, bool pending) {
-        uint8_t f = flags_[i] & kStored;
+        uint8_t f = flags_[i] & (kStored | kF32Refused);
         f |= kPath | kScore;
         if (grad_mode_ != GradMode::None) f |= kGrad;
         if (banded)  f |= kLastBanded;
@@ -1856,7 +1859,7 @@ private:
         }
         if (grad_mode_ == GradMode::Soft && (lazy || post)) {
             al.set_posterior_guide(post);
-            al.compute_forward_back(w.buf);
+            fwdbwd_(i, al, w.buf);
             al.set_posterior_guide(false);
             score_[i] = al.log_z();
             grad_with_buf_(i, al, w);
@@ -1941,7 +1944,7 @@ private:
                 apply_soft_lane_(i, *soft);
             } else if (grad_mode_ == GradMode::Soft) {
                 if (keep) store_path_(i, al, w.buf);   // before forward-backward reuses buf
-                al.compute_forward_back(w.buf);
+                fwdbwd_(i, al, w.buf);
                 score_[i] = al.log_z();
                 grad_with_buf_(i, al, w);
                 finish_(i, false, false);
@@ -2107,14 +2110,12 @@ private:
         al.set_rowwise_full(s_.rowwise_full);
         al.set_soft_impl(s_.soft_impl);
         al.set_soft_f32(s_.soft_f32);
-        al.set_soft_f32_counter(f32_refusals_.get());
         al.set_soft_temperature(s_.soft_temperature);
     }
     void configure_lane_(BandAl& al) const {
         al.set_traceback(TracebackMode::Scores);
         al.set_soft_impl(s_.soft_impl);
         al.set_soft_f32(s_.soft_f32);
-        al.set_soft_f32_counter(f32_refusals_.get());
         al.set_soft_temperature(s_.soft_temperature);
     }
     static void set_inter_params_(InterJobT<T>& job, const AlignParams& P, const std::vector<T>& blkT) {
@@ -2271,7 +2272,6 @@ private:
     // tables for score, path and gradient; the other pairs run their own fill.  One
     // atomic counter over all tasks.  (SeqPairBatch::score_and_grad_inter_.)
     void score_and_grad_inter_(bool keep) {
-        f32_refusals_->store(0, std::memory_order_relaxed);   // a new call: float32 tried afresh
         ensure_plan_();
         const auto& elig = plan_.elig;
         const auto& other = plan_.other;
@@ -2296,7 +2296,9 @@ private:
                 const size_t t = idx.fetch_add(1, std::memory_order_relaxed);
                 if (t >= tasks) break;
                 if (t >= G) { run_full_(other[t - G], w, keep); continue; }
-                const auto [s, e] = groups[t];
+                // (not a structured binding: the soft pass's lambda captures s, and clang
+                // cannot capture a structured binding inside an OpenMP region)
+                const size_t s = groups[t].first, e = groups[t].second;
                 const size_t real = e - s;
                 const LevelKernels& K = level_kernels(plan_.backend);
                 const int W = inter_w_(K);
@@ -2367,16 +2369,37 @@ private:
                                    tracked_ ? w.srsp.data() + c : nullptr,
                                    tracked_ ? w.template srwp_of<SFx>().data() + c : nullptr);
                         }
-                        if constexpr (std::is_same_v<SFx, float>) {
-                            bool any = false;
-                            for (size_t l = 0; l < real; ++l) any |= sok[l] != 0;
-                            if (any) f32_refusals_->store(0, std::memory_order_relaxed); else f32_refusals_->fetch_add(1, std::memory_order_relaxed);
-                        }
+                        // The lanes float32 refused: remembered per pair (kF32Refused); their
+                        // own path below runs double directly, as on later calls.
+                        if constexpr (std::is_same_v<SFx, float>)
+                            for (size_t l = 0; l < real; ++l)
+                                if (!sok[l]) flags_[elig[s + l]] |= kF32Refused;
                     };
-                    // The batch's float32 patience spent (whole groups or lanes refused, none
-                    // accepted since): the rest of this call runs the double pass (diffuse
-                    // problems refuse every lane; see Aligner::run_fwdbwd).
-                    if (soft_f32_() && f32_refusals_->load(std::memory_order_relaxed) < FullAl::kSoftF32Patience) run(sgf); else run(sgd);
+                    // The float32 pass unless every pair of the group refused float32 before
+                    // (under these params, temperature and precision; kF32Refused), then the
+                    // double pass directly.  A pair's path depends on its own data and the call
+                    // history only, never on thread timing, and a later call repeats it: a group
+                    // float32 took no lane of (every lane refused, or the weights or a lane's
+                    // rows out of float32's range) reruns in double at once, all its pairs
+                    // marked, so the next call's double pass gives the same results; a group
+                    // float32 took some lanes of takes them again, and its refused lanes run
+                    // their own path in double both times.
+                    bool f32 = false;
+                    if (soft_f32_())
+                        for (size_t l = 0; l < real; ++l) f32 |= !(flags_[elig[s + l]] & kF32Refused);
+                    if (f32) {
+                        run(sgf);
+                        bool took = false;
+                        if (soft_group)
+                            for (size_t l = 0; l < real; ++l) took |= sok[l] != 0;
+                        if (!took) {
+                            for (size_t l = 0; l < real; ++l) flags_[elig[s + l]] |= kF32Refused;
+                            soft_group = true;
+                            run(sgd);
+                        }
+                    } else {
+                        run(sgd);
+                    }
                 }
                 for (size_t l = 0; l < real; ++l) {
                     const size_t i = elig[s + l];
@@ -2470,7 +2493,6 @@ private:
     // lane around its own guide, its tables bit-identical to its own banded fill.
     // (SeqPairBatch::banded_grad_inter_.)
     void banded_grad_inter_(int bandwidth) {
-        f32_refusals_->store(0, std::memory_order_relaxed);   // a new call: float32 tried afresh
         ensure_band_groups_();
         const auto& elig = band_.elig;
         const auto& other = band_.other;
@@ -2619,7 +2641,6 @@ private:
     }
 
     void score_and_grad_dynamic_(bool keep) {
-        f32_refusals_->store(0, std::memory_order_relaxed);   // a new call: float32 tried afresh
         const size_t N = size();
         std::atomic<size_t> idx{0};
         auto worker = [&]() {
@@ -2727,7 +2748,6 @@ private:
     }
 
     void banded_grad_dynamic_(int bandwidth, bool keep) {
-        f32_refusals_->store(0, std::memory_order_relaxed);   // a new call: float32 tried afresh
         const size_t N = size();
         std::atomic<size_t> idx{0};
         auto worker = [&]() {
@@ -2743,7 +2763,6 @@ private:
     // in length and fits every thread at once, so the chunked scheduler would be
     // overhead (see SeqPairBatch::banded_grad_lpt_).
     void banded_grad_lpt_(int bandwidth, bool keep) {
-        f32_refusals_->store(0, std::memory_order_relaxed);   // a new call: float32 tried afresh
         const size_t N = size();
         const double bw = 2.0 * static_cast<double>(bandwidth) + 1.0;
         std::vector<double> cost(N);

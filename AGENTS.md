@@ -2320,18 +2320,39 @@ tables, the rows, the weights and the row-wise reductions are float32.
    term is now float-only too (and the kernels free function templates, not members of a
    class template, so each instantiation's dead code is dead); parity by cycles (21.3 vs
    21.2-21.6 G).
-6. **Refusal patience is the batch's, not the lane's.** A pair whose weights or bound do
-   not fit float32 costs its float32 attempt before the double rerun; after
-   `kSoftF32Patience` (3) refusals with no acceptance between, the batch runs double
-   directly for the rest of the call. The count was per lane / per worker at first, so 8
-   threads over 40 refusing L1000 linear pairs each paid it: 1.41-1.44x the double class on
-   the M1 (1 thread 1.06). One atomic per batch (`BatchEngine::f32_refusals_`, handed to
-   the lanes by `Aligner::set_soft_f32_counter`, reset per call and by `set_soft_f32`) --
-   a success stores 0, so a mixed batch keeps trying. What is left: the threads that
-   start together each try once before the count reaches three, so an all-refusing
-   batch pays n_threads attempts a call (8 threads, 40 L1000 linear pairs: 1.11-1.22 of
-   the double class on the M1, 1.06 at one thread; AVX2 1.04-1.05). A per-pair memory
-   of the refusal across calls would remove it (`TODO.md`).
+6. **A pair's precision is its own: no refusal state shared between pairs.** A pair whose
+   weights or bound do not fit float32 costs its float32 attempt before the double rerun.
+   To stop paying that for batches where every pair refuses (diffuse long linear pairs),
+   the branch first counted refusals -- per lane (8 threads over 40 refusing L1000 linear
+   pairs each paid it: 1.41-1.44x the double class on the M1), then per batch: one atomic
+   (`f32_refusals_`) shared by every lane and group, after `kSoftF32Patience` (3)
+   refusals with no acceptance between, double directly for the rest of the call.
+   **That was wrong: it made results depend on thread timing.** Which pairs had tried
+   float32 before the count reached three depended on which thread got where first, so
+   two runs of the same batch differed at float32 precision (CI: `test_stress.py`
+   `test_soft_grad_determinism_large_batch[8]`, 8e-7 on a count, in the ASan, UBSan and
+   plain Python jobs). The library promises results reproducible across runs and thread
+   counts. **Replaced (2026-11-01):** no count anywhere. The `Aligner` keeps no refusal
+   state between runs (every run with `soft_f32` on tries float32, then double); every
+   pair of a shared group tries float32 in the group's float32 pass and falls back by
+   itself (its own path, in double). The cost is paid once per pair instead, and a
+   STORED batch then remembers it: `kF32Refused`, a bit beside `kStored` in `flags_[i]`,
+   set when a pair's own forward-backward ended without float32 (`fwdbwd_`), or when the
+   group's float32 pass refused the lane; a marked pair runs double directly on later
+   calls (`fwdbwd_` turns the lane's `soft_f32` off), and a group whose pairs are all
+   marked runs its double pass directly. A group the float32 pass took no lane of (every
+   lane refused, or the weights or a tracked lane's rows out of float32's range) is
+   rerun in double AT ONCE, all its pairs marked: so the next call's direct double pass
+   gives the same bits, and a group float32 took some lanes of takes the same lanes again
+   and sends the same refused lanes to their own double path. A pair's path thus depends
+   on its own data and the call history, never on the threads (tests:
+   `test_soft_float32.py` `test_every_pair_refuses_float32_deterministic` /
+   `..._fits_...`: three calls at 8 threads and three at 1, bit-equal; the all-refusing
+   batch bit-equal to `soft_precision="double"`). The marks are cleared by `set_params`,
+   `soft_temperature` and `soft_precision`. The streaming `align()` has nothing stored
+   between calls: each pair tries float32 each call. What is left: a training loop calls
+   `set_params` every step, which clears the marks, so an all-refusing batch pays one
+   float32 attempt per PAIR per step (`TODO.md`).
 
 **Measured** (`tools/bench_soft_f32.py`: float32 / double of the SAME class, one binary,
 control arm 0.95-1.06; `scaled_or_log`; DNA = 22 x 50 miRNA-like pairs, DiscrimAlign's
@@ -2357,9 +2378,11 @@ there where AVX2 gains 0.80 and NEON 0.72. The gains come with length (L300 0.86
 L1000 affine 0.29-0.43). A secondary-target finding, left as is: `soft_precision="double"`
 is a property away, and the shared pass is the default at these sizes.
 
-L1000 linear: every pair refuses float32 (the lost-mass bound: diffuse rows) and the
-batch pays the attempts before its patience is spent (item 6). L1000 affine: the double
-pass's three 8-byte tables leave the cache; float32's stay (0.2-0.5).
+L1000 linear: every pair refuses float32 (the lost-mass bound: diffuse rows); the
+columns above were measured with the batch-wide patience count of the time (item 6), since
+replaced by a per-pair mark, which pays one attempt per pair after each `set_params`.
+L1000 affine: the double pass's three 8-byte tables leave the cache; float32's stay
+(0.2-0.5).
 
 (The C column of the tool, `SeqPairBatchDouble` / the float32 class in double, is the
 double build's own soft pass: 1.0-1.2x of the float32 class at double, the guide Viterbi's

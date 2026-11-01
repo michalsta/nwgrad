@@ -1088,13 +1088,11 @@ struct Aligner {
     // float32 T only: whether the scaled path runs in float32 (default) before double.
     // A pair whose range does not fit float32 reruns in double, silently; soft_f32_used()
     // tells which precision the most recent compute_forward_back() ended in.
-    void set_soft_f32(bool v) noexcept { soft_f32_ = v; soft_f32_refused_ = 0; }
+    // Every run tries float32 afresh: the aligner keeps no refusal state between runs, so
+    // a pair's precision depends on that pair alone.  (A batch remembers its pairs'
+    // refusals itself, per pair, and turns float32 off here for a pair that refused.)
+    void set_soft_f32(bool v) noexcept { soft_f32_ = v; }
     bool soft_f32() const noexcept { return soft_f32_; }
-    // The refusal count a batch shares between its lanes (reset per call): past
-    // kSoftF32Patience refusals with no success between, every lane runs double directly.
-    // Alone (nullptr), the aligner counts its own.
-    static constexpr int kSoftF32Patience = 3;
-    void set_soft_f32_counter(std::atomic<int>* c) noexcept { soft_f32_counter_ = c; }
     bool soft_f32_used() const noexcept { return soft_f32_used_; }
 
     // Soft temperature T > 0 (default 1).  The soft path then evaluates the smoothed
@@ -1560,8 +1558,6 @@ private:
     SoftImpl soft_impl_ = SoftImpl::Scaled;
     bool     soft_scaled_used_ = false;
     bool     soft_f32_ = true;             // float32 T: run the scaled path in float32 first
-    int      soft_f32_refused_ = 0;        // consecutive float32 refusals; past kSoftF32Patience, double directly
-    std::atomic<int>* soft_f32_counter_ = nullptr;   // the batch's shared count, if any
     bool     soft_f32_used_ = false;       // the most recent run was the float32 scaled pass
     bool     soft_counts_ready_ = false;   // scnt_/sg_* hold this run's gradient
     double   soft_temp_ = 1.0;
@@ -4784,19 +4780,11 @@ private:
             // float32 pairs: the float32 scaled pass first; a pair whose weights or lost-mass
             // bound do not fit float32 (a step score past ~88 nats, or very low T) reruns
             // in double before SoftImpl decides anything.
-            // A batch whose pairs keep refusing float32 (diffuse long problems: the bound
-            // rejects them all) stops paying for the attempt until one succeeds again or the
-            // next call; the count is the batch's, shared by its lanes (a per-lane count let
-            // every thread pay the patience over again: 8 threads, 40 refusing pairs, +40 %).
+            // No refusal state is carried between runs (a shared count made a batch's
+            // precision per pair depend on thread timing); a batch skips the attempt for the
+            // pairs that refused it before, by turning soft_f32 off for them.
             if constexpr (std::is_same_v<T, float>)
-                if (soft_f32_) {
-                    const int refused = soft_f32_counter_ ? soft_f32_counter_->load(std::memory_order_relaxed) : soft_f32_refused_;
-                    if (refused < kSoftF32Patience) {
-                        ok = fwdbwd_scaled<float>(buf);
-                        if (soft_f32_counter_) { if (ok) soft_f32_counter_->store(0, std::memory_order_relaxed); else soft_f32_counter_->fetch_add(1, std::memory_order_relaxed); }
-                        else soft_f32_refused_ = ok ? 0 : soft_f32_refused_ + 1;
-                    }
-                }
+                if (soft_f32_) ok = fwdbwd_scaled<float>(buf);
             if (!ok) ok = fwdbwd_scaled<double>(buf);
             if (ok) {
                 soft_scaled_used_ = soft_counts_ready_ = true;
