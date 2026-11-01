@@ -2215,6 +2215,33 @@ solace (4623); the C++ suite on skynet (sse4, 2.93 M assertions), spot (neon, gc
 tests under clang 22 at avx512), with the integer tag at sse2 / sse4 / scalar_fallback;
 `tools/fuzz_ab.py` main vs branch 300 seeds, 0 differ (skynet).
 
+### Score-only integer kernel: two segments a trip (branch `perf/int-unroll`, 2026-10-31)
+
+**Why.** The gcc-vs-clang residue on the integer striped kernels (clang 4-20 % faster on
+int16 / int32 score-only, "Toolchain" above) is scheduling: clang unrolls the segment
+loop by two and interleaves the iterations' loads, cells and carries, gcc issues one
+segment's chain at a time. The fused score kernel's row pass (`score_affine_striped_pos`)
+got that unrolling by hand: template flag `U2`, the loop takes two segments a trip --
+both segments' loads first, the two cells, then the two carry steps, the same operations
+in the same order per cell (bit-identical, checked on every host), the diagonal of
+segment s carried in a register from segment s-1's up vector (the rolled form reloads
+it). `NWGRAD_SCORE_UNROLL=0` keeps the rolled form in the same binary (the A/B switch).
+
+**Measured** (`scratchpad/ab_env.py`: one binary, the env switch, arms alternated, best
+of 3-5, score-only protein L200 / L1000, 1 thread unless noted; control arms 0.99-1.02):
+- gcc AVX2 int16 / int32: nighthaven 0.95-0.98, solace (avx2) 0.96-0.99; AVX-512 and SSE4
+  ~1.00 (within noise either way); 12 threads the same.
+- clang: 0.89-0.99.
+- NEON (spot, gcc 16): int16 Global **1.25x slower** -- the M1's rename width has no use
+  for the interleave and the longer body costs; off on AArch64 by default
+  (`score_unroll2()`), `NWGRAD_SCORE_UNROLL=1` forces it on.
+- gcc vs clang after it, both unrolled (solace, B/A = gcc / clang, controls 1.0-1.03):
+  avx512 int16 1.09, int32 1.02; avx2 0.99 / 1.07; sse4 1.06 / 1.18 -- the same numbers
+  as both rolled. On nighthaven gcc is the faster compiler on the AVX2 int score kernel
+  either way (0.89-0.97). So the hand unroll is a marginal, bit-identical win on x86 and
+  the residual gap is clang's scheduling of the whole kernel, not the unroll count; not
+  closable this way.
+
 ### The soft path: scaled probability space (2026-10-05)
 
 **The soft path is NOT bit-exact** — across `soft_impl`, ISA levels, compilers, `fill`,
