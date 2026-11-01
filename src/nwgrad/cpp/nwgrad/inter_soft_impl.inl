@@ -406,6 +406,9 @@ for (int i = M; i >= 0; --i) {
     }
     if constexpr (decltype(Cnt)::value) { lbv_out = lbv; lcv_out = lcv; }
     };
+    // the counted rerun out of line: inlined beside the uncounted pass it cost that pass
+    // 15-25 % on the M1 from code placement and register allocation alone (2026-11-01)
+    auto row_counted = [&]() __attribute__((noinline)) { row(std::true_type{}); };
     row(std::false_type{});
     // The flushed products' term (simd_levels.hpp, sp_loss_products_max): the worst case
     // from this pass's row max, or the counted rerun where that would eat into the
@@ -429,7 +432,7 @@ for (int i = M; i >= 0; --i) {
           if (r % 100000 == 0) std::fprintf(stderr, "inter rows %ld reruns %ld\n", r, reruns_.load()); }
 #endif
         if (need) {
-            row(std::true_type{});
+            row_counted();
             for (int l = 0; l < IW; ++l)
                 lossp[l] = (i > J.m[l]) ? 0.0 : sp_loss_products<SF>(lbv_out[l], lcv_out[l], gh0[l], gv0[l]);
         }
@@ -751,6 +754,9 @@ for (int i = M; i >= 0; --i) {
     else         cols(std::integral_constant<int, -1>{});
     if constexpr (decltype(Cnt)::value) { lbv_out = lbv; lcv_out = lcv; }
     };
+    // the counted rerun out of line: inlined beside the uncounted pass it cost that pass
+    // 15-25 % on the M1 from code placement and register allocation alone (2026-11-01)
+    auto row_counted = [&]() __attribute__((noinline)) { row(std::true_type{}); };
     row(std::false_type{});
     // The flushed products' term (simd_levels.hpp, sp_loss_products_max): the worst case
     // from this pass's row max, or the counted rerun where that would eat into the
@@ -774,7 +780,7 @@ for (int i = M; i >= 0; --i) {
           if (r % 100000 == 0) std::fprintf(stderr, "inter rows %ld reruns %ld\n", r, reruns_.load()); }
 #endif
         if (need) {
-            row(std::true_type{});
+            row_counted();
             for (int l = 0; l < IW; ++l)
                 lossp[l] = (i > J.m[l]) ? 0.0 : sp_loss_products<SF>(lbv_out[l], lcv_out[l], gh0[l], gv0[l]);
         }

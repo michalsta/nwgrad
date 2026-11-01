@@ -373,6 +373,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear_t(SoftPairJobT<SF>& J) noexcept {
                 }
                 mx = mx_; sa = sa_; sb = sb_; lb = lb_; lc = lc_;
             };
+            auto pass_counted = [&]() __attribute__((noinline)) { pass(std::true_type{}); };   // out of line (see inter_soft_impl.inl)
             pass(std::false_type{});
             if constexpr (kSpCountF) {
                 const double gv0 = sp_post(S[i - 1] + Tn - ze, izr, bad);
@@ -382,7 +383,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear_t(SoftPairJobT<SF>& J) noexcept {
                   if (r % 100000 == 0) std::fprintf(stderr, "pair rows %ld reruns %ld\n", r, reruns_.load()); }
 #endif
                 if (!(loss + lossp <= kSpCountBudget * SoftRange<SF>::tol)) {   // near rejection: count
-                    pass(std::true_type{});
+                    pass_counted();
                     lossp = sp_loss_products<SF>(lb, lc, gh0, gv0);
                 }
             }
@@ -654,6 +655,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine_t(SoftPairJobT<SF>& J) noexcept {
                 }
                 mx = mx_; sx = sx_; sy = sy_; so = so_; sob = sob_; lb = lb_; lc = lc_;
             };
+            auto pass_counted = [&]() __attribute__((noinline)) { pass(std::true_type{}); };   // out of line (see inter_soft_impl.inl)
             pass(std::false_type{});
             if constexpr (kSpCountF) {
                 const double gv0 = sp_post(S[i - 1] + Tn - ze, izr, bad);
@@ -663,7 +665,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine_t(SoftPairJobT<SF>& J) noexcept {
                   if (r % 100000 == 0) std::fprintf(stderr, "pair rows %ld reruns %ld\n", r, reruns_.load()); }
 #endif
                 if (!(loss + lossp <= kSpCountBudget * SoftRange<SF>::tol)) {   // near rejection: count
-                    pass(std::true_type{});
+                    pass_counted();
                     lossp = sp_loss_products<SF>(lb, lc, gh0, gv0);
                 }
             }
