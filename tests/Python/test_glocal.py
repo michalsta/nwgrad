@@ -258,9 +258,13 @@ def test_batch_matches_pairs(generic_matrix, gap_model, grad_mode):
     B = ["".join(rng.choice(ALPHABET) for _ in range(rng.randint(1, 16))) for _ in range(40)]
     batch = nwgrad.SeqPairBatchDouble(A, B, p, gap_model=gap_model, mode="glocal", grad_mode=grad_mode, n_threads=3)
     assert batch.mode == "glocal"
-    batch.score_and_grad()
+    total = batch.score_and_grad()
     scores = batch.scores()
-    grad = None if grad_mode == "none" else batch.grad
+    assert total == pytest.approx(float(np.sum(scores)))
+    grad = None
+    if grad_mode != "none":
+        for i in range(len(A)):
+            grad = batch[i].grad if grad is None else grad + batch[i].grad
     single = []
     gsum = None
     for a, b in zip(A, B):
