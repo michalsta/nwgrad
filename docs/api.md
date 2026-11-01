@@ -239,6 +239,7 @@ soft options, `hb_cutoff` — belong to the batch: setting them on a view raises
 | `score_and_grad(keep_paths=True)` | Full DP with immediately available gradient. By default stores the path; `keep_paths=False` skips path storage while retaining the guide for banded alignment. Returns `(score, grad)`; raises if `grad_mode` is `"none"`. |
 | `aligned()` | The alignment as a pair of gapped strings `(seq_a, seq_b)`. Needs a stored path: raises after `drop_paths()` or `set_params()` until the next align. With `grad_mode="soft"` it is the Viterbi alignment. |
 | `coordinates()` | The alignment as Biopython-style coordinates: an `int64` array of shape `(2, k)`, row 0 positions in `seq_a`, row 1 in `seq_b`, with a column at the start, at each change between aligned and gap columns, and at the end. `Bio.Align.Alignment([seq_a, seq_b], coordinates)` rebuilds it. A local alignment starts where its path starts. Same availability as `aligned()`. |
+| `cigar(*, extended=False, soft_clip=False)` | The alignment as a SAM CIGAR string, `seq_a` the query and `seq_b` the reference: `M` aligned, `I` a residue of `seq_a` against a gap, `D` a residue of `seq_b` against a gap. `extended=True` writes `=` / `X` (equal / unequal symbols) instead of `M`. `soft_clip=True` adds the parts of `seq_a` outside a local alignment as leading / trailing `S` (a global alignment has none); the reference start (SAM `POS`, 0-based) is `coordinates()[1, 0]`. Same availability as `aligned()`. |
 | `formatted(width=60)` | Pretty-printed alignment block (seq A / match line / seq B), wrapped at `width` columns (`0` = no wrap). Same availability as `aligned()`. |
 | `set_params(params)` | (Standalone pairs.) Swap alignment parameters. Clears `score`, `grad` and the stored path; preserves `guide_j`, so `banded_align()` works straight after. |
 | `drop_paths()` | Free the stored path and reusable scratch memory. `score`, `grad` and `guide_j` survive. |
@@ -257,7 +258,7 @@ A failed pair computation invalidates its cached score and gradient.
 | `path_valid` | `bool` | `guide_j` is usable as a banding guide |
 | `score_valid` | `bool` | `score` matches the current params |
 | `grad_valid` | `bool` | `grad` is populated |
-| `stored_path_valid` | `bool` | A stored path is available (`aligned()`, `coordinates()`). Independent of `path_valid`, which reports guide availability. |
+| `stored_path_valid` | `bool` | A stored path is available (`aligned()`, `coordinates()`, `cigar()`). Independent of `path_valid`, which reports guide availability. |
 | `traceback` | `str` | The traceback mode the pair *resolved* to (never `"auto"`) |
 | `hb_cutoff` | `int` | Hirschberg base-case size in rows (settable on a standalone pair; default 512) |
 | `fill` | `str` | Full-DP simd fill at double precision: `"striped"` (default) or `"rowwise"` (settable on a standalone pair; see `SeqPairBatch.fill`) |
@@ -350,13 +351,14 @@ the logical count measured up to 1.44× slower. A negative `n_threads` raises
 | Method | Returns | Description |
 |---|---|---|
 | `set_params(params)` | — | Give every pair a copy of `params` (same alphabet; a mismatch raises without changing anything). Clears cached scores, gradients and stored paths; keeps the guides, for `banded_grad()`. |
-| `score_and_grad(keep_paths=False)` | `float` (sum of scores) | Full DP on every pair: score, guide and (unless `grad_mode="none"`) gradient, cached per pair. With `grad_mode="none"` and no `keep_paths`: [score only](#score-only), guides deferred. `keep_paths=True` also stores each alignment path, so `batch[i].aligned()` / `.coordinates()` work (a few bytes per alignment column). |
+| `score_and_grad(keep_paths=False)` | `float` (sum of scores) | Full DP on every pair: score, guide and (unless `grad_mode="none"`) gradient, cached per pair. With `grad_mode="none"` and no `keep_paths`: [score only](#score-only), guides deferred. `keep_paths=True` also stores each alignment path, so `batch[i].aligned()` / `.coordinates()` / `.cigar()` and `batch.cigars()` work (a few bytes per alignment column). |
 | `banded_grad(bandwidth, keep_paths=False)` | `float` (sum of scores) | Banded re-align + gradient around each pair's cached guide. Run `score_and_grad()` once to establish the guides, then `set_params()` + `banded_grad(bw)` after each update; no full DP is run. |
 | `align(seqs_a, seqs_b, params, band=0, aligned_a=[], aligned_b=[], kernel="auto", *, tracks=None, gap_tracks=None)` | [`BatchResult`](#batchresult) | Align pairs **without adding them** (what `BatchAligner` was): scores plus the gradient summed over the pairs, nothing kept per pair, so memory stays O(threads). Uses the batch's type, grad mode, threads and settings. `band > 0` bands every pair (`aligned_a` / `aligned_b`, one gapped string per pair, give the guides; the diagonal otherwise); `band == 0` with guides bands at width 0, so all pairs or none must carry one. Soft: forward-backward only (no Viterbi). None, unbanded: [score only](#score-only). |
 | `compute_grad()` | `AlignParams` | The cached gradients summed over all pairs. Summed in fixed blocks, so bit-reproducible whatever `n_threads`. Raises on an empty batch. |
 | `scores()` | `numpy.ndarray` (float64) | The cached per-pair scores, in pair order. Runs no DP; raises if any pair has no valid score. |
 | `weighted_grad(weights)` | `AlignParams` | `sum_i weights[i] * grad_i` over the cached per-pair gradients. `weights` is a 1-D numeric array with one entry per pair. Runs no DP; raises if any pair has no valid gradient. Summed in fixed blocks of 4096 pairs (each in pair order, the blocks in parallel), then over the blocks in order, so the result is bit-reproducible and does not depend on `n_threads`. |
 | `grads()` | `(numpy.ndarray, numpy.ndarray)` (float64) | The cached per-pair gradients as two arrays, in pair order: `matrices` of shape `(N, n, n)`, rows and columns in the order of `alphabet`, and `gaps` of shape `(N, 4)` with columns `gap_open_a`, `gap_extend_a`, `gap_open_b`, `gap_extend_b` — a tracked batch: `(N, K, n, n)` and `(N, K, 4)`. Runs no DP; raises on an empty batch and if any pair has no valid gradient. |
+| `cigars(*, extended=False, soft_clip=False)` | `list[str]` | Every pair's [`cigar()`](#seqpair), in pair order, built in parallel. Needs `score_and_grad(keep_paths=True)` (or `banded_grad(..., keep_paths=True)`); raises if any pair has no stored path. |
 | `drop_paths()` | — | Free the stored alignment paths. |
 
 The batch is also a sequence: `len(batch)` is the number of pairs and `batch[i]`
