@@ -233,10 +233,18 @@ def _det_case(T, fill):
     p = protein_params(rng)
     A = [rand_seq(rng, PROT, 300) for _ in range(40)]
     B = [rand_seq(rng, PROT, 300) for _ in range(40)]
-    runs = _det_runs(A, B, p, 8, fill, T) + _det_runs(A, B, p, 1, fill, T)
-    for r in runs[1:]:   # every call, 8 threads and 1: exactly equal
-        for x, y in zip(r, runs[0]):
-            np.testing.assert_array_equal(x, y)
+    r8, r1 = _det_runs(A, B, p, 8, fill, T), _det_runs(A, B, p, 1, fill, T)
+    for runs in (r8, r1):   # every call at one thread count: exactly equal
+        for r in runs[1:]:
+            for x, y in zip(r, runs[0]):
+                np.testing.assert_array_equal(x, y)
+    # Across thread counts only to the route's precision: the shared fill's byte budget is
+    # larger at one thread (inter_pair_fits), so a pair may run in a shared group at 1
+    # thread and on its own fill at 8 -- double rounding apart in double, float32 rounding
+    # apart in float32.  (Sums are thread-count independent; the route is not, as on main.)
+    for x, y in zip(r1[0], r8[0]):
+        close(x, y)
+    runs = r8
     dbl = _det_runs(A, B, p, 8, fill, T, precision="double", calls=1)[0]
     return runs[0], dbl
 

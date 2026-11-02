@@ -2348,7 +2348,9 @@ tables, the rows, the weights and the row-wise reductions are float32.
    and sends the same refused lanes to their own double path. A pair's path thus depends
    on its own data and the call history, never on the threads (tests:
    `test_soft_float32.py` `test_every_pair_refuses_float32_deterministic` /
-   `..._fits_...`: three calls at 8 threads and three at 1, bit-equal; the all-refusing
+   `..._fits_...`: three calls at 8 threads and three at 1, bit-equal within each thread count and
+   within float32 tolerance across them (the shared fill's byte budget is larger at one
+   thread, `inter_pair_fits`, so the route, not the sums, may differ by thread count); the all-refusing
    batch bit-equal to `soft_precision="double"`). The marks are cleared by `set_params`,
    `soft_temperature` and `soft_precision`. The streaming `align()` has nothing stored
    between calls: each pair tries float32 each call. What is left: a training loop calls
