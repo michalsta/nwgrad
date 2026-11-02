@@ -62,6 +62,19 @@
 // row whose worst case (simd_levels.hpp, sp_loss_products_max) could eat into the
 // tolerance.  lbv: the b of a flushed F̂·P intermediate; lcv: the flushed two-factor
 // products (the four gap products and the match product).
+// isp_ldexp(x, e) == std::ldexp(x, e), bit for bit: a product with an exact power of two rounds
+// once, as ldexp does (and flushes as it does under FTZ/DAZ), and the power is built from its
+// bits -- libc's scalbn was a call per row (~1-3 % of the per-pair float32 linear pass at
+// AVX2, 2026-11-02).  Outside the normal exponent range, std::ldexp itself.
+template <class SF>
+static inline SF isp_ldexp(SF x, int e) noexcept {
+    if constexpr (std::is_same_v<SF, float>) {
+        if (e >= -126 && e <= 127) return x * std::bit_cast<float>(static_cast<uint32_t>(e + 127) << 23);
+    } else {
+        if (e >= -1022 && e <= 1023) return x * std::bit_cast<double>(static_cast<uint64_t>(e + 1023) << 52);
+    }
+    return std::ldexp(x, e);
+}
 template <class SF>
 static inline typename IVT<SF>::v is_flushed(typename IVT<SF>::v p, typename IVT<SF>::v a, typename IVT<SF>::v b) noexcept {
     NWGRAD_IS_LANES;
@@ -237,7 +250,7 @@ auto rescale = [&](ivd* r0, ivd* r1, ivd* r2, ivd* tot, ivd mx) -> ivd {
         else if (v > 0.0 && (v > SoftRange<SF>::win || v < SF(1) / SoftRange<SF>::win)) k = std::ilogb(v);
         kv[l] = k;
         any |= (k != 0);
-        sc[l] = std::ldexp(SF(1), -k);
+        sc[l] = isp_ldexp(SF(1), -k);
     }
     if (!any) return mx;
     for (int j = 0; j <= n; ++j) { r0[j] *= sc; r1[j] *= sc; r2[j] *= sc; }
@@ -268,7 +281,7 @@ for (int i = 1; i <= M; ++i) {
     ivd* rM = FM + ro; ivd* rX = FX + ro; ivd* rY = FY + ro;
     const ivd* pM = rM - st; const ivd* pX = rX - st; const ivd* pY = rY - st;
     ivd fr = z;
-    if (local) for (int l = 0; l < IW; ++l) fr[l] = std::ldexp(SF(1), -S[(i - 1) * IW + l]);
+    if (local) for (int l = 0; l < IW; ++l) fr[l] = isp_ldexp(SF(1), -S[(i - 1) * IW + l]);
     if constexpr (Tr) { oa = isj_w(J, i, 0); ea = isj_w(J, i, 1); ob = isj_w(J, i, 2); eb = isj_w(J, i, 3); }
     ivd lm, lx, ly;
     if (local) { lm = fr; lx = z; ly = z; }
@@ -292,7 +305,7 @@ for (int i = 1; i <= M; ++i) {
     mx = rescale(rM, rX, rY, tq, mx);
     for (int l = 0; l < IW; ++l) {
         S[i * IW + l] = S[(i - 1) * IW + l] + kv[l];
-        if (kv[l]) s[l] = std::ldexp(s[l], -kv[l]);
+        if (kv[l]) s[l] = isp_ldexp(s[l], -kv[l]);
     }
     rs[i] = s; mf[i] = mx;
 }
@@ -312,12 +325,12 @@ for (int l = 0; l < IW; ++l) {
         for (int i = 1; i <= ml; ++i) e = std::max(e, S[i * IW + l]);
         ze[l] = e;
         zr = 0.0;
-        for (int i = 0; i <= ml; ++i) zr += std::ldexp(rs[i][l], S[i * IW + l] - e);
+        for (int i = 0; i <= ml; ++i) zr += isp_ldexp(rs[i][l], S[i * IW + l] - e);
     }
     if (!(zr > 0.0) || !(zr <= static_cast<double>(DMAX))) { bad[l] = true; zr = 1.0; }
     // Normalize zr into [1, 2) so 1/zr and the ldexp factors stay in range.
     const int kz = std::ilogb(zr);
-    zr = std::ldexp(zr, -kz); ze[l] += kz;
+    zr = isp_ldexp(zr, -kz); ze[l] += kz;
     izr[l] = 1.0 / zr;
     J.logz[l] = std::log(zr) + ze[l] * 0.69314718055994530942;
 }
@@ -340,7 +353,7 @@ for (int i = M; i >= 0; --i) {
     ivd init = z;
     for (int l = 0; l < IW; ++l) {
         top[l] = (i == J.m[l]) ? -1 : 0;
-        if (local && i <= J.m[l]) init[l] = std::ldexp(SF(1), -Tn[l]);
+        if (local && i <= J.m[l]) init[l] = isp_ldexp(SF(1), -Tn[l]);
     }
     const ivd* En = (i < M) ? ER + static_cast<size_t>(i + 1) * w2 : nullptr;
     const size_t ro = static_cast<size_t>(i) * st;
@@ -434,8 +447,8 @@ for (int i = M; i >= 0; --i) {
         for (int l = 0; l < IW; ++l) {
             gh0[l] = gv0[l] = 0.0;
             if (i > J.m[l]) continue;
-            gh0[l] = std::ldexp(izr[l], S[i * IW + l] + Tn[l] - ze[l]);
-            if (i >= 1) gv0[l] = std::ldexp(izr[l], S[(i - 1) * IW + l] + Tn[l] - ze[l]);
+            gh0[l] = isp_ldexp(izr[l], S[i * IW + l] + Tn[l] - ze[l]);
+            if (i >= 1) gv0[l] = isp_ldexp(izr[l], S[(i - 1) * IW + l] + Tn[l] - ze[l]);
             lossp[l] = sp_loss_products_max<SF>(n + 1, 5, mx[l], gh0[l], gv0[l]);
             need |= !(loss[l] + lossp[l] <= kSpCountBudget * SoftRange<SF>::tol);
         }
@@ -451,7 +464,7 @@ for (int i = M; i >= 0; --i) {
     mx = rescale(cM, cX, cY, nullptr, mx);
     for (int l = 0; l < IW; ++l)
         if (kv[l]) {
-            const SF f = std::ldexp(SF(1), -kv[l]);
+            const SF f = isp_ldexp(SF(1), -kv[l]);
             sx[l] *= f; sy[l] *= f; so[l] *= f; sob[l] *= f;
             for (int cc = 0; cc < nm; ++cc) acc[cc][l] *= f;
         }
@@ -461,15 +474,15 @@ for (int i = M; i >= 0; --i) {
     for (int l = 0; l < IW; ++l) {
         Ti[l] = Tn[l] + kv[l];
         if (i > J.m[l]) { gh[l] = 0.0; continue; }
-        gh[l] = std::ldexp(izr[l], S[i * IW + l] + Ti[l] - ze[l]);
-        if (i >= 1) gv[l] = std::ldexp(izr[l], S[(i - 1) * IW + l] + Ti[l] - ze[l]);
+        gh[l] = isp_ldexp(izr[l], S[i * IW + l] + Ti[l] - ze[l]);
+        if (i >= 1) gv[l] = isp_ldexp(izr[l], S[(i - 1) * IW + l] + Ti[l] - ze[l]);
         if (!(gh[l] <= DMAX) || !(gv[l] <= DMAX)) bad[l] = true;
         // Lost mass: below DMIN per term in stored units (times 2^-k where a
         // rescale scaled the row UP); its posterior effect is bounded by the other
         // direction's actual row max times the row's posterior factor.
         const int kf = i > 0 ? S[i * IW + l] - S[(i - 1) * IW + l] : 0, kb = kv[l];
-        const double lf = kf < 0 ? std::ldexp(1.0, -kf) : 1.0;
-        const double lb = kb < 0 ? std::ldexp(1.0, -kb) : 1.0;
+        const double lf = kf < 0 ? isp_ldexp(1.0, -kf) : 1.0;
+        const double lb = kb < 0 ? isp_ldexp(1.0, -kb) : 1.0;
         // 32 terms per cell: sp_loss's kSpTermsAffine (both fills must agree).
         loss[l] += 32.0 * (n + 1) * DMIN * (lf * mx[l] + lb * mf[i][l]) * gh[l];
         loss[l] += lossp[l];   // the gradient products' flushes (above)
@@ -493,7 +506,7 @@ for (int i = M; i >= 0; --i) {
                             : J.counts + l * nn + static_cast<size_t>(J.a[l][i - 1]) * na;
             if (big) {
                 // trow holds pre-rescale values: apply this row's rescale factor here.
-                const double f = std::ldexp(gv[l], -kv[l]);
+                const double f = isp_ldexp(gv[l], -kv[l]);
                 const unsigned char* bl = J.b[l];
                 const int nl = Rag ? J.nb[l] : n;
                 const SF* tl = reinterpret_cast<const SF*>(trow + 1) + l;   // as fill_E
@@ -616,7 +629,7 @@ auto rescale = [&](ivd* r, ivd mx) -> ivd {   // mx by value: see the affine ker
         else if (v > 0.0 && (v > SoftRange<SF>::win || v < SF(1) / SoftRange<SF>::win)) k = std::ilogb(v);
         kv[l] = k;
         any |= (k != 0);
-        sc[l] = std::ldexp(SF(1), -k);
+        sc[l] = isp_ldexp(SF(1), -k);
     }
     if (!any) return mx;
     for (int j = 0; j <= n; ++j) r[j] *= sc;
@@ -640,7 +653,7 @@ for (int i = 1; i <= M; ++i) {
     const ivd* p = r - st;
     if constexpr (Tr) { ea = isj_w(J, i, 1); eb = isj_w(J, i, 3); }
     ivd fr = z;
-    if (local) for (int l = 0; l < IW; ++l) fr[l] = std::ldexp(SF(1), -S[(i - 1) * IW + l]);
+    if (local) for (int l = 0; l < IW; ++l) fr[l] = isp_ldexp(SF(1), -S[(i - 1) * IW + l]);
     ivd lv = local ? fr : p[0] * eb;
     r[0] = lv;
     ivd sv = lv, mx = lv;
@@ -652,7 +665,7 @@ for (int i = 1; i <= M; ++i) {
     mx = rescale(r, mx);
     for (int l = 0; l < IW; ++l) {
         S[i * IW + l] = S[(i - 1) * IW + l] + kv[l];
-        if (kv[l]) sv[l] = std::ldexp(sv[l], -kv[l]);
+        if (kv[l]) sv[l] = isp_ldexp(sv[l], -kv[l]);
     }
     rs[i] = sv; mf[i] = mx;
 }
@@ -670,11 +683,11 @@ for (int l = 0; l < IW; ++l) {
         for (int i = 1; i <= ml; ++i) e = std::max(e, S[i * IW + l]);
         ze[l] = e;
         zr = 0.0;
-        for (int i = 0; i <= ml; ++i) zr += std::ldexp(rs[i][l], S[i * IW + l] - e);
+        for (int i = 0; i <= ml; ++i) zr += isp_ldexp(rs[i][l], S[i * IW + l] - e);
     }
     if (!(zr > 0.0) || !(zr <= static_cast<double>(DMAX))) { bad[l] = true; zr = 1.0; }
     const int kz = std::ilogb(zr);
-    zr = std::ldexp(zr, -kz); ze[l] += kz;
+    zr = isp_ldexp(zr, -kz); ze[l] += kz;
     izr[l] = 1.0 / zr;
     J.logz[l] = std::log(zr) + ze[l] * 0.69314718055994530942;
 }
@@ -696,7 +709,7 @@ for (int i = M; i >= 0; --i) {
     ivd init = z;
     for (int l = 0; l < IW; ++l) {
         top[l] = (i == J.m[l]) ? -1 : 0;
-        if (local && i <= J.m[l]) init[l] = std::ldexp(SF(1), -Tn[l]);
+        if (local && i <= J.m[l]) init[l] = isp_ldexp(SF(1), -Tn[l]);
     }
     const ivd* En = (i < M) ? ER + static_cast<size_t>(i + 1) * w2 : nullptr;
     const ivd* f = F + static_cast<size_t>(i) * st;
@@ -752,8 +765,8 @@ for (int i = M; i >= 0; --i) {
         for (int l = 0; l < IW; ++l) {
             gh0[l] = gv0[l] = 0.0;
             if (i > J.m[l]) continue;
-            gh0[l] = std::ldexp(izr[l], S[i * IW + l] + Tn[l] - ze[l]);
-            if (i >= 1) gv0[l] = std::ldexp(izr[l], S[(i - 1) * IW + l] + Tn[l] - ze[l]);
+            gh0[l] = isp_ldexp(izr[l], S[i * IW + l] + Tn[l] - ze[l]);
+            if (i >= 1) gv0[l] = isp_ldexp(izr[l], S[(i - 1) * IW + l] + Tn[l] - ze[l]);
             lossp[l] = sp_loss_products_max<SF>(n + 1, 3, mx[l], gh0[l], gv0[l]);
             need |= !(loss[l] + lossp[l] <= kSpCountBudget * SoftRange<SF>::tol);
         }
@@ -769,19 +782,19 @@ for (int i = M; i >= 0; --i) {
     mx = rescale(cur, mx);
     for (int l = 0; l < IW; ++l)
         if (kv[l]) {
-            const SF fct = std::ldexp(SF(1), -kv[l]);
+            const SF fct = isp_ldexp(SF(1), -kv[l]);
             sa[l] *= fct; sb[l] *= fct;
             for (int cc = 0; cc < nm; ++cc) acc[cc][l] *= fct;
         }
     for (int l = 0; l < IW; ++l) {
         const int Ti = Tn[l] + kv[l];
         if (i > J.m[l]) { Tn[l] = 0; continue; }
-        const SF gh = std::ldexp(izr[l], S[i * IW + l] + Ti - ze[l]);
-        const SF gv = i >= 1 ? std::ldexp(izr[l], S[(i - 1) * IW + l] + Ti - ze[l]) : 0.0;
+        const SF gh = isp_ldexp(izr[l], S[i * IW + l] + Ti - ze[l]);
+        const SF gv = i >= 1 ? isp_ldexp(izr[l], S[(i - 1) * IW + l] + Ti - ze[l]) : 0.0;
         if (!(gh <= DMAX) || !(gv <= DMAX)) bad[l] = true;
         const int kf = i > 0 ? S[i * IW + l] - S[(i - 1) * IW + l] : 0, kb = kv[l];
-        const double lf = kf < 0 ? std::ldexp(1.0, -kf) : 1.0;
-        const double lb = kb < 0 ? std::ldexp(1.0, -kb) : 1.0;
+        const double lf = kf < 0 ? isp_ldexp(1.0, -kf) : 1.0;
+        const double lb = kb < 0 ? isp_ldexp(1.0, -kb) : 1.0;
         // 16 terms per cell: sp_loss's kSpTermsLinear (both fills must agree).
         loss[l] += 16.0 * (n + 1) * DMIN * (lf * mx[l] + lb * mf[i][l]) * gh;
         loss[l] += lossp[l];   // the gradient products' flushes (above)
@@ -797,7 +810,7 @@ for (int i = M; i >= 0; --i) {
             double* gr = Tr ? J.counts + l * cstride + static_cast<size_t>(i - 1) * na
                             : J.counts + l * nn + static_cast<size_t>(J.a[l][i - 1]) * na;
             if (big) {
-                const SF f = std::ldexp(gv, -kv[l]);
+                const SF f = isp_ldexp(gv, -kv[l]);
                 const unsigned char* bl = J.b[l];
                 const int nl = Rag ? J.nb[l] : n;
                 const SF* tl = reinterpret_cast<const SF*>(trow + 1) + l;   // as fill_E

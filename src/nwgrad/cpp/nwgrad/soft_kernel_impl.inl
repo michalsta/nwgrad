@@ -84,6 +84,19 @@
 // carry step: only y[j+3] = (u3 + e·u2 + e²·u1 + e³·u0) + e⁴·c sits on the serial
 // chain (one FMA latency per four cells); y[j..j+2] hang off it.  Reassociated — the
 // soft path is tolerance-tested.
+// sp_ldexp(x, e) == std::ldexp(x, e), bit for bit: a product with an exact power of two rounds
+// once, as ldexp does (and flushes as it does under FTZ/DAZ), and the power is built from its
+// bits -- libc's scalbn was a call per row (~1-3 % of the per-pair float32 linear pass at
+// AVX2, 2026-11-02).  Outside the normal exponent range, std::ldexp itself.
+template <class SF>
+static inline SF sp_ldexp(SF x, int e) noexcept {
+    if constexpr (std::is_same_v<SF, float>) {
+        if (e >= -126 && e <= 127) return x * std::bit_cast<float>(static_cast<uint32_t>(e + 127) << 23);
+    } else {
+        if (e >= -1022 && e <= 1023) return x * std::bit_cast<double>(static_cast<uint64_t>(e + 1023) << 52);
+    }
+    return std::ldexp(x, e);
+}
 template <class SF>
 static inline void sp_carry_fwd(SF* y, const SF* u, int lo, int hi, SF e) noexcept {
     NWGRAD_SP_FMA_BODY   // clang: a pragma reaches only its own scope, not the caller's
@@ -130,7 +143,7 @@ static inline int sp_lazy(SF& mx, int lo, int hi, bool& bad, SF* r0, SF* r1 = nu
     if (!(mx <= std::numeric_limits<SF>::max())) { bad = true; return 0; }
     if (mx == SF(0) || (mx <= win && mx >= SF(1) / win)) return 0;
     const int k = std::ilogb(mx);
-    const SF sc = std::ldexp(SF(1), -k);
+    const SF sc = sp_ldexp(SF(1), -k);
     for (SF* r : {r0, r1, r2, r3})
         if (r) for (int j = lo; j <= hi; ++j) r[j] *= sc;
     mx *= sc;
@@ -151,8 +164,8 @@ template <class SF>
 static inline double sp_loss(double terms, int n, int kf, int kb, SF mxf, SF mxb,
                              double g) noexcept {
     NWGRAD_SP_FMA_BODY
-    const double lf = kf < 0 ? std::ldexp(1.0, -kf) : 1.0;
-    const double lb = kb < 0 ? std::ldexp(1.0, -kb) : 1.0;
+    const double lf = kf < 0 ? sp_ldexp(1.0, -kf) : 1.0;
+    const double lb = kb < 0 ? sp_ldexp(1.0, -kb) : 1.0;
     return terms * (n + 1) * static_cast<double>(std::numeric_limits<SF>::min()) * (lf * mxb + lb * mxf) * g;
 }
 // The gradient pass multiplies table values -- F̂·P·B̂ for the match posteriors, F̂·B̂ for
@@ -233,7 +246,7 @@ static inline void sp_count_match3(const SF* __restrict q1, const SF* __restrict
     lb += cb; lc += cc;
 }
 static inline double sp_post(int e, double izr, bool& bad) noexcept {
-    const double f = std::ldexp(izr, e);
+    const double f = sp_ldexp(izr, e);
     if (!(f <= std::numeric_limits<double>::max())) bad = true;
     return f;
 }
@@ -267,11 +280,11 @@ static inline bool sp_log_z(SoftPairJobT<SF>& J, const int* S, const SF* rowsum_
         ze = S[0];
         for (int i = 1; i <= J.m; ++i) ze = std::max(ze, S[i]);
         zr = 0.0;
-        for (int i = 0; i <= J.m; ++i) zr += std::ldexp(rowsum_or_null[i], S[i] - ze);
+        for (int i = 0; i <= J.m; ++i) zr += sp_ldexp(rowsum_or_null[i], S[i] - ze);
     }
     if (!(zr > 0.0) || !(zr <= std::numeric_limits<double>::max())) return false;
     const int kz = std::ilogb(zr);
-    zr = std::ldexp(zr, -kz); ze += kz;
+    zr = sp_ldexp(zr, -kz); ze += kz;
     izr = 1.0 / zr;
     J.log_z = std::log(zr) + ze * 0.69314718055994530942;
     return true;
@@ -324,7 +337,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear_t(SoftPairJobT<SF>& J) noexcept {
         const SF* __restrict p = r - st;
         if constexpr (Tr) { ea = RW[4 * i + 1]; eb = RW[4 * i + 3]; }
         SF fr = 0.0;
-        if (L) { fr = std::ldexp(SF(1), -S[i - 1]); r[0] = fr; }
+        if (L) { fr = sp_ldexp(SF(1), -S[i - 1]); r[0] = fr; }
         else   r[0] = (i <= J.bi) ? p[0] * eb : 0.0;
         const SF* __restrict pr = P + sp_row<Tr>(J, i) * w;
         const int lo = J.jlo[i], hi = J.jhi[i];
@@ -363,7 +376,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear_t(SoftPairJobT<SF>& J) noexcept {
     for (int i = m; i >= 0; --i) {
         const int lo0 = J.jlo0[i], hi0 = J.jhi0[i];
         for (int j = clo; j <= chi; ++j) cur[j] = 0.0;
-        const SF init = L ? std::ldexp(SF(1), -Tn) : 0.0;
+        const SF init = L ? sp_ldexp(SF(1), -Tn) : 0.0;
         SF ebn = eb;   // the move down into row i+1 (Tr: that row's)
         if constexpr (Tr) { ea = RW[4 * i + 1]; eb = RW[4 * i + 3]; if (i < m) ebn = RW[4 * (i + 1) + 3]; }
         if (i < m) {
@@ -526,7 +539,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine_t(SoftPairJobT<SF>& J) noexcept {
         const SF* __restrict pY = rY - st;
         if constexpr (Tr) { oa = RW[4 * i]; ea = RW[4 * i + 1]; ob = RW[4 * i + 2]; eb = RW[4 * i + 3]; }
         SF fr = 0.0;
-        if (L) { fr = std::ldexp(SF(1), -S[i - 1]); rM[0] = fr; rX[0] = 0.0; rY[0] = 0.0; }
+        if (L) { fr = sp_ldexp(SF(1), -S[i - 1]); rM[0] = fr; rX[0] = 0.0; rY[0] = 0.0; }
         else {
             rM[0] = 0.0; rY[0] = 0.0;
             rX[0] = (i <= J.bi) ? (pM[0] + pY[0]) * ob + pX[0] * eb : 0.0;
@@ -589,7 +602,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine_t(SoftPairJobT<SF>& J) noexcept {
         // cY is not swapped (only M and X of the next row are read): it still holds
         // row i+1 over [nlo, nhi].
         for (int j = nlo; j <= nhi; ++j) cY[j] = 0.0;
-        const SF init = L ? std::ldexp(SF(1), -Tn) : 0.0;
+        const SF init = L ? sp_ldexp(SF(1), -Tn) : 0.0;
         SF obn = ob, ebn = eb;   // the move down into row i+1 (Tr: that row's)
         if constexpr (Tr) {
             oa = RW[4 * i]; ea = RW[4 * i + 1]; ob = RW[4 * i + 2]; eb = RW[4 * i + 3];
