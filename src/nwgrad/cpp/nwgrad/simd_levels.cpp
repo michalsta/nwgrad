@@ -80,4 +80,3 @@ void register_level_soft(SimdLevel l, inter_soft_fn inter_soft,
     k.soft_pair_linear_f = soft_pair_linear_f;
     k.soft_pair_affine_f = soft_pair_affine_f;
 }
-}
