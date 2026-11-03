@@ -546,14 +546,15 @@ inline size_t gate_value(Gate g, size_t def) {
 // crossover (int16 / int32 from L40-60, float32 to L150 on AVX2 and beyond L250 on
 // AVX-512).  In Global mode the shared score fill stays ahead to longer pairs than in
 // Local, so Global has caps of its own (*_g; measured, not derived): on NEON float32
-// linear Global wins to L100 where Local stops at L60, affine to L120 against L100, and
-// int64 affine on AVX2 to L80 against L60.  Elsewhere both modes cross at the same
-// length, or the shared cap already lies between them.  0 = never shared, kGateNoCap =
-// always.  Alphabets of up to 8 letters (DNA) take the mask-blend kernels instead,
-// which never gather: those have caps of their own -- the shared score kernel loses
-// to the own fill from 22 x 80 for double and int32 on AVX2 (the own kernel's single
-// profile row wins once B is long), and in Local mode sooner than in Global, so they
-// are per mode; the shared linear fill of int64 loses at SSE and NEON at every length.
+// linear Global wins to L100 where Local stops at L60, affine to L120 against L100.
+// Elsewhere both modes cross at the same length, or the shared cap already lies between
+// them (AVX2 int64 affine looked like a third case once, but did not repeat).  0 = never
+// shared, kGateNoCap = always.  Alphabets of up to 8 letters (DNA) take the mask-blend
+// kernels instead, which never gather: those have caps of their own -- the shared score
+// kernel loses to the own fill from 22 x 80 for double and int32 on AVX2 (the own
+// kernel's single profile row wins once B is long), and in Local mode sooner than in
+// Global, so they are per mode; the shared linear fill of int64 loses at SSE and NEON at
+// every length.
 //
 // The shared soft pass's 5 (affine) or 2 (linear) double tables of Ws lanes: affine ~3
 // MiB per thread (8 with one thread), linear ~L140 (20000 cells) on AVX2 / AVX-512 /
@@ -590,7 +591,7 @@ inline constexpr GateLevelCaps kGateCapsAvx2   { {      31000,    10300,      20
                                                  {       6600,     3800,      20000,     3072,      12288,       1900, kGateNoCap, kGateNoCap,       6600,       3800 },
                                                  {       1700,     1700,       4000,     1024,        450,       4700,       4700, kGateNoCap,       1700,       1700 },
                                                  {       1700,     3800,       4000,     2560,       2048,       1900,       1900, kGateNoCap,       1700,       3800 },
-                                                 {       3800,     1700,       2500,     3072,      12288,       2800,       1900, kGateNoCap,       6600,       1700 },
+                                                 {       3800,     1700,       2500,     3072,      12288,       2800,       1900, kGateNoCap,       3800,       1700 },
                                                  3072, 8192, 20000 };
 inline constexpr GateLevelCaps kGateCapsAvx512 { { kGateNoCap,    31000,      33000,     3072,      18432, kGateNoCap, kGateNoCap, kGateNoCap, kGateNoCap,      31000 },
                                                  {     160000,    23000,      33000,     3072,      18432, kGateNoCap, kGateNoCap, kGateNoCap,     160000,      23000 },
