@@ -47,7 +47,7 @@ def _grad_arrays(p):
 
 @pytest.mark.parametrize("width", WIDTHS)
 @pytest.mark.parametrize("gap_model", ["affine", "linear"])
-@pytest.mark.parametrize("mode", ["global", "local"])
+@pytest.mark.parametrize("mode", ["global", "local", "glocal"])
 @pytest.mark.parametrize("fill", ["interpair", "striped", "rowwise"])
 def test_batch_matches_double(width, gap_model, mode, fill):
     rng = np.random.default_rng(width * 7 + len(gap_model) + len(mode) + len(fill))
@@ -57,6 +57,8 @@ def test_batch_matches_double(width, gap_model, mode, fill):
     seqs_a = [rseq(rng, alpha, int(rng.integers(0, 40))) for _ in range(n)]
     seqs_b = [rseq(rng, alpha, int(rng.integers(0, 40))) for _ in range(n)]
     for tb in ["auto", "pointers", "scores", "hirschberg", "hirschberg_pmax"]:
+        if mode == "glocal" and tb.startswith("hirschberg"):
+            continue   # no Hirschberg form for glocal (refused; test_glocal.py)
         kw = dict(gap_model=gap_model, mode=mode, n_threads=3, traceback=tb)
         bd = nwgrad.SeqPairBatchDouble(seqs_a, seqs_b, p, **kw)
         bi = INT_BATCHES[width](seqs_a, seqs_b, p, **kw)

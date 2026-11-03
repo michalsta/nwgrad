@@ -84,7 +84,7 @@ def _fixed_len_b(seqs, n, seed):
 @pytest.mark.parametrize("prec,fill", [("double", "rowwise"), ("double", "interpair"),
                                        ("float32", "interpair")])
 @pytest.mark.parametrize("kind", ["ties", "cheap_gaps", "random"])
-@pytest.mark.parametrize("mode", ["local", "global"])
+@pytest.mark.parametrize("mode", ["local", "global", "glocal"])
 @pytest.mark.parametrize("traceback", ["pointers", "scores"])
 @pytest.mark.parametrize("lengths", [(1, 30, 1, 60), (15, 30, 40, 60), (60, 200, 60, 200),
                                      (15, 30, 50, 51)])
@@ -104,7 +104,7 @@ def test_fill_matches_striped(prec, fill, kind, mode, traceback, lengths):
 
 @pytest.mark.parametrize("prec,fill", [("double", "rowwise"), ("double", "interpair"),
                                        ("float32", "interpair")])
-@pytest.mark.parametrize("mode", ["local", "global"])
+@pytest.mark.parametrize("mode", ["local", "global", "glocal"])
 @pytest.mark.parametrize("level", [l for l in nwgrad.available_isa_levels()])
 def test_every_isa_level(level, mode, prec, fill):
     a, b = _seqs(203, 10, 40, 3), _seqs(203, 30, 33, 4)
@@ -253,7 +253,7 @@ def test_interpair_plan_follows_cutoff_changes(traceback, threads, initial_cutof
 
 
 @pytest.mark.parametrize("fill", ["rowwise", "interpair"])
-@pytest.mark.parametrize("mode", ["local", "global"])
+@pytest.mark.parametrize("mode", ["local", "global", "glocal"])
 def test_guides_match_striped(fill, mode):
     """score_and_grad() caches each pair's path as the guide for banded_grad(); the
     row-wise and inter-pair paths take it from the gradient's own traceback walk.  A
@@ -291,7 +291,7 @@ def _run_linear(seqs_a, seqs_b, params, mode, fill, grad_mode="hard", kernel="au
 
 @pytest.mark.parametrize("prec", ["double", "float32"])
 @pytest.mark.parametrize("kind", ["ties", "cheap_gaps", "random"])
-@pytest.mark.parametrize("mode", ["local", "global"])
+@pytest.mark.parametrize("mode", ["local", "global", "glocal"])
 @pytest.mark.parametrize("lengths", [(1, 30, 1, 60), (15, 30, 50, 51), (60, 200, 60, 200)])
 def test_linear_interpair_matches_striped(kind, mode, lengths, prec):
     a = _seqs(301, lengths[0], lengths[1], 11)
@@ -305,7 +305,7 @@ def test_linear_interpair_matches_striped(kind, mode, lengths, prec):
 
 
 @pytest.mark.parametrize("prec", ["double", "float32"])
-@pytest.mark.parametrize("mode", ["local", "global"])
+@pytest.mark.parametrize("mode", ["local", "global", "glocal"])
 @pytest.mark.parametrize("level", [l for l in nwgrad.available_isa_levels()])
 def test_linear_interpair_every_isa_level(level, mode, prec):
     a, b = _seqs(203, 10, 40, 13), _seqs(203, 30, 33, 14)
@@ -318,7 +318,7 @@ def test_linear_interpair_every_isa_level(level, mode, prec):
 
 
 @pytest.mark.parametrize("prec", ["double", "float32"])
-@pytest.mark.parametrize("mode", ["local", "global"])
+@pytest.mark.parametrize("mode", ["local", "global", "glocal"])
 def test_linear_interpair_soft_guides(mode, prec):
     """Eager soft linear pairs now take their guide from the inter-pair Viterbi fill:
     guides bit-identical to striped; scores and gradients tolerance-equal (soft)."""
@@ -361,7 +361,7 @@ def _assert_same(r0, r1):
 
 @pytest.mark.parametrize("prec", ["double", "float32"])
 @pytest.mark.parametrize("gm", ["affine", "linear"])
-@pytest.mark.parametrize("mode", ["local", "global"])
+@pytest.mark.parametrize("mode", ["local", "global", "glocal"])
 @pytest.mark.parametrize("kind", ["ties", "cheap_gaps", "random"])
 @pytest.mark.parametrize("lengths", [(1, 30, 1, 60), (15, 30, 50, 51), (40, 120, 40, 120)])
 def test_banded_interpair_matches_own(prec, gm, mode, kind, lengths):
@@ -378,7 +378,7 @@ def test_banded_interpair_matches_own(prec, gm, mode, kind, lengths):
 
 @pytest.mark.parametrize("prec", ["double", "float32"])
 @pytest.mark.parametrize("gm", ["affine", "linear"])
-@pytest.mark.parametrize("mode", ["local", "global"])
+@pytest.mark.parametrize("mode", ["local", "global", "glocal"])
 @pytest.mark.parametrize("level", [l for l in nwgrad.available_isa_levels()])
 def test_banded_interpair_every_isa_level(level, mode, gm, prec):
     A, B = _seqs(150, 10, 40, 33), _seqs(150, 30, 33, 34)
@@ -431,7 +431,7 @@ def test_banded_interpair_needs_a_guide():
 
 @pytest.mark.parametrize("prec", ["double", "float32"])
 @pytest.mark.parametrize("gm", ["affine", "linear"])
-@pytest.mark.parametrize("mode", ["local", "global"])
+@pytest.mark.parametrize("mode", ["local", "global", "glocal"])
 @pytest.mark.parametrize("fill", ["striped", "interpair"])
 def test_banded_grad_guides_match_banded_align(prec, gm, mode, fill):
     """banded_grad() takes its new guide from the gradient's traceback walk (one walk
@@ -460,7 +460,7 @@ def test_banded_grad_guides_match_banded_align(prec, gm, mode, fill):
 
 @pytest.mark.parametrize("prec", ["double", "float32"])
 @pytest.mark.parametrize("gm", ["affine", "linear"])
-@pytest.mark.parametrize("mode", ["local", "global"])
+@pytest.mark.parametrize("mode", ["local", "global", "glocal"])
 @pytest.mark.parametrize("grad", ["hard", "soft"])
 @pytest.mark.parametrize("level", [l for l in nwgrad.available_isa_levels()
                                    if l != "scalar_fallback"])
@@ -500,7 +500,7 @@ def _protein(kind, gm):
 
 @pytest.mark.parametrize("prec", ["double", "float32"])
 @pytest.mark.parametrize("gm", ["affine", "linear"])
-@pytest.mark.parametrize("mode", ["local", "global"])
+@pytest.mark.parametrize("mode", ["local", "global", "glocal"])
 @pytest.mark.parametrize("grad", ["hard", "soft"])
 @pytest.mark.parametrize("level", [l for l in nwgrad.available_isa_levels()
                                    if l != "scalar_fallback"])

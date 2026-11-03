@@ -20,6 +20,8 @@ FUNCS = {
     ("linear", "local"): "sw_grad",
     ("affine", "global"): "nw_affine_grad",
     ("affine", "local"): "sw_affine_grad",
+    ("linear", "glocal"): "glocal_grad",
+    ("affine", "glocal"): "glocal_affine_grad",
 }
 CASES = list(FUNCS)
 STORAGE = ["paths"]   # the hard-gradient store of every batch built here (track_storage)
@@ -342,6 +344,8 @@ def test_one_set_tracked_weighted_grad_is_untracked_bit_for_bit(case, prec):
 def test_tracked_hirschberg_splits_and_stays_optimal(case, prec, traceback):
     """hb_cutoff 2: the recursion really splits (with tracks the reverse sweeps run on
     rewritten rows).  The path's score is the optimum, and the gradient is that path's."""
+    if case[1] == "glocal":
+        pytest.skip("no Hirschberg form for glocal (refused; test_glocal.py)")
     rng = np.random.default_rng(19)
     A, B, mats, gaps, tracks, gtracks = random_problem(rng, 120, 4, maxlen=40)
     P = to_params(mats, gaps)

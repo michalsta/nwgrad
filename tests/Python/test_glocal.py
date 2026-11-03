@@ -363,6 +363,79 @@ def test_levels_match_scalar(generic_matrix, gap_model, traceback):
                 assert np.array_equal(np.asarray(g1.to_dict()["matrix"]), np.asarray(g0.to_dict()["matrix"])), (lv, a, b)
 
 
+# ── The inter-pair fills (fill="interpair") against the per-pair fill, bit for bit ──
+
+def _mirna_like(rng, n):
+    A = ["".join(rng.choice(ALPHABET) for _ in range(rng.randint(18, 25))) for _ in range(n)]
+    B = ["".join(rng.choice(ALPHABET) for _ in range(rng.randint(40, 60))) for _ in range(n)]
+    return A, B
+
+
+@pytest.mark.parametrize("cls", ["SeqPairBatchDouble", "SeqPairBatch", "SeqPairBatchInt32", "SeqPairBatchInt16"])
+@pytest.mark.parametrize("gap_model", ["affine", "linear"])
+@pytest.mark.parametrize("grad_mode", ["hard", "none"])
+def test_interpair_matches_striped(generic_matrix, cls, gap_model, grad_mode):
+    rng = random.Random(404)
+    A, B = _mirna_like(rng, 300)
+    A += ["", "ACG", "A" * 30]; B += ["ACGT", "", "C" * 5]   # empty sides, A longer than B
+    integer = "Int" in cls
+    if integer:
+        m = nwgrad.SubstMatrix(np.rint(np.asarray(generic_matrix.to_matrix()) * 3), alphabet=ALPHABET)
+        p = params(m, 6, 3, 4, 2)
+    else:
+        p = params(generic_matrix, 2.0, 1.0, 1.5, 0.5)
+    C = getattr(nwgrad, cls)
+    out = {}
+    for fill in ("striped", "interpair"):
+        b = C(A, B, p, gap_model=gap_model, mode="glocal", grad_mode=grad_mode, n_threads=3)
+        b.fill = fill
+        if fill == "interpair":
+            elig, other, groups = b._inter_plan()
+            # linear double below 4 lanes (sse2 / sse4) stays on its own fill by design
+            # (linear_fill_ok_: Global's rule); every other case must share
+            if not (gap_model == "linear" and cls == "SeqPairBatchDouble"
+                    and nwgrad.get_isa_level() in ("sse2", "sse4", "scalar_fallback")):
+                assert elig > 0 and groups > 0, (elig, other, groups)
+        b.score_and_grad()
+        g = None
+        if grad_mode == "hard":
+            g = [np.asarray(b[i].grad.to_dict()["matrix"]).copy() for i in range(len(A))]
+            gaps = [[b[i].grad.to_dict()[k] for k in ("gap_open_a", "gap_extend_a", "gap_open_b", "gap_extend_b")]
+                    for i in range(len(A))]
+            g = (g, gaps)
+        out[fill] = (np.asarray(b.scores()).copy(), g)
+    s0, g0 = out["striped"]
+    s1, g1 = out["interpair"]
+    assert np.array_equal(s0, s1)
+    if g0 is not None:
+        for i in range(len(A)):
+            assert np.array_equal(g0[0][i], g1[0][i]), i
+            assert g0[1][i] == g1[1][i], i
+
+
+@pytest.mark.parametrize("gap_model", ["affine", "linear"])
+def test_interpair_every_level(generic_matrix, gap_model):
+    rng = random.Random(505)
+    A, B = _mirna_like(rng, 120)
+    p = params(generic_matrix, 2.0, 1.0, 1.5, 0.5)
+    ref = nwgrad.SeqPairBatchDouble(A, B, p, gap_model=gap_model, mode="glocal", n_threads=2,
+                                    kernel="scalar_fallback")
+    ref.fill = "striped"
+    ref.score_and_grad()
+    s0 = np.asarray(ref.scores()).copy()
+    m0, q0 = (np.asarray(x).copy() for x in ref.grads())
+    for lv in nwgrad.available_isa_levels():
+        if lv == "scalar_fallback":
+            continue
+        b = nwgrad.SeqPairBatchDouble(A, B, p, gap_model=gap_model, mode="glocal", n_threads=2, kernel=lv)
+        b.fill = "interpair"
+        b.score_and_grad()
+        assert np.array_equal(np.asarray(b.scores()), s0), lv
+        m1, q1 = b.grads()
+        assert np.array_equal(np.asarray(m1), m0), lv
+        assert np.array_equal(np.asarray(q1), q0), lv
+
+
 @pytest.mark.parametrize("sfx", ["_double", ""])
 def test_score_only_end_at_column_0(sfx):
     # A long against a 1-residue B under a harsh mismatch: the optimum gaps all of A and

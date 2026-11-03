@@ -59,7 +59,7 @@ def test_fill_property():
 
 @pytest.mark.parametrize("prec", ["double", "float32"])
 @pytest.mark.parametrize("gm", ["affine", "linear"])
-@pytest.mark.parametrize("mode", ["local", "global"])
+@pytest.mark.parametrize("mode", ["local", "global", "glocal"])
 @pytest.mark.parametrize("grad", ["hard", "none"])
 @pytest.mark.parametrize("kind", ["ties", "random"])
 @pytest.mark.parametrize("lengths", [(0, 30, 0, 60), (15, 30, 50, 51), (100, 700, 100, 700)])
@@ -75,7 +75,7 @@ def test_viterbi_matches(prec, gm, mode, grad, kind, lengths):
 
 
 @pytest.mark.parametrize("prec", ["double", "float32"])
-@pytest.mark.parametrize("mode", ["local", "global"])
+@pytest.mark.parametrize("mode", ["local", "global", "glocal"])
 @pytest.mark.parametrize("band", [1, 4])
 def test_banded_matches(prec, mode, band):
     A, B = _seqs(150, 10, 40, 3), _seqs(150, 30, 45, 4)
@@ -105,7 +105,7 @@ def test_guided_matches(prec):
 
 @pytest.mark.parametrize("prec", ["double", "float32"])
 @pytest.mark.parametrize("gm", ["affine", "linear"])
-@pytest.mark.parametrize("mode", ["local", "global"])
+@pytest.mark.parametrize("mode", ["local", "global", "glocal"])
 @pytest.mark.parametrize("T", [1.0, 0.5])
 def test_soft_matches(prec, gm, mode, T):
     A, B = _seqs(157, 0, 30, 7), _seqs(157, 40, 42, 8)
@@ -118,7 +118,7 @@ def test_soft_matches(prec, gm, mode, T):
 
 @pytest.mark.parametrize("prec", ["double", "float32"])
 @pytest.mark.parametrize("gm", ["affine", "linear"])
-@pytest.mark.parametrize("mode", ["local", "global"])
+@pytest.mark.parametrize("mode", ["local", "global", "glocal"])
 @pytest.mark.parametrize("level", nwgrad.available_isa_levels())
 def test_every_isa_level(prec, gm, mode, level):
     A, B = _seqs(97, 5, 30, 9), _seqs(97, 30, 32, 10)
@@ -175,7 +175,7 @@ def test_global_banded_guide_ending_short_of_n(prec, fill, band):
 
 @pytest.mark.parametrize("prec", ["double", "float32"])
 @pytest.mark.parametrize("gm", ["affine", "linear"])
-@pytest.mark.parametrize("mode", ["local", "global"])
+@pytest.mark.parametrize("mode", ["local", "global", "glocal"])
 @pytest.mark.parametrize("grad", ["hard", "soft"])
 def test_ragged_b(prec, gm, mode, grad):
     """B lengths 40..50: full groups mixing B lengths (padded to the longest)."""
@@ -197,7 +197,7 @@ def test_ragged_b(prec, gm, mode, grad):
 
 @pytest.mark.parametrize("prec", ["double", "float32"])
 @pytest.mark.parametrize("gm", ["affine", "linear"])
-@pytest.mark.parametrize("mode", ["local", "global"])
+@pytest.mark.parametrize("mode", ["local", "global", "glocal"])
 @pytest.mark.parametrize("grad", ["hard", "soft"])
 def test_protein(prec, gm, mode, grad):
     """20 letters: the gathered per-row profile (hard) and gathered weights with per-lane

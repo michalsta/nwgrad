@@ -731,7 +731,9 @@ private:
     // admitted there — ignoring every guide and returning the unbanded log Z, so
     // fill="interpair" and fill="striped" disagreed (inherited from BatchAligner).
     int stream_inter_backend_(const AlignParams& params, int kernel, bool banded) const {
-        if constexpr (AM == AlignMode::Glocal) return -1;   // no shared fill yet: every pair its own
+        // Glocal: the hard Full fills only (no inter-pair soft pass, no banded Glocal lanes yet)
+        if constexpr (AM == AlignMode::Glocal)
+            if (banded || grad_mode_ == GradMode::Soft) return -1;
         const int backend = (kernel == kBackendAuto) ? global_default_backend() : kernel;
         if (backend < 0) return -1;
         const LevelKernels& K = level_kernels(backend);
@@ -739,7 +741,7 @@ private:
             return (K.inter_soft && K.d.inter_w > 0 && s_.soft_impl != SoftImpl::Log && !banded) ? backend : -1;
         if (inter_w_(K) <= 0) return -1;
         if (GM == GapModel::Linear &&
-            (banded || (AM == AlignMode::Global && (inter_w_(K) < 4 || params.matrix.size() > 8))))
+            (banded || (AM != AlignMode::Local && (inter_w_(K) < 4 || params.matrix.size() > 8))))
             return -1;
         return backend;
     }
@@ -776,7 +778,7 @@ private:
             // are gated by inter_score_ok in the loop)
             if constexpr (GM == GapModel::Linear)
                 if (grad_mode_ == GradMode::Hard &&
-                    (la + 1) * (lb + 1) > inter_linear_cap<T, AM == AlignMode::Global>(params.matrix.size(), backend)) {
+                    (la + 1) * (lb + 1) > inter_linear_cap<T, AM != AlignMode::Local>(params.matrix.size(), backend)) {
                     other.push_back(i); continue;
                 }
             elig.push_back(i);
@@ -2090,12 +2092,14 @@ private:
     // 0.54-0.85 at 1 thread and 0.67-0.87 at 12 for every type, score-only 0.09-0.78 — so the
     // exclusion is gone, and the per-pair caps in inter_eligible_ take the bands that lose.
     bool linear_fill_ok_(const LevelKernels& K) const {
-        return !(GM == GapModel::Linear && AM == AlignMode::Global && inter_w_(K) < 4);
+        return !(GM == GapModel::Linear && AM != AlignMode::Local && inter_w_(K) < 4);   // Glocal: Global's recurrence
     }
     // The vector backend the batch's inter-pair fills run on, or -1 (every pair its own
     // fill).
     int inter_backend_() const {
-        if constexpr (AM == AlignMode::Glocal) return -1;   // no shared fill yet: every pair its own
+        // Glocal: the hard fills only, until the inter-pair soft pass has the mode
+        if constexpr (AM == AlignMode::Glocal)
+            if (grad_mode_ == GradMode::Soft) return -1;
         const int backend = (kernel_ == kBackendAuto) ? global_default_backend() : kernel_;
         if (backend < 0) return -1;
         const LevelKernels& K = level_kernels(backend);
@@ -2121,7 +2125,7 @@ private:
         // level and type, inter_linear_cap (simd_levels.hpp).
         if constexpr (GM == GapModel::Linear)
             if (grad_mode_ != GradMode::Soft &&
-                (len_a(i) + 1) * (len_b(i) + 1) > inter_linear_cap<T, AM == AlignMode::Global>(alpha_->size(), K.level))
+                (len_a(i) + 1) * (len_b(i) + 1) > inter_linear_cap<T, AM != AlignMode::Local>(alpha_->size(), K.level))
                 return false;
         // Hirschberg pairs past the cutoff split: no shared fill.
         return !hb_splits(tb_resolved_, s_.traceback == TracebackMode::Default ? FullAl::kAutoPointerCells : 0, s_.hb_cutoff, len_a(i), len_b(i));
@@ -2363,7 +2367,8 @@ private:
         Bg.full_calls = full_calls_;
         Bg.default_backend = plan_.default_backend; Bg.hb_cutoff = plan_.hb_cutoff;
         Bg.other = plan_.other;
-        const bool shared = GM == GapModel::Affine && grad_mode_ != GradMode::Soft;
+        // Glocal: no banded inter-pair lanes yet (each pair its own banded fill)
+        const bool shared = GM == GapModel::Affine && grad_mode_ != GradMode::Soft && AM != AlignMode::Glocal;
         std::vector<size_t> E;
         if (shared) E = plan_.elig;
         else Bg.other.insert(Bg.other.end(), plan_.elig.begin(), plan_.elig.end());

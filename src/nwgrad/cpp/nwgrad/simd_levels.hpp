@@ -384,7 +384,7 @@ struct InterJobT {
     int M;                           // max m over the lanes (rows filled)
     const T* blk; int nalpha;        // substitution block, row-major nalpha x nalpha
     T go_a, ge_a, go_b, ge_b;
-    int align_mode;                  // 0 = Global, 1 = Local
+    int align_mode;                  // 0 = Global, 1 = Local, 2 = Glocal (row 0 a free start)
     int linear;                      // 1 = linear gaps: H in VM only (go_*, VX, VY unused)
     T* VM; T* VX; T* VY;             // (M+1)*(n+1)*W each
     T* best; int* best_i; int* best_j;   // W each, Local only
