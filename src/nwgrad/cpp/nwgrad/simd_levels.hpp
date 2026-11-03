@@ -547,7 +547,7 @@ inline size_t gate_value(Gate g, size_t def) {
 // cross at different lengths, so each has its own caps (score_* Local, score_*_g Global),
 // from gate_sweep at 1 thread and all with the own arm closing the gather (nighthaven,
 // solace, the M1): mostly Global keeps the shared fill longer -- linear float32 to L100 on
-// AVX2 and NEON where Local stops at L60 (L60 against L40 at SSE), double to L80 against
+// AVX2 where Local stops at L60, on NEON against L40 (L60 against L40 at SSE), double to L80 against
 // L40 on AVX2, L150 against L120 on AVX-512; affine float32 to L120 against L100 and int64
 // to L250 against L120 on NEON -- but int32 linear at SSE goes the other way (Local shared
 // to L60, Global L40).  Where the AVX2 hosts disagree (Tiger Lake's AVX2 keeps the shared
@@ -601,7 +601,7 @@ inline constexpr GateLevelCaps kGateCapsAvx512 { { kGateNoCap,    31000,      33
                                                  {       2600,     3800,       4000,     1024,       1024, kGateNoCap, kGateNoCap, kGateNoCap,       2600,       3800 },
                                                  {       1700,     3800,       6600,     1500,       2048,       4700, kGateNoCap, kGateNoCap,       1700,       3800 },
                                                  3072, 8192, 20000 };
-inline constexpr GateLevelCaps kGateCapsNeon   { {      10300,     3800,       8000,     5120,      12288,       2800, kGateNoCap, kGateNoCap,      14700,      10300 },
+inline constexpr GateLevelCaps kGateCapsNeon   { {      10300,     1700,       8000,     5120,      12288,       2800, kGateNoCap, kGateNoCap,      14700,      10300 },
                                                  {          0,        0,       3000,     3072,      12288,        800,       1900, kGateNoCap,          0,          0 },
                                                  {       1700,     1700,       8000,     3072,       1400,       4700,       4700, kGateNoCap,       1700,       1700 },
                                                  {       1700,     1700,       8000,     4608,       6144,       4700,       4700, kGateNoCap,       1700,       1700 },
