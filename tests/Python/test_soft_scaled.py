@@ -15,7 +15,7 @@ from conftest import StreamAligner, StreamAlignerDouble
 REL = 1e-11
 ABS = 1e-11
 
-MODES = [(g, m) for g in ("linear", "affine") for m in ("global", "local")]
+MODES = [(g, m) for g in ("linear", "affine") for m in ("global", "local", "glocal")]
 
 
 def dna_params(rng, scale=1.0, gaps=(1.0, 0.5, 1.5, 0.3)):
@@ -197,7 +197,7 @@ BATCHES = [nwgrad.SeqPairBatchDouble, nwgrad.SeqPairBatch]
 
 
 @pytest.mark.parametrize("cls", BATCHES)
-@pytest.mark.parametrize("mode", ["global", "local"])
+@pytest.mark.parametrize("mode", ["global", "local", "glocal"])
 def test_soft_interpair_identical(mode, cls):
     """fill="interpair" runs the guide Viterbi AND the scaled forward-backward W pairs
     per vector (InterSoftJob): guides and banded results match the striped fill bit for
@@ -289,7 +289,7 @@ def test_temperature_invalidates_and_validates():
             sp.soft_temperature = bad
 
 
-@pytest.mark.parametrize("mode", ["global", "local"])
+@pytest.mark.parametrize("mode", ["global", "local", "glocal"])
 def test_soft_interpair_mixed_groups_and_temperature(mode):
     """A non-unit temperature through the inter-pair soft pass, against the striped fill
     (soft and hard pairs are separate batches since 0.6: one problem type per batch)."""
@@ -314,7 +314,7 @@ def test_soft_interpair_mixed_groups_and_temperature(mode):
 
 
 @pytest.mark.parametrize("cls", BATCHES)
-@pytest.mark.parametrize("mode", ["global", "local"])
+@pytest.mark.parametrize("mode", ["global", "local", "glocal"])
 @pytest.mark.parametrize("T", [1.0, 0.6])
 def test_soft_interpair_linear(mode, T, cls):
     """Linear soft pairs under fill="interpair" share the forward-backward (InterSoftJob,
@@ -386,7 +386,7 @@ def test_soft_guide_rejects_unknown():
 
 
 @pytest.mark.parametrize("gm", ["affine", "linear"])
-@pytest.mark.parametrize("mode", ["global", "local"])
+@pytest.mark.parametrize("mode", ["global", "local", "glocal"])
 @pytest.mark.parametrize("bw", [0, 6])
 def test_lazy_rescale_both_directions(gm, mode, bw):
     """Rows are rescaled only when they leave [2^-256, 2^256].  Long pairs with strongly
@@ -458,7 +458,7 @@ def test_soft_guide_posterior(gm, mode, cls):
     runs[2].banded_grad(4)   # usable as a band centre
 
 
-@pytest.mark.parametrize("mode", ["global", "local"])
+@pytest.mark.parametrize("mode", ["global", "local", "glocal"])
 def test_soft_guide_posterior_tracks_viterbi_when_cold(mode):
     """At low temperature the posterior concentrates on the optimal path: its guide
     and the Viterbi guide agree on nearly every row."""

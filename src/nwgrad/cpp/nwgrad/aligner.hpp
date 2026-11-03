@@ -2386,12 +2386,9 @@ private:
                 // Linear: one exact sweep for both "hirschberg" and "hirschberg_pmax" —
                 // the prefix-max carry exists to remove affine's lazy-F fixpoint, and the
                 // scalar linear sweep has none.
-                if constexpr (AM == AlignMode::Glocal)
-                    throw std::logic_error(
-                        "nwgrad: traceback=\"hirschberg\" / \"hirschberg_pmax\" is not implemented for "
-                        "mode=\"glocal\"; use traceback=\"pointers\" or \"auto\"");
-                else if constexpr (GM == GapModel::Linear) { sat_dispatch1_([&]<bool Sat>() { viterbi_linear_hirschberg<Sat>(buf); }); return; }
+                if constexpr (GM == GapModel::Linear) { sat_dispatch1_([&]<bool Sat>() { viterbi_linear_hirschberg<Sat>(buf); }); return; }
                 else if constexpr (AM == AlignMode::Local) { sat_dispatch1_([&]<bool Sat>() { viterbi_affine_hirschberg_local<Sat>(buf); }); return; }
+                else if constexpr (AM == AlignMode::Glocal) { sat_dispatch1_([&]<bool Sat>() { viterbi_affine_hirschberg_glocal<Sat>(buf); }); return; }
                 else { sat_dispatch1_([&]<bool Sat>() { viterbi_affine_hirschberg<Sat>(buf); }); return; }
             }
             // A pair no longer than hb_cutoff never splits, so it is run AS Pointers —
@@ -2454,7 +2451,7 @@ private:
         if constexpr (AB == AlignBand::Full) {
             // Opt-in row-wise fill (set_rowwise_full): score tables, row-major, read back
             // by the Scores traceback whatever tb_ says — the paths are identical.
-            if (uses_rowwise_full() && AM != AlignMode::Glocal) { viterbi_affine_simd(buf, K); return; }   // (no Glocal row kernel yet)
+            if (uses_rowwise_full()) { viterbi_affine_simd(buf, K); return; }
             // The striped Full kernel, this level's instantiation for T.
             if (use_ptr && KT.viterbi_ptr) { run_dispatched_affine(buf, K, true);  return; }
             if (KT.viterbi)                { run_dispatched_affine(buf, K, false); return; }
@@ -2462,7 +2459,7 @@ private:
         }
         // The row-wise banded kernel (every T); a level without it falls back to the
         // scalar fill.
-        if (KT.banded_row_local && AM != AlignMode::Glocal) { viterbi_affine_simd(buf, K); return; }   // (no Glocal row kernel yet)
+        if (KT.banded_row_local) { viterbi_affine_simd(buf, K); return; }
         viterbi_affine(buf);
     }
 
@@ -3484,7 +3481,7 @@ private:
     void hb_scan(DpBuffer& buf, bool local, bool reverse, int i0, int i1, int j0, int j1,
                  T& best, int& bi, int& bj) {
         const int H = i1 - i0, NC = j1 - j0;
-        if (const LevelKernels* K = hb_scan_level()) {
+        if (const LevelKernels* K = hb_scan_level()) {   // (Glocal's scans: hb_scan_scalar)
             HbScanJob<T> job{}; job.sat = sat_;
             job.a = a_idx_.data(); job.b = b_idx_.data();
             job.blk = blkT_; job.nalpha = nalpha_;
@@ -3509,12 +3506,23 @@ private:
     // switch on `local`, the walk direction on `reverse`.  The argmax is topmost-row /
     // leftmost-column, strict > — the SAME tie-break the simd kernel uses, so the two
     // agree to the bit (the property NWGRAD_ISA relies on).
+    //
+    // Glocal (`glocal` 1 / 2, `local` false): only the block's LAST row is a candidate,
+    // column 0 included, the first column holding the row's maximum.  1 = the forward
+    // end scan: row 0 a free start (M = 0 at every column, no Y), column 0 the charged
+    // chain.  2 = the reverse start scan from the end cell (Global's borders); its last
+    // row is DP row 0, where a path may only leave by a diagonal or a vertical move, so
+    // the Y state is not a candidate there.
     template <bool Sat>
     void hb_scan_scalar(DpBuffer& buf, bool local, bool reverse, int i0, int i1, int j0, int j1,
-                        T& best, int& bi, int& bj) {
+                        T& best, int& bi, int& bj, int glocal = 0) {
         const int H = i1 - i0, NC = j1 - j0;
         best = static_cast<T>(0); bi = 0; bj = 0;
-        if (H == 0 || NC == 0) return;
+        if (glocal && H == 0) {   // no rows: the block's row 0 is its last
+            if (glocal == 1) return;                       // the free start: 0 at column 0
+            best = static_cast<T>(0); return;             // reverse: start at the end cell
+        }
+        if (H == 0 || (NC == 0 && !glocal)) return;
         if (tr_) hb_reverse_rows_();
         // Tracked: the rows as the leveled scan reads them (HbRows): forward, row t's
         // cells are DP row a[t]+1; reverse (the mirror), DP row a[t], with the rewritten
@@ -3540,14 +3548,14 @@ private:
         // Y-gap-open series, so the reverse pass computes the suffixes' global alignment.
         pM[0] = static_cast<T>(0); pX[0] = NINF(); pY[0] = NINF();
         for (int c = 1; c <= NC; ++c) {
-            if (local) { pM[c] = static_cast<T>(0); pX[c] = NINF(); pY[c] = NINF(); }
+            if (local || glocal == 1) { pM[c] = static_cast<T>(0); pX[c] = NINF(); pY[c] = NINF(); }
             else {
                 pM[c] = NINF(); pX[c] = NINF();
                 pY[c] = std::max(nw_sub_s<Sat>(nw_sub_s<Sat>(std::max(pM[c-1], pX[c-1]), go_a), ge_a), nw_sub_s<Sat>(pY[c-1], ge_a));
             }
         }
 
-        T gbest = static_cast<T>(0); int gi = 0, gj = 0;
+        T gbest = glocal ? NINF() : static_cast<T>(0); int gi = 0, gj = 0;
         for (int t = 0; t < H; ++t) {
             const int arow = a_start + t * a_step;                 // 0-based sequence row
             if (tr_) {
@@ -3574,12 +3582,56 @@ private:
                     y = std::max(std::max(nw_sub_s<Sat>(nw_sub_s<Sat>(cM[c-1], go_a), ge_a), nw_sub_s<Sat>(nw_sub_s<Sat>(cX[c-1], go_a), ge_a)), nw_sub_s<Sat>(cY[c-1], ge_a));
                 }
                 cM[c] = m; cX[c] = x; cY[c] = y;
+                if (glocal) continue;
                 const T here = std::max({m, x, y});
                 if (here > gbest) { gbest = here; gi = t + 1; gj = c; }
             }
+            if (glocal && t == H - 1)
+                for (int c = 0; c <= NC; ++c) {
+                    const T here = glocal == 2 ? std::max(cM[c], cX[c]) : std::max({cM[c], cX[c], cY[c]});
+                    if (here > gbest) { gbest = here; gi = t + 1; gj = c; }
+                }
             std::swap(pM, cM); std::swap(pX, cX); std::swap(pY, cY);
         }
         best = gbest; bi = gi; bj = gj;
+    }
+
+    // Entry: linear-space glocal.  The forward glocal scan -> the end column je of row m
+    // (the first holding the row's best, as glocal_end_* picks it) and the score S; the
+    // reverse scan from (m, je) -> the start column js on row 0; then hb_solve GLOBALLY
+    // aligns the box A x B[js..je), which scores exactly S (a box path leaving its corner
+    // by a horizontal move is no glocal path, but it costs go_a + ge_a >= 0 more than the
+    // path starting one column later, so it is optimal only when that is 0 -- and such
+    // leading moves, free, are dropped).  Both scans are scalar; O(n) memory.
+    template <bool Sat>
+    void viterbi_affine_hirschberg_glocal(DpBuffer& buf) {
+        hops_.clear();
+        hb_start_i_ = 0; hb_start_j_ = 0;
+        T s_fwd; int ie, je;
+        hb_scan_scalar<Sat>(buf, false, false, 0, m_, 0, n_, s_fwd, ie, je, 1);
+        T s_rev; int p, q;
+        hb_scan_scalar<Sat>(buf, false, true, 0, m_, 0, je, s_rev, p, q, 2);
+        int js = je - q;
+        hb_solve<Sat>(buf, 0, m_, js, je, false, false);
+        size_t lead = 0;
+        while (lead < hops_.size() && hops_[lead] == 2) ++lead;   // free moves along row 0
+        if (lead) { hops_.erase(hops_.begin(), hops_.begin() + static_cast<std::ptrdiff_t>(lead)); js += static_cast<int>(lead); }
+        hb_start_i_ = 0; hb_start_j_ = js;
+        T s = static_cast<T>(0);
+        int i = 0, j = js;
+        unsigned char prev = 3;
+        for (unsigned char op : hops_) {
+            if (op == 0) { ++i; ++j; s += subT(i, j); }
+            else if (op == 1) { ++i; if (prev != 1) s -= row_go_b(i); s -= row_ge_b(i); }
+            else              { if (prev != 2) s -= row_go_a(i); s -= row_ge_a(i); ++j; }
+            prev = op;
+        }
+        viterbi_score_ = s;
+        best_i_ = m_; best_j_ = je;
+        best_tbl_ = hops_.empty() ? TBTable::M
+                  : (hops_.back() == 1 ? TBTable::X
+                     : (hops_.back() == 2 ? TBTable::Y : TBTable::M));
+        hirschberg_ = true;
     }
 
     // Entry: linear-space Smith-Waterman.  Forward clamped scan -> end cell (ie, je) and
@@ -3681,8 +3733,9 @@ public:
     int lhb_kernel_runs() const noexcept { return lhb_runs_; }
 private:
 
+    // free0: the block's row 0 a free start (0 at every column: Glocal's forward scan).
     template <bool Sat>
-    void lhb_sweep(DpBuffer& buf, bool rev, int i0, int i1, int j0, int j1, T* out) {
+    void lhb_sweep(DpBuffer& buf, bool rev, int i0, int i1, int j0, int j1, T* out, bool free0 = false) {
         const int W = j1 - j0;
         if (const lhb_fn_t fn = lhb_kernel_(W); fn && i1 > i0 && W > 0) {
             // the scalar sweep's arrays, in its order and with its expressions
@@ -3696,7 +3749,7 @@ private:
             T ga = hb_ge_a(rev ? i1 : i0), gb = static_cast<T>(params_->gap_extend_b);
             lhb_r0_.resize(static_cast<size_t>(W) + 1); lhb_c0_.resize(static_cast<size_t>(Hh) + 1);
             lhb_r0_[0] = static_cast<T>(0);
-            for (int c = 1; c <= W; ++c) lhb_r0_[static_cast<size_t>(c)] = nw_sub_s<Sat>(lhb_r0_[static_cast<size_t>(c) - 1], ga);
+            for (int c = 1; c <= W; ++c) lhb_r0_[static_cast<size_t>(c)] = free0 ? static_cast<T>(0) : nw_sub_s<Sat>(lhb_r0_[static_cast<size_t>(c) - 1], ga);
             lhb_c0_[0] = lhb_r0_[0];
             for (int r = 1; r <= Hh; ++r) {
                 const int i = rev ? i1 - r + 1 : i0 + r;
@@ -3718,7 +3771,7 @@ private:
         T ge_a = hb_ge_a(rev ? i1 : i0);
         T ge_b = static_cast<T>(params_->gap_extend_b);
         row[0] = static_cast<T>(0);
-        for (int c = 1; c <= W; ++c) row[c] = nw_sub_s<Sat>(row[c - 1], ge_a);
+        for (int c = 1; c <= W; ++c) row[c] = free0 ? static_cast<T>(0) : nw_sub_s<Sat>(row[c - 1], ge_a);
         // The direction and the substitution row are resolved outside the column loop
         // (gcc unswitched them, clang did not: clang/gcc 1.65x); the same arithmetic.
         auto sweep = [&](auto step) {
@@ -3969,6 +4022,35 @@ private:
             hb_start_i_ = is; hb_start_j_ = js;
             i_end = ie; j_end = je;
             lhb_solve<Sat>(buf, is, ie, js, je);
+        } else if constexpr (AM == AlignMode::Glocal) {
+            // The end: row m of a forward sweep from a free row 0, its first best column.
+            hb_fit(buf.hsM, static_cast<std::size_t>(n_) + 1);
+            T* F = buf.hsM.data();
+            lhb_sweep<Sat>(buf, false, 0, m_, 0, n_, F, /*free0=*/true);
+            int je = 0;
+            for (int c = 1; c <= n_; ++c) if (F[c] > F[je]) je = c;
+            // The start: the best suffix from (0, q) to (m, je) whose first move is not
+            // along row 0 -- a diagonal or a vertical move into row 1, then any path.
+            int js = je;
+            if (m_ > 0) {
+                hb_fit(buf.hra, static_cast<std::size_t>(je) + 1);
+                T* R = buf.hra.data();                     // R[d]: from (1, je - d) to (m, je)
+                lhb_sweep<Sat>(buf, true, 1, m_, 0, je, R);
+                const T gb1 = gb(1);
+                T sbest = nw_sub_s<Sat>(R[0], gb1);        // q = je: down only
+                for (int q = je - 1; q >= 0; --q) {
+                    T v = nw_add_s<Sat, T>(R[je - q - 1], tr_ ? subT(1, q + 1) : subTu(1, q + 1));
+                    const T u = nw_sub_s<Sat>(R[je - q], gb1);
+                    if (v < u) v = u;
+                    if (v > sbest) { sbest = v; js = q; }
+                }
+            }
+            lhb_solve<Sat>(buf, 0, m_, js, je);
+            size_t lead = 0;   // free leading moves along row 0 (ge_a = 0): not glocal moves
+            while (lead < hops_.size() && hops_[lead] == 2) ++lead;
+            if (lead) { hops_.erase(hops_.begin(), hops_.begin() + static_cast<std::ptrdiff_t>(lead)); js += static_cast<int>(lead); }
+            hb_start_i_ = 0; hb_start_j_ = js;
+            i_end = m_; j_end = je;
         } else {
             lhb_solve<Sat>(buf, 0, m_, 0, n_);
         }
@@ -4868,7 +4950,7 @@ private:
     void run_fwdbwd(DpBuffer& buf) {
         soft_counts_ready_ = false;
 
-        if (soft_impl_ != SoftImpl::Log && AM != AlignMode::Glocal) {   // Glocal: the log path, until its scaled kernels exist
+        if (soft_impl_ != SoftImpl::Log) {
             bool ok;
             ok = fwdbwd_scaled(buf);
             if (ok) {

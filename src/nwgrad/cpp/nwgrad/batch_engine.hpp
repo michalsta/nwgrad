@@ -731,9 +731,6 @@ private:
     // admitted there — ignoring every guide and returning the unbanded log Z, so
     // fill="interpair" and fill="striped" disagreed (inherited from BatchAligner).
     int stream_inter_backend_(const AlignParams& params, int kernel, bool banded) const {
-        // Glocal: the hard Full fills only (no inter-pair soft pass, no banded Glocal lanes yet)
-        if constexpr (AM == AlignMode::Glocal)
-            if (banded || grad_mode_ == GradMode::Soft) return -1;
         const int backend = (kernel == kBackendAuto) ? global_default_backend() : kernel;
         if (backend < 0) return -1;
         const LevelKernels& K = level_kernels(backend);
@@ -2097,9 +2094,6 @@ private:
     // The vector backend the batch's inter-pair fills run on, or -1 (every pair its own
     // fill).
     int inter_backend_() const {
-        // Glocal: the hard fills only, until the inter-pair soft pass has the mode
-        if constexpr (AM == AlignMode::Glocal)
-            if (grad_mode_ == GradMode::Soft) return -1;
         const int backend = (kernel_ == kBackendAuto) ? global_default_backend() : kernel_;
         if (backend < 0) return -1;
         const LevelKernels& K = level_kernels(backend);
@@ -2367,8 +2361,7 @@ private:
         Bg.full_calls = full_calls_;
         Bg.default_backend = plan_.default_backend; Bg.hb_cutoff = plan_.hb_cutoff;
         Bg.other = plan_.other;
-        // Glocal: no banded inter-pair lanes yet (each pair its own banded fill)
-        const bool shared = GM == GapModel::Affine && grad_mode_ != GradMode::Soft && AM != AlignMode::Glocal;
+        const bool shared = GM == GapModel::Affine && grad_mode_ != GradMode::Soft;
         std::vector<size_t> E;
         if (shared) E = plan_.elig;
         else Bg.other.insert(Bg.other.end(), plan_.elig.begin(), plan_.elig.end());

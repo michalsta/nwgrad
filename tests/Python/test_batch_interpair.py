@@ -87,18 +87,19 @@ def test_banded_matches(prec, mode, band):
 
 
 @pytest.mark.parametrize("prec", ["double", "float32"])
-def test_guided_matches(prec):
+@pytest.mark.parametrize("mode", ["global", "glocal"])
+def test_guided_matches(prec, mode):
     """Guides from aligned strings, band 0 (GuideBanded) and band 3."""
     A, B = _seqs(80, 10, 30, 5), _seqs(80, 33, 34, 6)
     p = _params("random", "affine")
-    sp = [nwgrad.SeqPairDouble(a, b, p, gap_model="affine", mode="global") for a, b in zip(A, B)]
+    sp = [nwgrad.SeqPairDouble(a, b, p, gap_model="affine", mode=mode) for a, b in zip(A, B)]
     al = []
     for s in sp:
         s.align(); al.append(s.aligned())
     aligned = ([x[0] for x in al], [x[1] for x in al])
     for band in (0, 3):
-        r0 = _align(prec, p, "affine", "global", "hard", A, B, "striped", band=band, aligned=aligned)
-        r1 = _align(prec, p, "affine", "global", "hard", A, B, "interpair", band=band, aligned=aligned)
+        r0 = _align(prec, p, "affine", mode, "hard", A, B, "striped", band=band, aligned=aligned)
+        r1 = _align(prec, p, "affine", mode, "hard", A, B, "interpair", band=band, aligned=aligned)
         for x, y in zip(r0, r1):
             assert np.array_equal(x, y)
 

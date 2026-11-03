@@ -169,12 +169,14 @@ static inline size_t sp_row(const SoftPairJob& J, int i) noexcept {
     if constexpr (Tr) return static_cast<size_t>(i - 1);
     else              return static_cast<size_t>(J.a[i - 1]);
 }
-// Z = 2^ze·zr from per-row sums (Local) or the (m, n) cell (Global), zr normalized
+// Z = 2^ze·zr from per-row sums (Local), row m's sum (Glocal) or the (m, n) cell
+// (Global), zr normalized
 // into [1, 2).  Returns false if Z is not positive and finite (handled by caller).
 static inline bool sp_log_z(SoftPairJob& J, const int* S, const double* rowsum_or_null,
                             double corner, int& ze, double& izr) noexcept {
     double zr;
     if (!J.local) { ze = S[J.m]; zr = corner; }
+    else if (J.local == 2) { ze = S[J.m]; zr = rowsum_or_null[J.m]; }
     else {
         ze = S[0];
         for (int i = 1; i <= J.m; ++i) ze = std::max(ze, S[i]);
@@ -195,8 +197,11 @@ template <bool Tr>
 NWGRAD_SP_FMA_FN static void soft_pair_linear_t(SoftPairJob& J) noexcept {
     NWGRAD_SP_FMA_BODY
     const int m = J.m, n = J.n;
-    const bool L = J.local != 0;
-    const int kmin = L ? 1 : 0;
+    // Glocal (local == 2): row 0 a free start (no moves along it), column 0 Global's
+    // chain, no free start inside, Z = row m's sum, the backward seeded along row m.
+    const bool L = J.local == 1, G = J.local == 2;
+    const int kmin = (L || G) ? 1 : 0;    // first row whose horizontal moves count
+    const int kmin0 = L ? 1 : 0;          // first row whose column-0 vertical move counts
     double ea = J.ea, eb = J.eb;
     const double* RW = J.rw;
     if constexpr (Tr) {
@@ -217,7 +222,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear_t(SoftPairJob& J) noexcept {
             double* r = F + static_cast<size_t>(i) * st;
             for (int j = J.slo[i]; j <= J.shi[i]; ++j) r[j] = 0.0;
         }
-    if (L) { for (int j = 0; j <= n; ++j) F[j] = 1.0; }
+    if (L || G) { for (int j = 0; j <= n; ++j) F[j] = 1.0; }
     else {
         if (J.full) for (int j = 0; j <= n; ++j) F[j] = 0.0;
         F[0] = 1.0;
@@ -228,7 +233,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear_t(SoftPairJob& J) noexcept {
         double mx = 0.0;
         for (int j = J.slo[0]; j <= J.shi[0]; ++j) mx = NWGRAD_SP_VMAX(mx, F[j]);
         mf[0] = mx;
-        if (L) { double s = 0.0; for (int j = J.jlo0[0]; j <= J.jhi0[0]; ++j) s += F[j]; rs[0] = s; }
+        if (L || (G && m == 0)) { double s = 0.0; for (int j = J.jlo0[0]; j <= J.jhi0[0]; ++j) s += F[j]; rs[0] = s; }
     }
     for (int i = 1; i <= m; ++i) {
         double* __restrict r = F + static_cast<size_t>(i) * st;
@@ -247,7 +252,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear_t(SoftPairJob& J) noexcept {
         S[i] = S[i - 1] + sp_lazy(mx, J.slo[i], J.shi[i], bad, r);
         if (bad) return;
         mf[i] = mx;
-        if (L) {
+        if (L || (G && i == m)) {
             double s = 0.0;
             NWGRAD_SP_SUM(s)
             for (int j = J.jlo0[i]; j <= J.jhi0[i]; ++j) s += r[j];
@@ -258,7 +263,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear_t(SoftPairJob& J) noexcept {
     const double corner = mn_in ? F[static_cast<size_t>(m) * st + n] : 0.0;
     int ze; double izr;
     if (!sp_log_z(J, S, rs, corner, ze, izr)) {
-        if (!L && !mn_in) {   // Global, (m, n) outside the band: log Z = -inf, genuinely
+        if (!L && !G && !mn_in) {   // Global, (m, n) outside the band: log Z = -inf, genuinely
             J.log_z = -std::numeric_limits<double>::infinity();
             J.g_oa = J.g_ea = J.g_ob = J.g_eb = 0.0;
             J.ok = 1;
@@ -283,8 +288,9 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear_t(SoftPairJob& J) noexcept {
             const double* __restrict nx = nxt;
             for (int j = lo0; j <= hi0; ++j) c[j] = pn[j + 1] * nx[j + 1] + nx[j] * ebn + init;
         } else {
-            for (int j = lo0; j <= hi0; ++j) cur[j] = init;
-            if (!L && n >= lo0 && n <= hi0) cur[n] = 1.0;
+            const double e = G ? 1.0 : init;   // Glocal: every cell of row m an end
+            for (int j = lo0; j <= hi0; ++j) cur[j] = e;
+            if (!L && !G && n >= lo0 && n <= hi0) cur[n] = 1.0;
         }
         if (lo0 <= hi0) sp_carry_bwd(cur, lo0, hi0, ea);
         clo = lo0; chi = hi0;
@@ -294,7 +300,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear_t(SoftPairJob& J) noexcept {
         const double* __restrict cb = cur;
         const int j1 = std::max(1, lo0);
         double mx = 0.0, sa = 0.0, sb = 0.0;
-        if (lo0 == 0) { mx = cb[0]; if (i >= 1 && kmin == 0) sb += (Fi - st)[0] * cb[0]; }
+        if (lo0 == 0) { mx = cb[0]; if (i >= 1 && kmin0 == 0) sb += (Fi - st)[0] * cb[0]; }
         if (i >= 1) {
             const double* __restrict Fp = Fi - st;
             const double* __restrict pr = P + sp_row<Tr>(J, i) * w;
@@ -368,8 +374,11 @@ template <bool Tr>
 NWGRAD_SP_FMA_FN static void soft_pair_affine_t(SoftPairJob& J) noexcept {
     NWGRAD_SP_FMA_BODY
     const int m = J.m, n = J.n;
-    const bool L = J.local != 0;
-    const int kmin = L ? 1 : 0;
+    // Glocal (local == 2): row 0 a free start (no moves along it), column 0 Global's
+    // chain, no free start inside, Z = row m's sum, the backward seeded along row m.
+    const bool L = J.local == 1, G = J.local == 2;
+    const int kmin = (L || G) ? 1 : 0;    // first row whose horizontal moves count
+    const int kmin0 = L ? 1 : 0;          // first row whose column-0 vertical move counts
     double oa = J.oa, ea = J.ea, ob = J.ob, eb = J.eb;
     const double* RW = J.rw;
     if constexpr (Tr) {
@@ -395,7 +404,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine_t(SoftPairJob& J) noexcept {
     } else {
         for (int j = 0; j <= n; ++j) { FM[j] = 0.0; FX[j] = 0.0; FY[j] = 0.0; }
     }
-    if (L) { for (int j = 0; j <= n; ++j) FM[j] = 1.0; }
+    if (L || G) { for (int j = 0; j <= n; ++j) FM[j] = 1.0; }
     else {
         FM[0] = 1.0;
         if (J.bj >= 1) FY[1] = oa;
@@ -410,7 +419,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine_t(SoftPairJob& J) noexcept {
         mf[0] = mx;
     }
     S[0] = 0;
-    if (L) { double s = 0.0; for (int j = J.jlo0[0]; j <= J.jhi0[0]; ++j) s += tp[j]; rs[0] = s; }
+    if (L || (G && m == 0)) { double s = 0.0; for (int j = J.jlo0[0]; j <= J.jhi0[0]; ++j) s += tp[j]; rs[0] = s; }
     for (int i = 1; i <= m; ++i) {
         const size_t ro = static_cast<size_t>(i) * st;
         double* __restrict rM = FM + ro; double* __restrict rX = FX + ro;
@@ -450,7 +459,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine_t(SoftPairJob& J) noexcept {
         S[i] = S[i - 1] + sp_lazy(mx, J.slo[i], J.shi[i], bad, rM, rX, rY, tp);
         if (bad) return;
         mf[i] = mx;
-        if (L) {
+        if (L || (G && i == m)) {
             double s = 0.0;
             NWGRAD_SP_SUM(s)
             for (int j = J.jlo0[i]; j <= J.jhi0[i]; ++j) s += tp[j];
@@ -462,7 +471,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine_t(SoftPairJob& J) noexcept {
     const double corner = mn_in ? FM[cmn] + FX[cmn] + FY[cmn] : 0.0;
     int ze; double izr;
     if (!sp_log_z(J, S, rs, corner, ze, izr)) {
-        if (!L && !mn_in) {
+        if (!L && !G && !mn_in) {
             J.log_z = -std::numeric_limits<double>::infinity();
             J.g_oa = J.g_ea = J.g_ob = J.g_eb = 0.0;
             J.ok = 1;
@@ -500,8 +509,9 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine_t(SoftPairJob& J) noexcept {
                     b1[j] = v1; b2[j] = d + v * ebn; y[j] = v1;
                 }
             } else {
-                for (int j = lo0; j <= hi0; ++j) { b1[j] = init; b2[j] = init; y[j] = init; }
-                if (!L && n >= lo0 && n <= hi0) { b1[n] = 1.0; b2[n] = 1.0; y[n] = 1.0; }
+                const double e = G ? 1.0 : init;   // Glocal: every cell of row m an end
+                for (int j = lo0; j <= hi0; ++j) { b1[j] = e; b2[j] = e; y[j] = e; }
+                if (!L && !G && n >= lo0 && n <= hi0) { b1[n] = 1.0; b2[n] = 1.0; y[n] = 1.0; }
             }
         }
         if (lo0 <= hi0) sp_carry_bwd(cY, lo0, hi0, ea);
@@ -523,7 +533,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine_t(SoftPairJob& J) noexcept {
             mx = mv + xv + bY[0];
             if (i >= 1) {
                 sx += fX[0] * xv;
-                if (kmin == 0) sob += ((fM - st)[0] + (fY - st)[0]) * xv;
+                if (kmin0 == 0) sob += ((fM - st)[0] + (fY - st)[0]) * xv;
             }
         }
         if (i >= 1) {

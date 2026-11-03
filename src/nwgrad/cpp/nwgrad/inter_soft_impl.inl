@@ -72,8 +72,11 @@ template <bool Rag, bool Tr = false>
 NWGRAD_SOFT_FMA_FN static void inter_soft_affine(InterSoftJob& J) noexcept {
     NWGRAD_SOFT_FMA_BODY
     const int n = J.n, M = J.M, st = n + 1, na = J.nalpha, w2 = n + 2;
-    const bool local = J.align_mode == 1;
-    const int kmin = local ? 1 : 0;   // Aligner::kGapTargetMin
+    // Glocal (align_mode 2): row 0 a free start (Local's row 0), column 0 Global's chain,
+    // no free start inside, Z = row m's sum, the backward seeded along row m.
+    const bool local = J.align_mode == 1, glocal = J.align_mode == 2;
+    const int kmin = (local || glocal) ? 1 : 0;   // Aligner::kGapTargetMinI (rows)
+    const int kmin0 = local ? 1 : 0;              // kGapTargetMinJ (column 0)
     const ivd z = {}, one = z + 1.0;
     ivd oa = z + J.oa, ea = z + J.ea, ob = z + J.ob, eb = z + J.eb;
     if constexpr (Tr) { oa = isj_w(J, 0, 0); ea = isj_w(J, 0, 1); }
@@ -190,7 +193,7 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_affine(InterSoftJob& J) noexcept {
 
     // ── Forward ──
     for (int j = 0; j <= n; ++j) { FM[j] = z; FX[j] = z; FY[j] = z; }
-    if (local) { for (int j = 0; j <= n; ++j) FM[j] = one; }
+    if (local || glocal) { for (int j = 0; j <= n; ++j) FM[j] = one; }
     else {
         FM[0] = one;
         if (n >= 1) FY[1] = oa;
@@ -246,7 +249,10 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_affine(InterSoftJob& J) noexcept {
     for (int l = 0; l < IW; ++l) {
         const int ml = J.m[l];
         double zr;
-        if (!local) {
+        if (glocal) {
+            ze[l] = S[ml * IW + l];
+            zr = rs[ml][l];
+        } else if (!local) {
             const size_t o = static_cast<size_t>(ml) * st + (Rag ? J.nb[l] : n);
             ze[l] = S[ml * IW + l];
             zr = FM[o][l] + FX[o][l] + FY[o][l];
@@ -283,7 +289,7 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_affine(InterSoftJob& J) noexcept {
         ivd init = z;
         for (int l = 0; l < IW; ++l) {
             top[l] = (i == J.m[l]) ? -1 : 0;
-            if (local && i <= J.m[l]) init[l] = std::ldexp(1.0, -Tn[l]);
+            if ((local && i <= J.m[l]) || (glocal && i == J.m[l])) init[l] = std::ldexp(1.0, -Tn[l]);
         }
         const ivd* En = (i < M) ? ER + static_cast<size_t>(i + 1) * w2 : nullptr;
         const size_t ro = static_cast<size_t>(i) * st;
@@ -311,8 +317,8 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_affine(InterSoftJob& J) noexcept {
             const ivd v = nX[j];
             ivd b1 = d + v * obn, b2 = d + v * ebn;
             if constexpr (Rag) {
-                if (!local) { const ivl e = top & endc[j]; b1 = ivsel(e, one, b1); b2 = ivsel(e, one, b2); }
-            } else if (!local && j == n) { b1 = ivsel(top, one, b1); b2 = ivsel(top, one, b2); }
+                if (!local && !glocal) { const ivl e = top & endc[j]; b1 = ivsel(e, one, b1); b2 = ivsel(e, one, b2); }
+            } else if (!local && !glocal && j == n) { b1 = ivsel(top, one, b1); b2 = ivsel(top, one, b2); }
             const ivd h = c * oa;
             ivd y = b1 + ea * c;
             ivd mv = b1 + h, xv = b2 + h;
@@ -355,7 +361,7 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_affine(InterSoftJob& J) noexcept {
             const auto [mv0, xv0] = cell(0);
             (void)mv0;
             sx += fX[0] * xv0;
-            if (kmin == 0) sob += (qM[0] + qY[0]) * xv0;
+            if (kmin0 == 0) sob += (qM[0] + qY[0]) * xv0;
         } else {
             for (int j = n; j >= 1; --j) {
                 cell(j);
@@ -440,8 +446,8 @@ template <bool Rag, bool Tr = false>
 NWGRAD_SOFT_FMA_FN static void inter_soft_linear(InterSoftJob& J) noexcept {
     NWGRAD_SOFT_FMA_BODY
     const int n = J.n, M = J.M, st = n + 1, na = J.nalpha, w2 = n + 2;
-    const bool local = J.align_mode == 1;
-    const int kmin = local ? 1 : 0;
+    const bool local = J.align_mode == 1, glocal = J.align_mode == 2;   // as inter_soft_affine
+    const int kmin = (local || glocal) ? 1 : 0, kmin0 = local ? 1 : 0;
     const ivd z = {}, one = z + 1.0;
     ivd ea = z + J.ea, eb = z + J.eb;
     if constexpr (Tr) ea = isj_w(J, 0, 1);
@@ -541,7 +547,7 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_linear(InterSoftJob& J) noexcept {
     };
 
     // ── Forward ──
-    if (local) { for (int j = 0; j <= n; ++j) F[j] = one; }
+    if (local || glocal) { for (int j = 0; j <= n; ++j) F[j] = one; }
     else { F[0] = one; for (int j = 1; j <= n; ++j) F[j] = F[j - 1] * ea; }
     if constexpr (Rag) for (int j = 0; j <= n; ++j) F[j] = ivsel(cok[j], F[j], z);
     for (int l = 0; l < IW; ++l) S[l] = 0;
@@ -579,7 +585,10 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_linear(InterSoftJob& J) noexcept {
     for (int l = 0; l < IW; ++l) {
         const int ml = J.m[l];
         double zr;
-        if (!local) {
+        if (glocal) {
+            ze[l] = S[ml * IW + l];
+            zr = rs[ml][l];
+        } else if (!local) {
             ze[l] = S[ml * IW + l];
             zr = F[static_cast<size_t>(ml) * st + (Rag ? J.nb[l] : n)][l];
         } else {
@@ -613,7 +622,7 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_linear(InterSoftJob& J) noexcept {
         ivd init = z;
         for (int l = 0; l < IW; ++l) {
             top[l] = (i == J.m[l]) ? -1 : 0;
-            if (local && i <= J.m[l]) init[l] = std::ldexp(1.0, -Tn[l]);
+            if ((local && i <= J.m[l]) || (glocal && i == J.m[l])) init[l] = std::ldexp(1.0, -Tn[l]);
         }
         const ivd* En = (i < M) ? ER + static_cast<size_t>(i + 1) * w2 : nullptr;
         const ivd* f = F + static_cast<size_t>(i) * st;
@@ -632,9 +641,9 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_linear(InterSoftJob& J) noexcept {
             const ivd bn = c;   // B at j+1 (exit mass)
             ivd b = (En ? En[j + 1] * nxt[j + 1] : z) + nxt[j] * ebn + init + ea * c;
             if constexpr (Rag) {
-                if (!local) b = ivsel(top & endc[j], one, b);
+                if (!local && !glocal) b = ivsel(top & endc[j], one, b);
                 b = ivsel(cok[j], b, z);
-            } else if (!local && j == n) b = ivsel(top, one, b);
+            } else if (!local && !glocal && j == n) b = ivsel(top, one, b);
             cur[j] = b; c = b;
             mx = ivmax(mx, b);
             if (post) {
@@ -645,7 +654,7 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_linear(InterSoftJob& J) noexcept {
             }
             if (j >= 1) sa += f[j - 1] * b;
             if (i >= 1) {
-                if (j >= kmin) sb += q[j] * b;
+                if (j >= kmin0) sb += q[j] * b;
                 if (j >= 1) {
                     const ivd t = q[j - 1] * Ec[j] * b;
                     if (big) trow[j] = t;

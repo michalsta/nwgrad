@@ -242,12 +242,53 @@ def test_pointers_and_scores_agree(generic_matrix):
         assert np.array_equal(np.asarray(r[0][2]["matrix"]), np.asarray(r[1][2]["matrix"]))
 
 
-def test_hirschberg_is_refused(matrix):
-    p = params(matrix, 1.0, 1.0, 1.0, 1.0)
-    # long enough to split above any default hb_cutoff (a shorter pair runs AS pointers)
-    sp = nwgrad.SeqPair("ACGTACGT" * 90, "TTACGTACGTTT" * 90, p, mode="glocal", traceback="hirschberg")
-    with pytest.raises(Exception, match="glocal"):
-        sp.align()
+@pytest.mark.parametrize("gap_model", ["affine", "linear"])
+@pytest.mark.parametrize("traceback", ["hirschberg", "hirschberg_pmax"])
+@pytest.mark.parametrize("cls", [nwgrad.SeqPairDouble, nwgrad.SeqPair])
+@pytest.mark.parametrize("gaps", [(2.0, 1.0, 1.5, 0.5), (0.0, 0.0, 0.0, 0.0), (0.0, 0.7, 3.0, 0.0)])
+def test_hirschberg_finds_an_optimal_path(generic_matrix, gap_model, traceback, cls, gaps):
+    # The linear-space form: a forward scan to the end column, a reverse scan to the start
+    # column, the global box between.  It may take another optimal path at ties, never a
+    # worse one (hirschberg_pmax at float32: within float32's own error), its path scores
+    # its score, and its gradient is that path's.  hb_cutoff 2: the box really splits.
+    # Zero gap costs: a box path may lead with free moves along row 0, which are dropped.
+    rng = random.Random(77)
+    p = params(generic_matrix, *gaps)
+    lin = gap_model == "linear"
+    tol = 1e-9 if cls is nwgrad.SeqPairDouble else 1e-3
+    for _ in range(60):
+        a = "".join(rng.choice(ALPHABET) for _ in range(rng.randint(0, 30)))
+        b = "".join(rng.choice(ALPHABET) for _ in range(rng.randint(0, 45)))
+        ref = cls(a, b, p, gap_model=gap_model, mode="glocal", traceback="pointers")
+        s_ref = ref.align()
+        sp = cls(a, b, p, gap_model=gap_model, mode="glocal", traceback=traceback)
+        sp.hb_cutoff = 2
+        s, g = sp.score_and_grad()
+        assert s == pytest.approx(s_ref, abs=tol * max(1, len(a) + len(b)))
+        sa, sb = sp.aligned()
+        assert sa.replace("-", "") == a
+        assert sb.replace("-", "") in b
+        if sa:
+            assert sa[0] != "-" or sb[0] == "-" or len(a) == 0   # no leading gap in a
+        assert _aligned_score(sa, sb, p, not lin) == pytest.approx(s, abs=tol * 10)
+        d, gd = p.to_dict(), g.to_dict()
+        dot = float(np.sum(np.asarray(gd["matrix"]) * np.asarray(d["matrix"])))
+        for k in ("gap_open_a", "gap_extend_a", "gap_open_b", "gap_extend_b"):
+            if lin and k.startswith("gap_open"):
+                continue
+            dot += gd[k] * d[k]
+        assert dot == pytest.approx(s, abs=tol * 10)
+
+
+def test_hirschberg_long_pair_matches_pointers(generic_matrix):
+    p = params(generic_matrix, 2.0, 1.0, 1.5, 0.5)
+    rng = random.Random(4)
+    a = "".join(rng.choice(ALPHABET) for _ in range(400))
+    b = "".join(rng.choice(ALPHABET) for _ in range(300)) + a[50:350] + "".join(rng.choice(ALPHABET) for _ in range(300))
+    for gm in ("affine", "linear"):
+        ref = nwgrad.SeqPairDouble(a, b, p, gap_model=gm, mode="glocal", traceback="pointers").align()
+        hb = nwgrad.SeqPairDouble(a, b, p, gap_model=gm, mode="glocal", traceback="hirschberg")
+        assert hb.align() == pytest.approx(ref, abs=1e-9)
 
 
 @pytest.mark.parametrize("gap_model", ["affine", "linear"])
