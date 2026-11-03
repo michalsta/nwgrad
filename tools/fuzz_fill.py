@@ -15,6 +15,7 @@ ending the sweep:
 
     python tools/fuzz_fill.py 0 400 [--jobs 8]
     python tools/fuzz_fill.py --seed 6        # one seed, in this process (for gdb)
+    python tools/fuzz_fill.py 0 400 --mode glocal   # every seed in one mode
 
 This is the harness that found the linear/affine DpBuffer overrun (test_buffer_reuse.cpp):
 39 of 400 seeds crashed before the guard fix, none after.  (Its batches then mixed gap
@@ -68,7 +69,7 @@ def rlen(rng):
     return int(rng.integers(500, 800))
 
 
-def make_case(seed):
+def make_case(seed, force_mode=None):
     rng = np.random.default_rng(seed)
     alpha = str(rng.choice(["ACGT", nwgrad.PROTEIN.symbols, "ACGTN"]))
     prec = str(rng.choice(["double", "float32"]))
@@ -76,6 +77,8 @@ def make_case(seed):
     specs = []
     gm = str(rng.choice(["affine", "linear"]))
     mode = str(rng.choice(["global", "local"]))
+    if force_mode:   # --mode: the draw above is kept, so a seed's other choices stay
+        mode = force_mode
     gr = str(rng.choice(["hard", "hard", "none", "soft"]))
     for _ in range(int(rng.integers(1, 5))):
         p = rparams(rng, alpha, gm)
@@ -118,9 +121,9 @@ def run_fill(prec, tb, specs, fill, bw):
     return full, grads, banded
 
 
-def check_seed(seed):
+def check_seed(seed, force_mode=None):
     """None if the fills agree, else a one-line description of the first disagreement."""
-    alpha, prec, tb, specs, bw = make_case(seed)
+    alpha, prec, tb, specs, bw = make_case(seed, force_mode)
     tag = (f"seed={seed} alphabet={len(alpha)} {prec} traceback={tb} bw={bw} groups="
            f"{[(len(s[0]), s[3], s[4], s[5]) for s in specs]}")
     s = run_fill(prec, tb, specs, "striped", bw)
@@ -164,14 +167,16 @@ def main():
     ap.add_argument("hi", type=int, nargs="?", default=100)
     ap.add_argument("--seed", type=int, help="run one seed in this process")
     ap.add_argument("--jobs", type=int, default=4)
+    ap.add_argument("--mode", choices=["global", "local", "glocal"],
+                    help="every seed in this mode (default: each seed draws global or local)")
     a = ap.parse_args()
     if a.seed is not None:
-        r = check_seed(a.seed)
+        r = check_seed(a.seed, a.mode)
         print(r or f"seed={a.seed} ok")
         sys.exit(1 if r else 0)
 
     def one(seed):
-        p = subprocess.run([sys.executable, __file__, "--seed", str(seed)],
+        p = subprocess.run([sys.executable, __file__, "--seed", str(seed)] + (["--mode", a.mode] if a.mode else []),
                            capture_output=True, text=True)
         if p.returncode < 0:
             return f"seed={seed} CRASHED (signal {-p.returncode})"
