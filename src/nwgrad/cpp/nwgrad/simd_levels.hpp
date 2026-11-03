@@ -540,24 +540,23 @@ inline size_t gate_value(Gate g, size_t def) {
 // int32 keep winning to L250-300 (3-4.5 MiB).  A score-only call keeps one row per
 // table, so the byte budget does not apply to it (inter_eligible_, stream_inter_).
 //
-// The score-only and linear hard shared fills of alphabets over 8 letters gather one
-// scalar per lane-cell where the own striped kernels read a profile row, so they pay
-// only for short pairs: cell caps per type, where the own kernel's speed sets the
-// crossover (int16 / int32 from L40-60, float32 to L150 on AVX2 and beyond L250 on
-// AVX-512).  The two modes cross at different lengths, so each has its own caps
-// (score_* Local, score_*_g Global), from gate_sweep at 1 thread and all with the own arm
-// closing the gather (nighthaven, solace, the M1): mostly Global keeps the shared fill
-// longer -- linear float32 to L100 on AVX2 and NEON where Local stops at L60 (L60 against
-// L40 at SSE), double to L80 against L40 on AVX2, L150 against L120 on AVX-512; affine float32 to L120 against
-// L100 and int64 to L250 against L120 on NEON -- but int32 linear at SSE goes the other
-// way (Local shared to L60, Global L40).  Where the AVX2 hosts disagree (Tiger Lake's
-// AVX2 keeps the shared affine fills longer), nighthaven's crossover is the cap.  0 = never
-// shared, kGateNoCap = always.  Alphabets of up to 8 letters (DNA) take the mask-blend
-// kernels instead, which never gather: those have caps of their own -- the shared score
-// kernel loses to the own fill from 22 x 80 for double and int32 on AVX2 (the own
-// kernel's single profile row wins once B is long), and in Local mode sooner than in
-// Global, so they are per mode; the shared linear fill of int64 loses at SSE and NEON at
-// every length.
+// The score-only and linear hard shared fills of alphabets over 8 letters gather one scalar
+// per lane-cell where the own striped kernels read a profile row, so they pay only for
+// short pairs: cell caps per type, where the own kernel's speed sets the crossover (int16 /
+// int32 from L40-60, float32 to L150 on AVX2 and beyond L250 on AVX-512).  The two modes
+// cross at different lengths, so each has its own caps (score_* Local, score_*_g Global),
+// from gate_sweep at 1 thread and all with the own arm closing the gather (nighthaven,
+// solace, the M1): mostly Global keeps the shared fill longer -- linear float32 to L100 on
+// AVX2 and NEON where Local stops at L60 (L60 against L40 at SSE), double to L80 against
+// L40 on AVX2, L150 against L120 on AVX-512; affine float32 to L120 against L100 and int64
+// to L250 against L120 on NEON -- but int32 linear at SSE goes the other way (Local shared
+// to L60, Global L40).  Where the AVX2 hosts disagree (Tiger Lake's AVX2 keeps the shared
+// affine fills longer), nighthaven's crossover is the cap.  0 = never shared, kGateNoCap =
+// always.  Alphabets of up to 8 letters (DNA) take the mask-blend kernels instead, which
+// never gather: those have caps of their own -- the shared score kernel loses to the own
+// fill from 22 x 80 for double and int32 on AVX2 (the own kernel's single profile row wins
+// once B is long), and in Local mode sooner than in Global, so they are per mode; the
+// shared linear fill of int64 loses at SSE and NEON at every length.
 //
 // The shared soft pass's 5 (affine) or 2 (linear) double tables of Ws lanes: affine ~3
 // MiB per thread (8 with one thread), linear ~L140 (20000 cells) on AVX2 / AVX-512 /
