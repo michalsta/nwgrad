@@ -2524,9 +2524,39 @@ stops at row 0 before reading them). Bit-identical to the scalar fills on every 
 (`test_levels_match_scalar`: scores, alignments and gradients, double / float32 / int32,
 both tracebacks, both gap models; `test_score_only_equals_the_pointer_fill`).
 
+**Inter-pair: the hard and score-only Full fills (2026-11-03).** `InterJobT::align_mode`
+2: row 0 a free start (VM / H / D = 0 at every column, VY = -inf, no row-0 border loop),
+column 0 Global's chain, and `capture(i)` at row m_l takes the max over columns 0..n_l
+(each lane its own n_l when ragged) of max(VM, VX, VY) / H / D; the traceback side was
+already glocal (`adopt_interleaved` through `glocal_end_*`). Same gates as Global: linear
+needs >= 4 lanes (`linear_fill_ok_`), `inter_linear_cap<T, true>`, `nw_int_bound_check`.
+Not shared: soft (`inter_backend_` -1) and banded (`stream_inter_backend_` -1;
+`ensure_band_groups_` keeps glocal out of the shared affine band groups). Bit-identical to
+striped (`test_interpair_matches_striped`, `test_interpair_every_level`, fuzz_fill
+`--mode glocal` 1000/1000). Found on the way and fixed: the per-pair score-only kernels
+skipped column 0 as an end (A entirely gapped against the free B), -23.900000000000013
+for -23.9 (`test_score_only_end_at_column_0`).
+
+`tools/bench_glocal.py` (200k Manakov pairs, PosimiR's model: L position sets + an edge
+set, one step = set_params + score_and_grad + scores + weighted_grad, best of 5; the
+baseline `free` is PosimiR's emulation, mode global with free edge rows, inter-pair).
+Native glocal inter-pair / free, then per-pair striped / free:
+
+| host (level) | thr | float lin | float aff | double lin | double aff |
+|---|---|---|---|---|---|
+| nighthaven (avx2) | 1 | 0.887 / 2.18 | 0.889 / 2.41 | 0.913 / 1.76 | 0.949 / 1.90 |
+| nighthaven (avx2) | 6 | 0.903 / 2.11 | 0.910 / 2.37 | 0.905 / 1.67 | 0.999 / 1.98 |
+| solace WSL (avx512) | 1 | 0.880 / 2.76 | 0.894 / 2.96 | 0.900 / 2.23 | 0.926 / 2.22 |
+| solace WSL (avx512) | 8 | 0.862 / 2.77 | 0.861 / 2.96 | 0.933 / 2.21 | 0.971 / 2.32 |
+
+(free float 6 thr: 31.6 ms per step on nighthaven; control arm within 0.6% on nighthaven,
+3.3% on solace.) Every pair went to a shared group; scores equal to the emulation's.
+So native glocal is 3-14% faster than PosimiR's emulation, and without the inter-pair
+fill it would be 1.7-3x slower.
+
 **What is gated to the scalar or log path for this mode** (each a follow-up, in the
-order they pay): the inter-pair hard and
-soft fills (`inter_backend_` / `stream_inter_backend_` return -1); the scaled soft
+order they pay): the inter-pair soft fills and the banded inter-pair fills
+(`inter_backend_` / `stream_inter_backend_` return -1); the scaled soft
 kernels (`run_fwdbwd` takes the log path, so `soft_scaled_used()` is false and
 `soft_impl="scaled"` does not raise); Hirschberg (an explicit request throws, `kDefaultTb`
 is Pointers: the form is a glocal forward scan to the best end column, the same scan on

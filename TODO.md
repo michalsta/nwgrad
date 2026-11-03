@@ -322,11 +322,13 @@ Tracks landed on branch `tracks` (2026-10-11; see AGENTS.md, "Tracks").  Deferre
   PosimiR's second DP mode.  STARTED 2026-11-01 on branch `feat/glocal` as a third
   `AlignMode` (AGENTS.md "Glocal mode"): the scalar fills, both tracebacks, the log-space
   soft path, the batch and streaming surfaces and the Python functions are in and tested
-  against an exhaustive oracle.  Not yet: the leveled striped / score / pointer kernels,
-  the inter-pair fills, the scaled soft kernels (per-pair and inter-pair), Hirschberg and
+  against an exhaustive oracle.  Since then: the leveled striped / score / pointer
+  kernels and the inter-pair hard and score-only Full fills (2026-11-03; 3-14% faster than
+  PosimiR's global + FREE emulation on nighthaven and solace).  Not yet: the inter-pair
+  soft and banded fills, the scaled soft kernels (per-pair and inter-pair), Hirschberg and
   Grid, the guide-banded row kernels -- each falls back to the scalar or log path for
-  this mode (or throws, for an explicit Hirschberg request), so glocal is correct but
-  slow until they are ported.
+  this mode (or throws, for an explicit Hirschberg request).  Then PosimiR's backend can
+  switch from the emulation to `mode="glocal"`.
 - **Fleet runs not yet done: spot (neon) and solace (avx512).**  Correctness
   (`ctest`, `NWGRAD_FORCE_KERNEL=simd pytest tests/Python`) and `tools/bench_tracks.py`.
   Everything on the branch was verified on sse2 (skynet, wloczykij) and avx2 (nighthaven).
