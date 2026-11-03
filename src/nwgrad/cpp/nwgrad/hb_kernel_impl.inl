@@ -590,6 +590,7 @@ static void hb_scan_impl(HbScanJob<T>& job) {
     // The empty local alignment (score 0 at the origin) is the default answer.
     job.best = T(0); job.best_i = 0; job.best_j = 0;
     if (H == 0 || NC == 0) return;      // no interior cell to score
+    const int G = job.glocal;           // 0, or Glocal's forward (1) / reverse (2) scan
 
     const int seg = (NC + W - 1) / W;
     const std::size_t sw = (std::size_t)seg * W;
@@ -627,7 +628,7 @@ static void hb_scan_impl(HbScanJob<T>& job) {
     // Local: M = 0 for every real column (a fresh alignment may start anywhere), X = Y =
     // -inf.  Global: the same Y-gap-open series hb_sweep_striped builds, so the reverse
     // pass computes the suffixes' global alignment.  Column 0 is held in the border scalars.
-    if constexpr (Local) {
+    if (Local || G == 1) {   // (Glocal's forward scan: row 0 a free start, as Local's)
         for (int l = 0; l < W; ++l)
             for (int s = 0; s < seg; ++s) {
                 const int c = l * seg + s + 1;
@@ -672,7 +673,7 @@ static void hb_scan_impl(HbScanJob<T>& job) {
         padm = striped_pad_into<T, Sat>(rows + 8 * rs, NC, seg, W);
     }
 
-    T gbest = T(0); int gi = 0, gj = 0;
+    T gbest = G ? NINF : T(0); int gi = 0, gj = 0;
 
     for (int t = 0; t < H; ++t) {
         const T* sub;
@@ -793,12 +794,14 @@ static void hb_scan_impl(HbScanJob<T>& job) {
         }   // Pmax
 
         // ── per-row argmax over the row's cells, leftmost-column per lane ────────
+        // (Glocal: the last row only.)
+        if (G && t != H - 1) { std::swap(pM, cM); std::swap(pX, cX); std::swap(pY, cY); bM = nbM; bX = nbX; bY = nbY; continue; }
         vd vbest(NINF), vbcol(T(0));
         for (int s = 0; s < seg; ++s) {
             vd mm; mm.copy_from(cM + (std::size_t)s * W, stdx::element_aligned);
             vd xx; xx.copy_from(cX + (std::size_t)s * W, stdx::element_aligned);
-            vd yy; yy.copy_from(cY + (std::size_t)s * W, stdx::element_aligned);
-            vd here = stdx::max(stdx::max(mm, xx), yy);
+            vd here = stdx::max(mm, xx);
+            if (G != 2) { vd yy; yy.copy_from(cY + (std::size_t)s * W, stdx::element_aligned); here = stdx::max(here, yy); }
             if constexpr (nw_is_int<T>) { vd pv; pv.copy_from(padm + (std::size_t)s * W, stdx::element_aligned); here = vadd<Sat>(here, pv); }
             const vd colv = vlane * T(seg) + T(s + 1);     // column l*seg + s + 1, per lane
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
@@ -819,6 +822,10 @@ static void hb_scan_impl(HbScanJob<T>& job) {
         T rowbest = NINF; T rowcol = 0;
         for (int l = 0; l < W; ++l)
             if (rb[l] > rowbest) { rowbest = rb[l]; rowcol = cb[l]; }
+        if (G) {   // column 0 is a candidate too, and the first: it wins ties
+            const T c0 = G == 2 ? std::max(nbM, nbX) : std::max({nbM, nbX, nbY});
+            if (c0 >= rowbest) { rowbest = c0; rowcol = 0; }
+        }
         // global update, strict > so the topmost row and (via rowcol) leftmost column win
         if (rowbest > gbest) { gbest = rowbest; gi = t + 1; gj = (int)rowcol; }
 

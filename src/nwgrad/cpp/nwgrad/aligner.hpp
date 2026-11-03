@@ -1526,8 +1526,7 @@ private:
     static constexpr TracebackMode kGridFallbackTb =
         std::is_same_v<T, float> ? TracebackMode::HirschbergPmax : TracebackMode::Hirschberg;
     static constexpr TracebackMode kDefaultTb =
-        AM == AlignMode::Glocal ? TracebackMode::Pointers   // no Hirschberg form yet
-        : (GM == GapModel::Affine && AB == AlignBand::Full && AM == AlignMode::Global)
+        (GM == GapModel::Affine && AB == AlignBand::Full && AM == AlignMode::Global)
             ? (nw_is_int<T> ? TracebackMode::HirschbergPmax
                             : TracebackMode::Grid)
         : (GM == GapModel::Affine && AB == AlignBand::Full && (std::is_same_v<T, float> || nw_is_int<T>))
@@ -3479,9 +3478,10 @@ private:
     // topmost/leftmost tie-break — so which runs is a speed choice, exactly as elsewhere.
     template <bool Sat>
     void hb_scan(DpBuffer& buf, bool local, bool reverse, int i0, int i1, int j0, int j1,
-                 T& best, int& bi, int& bj) {
+                 T& best, int& bi, int& bj, int glocal = 0) {
         const int H = i1 - i0, NC = j1 - j0;
-        if (const LevelKernels* K = hb_scan_level()) {   // (Glocal's scans: hb_scan_scalar)
+        const LevelKernels* K = (glocal && (H == 0 || NC == 0)) ? nullptr : hb_scan_level();
+        if (K) {
             HbScanJob<T> job{}; job.sat = sat_;
             job.a = a_idx_.data(); job.b = b_idx_.data();
             job.blk = blkT_; job.nalpha = nalpha_;
@@ -3493,13 +3493,14 @@ private:
             else         { job.a_start = i0;     job.a_step = +1; job.b_start = j0;     job.b_step = +1; }
             job.H = H; job.ncols = NC; job.local = local ? 1 : 0;
             job.pmax = hb_pmax() ? 1 : 0;
+            job.glocal = glocal;
             job.buf = &buf;
             if (tr_) { hb_reverse_rows_(); fill_track_job_(job.tr, false, 0); }
             K->template of<T>().hb_scan(job);
             best = job.best; bi = job.best_i; bj = job.best_j;
             return;
         }
-        hb_scan_scalar<Sat>(buf, local, reverse, i0, i1, j0, j1, best, bi, bj);
+        hb_scan_scalar<Sat>(buf, local, reverse, i0, i1, j0, j1, best, bi, bj, glocal);
     }
 
     // Scalar reference endpoint scan.  Rolling rows only; the borders and the M-clamp
@@ -3602,15 +3603,16 @@ private:
     // aligns the box A x B[js..je), which scores exactly S (a box path leaving its corner
     // by a horizontal move is no glocal path, but it costs go_a + ge_a >= 0 more than the
     // path starting one column later, so it is optimal only when that is 0 -- and such
-    // leading moves, free, are dropped).  Both scans are scalar; O(n) memory.
+    // leading moves, free, are dropped).  Both scans are hb_scan's (leveled, bit-identical
+    // to hb_scan_scalar); O(n) memory.
     template <bool Sat>
     void viterbi_affine_hirschberg_glocal(DpBuffer& buf) {
         hops_.clear();
         hb_start_i_ = 0; hb_start_j_ = 0;
         T s_fwd; int ie, je;
-        hb_scan_scalar<Sat>(buf, false, false, 0, m_, 0, n_, s_fwd, ie, je, 1);
+        hb_scan<Sat>(buf, false, false, 0, m_, 0, n_, s_fwd, ie, je, 1);
         T s_rev; int p, q;
-        hb_scan_scalar<Sat>(buf, false, true, 0, m_, 0, je, s_rev, p, q, 2);
+        hb_scan<Sat>(buf, false, true, 0, m_, 0, je, s_rev, p, q, 2);
         int js = je - q;
         hb_solve<Sat>(buf, 0, m_, js, je, false, false);
         size_t lead = 0;

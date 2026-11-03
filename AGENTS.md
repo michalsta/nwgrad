@@ -2530,8 +2530,7 @@ column 0 Global's chain, and `capture(i)` at row m_l takes the max over columns 
 (each lane its own n_l when ragged) of max(VM, VX, VY) / H / D; the traceback side was
 already glocal (`adopt_interleaved` through `glocal_end_*`). Same gates as Global: linear
 needs >= 4 lanes (`linear_fill_ok_`), `inter_linear_cap<T, true>`, `nw_int_bound_check`.
-Not shared: soft (`inter_backend_` -1) and banded (`stream_inter_backend_` -1;
-`ensure_band_groups_` keeps glocal out of the shared affine band groups). Bit-identical to
+(Soft and banded lanes followed the next day, below.) Bit-identical to
 striped (`test_interpair_matches_striped`, `test_interpair_every_level`, fuzz_fill
 `--mode glocal` 1000/1000). Found on the way and fixed: the per-pair score-only kernels
 skipped column 0 as an end (A entirely gapped against the free B), -23.900000000000013
@@ -2554,14 +2553,38 @@ Native glocal inter-pair / free, then per-pair striped / free:
 So native glocal is 3-14% faster than PosimiR's emulation, and without the inter-pair
 fill it would be 1.7-3x slower.
 
-**What is gated to the scalar or log path for this mode** (each a follow-up, in the
-order they pay): the inter-pair soft fills and the banded inter-pair fills
-(`inter_backend_` / `stream_inter_backend_` return -1); the scaled soft
-kernels (`run_fwdbwd` takes the log path, so `soft_scaled_used()` is false and
-`soft_impl="scaled"` does not raise); Hirschberg (an explicit request throws, `kDefaultTb`
-is Pointers: the form is a glocal forward scan to the best end column, the same scan on
-the reversed sequences for the start column, then the global box, as Local's); Grid; the
-guide-banded and row-wise row kernels (the scalar banded fill runs instead).
+**Soft, banded, row kernels, Hirschberg (2026-11-03).** No path is gated for this mode
+any more except Grid (Global only, as for Local).
+- *Scaled soft*, per pair (`soft_kernel_impl.inl`) and inter-pair (`inter_soft_impl.inl`):
+  row 0 all ones (Local's), column 0 Global's chain, no free start inside, Z = row m's
+  sum (`rowsum[m]`, per lane `rs[m_l]`), the backward seeded with ones along row m only.
+  The gap targets split as in the log path: `kmin` (rows whose horizontal moves count:
+  1 for Local and Glocal) and `kmin0` (column 0's vertical moves: 1 for Local only).
+  Tolerance-equal to the log path (`test_soft_scaled.py` runs every mode test on glocal);
+  20k DNA pairs, per pair, 4 threads, skynet: log 5.79 s -> scaled 0.24 s.
+- *Banded inter-pair lanes*: the fill already had Glocal's borders (`align_mode` 2) and
+  the end is taken at adoption (`glocal_end_*`), so only the gates went
+  (`stream_inter_backend_`, `ensure_band_groups_`); bit-identical to striped
+  (`test_guided_matches[glocal]`, `test_banded_matches`).
+- *Row-wise / guide-banded row kernels* (`viterbi_affine_simd`): Global's column-0 chain,
+  row 0 M = 0 and no Y series, `banded_row_global`, the end by `glocal_end_affine_`.
+- *Hirschberg*: `viterbi_affine_hirschberg_glocal` / the Glocal branch of
+  `viterbi_linear_hirschberg`.  A forward scan from a free row 0 gives the end column je
+  of row m (the first holding the row's best) and the score; a reverse scan from (m, je)
+  gives the start column js on row 0, where a path may leave only by a diagonal or a
+  vertical move (so Y is not a candidate there; linear: the last row is done by hand from
+  the reverse sweep's row 1); then the global box A x B[js..je).  A box path that leaves
+  its corner horizontally is no glocal path, but costs go_a + ge_a >= 0 more than the one
+  starting a column later, so it is optimal only at zero cost, and such free leading
+  moves are dropped.  Affine scans: `hb_scan` with `glocal` 1 / 2 (the leveled kernel's
+  `HbScanJob::glocal`, bit-identical to `hb_scan_scalar`); linear: `lhb_sweep(free0)`.
+  Tests: optimal score, the path scores it, grad . params = score, hb_cutoff 2, zero
+  gap costs (`test_hirschberg_finds_an_optimal_path`), every level vs scalar
+  (`test_hirschberg_levels_match_scalar`), the tracked and integer suites.
+  `kDefaultTb` is now Local's rule for Glocal too: affine Full at float32 / integer T
+  resolves `auto` to `hirschberg_pmax` (above the pointer-cells threshold), else Pointers.
+  2000 x 8000 float32 pair, skynet: pointers 0.053 s, hirschberg 0.080, pmax 0.067
+  (Local 0.059 / 0.096 / 0.084).
 
 ### Python bindings (`py_exports.cpp`)
 

@@ -499,3 +499,24 @@ def test_score_only_end_at_column_0(sfx):
     assert ref == pytest.approx(ref_bf, abs=1e-5)
     for lv in nwgrad.available_isa_levels():
         assert cls(a, b, p, mode="glocal", kernel=lv).align() == ref, lv
+
+
+@pytest.mark.parametrize("gap_model", ["affine", "linear"])
+@pytest.mark.parametrize("traceback", ["hirschberg", "hirschberg_pmax"])
+@pytest.mark.parametrize("cls", [nwgrad.SeqPairDouble, nwgrad.SeqPair])
+def test_hirschberg_levels_match_scalar(generic_matrix, gap_model, traceback, cls):
+    # the end-point scans and sweeps run leveled where the backend has them: the same
+    # path and score, bit for bit, as the scalar backend
+    p = params(generic_matrix, 2.0, 1.0, 1.5, 0.5)
+    rng = random.Random(8)
+    levels = [lv for lv in nwgrad.available_isa_levels() if lv != "scalar_fallback"]
+    for _ in range(30):
+        a = "".join(rng.choice(ALPHABET) for _ in range(rng.randint(1, 60)))
+        b = "".join(rng.choice(ALPHABET) for _ in range(rng.randint(1, 120)))
+        out = []
+        for lv in ["scalar_fallback"] + levels:
+            sp = cls(a, b, p, gap_model=gap_model, mode="glocal", traceback=traceback, kernel=lv)
+            sp.hb_cutoff = 2
+            s = sp.align()
+            out.append((s, sp.aligned()))
+        assert all(o == out[0] for o in out[1:])
