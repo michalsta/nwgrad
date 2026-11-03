@@ -918,7 +918,7 @@ private:
             }
             if constexpr (AB == AlignBand::Full) {
                 if (grad_mode_ == GradMode::None && has_inter_score_(K)) {
-                    if (!inter_score_ok<T>(na, M, n, GM == GapModel::Affine, AM == AlignMode::Local, K.level)) {   // short pairs only
+                    if (!inter_score_ok<T>(na, M, n, GM == GapModel::Affine, AM == AlignMode::Local, s_.n_threads == 1, K.level)) {   // short pairs only
                         for (size_t l = 0; l < real; ++l) own(elig[s + l]);
                         continue;
                     }
@@ -2515,7 +2515,7 @@ private:
                     n = std::max(n, nb[l]);
                     ragged |= nb[l] != nb[0];
                 }
-                if (!inter_score_ok<T>(alpha_->size(), M, n, GM == GapModel::Affine, AM == AlignMode::Local, plan_.backend)) {   // short pairs only
+                if (!inter_score_ok<T>(alpha_->size(), M, n, GM == GapModel::Affine, AM == AlignMode::Local, s_.n_threads == 1, plan_.backend)) {   // short pairs only
                     for (size_t l = 0; l < real; ++l) own(plan_.elig[s + l]);
                     continue;
                 }
