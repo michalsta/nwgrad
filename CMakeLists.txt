@@ -61,8 +61,21 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
     # baseline is the x86-64 default (SSE2); the other levels get their flags per-file.
     # sse4 is the x86-64-v2 feature set (SSE4.2 + POPCNT), spelled as -m flags like the
     # others so no -march/-mtune change rides along.
+    # The JCC padding below is for Skylake-derived cores, which all run the avx2 level or
+    # higher; baseline and sse4 run on the others -- Piledriver, pre-Haswell Intel, Atoms.
+    # There gas's default padding, segment prefixes on the instructions before a jump, hurts:
+    # Bulldozer-family decoders slow down on more than three prefixes, and a cs cs cs in
+    # front of a 66-prefixed SSE op is four.  On skynet (Piledriver) an unrelated 30-byte
+    # shift put them into the soft linear fill's hot loop, 1.1-1.2x slower.  NOP padding in
+    # these two TUs instead, skynet at 1 thread: bench_int (hard, score, stream; 5 types,
+    # DNA and protein, both modes and gap models) median 0.97-0.98, one arm in ten 1.7-4x
+    # faster (local affine float32/double hard 0.31-0.44, DNA int16 score 0.26), none slower
+    # than its control; soft fills median 0.98, to 0.75.
+    set(NWGRAD_PAD_NOP_OPTS "$<$<CXX_COMPILER_ID:GNU>:-Wa,-malign-branch-prefix-size=0>")
+    set_source_files_properties(${NWGRAD_LEVEL_DIR}/level_baseline.cpp PROPERTIES
+        COMPILE_OPTIONS "${NWGRAD_PAD_NOP_OPTS}")
     set_source_files_properties(${NWGRAD_LEVEL_DIR}/level_sse4.cpp    PROPERTIES
-        COMPILE_OPTIONS "-msse4.2;-mpopcnt")
+        COMPILE_OPTIONS "-msse4.2;-mpopcnt;${NWGRAD_PAD_NOP_OPTS}")
     # The avx2 and avx512 levels are the ones Skylake-derived cores run (6th-10th gen Core,
     # Skylake-SP/Cascade Lake Xeons), whose JCC-erratum microcode keeps any jump that crosses
     # or ends on a 32-byte boundary out of the uop cache: a hot loop that lands there runs from
