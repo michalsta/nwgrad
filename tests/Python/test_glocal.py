@@ -361,3 +361,24 @@ def test_levels_match_scalar(generic_matrix, gap_model, traceback):
                 assert s1 == s0, (lv, a, b)
                 assert sp.aligned() == al0, (lv, a, b)
                 assert np.array_equal(np.asarray(g1.to_dict()["matrix"]), np.asarray(g0.to_dict()["matrix"])), (lv, a, b)
+
+
+@pytest.mark.parametrize("sfx", ["_double", ""])
+def test_score_only_end_at_column_0(sfx):
+    # A long against a 1-residue B under a harsh mismatch: the optimum gaps all of A and
+    # ends at column 0 (-(go_b + m*ge_b), the closed-form border), a hair above the path
+    # through column 1, whose chain rounds differently.  The score-only kernels once
+    # scanned columns 1..n of the last row only and returned the column-1 value.
+    m = np.full((4, 4), -1.0)
+    np.fill_diagonal(m, 2.0)
+    p = nwgrad.AlignParams(nwgrad.SubstMatrix(m, alphabet=ALPHABET), gap_open_a=3.0, gap_extend_a=1.0,
+                           gap_open_b=3.9000000000000004, gap_extend_b=0.8)
+    cls = getattr(nwgrad, "SeqPair" + ("Double" if sfx else ""))
+    fn = getattr(nwgrad, "glocal_score_affine" + sfx)
+    a, b = "GGCAAGCACTTAGAAGCAACTATCG", "C"
+    ref = cls(a, b, p, mode="glocal", traceback="pointers").align()
+    assert fn(a, b, p) == ref
+    ref_bf = max(s for _, s, _ in bf._glocal_scored_paths(a, b, p, True))
+    assert ref == pytest.approx(ref_bf, abs=1e-5)
+    for lv in nwgrad.available_isa_levels():
+        assert cls(a, b, p, mode="glocal", kernel=lv).align() == ref, lv

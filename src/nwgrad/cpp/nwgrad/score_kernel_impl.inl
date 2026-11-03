@@ -280,7 +280,7 @@ static void score_affine_striped(ScoreJob<T>& job) {
             vy.copy_from(pY + (std::size_t)s * W, stdx::element_aligned);
             vb = stdx::max(vb, padded(stdx::max(stdx::max(vm, vx), vy), s));
         }
-        T best = NINF;
+        T best = std::max({bM, bX, bY});   // column 0 of the last row: an end too (A all gapped)
         for (int q = 0; q < W; ++q) best = std::max(best, static_cast<T>(vb[q]));
         job.score = best;
     } else {
@@ -577,7 +577,7 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
             vd v; v.copy_from(pD + (std::size_t)s * W, stdx::element_aligned);
             vb = stdx::max(vb, padded(v, s));
         }
-        T best = NINF;
+        T best = bD;   // column 0 of the last row: an end too (A all gapped)
         for (int q = 0; q < W; ++q) best = std::max(best, static_cast<T>(vb[q]));
         job.score = best;
     } else {
@@ -765,7 +765,7 @@ static void score_affine_striped_pos_fp(ScoreJob<T>& job) {
             vy.copy_from(pY + (std::size_t)s * W, stdx::element_aligned);
             vb = stdx::max(vb, padded(stdx::max(va, vy), s));
         }
-        T best = NINF;
+        T best = bD;   // column 0 of the last row: an end too (A all gapped)
         for (int q = 0; q < W; ++q) best = std::max(best, static_cast<T>(vb[q]));
         job.score = best;
     } else {
