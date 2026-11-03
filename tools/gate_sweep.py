@@ -9,7 +9,8 @@ Every gate (nwgrad._tuning) picks between fills that are bit-identical, so for e
 configuration (level, threads, section, fixture, type, gap model, mode, lengths) three
 arms run in ONE process, same binary, interleaved, best of --reps:
   inter     every inter-pair cap off: any eligible pair joins a shared group
-  own       inter_group_bytes = 0 (and inter_soft_bytes): every pair its own fill
+  own       inter_group_bytes = 0 (and inter_soft_bytes, inter_score_gather_cells): every
+            pair its own fill (not in the dna-score sections: no override closes them)
   default   the compiled gates
 and for the striped-vs-scalar linear gate (section striped-min), own fill only:
   striped   linear_striped_min_n = 0 (the striped kernel from any length)
@@ -105,7 +106,10 @@ INTER_OFF = dict(inter_group_bytes=None, inter_soft_bytes=None, inter_score_gath
                  inter_linear_int_gather_cells=None, inter_linear_f32_gather_cells=None,
                  inter_linear_f64_gather_cells=None, inter_global_linear_int_cells=None,
                  inter_global_linear_f32_cells=None)
-OWN = dict(inter_group_bytes=0, inter_soft_bytes=0)
+# A score-only call is exempt from the byte budget (it keeps rows, not tables), so the own
+# arm closes the score gather cap too; the DNA score caps (mask blend) have no override,
+# so in the dna-score sections own runs the compiled gates.
+OWN = dict(inter_group_bytes=0, inter_soft_bytes=0, inter_score_gather_cells=0)
 ARMS_INTER = {"inter": INTER_OFF, "own": OWN, "default": {}}
 ARMS_MINN = {"striped": dict(OWN, linear_striped_min_n=None),
              "scalar": dict(OWN, linear_striped_min_n=10 ** 6),
