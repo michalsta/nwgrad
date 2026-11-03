@@ -2384,7 +2384,7 @@ private:
                     // float32 took some lanes of takes them again, and its refused lanes run
                     // their own path in double both times.
                     bool f32 = false;
-                    if (soft_f32_())
+                    if (soft_f32_() && soft_f32_fits(K.level, alpha_->size(), M, n, GM == GapModel::Linear, true))
                         for (size_t l = 0; l < real; ++l) f32 |= !(flags_[elig[s + l]] & kF32Refused);
                     if (f32) {
                         run(sgf);

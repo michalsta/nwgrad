@@ -4783,8 +4783,12 @@ private:
             // No refusal state is carried between runs (a shared count made a batch's
             // precision per pair depend on thread timing); a batch skips the attempt for the
             // pairs that refused it before, by turning soft_f32 off for them.
+            // Short pairs on the wide levels run double directly (soft_f32_fits).
             if constexpr (std::is_same_v<T, float>)
-                if (soft_f32_) ok = fwdbwd_scaled<float>(buf);
+                if (soft_f32_ && soft_f32_fits((backend_ == kBackendAuto) ? global_default_backend() : backend_,
+                                               static_cast<size_t>(nalpha_), m_, n_,
+                                               GM == GapModel::Linear, false))
+                    ok = fwdbwd_scaled<float>(buf);
             if (!ok) ok = fwdbwd_scaled<double>(buf);
             if (ok) {
                 soft_scaled_used_ = soft_counts_ready_ = true;
