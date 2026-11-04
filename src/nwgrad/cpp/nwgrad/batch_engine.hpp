@@ -831,7 +831,7 @@ private:
             return (soft_fn_ok_(K) && soft_lanes_of_(K) > 0 && s_.soft_impl != SoftImpl::Log && !banded) ? backend : -1;
         if (inter_w_(K) <= 0) return -1;
         if (GM == GapModel::Linear &&
-            (banded || (AM == AlignMode::Global && (inter_w_(K) < 4 || params.matrix.size() > 8))))
+            (banded || (AM != AlignMode::Local && (inter_w_(K) < 4 || params.matrix.size() > 8))))
             return -1;
         return backend;
     }
@@ -872,7 +872,7 @@ private:
             // are gated by inter_score_ok in the loop)
             if constexpr (GM == GapModel::Linear)
                 if (grad_mode_ == GradMode::Hard &&
-                    (la + 1) * (lb + 1) > inter_linear_cap<T, AM == AlignMode::Global>(params.matrix.size(), backend)) {
+                    (la + 1) * (lb + 1) > inter_linear_cap<T, AM != AlignMode::Local>(params.matrix.size(), backend)) {
                     other.push_back(i); continue;
                 }
             elig.push_back(i);
@@ -991,7 +991,7 @@ private:
                 const size_t cgap = trk ? 4 * (static_cast<size_t>(M) + 1) : 4;
                 slogz.resize(W); scnt.resize(W * ccnt); sgap.resize(W * cgap); sok.resize(W);
                 sg.run(K, n, M, W, a.data(), m.data(), b.data(), ragged ? nb.data() : nullptr,
-                       (AM == AlignMode::Local) ? 1 : 0, slogz.data(), scnt.data(), sgap.data(),
+                       (AM == AlignMode::Local) ? 1 : (AM == AlignMode::Glocal ? 2 : 0), slogz.data(), scnt.data(), sgap.data(),
                        sok.data(), nullptr, trk ? lrsp.data() : nullptr, trk ? lrwp.data() : nullptr);
                 for (size_t l = 0; l < real; ++l) {
                     const size_t i = elig[s + l];
@@ -1017,7 +1017,7 @@ private:
                     // Score only: one row per table, no adopt / traceback.
                     InterJobT<T> job{};
                     job.a = a.data(); job.m = m.data(); job.b = b.data(); job.n = n; job.M = M;
-                    job.align_mode = (AM == AlignMode::Local) ? 1 : 0;
+                    job.align_mode = (AM == AlignMode::Local) ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
                     if (ragged) job.nb = nb.data();
                     set_inter_params_(job, params, blkT);
                     if (trk) {
@@ -1060,7 +1060,7 @@ private:
             }
             InterJobT<T> job{};
             job.a = a.data(); job.m = m.data(); job.b = b.data(); job.n = n; job.M = M;
-            job.align_mode = (AM == AlignMode::Local) ? 1 : 0;
+            job.align_mode = (AM == AlignMode::Local) ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
             if (ragged) job.nb = nb.data();
             if (trk) {
                 for (size_t l = real; l < static_cast<size_t>(W); ++l) tj[l] = tj[real - 1];
@@ -2207,7 +2207,7 @@ private:
     // 0.54-0.85 at 1 thread and 0.67-0.87 at 12 for every type, score-only 0.09-0.78 — so the
     // exclusion is gone, and the per-pair caps in inter_eligible_ take the bands that lose.
     bool linear_fill_ok_(const LevelKernels& K) const {
-        return !(GM == GapModel::Linear && AM == AlignMode::Global && inter_w_(K) < 4);
+        return !(GM == GapModel::Linear && AM != AlignMode::Local && inter_w_(K) < 4);   // Glocal: Global's recurrence
     }
     // The vector backend the batch's inter-pair fills run on, or -1 (every pair its own
     // fill).
@@ -2240,7 +2240,7 @@ private:
         // level and type, inter_linear_cap (simd_levels.hpp).
         if constexpr (GM == GapModel::Linear)
             if (grad_mode_ != GradMode::Soft &&
-                (len_a(i) + 1) * (len_b(i) + 1) > inter_linear_cap<T, AM == AlignMode::Global>(alpha_->size(), K.level))
+                (len_a(i) + 1) * (len_b(i) + 1) > inter_linear_cap<T, AM != AlignMode::Local>(alpha_->size(), K.level))
                 return false;
         // Hirschberg pairs past the cutoff split: no shared fill.
         return !hb_splits(tb_resolved_, s_.traceback == TracebackMode::Default ? FullAl::kAutoPointerCells : 0, s_.hb_cutoff, len_a(i), len_b(i));
@@ -2380,7 +2380,7 @@ private:
                 const bool skip_fill = no_viterbi || !linear_fill_ok_(K);
                 InterJobT<T> job{};
                 job.a = a.data(); job.m = m.data(); job.b = b.data(); job.n = n; job.M = M;
-                job.align_mode = (AM == AlignMode::Local) ? 1 : 0;
+                job.align_mode = (AM == AlignMode::Local) ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
                 if (ragged) job.nb = nb.data();
                 auto& buf = w.buf;
                 const bool tl = tracked_ && !skip_fill;   // tracked lanes, set up before the fill
@@ -2604,7 +2604,7 @@ private:
                 }
                 InterJobT<T> job{};
                 job.a = a.data(); job.m = m.data(); job.b = b.data(); job.n = n; job.M = M;
-                job.align_mode = (AM == AlignMode::Local) ? 1 : 0;
+                job.align_mode = (AM == AlignMode::Local) ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
                 if (tracked_) job.tr = w.tjobs.data();
                 block_for_(job, blkT);   // affine: this path runs for affine only
                 wire_inter_tables_(job, w.buf, static_cast<size_t>(M + 1) * (n + 1) * W);
@@ -2680,7 +2680,7 @@ private:
                 }
                 InterJobT<T> job{};
                 job.a = a.data(); job.m = m.data(); job.b = b.data(); job.n = n; job.M = M;
-                job.align_mode = (AM == AlignMode::Local) ? 1 : 0;
+                job.align_mode = (AM == AlignMode::Local) ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
                 if (ragged) job.nb = nb.data();
                 if (tracked_) {
                     tracked_lanes_(w, w.lanes, W, real, PL.elig, s);

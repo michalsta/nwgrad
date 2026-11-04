@@ -228,21 +228,26 @@ void Aligner<GM, AM, AB, T>::viterbi_affine_simd(DpBuffer& buf, const LevelKerne
         band_fill(buf.VY, NINF());
     }
 
-    if constexpr (AM == AlignMode::Global) {
+    if constexpr (AM != AlignMode::Local) {
+        // Global, and Glocal's column 0 (its row 0 is a free start: M = 0, no Y).
         at(buf.VM, 0, 0) = 0.0;
         const int bi = border_rows(), bj = border_cols();
         if (tr_) {
             for (int i = 1; i <= bi; ++i) at(buf.VX, i, 0) = tbx0_[static_cast<size_t>(i)];
-            for (int j = 1; j <= bj; ++j) at(buf.VY, 0, j) = -(tgoa_[0] + static_cast<T>(j) * tgea_[0]);
+            if constexpr (AM == AlignMode::Global)
+                for (int j = 1; j <= bj; ++j) at(buf.VY, 0, j) = -(tgoa_[0] + static_cast<T>(j) * tgea_[0]);
         } else {
             // The closed-form borders in T, as viterbi_affine casts them (go + T(i)*ge).
             const T go_a0 = static_cast<T>(params_->gap_open_a), ge_a0 = static_cast<T>(params_->gap_extend_a);
             const T go_b0 = static_cast<T>(params_->gap_open_b), ge_b0 = static_cast<T>(params_->gap_extend_b);
             for (int i = 1; i <= bi; ++i)
                 at(buf.VX, i, 0) = -(go_b0 + static_cast<T>(i) * ge_b0);
-            for (int j = 1; j <= bj; ++j)
-                at(buf.VY, 0, j) = -(go_a0 + static_cast<T>(j) * ge_a0);
+            if constexpr (AM == AlignMode::Global)
+                for (int j = 1; j <= bj; ++j)
+                    at(buf.VY, 0, j) = -(go_a0 + static_cast<T>(j) * ge_a0);
         }
+        if constexpr (AM == AlignMode::Glocal)
+            for (int j = 0; j <= n_; ++j) at(buf.VM, 0, j) = static_cast<T>(0);
     } else {
         for (int i = 0; i <= m_; ++i) at(buf.VM, i, 0) = 0.0;
         for (int j = 0; j <= n_; ++j) at(buf.VM, 0, j) = 0.0;
@@ -326,6 +331,8 @@ void Aligner<GM, AM, AB, T>::viterbi_affine_simd(DpBuffer& buf, const LevelKerne
         if      (vm >= vx && vm >= vy) best_tbl_ = TBTable::M;
         else if (vx >= vy)             best_tbl_ = TBTable::X;
         else                            best_tbl_ = TBTable::Y;
+    } else if constexpr (AM == AlignMode::Glocal) {
+        glocal_end_affine_(buf);
     } else {
         viterbi_score_ = best_local;
     }

@@ -178,7 +178,7 @@ struct ViterbiJob {
     const unsigned char* b; int n;
     const T* blk; int nalpha;               // substitution block, row-major nalpha×nalpha
     T go_a, ge_a, go_b, ge_b;               // gap penalties (in the Viterbi precision)
-    int   align_mode;                       // 0 = Global, 1 = Local
+    int   align_mode;                       // 0 = Global, 1 = Local, 2 = Glocal
     int   align_band;                       // 0 = Full,   1 = GuideBanded
     int   band;                             // half-width (band>0)
     const int* guide_j; int guide_len;      // guide path for GuideBanded (may be null)
@@ -237,7 +237,7 @@ struct ScoreJob {
     const unsigned char* b; int n;
     const T* blk; int nalpha;
     T go_a, ge_a, go_b, ge_b;
-    int local;                              // 0 = Global, 1 = Local
+    int local;                              // 0 = Global, 1 = Local, 2 = Glocal (AlignMode)
     int variant;                            // 0 auto, 1 two-pass, 2 fused three-state (measuring)
     DpBufferT<T>* buf;
     T score;                                // out
@@ -327,6 +327,10 @@ struct HbScanJob {
     int ncols;                              // columns in this block
     int local;                              // 1 = clamped local (forward end), 0 = global (reverse start)
     int pmax;                               // 1 = the prefix-max VY carry (HirschbergPmax)
+    // Glocal (local 0): 1 = the forward end scan (row 0 a free start: M = 0, no Y), 2 = the
+    // reverse start scan; either way only the LAST row is a candidate, column 0 first, and
+    // for 2 the Y state is not (a path leaves DP row 0 by a diagonal or vertical move).
+    int glocal = 0;
     DpBufferT<T>* buf;                      // scratch (striped rows, profile, open vector)
     // outputs: the best cell and its block-1-based coordinates.  Default 0 at (0,0), so
     // an all-nonpositive local block reports the empty alignment.
@@ -387,7 +391,7 @@ struct InterJobT {
     int M;                           // max m over the lanes (rows filled)
     const T* blk; int nalpha;        // substitution block, row-major nalpha x nalpha
     T go_a, ge_a, go_b, ge_b;
-    int align_mode;                  // 0 = Global, 1 = Local
+    int align_mode;                  // 0 = Global, 1 = Local, 2 = Glocal (row 0 a free start)
     int linear;                      // 1 = linear gaps: H in VM only (go_*, VX, VY unused)
     T* VM; T* VX; T* VY;             // (M+1)*(n+1)*W each
     T* best; int* best_i; int* best_j;   // W each, Local only

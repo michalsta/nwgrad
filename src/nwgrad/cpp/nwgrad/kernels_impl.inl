@@ -804,7 +804,10 @@ static inline const T* striped_row_profile(T* prof, const T* blk, int nalpha, co
 // sentinel are all local to T here, shadowing the file-scope double versions above.
 // Tr: a tracked problem (job.tr) — each row's penalties, border and profile row from
 // the track arrays, in the same expressions, so equal sets give the untracked tables.
-template <class T, bool Local, bool Tr = false, bool Sat = false>
+// Glocal (Local false): row 0 a free start (M = 0 at every column, no Y series), column 0
+// Global's chain, no clamp, and the end the best cell of row m in any state -- column 0
+// first, then the striped columns in column order with strict > (the scalar fill's scan).
+template <class T, bool Local, bool Tr = false, bool Sat = false, bool Glocal = false>
 static void striped_affine_full(ViterbiJob<T>& job) {
     using vd = stdx::native_simd<T>;
     const int W = (int)vd::size();                       // native T-lane count for this level
@@ -877,8 +880,8 @@ static void striped_affine_full(ViterbiJob<T>& job) {
                 const int j = l * seg + s + 1;
                 if (j <= n) {
                     const std::size_t k = (std::size_t)s * W + l;
-                    if constexpr (Local) z0M[off + k] = 0;
-                    else                 z0Y[off + k] = -(go_a + j * ge_a);
+                    if constexpr (Local || Glocal) z0M[off + k] = 0;
+                    else                           z0Y[off + k] = -(go_a + j * ge_a);
                 }
             }
     }
@@ -889,7 +892,8 @@ static void striped_affine_full(ViterbiJob<T>& job) {
     T bM = 0, bX = K_NINF, bY = K_NINF;
 
     T best_local = 0; int best_i = 0, best_j = 0, best_tbl = 0;
-    const T* pad = Local ? striped_pad<Sat>(buf.spad, n, seg, W) : nullptr;
+    const T* pad = (Local || Glocal) ? striped_pad<Sat>(buf.spad, n, seg, W) : nullptr;
+    if constexpr (Glocal) { best_local = 0; best_i = 0; best_j = 0; best_tbl = 0; }   // m == 0: row 0, (0, 0)
 
     for (int i = 1; i <= m; ++i) {
         if constexpr (Tr) {
@@ -1019,10 +1023,15 @@ static void striped_affine_full(ViterbiJob<T>& job) {
             if constexpr (Local)
                 striped_row_best<T, Sat>(cM, cX, cY, pad, seg, i, best_local, best_i, best_j, best_tbl);
         }
+        if constexpr (Glocal)
+            if (i == m) {   // the end: column 0 first (M > X > Y), then the striped columns
+                best_local = std::max(nbM, nbX); best_i = m; best_j = 0; best_tbl = (nbM >= nbX) ? 0 : 1;
+                if (seg > 0) striped_row_best<T, Sat>(cM, cX, cY, pad, seg, i, best_local, best_i, best_j, best_tbl);
+            }
         bM = nbM; bX = nbX; bY = K_NINF;
     }
 
-    if constexpr (Local) {
+    if constexpr (Local || Glocal) {
         job.score = best_local;
         job.best_i = best_i; job.best_j = best_j; job.best_tbl = best_tbl;
     } else {
@@ -1045,13 +1054,16 @@ static void striped_affine_full(ViterbiJob<T>& job) {
 // is not handled here (the caller routes it to the row-wise kernel).
 template <class T, bool Sat>
 static void striped_full_entry_impl(ViterbiJob<T>& job) {
+    const bool glocal = job.align_mode == 2;   // 0 Global, 1 Local, 2 Glocal
     if (job.tr.on()) {
-        if (job.align_mode) striped_affine_full<T, true, true, Sat>(job);
-        else                striped_affine_full<T, false, true, Sat>(job);
+        if (glocal)              striped_affine_full<T, false, true, Sat, true>(job);
+        else if (job.align_mode) striped_affine_full<T, true, true, Sat>(job);
+        else                     striped_affine_full<T, false, true, Sat>(job);
         return;
     }
-    if (job.align_mode) striped_affine_full<T, true, false, Sat>(job);
-    else                striped_affine_full<T, false, false, Sat>(job);
+    if (glocal)              striped_affine_full<T, false, false, Sat, true>(job);
+    else if (job.align_mode) striped_affine_full<T, true, false, Sat>(job);
+    else                     striped_affine_full<T, false, false, Sat>(job);
 }
 // job.sat (an nw_sat type past the quarter-range bound): the saturating variant.
 template <class T>

@@ -1,0 +1,530 @@
+"""mode="glocal": global in a, local in b -- "a within b".
+
+b's leading and trailing residues are free (left unaligned, not gap moves); every residue
+of a is aligned or pays a gap.  Checked against `bruteforce`'s exhaustive enumeration
+(scores, log-partition functions, hard and soft counts), against the Global and Local
+scores it sits between, and across the API surfaces (convenience functions, SeqPair,
+SeqPairBatch, the streaming align(), score-only, both traceback modes, a guide band).
+"""
+
+import os
+import random
+
+import numpy as np
+import pytest
+
+import nwgrad
+from conftest import StreamAligner, StreamAlignerDouble
+
+import bruteforce as bf
+
+ALPHABET = "ACGT"
+
+
+@pytest.fixture(scope="module")
+def matrix():
+    return nwgrad.SubstMatrix(np.eye(4) * 2 - 1, alphabet=ALPHABET)
+
+
+@pytest.fixture(scope="module")
+def generic_matrix():
+    rng = np.random.default_rng(20261101)
+    return nwgrad.SubstMatrix(rng.normal(size=(4, 4)) * 2.0, alphabet=ALPHABET)
+
+
+def params(matrix, oa, ea, ob, eb):
+    return nwgrad.AlignParams(matrix, gap_open_a=oa, gap_extend_a=ea,
+                              gap_open_b=ob, gap_extend_b=eb)
+
+
+def _corpus(n=24, seed=5):
+    rng = random.Random(seed)
+    out = []
+    for _ in range(n):
+        a = "".join(rng.choice(ALPHABET) for _ in range(rng.randint(1, 4)))
+        b = "".join(rng.choice(ALPHABET) for _ in range(rng.randint(1, 6)))
+        out.append((a, b,
+                    rng.choice([0.5, 2.0, 4.0]), rng.choice([0.5, 1.0, 2.0]),
+                    rng.choice([0.5, 2.0, 4.0]), rng.choice([0.5, 1.0, 2.0])))
+    out.append(("A", "", 1.0, 1.0, 1.0, 1.0))        # empty b: a all gapped
+    out.append(("", "ACG", 1.0, 1.0, 1.0, 1.0))      # empty a: 0 (b free)
+    out.append(("ACGT", "ACGT", 1.0, 1.0, 1.0, 1.0))
+    return out
+
+
+CORPUS = _corpus()
+
+
+def _level():
+    """The level a batch built without kernel= runs on: the forced sweep's (conftest
+    injects kernel=), else the process default."""
+    import conftest
+    lv = conftest._current_backend
+    return lv if lv not in (None, "auto", "simd") else nwgrad.get_isa_level()
+
+
+def _grad_arrays(grad):
+    d = grad.to_dict()
+    return (d["matrix"], d["gap_open_a"], d["gap_extend_a"], d["gap_open_b"], d["gap_extend_b"])
+
+
+def _pairs_to_matrix(pairs):
+    m = np.zeros((4, 4))
+    for (x, y), v in pairs.items():
+        m[ALPHABET.index(x), ALPHABET.index(y)] += v
+    return m
+
+
+def _optimum_is_unique(a, b, p, affine):
+    scores = [s for _, s, _ in bf._glocal_scored_paths(a, b, p, affine)]
+    best = max(scores)
+    return sum(1 for s in scores if s > best - 1e-9) == 1
+
+
+# ── Scores against the oracle ───────────────────────────────────────────────
+
+@pytest.mark.parametrize("a,b,oa,ea,ob,eb", CORPUS)
+def test_affine_score_matches_bruteforce(matrix, a, b, oa, ea, ob, eb):
+    p = params(matrix, oa, ea, ob, eb)
+    ref = bf.glocal_score(a, b, p, affine=True)
+    assert nwgrad.glocal_score_affine(a, b, p) == pytest.approx(ref)
+    assert nwgrad.glocal_score_affine_double(a, b, p) == pytest.approx(ref)
+
+
+@pytest.mark.parametrize("a,b,oa,ea,ob,eb", CORPUS)
+def test_linear_score_matches_bruteforce(matrix, a, b, oa, ea, ob, eb):
+    p = params(matrix, 0.0, ea, 0.0, eb)
+    ref = bf.glocal_score(a, b, p, affine=False)
+    assert nwgrad.glocal_score(a, b, p) == pytest.approx(ref)
+    assert nwgrad.glocal_score_double(a, b, p) == pytest.approx(ref)
+
+
+@pytest.mark.parametrize("a,b,oa,ea,ob,eb", CORPUS)
+def test_integer_scores_match(matrix, a, b, oa, ea, ob, eb):
+    p = params(matrix, round(oa), round(ea), round(ob), round(eb))
+    ref_aff = nwgrad.glocal_score_affine_double(a, b, p)
+    ref_lin = nwgrad.glocal_score_double(a, b, p)
+    for sfx in ("int16", "int32", "int64"):
+        assert getattr(nwgrad, "glocal_score_affine_" + sfx)(a, b, p) == ref_aff
+        assert getattr(nwgrad, "glocal_score_" + sfx)(a, b, p) == ref_lin
+
+
+@pytest.mark.parametrize("a,b,oa,ea,ob,eb", CORPUS)
+def test_between_global_and_local(matrix, a, b, oa, ea, ob, eb):
+    # Non-negative gap costs: a global alignment is a glocal one (nothing free), a glocal
+    # one is a local one (b's free ends, a fully aligned).
+    p = params(matrix, oa, ea, ob, eb)
+    g = nwgrad.glocal_score_affine_double(a, b, p)
+    assert g >= nwgrad.nw_score_affine_double(a, b, p) - 1e-12
+    assert g <= nwgrad.sw_score_affine_double(a, b, p) + 1e-12
+
+
+def test_a_within_b(matrix):
+    # a occurs inside b: the glocal score is a's self-score, b's flanks are free.
+    p = params(matrix, 2.0, 1.0, 2.0, 1.0)
+    assert nwgrad.glocal_score_affine("ACGT", "TTTACGTGGG", p) == pytest.approx(4.0)   # match = +1
+    assert nwgrad.nw_score_affine("ACGT", "TTTACGTGGG", p) < 4.0
+    # the other way round, a's flanks are charged
+    assert nwgrad.glocal_score_affine("TTTACGTGGG", "ACGT", p) < 4.0
+
+
+# ── The soft path against the oracle ────────────────────────────────────────
+
+@pytest.mark.parametrize("a,b,oa,ea,ob,eb", CORPUS)
+def test_affine_log_z_matches_bruteforce(generic_matrix, a, b, oa, ea, ob, eb):
+    p = params(generic_matrix, oa, ea, ob, eb)
+    ref = bf.glocal_log_z(a, b, p, affine=True)
+    for impl in ("log", "scaled_or_log"):
+        log_z, _ = nwgrad.glocal_affine_soft_grad_double(a, b, p, soft_impl=impl)
+        assert log_z == pytest.approx(ref, rel=1e-9, abs=1e-9)
+    log_z, _ = nwgrad.glocal_affine_soft_grad(a, b, p)
+    assert log_z == pytest.approx(ref, rel=1e-5, abs=1e-5)
+
+
+@pytest.mark.parametrize("a,b,oa,ea,ob,eb", CORPUS)
+def test_linear_log_z_matches_bruteforce(generic_matrix, a, b, oa, ea, ob, eb):
+    p = params(generic_matrix, 0.0, ea, 0.0, eb)
+    ref = bf.glocal_log_z(a, b, p, affine=False)
+    log_z, _ = nwgrad.glocal_soft_grad_double(a, b, p, soft_impl="log")
+    assert log_z == pytest.approx(ref, rel=1e-9, abs=1e-9)
+
+
+@pytest.mark.parametrize("a,b,oa,ea,ob,eb", CORPUS)
+def test_soft_counts_match_bruteforce(generic_matrix, a, b, oa, ea, ob, eb):
+    p = params(generic_matrix, oa, ea, ob, eb)
+    _, grad = nwgrad.glocal_affine_soft_grad_double(a, b, p)
+    got_matrix, got_oa, got_ea, got_ob, got_eb = _grad_arrays(grad)
+    pairs, exp_oa, exp_ea, exp_ob, exp_eb = bf.glocal_soft_counts(a, b, p, affine=True)
+    np.testing.assert_allclose(got_matrix, _pairs_to_matrix(pairs), atol=1e-9)
+    assert (got_oa, got_ea, got_ob, got_eb) == pytest.approx((-exp_oa, -exp_ea, -exp_ob, -exp_eb), abs=1e-9)
+
+
+@pytest.mark.parametrize("a,b,oa,ea,ob,eb", CORPUS)
+def test_linear_soft_counts_match_bruteforce(generic_matrix, a, b, oa, ea, ob, eb):
+    p = params(generic_matrix, 0.0, ea, 0.0, eb)
+    _, grad = nwgrad.glocal_soft_grad_double(a, b, p)
+    got_matrix, _, got_ea, _, got_eb = _grad_arrays(grad)
+    pairs, _, exp_ea, _, exp_eb = bf.glocal_soft_counts(a, b, p, affine=False)
+    np.testing.assert_allclose(got_matrix, _pairs_to_matrix(pairs), atol=1e-9)
+    assert (got_ea, got_eb) == pytest.approx((-exp_ea, -exp_eb), abs=1e-9)
+
+
+# ── Hard gradients ──────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("a,b,oa,ea,ob,eb", CORPUS)
+def test_hard_counts_match_bruteforce(generic_matrix, a, b, oa, ea, ob, eb):
+    p = params(generic_matrix, oa, ea, ob, eb)
+    if not _optimum_is_unique(a, b, p, affine=True):
+        pytest.skip("optimal alignment is not unique")
+    score, grad = nwgrad.glocal_affine_grad_double(a, b, p)
+    got_matrix, got_oa, got_ea, got_ob, got_eb = _grad_arrays(grad)
+    pairs, exp_oa, exp_ea, exp_ob, exp_eb = bf.glocal_hard_counts(a, b, p, affine=True)
+    np.testing.assert_allclose(got_matrix, _pairs_to_matrix(pairs), atol=1e-9)
+    assert (got_oa, got_ea, got_ob, got_eb) == pytest.approx((-exp_oa, -exp_ea, -exp_ob, -exp_eb))
+    assert score == pytest.approx(bf.glocal_score(a, b, p, affine=True))
+
+
+@pytest.mark.parametrize("a,b,oa,ea,ob,eb", CORPUS)
+def test_hard_gradient_dot_params_is_the_score(generic_matrix, a, b, oa, ea, ob, eb):
+    # the score is linear in the parameters: grad . params == score (any tie)
+    p = params(generic_matrix, oa, ea, ob, eb)
+    for fn, lin in ((nwgrad.glocal_affine_grad_double, False), (nwgrad.glocal_grad_double, True)):
+        pp = params(generic_matrix, 0.0, ea, 0.0, eb) if lin else p
+        score, grad = fn(a, b, pp)
+        d, g = pp.to_dict(), grad.to_dict()
+        dot = float(np.sum(np.asarray(g["matrix"]) * np.asarray(d["matrix"])))
+        for k in ("gap_open_a", "gap_extend_a", "gap_open_b", "gap_extend_b"):
+            dot += g[k] * d[k]   # the gap gradients are the negated counts
+        assert dot == pytest.approx(score, abs=1e-9)
+
+
+# ── The classes: pairs, batches, streaming, traceback modes, a band ─────────
+
+def _aligned_score(sa, sb, p, affine):
+    """Score a gapped pair of strings as glocal scores them: b's flanks free."""
+    assert len(sa) == len(sb)
+    lo, hi = 0, len(sa)
+    while lo < hi and sa[lo] == "-": lo += 1
+    while hi > lo and sa[hi - 1] == "-": hi -= 1
+    # a trailing gap run in a (b residues after a ends) is charged; the oracle's path
+    # scorer charges every move, so hand it the trimmed strings
+    sa, sb = sa[lo:hi], sb[lo:hi]
+    d = p.to_dict()
+    path = "".join("D" if x != "-" and y != "-" else ("X" if y == "-" else "Y") for x, y in zip(sa, sb))
+    a = sa.replace("-", ""); b = sb.replace("-", "")
+    return bf.path_score(path, a, b, p.matrix, d["gap_open_a"], d["gap_extend_a"],
+                         d["gap_open_b"], d["gap_extend_b"], affine)
+
+
+@pytest.mark.parametrize("gap_model", ["affine", "linear"])
+@pytest.mark.parametrize("traceback", ["pointers", "scores"])
+def test_pair_alignment_scores_its_score(generic_matrix, gap_model, traceback):
+    rng = random.Random(3)
+    p = params(generic_matrix, 2.0, 1.0, 1.5, 0.5)
+    for _ in range(40):
+        a = "".join(rng.choice(ALPHABET) for _ in range(rng.randint(1, 9)))
+        b = "".join(rng.choice(ALPHABET) for _ in range(rng.randint(1, 14)))
+        sp = nwgrad.SeqPairDouble(a, b, p, gap_model=gap_model, mode="glocal", traceback=traceback)
+        score = sp.align()
+        sa, sb = sp.aligned()
+        assert sa.replace("-", "") == a                      # every residue of a
+        assert sb.replace("-", "") in b                      # a window of b
+        assert _aligned_score(sa, sb, p, gap_model == "affine") == pytest.approx(score)
+        ref = (nwgrad.glocal_score_affine_double if gap_model == "affine" else nwgrad.glocal_score_double)(a, b, p)
+        assert score == pytest.approx(ref)
+        assert sp.mode == "glocal"
+
+
+def test_pointers_and_scores_agree(generic_matrix):
+    rng = random.Random(9)
+    p = params(generic_matrix, 2.0, 1.0, 1.5, 0.5)
+    for _ in range(30):
+        a = "".join(rng.choice(ALPHABET) for _ in range(rng.randint(1, 12)))
+        b = "".join(rng.choice(ALPHABET) for _ in range(rng.randint(1, 20)))
+        r = []
+        for tb in ("pointers", "scores"):
+            sp = nwgrad.SeqPair(a, b, p, mode="glocal", traceback=tb)
+            s, g = sp.score_and_grad()
+            r.append((s, sp.aligned(), g.to_dict()))
+        assert r[0][0] == r[1][0] and r[0][1] == r[1][1]
+        assert np.array_equal(np.asarray(r[0][2]["matrix"]), np.asarray(r[1][2]["matrix"]))
+
+
+@pytest.mark.parametrize("gap_model", ["affine", "linear"])
+@pytest.mark.parametrize("traceback", ["hirschberg", "hirschberg_pmax"])
+@pytest.mark.parametrize("cls", [nwgrad.SeqPairDouble, nwgrad.SeqPair])
+@pytest.mark.parametrize("gaps", [(2.0, 1.0, 1.5, 0.5), (0.0, 0.0, 0.0, 0.0), (0.0, 0.7, 3.0, 0.0)])
+def test_hirschberg_finds_an_optimal_path(generic_matrix, gap_model, traceback, cls, gaps):
+    # The linear-space form: a forward scan to the end column, a reverse scan to the start
+    # column, the global box between.  It may take another optimal path at ties, never a
+    # worse one (hirschberg_pmax at float32: within float32's own error), its path scores
+    # its score, and its gradient is that path's.  hb_cutoff 2: the box really splits.
+    # Zero gap costs: a box path may lead with free moves along row 0, which are dropped.
+    rng = random.Random(77)
+    p = params(generic_matrix, *gaps)
+    lin = gap_model == "linear"
+    tol = 1e-9 if cls is nwgrad.SeqPairDouble else 1e-3
+    for _ in range(60):
+        a = "".join(rng.choice(ALPHABET) for _ in range(rng.randint(0, 30)))
+        b = "".join(rng.choice(ALPHABET) for _ in range(rng.randint(0, 45)))
+        ref = cls(a, b, p, gap_model=gap_model, mode="glocal", traceback="pointers")
+        s_ref = ref.align()
+        sp = cls(a, b, p, gap_model=gap_model, mode="glocal", traceback=traceback)
+        sp.hb_cutoff = 2
+        s, g = sp.score_and_grad()
+        assert s == pytest.approx(s_ref, abs=tol * max(1, len(a) + len(b)))
+        sa, sb = sp.aligned()
+        assert sa.replace("-", "") == a
+        assert sb.replace("-", "") in b
+        if sa:
+            assert sa[0] != "-" or sb[0] == "-" or len(a) == 0   # no leading gap in a
+        assert _aligned_score(sa, sb, p, not lin) == pytest.approx(s, abs=tol * 10)
+        d, gd = p.to_dict(), g.to_dict()
+        dot = float(np.sum(np.asarray(gd["matrix"]) * np.asarray(d["matrix"])))
+        for k in ("gap_open_a", "gap_extend_a", "gap_open_b", "gap_extend_b"):
+            if lin and k.startswith("gap_open"):
+                continue
+            dot += gd[k] * d[k]
+        assert dot == pytest.approx(s, abs=tol * 10)
+
+
+def test_hirschberg_long_pair_matches_pointers(generic_matrix):
+    p = params(generic_matrix, 2.0, 1.0, 1.5, 0.5)
+    rng = random.Random(4)
+    a = "".join(rng.choice(ALPHABET) for _ in range(400))
+    b = "".join(rng.choice(ALPHABET) for _ in range(300)) + a[50:350] + "".join(rng.choice(ALPHABET) for _ in range(300))
+    for gm in ("affine", "linear"):
+        ref = nwgrad.SeqPairDouble(a, b, p, gap_model=gm, mode="glocal", traceback="pointers").align()
+        hb = nwgrad.SeqPairDouble(a, b, p, gap_model=gm, mode="glocal", traceback="hirschberg")
+        assert hb.align() == pytest.approx(ref, abs=1e-9)
+
+
+@pytest.mark.parametrize("gap_model", ["affine", "linear"])
+@pytest.mark.parametrize("grad_mode", ["hard", "soft", "none"])
+def test_batch_matches_pairs(generic_matrix, gap_model, grad_mode):
+    rng = random.Random(21)
+    p = params(generic_matrix, 2.0, 1.0, 1.5, 0.5)
+    A = ["".join(rng.choice(ALPHABET) for _ in range(rng.randint(1, 10))) for _ in range(40)]
+    B = ["".join(rng.choice(ALPHABET) for _ in range(rng.randint(1, 16))) for _ in range(40)]
+    batch = nwgrad.SeqPairBatchDouble(A, B, p, gap_model=gap_model, mode="glocal", grad_mode=grad_mode, n_threads=3)
+    assert batch.mode == "glocal"
+    total = batch.score_and_grad()
+    scores = batch.scores()
+    assert total == pytest.approx(float(np.sum(scores)))
+    grad = None
+    if grad_mode != "none":
+        for i in range(len(A)):
+            grad = batch[i].grad if grad is None else grad + batch[i].grad
+    single = []
+    gsum = None
+    for a, b in zip(A, B):
+        if grad_mode == "soft":
+            fn = nwgrad.glocal_affine_soft_grad_double if gap_model == "affine" else nwgrad.glocal_soft_grad_double
+        elif grad_mode == "hard":
+            fn = nwgrad.glocal_affine_grad_double if gap_model == "affine" else nwgrad.glocal_grad_double
+        else:
+            fn = None
+        if fn is None:
+            s = (nwgrad.glocal_score_affine_double if gap_model == "affine" else nwgrad.glocal_score_double)(a, b, p)
+        else:
+            s, g = fn(a, b, p)
+            gsum = g if gsum is None else gsum + g
+        single.append(s)
+    np.testing.assert_allclose(np.asarray(scores), np.asarray(single), rtol=1e-9, atol=1e-9)
+    if grad is not None:
+        got, exp = grad.to_dict(), gsum.to_dict()
+        np.testing.assert_allclose(np.asarray(got["matrix"]), np.asarray(exp["matrix"]), rtol=1e-8, atol=1e-8)
+        for k in ("gap_open_a", "gap_extend_a", "gap_open_b", "gap_extend_b"):
+            assert got[k] == pytest.approx(exp[k], rel=1e-8, abs=1e-8)
+
+
+@pytest.mark.parametrize("cls", [StreamAligner, StreamAlignerDouble])
+@pytest.mark.parametrize("grad_mode", ["hard", "soft"])
+def test_streaming_matches_pairs(generic_matrix, cls, grad_mode):
+    rng = random.Random(33)
+    p = params(generic_matrix, 2.0, 1.0, 1.5, 0.5)
+    A = ["".join(rng.choice(ALPHABET) for _ in range(rng.randint(1, 10))) for _ in range(30)]
+    B = ["".join(rng.choice(ALPHABET) for _ in range(rng.randint(1, 16))) for _ in range(30)]
+    res = cls(p, mode="glocal", grad_mode=grad_mode, n_threads=2).align(A, B)
+    fn = nwgrad.glocal_affine_soft_grad_double if grad_mode == "soft" else nwgrad.glocal_affine_grad_double
+    exp = [fn(a, b, p)[0] for a, b in zip(A, B)]
+    tol = 1e-4 if cls is StreamAligner else 1e-9
+    np.testing.assert_allclose(np.asarray(res.scores), np.asarray(exp), rtol=tol, atol=tol)
+
+
+def test_band_around_the_alignment(generic_matrix):
+    # A guide band wide enough to hold the optimum gives the full score.
+    p = params(generic_matrix, 2.0, 1.0, 1.5, 0.5)
+    a, b = "ACGTTGCA", "GGACGTTGCATT"
+    sp = nwgrad.SeqPairDouble(a, b, p, mode="glocal")
+    full = sp.align()
+    sa, sb = sp.aligned()
+    banded = nwgrad.glocal_score_affine_double(a, b, p, band=3, aligned_a=sa, aligned_b=sb)
+    assert banded == pytest.approx(full)
+    s_hard, _ = nwgrad.glocal_affine_grad_double(a, b, p, band=3, aligned_a=sa, aligned_b=sb)
+    assert s_hard == pytest.approx(full)
+
+
+def test_mode_name_rejected_elsewhere():
+    with pytest.raises(ValueError, match="glocal"):
+        nwgrad.SeqPairBatch(n_threads=1, mode="glocla")
+
+
+# ── The score-only kernels against the scalar fill, bit for bit ─────────────
+
+@pytest.mark.parametrize("sfx", ["_double", ""])
+def test_score_only_equals_the_pointer_fill(generic_matrix, sfx):
+    # the score-only kernel of the running backend vs the traceback fill: the exact
+    # optimum, bit-identical (as test_score_only pins it for the other modes).  The
+    # names are resolved here, under the forced-kernel wrapper, not at import.
+    cls = getattr(nwgrad, "SeqPair" + ("Double" if sfx else ""))
+    fn_aff, fn_lin = getattr(nwgrad, "glocal_score_affine" + sfx), getattr(nwgrad, "glocal_score" + sfx)
+    rng = random.Random(77)
+    for oa, ea, ob, eb in ((2.0, 1.0, 1.5, 0.5), (0.0, 0.5, 0.0, 1.0), (3.0, 0.0, 1.0, 0.0)):
+        p = params(generic_matrix, oa, ea, ob, eb)
+        for _ in range(25):
+            a = "".join(rng.choice(ALPHABET) for _ in range(rng.randint(0, 40)))
+            b = "".join(rng.choice(ALPHABET) for _ in range(rng.randint(0, 70)))
+            assert fn_aff(a, b, p) == cls(a, b, p, mode="glocal", traceback="pointers").align()
+            assert fn_lin(a, b, p) == cls(a, b, p, gap_model="linear", mode="glocal").align()
+
+
+# ── Every simd level against the scalar backend, bit for bit ────────────────
+
+@pytest.mark.parametrize("gap_model", ["affine", "linear"])
+@pytest.mark.parametrize("traceback", ["pointers", "scores"])
+def test_levels_match_scalar(generic_matrix, gap_model, traceback):
+    rng = random.Random(101)
+    p = params(generic_matrix, 2.0, 1.0, 1.5, 0.5)
+    levels = [l for l in nwgrad.available_isa_levels() if l != "scalar_fallback"]
+    cases = [("".join(rng.choice(ALPHABET) for _ in range(rng.randint(0, 60))),
+              "".join(rng.choice(ALPHABET) for _ in range(rng.randint(0, 150)))) for _ in range(40)]
+    pint = params(nwgrad.SubstMatrix(np.rint(np.asarray(generic_matrix.to_matrix()) * 3), alphabet=ALPHABET), 6, 3, 4, 2)
+    for cls, pp in ((nwgrad.SeqPairDouble, p), (nwgrad.SeqPair, p), (nwgrad.SeqPairInt32, pint)):   # explicit kernel= below
+        for a, b in cases:
+            ref = cls(a, b, pp, gap_model=gap_model, mode="glocal", traceback=traceback, kernel="scalar_fallback")
+            s0, g0 = ref.score_and_grad()
+            al0 = ref.aligned()
+            for lv in levels:
+                sp = cls(a, b, pp, gap_model=gap_model, mode="glocal", traceback=traceback, kernel=lv)
+                s1, g1 = sp.score_and_grad()
+                assert s1 == s0, (lv, a, b)
+                assert sp.aligned() == al0, (lv, a, b)
+                assert np.array_equal(np.asarray(g1.to_dict()["matrix"]), np.asarray(g0.to_dict()["matrix"])), (lv, a, b)
+
+
+# ── The inter-pair fills (fill="interpair") against the per-pair fill, bit for bit ──
+
+def _mirna_like(rng, n):
+    A = ["".join(rng.choice(ALPHABET) for _ in range(rng.randint(18, 25))) for _ in range(n)]
+    B = ["".join(rng.choice(ALPHABET) for _ in range(rng.randint(40, 60))) for _ in range(n)]
+    return A, B
+
+
+@pytest.mark.parametrize("cls", ["SeqPairBatchDouble", "SeqPairBatch", "SeqPairBatchInt32", "SeqPairBatchInt16"])
+@pytest.mark.parametrize("gap_model", ["affine", "linear"])
+@pytest.mark.parametrize("grad_mode", ["hard", "none"])
+def test_interpair_matches_striped(generic_matrix, cls, gap_model, grad_mode):
+    rng = random.Random(404)
+    A, B = _mirna_like(rng, 300)
+    A += ["", "ACG", "A" * 30]; B += ["ACGT", "", "C" * 5]   # empty sides, A longer than B
+    integer = "Int" in cls
+    if integer:
+        m = nwgrad.SubstMatrix(np.rint(np.asarray(generic_matrix.to_matrix()) * 3), alphabet=ALPHABET)
+        p = params(m, 6, 3, 4, 2)
+    else:
+        p = params(generic_matrix, 2.0, 1.0, 1.5, 0.5)
+    C = getattr(nwgrad, cls)
+    out = {}
+    for fill in ("striped", "interpair"):
+        b = C(A, B, p, gap_model=gap_model, mode="glocal", grad_mode=grad_mode, n_threads=3)
+        b.fill = fill
+        if fill == "interpair":
+            elig, other, groups = b._inter_plan()
+            # linear double below 4 lanes (sse2 / sse4 / neon) stays on its own fill by design
+            # (linear_fill_ok_: Global's rule); every other case must share
+            # (and a forced scalar backend has no shared fill at all)
+            if os.environ.get("NWGRAD_FORCE_KERNEL") != "scalar_fallback" and not (
+                    gap_model == "linear" and cls == "SeqPairBatchDouble"
+                    and _level() in ("sse2", "sse4", "neon", "scalar_fallback")):
+                assert elig > 0 and groups > 0, (elig, other, groups)
+        b.score_and_grad()
+        g = None
+        if grad_mode == "hard":
+            g = [np.asarray(b[i].grad.to_dict()["matrix"]).copy() for i in range(len(A))]
+            gaps = [[b[i].grad.to_dict()[k] for k in ("gap_open_a", "gap_extend_a", "gap_open_b", "gap_extend_b")]
+                    for i in range(len(A))]
+            g = (g, gaps)
+        out[fill] = (np.asarray(b.scores()).copy(), g)
+    s0, g0 = out["striped"]
+    s1, g1 = out["interpair"]
+    assert np.array_equal(s0, s1)
+    if g0 is not None:
+        for i in range(len(A)):
+            assert np.array_equal(g0[0][i], g1[0][i]), i
+            assert g0[1][i] == g1[1][i], i
+
+
+@pytest.mark.parametrize("gap_model", ["affine", "linear"])
+def test_interpair_every_level(generic_matrix, gap_model):
+    rng = random.Random(505)
+    A, B = _mirna_like(rng, 120)
+    p = params(generic_matrix, 2.0, 1.0, 1.5, 0.5)
+    ref = nwgrad.SeqPairBatchDouble(A, B, p, gap_model=gap_model, mode="glocal", n_threads=2,
+                                    kernel="scalar_fallback")
+    ref.fill = "striped"
+    ref.score_and_grad()
+    s0 = np.asarray(ref.scores()).copy()
+    m0, q0 = (np.asarray(x).copy() for x in ref.grads())
+    for lv in nwgrad.available_isa_levels():
+        if lv == "scalar_fallback":
+            continue
+        b = nwgrad.SeqPairBatchDouble(A, B, p, gap_model=gap_model, mode="glocal", n_threads=2, kernel=lv)
+        b.fill = "interpair"
+        b.score_and_grad()
+        assert np.array_equal(np.asarray(b.scores()), s0), lv
+        m1, q1 = b.grads()
+        assert np.array_equal(np.asarray(m1), m0), lv
+        assert np.array_equal(np.asarray(q1), q0), lv
+
+
+@pytest.mark.parametrize("sfx", ["_double", ""])
+def test_score_only_end_at_column_0(sfx):
+    # A long against a 1-residue B under a harsh mismatch: the optimum gaps all of A and
+    # ends at column 0 (-(go_b + m*ge_b), the closed-form border), a hair above the path
+    # through column 1, whose chain rounds differently.  The score-only kernels once
+    # scanned columns 1..n of the last row only and returned the column-1 value.
+    m = np.full((4, 4), -1.0)
+    np.fill_diagonal(m, 2.0)
+    p = nwgrad.AlignParams(nwgrad.SubstMatrix(m, alphabet=ALPHABET), gap_open_a=3.0, gap_extend_a=1.0,
+                           gap_open_b=3.9000000000000004, gap_extend_b=0.8)
+    cls = getattr(nwgrad, "SeqPair" + ("Double" if sfx else ""))
+    fn = getattr(nwgrad, "glocal_score_affine" + sfx)
+    a, b = "GGCAAGCACTTAGAAGCAACTATCG", "C"
+    ref = cls(a, b, p, mode="glocal", traceback="pointers").align()
+    assert fn(a, b, p) == ref
+    ref_bf = max(s for _, s, _ in bf._glocal_scored_paths(a, b, p, True))
+    assert ref == pytest.approx(ref_bf, abs=1e-5)
+    for lv in nwgrad.available_isa_levels():
+        assert cls(a, b, p, mode="glocal", kernel=lv).align() == ref, lv
+
+
+@pytest.mark.parametrize("gap_model", ["affine", "linear"])
+@pytest.mark.parametrize("traceback", ["hirschberg", "hirschberg_pmax"])
+@pytest.mark.parametrize("cls", [nwgrad.SeqPairDouble, nwgrad.SeqPair])
+def test_hirschberg_levels_match_scalar(generic_matrix, gap_model, traceback, cls):
+    # the end-point scans and sweeps run leveled where the backend has them: the same
+    # path and score, bit for bit, as the scalar backend
+    p = params(generic_matrix, 2.0, 1.0, 1.5, 0.5)
+    rng = random.Random(8)
+    levels = [lv for lv in nwgrad.available_isa_levels() if lv != "scalar_fallback"]
+    for _ in range(30):
+        a = "".join(rng.choice(ALPHABET) for _ in range(rng.randint(1, 60)))
+        b = "".join(rng.choice(ALPHABET) for _ in range(rng.randint(1, 120)))
+        out = []
+        for lv in ["scalar_fallback"] + levels:
+            sp = cls(a, b, p, gap_model=gap_model, mode="glocal", traceback=traceback, kernel=lv)
+            sp.hb_cutoff = 2
+            s = sp.align()
+            out.append((s, sp.aligned()))
+        assert all(o == out[0] for o in out[1:])

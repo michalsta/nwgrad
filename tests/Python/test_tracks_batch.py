@@ -20,6 +20,8 @@ FUNCS = {
     ("linear", "local"): "sw_grad",
     ("affine", "global"): "nw_affine_grad",
     ("affine", "local"): "sw_affine_grad",
+    ("linear", "glocal"): "glocal_grad",
+    ("affine", "glocal"): "glocal_affine_grad",
 }
 CASES = list(FUNCS)
 STORAGE = ["paths"]   # the hard-gradient store of every batch built here (track_storage)

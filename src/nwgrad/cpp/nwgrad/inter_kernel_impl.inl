@@ -337,6 +337,9 @@ static void inter_fill_linear(InterJobT<T>& J) noexcept {
             else              v = ivsplat<ivd>(-static_cast<T>(i) * J.ge_b);
             H[static_cast<size_t>(i) * st] = Banded ? cm.border_mask(v, i, J.bri) : v;
         }
+        if (J.align_mode == 2) {   // Glocal: row 0 a free start at every column
+            for (int j = 1; j <= n; ++j) H[j] = z;
+        } else
         for (int j = 1; j <= n; ++j) {
             ivd v;
             if constexpr (Tr) v = cm.border_y0(j, true);
@@ -420,6 +423,9 @@ static void inter_fill_affine(InterJobT<T>& J) noexcept {
             else              v = ivsplat<ivd>(-(J.go_b + static_cast<T>(i) * J.ge_b));
             VX[static_cast<size_t>(i) * st] = Banded ? cm.border_mask(v, i, J.bri) : v;
         }
+        if (J.align_mode == 2) {   // Glocal: row 0 a free start (M = 0) at every column, no Y
+            for (int j = 1; j <= n; ++j) VM[j] = z;
+        } else
         for (int j = 1; j <= n; ++j) {
             ivd v;
             if constexpr (Tr) v = cm.border_y0(j, false);
@@ -523,7 +529,8 @@ static void inter_fill_entry(InterJobT<T>& J) noexcept { inter_fill_t<T>(J); }
 // overwrites row i-1 left to right in J.VM/VX/VY ((n+1)*W each: one row, not a table).
 // The diagonal operand of column j — row i-1, column j-1 — is overwritten one step
 // earlier, so it is carried in registers.  Output, per lane, in J.best: Global the
-// cell (m_l, n_l) — captured when the row loop passes that lane's last row — and Local
+// cell (m_l, n_l) — captured when the row loop passes that lane's last row — Glocal the
+// best cell of that row (columns 0..n_l, every state), and Local
 // the maximum over the lane's own cells (rows <= m_l, columns <= n_l), which is the
 // fill's best value (max is exact in any order; the strict-first rule only places it).
 template <class T, bool Ragged, bool Tr = false>
@@ -534,7 +541,7 @@ static void inter_score_affine(InterJobT<T>& J) noexcept {
     const C cm(J);
     const auto sub = cm.sub();
     const int n = J.n, M = J.M;
-    const bool local = J.align_mode == 1;
+    const bool local = J.align_mode == 1, glocal = J.align_mode == 2;
     ivd* VM = reinterpret_cast<ivd*>(J.VM);
     ivd* VX = reinterpret_cast<ivd*>(J.VX);
     ivd* VY = reinterpret_cast<ivd*>(J.VY);
@@ -543,16 +550,22 @@ static void inter_score_affine(InterJobT<T>& J) noexcept {
 
     // row 0, as inter_fill_affine leaves it
     for (int j = 0; j <= n; ++j) {
-        VM[j] = local ? z : (j == 0 ? z : ninf);
+        VM[j] = (local || glocal) ? z : (j == 0 ? z : ninf);
         VX[j] = ninf;
-        if constexpr (Tr) VY[j] = (local || j == 0) ? ninf : cm.border_y0(j, false);
-        else VY[j] = (local || j == 0) ? ninf : ivsplat<ivd>(-(J.go_a + static_cast<T>(j) * J.ge_a));
+        if constexpr (Tr) VY[j] = (local || glocal || j == 0) ? ninf : cm.border_y0(j, false);
+        else VY[j] = (local || glocal || j == 0) ? ninf : ivsplat<ivd>(-(J.go_a + static_cast<T>(j) * J.ge_a));
     }
-    auto capture = [&](int i) {        // Global: lanes whose A ends at row i
+    auto capture = [&](int i) {        // Global / Glocal: lanes whose A ends at row i
         for (int l = 0; l < W; ++l)
             if (J.m[l] == i) {
                 const int nl = Ragged ? J.nb[l] : n;
-                J.best[l] = std::max({VM[nl][l], VX[nl][l], VY[nl][l]});
+                if (glocal) {          // the best cell of the lane's last row (max is exact)
+                    T b = std::max({VM[0][l], VX[0][l], VY[0][l]});
+                    for (int j = 1; j <= nl; ++j) b = std::max(b, std::max({VM[j][l], VX[j][l], VY[j][l]}));
+                    J.best[l] = b;
+                } else {
+                    J.best[l] = std::max({VM[nl][l], VX[nl][l], VY[nl][l]});
+                }
             }
     };
     if (!local) capture(0);
@@ -605,18 +618,27 @@ static void inter_score_linear(InterJobT<T>& J) noexcept {
     const C cm(J);
     const auto sub = cm.sub();
     const int n = J.n, M = J.M;
-    const bool local = J.align_mode == 1;
+    const bool local = J.align_mode == 1, glocal = J.align_mode == 2;
     ivd* H = reinterpret_cast<ivd*>(J.VM);
     const ivd z = {};
     ivd ge_a = z + J.ge_a, ge_b = z + J.ge_b;
 
     for (int j = 0; j <= n; ++j) {
-        if constexpr (Tr) H[j] = (local || j == 0) ? z : cm.border_y0(j, true);
-        else H[j] = (local || j == 0) ? z : ivsplat<ivd>(-static_cast<T>(j) * J.ge_a);
+        if constexpr (Tr) H[j] = (local || glocal || j == 0) ? z : cm.border_y0(j, true);
+        else H[j] = (local || glocal || j == 0) ? z : ivsplat<ivd>(-static_cast<T>(j) * J.ge_a);
     }
     auto capture = [&](int i) {
         for (int l = 0; l < W; ++l)
-            if (J.m[l] == i) J.best[l] = H[Ragged ? J.nb[l] : n][l];
+            if (J.m[l] == i) {
+                const int nl = Ragged ? J.nb[l] : n;
+                if (glocal) {          // Glocal: the best cell of the lane's last row
+                    T b = H[0][l];
+                    for (int j = 1; j <= nl; ++j) b = std::max(b, static_cast<T>(H[j][l]));
+                    J.best[l] = b;
+                } else {
+                    J.best[l] = H[nl][l];
+                }
+            }
     };
     if (!local) capture(0);
     ivd vbest = z;
@@ -674,7 +696,7 @@ static void inter_score_affine_pos(InterJobT<T>& J) noexcept {
     const C cm(J);
     const auto sub = cm.sub();
     const int n = J.n, M = J.M;
-    const bool local = J.align_mode == 1;
+    const bool local = J.align_mode == 1, glocal = J.align_mode == 2;
     ivd* D = reinterpret_cast<ivd*>(J.VM);
     ivd* X = reinterpret_cast<ivd*>(J.VX);
     const ivd z = {}, ninf = z + nw_ninf<T>;
@@ -682,13 +704,22 @@ static void inter_score_affine_pos(InterJobT<T>& J) noexcept {
 
     // row 0: D = max(M, X, Y) of inter_score_affine's row 0, X as there
     for (int j = 0; j <= n; ++j) {
-        if constexpr (Tr) D[j] = local ? z : (j == 0 ? z : cm.border_y0(j, false));
-        else D[j] = local ? z : (j == 0 ? z : ivsplat<ivd>(-(J.go_a + static_cast<T>(j) * J.ge_a)));
+        if constexpr (Tr) D[j] = (local || glocal) ? z : (j == 0 ? z : cm.border_y0(j, false));
+        else D[j] = (local || glocal) ? z : (j == 0 ? z : ivsplat<ivd>(-(J.go_a + static_cast<T>(j) * J.ge_a)));
         X[j] = ninf;
     }
     auto capture = [&](int i) {
         for (int l = 0; l < W; ++l)
-            if (J.m[l] == i) J.best[l] = D[Ragged ? J.nb[l] : n][l];
+            if (J.m[l] == i) {
+                const int nl = Ragged ? J.nb[l] : n;
+                if (glocal) {          // Glocal: the best cell of the lane's last row (D = every state)
+                    T b = D[0][l];
+                    for (int j = 1; j <= nl; ++j) b = std::max(b, static_cast<T>(D[j][l]));
+                    J.best[l] = b;
+                } else {
+                    J.best[l] = D[nl][l];
+                }
+            }
     };
     if (!local) capture(0);
     ivd vbest = z;
