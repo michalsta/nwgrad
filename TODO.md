@@ -354,7 +354,11 @@ Tracks landed on branch `tracks` (2026-10-11; see AGENTS.md, "Tracks").  Deferre
   banded, `fill="striped"` vs `"interpair"`.  Hard: 125, 178, 234 (scores 1-2 float32
   ulps apart, e.g. -34.03999329 vs -34.03999710 -- the bit-identity contract broken);
   soft banded: 145 (7.77309 vs 7.77934), 190 (-328.501 vs -329.908).  fuzz_fill passed
-  1000/1000 on 2026-10-20 (`7f45155`); bisect the main merges since (#19 gate caps first).: spot (neon) and solace (avx512).**  Correctness
+  1000/1000 on 2026-10-20 (`7f45155`); bisect the main merges since (#19 gate caps first).
+  After merging #23 (`e75d80a`, float32 soft; fuzz_fill now compares float32 soft scores
+  at rtol 1e-5): Global float32 affine hard, seeds 0-299, fails 10, 27, 80, 125, 144, 145,
+  178, 190, 234, all `traceback="auto"`; glocal and local 0 of 300.
+- **Fleet runs not yet done: spot (neon) and solace (avx512).**  Correctness
   (`ctest`, `NWGRAD_FORCE_KERNEL=simd pytest tests/Python`) and `tools/bench_tracks.py`.
   Everything on the branch was verified on sse2 (skynet, wloczykij) and avx2 (nighthaven).
 - **Python track conversion** (`to_tracks` in py_exports.cpp) casts each pair's list

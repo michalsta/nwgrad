@@ -141,7 +141,11 @@ def check_seed(seed, force_mode=None):
         if len(bad):
             i = bad[0]
             return f"{what} MISMATCH {tag}: pair {i} striped={x[i]!r} interpair={y[i]!r}"
-        close = np.isclose(x, y, rtol=1e-9, atol=1e-9) | same
+        # float32 batches run the soft pass in float32 (soft_precision), and the two fills
+        # round differently (~1e-8 relative seen); either may also fall back to double per
+        # pair, ~1e-6 from float32 (test_soft_float32.py's REL32 is float32 vs double).
+        tol = 1e-5 if prec == "float32" else 1e-9
+        close = np.isclose(x, y, rtol=tol, atol=tol) | same
         bad = np.where(~close & soft)[0]
         if len(bad):
             i = bad[0]
