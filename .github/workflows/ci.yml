@@ -317,10 +317,14 @@ jobs:
       # -fno-sanitize-recover=all (set in CMakeLists) is what makes this worth
       # anything: UBSan otherwise prints a diagnostic, carries on, and lets pytest
       # exit 0 over undefined behaviour.
+      # One compile at a time: unoptimized instrumented TUs peak at 7-8.5 GB each
+      # (py_exports.cpp, level_avx2/avx512.cpp), so even two in parallel exhaust the
+      # 16 GB runner, which then dies with "received a shutdown signal".
       - name: Install with an instrumented extension
         env:
           CC: gcc
           CXX: g++
+          CMAKE_BUILD_PARALLEL_LEVEL: "1"
         run: |
           pip install -e ".[dev]" \
             --config-settings=cmake.define.NWGRAD_SANITIZE_EXT=ON \

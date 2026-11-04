@@ -2495,6 +2495,63 @@ level, 1 thread and all, 1148 / 3600 / 4800 configurations), default / better ar
   1148 over 1.08 (0.3 %; the first table 34), 2 over 1.15 (31), none over 1.3 (21), the
   worst 1.18 (1.94); AVX2 24 / 11 / 1 (36 / 14 / 3), SSE4 19 / 3 / 0 (89 / 53 / 19), SSE2
   12 / 1 / 0 of 948 (123 / 101 / 47).
+### Two holes in the gates: kept paths and empty lanes (2026-11-04)
+
+**Found** by the fleet rebench of the cells parasail / SeqAn won in October: the new code
+(`main` + glocal) ran some long cells 1.5-8x slower than the October build, everything
+else 3-21 % faster. Bisected on nighthaven to #15 (`0b52842`, this section's predecessor).
+Two separate causes:
+
+1. **`grad_mode="none"` with `keep_paths=True` skipped the byte budget.** #15 exempted
+   grad_mode None from `inter_pair_fits` ("score only keeps rows"), but a call that keeps
+   paths runs the HARD shared fill, whole tables and all. Protein L1000 int32: 8 lanes x
+   1e6 cells x 3 tables x 4 B = 96 MB per group, streamed from DRAM: 46.5 ms against 23.5
+   for the own fill and 23.3 for the same pairs' hard gradient (which kept the budget);
+   DNA L10000 int64 linear 433 vs 298 ms. Fix: two plans, `plan_` (tables: every call
+   but score_only_) and `plan_rows_` (score_only_, no budget); streaming `align()` drops
+   the budget only when its score kernel actually runs (Full band, grad None,
+   `has_inter_score_`). `_inter_plan(score_only=True)` shows the second plan.
+2. **A group of mostly empty lanes still shared.** The empty lanes repeat the last pair,
+   so a group costs the same with 1 real pair as with W: the shared/own ratio scales as
+   W / real (solace DNA int32 L100 score: 0.55 full, 1.10 at 8 of 16, 7.89 at 1). Long
+   pairs in a small batch come one or two to a group (the fleet's L10000 fixtures are 2
+   pairs): solace DNA L10000 score int32 ran 425 ms against 52 striped. Every level, type,
+   output (score, hard, path) and length agrees. New gate `inter_min_fill` (percent of W,
+   default 75; 0 / None: any group shares) applied where groups form: the plan, the band
+   groups, streaming. Threshold from a sweep of 1, 2, W/4, W/2, 5W/8, 3W/4, 7W/8 and W
+   real pairs (1 thread, L100 / L300, every type, both alphabets, modes and gap models;
+   `scratchpad/rebench/underfill*.py`): geomean loss against the better arm per cell,
+   score / hard -- at 0 (before) nighthaven 1.16 / 1.85, solace 2.30 / 2.16; at 62.5 %
+   1.020 / 1.038 and 1.033 / 1.030; at 75 % 1.014 / 1.027 and 1.030 / 1.038. Full-group
+   winners cross over at 0.4-0.7 W, so no single fraction is exact; 75 % is the v3 best.
+   The test suite turns the gate off (conftest), so small test batches still exercise the
+   shared kernels.
+
+3. **(Found by the fix's rebench.) DNA alone lost its shared fill to protein's integer
+   budgets.** Applying the byte budget to path calls (1.) sent nighthaven's DNA L100 int16
+   affine path from 9.9 to 15.6 ms: the one-thread int16 budget is 450 KiB on AVX2 (1 MiB
+   int32 / int16 on AVX-512), measured on protein, whose shared fill gathers and loses
+   early. The same budget had been costing DNA hard gradients since #15 (13.4 ms default /
+   7.6 shared, L100 int16 affine). Swept (`dnabudget.py`: full groups, shared with the
+   budget off vs striped, DNA every type, 1 thread and all logical threads): alone the
+   mask-blend shared fill wins for every type through L400 on AVX2 (15 MB of affine
+   tables; 0.38-0.85) and L300 on AVX-512 (17 MB; 0.29-0.94), and loses past ~30 MB.
+   New level field `group_small_kb_1` = 16 MiB on AVX2 and AVX-512, a floor under the
+   type's one-thread budget for alphabets <= 8; SSE and NEON unmeasured, unchanged.
+   At the default thread count (physical cores: 6 on nighthaven) #15's 3 MiB holds for
+   DNA and protein alike (L150 wins 0.50-0.86, L200 loses 1.06-2.2 and is routed own).
+   With every LOGICAL thread (12 / 16: two threads share an L2) it does not: affine loses
+   from L150 (1.3-3x; solace float L100 1.13-1.64x), linear from L200-300 (2-6x) while
+   the budget still shares there. Not changed (TODO.md): only an explicit n_threads above
+   the core count reaches it.
+
+Also from the same sweep, **AVX-512 float score caps** the original sweep had not reached
+(they were "no cap"): DNA float32 crosses over at ~L5500 Local / ~L6300 Global (L10000
+1.18-1.25x), float64 at ~L4000 / ~L5600 (L7000 1.37-1.54x), protein float32 affine at
+~L720 (L1000 1.33-1.57x). Open: on nighthaven DNA float32 linear Global L1000 (1.30x)
+and float64 linear Global L300 (1.24-1.28x) lose with full groups while their neighbours
+win (L3000 0.66x, float64 L1000 0.78x); reproduced, not chased.
+
 ### Score-only integer kernel: two segments a trip (branch `perf/int-unroll`, 2026-10-31)
 
 **Why.** The gcc-vs-clang residue on the integer striped kernels (clang 4-20 % faster on
@@ -2665,6 +2722,125 @@ sequences, BLOSUM62 ×0.3, gaps 11/1 ×0.3, affine, 200 pairs, 1 thread; hard = 
 Before the leveled kernel the same protein runs were 23–26 ns/cell on skynet and
 7.2 ns/cell on nighthaven (baseline copy). At len 1000 the three forward tables (24
 B/cell, 24 MB) leave L3 and the kernel turns memory-bound (Open TODOs).
+
+### Glocal mode (branch `feat/glocal`, 2026-11-01)
+
+**What.** `AlignMode::Glocal`, `mode="glocal"`: global in A, local in B -- "A within B".
+B's leading and trailing residues are free (left unaligned, not gap moves); every residue
+of A is aligned or pays a gap. In the DP: row 0 is a free start (M = 0 at every column,
+no gap moves along it: VY row 0 = -inf, the linear H row 0 = 0 by fiat), column 0 is
+Global's charged gap chain, no clamp anywhere, and the alignment ends at the best cell of
+row m in ANY state -- the first column holding the row's maximum, the state by M > X > Y
+-- so a path may end with charged gaps in A along the last row. The soft path's ensemble
+is exactly that set of paths: forward row 0 all ones, Z = the sum over row m (all
+states), the backward pass seeded with ones along row m. The gradient's gap targets:
+gaps in B are counted from column 0 (the chain is real), gaps in A from row 1 (row 0's
+are not moves): `kGapTargetMinJ` / `kGapTargetMinI`, which split the old
+`kGapTargetMin` (Local: both 1).  Everything else -- the walkers (which stop at row 0),
+the pointer codes (row 0 all stops), `alignment_end()`, the guide, the gradients, the
+batch variant (`SeqPairBatchT::Var` indices 4 / 5), `glocal_*` functions in every
+precision -- follows from the fills setting `best_i_ = m`, `best_j_` the end column.
+Tested against `bruteforce.py`'s enumeration (every global path of A vs B[j0:j1], every
+window, minus the paths opening with a gap in A): scores, log Z, hard and soft counts,
+the integer types, pointers vs scores, the batch (hard / soft / score-only), the
+streaming `align()`, a guide band (`tests/Python/test_glocal.py`).
+
+**Leveled: the Full fills and the score-only kernels.** A template flag `Glocal` on the
+striped affine Scores and Pointers kernels (`kernels_impl.inl`, `kernels_pointers_impl.
+inl`), the striped linear kernel (`kernels_linear_impl.inl`) and the three score-only
+forms (`score_kernel_impl.inl`), `ViterbiJob::align_mode` / `ScoreJob::local` 2: row 0
+M = 0 at every column and no Y series, column 0 Global's chain, no clamp, and the end the
+best cell of row m in any state -- column 0 first, then `striped_row_best` over the
+striped columns with the padding masked (row 0's direction codes stay Global's: the walk
+stops at row 0 before reading them). Bit-identical to the scalar fills on every level
+(`test_levels_match_scalar`: scores, alignments and gradients, double / float32 / int32,
+both tracebacks, both gap models; `test_score_only_equals_the_pointer_fill`).
+
+**Inter-pair: the hard and score-only Full fills (2026-11-03).** `InterJobT::align_mode`
+2: row 0 a free start (VM / H / D = 0 at every column, VY = -inf, no row-0 border loop),
+column 0 Global's chain, and `capture(i)` at row m_l takes the max over columns 0..n_l
+(each lane its own n_l when ragged) of max(VM, VX, VY) / H / D; the traceback side was
+already glocal (`adopt_interleaved` through `glocal_end_*`). Same gates as Global: linear
+needs >= 4 lanes (`linear_fill_ok_`), `inter_linear_cap<T, true>`, `nw_int_bound_check`.
+(Soft and banded lanes followed the next day, below.) Bit-identical to
+striped (`test_interpair_matches_striped`, `test_interpair_every_level`, fuzz_fill
+`--mode glocal` 1000/1000). Found on the way and fixed: the per-pair score-only kernels
+skipped column 0 as an end (A entirely gapped against the free B), -23.900000000000013
+for -23.9 (`test_score_only_end_at_column_0`).
+
+`tools/bench_glocal.py` (200k Manakov pairs, PosimiR's model: L position sets + an edge
+set, one step = set_params + score_and_grad + scores + weighted_grad, best of 5; the
+baseline `free` is PosimiR's emulation, mode global with free edge rows, inter-pair).
+Native glocal inter-pair / free, then per-pair striped / free:
+
+| host (level) | thr | float lin | float aff | double lin | double aff |
+|---|---|---|---|---|---|
+| nighthaven (avx2) | 1 | 0.887 / 2.18 | 0.889 / 2.41 | 0.913 / 1.76 | 0.949 / 1.90 |
+| nighthaven (avx2) | 6 | 0.903 / 2.11 | 0.910 / 2.37 | 0.905 / 1.67 | 0.999 / 1.98 |
+| solace WSL (avx512) | 1 | 0.880 / 2.76 | 0.894 / 2.96 | 0.900 / 2.23 | 0.926 / 2.22 |
+| solace WSL (avx512) | 8 | 0.862 / 2.77 | 0.861 / 2.96 | 0.933 / 2.21 | 0.971 / 2.32 |
+
+(free float 6 thr: 31.6 ms per step on nighthaven; control arm within 0.6% on nighthaven,
+3.3% on solace.) Every pair went to a shared group; scores equal to the emulation's.
+So native glocal is 3-14% faster than PosimiR's emulation, and without the inter-pair
+fill it would be 1.7-3x slower.
+
+**Soft, banded, row kernels, Hirschberg (2026-11-03).** No path is gated for this mode
+any more except Grid (Global only, as for Local).
+- *Scaled soft*, per pair (`soft_kernel_impl.inl`) and inter-pair (`inter_soft_impl.inl`):
+  row 0 all ones (Local's), column 0 Global's chain, no free start inside, Z = row m's
+  sum (`rowsum[m]`, per lane `rs[m_l]`), the backward seeded with ones along row m only.
+  The gap targets split as in the log path: `kmin` (rows whose horizontal moves count:
+  1 for Local and Glocal) and `kmin0` (column 0's vertical moves: 1 for Local only).
+  Tolerance-equal to the log path (`test_soft_scaled.py` runs every mode test on glocal);
+  20k DNA pairs, per pair, 4 threads, skynet: log 5.79 s -> scaled 0.24 s.
+- *Banded inter-pair lanes*: the fill already had Glocal's borders (`align_mode` 2) and
+  the end is taken at adoption (`glocal_end_*`), so only the gates went
+  (`stream_inter_backend_`, `ensure_band_groups_`); bit-identical to striped
+  (`test_guided_matches[glocal]`, `test_banded_matches`).
+- *Row-wise / guide-banded row kernels* (`viterbi_affine_simd`): Global's column-0 chain,
+  row 0 M = 0 and no Y series, `banded_row_global`, the end by `glocal_end_affine_`.
+- *Hirschberg*: `viterbi_affine_hirschberg_glocal` / the Glocal branch of
+  `viterbi_linear_hirschberg`.  A forward scan from a free row 0 gives the end column je
+  of row m (the first holding the row's best) and the score; a reverse scan from (m, je)
+  gives the start column js on row 0, where a path may leave only by a diagonal or a
+  vertical move (so Y is not a candidate there; linear: the last row is done by hand from
+  the reverse sweep's row 1); then the global box A x B[js..je).  A box path that leaves
+  its corner horizontally is no glocal path, but costs go_a + ge_a >= 0 more than the one
+  starting a column later, so it is optimal only at zero cost, and such free leading
+  moves are dropped.  Affine scans: `hb_scan` with `glocal` 1 / 2 (the leveled kernel's
+  `HbScanJob::glocal`, bit-identical to `hb_scan_scalar`); linear: `lhb_sweep(free0)`.
+  Tests: optimal score, the path scores it, grad . params = score, hb_cutoff 2, zero
+  gap costs (`test_hirschberg_finds_an_optimal_path`), every level vs scalar
+  (`test_hirschberg_levels_match_scalar`), the tracked and integer suites.
+  `kDefaultTb` is now Local's rule for Glocal too: affine Full at float32 / integer T
+  resolves `auto` to `hirschberg_pmax` (above the pointer-cells threshold), else Pointers.
+  2000 x 8000 float32 pair, skynet: pointers 0.053 s, hirschberg 0.080, pmax 0.067
+  (Local 0.059 / 0.096 / 0.084).
+
+**The soft range bound went subnormal (fixed 2026-11-04, every mode).** The scaled
+path's lost-mass bound summed `terms (n+1) DBL_MIN (...) g` per row, g the row's
+posterior factor ~1/Z.  Where Z is large -- Local, and Glocal's row-m sum, ~2^30 on
+miRNA pairs -- the product fell below DBL_MIN: a microcode assist per row on x86, 13 %
+of a linear glocal soft pass on skynet (perf: `sp_loss` the second-hottest line).  The
+bound is now kept in units of DBL_MIN and compared against 2^-45 / DBL_MIN = 2^977
+(`kSpLossTolU`; the inter-pair kernels the same): the same test, as the factor is an
+exact power of two.  skynet, 20k pairs, linear soft, 1 thread: glocal per pair 0.419 ->
+0.359 s (Global 0.349), inter-pair 0.340 -> 0.298 (Global 0.297); Local 0.464 -> 0.406
+and 0.329 -> 0.279.  Affine moved little.
+
+**Fleet, 2026-11-04 (`tools/bench_modes.py`, 20k pairs: A 18-25, B 50; release flags;
+best of 5).** glocal / global:
+- soft, per pair and inter-pair, both gap models and precisions, 1 thread and all cores:
+  0.96-1.05 on nighthaven (avx2), solace WSL (avx512) and spot macOS (neon), 1.04-1.09 in
+  three float affine all-core cells (noise-level times, 15-27 ms).
+- banded (band 8, hard), striped and inter-pair: 0.79-0.97 (glocal's row 0 needs no
+  border), one cell 1.095 (solace float affine striped, 8 threads).
+- tracebacks, one 2000 x 5600 pair: Hirschberg 1.00-1.27 of Global's (its two end-point
+  scans; Global has none) and below Local's everywhere (nighthaven double affine 0.0210 vs
+  Local 0.0229, linear 0.0144 vs 0.0176; spot 0.0421 vs 0.0458); Pointers 0.59-0.99.  So
+  the scans' Glocal branches (`HbScanJob::glocal`, a runtime int) cost nothing measurable
+  against Local's: no template split needed.
 
 ### Python bindings (`py_exports.cpp`)
 

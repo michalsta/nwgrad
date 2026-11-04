@@ -142,8 +142,11 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_affine(InterSoftJobT<SF>& J) noexcept 
 NWGRAD_SOFT_FMA_BODY
 NWGRAD_IS_LANES;
 const int n = J.n, M = J.M, st = n + 1, na = J.nalpha, w2 = n + 2;
-const bool local = J.align_mode == 1;
-const int kmin = local ? 1 : 0;   // Aligner::kGapTargetMin
+// Glocal (align_mode 2): row 0 a free start (Local's row 0), column 0 Global's chain,
+// no free start inside, Z = row m's sum, the backward seeded along row m.
+const bool local = J.align_mode == 1, glocal = J.align_mode == 2;
+const int kmin = (local || glocal) ? 1 : 0;   // Aligner::kGapTargetMinI (rows)
+const int kmin0 = local ? 1 : 0;              // kGapTargetMinJ (column 0)
 const ivd z = {}, one = z + SF(1);
 ivd oa = z + J.oa, ea = z + J.ea, ob = z + J.ob, eb = z + J.eb;
 if constexpr (Tr) { oa = isj_w(J, 0, 0); ea = isj_w(J, 0, 1); }
@@ -260,7 +263,7 @@ auto rescale = [&](ivd* r0, ivd* r1, ivd* r2, ivd* tot, ivd mx) -> ivd {
 
 // ── Forward ──
 for (int j = 0; j <= n; ++j) { FM[j] = z; FX[j] = z; FY[j] = z; }
-if (local) { for (int j = 0; j <= n; ++j) FM[j] = one; }
+if (local || glocal) { for (int j = 0; j <= n; ++j) FM[j] = one; }
 else {
     FM[0] = one;
     if (n >= 1) FY[1] = oa;
@@ -316,7 +319,10 @@ double izr[IW];
 for (int l = 0; l < IW; ++l) {
     const int ml = J.m[l];
     double zr;
-    if (!local) {
+    if (glocal) {
+        ze[l] = S[ml * IW + l];
+        zr = rs[ml][l];
+    } else if (!local) {
         const size_t o = static_cast<size_t>(ml) * st + (Rag ? J.nb[l] : n);
         ze[l] = S[ml * IW + l];
         zr = FM[o][l] + FX[o][l] + FY[o][l];
@@ -338,8 +344,8 @@ for (int l = 0; l < IW; ++l) {
 // ── Backward, gradient fused ──
 for (int j = 0; j < w2; ++j) { cM[j] = z; cX[j] = z; cY[j] = z; nM[j] = z; nX[j] = z; }
 int Tn[IW];
-double loss[IW], g_oa[IW], g_ea[IW], g_ob[IW], g_eb[IW];
-for (int l = 0; l < IW; ++l) { Tn[l] = 0; loss[l] = g_oa[l] = g_ea[l] = g_ob[l] = g_eb[l] = 0.0; }
+double loss[IW], lossu[IW], g_oa[IW], g_ea[IW], g_ob[IW], g_eb[IW];   // lossu: the lost mass in units of MIN
+for (int l = 0; l < IW; ++l) { Tn[l] = 0; loss[l] = lossu[l] = g_oa[l] = g_ea[l] = g_ob[l] = g_eb[l] = 0.0; }
 const size_t nn = static_cast<size_t>(na) * na;
 // Tracked: per lane and row (counts M*na, gaps (M+1)*4 per lane).
 const size_t cstride = Tr ? static_cast<size_t>(M) * na : nn;
@@ -353,7 +359,7 @@ for (int i = M; i >= 0; --i) {
     ivd init = z;
     for (int l = 0; l < IW; ++l) {
         top[l] = (i == J.m[l]) ? -1 : 0;
-        if (local && i <= J.m[l]) init[l] = isp_ldexp(SF(1), -Tn[l]);
+        if ((local && i <= J.m[l]) || (glocal && i == J.m[l])) init[l] = isp_ldexp(SF(1), -Tn[l]);
     }
     const ivd* En = (i < M) ? ER + static_cast<size_t>(i + 1) * w2 : nullptr;
     const size_t ro = static_cast<size_t>(i) * st;
@@ -381,8 +387,8 @@ for (int i = M; i >= 0; --i) {
         const ivd v = nX[j];
         ivd b1 = d + v * obn, b2 = d + v * ebn;
         if constexpr (Rag) {
-            if (!local) { const ivl e = top & endc[j]; b1 = ivsel(e, one, b1); b2 = ivsel(e, one, b2); }
-        } else if (!local && j == n) { b1 = ivsel(top, one, b1); b2 = ivsel(top, one, b2); }
+            if (!local && !glocal) { const ivl e = top & endc[j]; b1 = ivsel(e, one, b1); b2 = ivsel(e, one, b2); }
+        } else if (!local && !glocal && j == n) { b1 = ivsel(top, one, b1); b2 = ivsel(top, one, b2); }
         const ivd h = c * oa;
         ivd y = b1 + ea * c;
         ivd mv = b1 + h, xv = b2 + h;
@@ -425,7 +431,7 @@ for (int i = M; i >= 0; --i) {
         const auto [mv0, xv0] = cell(0);
         (void)mv0;
         sx += fX[0] * xv0;
-        if (kmin == 0) sob += (qM[0] + qY[0]) * xv0;
+        if (kmin0 == 0) sob += (qM[0] + qY[0]) * xv0;
     } else {
         for (int j = n; j >= 1; --j) {
             cell(j);
@@ -450,7 +456,7 @@ for (int i = M; i >= 0; --i) {
             gh0[l] = isp_ldexp(izr[l], S[i * IW + l] + Tn[l] - ze[l]);
             if (i >= 1) gv0[l] = isp_ldexp(izr[l], S[(i - 1) * IW + l] + Tn[l] - ze[l]);
             lossp[l] = sp_loss_products_max<SF>(n + 1, 5, mx[l], gh0[l], gv0[l]);
-            need |= !(loss[l] + lossp[l] <= kSpCountBudget * SoftRange<SF>::tol);
+            need |= !(loss[l] + lossu[l] * static_cast<double>(DMIN) + lossp[l] <= kSpCountBudget * SoftRange<SF>::tol);
         }
         if (need) {
             ivd lbv = z, lcv = z;
@@ -484,7 +490,9 @@ for (int i = M; i >= 0; --i) {
         const double lf = kf < 0 ? isp_ldexp(1.0, -kf) : 1.0;
         const double lb = kb < 0 ? isp_ldexp(1.0, -kb) : 1.0;
         // 32 terms per cell: sp_loss's kSpTermsAffine (both fills must agree).
-        loss[l] += 32.0 * (n + 1) * DMIN * (lf * mx[l] + lb * mf[i][l]) * gh[l];
+        // In units of DMIN (lossu): with DMIN in the product it went subnormal in double
+        // whenever Z was large (a microcode assist per row on x86; soft_kernel_impl.inl's sp_loss).
+        lossu[l] += 32.0 * (n + 1) * (lf * mx[l] + lb * mf[i][l]) * gh[l];
         loss[l] += lossp[l];   // the gradient products' flushes (above)
     }
     for (int l = 0; l < IW; ++l) {
@@ -519,7 +527,7 @@ for (int i = M; i >= 0; --i) {
     std::swap(cM, nM); std::swap(cX, nX);
 }
 for (int l = 0; l < IW; ++l) {
-    J.ok[l] = (!bad[l] && loss[l] <= SoftRange<SF>::tol) ? 1 : 0;
+    J.ok[l] = (!bad[l] && loss[l] + lossu[l] * static_cast<double>(DMIN) <= SoftRange<SF>::tol) ? 1 : 0;
     if constexpr (Tr) continue;
     J.gaps[l * 4 + 0] = -g_oa[l];
     J.gaps[l * 4 + 1] = -g_ea[l];
@@ -536,8 +544,8 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_linear(InterSoftJobT<SF>& J) noexcept 
 NWGRAD_SOFT_FMA_BODY
 NWGRAD_IS_LANES;
 const int n = J.n, M = J.M, st = n + 1, na = J.nalpha, w2 = n + 2;
-const bool local = J.align_mode == 1;
-const int kmin = local ? 1 : 0;
+const bool local = J.align_mode == 1, glocal = J.align_mode == 2;   // as inter_soft_affine
+const int kmin = (local || glocal) ? 1 : 0, kmin0 = local ? 1 : 0;
 const ivd z = {}, one = z + SF(1);
 ivd ea = z + J.ea, eb = z + J.eb;
 if constexpr (Tr) ea = isj_w(J, 0, 1);
@@ -637,7 +645,7 @@ auto rescale = [&](ivd* r, ivd mx) -> ivd {   // mx by value: see the affine ker
 };
 
 // ── Forward ──
-if (local) { for (int j = 0; j <= n; ++j) F[j] = one; }
+if (local || glocal) { for (int j = 0; j <= n; ++j) F[j] = one; }
 else { F[0] = one; for (int j = 1; j <= n; ++j) F[j] = F[j - 1] * ea; }
 if constexpr (Rag) for (int j = 0; j <= n; ++j) F[j] = ivsel(cok[j], F[j], z);
 for (int l = 0; l < IW; ++l) S[l] = 0;
@@ -675,7 +683,10 @@ double izr[IW];
 for (int l = 0; l < IW; ++l) {
     const int ml = J.m[l];
     double zr;
-    if (!local) {
+    if (glocal) {
+        ze[l] = S[ml * IW + l];
+        zr = rs[ml][l];
+    } else if (!local) {
         ze[l] = S[ml * IW + l];
         zr = F[static_cast<size_t>(ml) * st + (Rag ? J.nb[l] : n)][l];
     } else {
@@ -695,8 +706,8 @@ for (int l = 0; l < IW; ++l) {
 // ── Backward, gradient fused ──
 for (int j = 0; j < w2; ++j) { cur[j] = z; nxt[j] = z; }
 int Tn[IW];
-double loss[IW], g_ea[IW], g_eb[IW];
-for (int l = 0; l < IW; ++l) { Tn[l] = 0; loss[l] = g_ea[l] = g_eb[l] = 0.0; }
+double loss[IW], lossu[IW], g_ea[IW], g_eb[IW];   // as inter_soft_affine
+for (int l = 0; l < IW; ++l) { Tn[l] = 0; loss[l] = lossu[l] = g_ea[l] = g_eb[l] = 0.0; }
 const size_t nn = static_cast<size_t>(na) * na;
 const size_t cstride = Tr ? static_cast<size_t>(M) * na : nn;
 for (int l = 0; l < IW; ++l)
@@ -709,7 +720,7 @@ for (int i = M; i >= 0; --i) {
     ivd init = z;
     for (int l = 0; l < IW; ++l) {
         top[l] = (i == J.m[l]) ? -1 : 0;
-        if (local && i <= J.m[l]) init[l] = isp_ldexp(SF(1), -Tn[l]);
+        if ((local && i <= J.m[l]) || (glocal && i == J.m[l])) init[l] = isp_ldexp(SF(1), -Tn[l]);
     }
     const ivd* En = (i < M) ? ER + static_cast<size_t>(i + 1) * w2 : nullptr;
     const ivd* f = F + static_cast<size_t>(i) * st;
@@ -728,9 +739,9 @@ for (int i = M; i >= 0; --i) {
         const ivd bn = c;   // B at j+1 (exit mass)
         ivd b = (En ? En[j + 1] * nxt[j + 1] : z) + nxt[j] * ebn + init + ea * c;
         if constexpr (Rag) {
-            if (!local) b = ivsel(top & endc[j], one, b);
+            if (!local && !glocal) b = ivsel(top & endc[j], one, b);
             b = ivsel(cok[j], b, z);
-        } else if (!local && j == n) b = ivsel(top, one, b);
+        } else if (!local && !glocal && j == n) b = ivsel(top, one, b);
         cur[j] = b; c = b;
         mx = ivmax(mx, b);
         if (post) {
@@ -741,7 +752,7 @@ for (int i = M; i >= 0; --i) {
         }
         if (j >= 1) sa += f[j - 1] * b;
         if (i >= 1) {
-            if (j >= kmin) sb += q[j] * b;
+            if (j >= kmin0) sb += q[j] * b;
             if (j >= 1) {
                 const ivd t = q[j - 1] * Ec[j] * b;
                 if (big) trow[j] = t;
@@ -768,11 +779,11 @@ for (int i = M; i >= 0; --i) {
             gh0[l] = isp_ldexp(izr[l], S[i * IW + l] + Tn[l] - ze[l]);
             if (i >= 1) gv0[l] = isp_ldexp(izr[l], S[(i - 1) * IW + l] + Tn[l] - ze[l]);
             lossp[l] = sp_loss_products_max<SF>(n + 1, 3, mx[l], gh0[l], gv0[l]);
-            need |= !(loss[l] + lossp[l] <= kSpCountBudget * SoftRange<SF>::tol);
+            need |= !(loss[l] + lossu[l] * static_cast<double>(DMIN) + lossp[l] <= kSpCountBudget * SoftRange<SF>::tol);
         }
         if (need) {
             ivd lbv = z, lcv = z;
-            is_count_linear<SF>(f, q, Ec, cur, n, kmin, i >= 1, lbv, lcv);
+            is_count_linear<SF>(f, q, Ec, cur, n, kmin0, i >= 1, lbv, lcv);
             for (int l = 0; l < IW; ++l)
                 lossp[l] = (i > J.m[l]) ? 0.0 : sp_loss_products<SF>(lbv[l], lcv[l], gh0[l], gv0[l]);
         }
@@ -796,7 +807,7 @@ for (int i = M; i >= 0; --i) {
         const double lf = kf < 0 ? isp_ldexp(1.0, -kf) : 1.0;
         const double lb = kb < 0 ? isp_ldexp(1.0, -kb) : 1.0;
         // 16 terms per cell: sp_loss's kSpTermsLinear (both fills must agree).
-        loss[l] += 16.0 * (n + 1) * DMIN * (lf * mx[l] + lb * mf[i][l]) * gh;
+        lossu[l] += 16.0 * (n + 1) * (lf * mx[l] + lb * mf[i][l]) * gh;   // units of DMIN, as inter_soft_affine
         loss[l] += lossp[l];   // the gradient products' flushes (above)
         const SF eal = Tr ? ea[l] : J.ea, ebl = Tr ? eb[l] : J.eb;
         if (i >= kmin) g_ea[l] += sa[l] * eal * gh;
@@ -823,7 +834,7 @@ for (int i = M; i >= 0; --i) {
     std::swap(cur, nxt);
 }
 for (int l = 0; l < IW; ++l) {
-    J.ok[l] = (!bad[l] && loss[l] <= SoftRange<SF>::tol) ? 1 : 0;
+    J.ok[l] = (!bad[l] && loss[l] + lossu[l] * static_cast<double>(DMIN) <= SoftRange<SF>::tol) ? 1 : 0;
     if constexpr (Tr) continue;
     J.gaps[l * 4 + 0] = 0.0;
     J.gaps[l * 4 + 1] = -g_ea[l];

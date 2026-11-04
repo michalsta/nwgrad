@@ -279,9 +279,10 @@ static GapModel parse_gap_model(const std::string& name) {
 static AlignMode parse_align_mode(const std::string& name) {
     if (name == "global") return AlignMode::Global;
     if (name == "local")  return AlignMode::Local;
+    if (name == "glocal") return AlignMode::Glocal;
     throw nb::value_error(
         ("nwgrad: unknown mode \"" + name +
-         "\" (expected \"global\" or \"local\")").c_str());
+         "\" (expected \"global\", \"local\" or \"glocal\")").c_str());
 }
 
 template<class Mode>
@@ -472,6 +473,12 @@ static void bind_convenience(nb::module_& m, const std::string& sfx) {
     NWG_HARD("sw_grad", Linear, Local,  "SW local: returns (score, AlignParams grad) — hard subgradient (linear gap).");
     NWG_HARD("nw_affine_grad", Affine, Global, "NW global: returns (score, AlignParams grad) — hard subgradient (affine gap).");
     NWG_HARD("sw_affine_grad", Affine, Local,  "SW local: returns (score, AlignParams grad) — hard subgradient (affine gap).");
+    // Glocal: global in seq_a, local in seq_b (seq_b's leading and trailing residues are
+    // free; every residue of seq_a is aligned or pays a gap) -- "seq_a within seq_b".
+    NWG_SCORE("glocal_score", Linear, Glocal, "Glocal (global in seq_a, local in seq_b) alignment score (linear gap penalty).");
+    NWG_SCORE("glocal_score_affine", Affine, Glocal, "Glocal (global in seq_a, local in seq_b) alignment score (affine gap penalty).");
+    NWG_HARD("glocal_grad", Linear, Glocal, "Glocal: returns (score, AlignParams grad) — hard subgradient (linear gap).");
+    NWG_HARD("glocal_affine_grad", Affine, Glocal, "Glocal: returns (score, AlignParams grad) — hard subgradient (affine gap).");
     // The soft path has no integer form (it is a computation in exp/log space), so an
     // integer T binds no soft function at all rather than one that always raises.
     if constexpr (std::is_floating_point_v<T>) {
@@ -479,6 +486,8 @@ static void bind_convenience(nb::module_& m, const std::string& sfx) {
     NWG_SOFT("sw_soft_grad", Linear, Local,  "SW local: returns (log_Z, AlignParams grad) — soft gradient (linear gap).");
     NWG_SOFT("nw_affine_soft_grad", Affine, Global, "NW global: returns (log_Z, AlignParams grad) — soft gradient (affine gap).");
     NWG_SOFT("sw_affine_soft_grad", Affine, Local,  "SW local: returns (log_Z, AlignParams grad) — soft gradient (affine gap).");
+    NWG_SOFT("glocal_soft_grad", Linear, Glocal, "Glocal: returns (log_Z, AlignParams grad) — soft gradient (linear gap).");
+    NWG_SOFT("glocal_affine_soft_grad", Affine, Glocal, "Glocal: returns (log_Z, AlignParams grad) — soft gradient (affine gap).");
     }
 #undef NWG_SCORE
 #undef NWG_HARD
@@ -938,12 +947,15 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
         .def("drop_paths", &SPB::drop_paths,
              "Free the stored alignment paths (score_and_grad(keep_paths=True)).")
         .def("_inter_plan",
-             [](SPB& self) {
-                 const auto c = self.inter_plan_counts();
+             [](SPB& self, bool score_only) {
+                 const auto c = self.inter_plan_counts(score_only);
                  return std::vector<size_t>(c.begin(), c.end());
              },
+             nb::arg("score_only") = false,
              "UNSTABLE (nwgrad._tuning): the fill=\"interpair\" plan as the next call runs\n"
-             "it, [pairs in shared groups, pairs on their own fill, groups].  The\n"
+             "it, [pairs in shared groups, pairs on their own fill, groups].  score_only:\n"
+             "the plan of a grad_mode \"none\" call without keep_paths (no byte budget:\n"
+             "its score kernel keeps rows); else the plan of a call that keeps tables.  The\n"
              "score-only gather gate acts per group inside the call and is not reflected.")
         .def_prop_ro(
             "alphabet",
@@ -1472,7 +1484,8 @@ NB_MODULE(nwgrad_ext, m) {
             {"inter_linear_f64_gather_cells", int64_t(c.f64.linear_gather)},
             {"inter_global_linear_int_cells", int64_t(c.i16.linear_gather)},
             {"inter_global_linear_f32_cells", int64_t(c.f32.linear_gather == kGateNoCap ? 0 : c.f32.linear_gather)},
-            {"soft_f32_min_cells", int64_t(c.f32soft_big.own_affine)}};
+            {"soft_f32_min_cells", int64_t(c.f32soft_big.own_affine)},
+            {"inter_min_fill", int64_t(kInterMinFillPct)}};
     });
 
     m.def(

@@ -178,7 +178,7 @@ struct ViterbiJob {
     const unsigned char* b; int n;
     const T* blk; int nalpha;               // substitution block, row-major nalpha×nalpha
     T go_a, ge_a, go_b, ge_b;               // gap penalties (in the Viterbi precision)
-    int   align_mode;                       // 0 = Global, 1 = Local
+    int   align_mode;                       // 0 = Global, 1 = Local, 2 = Glocal
     int   align_band;                       // 0 = Full,   1 = GuideBanded
     int   band;                             // half-width (band>0)
     const int* guide_j; int guide_len;      // guide path for GuideBanded (may be null)
@@ -237,7 +237,7 @@ struct ScoreJob {
     const unsigned char* b; int n;
     const T* blk; int nalpha;
     T go_a, ge_a, go_b, ge_b;
-    int local;                              // 0 = Global, 1 = Local
+    int local;                              // 0 = Global, 1 = Local, 2 = Glocal (AlignMode)
     int variant;                            // 0 auto, 1 two-pass, 2 fused three-state (measuring)
     DpBufferT<T>* buf;
     T score;                                // out
@@ -327,6 +327,10 @@ struct HbScanJob {
     int ncols;                              // columns in this block
     int local;                              // 1 = clamped local (forward end), 0 = global (reverse start)
     int pmax;                               // 1 = the prefix-max VY carry (HirschbergPmax)
+    // Glocal (local 0): 1 = the forward end scan (row 0 a free start: M = 0, no Y), 2 = the
+    // reverse start scan; either way only the LAST row is a candidate, column 0 first, and
+    // for 2 the Y state is not (a path leaves DP row 0 by a diagonal or vertical move).
+    int glocal = 0;
     DpBufferT<T>* buf;                      // scratch (striped rows, profile, open vector)
     // outputs: the best cell and its block-1-based coordinates.  Default 0 at (0,0), so
     // an all-nonpositive local block reports the empty alignment.
@@ -387,7 +391,7 @@ struct InterJobT {
     int M;                           // max m over the lanes (rows filled)
     const T* blk; int nalpha;        // substitution block, row-major nalpha x nalpha
     T go_a, ge_a, go_b, ge_b;
-    int align_mode;                  // 0 = Global, 1 = Local
+    int align_mode;                  // 0 = Global, 1 = Local, 2 = Glocal (row 0 a free start)
     int linear;                      // 1 = linear gaps: H in VM only (go_*, VX, VY unused)
     T* VM; T* VX; T* VY;             // (M+1)*(n+1)*W each
     T* best; int* best_i; int* best_j;   // W each, Local only
@@ -571,13 +575,15 @@ inline double sp_loss_products_max(int cells, int kinds, SF mx, double gh0, doub
 enum class Gate : int {
     InterGroupBytes, InterSoftBytes, InterScoreGatherCells,
     InterLinearIntGatherCells, InterLinearF32GatherCells, InterLinearF64GatherCells,
-    InterGlobalLinearIntCells, InterGlobalLinearF32Cells, LinearStripedMinN, SoftF32MinCells, Count_
+    InterGlobalLinearIntCells, InterGlobalLinearF32Cells, LinearStripedMinN, SoftF32MinCells,
+    InterMinFill, Count_
 };
 inline constexpr const char* kGateNames[] = {
     "inter_group_bytes", "inter_soft_bytes", "inter_score_gather_cells",
     "inter_linear_int_gather_cells", "inter_linear_f32_gather_cells",
     "inter_linear_f64_gather_cells", "inter_global_linear_int_cells",
-    "inter_global_linear_f32_cells", "linear_striped_min_n", "soft_f32_min_cells"};
+    "inter_global_linear_f32_cells", "linear_striped_min_n", "soft_f32_min_cells",
+    "inter_min_fill"};
 static_assert(sizeof(kGateNames) / sizeof(kGateNames[0]) == static_cast<size_t>(Gate::Count_));
 inline constexpr int64_t kGateUnset = -1;
 inline constexpr int64_t kGateOff = INT64_MAX;
@@ -642,6 +648,16 @@ inline size_t gate_value(Gate g, size_t def) {
 // from 22 x 80 for double and int32 on AVX2 (the own kernel's single profile row wins once
 // B is long), and in Local mode sooner than in Global, so they are per mode; the shared
 // linear fill of int64 loses at SSE and NEON at every length.
+// One thread, alphabets of up to 8 letters (2026-11-04): the integers' small one-thread
+// budgets above come from protein, whose shared fill gathers; DNA's mask-blend fill wins
+// alone through L400 on AVX2 (15 MB of affine tables; L600, 34 MB, loses) and L300 on
+// AVX-512 (17 MB; L400, 30 MB, loses for the integers) for every type, where the 450 KiB
+// - 2 MiB integer budgets sent it to the own fill at 0.53-0.94x.  group_small_kb_1 = 16
+// MiB on both; SSE and NEON unmeasured (0: the type's budget).
+// AVX-512 float caps from 2026-11-04 (solace, 1 thread, full groups, L300-10000; the
+// original sweep stopped short of the crossovers): DNA float32 shares to ~L5500 Local /
+// ~L6300 Global (L10000: 1.18-1.25x), float64 to ~L4000 / ~L5600 (L7000: 1.37-1.54x);
+// protein float32 affine score to ~L720 (L1000: 1.33-1.57x).
 //
 // The shared soft pass's 5 (affine) or 2 (linear) double tables of Ws lanes: affine ~3
 // MiB per thread (8 with one thread), linear ~L140 (20000 cells) on AVX2 / AVX-512 /
@@ -672,6 +688,8 @@ struct GateLevelCaps {
     uint32_t soft_kb, soft_kb_1;           // shared soft pass, affine: KiB of its 5 tables per thread
     uint32_t soft_linear_cells;            // shared soft pass, linear: cells
     SoftF32Caps f32soft_big, f32soft_small;   // float32 soft pass from: alphabets over 8 / up to 8
+    uint32_t group_small_kb_1;             // hard shared fill, alphabets <= 8, n_threads == 1: KiB
+                                           // floor under the type's group_kb_1 (0 = none)
     template <class T> const GateTypeCaps& of() const noexcept {
         if constexpr (std::is_same_v<T, float>)        return f32;
         else if constexpr (std::is_same_v<T, double>)  return f64;
@@ -688,28 +706,28 @@ inline constexpr GateLevelCaps kGateCapsSse    { {       6600,     1700,      20
                                                  {          0,     3800, kGateNoCap,     3072,      12288,       1200,        800, kGateNoCap,          0,       1700,       1700,       1700 },   // int32 (its own linear fill is slow at W=4: shared to L400)
                                                  {          0,     1700,          0,     3072,      12288,          0,          0,          0,          0,       1700,       3800,       3800 },   // int64
                                                  3072, 8192, 33000,
-                                                 { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };
+                                                 { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, 0 };
 inline constexpr GateLevelCaps kGateCapsAvx2   { {      31000,     3800,      20000,     3072,      12288,       4700, kGateNoCap, kGateNoCap,      31000,      10300,      31000,      31000 },
                                                  {       6600,     1700,      20000,     3072,      12288,       1900, kGateNoCap, kGateNoCap,       6600,       6600,       6600,       6600 },
                                                  {       1700,     1700,       4000,     1024,        450,       4700,       4700, kGateNoCap,       1700,       1700,       1700,       1700 },
                                                  {       1700,     3800,       4000,     2560,       2048,       1900,       1900, kGateNoCap,       1700,       3800,       1700,       1700 },
                                                  {       3800,     1700,       2500,     3072,      12288,       2800,       1900, kGateNoCap,       3800,       1700,       3800,       3800 },
                                                  3072, 8192, 20000,
-                                                 { 1000, 2000, 0, 5000 }, { 0, 0, 0, 0 } };
-inline constexpr GateLevelCaps kGateCapsAvx512 { { kGateNoCap,    31000,      33000,     3072,      18432, kGateNoCap, kGateNoCap, kGateNoCap, kGateNoCap,      31000, kGateNoCap, kGateNoCap },
-                                                 {     160000,    14700,      33000,     3072,      18432, kGateNoCap, kGateNoCap, kGateNoCap,     160000,      23000,     160000,     160000 },
+                                                 { 1000, 2000, 0, 5000 }, { 0, 0, 0, 0 }, 16384 };
+inline constexpr GateLevelCaps kGateCapsAvx512 { {     520000,    31000,      33000,     3072,      18432,   30000000,   40000000, kGateNoCap,     520000,      31000,     520000,     520000 },
+                                                 {     160000,    14700,      33000,     3072,      18432,   16000000,   31000000, kGateNoCap,     160000,      23000,     160000,     160000 },
                                                  {       1700,     1700,       4000,     1024,       1024, kGateNoCap, kGateNoCap, kGateNoCap,       1700,       1700,       1700,       1700 },
                                                  {       2600,     3800,       4000,     1024,       1024, kGateNoCap, kGateNoCap, kGateNoCap,       2600,       3800,       2600,       2600 },
                                                  {       1700,     3800,       6600,     1500,       2048,       4700, kGateNoCap, kGateNoCap,       1700,       3800,       1700,       1700 },
                                                  3072, 8192, 20000,
-                                                 { 7000, 10000, 1000, 7000 }, { 5000, 5000, 0, 0 } };
+                                                 { 7000, 10000, 1000, 7000 }, { 5000, 5000, 0, 0 }, 16384 };
 inline constexpr GateLevelCaps kGateCapsNeon   { {      10300,     1700,       8000,     5120,      12288,       2800, kGateNoCap, kGateNoCap,      14700,      10300,      10300,      14700 },
                                                  {          0,        0,       3000,     3072,      12288,        800,       1900, kGateNoCap,          0,          0,          0,          0 },
                                                  {       1700,     1700,       8000,     3072,       1400,       4700,       4700, kGateNoCap,       1700,       1700,       1700,       1700 },
                                                  {       1700,     1700,       8000,     4608,       6144,       4700,       4700, kGateNoCap,       1700,       1700,       1700,       1700 },
                                                  {      14700,        0,          0,     4608,      12288,       2800, kGateNoCap,          0,      63100,          0,      14700,      63100 },
                                                  3072, 8192, 20000,
-                                                 { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };
+                                                 { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, 0 };
 inline const GateLevelCaps& gate_caps(int level) noexcept {
 #if defined(__aarch64__) || defined(_M_ARM64)
     (void)level; return kGateCapsNeon;
@@ -740,6 +758,20 @@ inline bool soft_f32_fits(int level, size_t nalpha, int M, int n, bool linear, b
     const uint32_t from = shared ? (linear ? c.shared_linear : c.shared_affine)
                                  : (linear ? c.own_linear : c.own_affine);
     return cells >= from;
+}
+// A shared group's W lanes cost the same whatever number of them hold pairs (the empty
+// lanes repeat the last pair), so a group pays only when most lanes are real: from
+// kInterMinFillPct percent of W, else its pairs run their own fills.  Measured 2026-11-04
+// (nighthaven AVX2, solace AVX-512; 1 thread, every type, DNA and protein, L100-10000;
+// score only, hard and path): the shared/own ratio scales as W / real -- a group winning
+// 0.55x full loses 7.9x with one pair -- and the full-group winners cross over at
+// 0.4-0.7 W.  Override (inter_min_fill): percent; 0 = any group shares.
+inline constexpr size_t kInterMinFillPct = 75;
+inline bool inter_group_filled(size_t real, size_t W) noexcept {
+    const int64_t o = gate_override(Gate::InterMinFill);
+    const size_t pct = o < 0 ? kInterMinFillPct
+                     : o == kGateOff ? 0 : static_cast<size_t>(std::min<int64_t>(o, 100));
+    return real * 100 >= W * pct;
 }
 // Score only: the shared score kernel pays only for short pairs -- over 8 letters it
 // gathers (the InterScoreGatherCells override applies), up to 8 it blends on masks and
@@ -783,11 +815,12 @@ inline size_t inter_linear_cap(size_t nalpha, int level) noexcept {
 // size, the same bytes) too.  Not for a score-only call, which keeps rows, not tables.
 template <class T>
 inline bool inter_pair_fits(size_t la, size_t lb, bool affine, bool soft, int W, int Ws,
-                            bool single, int level) noexcept {
+                            bool single, int level, bool small_alpha = false) noexcept {
     const size_t cells = (la + 1) * (lb + 1);
     const GateLevelCaps& lc = gate_caps(level);
     const GateTypeCaps& tc = lc.template of<T>();
-    const size_t cap = gate_cap(Gate::InterGroupBytes, size_t(single ? tc.group_kb_1 : tc.group_kb) << 10);
+    const size_t kb = single ? std::max(tc.group_kb_1, small_alpha ? lc.group_small_kb_1 : 0u) : tc.group_kb;
+    const size_t cap = gate_cap(Gate::InterGroupBytes, kb << 10);
     if (cells * static_cast<size_t>(W) * (affine ? 3 : 1) * sizeof(T) > cap) return false;
     if (!soft) return true;
     if (affine) {

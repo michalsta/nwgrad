@@ -27,7 +27,7 @@ def _float32_at_any_size():
 REL32 = 2e-4    # float32 against double, log Z and every gradient field
 ABS32 = 1e-5
 RELD = 1e-9     # a float32 pair that fell back to double, against the double path
-MODES = [(g, m) for g in ("linear", "affine") for m in ("global", "local")]
+MODES = [(g, m) for g in ("linear", "affine") for m in ("global", "local", "glocal")]
 ALPHA = "ACGT"
 PROT = nwgrad.PROTEIN.symbols
 

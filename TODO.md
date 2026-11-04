@@ -233,6 +233,32 @@ and int64 kernels are slower than SSE4's (the shared fills win further there); a
 the sweep only has square protein pairs and 22 x L DNA pairs, so a short-A shape
 (`la` under the lane count) is not separated from the alphabet effect.
 
+## Gate follow-ups from the 2026-11-04 rebench (AGENTS.md, "Two holes in the gates")
+
+- nighthaven (AVX2): DNA float32 linear Global L1000 loses 1.30x with full shared groups,
+  float64 linear Global L300 1.24-1.28x, while L300 / L3000 (float32) and L1000 (float64)
+  win. Reproduced twice; likely the own fill being unusually fast there, not the gate.
+- `inter_min_fill` is one fraction for every level and type; the full-group winners cross
+  over at 0.4-0.7 W. A per-level/type value would gain ~1-3 % geomean on small batches.
+- The AVX-512 float score caps came from 1 thread; the threaded crossover is not measured.
+- Soft groups get the same fill rule unmeasured (the soft pass was not in the sweep).
+- The byte budget with hyperthreads: at n_threads = logical cores (nighthaven 12, solace
+  16) the hard shared fill loses from L150 affine (1.3-3x; solace float L100 1.1-1.6x)
+  and L200-300 linear (2-6x) inside the 3 MiB budget, measured for DNA and protein. At
+  the default (physical cores) the budget is right. A budget that halves when threads
+  outnumber cores would cover it; needs the core count the scheduler already knows.
+- `group_small_kb_1` (DNA, one thread) is measured on AVX2 / AVX-512 only; SSE and NEON
+  keep the type's budget.
+- **The SSE table follows forced-SSE4 runs on AVX2 / AVX-512 Intel (#15), not the hardware
+  that runs SSE by default.** wloczykij (Piledriver, SSE4; another user's job on ~5 of 64
+  cores) disagrees, 1 thread: the DNA score kernel wins Global int32 to L50 affine / L100
+  linear (cap 800 cells: miRNA 22x50 runs own at 55 ms vs 36 shared, 0.59-0.67x of the
+  October build), int16 to L100-200 (cap 1900), float32 to L200 and loses past (no cap,
+  1.07-1.23x at L300+); the hard byte budget loses from L300 (4.2 MB, 1.08-1.39x) for
+  protein and DNA alike where the one-thread SSE budget is 12 MiB (protein L300 path int32
+  0.77x of October). Which hardware the SSE table should follow is a decision to make
+  before changing it (Westmere / Sandy Bridge unmeasured; cudak has no bench setup).
+
 ## Per-pair gradients stored contiguously (weighted_grad, grads)
 
 `weighted_grad()` and `grads()` read every pair's cached gradient from its own
@@ -330,12 +356,38 @@ Also open from the same work:
 Tracks landed on branch `tracks` (2026-10-11; see AGENTS.md, "Tracks").  Deferred:
 
 - **Glocal mode** (global in A, local in B: free leading and trailing gaps along B) —
-  PosimiR's second DP mode.  A third `AlignMode`, or row-0 / row-m horizontal costs of
-  0 via the gap track (that needs a "free" set whose counts reach no gradient).  Not
-  started; the gap track already prices rows 0 and m on their own, so the hooks exist.
-- **Fleet runs not yet done: spot (neon) and solace (avx512).**  Correctness
-  (`ctest`, `NWGRAD_FORCE_KERNEL=simd pytest tests/Python`) and `tools/bench_tracks.py`.
-  Everything on the branch was verified on sse2 (skynet, wloczykij) and avx2 (nighthaven).
+  PosimiR's second DP mode.  MERGED 2026-11-04 (#24, `36e9b35`), begun 2026-11-01 as a third
+  `AlignMode` (AGENTS.md "Glocal mode"): the scalar fills, both tracebacks, the log-space
+  soft path, the batch and streaming surfaces and the Python functions are in and tested
+  against an exhaustive oracle.  Since then: the leveled striped / score / pointer
+  kernels, the inter-pair hard, score-only, banded and soft fills, the scaled soft
+  kernels, the row kernels and Hirschberg (2026-11-03).  Not yet: Grid (below).
+  Then PosimiR's backend can switch from the emulation to `mode="glocal"`.
+- **Grid traceback for Local and Glocal** (now affine Global Full only; the others run AS
+  Pointers: same result, table memory).  Glocal: the forward kernel's row 0 M = 0 at
+  every column and no Y series (column 0 Global's chain, no clamp), the walk entered at
+  row m's first best column (row m is in hand after the forward pass) and stopped at
+  row 0.  Local: the forward kernel also needs the clamp at 0 and a running argmax for
+  the end cell, and the walk stops at a zero cell.  Tests against Pointers, bit for bit,
+  as `test_grid.cpp` / `test_grid.py` do for Global.  (Not for PosimiR: its miRNA rows
+  never exceed hb_cutoff, and it is tracked; for long glocal / local alignments.)
+- **`test_tuning::test_plan_follows_the_gates` fails under
+  `NWGRAD_FORCE_KERNEL=scalar_fallback`** (a Global case; seen 2026-11-03 on
+  `feat/glocal`, pre-existing).  CI forces only simd, so it never shows there: make the
+  test expect the scalar backend's plan (no shared groups), or skip it there.
+- **fuzz_fill: 5 of seeds 0-299 fail on `main` `9072407`** (found 2026-11-04 from
+  `feat/glocal`, reproduced on a clean `main` build, skynet): all Global affine float32
+  banded, `fill="striped"` vs `"interpair"`.  Hard: 125, 178, 234 (scores 1-2 float32
+  ulps apart, e.g. -34.03999329 vs -34.03999710 -- the bit-identity contract broken);
+  soft banded: 145 (7.77309 vs 7.77934), 190 (-328.501 vs -329.908).  fuzz_fill passed
+  1000/1000 on 2026-10-20 (`7f45155`); bisect the main merges since (#19 gate caps first).
+  After merging #23 (`e75d80a`, float32 soft; fuzz_fill now compares float32 soft scores
+  at rtol 1e-5): Global float32 affine hard, seeds 0-299, fails 10, 27, 80, 125, 144, 145,
+  178, 190, 234, all `traceback="auto"`; glocal and local 0 of 300.
+- **Fleet runs not yet done: spot (neon) and `tools/bench_tracks.py`.**  Correctness was
+  verified on sse2 (skynet, wloczykij), avx2 (nighthaven) and avx512 (solace WSL, 2026-11-04
+  at `c9ed87e`: ctest 17/17, `NWGRAD_FORCE_KERNEL=simd` pytest 22744 passed, 72 skipped);
+  NEON only through CI's ARM64 job.
 - **Python track conversion** (`to_tracks` in py_exports.cpp) casts each pair's list
   separately: ~1-2 µs per pair, seconds for millions.  Accepting one flat int array plus
   offsets would remove it.

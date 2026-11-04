@@ -87,7 +87,9 @@ static inline void striped_row_best1(const T* cH, const T* pad, int seg, int i,
 // Dense (Ptr only): the same codes, four segments' worth a byte (dense_codes_row_bytes,
 // simd_levels.hpp: 0.25 B/cell), for the memory-bound regime -- each lane accumulates its
 // 2-bit codes by Horner over a group of four segments and stores one byte per lane a group.
-template <class T, bool Local, bool Ptr, bool Tr, bool Dense = false, bool Sat = false>
+// Glocal (Local false): row 0 = 0 (a free start), column 0 Global's chain, no clamp, the
+// end the best cell of row m (column 0 first, then the striped columns, strict >).
+template <class T, bool Local, bool Ptr, bool Tr, bool Dense = false, bool Sat = false, bool Glocal = false>
 static void striped_linear_full(ViterbiJob<T>& job) {
     static_assert(!Dense || (Ptr && sizeof(T) >= 4), "dense codes: pointer fill, lanes >= 32 bits");
     using vd = stdx::native_simd<T>;
@@ -150,7 +152,7 @@ static void striped_linear_full(ViterbiJob<T>& job) {
         for (int s = 0; s < seg; ++s) {
             const int j = l * seg + s + 1;
             const std::size_t k = off + (std::size_t)s * W + l;
-            if (j <= n) pH[k] = Local ? static_cast<T>(0) : -static_cast<T>(j) * ge_a;
+            if (j <= n) pH[k] = (Local || Glocal) ? static_cast<T>(0) : -static_cast<T>(j) * ge_a;
             else        pH[k] = K_NINF;
         }
     if constexpr (Ptr) {
@@ -167,7 +169,7 @@ static void striped_linear_full(ViterbiJob<T>& job) {
     const vd vthree(static_cast<T>(3));
     const vd vninf(K_NINF);
     T best_local = static_cast<T>(0); int best_i = 0, best_j = 0;
-    const T* pad = Local ? striped_pad_into<T, Sat>(rows + 2 * rs, n, seg, W) : nullptr;
+    const T* pad = (Local || Glocal) ? striped_pad_into<T, Sat>(rows + 2 * rs, n, seg, W) : nullptr;
 
     for (int i = 1; i <= m; ++i) {
         if constexpr (Tr) {
@@ -314,12 +316,17 @@ static void striped_linear_full(ViterbiJob<T>& job) {
             }   // groups
             if constexpr (Local) striped_row_best1<T, Sat>(cH + off, pad, seg, i, best_local, best_i, best_j);
         }
+        if constexpr (Glocal)
+            if (i == m) {   // the end: column 0 first, then the striped columns
+                best_local = cH[0]; best_i = m; best_j = 0;
+                if (seg > 0) striped_row_best1<T, Sat>(cH + off, pad, seg, i, best_local, best_i, best_j);
+            }
 
         if constexpr (Ptr) std::swap(pH, cH);
         else { pH = cH; cH += hstride; }
     }
 
-    if constexpr (Local) {
+    if constexpr (Local || Glocal) {
         job.score = best_local;
         job.best_i = best_i; job.best_j = best_j;
     } else {
@@ -346,36 +353,44 @@ static constexpr bool linear_kernel_pays() {
 
 template <class T, bool Sat>
 static void striped_linear_entry_impl(ViterbiJob<T>& job) {
+    const bool glocal = job.align_mode == 2;   // 0 Global, 1 Local, 2 Glocal
     if (job.tr.on()) {
-        if (job.align_mode) striped_linear_full<T, true, false, true, false, Sat>(job);
-        else                striped_linear_full<T, false, false, true, false, Sat>(job);
+        if (glocal)              striped_linear_full<T, false, false, true, false, Sat, true>(job);
+        else if (job.align_mode) striped_linear_full<T, true, false, true, false, Sat>(job);
+        else                     striped_linear_full<T, false, false, true, false, Sat>(job);
         return;
     }
-    if (job.align_mode) striped_linear_full<T, true, false, false, false, Sat>(job);
-    else                striped_linear_full<T, false, false, false, false, Sat>(job);
+    if (glocal)              striped_linear_full<T, false, false, false, false, Sat, true>(job);
+    else if (job.align_mode) striped_linear_full<T, true, false, false, false, Sat>(job);
+    else                     striped_linear_full<T, false, false, false, false, Sat>(job);
 }
 template <class T, bool Sat>
 static void striped_linear_ptr_entry_impl(ViterbiJob<T>& job) {
+    const bool glocal = job.align_mode == 2;
     if constexpr (sizeof(T) >= 4) {
         if (job.dense) {
             if (job.tr.on()) {
-                if (job.align_mode) striped_linear_full<T, true, true, true, true, Sat>(job);
-                else                striped_linear_full<T, false, true, true, true, Sat>(job);
+                if (glocal)              striped_linear_full<T, false, true, true, true, Sat, true>(job);
+                else if (job.align_mode) striped_linear_full<T, true, true, true, true, Sat>(job);
+                else                     striped_linear_full<T, false, true, true, true, Sat>(job);
             } else {
-                if (job.align_mode) striped_linear_full<T, true, true, false, true, Sat>(job);
-                else                striped_linear_full<T, false, true, false, true, Sat>(job);
+                if (glocal)              striped_linear_full<T, false, true, false, true, Sat, true>(job);
+                else if (job.align_mode) striped_linear_full<T, true, true, false, true, Sat>(job);
+                else                     striped_linear_full<T, false, true, false, true, Sat>(job);
             }
             return;
         }
     }
     job.dense = 0;
     if (job.tr.on()) {
-        if (job.align_mode) striped_linear_full<T, true, true, true, false, Sat>(job);
-        else                striped_linear_full<T, false, true, true, false, Sat>(job);
+        if (glocal)              striped_linear_full<T, false, true, true, false, Sat, true>(job);
+        else if (job.align_mode) striped_linear_full<T, true, true, true, false, Sat>(job);
+        else                     striped_linear_full<T, false, true, true, false, Sat>(job);
         return;
     }
-    if (job.align_mode) striped_linear_full<T, true, true, false, false, Sat>(job);
-    else                striped_linear_full<T, false, true, false, false, Sat>(job);
+    if (glocal)              striped_linear_full<T, false, true, false, false, Sat, true>(job);
+    else if (job.align_mode) striped_linear_full<T, true, true, false, false, Sat>(job);
+    else                     striped_linear_full<T, false, true, false, false, Sat>(job);
 }
 
 // ── Linear Hirschberg: the sweeps, the base case and the Local endpoint scans ──────

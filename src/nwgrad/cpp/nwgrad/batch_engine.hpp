@@ -831,7 +831,7 @@ private:
             return (soft_fn_ok_(K) && soft_lanes_of_(K) > 0 && s_.soft_impl != SoftImpl::Log && !banded) ? backend : -1;
         if (inter_w_(K) <= 0) return -1;
         if (GM == GapModel::Linear &&
-            (banded || (AM == AlignMode::Global && (inter_w_(K) < 4 || params.matrix.size() > 8))))
+            (banded || (AM != AlignMode::Local && (inter_w_(K) < 4 || params.matrix.size() > 8))))
             return -1;
         return backend;
     }
@@ -847,6 +847,9 @@ private:
         const bool soft = grad_mode_ == GradMode::Soft;
         const int W = soft ? SoftGroup<SFx>::lanes(K) : inter_w_(K);
         const bool hb_case = !soft && AB == AlignBand::Full && is_hirschberg(tb_resolved_);
+        // Score only on the shared score kernel (the Full branch below): one row per table, so
+        // no byte budget.  Any other shared fill keeps W pairs' whole tables.
+        const bool rows = AB == AlignBand::Full && grad_mode_ == GradMode::None && has_inter_score_(K);
         std::vector<size_t> other, elig;
         size_t maxa = 0, maxb = 0;
         // an nw_sat T: the params' bound facts, to keep pairs of the saturating regime off
@@ -856,8 +859,9 @@ private:
         for (size_t i = 0; i < N; ++i) {
             const size_t la = problems[i].seq_a.size(), lb = problems[i].seq_b.size();
             if (la == 0 || lb == 0 || (hb_case && hb_splits(tb_resolved_, s_.traceback == TracebackMode::Default ? FullAl::kAutoPointerCells : 0, s_.hb_cutoff, la, lb)) ||
-                (grad_mode_ != GradMode::None &&   // score only: rows, not tables
-                 !inter_pair_fits<T>(la, lb, GM == GapModel::Affine, soft, inter_w_(K), K.d.inter_w, s_.n_threads == 1, backend))) {
+                (!rows &&   // the score kernel keeps rows, not tables
+                 !inter_pair_fits<T>(la, lb, GM == GapModel::Affine, soft, inter_w_(K), K.d.inter_w, s_.n_threads == 1, backend,
+                                    params.matrix.size() <= 8))) {
                 other.push_back(i); continue;
             }
             if constexpr (nw_sat<T>)
@@ -868,7 +872,7 @@ private:
             // are gated by inter_score_ok in the loop)
             if constexpr (GM == GapModel::Linear)
                 if (grad_mode_ == GradMode::Hard &&
-                    (la + 1) * (lb + 1) > inter_linear_cap<T, AM == AlignMode::Global>(params.matrix.size(), backend)) {
+                    (la + 1) * (lb + 1) > inter_linear_cap<T, AM != AlignMode::Local>(params.matrix.size(), backend)) {
                     other.push_back(i); continue;
                 }
             elig.push_back(i);
@@ -889,7 +893,8 @@ private:
             size_t e = s + 1;
             while (e < elig.size() && e - s < static_cast<size_t>(W) &&
                    problems[elig[e]].seq_b.size() * 4 <= lb * 5 + 16) ++e;
-            groups.emplace_back(s, e);
+            if (inter_group_filled(e - s, static_cast<size_t>(W))) groups.emplace_back(s, e);
+            else other.insert(other.end(), elig.begin() + s, elig.begin() + e);   // mostly padding
             s = e;
         }
         // Tracked lanes (per-lane rows into the kernels): params with sets, or any track.
@@ -986,7 +991,7 @@ private:
                 const size_t cgap = trk ? 4 * (static_cast<size_t>(M) + 1) : 4;
                 slogz.resize(W); scnt.resize(W * ccnt); sgap.resize(W * cgap); sok.resize(W);
                 sg.run(K, n, M, W, a.data(), m.data(), b.data(), ragged ? nb.data() : nullptr,
-                       (AM == AlignMode::Local) ? 1 : 0, slogz.data(), scnt.data(), sgap.data(),
+                       (AM == AlignMode::Local) ? 1 : (AM == AlignMode::Glocal ? 2 : 0), slogz.data(), scnt.data(), sgap.data(),
                        sok.data(), nullptr, trk ? lrsp.data() : nullptr, trk ? lrwp.data() : nullptr);
                 for (size_t l = 0; l < real; ++l) {
                     const size_t i = elig[s + l];
@@ -1012,7 +1017,7 @@ private:
                     // Score only: one row per table, no adopt / traceback.
                     InterJobT<T> job{};
                     job.a = a.data(); job.m = m.data(); job.b = b.data(); job.n = n; job.M = M;
-                    job.align_mode = (AM == AlignMode::Local) ? 1 : 0;
+                    job.align_mode = (AM == AlignMode::Local) ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
                     if (ragged) job.nb = nb.data();
                     set_inter_params_(job, params, blkT);
                     if (trk) {
@@ -1055,7 +1060,7 @@ private:
             }
             InterJobT<T> job{};
             job.a = a.data(); job.m = m.data(); job.b = b.data(); job.n = n; job.M = M;
-            job.align_mode = (AM == AlignMode::Local) ? 1 : 0;
+            job.align_mode = (AM == AlignMode::Local) ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
             if (ragged) job.nb = nb.data();
             if (trk) {
                 for (size_t l = real; l < static_cast<size_t>(W); ++l) tj[l] = tj[real - 1];
@@ -2202,7 +2207,7 @@ private:
     // 0.54-0.85 at 1 thread and 0.67-0.87 at 12 for every type, score-only 0.09-0.78 — so the
     // exclusion is gone, and the per-pair caps in inter_eligible_ take the bands that lose.
     bool linear_fill_ok_(const LevelKernels& K) const {
-        return !(GM == GapModel::Linear && AM == AlignMode::Global && inter_w_(K) < 4);
+        return !(GM == GapModel::Linear && AM != AlignMode::Local && inter_w_(K) < 4);   // Glocal: Global's recurrence
     }
     // The vector backend the batch's inter-pair fills run on, or -1 (every pair its own
     // fill).
@@ -2214,25 +2219,28 @@ private:
         if (!linear_fill_ok_(K) && grad_mode_ != GradMode::Soft) return -1;
         return backend;
     }
-    // Whether pair i joins an inter-pair fill on `backend` (else: its own fill).
-    bool inter_eligible_(size_t i, const LevelKernels& K) const {
+    // Whether pair i joins an inter-pair fill on `backend` (else: its own fill).  rows: for
+    // score_only_, whose shared score kernel keeps one row per table, not the tables.
+    bool inter_eligible_(size_t i, const LevelKernels& K, bool rows) const {
         if (len_a(i) == 0 || len_b(i) == 0) return false;
         // An nw_sat pair past the quarter-range bound runs the saturating regime, which the
         // inter-pair kernels do not have: its own fill (nw_int_bound_check, aligner.hpp).
         if constexpr (nw_sat<T>)
             if (nw_int_bound_check<T, AM == AlignMode::Local, false>(params_->ib, static_cast<int>(len_a(i)), static_cast<int>(len_b(i))) != 0)
                 return false;
-        // The byte budget: not for a score-only batch, whose shared kernel keeps rows.
-        if (grad_mode_ != GradMode::None &&
+        // The byte budget of the tables: every hard and soft fill, and a grad_mode None call
+        // that keeps paths (it runs the hard fill, tables and all).
+        if (!rows &&
             !inter_pair_fits<T>(len_a(i), len_b(i), GM == GapModel::Affine,
-                                grad_mode_ == GradMode::Soft, inter_w_(K), K.d.inter_w, s_.n_threads == 1, K.level))
+                                grad_mode_ == GradMode::Soft, inter_w_(K), K.d.inter_w, s_.n_threads == 1, K.level,
+                                alpha_->size() <= 8))
             return false;
         // Linear hard fill: the shared fill gathers per lane-cell over 8 letters (the own
         // striped kernel reads a profile row) and blends on masks up to 8; its cell cap per
         // level and type, inter_linear_cap (simd_levels.hpp).
         if constexpr (GM == GapModel::Linear)
             if (grad_mode_ != GradMode::Soft &&
-                (len_a(i) + 1) * (len_b(i) + 1) > inter_linear_cap<T, AM == AlignMode::Global>(alpha_->size(), K.level))
+                (len_a(i) + 1) * (len_b(i) + 1) > inter_linear_cap<T, AM != AlignMode::Local>(alpha_->size(), K.level))
                 return false;
         // Hirschberg pairs past the cutoff split: no shared fill.
         return !hb_splits(tb_resolved_, s_.traceback == TracebackMode::Default ? FullAl::kAutoPointerCells : 0, s_.hb_cutoff, len_a(i), len_b(i));
@@ -2248,9 +2256,9 @@ public:
     // {pairs in shared groups, pairs on their own fill, groups}.  For nwgrad._tuning
     // sweeps, to see where the gates routed the pairs.  (The score-only gather gate,
     // inter_score_ok, acts per group inside the call and is not reflected here.)
-    std::array<size_t, 3> inter_plan_counts() {
-        ensure_plan_();
-        return {plan_.elig.size(), plan_.other.size(), plan_.groups.size()};
+    std::array<size_t, 3> inter_plan_counts(bool score_only = false) {
+        const InterPlan& P = ensure_plan_(score_only && grad_mode_ == GradMode::None);
+        return {P.elig.size(), P.other.size(), P.groups.size()};
     }
 private:
     struct InterPlan {
@@ -2260,18 +2268,22 @@ private:
         std::vector<size_t> elig, other;
         std::vector<std::pair<size_t, size_t>> groups;   // [start, end) into elig
     };
-    InterPlan plan_;
+    // Two plans: plan_ for the fills that keep tables (score_and_grad_inter_, the band
+    // groups), plan_rows_ for score_only_ (no byte budget: its kernel keeps rows).  Both
+    // only differ for grad_mode None; plan_rows_ stays empty otherwise.
+    InterPlan plan_, plan_rows_;
 
     // Built once and reused until the default ISA changes, the Hirschberg cutoff moves or
     // a fill gate is overridden (nwgrad._tuning):
     // re-sorting 2.5M pairs every training iteration was ~0.9 s of serial work per call.
     // Groups: len B runs of len-A-sorted pairs, cut every W and wherever len B outgrows
     // the group's shortest past ragged_ok().
-    void ensure_plan_() {
+    const InterPlan& ensure_plan_(bool rows = false) {
+        InterPlan& dst = rows ? plan_rows_ : plan_;
         const int def_backend = global_default_backend();
         const unsigned epoch = gate_epoch();
-        if (plan_.default_backend == def_backend && plan_.hb_cutoff == s_.hb_cutoff &&
-            plan_.gate_epoch == epoch) return;
+        if (dst.default_backend == def_backend && dst.hb_cutoff == s_.hb_cutoff &&
+            dst.gate_epoch == epoch) return dst;
         const size_t N = size();
         InterPlan P;
         P.default_backend = def_backend; P.hb_cutoff = s_.hb_cutoff; P.gate_epoch = epoch;
@@ -2279,15 +2291,15 @@ private:
         if (P.backend < 0) {
             P.other.resize(N);
             std::iota(P.other.begin(), P.other.end(), size_t{0});
-            plan_ = std::move(P);
-            return;
+            dst = std::move(P);
+            return dst;
         }
         const LevelKernels& K = level_kernels(P.backend);
         struct Key { size_t len_b, len_a, i; };
         std::vector<Key> keys;
         keys.reserve(N);
         for (size_t i = 0; i < N; ++i) {
-            if (!inter_eligible_(i, K)) { P.other.push_back(i); continue; }
+            if (!inter_eligible_(i, K, rows)) { P.other.push_back(i); continue; }
             keys.push_back({len_b(i), len_a(i), i});
         }
         std::sort(keys.begin(), keys.end(), [](const Key& x, const Key& y) {
@@ -2295,16 +2307,22 @@ private:
             if (x.len_a != y.len_a) return x.len_a < y.len_a;
             return x.i < y.i;
         });
+        // A group of mostly padding lanes runs its pairs' own fills (inter_group_filled).
         P.elig.reserve(keys.size());
-        for (const Key& k : keys) P.elig.push_back(k.i);
         const size_t W = static_cast<size_t>(inter_w_(K));
         for (size_t s = 0; s < keys.size();) {
             size_t e = s + 1;
             while (e < keys.size() && e - s < W && ragged_ok(keys[s].len_b, keys[e].len_b)) ++e;
-            P.groups.emplace_back(s, e);
+            if (inter_group_filled(e - s, W)) {
+                P.groups.emplace_back(P.elig.size(), P.elig.size() + (e - s));
+                for (size_t k = s; k < e; ++k) P.elig.push_back(keys[k].i);
+            } else {
+                for (size_t k = s; k < e; ++k) P.other.push_back(keys[k].i);
+            }
             s = e;
         }
-        plan_ = std::move(P);
+        dst = std::move(P);
+        return dst;
     }
 
     // fill = "interpair": each group one InterJob, then each lane's pair adopts its
@@ -2362,7 +2380,7 @@ private:
                 const bool skip_fill = no_viterbi || !linear_fill_ok_(K);
                 InterJobT<T> job{};
                 job.a = a.data(); job.m = m.data(); job.b = b.data(); job.n = n; job.M = M;
-                job.align_mode = (AM == AlignMode::Local) ? 1 : 0;
+                job.align_mode = (AM == AlignMode::Local) ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
                 if (ragged) job.nb = nb.data();
                 auto& buf = w.buf;
                 const bool tl = tracked_ && !skip_fill;   // tracked lanes, set up before the fill
@@ -2522,7 +2540,11 @@ private:
                 return x.i < y.i;
             });
             for (size_t k = s; k < e; ++k) Bg.elig[k] = keys[k - s].i;
-            for (size_t g = s; g < e; g += W) Bg.groups.emplace_back(g, std::min(e, g + W));
+            for (size_t g = s; g < e; g += W) {
+                const size_t ge = std::min(e, g + W);
+                if (inter_group_filled(ge - g, W)) Bg.groups.emplace_back(g, ge);
+                else Bg.other.insert(Bg.other.end(), Bg.elig.begin() + g, Bg.elig.begin() + ge);
+            }
             s = e;
         }
         band_ = std::move(Bg);
@@ -2582,7 +2604,7 @@ private:
                 }
                 InterJobT<T> job{};
                 job.a = a.data(); job.m = m.data(); job.b = b.data(); job.n = n; job.M = M;
-                job.align_mode = (AM == AlignMode::Local) ? 1 : 0;
+                job.align_mode = (AM == AlignMode::Local) ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
                 if (tracked_) job.tr = w.tjobs.data();
                 block_for_(job, blkT);   // affine: this path runs for affine only
                 wire_inter_tables_(job, w.buf, static_cast<size_t>(M + 1) * (n + 1) * W);
@@ -2612,9 +2634,9 @@ private:
         gparams_ = params_;
         const size_t N = size();
         const bool inter = s_.inter_fill;
-        if (inter) ensure_plan_();
-        const size_t G = inter ? plan_.groups.size() : 0;
-        const size_t tasks = inter ? G + plan_.other.size() : N;
+        const InterPlan& PL = inter ? ensure_plan_(true) : plan_;
+        const size_t G = inter ? PL.groups.size() : 0;
+        const size_t tasks = inter ? G + PL.other.size() : N;
         std::atomic<size_t> idx{0};
         auto worker = [&]() {
             WorkLease lease(*this);
@@ -2630,12 +2652,12 @@ private:
             };
             for (size_t t; (t = idx.fetch_add(1, std::memory_order_relaxed)) < tasks; ) {
                 if (!inter) { own(t); continue; }
-                if (t >= G) { own(plan_.other[t - G]); continue; }
-                const auto [s, e] = plan_.groups[t];
+                if (t >= G) { own(PL.other[t - G]); continue; }
+                const auto [s, e] = PL.groups[t];
                 const size_t real = e - s;
-                const LevelKernels& K = level_kernels(plan_.backend);
+                const LevelKernels& K = level_kernels(PL.backend);
                 if (!has_inter_score_(K) || !linear_fill_ok_(K)) {
-                    for (size_t l = 0; l < real; ++l) own(plan_.elig[s + l]);
+                    for (size_t l = 0; l < real; ++l) own(PL.elig[s + l]);
                     continue;
                 }
                 const int W = inter_w_(K);
@@ -2644,7 +2666,7 @@ private:
                 int M = 0, n = 0;
                 bool ragged = false;
                 for (int l = 0; l < W; ++l) {
-                    const size_t i = plan_.elig[s + std::min<size_t>(l, real - 1)];
+                    const size_t i = PL.elig[s + std::min<size_t>(l, real - 1)];
                     a[l] = codes_a(i).data(); b[l] = codes_b(i).data();
                     m[l] = static_cast<int>(len_a(i));
                     nb[l] = static_cast<int>(len_b(i));
@@ -2652,16 +2674,16 @@ private:
                     n = std::max(n, nb[l]);
                     ragged |= nb[l] != nb[0];
                 }
-                if (!inter_score_ok<T>(alpha_->size(), M, n, GM == GapModel::Affine, AM == AlignMode::Local, s_.n_threads == 1, plan_.backend)) {   // short pairs only
-                    for (size_t l = 0; l < real; ++l) own(plan_.elig[s + l]);
+                if (!inter_score_ok<T>(alpha_->size(), M, n, GM == GapModel::Affine, AM == AlignMode::Local, s_.n_threads == 1, PL.backend)) {   // short pairs only
+                    for (size_t l = 0; l < real; ++l) own(PL.elig[s + l]);
                     continue;
                 }
                 InterJobT<T> job{};
                 job.a = a.data(); job.m = m.data(); job.b = b.data(); job.n = n; job.M = M;
-                job.align_mode = (AM == AlignMode::Local) ? 1 : 0;
+                job.align_mode = (AM == AlignMode::Local) ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
                 if (ragged) job.nb = nb.data();
                 if (tracked_) {
-                    tracked_lanes_(w, w.lanes, W, real, plan_.elig, s);
+                    tracked_lanes_(w, w.lanes, W, real, PL.elig, s);
                     job.tr = w.tjobs.data();
                 }
                 block_for_(job, blkT);
@@ -2669,7 +2691,7 @@ private:
                 job.best = best.data();
                 run_inter_score_(K, job);
                 for (size_t l = 0; l < real; ++l) {
-                    const size_t i = plan_.elig[s + l];
+                    const size_t i = PL.elig[s + l];
                     flags_[i] &= static_cast<uint8_t>(~kStored);
                     score_[i] = static_cast<double>(best[l]);
                     finish_(i, false, true);

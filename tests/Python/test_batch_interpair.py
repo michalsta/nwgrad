@@ -63,7 +63,7 @@ def test_fill_property():
 
 @pytest.mark.parametrize("prec", ["double", "float32"])
 @pytest.mark.parametrize("gm", ["affine", "linear"])
-@pytest.mark.parametrize("mode", ["local", "global"])
+@pytest.mark.parametrize("mode", ["local", "global", "glocal"])
 @pytest.mark.parametrize("grad", ["hard", "none"])
 @pytest.mark.parametrize("kind", ["ties", "random"])
 @pytest.mark.parametrize("lengths", [(0, 30, 0, 60), (15, 30, 50, 51), (100, 700, 100, 700)])
@@ -79,7 +79,7 @@ def test_viterbi_matches(prec, gm, mode, grad, kind, lengths):
 
 
 @pytest.mark.parametrize("prec", ["double", "float32"])
-@pytest.mark.parametrize("mode", ["local", "global"])
+@pytest.mark.parametrize("mode", ["local", "global", "glocal"])
 @pytest.mark.parametrize("band", [1, 4])
 def test_banded_matches(prec, mode, band):
     A, B = _seqs(150, 10, 40, 3), _seqs(150, 30, 45, 4)
@@ -91,25 +91,26 @@ def test_banded_matches(prec, mode, band):
 
 
 @pytest.mark.parametrize("prec", ["double", "float32"])
-def test_guided_matches(prec):
+@pytest.mark.parametrize("mode", ["global", "glocal"])
+def test_guided_matches(prec, mode):
     """Guides from aligned strings, band 0 (GuideBanded) and band 3."""
     A, B = _seqs(80, 10, 30, 5), _seqs(80, 33, 34, 6)
     p = _params("random", "affine")
-    sp = [nwgrad.SeqPairDouble(a, b, p, gap_model="affine", mode="global") for a, b in zip(A, B)]
+    sp = [nwgrad.SeqPairDouble(a, b, p, gap_model="affine", mode=mode) for a, b in zip(A, B)]
     al = []
     for s in sp:
         s.align(); al.append(s.aligned())
     aligned = ([x[0] for x in al], [x[1] for x in al])
     for band in (0, 3):
-        r0 = _align(prec, p, "affine", "global", "hard", A, B, "striped", band=band, aligned=aligned)
-        r1 = _align(prec, p, "affine", "global", "hard", A, B, "interpair", band=band, aligned=aligned)
+        r0 = _align(prec, p, "affine", mode, "hard", A, B, "striped", band=band, aligned=aligned)
+        r1 = _align(prec, p, "affine", mode, "hard", A, B, "interpair", band=band, aligned=aligned)
         for x, y in zip(r0, r1):
             assert np.array_equal(x, y)
 
 
 @pytest.mark.parametrize("prec", ["double", "float32"])
 @pytest.mark.parametrize("gm", ["affine", "linear"])
-@pytest.mark.parametrize("mode", ["local", "global"])
+@pytest.mark.parametrize("mode", ["local", "global", "glocal"])
 @pytest.mark.parametrize("T", [1.0, 0.5])
 def test_soft_matches(prec, gm, mode, T):
     A, B = _seqs(157, 0, 30, 7), _seqs(157, 40, 42, 8)
@@ -122,7 +123,7 @@ def test_soft_matches(prec, gm, mode, T):
 
 @pytest.mark.parametrize("prec", ["double", "float32"])
 @pytest.mark.parametrize("gm", ["affine", "linear"])
-@pytest.mark.parametrize("mode", ["local", "global"])
+@pytest.mark.parametrize("mode", ["local", "global", "glocal"])
 @pytest.mark.parametrize("level", nwgrad.available_isa_levels())
 def test_every_isa_level(prec, gm, mode, level):
     A, B = _seqs(97, 5, 30, 9), _seqs(97, 30, 32, 10)
@@ -179,7 +180,7 @@ def test_global_banded_guide_ending_short_of_n(prec, fill, band):
 
 @pytest.mark.parametrize("prec", ["double", "float32"])
 @pytest.mark.parametrize("gm", ["affine", "linear"])
-@pytest.mark.parametrize("mode", ["local", "global"])
+@pytest.mark.parametrize("mode", ["local", "global", "glocal"])
 @pytest.mark.parametrize("grad", ["hard", "soft"])
 def test_ragged_b(prec, gm, mode, grad):
     """B lengths 40..50: full groups mixing B lengths (padded to the longest)."""
@@ -201,7 +202,7 @@ def test_ragged_b(prec, gm, mode, grad):
 
 @pytest.mark.parametrize("prec", ["double", "float32"])
 @pytest.mark.parametrize("gm", ["affine", "linear"])
-@pytest.mark.parametrize("mode", ["local", "global"])
+@pytest.mark.parametrize("mode", ["local", "global", "glocal"])
 @pytest.mark.parametrize("grad", ["hard", "soft"])
 def test_protein(prec, gm, mode, grad):
     """20 letters: the gathered per-row profile (hard) and gathered weights with per-lane
