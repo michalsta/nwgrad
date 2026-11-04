@@ -89,7 +89,6 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_affine(InterSoftJob& J) noexcept {
     const ivd z = {}, one = z + 1.0;
     ivd oa = z + J.oa, ea = z + J.ea, ob = z + J.ob, eb = z + J.eb;
     if constexpr (Tr) { oa = isj_w(J, 0, 0); ea = isj_w(J, 0, 1); }
-    const double DMIN = std::numeric_limits<double>::min();
     const double DMAX = std::numeric_limits<double>::max();
 
     ivd* FM = reinterpret_cast<ivd*>(J.scratch);
@@ -405,7 +404,7 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_affine(InterSoftJob& J) noexcept {
             const double lf = kf < 0 ? isp_ldexp(1.0, -kf) : 1.0;
             const double lb = kb < 0 ? isp_ldexp(1.0, -kb) : 1.0;
             // 32 terms per cell: sp_loss's kSpTermsAffine (both fills must agree).
-            loss[l] += 32.0 * (n + 1) * DMIN * (lf * mx[l] + lb * mf[i][l]) * gh[l];
+            loss[l] += 32.0 * (n + 1) * (lf * mx[l] + lb * mf[i][l]) * gh[l];   // units of DMIN (kSpLossTolU)
         }
         for (int l = 0; l < IW; ++l) {
             if (i > J.m[l]) continue;
@@ -439,7 +438,7 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_affine(InterSoftJob& J) noexcept {
         std::swap(cM, nM); std::swap(cX, nX);
     }
     for (int l = 0; l < IW; ++l) {
-        J.ok[l] = (!bad[l] && loss[l] <= 0x1p-45) ? 1 : 0;
+        J.ok[l] = (!bad[l] && loss[l] <= 0x1p977) ? 1 : 0;   // 2^-45 / DMIN, as kSpLossTolU
         if constexpr (Tr) continue;
         J.gaps[l * 4 + 0] = -g_oa[l];
         J.gaps[l * 4 + 1] = -g_ea[l];
@@ -460,7 +459,6 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_linear(InterSoftJob& J) noexcept {
     const ivd z = {}, one = z + 1.0;
     ivd ea = z + J.ea, eb = z + J.eb;
     if constexpr (Tr) ea = isj_w(J, 0, 1);
-    const double DMIN = std::numeric_limits<double>::min();
     const double DMAX = std::numeric_limits<double>::max();
 
     ivd* F = reinterpret_cast<ivd*>(J.scratch);
@@ -694,7 +692,7 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_linear(InterSoftJob& J) noexcept {
             const double lf = kf < 0 ? isp_ldexp(1.0, -kf) : 1.0;
             const double lb = kb < 0 ? isp_ldexp(1.0, -kb) : 1.0;
             // 16 terms per cell: sp_loss's kSpTermsLinear (both fills must agree).
-            loss[l] += 16.0 * (n + 1) * DMIN * (lf * mx[l] + lb * mf[i][l]) * gh;
+            loss[l] += 16.0 * (n + 1) * (lf * mx[l] + lb * mf[i][l]) * gh;   // units of DMIN (kSpLossTolU)
             const double eal = Tr ? ea[l] : J.ea, ebl = Tr ? eb[l] : J.eb;
             if (i >= kmin) g_ea[l] += sa[l] * eal * gh;
             if constexpr (Tr) {
@@ -720,7 +718,7 @@ NWGRAD_SOFT_FMA_FN static void inter_soft_linear(InterSoftJob& J) noexcept {
         std::swap(cur, nxt);
     }
     for (int l = 0; l < IW; ++l) {
-        J.ok[l] = (!bad[l] && loss[l] <= 0x1p-45) ? 1 : 0;
+        J.ok[l] = (!bad[l] && loss[l] <= 0x1p977) ? 1 : 0;   // 2^-45 / DMIN, as kSpLossTolU
         if constexpr (Tr) continue;
         J.gaps[l * 4 + 0] = 0.0;
         J.gaps[l * 4 + 1] = -g_ea[l];

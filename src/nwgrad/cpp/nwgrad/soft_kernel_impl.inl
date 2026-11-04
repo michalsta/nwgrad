@@ -78,6 +78,13 @@
 #endif
 
 static constexpr double kSpLossTol = 0x1p-45;
+// The bound is accumulated in units of DBL_MIN (sp_loss leaves that factor out) and compared
+// against kSpLossTol / DBL_MIN = 2^977: the same test, as the factor is an exact power of
+// two, but with DBL_MIN inside the per-row product it went SUBNORMAL whenever a row's
+// posterior factor was small (Z large: Local, and Glocal's row-m sum, ~2^30 on miRNA
+// pairs) -- a microcode assist per row on x86, 13 % of a linear glocal soft pass (skynet).
+// The inter-pair soft kernels (inter_soft_impl.inl) use the same units and limit.
+static constexpr double kSpLossTolU = 0x1p977;
 
 // sp_ldexp(x, e) == std::ldexp(x, e), bit for bit: a product with an exact power of two rounds
 // once, as ldexp does, and the power is built from its bits -- libc's scalbn was a call
@@ -153,7 +160,7 @@ static inline double sp_loss(double terms, int n, int kf, int kb, double mxf, do
     NWGRAD_SP_FMA_BODY
     const double lf = kf < 0 ? sp_ldexp(1.0, -kf) : 1.0;
     const double lb = kb < 0 ? sp_ldexp(1.0, -kb) : 1.0;
-    return terms * (n + 1) * std::numeric_limits<double>::min() * (lf * mxb + lb * mxf) * g;
+    return terms * (n + 1) * (lf * mxb + lb * mxf) * g;   // in units of DBL_MIN (kSpLossTolU)
 }
 static inline double sp_post(int e, double izr, bool& bad) noexcept {
     const double f = sp_ldexp(izr, e);
@@ -374,7 +381,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear_t(SoftPairJob& J) noexcept {
         Tn = Ti;
         std::swap(cur, nxt); std::swap(clo, nlo); std::swap(chi, nhi);
     }
-    if (!(loss <= kSpLossTol)) return;
+    if (!(loss <= kSpLossTolU)) return;
     J.g_oa = 0.0; J.g_ea = -g_ea; J.g_ob = 0.0; J.g_eb = -g_eb;
     J.ok = 1;
 }
@@ -629,7 +636,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine_t(SoftPairJob& J) noexcept {
         std::swap(cM, nM); std::swap(cX, nX);
         std::swap(clo, nlo); std::swap(chi, nhi);
     }
-    if (!(loss <= kSpLossTol)) return;
+    if (!(loss <= kSpLossTolU)) return;
     J.g_oa = -g_oa; J.g_ea = -g_ea; J.g_ob = -g_ob; J.g_eb = -g_eb;
     J.ok = 1;
 }
