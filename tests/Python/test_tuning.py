@@ -10,6 +10,7 @@ import os
 import numpy as np
 import pytest
 
+import conftest
 import nwgrad
 from nwgrad import _tuning
 from nwgrad.matrices import BLOSUM62
@@ -84,10 +85,18 @@ def test_override_restores():
     assert _tuning.get_gate("inter_soft_bytes") == "default"
 
 
+def _needs_shared_fill():
+    # NWGRAD_FORCE_KERNEL=scalar_fallback injects that kernel, which has no shared fill:
+    # every plan is [0, N], so a test of how the plan follows the gates has nothing to see.
+    if conftest._current_backend == "scalar_fallback":
+        pytest.skip("the scalar backend has no shared fill")
+
+
 def test_plan_follows_the_gates():
     # 30-500 aa: the default byte cap sends the long pairs to their own fill (with the
     # other threads busy -- n_threads 2; one thread alone has a wider budget; at W = 4
     # lanes the 3 MiB budget reaches L250).  Enough pairs to fill 16-lane groups.
+    _needs_shared_fill()
     A, B = _pairs(300, 30, 500, seed=1)
     b = nwgrad.SeqPairBatch(A, B, _params(), n_threads=2)
     elig, other, _ = b._inter_plan()
@@ -102,6 +111,7 @@ def test_plan_follows_the_gates():
 
 
 def test_kept_paths_keep_the_byte_budget():
+    _needs_shared_fill()
     # grad_mode "none" with keep_paths runs the hard shared fill, tables and all: the byte
     # budget applies (it did not, 0b52842..: L1000 path calls ran 2x slower than their own
     # fill).  Only the score-only call, whose kernel keeps rows, goes without it.
@@ -134,6 +144,7 @@ def test_dna_alone_keeps_a_wider_byte_budget():
 
 
 def test_mostly_empty_groups_run_their_own_fill():
+    _needs_shared_fill()
     # A group's empty lanes cost as much as its real ones: one short pair alone runs its
     # own fill; with the gate off it shares.  A batch of whole groups shares regardless.
     A, B = _pairs(1, 60, 61, seed=4)

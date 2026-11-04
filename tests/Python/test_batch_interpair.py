@@ -254,3 +254,36 @@ def test_soft_guided_band0_align_ignores_no_guide(prec):
             got[gd, fill] = np.asarray(b.align(A, B, p, 0, ga, gb).scores)
     np.testing.assert_allclose(got["soft", "interpair"], got["soft", "striped"], rtol=_rel(prec))
     np.testing.assert_allclose(got["soft", "striped"], got["hard", "striped"], rtol=_rel(prec))
+
+
+def test_tracked_long_global_float32_pairs_run_their_own_fill():
+    """`auto` is Grid for Global affine float32, but Grid refuses tracked pairs: they run
+    hirschberg_pmax, which splits past hb_cutoff rows and may score a ulp below Pointers.
+    The planner must keep them off the shared fill (Pointers' arithmetic), or the fills
+    disagree -- fuzz_fill seeds 125, 178, 234, scores 1-2 ulps apart."""
+    import conftest
+    if conftest._current_backend == "scalar_fallback":
+        pytest.skip("the scalar backend has no shared fill")
+    A = _seqs(40, 20, 60, 91) + _seqs(8, 600, 760, 92)
+    B = _seqs(48, 15, 20, 93)
+    p = nwgrad.AlignParams.stack([_params("random", "affine"), _params("ties", "affine")])
+    tracks = [[i % 2] * len(a) for i, a in enumerate(A)]
+    gap_tracks = [[i % 2] * (len(a) + 1) for i, a in enumerate(A)]
+    runs = {}
+    for fill in ("striped", "interpair"):
+        b = nwgrad.SeqPairBatch(A, B, p, tracks=tracks, gap_tracks=gap_tracks, n_threads=3)
+        b.fill = fill
+        if fill == "interpair":
+            elig, other, _ = b._inter_plan()
+            assert (elig, other) == (40, 8)
+        b.score_and_grad(keep_paths=True)
+        m, g = b.grads()
+        runs[fill] = (b.scores(), m, g, [b[i].aligned() for i in range(len(A))])
+    for x, y in zip(runs["striped"], runs["interpair"]):
+        if isinstance(x, list):
+            assert x == y
+        else:
+            assert np.array_equal(x, y)
+    # untracked, Grid applies (no split): the long pairs may share a fill
+    u = nwgrad.SeqPairBatch(A, B, _params("random", "affine"), n_threads=3)
+    assert u._inter_plan()[:2] == [48, 0]

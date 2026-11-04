@@ -1146,6 +1146,17 @@ score kernel's seven.  NEON (spot, the user at its desktop, ~0.5 core of WindowS
 run): 1.9-2.7x faster than the f32 default, 2.9-3.9x than the f64 one; `tests/Python/test_grid.py`
 passes there.
 
+**`auto`'s Grid and the planner (fixed 2026-11-04).**  Grid refuses a tracked pair
+(`grid_ok_`: `tr_`), which then runs `kGridFallbackTb` -- `hirschberg_pmax` at float32,
+splitting past `hb_cutoff` rows.  The batch engine resolved `auto` from an untracked probe
+(Grid) and so let those pairs onto the shared fill, which computes Pointers': under
+`fill="interpair"` a long tracked Global float32 pair got Pointers' score and path, under
+`"striped"` / `"rowwise"` hirschberg_pmax's (1-2 ulps below on fuzz_fill seeds 125, 178,
+234; a different guide, hence a different band, for the soft banded seeds 145, 190).  The
+planners now ask `hb_splits` with `own_tb_(tracked)`, the traceback the pair's own fill
+really takes (`test_tracked_long_global_float32_pairs_run_their_own_fill`).  fuzz_fill
+0 of 1000 seeds fail, 0 of 300 under `--mode local` / `glocal`.
+
 ### Linear gaps: Pointers and Hirschberg (2026-10-05)
 
 - **`traceback="pointers"` for linear** (`viterbi_linear_ptr`): one direction byte per

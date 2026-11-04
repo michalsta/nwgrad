@@ -672,6 +672,10 @@ struct Aligner {
         !kAutoPointerBudget ? 0
         : (AM == AlignMode::Global && std::is_same_v<T, double>) ? 2 * kAutoHbPointerCells
                                                                   : kAutoHbPointerCells;
+    // What `auto`'s Grid runs where Grid does not apply (grid_ok_: a tracked pair, the
+    // scalar backend): the batch planner must see it too, or it puts a pair this aligner
+    // would split (Hirschberg past hb_cutoff) on a shared fill that computes Pointers'.
+    static constexpr TracebackMode grid_fallback_tb() noexcept { return kGridFallbackTb; }
     void set_traceback(TracebackMode t) noexcept {
         tb_auto_ = (t == TracebackMode::Default);
         tb_ = tb_auto_ ? kDefaultTb : t;
