@@ -36,10 +36,10 @@ PARAMS = [
 @pytest.mark.parametrize("cls", [nwgrad.SeqPairBatch, nwgrad.SeqPairBatchDouble])
 @pytest.mark.parametrize("pi", range(len(PARAMS)))
 @pytest.mark.parametrize("threads", [1, 3])
-@pytest.mark.parametrize("mode", ["global", "glocal"])
+@pytest.mark.parametrize("mode", ["global", "glocal", "local"])
 def test_batch_grid_equals_pointers(cls, pi, threads, mode):
     A, B = related_pairs(12, 40, 400, seed=pi)
-    if mode == "glocal":   # B a window of a longer target: free flanks along B
+    if mode != "global":   # B a window of a longer target: free flanks along B
         rng = np.random.default_rng(pi + 10)
         B = ["".join(rng.choice(list(AA), int(rng.integers(0, 60)))) + b +
              "".join(rng.choice(list(AA), int(rng.integers(0, 60)))) for b in B]

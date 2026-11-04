@@ -142,6 +142,35 @@ TEST_CASE("Grid traceback is bit-identical to Pointers (affine Glocal)", "[grid]
     REQUIRE(n_grid > 0);
 }
 
+TEST_CASE("Grid traceback is bit-identical to Pointers (affine Local)", "[grid][traceback]") {
+    // The end cell from the exact forward scan, M clamped at 0 in the grid kernel and the
+    // base fill, the walk stopped at a start (code 3); unrelated pairs often score <= 0
+    // (the empty alignment) or end near a border.
+    std::mt19937 rng(20261105);
+    const long iters = grid_iters(60);
+    long n_grid = 0;
+    std::uniform_int_distribution<int> cut(1, 40);
+    for (long t = 0; t < iters; ++t) {
+        const AlignParams p = random_params(rng, static_cast<int>(t % 3));
+        auto [A, B] = random_pair(rng, t % 10 == 0 ? 1200 : 400);
+        if (t % 5 == 2) {   // homology in the middle of unrelated flanks
+            std::uniform_int_distribution<int> aa(0, 19), L(0, 150);
+            std::string f1, f2, f3, f4;
+            for (int k = L(rng); k > 0; --k) f1 += kAA[aa(rng)];
+            for (int k = L(rng); k > 0; --k) f2 += kAA[aa(rng)];
+            for (int k = L(rng); k > 0; --k) f3 += kAA[aa(rng)];
+            for (int k = L(rng); k > 0; --k) f4 += kAA[aa(rng)];
+            A = f1 + A + f2; B = f3 + B + f4;
+        }
+        const int cutoff = cut(rng);
+        for (int kern : grid_backends()) {
+            check_grid<GapModel::Affine, AlignMode::Local, double>(A, B, p, kern, cutoff, n_grid);
+            check_grid<GapModel::Affine, AlignMode::Local, float>(A, B, p, kern, cutoff, n_grid);
+        }
+    }
+    REQUIRE(n_grid > 0);
+}
+
 TEST_CASE("Grid traceback runs as Pointers where it is not implemented", "[grid][traceback]") {
     std::mt19937 rng(7);
     long n_grid = 0;
@@ -149,8 +178,8 @@ TEST_CASE("Grid traceback runs as Pointers where it is not implemented", "[grid]
         AlignParams p = random_params(rng, t % 3);
         auto [A, B] = random_pair(rng, 300);
         for (int kern : grid_backends()) {
-            check_grid<GapModel::Affine, AlignMode::Local, double>(A, B, p, kern, 8, n_grid);
             check_grid<GapModel::Linear, AlignMode::Global, float>(A, B, p, kern, 8, n_grid);
+            check_grid<GapModel::Linear, AlignMode::Local, double>(A, B, p, kern, 8, n_grid);
             AlignParams q = p;   // a negative open: the D/X form does not apply
             q.gap_open_a = -0.5;
             check_grid<GapModel::Affine, AlignMode::Global, double>(A, B, q, kern, 8, n_grid);

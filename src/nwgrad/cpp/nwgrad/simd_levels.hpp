@@ -269,6 +269,7 @@ struct GridFwdJob {
     DpBufferT<T>* buf;                      // scratch: grows, gprof, gbuilt
     int W, q;                               // out
     typename DpBufferT<T>::GVec* last = nullptr;   // out if set: row r1's max(M, X, Y), columns c0+1..c1 at [1..w]
+    int local = 0;                          // Local: M clamped at 0 (the walk stops at a start)
 };
 
 // ── Hirschberg linear-space sweep ─────────────────────────────────────────────
