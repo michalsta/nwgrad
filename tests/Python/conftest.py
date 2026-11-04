@@ -247,11 +247,17 @@ def shared_groups_at_any_fill(request):
     """Small test batches leave most lanes of a shared group empty, which by default sends
     the group's pairs to their own fills (the inter_min_fill gate) -- and an inter-pair
     test would then compare the own fill with itself.  The suite turns the gate off, so
-    every group shares; test_tuning.py keeps it."""
+    every group shares; test_tuning.py keeps it.  Likewise soft_f32_min_cells: its
+    per-level thresholds differ between a pair's own soft fill and the batch's shared pass
+    (on AVX-512 short DNA pairs run their own fill in double, the shared pass in float32),
+    so a batch-against-per-pair comparison would depend on the runner's ISA; off, float32
+    soft passes run in float32 at every size (test_soft_float32.py tests the gate)."""
     from nwgrad import _tuning
     if request.module.__name__.endswith("test_tuning"):
         yield
         return
     _tuning.set_gate("inter_min_fill", None)
+    _tuning.set_gate("soft_f32_min_cells", None)
     yield
     _tuning.set_gate("inter_min_fill", "default")
+    _tuning.set_gate("soft_f32_min_cells", "default")
