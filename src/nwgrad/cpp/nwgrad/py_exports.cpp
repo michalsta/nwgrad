@@ -938,12 +938,15 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
         .def("drop_paths", &SPB::drop_paths,
              "Free the stored alignment paths (score_and_grad(keep_paths=True)).")
         .def("_inter_plan",
-             [](SPB& self) {
-                 const auto c = self.inter_plan_counts();
+             [](SPB& self, bool score_only) {
+                 const auto c = self.inter_plan_counts(score_only);
                  return std::vector<size_t>(c.begin(), c.end());
              },
+             nb::arg("score_only") = false,
              "UNSTABLE (nwgrad._tuning): the fill=\"interpair\" plan as the next call runs\n"
-             "it, [pairs in shared groups, pairs on their own fill, groups].  The\n"
+             "it, [pairs in shared groups, pairs on their own fill, groups].  score_only:\n"
+             "the plan of a grad_mode \"none\" call without keep_paths (no byte budget:\n"
+             "its score kernel keeps rows); else the plan of a call that keeps tables.  The\n"
              "score-only gather gate acts per group inside the call and is not reflected.")
         .def_prop_ro(
             "alphabet",
@@ -1472,7 +1475,8 @@ NB_MODULE(nwgrad_ext, m) {
             {"inter_linear_f64_gather_cells", int64_t(c.f64.linear_gather)},
             {"inter_global_linear_int_cells", int64_t(c.i16.linear_gather)},
             {"inter_global_linear_f32_cells", int64_t(c.f32.linear_gather == kGateNoCap ? 0 : c.f32.linear_gather)},
-            {"soft_f32_min_cells", int64_t(c.f32soft_big.own_affine)}};
+            {"soft_f32_min_cells", int64_t(c.f32soft_big.own_affine)},
+            {"inter_min_fill", int64_t(kInterMinFillPct)}};
     });
 
     m.def(
