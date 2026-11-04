@@ -1146,6 +1146,34 @@ score kernel's seven.  NEON (spot, the user at its desktop, ~0.5 core of WindowS
 run): 1.9-2.7x faster than the f32 default, 2.9-3.9x than the f64 one; `tests/Python/test_grid.py`
 passes there.
 
+**Grid for Glocal and Local (2026-11-05, branch `feat/grid-modes`).**  `traceback="grid"`
+now runs Grid in all three modes (affine Full, floating T, untracked, opens >= 0, past
+`hb_cutoff`); before, Glocal and Local ran AS Pointers.  The kernel was already generic in its
+borders; what each mode adds:
+- **Glocal:** row 0 is M = 0 / X = Y = -inf at every column (column 0 Global's chain).  The
+  end column is `glocal_end_rows_`'s (row m's first column holding its max of M, X, Y): the
+  top-level kernel call returns row m (`GridFwdJob::last`, max(A, Y) per column; `buf.glast`),
+  or, when the whole problem is one base block, `grid_base` scans its last row
+  (`grid_pick_end_`).  The rectangle stays [0, m] x [0, n] at the top level and the walk enters
+  at (m, je).  It stops on row 0 (a free start: `hb_start_j_`, no hops along it); column 0 is
+  forced X moves, as Global.  An end in column 0 never reaches a block: its state and score
+  come from the border cell.
+- **Local:** borders M = 0 on row 0 and column 0.  The end cell comes first, from the exact
+  forward `hb_scan` (local, no pmax): its argmax (topmost row, leftmost column, strict >, over
+  max(M, X, Y), from 0) is `local_row_best_`'s rule over the fill's own values, so it is
+  Pointers' end cell; score <= 0 is the empty alignment.  Then Grid over [0, ie] x [0, je] with
+  M clamped at 0 (`GridFwdJob::local`, a template switch in the kernel; `grid_base` sets code 3
+  where M <= 0, as `viterbi_affine_ptr`), and the walk stops at an M cell coded 3
+  (`grid_stop_` ends every level's loop): `hb_start_i_ / _j_` is that cell.  One extra scan
+  pass over Global's cost.
+- **Tests:** `test_grid.cpp` has a bit-identity case per mode (Local with homology inside
+  unrelated flanks, Glocal with short B), counting runs by `Aligner::ran_grid()` (the length
+  test it replaced could not see a silent fallback), and the fallback case now requires 0
+  Grid runs; `test_grid.py` runs the batch layer in all three modes.  skynet: 4.45 M
+  assertions at `NWGRAD_GRID_FUZZ=600`, every backend.
+- **`auto` is unchanged** (Local / Glocal float32: hirschberg_pmax past hb_cutoff; double:
+  Pointers); whether it should take Grid there is measured below.
+
 **`auto`'s Grid and the planner (fixed 2026-11-04).**  Grid refuses a tracked pair
 (`grid_ok_`: `tr_`), which then runs `kGridFallbackTb` -- `hirschberg_pmax` at float32,
 splitting past `hb_cutoff` rows.  The batch engine resolved `auto` from an untracked probe
