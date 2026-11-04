@@ -574,6 +574,14 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
             "each change between aligned and gap columns, and at the end.  Pass it to\n"
             "Bio.Align.Alignment([seq_a, seq_b], coordinates).  A local alignment starts\n"
             "where its path starts.  Same availability as aligned().")
+        .def("cigar", &SP::cigar, nb::kw_only(),
+             nb::arg("extended") = false, nb::arg("soft_clip") = false,
+             "The alignment as a SAM CIGAR string, seq_a the query and seq_b the\n"
+             "reference: M aligned, I a residue of seq_a against a gap, D a residue of\n"
+             "seq_b against a gap.  extended=True writes = / X (equal / unequal symbols)\n"
+             "for M.  soft_clip=True adds the parts of seq_a outside a local alignment as\n"
+             "leading / trailing S (a global alignment has none); the reference start is\n"
+             "coordinates()[1, 0].  Same availability as aligned().")
         .def(
             "formatted",
             [](const SP& self, int width) {
@@ -611,7 +619,7 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
         .def_prop_ro("score_valid", &SP::score_valid)
         .def_prop_ro("grad_valid",  &SP::grad_valid)
         .def_prop_ro("stored_path_valid", &SP::stored_path_valid,
-                     "Whether a stored path is available (aligned(), coordinates()).")
+                     "Whether a stored path is available (aligned(), coordinates(), cigar()).")
         .def_prop_rw(
             "hb_cutoff",
             [](const SP& s) { return s.hb_cutoff(); },
@@ -844,6 +852,11 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
         .def("scores", [](const SPB& self) { return numpy_1d(self.scores()); },
              "The pairs' cached scores as a float64 array, in pair order.  Runs no\n"
              "alignment; raises if any pair has no valid score.")
+        .def("cigars", &SPB::cigars, nb::kw_only(),
+             nb::arg("extended") = false, nb::arg("soft_clip") = false,
+             "Every pair's cigar() as a list of str, in pair order (built in parallel).\n"
+             "Needs stored paths (score_and_grad(keep_paths=True)); raises if any pair\n"
+             "has none.")
         .def(
             "weighted_grad",
             [](const SPB& self,

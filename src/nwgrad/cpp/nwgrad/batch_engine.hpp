@@ -375,6 +375,46 @@ public:
         ci.push_back(x); cj.push_back(y);
         return {std::move(ci), std::move(cj)};
     }
+    // The stored alignment as a SAM CIGAR string, seq_a the query (read) and seq_b the
+    // reference: M aligned, I a residue of seq_a against a gap, D a residue of seq_b
+    // against a gap.  extended: = / X (equal / unequal symbols) in place of M.
+    // soft_clip: the parts of seq_a outside a local alignment as leading / trailing S
+    // (nothing for a global one); the reference start is coordinates()[1][0].
+    std::string cigar(size_t i, bool extended = false, bool soft_clip = false) const {
+        check_stored_(i);
+        auto [i0, j0] = path_start_(i);
+        const auto ca = codes_a(i), cb = codes_b(i);
+        std::string out;
+        char op_prev = 0;
+        size_t run = 0;
+        auto emit = [&](char op, size_t n) {
+            if (!n) return;
+            if (op == op_prev) { run += n; return; }
+            if (run) { out += std::to_string(run); out.push_back(op_prev); }
+            op_prev = op; run = n;
+        };
+        if (soft_clip) emit('S', static_cast<size_t>(i0));
+        size_t ia = static_cast<size_t>(i0), jb = static_cast<size_t>(j0);
+        for (uint32_t op : path_[i]) {
+            const uint32_t t = op >> 30, len = op & 0x3fffffffu;
+            if (t == 1) { emit('I', len); ia += len; }
+            else if (t == 2) { emit('D', len); jb += len; }
+            else if (!extended) { emit('M', len); ia += len; jb += len; }
+            else
+                for (uint32_t k = 0; k < len; ++k, ++ia, ++jb) emit(ca[ia] == cb[jb] ? '=' : 'X', 1);
+        }
+        if (soft_clip) emit('S', len_a(i) - ia);
+        if (run) { out += std::to_string(run); out.push_back(op_prev); }
+        return out;
+    }
+
+    // Every pair's cigar(), in pair order; raises if any pair has no stored path.
+    std::vector<std::string> cigars(bool extended = false, bool soft_clip = false) const {
+        std::vector<std::string> out(size());
+        for (size_t i = 0; i < size(); ++i) check_stored_(i);
+        parallel_for_c_(size(), [&](size_t i) { out[i] = cigar(i, extended, soft_clip); });
+        return out;
+    }
 
     // ── Batch operations ─────────────────────────────────────────────────────
 

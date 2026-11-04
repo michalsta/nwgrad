@@ -114,6 +114,9 @@ public:
     std::vector<double> scores() const {
         return visit([](const auto& e) { return e.scores(); });
     }
+    std::vector<std::string> cigars(bool extended = false, bool soft_clip = false) const {
+        return visit([&](const auto& e) { return e.cigars(extended, soft_clip); });
+    }
     AlignParams weighted_grad(const double* w, size_t n) const {
         return visit([&](const auto& e) { return e.weighted_grad(w, n); });
     }
@@ -263,6 +266,9 @@ public:
     }
     std::pair<std::vector<int64_t>, std::vector<int64_t>> coordinates() const {
         return ce([&](const auto& x) { return x.coordinates(i_); });
+    }
+    std::string cigar(bool extended = false, bool soft_clip = false) const {
+        return ce([&](const auto& x) { return x.cigar(i_, extended, soft_clip); });
     }
     std::vector<int> guide_j() { return e([&](auto& x) { return x.guide_j(i_); }); }
     bool path_valid()  const { return ce([&](const auto& x) { return x.path_valid(i_); }); }
