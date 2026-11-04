@@ -55,6 +55,14 @@ def _corpus(n=24, seed=5):
 CORPUS = _corpus()
 
 
+def _level():
+    """The level a batch built without kernel= runs on: the forced sweep's (conftest
+    injects kernel=), else the process default."""
+    import conftest
+    lv = conftest._current_backend
+    return lv if lv not in (None, "auto", "simd") else nwgrad.get_isa_level()
+
+
 def _grad_arrays(grad):
     d = grad.to_dict()
     return (d["matrix"], d["gap_open_a"], d["gap_extend_a"], d["gap_open_b"], d["gap_extend_b"])
@@ -438,7 +446,7 @@ def test_interpair_matches_striped(generic_matrix, cls, gap_model, grad_mode):
             # (and a forced scalar backend has no shared fill at all)
             if os.environ.get("NWGRAD_FORCE_KERNEL") != "scalar_fallback" and not (
                     gap_model == "linear" and cls == "SeqPairBatchDouble"
-                    and nwgrad.get_isa_level() in ("sse2", "sse4", "scalar_fallback")):
+                    and _level() in ("sse2", "sse4", "scalar_fallback")):
                 assert elig > 0 and groups > 0, (elig, other, groups)
         b.score_and_grad()
         g = None
