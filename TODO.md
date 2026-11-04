@@ -371,19 +371,6 @@ Tracks landed on branch `tracks` (2026-10-11; see AGENTS.md, "Tracks").  Deferre
   the end cell, and the walk stops at a zero cell.  Tests against Pointers, bit for bit,
   as `test_grid.cpp` / `test_grid.py` do for Global.  (Not for PosimiR: its miRNA rows
   never exceed hb_cutoff, and it is tracked; for long glocal / local alignments.)
-- **`test_tuning::test_plan_follows_the_gates` fails under
-  `NWGRAD_FORCE_KERNEL=scalar_fallback`** (a Global case; seen 2026-11-03 on
-  `feat/glocal`, pre-existing).  CI forces only simd, so it never shows there: make the
-  test expect the scalar backend's plan (no shared groups), or skip it there.
-- **fuzz_fill: 5 of seeds 0-299 fail on `main` `9072407`** (found 2026-11-04 from
-  `feat/glocal`, reproduced on a clean `main` build, skynet): all Global affine float32
-  banded, `fill="striped"` vs `"interpair"`.  Hard: 125, 178, 234 (scores 1-2 float32
-  ulps apart, e.g. -34.03999329 vs -34.03999710 -- the bit-identity contract broken);
-  soft banded: 145 (7.77309 vs 7.77934), 190 (-328.501 vs -329.908).  fuzz_fill passed
-  1000/1000 on 2026-10-20 (`7f45155`); bisect the main merges since (#19 gate caps first).
-  After merging #23 (`e75d80a`, float32 soft; fuzz_fill now compares float32 soft scores
-  at rtol 1e-5): Global float32 affine hard, seeds 0-299, fails 10, 27, 80, 125, 144, 145,
-  178, 190, 234, all `traceback="auto"`; glocal and local 0 of 300.
 - **Fleet runs not yet done: spot (neon) and `tools/bench_tracks.py`.**  Correctness was
   verified on sse2 (skynet, wloczykij), avx2 (nighthaven) and avx512 (solace WSL, 2026-11-04
   at `c9ed87e`: ctest 17/17, `NWGRAD_FORCE_KERNEL=simd` pytest 22744 passed, 72 skipped);

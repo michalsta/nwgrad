@@ -229,6 +229,16 @@ public:
     // The traceback as constructed ("auto" stays Default) and as this type resolves it.
     TracebackMode traceback() const noexcept { return s_.traceback; }
     TracebackMode traceback_resolved() const noexcept { return tb_resolved_; }
+    // The traceback a pair's OWN fill takes: `auto`'s Grid refuses tracked pairs
+    // (Aligner::grid_ok_), which run FullAl::grid_fallback_tb() instead — hirschberg_pmax
+    // at float32, which splits past hb_cutoff.  The planners ask hb_splits with this, so
+    // such a pair stays off the shared fills under every fill (fuzz_fill seeds 125, 178,
+    // 234: tracked Global float32, A > 512, scores 1-2 ulps apart between the fills).
+    TracebackMode own_tb_(bool tracked) const noexcept {
+        if (tracked && s_.traceback == TracebackMode::Default && tb_resolved_ == TracebackMode::Grid)
+            return FullAl::grid_fallback_tb();
+        return tb_resolved_;
+    }
 
     void set_n_threads(int n) { s_.set_n_threads(n); }
     void set_hb_cutoff(int rows) { s_.set_hb_cutoff(rows); }
@@ -846,7 +856,8 @@ private:
         const LevelKernels& K = level_kernels(backend);
         const bool soft = grad_mode_ == GradMode::Soft;
         const int W = soft ? SoftGroup<SFx>::lanes(K) : inter_w_(K);
-        const bool hb_case = !soft && AB == AlignBand::Full && is_hirschberg(tb_resolved_);
+        const TracebackMode own_tb = own_tb_(st.any());
+        const bool hb_case = !soft && AB == AlignBand::Full && is_hirschberg(own_tb);
         // Score only on the shared score kernel (the Full branch below): one row per table, so
         // no byte budget.  Any other shared fill keeps W pairs' whole tables.
         const bool rows = AB == AlignBand::Full && grad_mode_ == GradMode::None && has_inter_score_(K);
@@ -858,7 +869,7 @@ private:
         if constexpr (nw_sat<T>) { std::vector<T> st, gp; nw_int_prepare<T>(params, params.num_sets(), st, gp, sib); }
         for (size_t i = 0; i < N; ++i) {
             const size_t la = problems[i].seq_a.size(), lb = problems[i].seq_b.size();
-            if (la == 0 || lb == 0 || (hb_case && hb_splits(tb_resolved_, s_.traceback == TracebackMode::Default ? FullAl::kAutoPointerCells : 0, s_.hb_cutoff, la, lb)) ||
+            if (la == 0 || lb == 0 || (hb_case && hb_splits(own_tb, s_.traceback == TracebackMode::Default ? FullAl::kAutoPointerCells : 0, s_.hb_cutoff, la, lb)) ||
                 (!rows &&   // the score kernel keeps rows, not tables
                  !inter_pair_fits<T>(la, lb, GM == GapModel::Affine, soft, inter_w_(K), K.d.inter_w, s_.n_threads == 1, backend,
                                     params.matrix.size() <= 8))) {
@@ -2243,7 +2254,7 @@ private:
                 (len_a(i) + 1) * (len_b(i) + 1) > inter_linear_cap<T, AM != AlignMode::Local>(alpha_->size(), K.level))
                 return false;
         // Hirschberg pairs past the cutoff split: no shared fill.
-        return !hb_splits(tb_resolved_, s_.traceback == TracebackMode::Default ? FullAl::kAutoPointerCells : 0, s_.hb_cutoff, len_a(i), len_b(i));
+        return !hb_splits(own_tb_(tracked_), s_.traceback == TracebackMode::Default ? FullAl::kAutoPointerCells : 0, s_.hb_cutoff, len_a(i), len_b(i));
     }
 
 public:
