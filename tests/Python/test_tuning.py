@@ -18,7 +18,8 @@ AA = "ARNDCQEGHILKMFPSTWYV"
 OWN = dict(inter_group_bytes=0, inter_soft_bytes=0, inter_score_gather_cells=0,
            inter_linear_int_gather_cells=0, inter_linear_f32_gather_cells=0,
            inter_linear_f64_gather_cells=0, inter_global_linear_int_cells=0,
-           inter_global_linear_f32_cells=0, linear_striped_min_n=10**6)
+           inter_global_linear_f32_cells=0, linear_striped_min_n=10**6,
+           soft_f32_min_cells=0)   # (float32 at any size, as with the gate off: one precision)
 # Every gate off: the shared fill wherever it can run, the striped linear kernel always.
 OFF = {g: None for g in OWN}
 

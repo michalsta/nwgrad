@@ -72,14 +72,19 @@ void batch_case(const std::string& alpha, GapModel gm, AlignMode am, GradMode gd
     if (band > 0) { own.banded_grad(band); inter.banded_grad(band); }
     const AlignParams g0 = own.compute_grad(), g1 = inter.compute_grad();
     const int N = p.matrix.alphabet().size();
+    // Soft: tolerance-equal across fills; a float32 batch's soft pass runs in float32
+    // (~1e-6 relative between the shared and the per-pair kernel).
+    constexpr bool f32 = std::is_same_v<T, float>;
+    constexpr double se = f32 ? 2e-4 : 1e-11, sm = f32 ? 1e-5 : 1e-11;
+    constexpr double ge = f32 ? 2e-4 : 1e-10, gm_ = f32 ? 1e-5 : 1e-9;
     for (size_t i = 0; i < A.size(); ++i) {
         if (gd == GradMode::Hard) REQUIRE(own[i].score() == inter[i].score());
-        else REQUIRE(own[i].score() == Approx(inter[i].score()).epsilon(1e-11).margin(1e-11));
+        else REQUIRE(own[i].score() == Approx(inter[i].score()).epsilon(se).margin(sm));
     }
     for (int x = 0; x < N; ++x)
         for (int y = 0; y < N; ++y) {
             if (gd == GradMode::Hard) REQUIRE(g0.matrix.at(x, y) == g1.matrix.at(x, y));
-            else REQUIRE(g0.matrix.at(x, y) == Approx(g1.matrix.at(x, y)).epsilon(1e-10).margin(1e-9));
+            else REQUIRE(g0.matrix.at(x, y) == Approx(g1.matrix.at(x, y)).epsilon(ge).margin(gm_));
         }
 }
 

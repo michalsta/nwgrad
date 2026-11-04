@@ -29,15 +29,18 @@ def track_storage(request):
     STORAGE[0] = "paths"
 
 
-def _batch(cls):
+def _batch(name):
     def make(*args, **kwargs):
-        b = cls(*args, **kwargs)
+        b = getattr(nwgrad, name)(*args, **kwargs)
         b.track_storage = STORAGE[0]
         return b
     return make
 
 
-BATCH = {"_double": _batch(nwgrad.SeqPairBatchDouble), "": _batch(nwgrad.SeqPairBatch)}
+# Classes looked up at call time, not captured at import: NWGRAD_FORCE_KERNEL's conftest wraps
+# them after collection, and a captured class would build the stored batch at the host's level
+# while align() runs the forced one (float32 soft results differ by level under clang).
+BATCH = {"_double": _batch("SeqPairBatchDouble"), "": _batch("SeqPairBatch")}
 FILLS = ["interpair", "striped", "rowwise"]
 
 

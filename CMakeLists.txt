@@ -57,7 +57,12 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
         ${NWGRAD_LEVEL_DIR}/level_baseline.cpp
         ${NWGRAD_LEVEL_DIR}/level_sse4.cpp
         ${NWGRAD_LEVEL_DIR}/level_avx2.cpp
-        ${NWGRAD_LEVEL_DIR}/level_avx512.cpp)
+        ${NWGRAD_LEVEL_DIR}/level_avx512.cpp
+        # the soft kernels of each level, their own TU (level_common.inc, NWGRAD_LEVEL_SOFT_TU)
+        ${NWGRAD_LEVEL_DIR}/level_baseline_soft.cpp
+        ${NWGRAD_LEVEL_DIR}/level_sse4_soft.cpp
+        ${NWGRAD_LEVEL_DIR}/level_avx2_soft.cpp
+        ${NWGRAD_LEVEL_DIR}/level_avx512_soft.cpp)
     # baseline is the x86-64 default (SSE2); the other levels get their flags per-file.
     # sse4 is the x86-64-v2 feature set (SSE4.2 + POPCNT), spelled as -m flags like the
     # others so no -march/-mtune change rides along.
@@ -66,16 +71,16 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
     # gas pads with up to 5 segment prefixes on the instructions before a jump, and
     # Bulldozer-family decoders slow down on more than three prefixes: cs cs cs in front of
     # a 66-prefixed SSE op is four.  On skynet (Piledriver) an unrelated 30-byte shift put
-    # them into the soft linear fill's hot loop, 1.1-1.2x slower.  These two TUs cap the
-    # padding at 2 prefixes per instruction (66 + 2 = 3).  skynet, bench_int at 1 thread
+    # them into the soft linear fill's hot loop, 1.1-1.2x slower.  These TUs and their soft
+    # halves cap the padding at 2 prefixes per instruction (66 + 2 = 3).  skynet, bench_int at 1 thread
     # (hard, score, stream; 5 types, DNA and protein): one arm in five 1.2-4x faster (local
     # affine float32/double hard 0.32-0.46, DNA int16 score 0.25), the cap at 0 (all NOPs)
     # and 1 the same.  On cudak (Westmere; not a target) NOPs cost up to 1.15x, the cap at 2
     # less: baseline worst 1.05, sse4 1.14 in one arm, 10 of 60 above 1.03.
     set(NWGRAD_PAD_CAP_OPTS "$<$<CXX_COMPILER_ID:GNU>:-Wa,-malign-branch-prefix-size=2>")
-    set_source_files_properties(${NWGRAD_LEVEL_DIR}/level_baseline.cpp PROPERTIES
+    set_source_files_properties(${NWGRAD_LEVEL_DIR}/level_baseline.cpp ${NWGRAD_LEVEL_DIR}/level_baseline_soft.cpp PROPERTIES
         COMPILE_OPTIONS "${NWGRAD_PAD_CAP_OPTS}")
-    set_source_files_properties(${NWGRAD_LEVEL_DIR}/level_sse4.cpp    PROPERTIES
+    set_source_files_properties(${NWGRAD_LEVEL_DIR}/level_sse4.cpp ${NWGRAD_LEVEL_DIR}/level_sse4_soft.cpp PROPERTIES
         COMPILE_OPTIONS "-msse4.2;-mpopcnt;${NWGRAD_PAD_CAP_OPTS}")
     # The avx2 and avx512 levels are the ones Skylake-derived cores run (6th-10th gen Core,
     # Skylake-SP/Cascade Lake Xeons), whose JCC-erratum microcode keeps any jump that crosses
@@ -98,15 +103,16 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
     set(NWGRAD_JCC_GNU_OPTS
         "-Wa,-mbranches-within-32B-boundaries;-falign-functions=32;-falign-loops=1;-falign-jumps=1;-falign-labels=1")
     set(NWGRAD_JCC_CLANG_OPTS "$<$<CXX_COMPILER_ID:Clang,AppleClang>:-mbranches-within-32B-boundaries>")
-    set_source_files_properties(${NWGRAD_LEVEL_DIR}/level_avx2.cpp    PROPERTIES
+    set_source_files_properties(${NWGRAD_LEVEL_DIR}/level_avx2.cpp ${NWGRAD_LEVEL_DIR}/level_avx2_soft.cpp PROPERTIES
         COMPILE_OPTIONS "-mavx2;-mfma;${NWGRAD_JCC_CLANG_OPTS}")
-    set_source_files_properties(${NWGRAD_LEVEL_DIR}/level_avx512.cpp  PROPERTIES
+    set_source_files_properties(${NWGRAD_LEVEL_DIR}/level_avx512.cpp ${NWGRAD_LEVEL_DIR}/level_avx512_soft.cpp PROPERTIES
         COMPILE_OPTIONS "-mavx512f;-mavx512dq;-mavx512vl;-mavx512bw;${NWGRAD_JCC_CLANG_OPTS}")
 elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
     # NEON is mandatory baseline on AArch64 — one level, no runtime dispatch.
     set(NWGRAD_LEVEL_SOURCES
         ${NWGRAD_LEVEL_DIR}/simd_levels.cpp
-        ${NWGRAD_LEVEL_DIR}/level_neon.cpp)
+        ${NWGRAD_LEVEL_DIR}/level_neon.cpp
+        ${NWGRAD_LEVEL_DIR}/level_neon_soft.cpp)
 endif()
 
 nanobind_add_module(nwgrad_ext

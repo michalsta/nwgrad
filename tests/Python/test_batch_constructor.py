@@ -11,7 +11,11 @@ import pytest
 import nwgrad
 
 ALPHA = "ACGT"
-BATCH = {"_double": nwgrad.SeqPairBatchDouble, "": nwgrad.SeqPairBatch}
+# Classes looked up at call time, not captured at import: NWGRAD_FORCE_KERNEL's conftest wraps
+# them after collection, and a captured class would build the stored batch at the host's level
+# while align() runs the forced one (float32 soft results differ by level under clang).
+BATCH = {"_double": lambda *a, **kw: nwgrad.SeqPairBatchDouble(*a, **kw),
+         "": lambda *a, **kw: nwgrad.SeqPairBatch(*a, **kw)}
 CASES = [("linear", "global"), ("linear", "local"), ("affine", "global"), ("affine", "local")]
 
 

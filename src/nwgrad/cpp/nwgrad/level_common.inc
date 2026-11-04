@@ -67,10 +67,17 @@ namespace NWGRAD_LVL_NAME {
 #include "hb_kernel_impl.inl"     // Hirschberg linear-space sweep (striped, no tables)
 #include "row_kernel_impl.inl"    // row-wise banded leaf kernels (uses KW)
 #include "inter_kernel_impl.inl"  // inter-pair affine Full fill (uses KW)
-#include "inter_soft_impl.inl"    // inter-pair soft pass (uses the above's IW/ivd)
-#include "soft_kernel_impl.inl"   // per-pair scaled forward-backward
 #include "score_kernel_impl.inl"  // score only: rolling rows, no table
 #include "grid_kernel_impl.inl"   // TracebackMode::Grid's forward pass (score recurrence + grid lines)
+#ifdef NWGRAD_LEVEL_SOFT_TU
+// The soft kernels compile in a TU of their own per level (level_<name>_soft.cpp defines
+// NWGRAD_LEVEL_SOFT_TU and a distinct namespace): gcc's inlining budget is per unit
+// (--param inline-unit-growth), and with the float32 soft kernels beside the double ones
+// in the hard kernels' unit it stopped inlining in the hard inter-pair fill, whose rows
+// then ran 2.9x slower (2026-11-01).  The hard templates above are not instantiated here.
+#include "inter_soft_impl.inl"    // inter-pair soft pass (uses the above's IW/ivd)
+#include "soft_kernel_impl.inl"   // per-pair scaled forward-backward
+#endif
 }
 #undef NWGRAD_LEVEL_NS
 
@@ -104,16 +111,22 @@ struct NwgradLevelRegistrar {
         register_level_grid<T>(NWGRAD_LVL_ENUM, NWGRAD_LVL_NAME::grid_fwd_ptr<T>());
     }
     NwgradLevelRegistrar() {
+#ifdef NWGRAD_LEVEL_SOFT_TU
+        register_level_soft(NWGRAD_LVL_ENUM,
+                            &NWGRAD_LVL_NAME::inter_soft_entry,     // inter-pair soft pass, double
+                            &NWGRAD_LVL_NAME::soft_pair_linear,     // per-pair soft, linear
+                            &NWGRAD_LVL_NAME::soft_pair_affine,     // per-pair soft, affine
+                            &NWGRAD_LVL_NAME::inter_soft_entry_f,   // ... the three in float32
+                            &NWGRAD_LVL_NAME::soft_pair_linear_f,
+                            &NWGRAD_LVL_NAME::soft_pair_affine_f);
+#else
         typed<double>();
         typed<float>();
         typed<int16_t>();
         typed<int32_t>();
         typed<int64_t>();
-        register_level_common(NWGRAD_LVL_ENUM,
-                              NWGRAD_LVL_NAME::ROW_BLOCK,
-                              &NWGRAD_LVL_NAME::inter_soft_entry,     // inter-pair soft pass, double
-                              &NWGRAD_LVL_NAME::soft_pair_linear,     // per-pair soft, linear
-                              &NWGRAD_LVL_NAME::soft_pair_affine);    // per-pair soft, affine
+        register_level_common(NWGRAD_LVL_ENUM, NWGRAD_LVL_NAME::ROW_BLOCK);
+#endif
     }
 };
 const NwgradLevelRegistrar nwgrad_level_registrar_instance;
