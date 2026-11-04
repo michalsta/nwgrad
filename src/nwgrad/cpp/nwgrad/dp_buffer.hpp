@@ -249,7 +249,7 @@ struct DpBufferT {
     };
     std::vector<GridLevel> glv;          // one per recursion depth
     TVec grows, gprof;
-    GVec gtop, gleft;
+    GVec gtop, gleft, glast;   // glast: row m of a Glocal grid (its end column)
     std::vector<unsigned char> gbuilt;   // profile rows built for the current rectangle
     GVec gbM, gbX, gbY;
     GBVec gdM, gdX, gdY;
@@ -299,7 +299,7 @@ struct DpBufferT {
         clrB(hbD); clrB(hops);
         glv.clear(); glv.shrink_to_fit();
         clrT(grows); clrT(gprof);
-        for (GVec* v : {&gtop, &gleft, &gbM, &gbX, &gbY}) { v->clear(); v->shrink_to_fit(); }
+        for (GVec* v : {&gtop, &gleft, &glast, &gbM, &gbX, &gbY}) { v->clear(); v->shrink_to_fit(); }
         for (GBVec* v : {&gdM, &gdX, &gdY}) { v->clear(); v->shrink_to_fit(); }
         gbuilt.clear(); gbuilt.shrink_to_fit();
         sd.clear(); sf.clear();

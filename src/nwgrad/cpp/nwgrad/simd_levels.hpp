@@ -268,6 +268,7 @@ struct GridFwdJob {
     std::vector<int>* colid;
     DpBufferT<T>* buf;                      // scratch: grows, gprof, gbuilt
     int W, q;                               // out
+    typename DpBufferT<T>::GVec* last = nullptr;   // out if set: row r1's max(M, X, Y), columns c0+1..c1 at [1..w]
 };
 
 // ── Hirschberg linear-space sweep ─────────────────────────────────────────────

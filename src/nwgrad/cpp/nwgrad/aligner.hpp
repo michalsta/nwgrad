@@ -681,6 +681,9 @@ struct Aligner {
         tb_ = tb_auto_ ? kDefaultTb : t;
     }
     TracebackMode traceback() const noexcept { return tb_; }
+    // Whether the last Viterbi run took the Grid traceback (tests: Grid falls back to
+    // Pointers silently where it does not apply, with the same result).
+    bool ran_grid() const noexcept { return grid_; }
     // Rows per block at which the Hirschberg recursion stops splitting and solves
     // outright — see hb_cutoff_.  Unlike set_traceback this is safe to change between
     // runs: it alters how the DP divides, not what it retains.  It is a THREE-way knob
@@ -1490,6 +1493,8 @@ private:
     // hops_ came from the Grid traceback (hirschberg_ is set too: every consumer replays
     // hops_), whose guide follows Pointers' convention (guide_j_affine_hb).
     bool grid_ = false;
+    int  grid_end_ = 0;              // the Grid path's end column (Glocal: row m's best)
+    bool grid_pick_end_ = false;     // Glocal Grid: the end column is still to be picked
     // Local Hirschberg only: the 0-based cell where the recovered local path STARTS.
     // hops_ is a path within the sub-rectangle A[hb_start_i_..ie) x B[hb_start_j_..je),
     // so every consumer replays it from this origin rather than (0, 0).  For Global (and
@@ -2452,7 +2457,7 @@ private:
             return;
         }
         // Grid: where it is implemented (grid_ok_), else Pointers below — the same result.
-        if constexpr (GM == GapModel::Affine && AM == AlignMode::Global && AB == AlignBand::Full &&
+        if constexpr (GM == GapModel::Affine && AM != AlignMode::Local && AB == AlignBand::Full &&
                       std::is_floating_point_v<T>)
             if (tb_ == TracebackMode::Grid && grid_ok_(level_kernels(backend))) {
                 viterbi_affine_grid(buf, level_kernels(backend));
@@ -4165,7 +4170,7 @@ private:
     std::vector<int> guide_j_grid_() const {
         std::vector<int> gj;
         guide_affine_init(gj);
-        int i = 0, j = 0;
+        int i = hb_start_i_, j = hb_start_j_;   // Glocal: the path's start column on row 0
         for (unsigned char op : hops_) {
             if (op == 0)      { gj[static_cast<std::size_t>(i)] = j; ++i; ++j; }
             else if (op == 1) { gj[static_cast<std::size_t>(i)] = j; ++i; }
@@ -4211,13 +4216,15 @@ private:
     void viterbi_affine_grid(DpBuffer& buf, const LevelKernels& K) {
         const T go_a = static_cast<T>(params_->gap_open_a), ge_a = static_cast<T>(params_->gap_extend_a);
         const T go_b = static_cast<T>(params_->gap_open_b), ge_b = static_cast<T>(params_->gap_extend_b);
-        // the borders, as viterbi_affine_ptr leaves row 0 and column 0 (M, X, Y)
+        // the borders, as viterbi_affine_ptr leaves row 0 and column 0 (M, X, Y); Glocal:
+        // every column of row 0 a start (M 0), column 0 Global's
         const std::size_t n1 = static_cast<std::size_t>(n_) + 1, m1 = static_cast<std::size_t>(m_) + 1;
         buf.gtop.resize(3 * n1); buf.gleft.resize(3 * m1);
         for (std::size_t j = 0; j < n1; ++j) {
-            buf.gtop[j] = j == 0 ? T(0) : NEG_INF;
+            constexpr bool gl = AM == AlignMode::Glocal;
+            buf.gtop[j] = (j == 0 || gl) ? T(0) : NEG_INF;
             buf.gtop[n1 + j] = NEG_INF;
-            buf.gtop[2 * n1 + j] = j == 0 ? NEG_INF : -(go_a + static_cast<T>(j) * ge_a);
+            buf.gtop[2 * n1 + j] = (j == 0 || gl) ? NEG_INF : -(go_a + static_cast<T>(j) * ge_a);
         }
         for (std::size_t i = 0; i < m1; ++i) {
             buf.gleft[i] = i == 0 ? T(0) : NEG_INF;
@@ -4228,14 +4235,23 @@ private:
         hops_.clear();
         hops_.reserve(static_cast<std::size_t>(m_ + n_));
         int i = m_, j = n_, st = -1;
+        grid_end_ = n_;
+        grid_pick_end_ = AM == AlignMode::Glocal;   // the end column comes from row m
         grid_solve(buf, K, 0, 0, GridLine{buf.gtop.data(), n1, 1}, GridLine{buf.gleft.data(), m1, 1},
                    0, i, j, st);
-        // the borders: forced moves, as walk_affine's
-        for (; i == 0 && j > 0; --j) hops_.push_back(2);
+        if (st < 0) {   // Glocal ending in column 0 (no block walked): the border cell (m, 0)
+            const T vm = buf.gleft[m_], vx = buf.gleft[m1 + m_], vy = buf.gleft[2 * m1 + m_];
+            viterbi_score_ = std::max({vm, vx, vy});
+            best_tbl_ = (vm >= vx && vm >= vy) ? TBTable::M : (vx >= vy ? TBTable::X : TBTable::Y);
+        }
+        // the borders: forced moves, as walk_affine's (Glocal: row 0 is a start, no moves
+        // along it)
+        hb_start_i_ = 0; hb_start_j_ = 0;
+        if constexpr (AM == AlignMode::Glocal) { if (i == 0) hb_start_j_ = j; }
+        else for (; i == 0 && j > 0; --j) hops_.push_back(2);
         for (; j == 0 && i > 0; --i) hops_.push_back(1);
         std::reverse(hops_.begin(), hops_.end());
-        best_i_ = m_; best_j_ = n_;
-        hb_start_i_ = 0; hb_start_j_ = 0;
+        best_i_ = m_; best_j_ = grid_end_;
         hirschberg_ = true;
         grid_ = true;
     }
@@ -4259,8 +4275,15 @@ private:
         J.left = left.p; J.left_ss = left.ss; J.left_es = left.es;
         J.R = R; J.spacing = std::max(kGridMin, (w + kGridK - 1) / kGridK);
         J.rows = &L.rows; J.cols = &L.cols; J.colid = &L.colid; J.buf = &buf;
+        if (grid_pick_end_) J.last = &buf.glast;   // Glocal, top level: row m comes back
         K.template of<T>().grid_fwd(J);
         const int W = J.W, q = J.q;
+        if (grid_pick_end_) {   // glocal_end_rows_'s rule: the first column holding row m's best
+            const T* lr = buf.glast.data();
+            int bj = c0; T best = std::max({left(0, h), left(1, h), left(2, h)});
+            for (int jj = 1; jj <= w; ++jj) if (lr[jj] > best) { best = lr[jj]; bj = c0 + jj; }
+            j = bj; grid_end_ = bj; grid_pick_end_ = false;
+        }
         L.gcols.clear();
         L.gcols.push_back({c0, -1});                     // the rectangle's left line
         for (int t = 0; t < q * W; ++t)
@@ -4320,6 +4343,15 @@ private:
                 const T uy = nw_sub(nw_sub(bM[lf], go_a), ge_a), vy = nw_sub(nw_sub(bX[lf], go_a), ge_a), wy = nw_sub(bY[lf], ge_a);
                 bY[k] = std::max({uy, vy, wy}); dY[k] = pick(uy, vy, wy);
             }
+        }
+        if (grid_pick_end_) {   // Glocal, the whole problem one block: row m's first best column
+            int bj = c0; T best = std::max({bM[at(i, c0)], bX[at(i, c0)], bY[at(i, c0)]});
+            for (int jj = c0 + 1; jj <= c1; ++jj) {
+                const std::size_t k = at(i, jj);
+                const T v = std::max({bM[k], bX[k], bY[k]});
+                if (v > best) { best = v; bj = jj; }
+            }
+            j = bj; grid_end_ = bj; grid_pick_end_ = false;
         }
         if (st < 0) {   // the end cell (m, n): its argmax and the score, as viterbi_affine_ptr
             const std::size_t k = at(i, j);

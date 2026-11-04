@@ -187,6 +187,17 @@ static void grid_fwd_impl(GridFwdJob<T>& J) {
         std::swap(pA, cA); std::swap(pX, cX); std::swap(pY, cY);
         bD = std::max({lM, lX, lY});
     }
+    if (J.last) {   // row r1 (pA after the last swap): D = max(A, Y) = max(M, X, Y)
+        J.last->resize((std::size_t)w + 1);
+        T* const lr = J.last->data();
+        for (int s3 = 0; s3 < seg; ++s3)
+            for (int l = 0; l < W; ++l) {
+                const int j = l * seg + s3 + 1;
+                if (j > w) continue;
+                const std::size_t k = (std::size_t)s3 * W + l;
+                lr[j] = std::max(pA[k], pY[k]);
+            }
+    }
     J.W = W; J.q = q;
 }
 

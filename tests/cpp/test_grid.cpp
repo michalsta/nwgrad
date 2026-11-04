@@ -67,7 +67,7 @@ void check_grid(const std::string& a, const std::string& b, const AlignParams& p
     REQUIRE(gg.gap_open_b == gr.gap_open_b);
     REQUIRE(gg.gap_extend_b == gr.gap_extend_b);
     for (std::size_t k = 0; k < 400; ++k) REQUIRE(gg.matrix.data()[k] == gr.matrix.data()[k]);
-    if (static_cast<int>(a.size()) > cutoff) ++n_grid;
+    if (got.ran_grid()) ++n_grid;
 }
 
 AlignParams random_params(std::mt19937& rng, int scheme) {
@@ -122,6 +122,26 @@ TEST_CASE("Grid traceback is bit-identical to Pointers (affine Global)", "[grid]
     REQUIRE(n_grid > 0);
 }
 
+TEST_CASE("Grid traceback is bit-identical to Pointers (affine Glocal)", "[grid][traceback]") {
+    // Row 0 a start at every column, the end at row m's first best column (from the top
+    // level's last row, or the base block when the problem is one); the walk stops on row 0.
+    std::mt19937 rng(20261104);
+    const long iters = grid_iters(60);
+    long n_grid = 0;
+    std::uniform_int_distribution<int> cut(1, 40);
+    for (long t = 0; t < iters; ++t) {
+        const AlignParams p = random_params(rng, static_cast<int>(t % 3));
+        auto [A, B] = random_pair(rng, t % 10 == 0 ? 1200 : 400);
+        if (t % 7 == 3) B = B.substr(0, B.size() / 8);   // short B: the end column near 0
+        const int cutoff = cut(rng);
+        for (int kern : grid_backends()) {
+            check_grid<GapModel::Affine, AlignMode::Glocal, double>(A, B, p, kern, cutoff, n_grid);
+            check_grid<GapModel::Affine, AlignMode::Glocal, float>(A, B, p, kern, cutoff, n_grid);
+        }
+    }
+    REQUIRE(n_grid > 0);
+}
+
 TEST_CASE("Grid traceback runs as Pointers where it is not implemented", "[grid][traceback]") {
     std::mt19937 rng(7);
     long n_grid = 0;
@@ -136,4 +156,5 @@ TEST_CASE("Grid traceback runs as Pointers where it is not implemented", "[grid]
             check_grid<GapModel::Affine, AlignMode::Global, double>(A, B, q, kern, 8, n_grid);
         }
     }
+    REQUIRE(n_grid == 0);
 }
