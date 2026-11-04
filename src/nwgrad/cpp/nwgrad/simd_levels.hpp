@@ -633,8 +633,9 @@ inline size_t gate_value(Gate g, size_t def) {
 // L100 and int64 to L250 against L120 on NEON -- but int32 linear at SSE goes the other way
 // (Local shared to L60, Global L40).  At one thread the affine fills of double, int32 and
 // int64 keep the shared fill longer at SSE (score_affine_1 / _g1: double and int32 to L40,
-// int64 Local to L60 and Global to L120, where all threads never share; nighthaven, two
-// sweeps).  Where the AVX2 hosts disagree (Tiger Lake's AVX2 keeps the shared affine fills
+// int64 to L60, where all threads never share; nighthaven, two sweeps -- its Global int64
+// keeps the shared fill to L120 (1.03-1.10x), but skynet's Piledriver, the kind of host that
+// runs this level, loses 1.08-1.14x there from L80 on, so Global stops at L60 too).  Where the AVX2 hosts disagree (Tiger Lake's AVX2 keeps the shared affine fills
 // longer), nighthaven's crossover is the cap.  0 = never shared, kGateNoCap = always.
 // Alphabets of up to 8 letters (DNA) take the mask-blend kernels instead, which never
 // gather: those have caps of their own -- the shared score kernel loses to the own fill
@@ -685,7 +686,7 @@ inline constexpr GateLevelCaps kGateCapsSse    { {       6600,     1700,      20
                                                  {          0,        0,       8000,     3072,      12288,          0,       1200, kGateNoCap,          0,          0,       1700,       1700 },   // double
                                                  {          0,     1700,       4000,     1024,       1024,       1900,       1900, kGateNoCap,          0,       1700,          0,          0 },   // int16
                                                  {          0,     3800, kGateNoCap,     3072,      12288,       1200,        800, kGateNoCap,          0,       1700,       1700,       1700 },   // int32 (its own linear fill is slow at W=4: shared to L400)
-                                                 {          0,     1700,          0,     3072,      12288,          0,          0,          0,          0,       1700,       3800,      14700 },   // int64
+                                                 {          0,     1700,          0,     3072,      12288,          0,          0,          0,          0,       1700,       3800,       3800 },   // int64
                                                  3072, 8192, 33000,
                                                  { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };
 inline constexpr GateLevelCaps kGateCapsAvx2   { {      31000,     3800,      20000,     3072,      12288,       4700, kGateNoCap, kGateNoCap,      31000,      10300,      31000,      31000 },
