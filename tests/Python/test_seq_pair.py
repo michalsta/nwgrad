@@ -19,6 +19,7 @@ Coverage:
 import numpy as np
 import pytest
 import nwgrad
+from nwgrad import _tuning
 from conftest import StreamAligner, StreamAlignerDouble
 from test_subst_matrix import BLOSUM62
 
@@ -535,20 +536,24 @@ class TestScoreAndGrad:
         np.testing.assert_allclose(new_grad, ref_grad, atol=1e-10)
 
     def test_soft_grad_matches_ref(self):
-        p = make_params(1.0, 11.0)
-        ref_aligner = StreamAligner(
-            params=p, gap_model="affine", mode="global", grad_mode="soft", n_threads=1)
-        ref_result = ref_aligner.align(
-            [pr[0] for pr in PAIRS], [pr[1] for pr in PAIRS])
-        ref_grad = ref_result.grad.matrix.to_matrix()
-        ref_total = float(np.array(ref_result.scores).sum())
+        # The reference and the batch take different routes; float32 at any size keeps
+        # both on one precision (soft_f32_min_cells sends short pairs to double on
+        # AVX2 / AVX-512 by fill).
+        with _tuning.override(soft_f32_min_cells=None):
+            p = make_params(1.0, 11.0)
+            ref_aligner = StreamAligner(
+                params=p, gap_model="affine", mode="global", grad_mode="soft", n_threads=1)
+            ref_result = ref_aligner.align(
+                [pr[0] for pr in PAIRS], [pr[1] for pr in PAIRS])
+            ref_grad = ref_result.grad.matrix.to_matrix()
+            ref_total = float(np.array(ref_result.scores).sum())
 
-        batch = typed_batch(PAIRS, p, grad_mode="soft")
-        new_total = batch.score_and_grad()
-        new_grad = grad_matrix(batch.compute_grad())
+            batch = typed_batch(PAIRS, p, grad_mode="soft")
+            new_total = batch.score_and_grad()
+            new_grad = grad_matrix(batch.compute_grad())
 
-        assert new_total == pytest.approx(ref_total, rel=1e-10)
-        np.testing.assert_allclose(new_grad, ref_grad, atol=1e-10)
+            assert new_total == pytest.approx(ref_total, rel=1e-10)
+            np.testing.assert_allclose(new_grad, ref_grad, atol=1e-10)
 
     # ── state flags ───────────────────────────────────────────────────────────
 

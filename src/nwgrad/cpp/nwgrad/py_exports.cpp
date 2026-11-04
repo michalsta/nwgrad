@@ -1458,7 +1458,8 @@ NB_MODULE(nwgrad_ext, m) {
             {"inter_linear_f32_gather_cells", int64_t(c.f32.linear_gather == kGateNoCap ? 0 : c.f32.linear_gather)},
             {"inter_linear_f64_gather_cells", int64_t(c.f64.linear_gather)},
             {"inter_global_linear_int_cells", int64_t(c.i16.linear_gather)},
-            {"inter_global_linear_f32_cells", int64_t(c.f32.linear_gather == kGateNoCap ? 0 : c.f32.linear_gather)}};
+            {"inter_global_linear_f32_cells", int64_t(c.f32.linear_gather == kGateNoCap ? 0 : c.f32.linear_gather)},
+            {"soft_f32_min_cells", int64_t(c.f32soft_big.own_affine)}};
     });
 
     m.def(

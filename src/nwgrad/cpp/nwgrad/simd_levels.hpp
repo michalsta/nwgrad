@@ -571,13 +571,13 @@ inline double sp_loss_products_max(int cells, int kinds, SF mx, double gh0, doub
 enum class Gate : int {
     InterGroupBytes, InterSoftBytes, InterScoreGatherCells,
     InterLinearIntGatherCells, InterLinearF32GatherCells, InterLinearF64GatherCells,
-    InterGlobalLinearIntCells, InterGlobalLinearF32Cells, LinearStripedMinN, Count_
+    InterGlobalLinearIntCells, InterGlobalLinearF32Cells, LinearStripedMinN, SoftF32MinCells, Count_
 };
 inline constexpr const char* kGateNames[] = {
     "inter_group_bytes", "inter_soft_bytes", "inter_score_gather_cells",
     "inter_linear_int_gather_cells", "inter_linear_f32_gather_cells",
     "inter_linear_f64_gather_cells", "inter_global_linear_int_cells",
-    "inter_global_linear_f32_cells", "linear_striped_min_n"};
+    "inter_global_linear_f32_cells", "linear_striped_min_n", "soft_f32_min_cells"};
 static_assert(sizeof(kGateNames) / sizeof(kGateNames[0]) == static_cast<size_t>(Gate::Count_));
 inline constexpr int64_t kGateUnset = -1;
 inline constexpr int64_t kGateOff = INT64_MAX;
@@ -726,14 +726,19 @@ inline size_t gate_cap(Gate g, size_t def) noexcept {
     return o < 0 ? def : static_cast<size_t>(o);
 }
 // Whether a float32 batch's soft pass of a pair (or a shared group) of (M+1)(n+1) cells
-// runs in float32 on `level` (< 0, the scalar backend: always): SoftF32Caps.
+// runs in float32 on `level` (< 0, the scalar backend: always): SoftF32Caps, or the
+// soft_f32_min_cells override (one threshold for all; off = always float32).
 inline bool soft_f32_fits(int level, size_t nalpha, int M, int n, bool linear, bool shared) noexcept {
+    const size_t cells = static_cast<size_t>(M + 1) * static_cast<size_t>(n + 1);
+    const int64_t o = gate_override(Gate::SoftF32MinCells);
+    if (o == kGateOff) return true;
+    if (o >= 0) return cells >= static_cast<size_t>(o);
     if (level < 0) return true;
     const GateLevelCaps& lc = gate_caps(level);
     const SoftF32Caps& c = nalpha <= 8 ? lc.f32soft_small : lc.f32soft_big;
     const uint32_t from = shared ? (linear ? c.shared_linear : c.shared_affine)
                                  : (linear ? c.own_linear : c.own_affine);
-    return static_cast<size_t>(M + 1) * static_cast<size_t>(n + 1) >= from;
+    return cells >= from;
 }
 // Score only: the shared score kernel pays only for short pairs -- over 8 letters it
 // gathers (the InterScoreGatherCells override applies), up to 8 it blends on masks and

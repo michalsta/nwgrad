@@ -13,7 +13,16 @@ import numpy as np
 import pytest
 
 import nwgrad
+from nwgrad import _tuning
 from conftest import StreamAligner, StreamAlignerDouble
+
+
+@pytest.fixture(autouse=True)
+def _float32_at_any_size():
+    """These tests check the float32 path itself: no per-level size threshold
+    (soft_f32_min_cells, which sends short pairs on AVX2 / AVX-512 to double)."""
+    with _tuning.override(soft_f32_min_cells=None):
+        yield
 
 REL32 = 2e-4    # float32 against double, log Z and every gradient field
 ABS32 = 1e-5
@@ -265,3 +274,22 @@ def test_every_pair_fits_float32_deterministic(fill):
     got, dbl = _det_case(1.0, fill)
     assert np.all(got[0] != dbl[0])
     close(got[0], dbl[0]); close(got[1], dbl[1]); close(got[2], dbl[2])
+
+
+@pytest.mark.parametrize("gm,mode", MODES)
+@pytest.mark.parametrize("fill", ["interpair", "striped"])
+def test_min_cells_threshold_runs_double(gm, mode, fill):
+    """Below soft_f32_min_cells a float32 batch's soft pass runs in double: bit-equal to
+    soft_precision="double"; at 0 it is the float32 path again."""
+    rng = np.random.default_rng(seed("mincells", gm, mode, fill))
+    params = protein_params(rng)
+    A, B = pairs(rng, PROT)
+    sd, md, gd, _ = run(nwgrad.SeqPairBatch, A, B, params, gm, mode, fill=fill, precision="double")
+    with _tuning.override(soft_f32_min_cells=10**9):
+        sb, mb, gb, _ = run(nwgrad.SeqPairBatch, A, B, params, gm, mode, fill=fill)
+    np.testing.assert_array_equal(sb, sd); np.testing.assert_array_equal(mb, md)
+    np.testing.assert_array_equal(gb, gd)
+    with _tuning.override(soft_f32_min_cells=0):
+        s0, _, _, _ = run(nwgrad.SeqPairBatch, A, B, params, gm, mode, fill=fill)
+    assert not np.array_equal(s0, sd)
+    close(s0, sd)

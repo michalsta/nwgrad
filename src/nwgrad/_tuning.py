@@ -13,7 +13,10 @@ Values: an ``int`` is the threshold (cells, bytes, or for ``linear_striped_min_n
 B length from which the striped linear kernel runs); ``None`` turns the gate off (a cap
 never rejects; ``linear_striped_min_n`` becomes 0, the striped kernel at any length);
 ``"default"`` removes the override.  Gates only choose between fills that are
-bit-identical, so results never change, only speed and memory.  A batch regroups its
+bit-identical, so results never change, only speed and memory -- except
+``soft_f32_min_cells``: the cells from which a float32 batch's soft pass runs in float32
+(below, in double; ``None``: float32 at any size), which moves results within float32's
+tolerance.  A batch regroups its
 cached inter-pair plan on the next call after any change.  Not thread-safe to change
 while work is in flight.
 """
@@ -24,6 +27,7 @@ from . import nwgrad_ext as _ext
 GATES = tuple(_ext._gate_names())
 _OFF = _ext._gate_off_value()
 _MIN_N = "linear_striped_min_n"
+_SOFT = "soft_f32_min_cells"
 
 
 def _check(name):
@@ -36,6 +40,7 @@ def defaults():
     ``linear_striped_min_n`` is per mode, type and level, so it reads ``"per type"``."""
     d = {k: (v if v > 0 else None) for k, v in _ext._gate_defaults()}
     d[_MIN_N] = "per type"
+    d[_SOFT] = "per level, fill, gap model and alphabet"
     return d
 
 
