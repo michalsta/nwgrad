@@ -324,8 +324,20 @@ Tracks landed on branch `tracks` (2026-10-11; see AGENTS.md, "Tracks").  Deferre
   soft path, the batch and streaming surfaces and the Python functions are in and tested
   against an exhaustive oracle.  Since then: the leveled striped / score / pointer
   kernels, the inter-pair hard, score-only, banded and soft fills, the scaled soft
-  kernels, the row kernels and Hirschberg (2026-11-03).  Not yet: Grid (Global only).
+  kernels, the row kernels and Hirschberg (2026-11-03).  Not yet: Grid (below).
   Then PosimiR's backend can switch from the emulation to `mode="glocal"`.
+- **Grid traceback for Local and Glocal** (now affine Global Full only; the others run AS
+  Pointers: same result, table memory).  Glocal: the forward kernel's row 0 M = 0 at
+  every column and no Y series (column 0 Global's chain, no clamp), the walk entered at
+  row m's first best column (row m is in hand after the forward pass) and stopped at
+  row 0.  Local: the forward kernel also needs the clamp at 0 and a running argmax for
+  the end cell, and the walk stops at a zero cell.  Tests against Pointers, bit for bit,
+  as `test_grid.cpp` / `test_grid.py` do for Global.  (Not for PosimiR: its miRNA rows
+  never exceed hb_cutoff, and it is tracked; for long glocal / local alignments.)
+- **`test_tuning::test_plan_follows_the_gates` fails under
+  `NWGRAD_FORCE_KERNEL=scalar_fallback`** (a Global case; seen 2026-11-03 on
+  `feat/glocal`, pre-existing).  CI forces only simd, so it never shows there: make the
+  test expect the scalar backend's plan (no shared groups), or skip it there.
 - **Fleet runs not yet done: spot (neon) and solace (avx512).**  Correctness
   (`ctest`, `NWGRAD_FORCE_KERNEL=simd pytest tests/Python`) and `tools/bench_tracks.py`.
   Everything on the branch was verified on sse2 (skynet, wloczykij) and avx2 (nighthaven).
