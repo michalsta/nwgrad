@@ -5,6 +5,8 @@ result (scores, paths, gradients) — only which fill runs.  The routing itself 
 through the batch's inter-pair plan, including that a batch regroups after a change.
 """
 
+import os
+
 import numpy as np
 import pytest
 
@@ -19,7 +21,8 @@ OWN = dict(inter_group_bytes=0, inter_soft_bytes=0, inter_score_gather_cells=0,
            inter_linear_int_gather_cells=0, inter_linear_f32_gather_cells=0,
            inter_linear_f64_gather_cells=0, inter_global_linear_int_cells=0,
            inter_global_linear_f32_cells=0, linear_striped_min_n=10**6,
-           soft_f32_min_cells=0)   # (float32 at any size, as with the gate off: one precision)
+           soft_f32_min_cells=0,   # (float32 at any size, as with the gate off: one precision)
+           inter_min_fill=100)
 # Every gate off: the shared fill wherever it can run, the striped linear kernel always.
 OFF = {g: None for g in OWN}
 
@@ -84,17 +87,66 @@ def test_override_restores():
 def test_plan_follows_the_gates():
     # 30-500 aa: the default byte cap sends the long pairs to their own fill (with the
     # other threads busy -- n_threads 2; one thread alone has a wider budget; at W = 4
-    # lanes the 3 MiB budget reaches L250)
-    A, B = _pairs(60, 30, 500, seed=1)
+    # lanes the 3 MiB budget reaches L250).  Enough pairs to fill 16-lane groups.
+    A, B = _pairs(300, 30, 500, seed=1)
     b = nwgrad.SeqPairBatch(A, B, _params(), n_threads=2)
     elig, other, _ = b._inter_plan()
     assert elig > 0 and other > 0 and elig + other == len(A)
     _tuning.set_gate("inter_group_bytes", None)           # the same batch regroups
-    assert b._inter_plan()[:2] == [len(A), 0]
+    with _tuning.override(inter_min_fill=None):           # (mostly empty groups too)
+        assert b._inter_plan()[:2] == [len(A), 0]
     _tuning.set_gate("inter_group_bytes", 0)
     assert b._inter_plan()[:2] == [0, len(A)]
     _tuning.reset_gates()
     assert b._inter_plan()[:2] == [elig, other]
+
+
+def test_kept_paths_keep_the_byte_budget():
+    # grad_mode "none" with keep_paths runs the hard shared fill, tables and all: the byte
+    # budget applies (it did not, 0b52842..: L1000 path calls ran 2x slower than their own
+    # fill).  Only the score-only call, whose kernel keeps rows, goes without it.
+    A, B = _pairs(64, 400, 401, seed=3)
+    b = nwgrad.SeqPairBatch(A, B, _params(), n_threads=2, grad_mode="none")
+    assert b._inter_plan()[:2] == [0, len(A)]
+    elig, other, _ = b._inter_plan(score_only=True)
+    assert elig > 0 and elig + other == len(A)
+    ref = nwgrad.SeqPairBatch(A, B, _params(), n_threads=2, grad_mode="none")
+    ref.fill = "striped"
+    b.score_and_grad(keep_paths=True); ref.score_and_grad(keep_paths=True)
+    assert list(b.scores()) == list(ref.scores())
+    assert [b[i].aligned() for i in range(len(A))] == [ref[i].aligned() for i in range(len(A))]
+
+
+def test_dna_alone_keeps_a_wider_byte_budget():
+    # One thread, alphabet <= 8: the mask-blend shared fill keeps winning to ~16 MiB of
+    # tables (protein int16's budget is 450 KiB-1 MiB).  DNA int16 affine L150: ~2-4 MB.
+    level = nwgrad.simd_isa()
+    if level not in ("avx2", "avx512") or os.environ.get("NWGRAD_FORCE_KERNEL"):
+        pytest.skip("the small-alphabet budget is set for AVX2 / AVX-512")
+    rng = np.random.default_rng(6)
+    A = ["".join(rng.choice(list("ACGT"), 150)) for _ in range(64)]
+    m = np.where(np.eye(4, dtype=bool), 2.0, -1.0)
+    p = nwgrad.AlignParams(nwgrad.SubstMatrix(m, alphabet="ACGT"), 3.0, 1.0, 3.0, 1.0)
+    one = nwgrad.SeqPairBatchInt16(A, A, p, n_threads=1)
+    two = nwgrad.SeqPairBatchInt16(A, A, p, n_threads=2)
+    assert one._inter_plan()[:2] == [64, 0]
+    assert two._inter_plan()[:2] == [0, 64]
+
+
+def test_mostly_empty_groups_run_their_own_fill():
+    # A group's empty lanes cost as much as its real ones: one short pair alone runs its
+    # own fill; with the gate off it shares.  A batch of whole groups shares regardless.
+    A, B = _pairs(1, 60, 61, seed=4)
+    for gm in ("hard", "none"):
+        b = nwgrad.SeqPairBatch(A, B, _params(), n_threads=1, grad_mode=gm)
+        assert b._inter_plan()[:2] == [0, 1]
+        assert b._inter_plan(score_only=True)[:2] == [0, 1]
+        with _tuning.override(inter_min_fill=None):
+            assert b._inter_plan()[:2] == [1, 0]
+        assert b._inter_plan()[:2] == [0, 1]
+    A, B = _pairs(64, 60, 61, seed=5)
+    b = nwgrad.SeqPairBatch(A, B, _params(), n_threads=1)
+    assert b._inter_plan()[:2] == [64, 0]
 
 
 @pytest.mark.parametrize("dtype", list(CLASSES))
