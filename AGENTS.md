@@ -2586,6 +2586,30 @@ any more except Grid (Global only, as for Local).
   2000 x 8000 float32 pair, skynet: pointers 0.053 s, hirschberg 0.080, pmax 0.067
   (Local 0.059 / 0.096 / 0.084).
 
+**The soft range bound went subnormal (fixed 2026-11-04, every mode).** The scaled
+path's lost-mass bound summed `terms (n+1) DBL_MIN (...) g` per row, g the row's
+posterior factor ~1/Z.  Where Z is large -- Local, and Glocal's row-m sum, ~2^30 on
+miRNA pairs -- the product fell below DBL_MIN: a microcode assist per row on x86, 13 %
+of a linear glocal soft pass on skynet (perf: `sp_loss` the second-hottest line).  The
+bound is now kept in units of DBL_MIN and compared against 2^-45 / DBL_MIN = 2^977
+(`kSpLossTolU`; the inter-pair kernels the same): the same test, as the factor is an
+exact power of two.  skynet, 20k pairs, linear soft, 1 thread: glocal per pair 0.419 ->
+0.359 s (Global 0.349), inter-pair 0.340 -> 0.298 (Global 0.297); Local 0.464 -> 0.406
+and 0.329 -> 0.279.  Affine moved little.
+
+**Fleet, 2026-11-04 (`tools/bench_modes.py`, 20k pairs: A 18-25, B 50; release flags;
+best of 5).** glocal / global:
+- soft, per pair and inter-pair, both gap models and precisions, 1 thread and all cores:
+  0.96-1.05 on nighthaven (avx2), solace WSL (avx512) and spot macOS (neon), 1.04-1.09 in
+  three float affine all-core cells (noise-level times, 15-27 ms).
+- banded (band 8, hard), striped and inter-pair: 0.79-0.97 (glocal's row 0 needs no
+  border), one cell 1.095 (solace float affine striped, 8 threads).
+- tracebacks, one 2000 x 5600 pair: Hirschberg 1.00-1.27 of Global's (its two end-point
+  scans; Global has none) and below Local's everywhere (nighthaven double affine 0.0210 vs
+  Local 0.0229, linear 0.0144 vs 0.0176; spot 0.0421 vs 0.0458); Pointers 0.59-0.99.  So
+  the scans' Glocal branches (`HbScanJob::glocal`, a runtime int) cost nothing measurable
+  against Local's: no template split needed.
+
 ### Python bindings (`py_exports.cpp`)
 
 nanobind module `nwgrad_ext`, re-exported from `src/nwgrad/__init__.py`. Exposes:
