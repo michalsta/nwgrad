@@ -278,6 +278,11 @@ def test_guides_match_striped(fill, mode):
 # score, the traceback-derived guide and the hard gradient match striped bit for bit,
 # ties included (the "ties" fixture makes them common).
 
+# Soft results across fills: a float32 batch's soft pass runs in float32 (~1e-6 relative).
+def _soft_tol(prec):
+    return 2e-4 if prec == "float32" else 1e-11
+
+
 def _run_linear(seqs_a, seqs_b, params, mode, fill, grad_mode="hard", kernel="auto",
                 prec="double"):
     b = _CLS[prec][0](seqs_a, seqs_b, params,
@@ -327,7 +332,7 @@ def test_linear_interpair_soft_guides(mode, prec):
     r0 = _run_linear(a, b, p, mode, "striped", grad_mode="soft", prec=prec)
     r1 = _run_linear(a, b, p, mode, "interpair", grad_mode="soft", prec=prec)
     for x, y in zip(r0[:3], r1[:3]):
-        np.testing.assert_allclose(x, y, rtol=1e-11, atol=1e-11)
+        np.testing.assert_allclose(x, y, rtol=_soft_tol(prec), atol=_soft_tol(prec))
     assert r0[3] == r1[3]
 
 
@@ -478,7 +483,7 @@ def test_ragged_b_groups(prec, gm, mode, grad, level):
         if grad == "hard":
             assert np.array_equal(x, y)
         else:
-            np.testing.assert_allclose(x, y, rtol=1e-11, atol=1e-11)
+            np.testing.assert_allclose(x, y, rtol=_soft_tol(prec), atol=_soft_tol(prec))
     assert out[0][3] == out[1][3]
 
 
@@ -523,7 +528,7 @@ def test_protein_interpair(prec, gm, mode, grad, level):
         if grad == "hard":
             assert np.array_equal(x, y)
         else:
-            np.testing.assert_allclose(x, y, rtol=1e-11, atol=1e-11)
+            np.testing.assert_allclose(x, y, rtol=_soft_tol(prec), atol=_soft_tol(prec))
     assert out[0][3] == out[1][3]
     if len(out[0]) > 4:
         assert np.array_equal(out[0][4], out[1][4])

@@ -204,7 +204,7 @@ def test_soft_gradient_expected_counts_match_bruteforce(
         generic_matrix, a, b, oa, ea, ob, eb):
     # asymmetric matrix *and* asymmetric gaps at once
     p = params(generic_matrix, oa, ea, ob, eb)
-    _, grad = nwgrad.nw_affine_soft_grad(a, b, p)
+    _, grad = nwgrad.nw_affine_soft_grad_double(a, b, p)   # (the plain one runs float32)
     got_matrix, got_oa, got_ea, got_ob, got_eb = _grad_arrays(grad)
     pairs, exp_oa, exp_ea, exp_ob, exp_eb = bf.global_soft_counts(a, b, p, affine=True)
 
@@ -327,4 +327,10 @@ def test_batch_aligner_accumulates_asymmetric_gap_gradients(matrix, grad_mode):
         expected = sum(g.to_dict()[key] for _, g in per_pair)
         assert got[key] == pytest.approx(expected), key
     expected_matrix = sum(g.to_dict()["matrix"] for _, g in per_pair)
-    np.testing.assert_allclose(got["matrix"], expected_matrix, atol=1e-9)
+    # The float32 class runs its soft pass in float32, the batch's shared kernel against
+    # the function's per-pair one: they agree to float32 rounding, not to double's (CI saw
+    # 2.2e-8 absolute, 1.6e-7 relative on a count of 0.138 -- ~1.3 float32 ulp -- on x86
+    # and on NEON).  rtol 1e-6 there; hard counts and the double class stay at the
+    # default rtol 1e-7 / atol 1e-9.  (By class name: the forced-kernel conftest wraps it.)
+    f32 = grad_mode == "soft" and "Double" not in getattr(StreamAligner, "__name__", "")
+    np.testing.assert_allclose(got["matrix"], expected_matrix, rtol=1e-6 if f32 else 1e-7, atol=1e-9)
