@@ -338,7 +338,12 @@ Tracks landed on branch `tracks` (2026-10-11; see AGENTS.md, "Tracks").  Deferre
   `NWGRAD_FORCE_KERNEL=scalar_fallback`** (a Global case; seen 2026-11-03 on
   `feat/glocal`, pre-existing).  CI forces only simd, so it never shows there: make the
   test expect the scalar backend's plan (no shared groups), or skip it there.
-- **Fleet runs not yet done: spot (neon) and solace (avx512).**  Correctness
+- **fuzz_fill: 5 of seeds 0-299 fail on `main` `9072407`** (found 2026-11-04 from
+  `feat/glocal`, reproduced on a clean `main` build, skynet): all Global affine float32
+  banded, `fill="striped"` vs `"interpair"`.  Hard: 125, 178, 234 (scores 1-2 float32
+  ulps apart, e.g. -34.03999329 vs -34.03999710 -- the bit-identity contract broken);
+  soft banded: 145 (7.77309 vs 7.77934), 190 (-328.501 vs -329.908).  fuzz_fill passed
+  1000/1000 on 2026-10-20 (`7f45155`); bisect the main merges since (#19 gate caps first).: spot (neon) and solace (avx512).**  Correctness
   (`ctest`, `NWGRAD_FORCE_KERNEL=simd pytest tests/Python`) and `tools/bench_tracks.py`.
   Everything on the branch was verified on sse2 (skynet, wloczykij) and avx2 (nighthaven).
 - **Python track conversion** (`to_tracks` in py_exports.cpp) casts each pair's list
