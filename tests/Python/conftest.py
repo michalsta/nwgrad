@@ -240,3 +240,18 @@ class StreamAlignerDouble(StreamAligner):
         import nwgrad
         self._batch_cls = nwgrad.SeqPairBatchDouble
         super().__init__(*args, **kwargs)
+
+
+@pytest.fixture(autouse=True)
+def shared_groups_at_any_fill(request):
+    """Small test batches leave most lanes of a shared group empty, which by default sends
+    the group's pairs to their own fills (the inter_min_fill gate) -- and an inter-pair
+    test would then compare the own fill with itself.  The suite turns the gate off, so
+    every group shares; test_tuning.py keeps it."""
+    from nwgrad import _tuning
+    if request.module.__name__.endswith("test_tuning"):
+        yield
+        return
+    _tuning.set_gate("inter_min_fill", None)
+    yield
+    _tuning.set_gate("inter_min_fill", "default")

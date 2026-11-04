@@ -2495,6 +2495,63 @@ level, 1 thread and all, 1148 / 3600 / 4800 configurations), default / better ar
   1148 over 1.08 (0.3 %; the first table 34), 2 over 1.15 (31), none over 1.3 (21), the
   worst 1.18 (1.94); AVX2 24 / 11 / 1 (36 / 14 / 3), SSE4 19 / 3 / 0 (89 / 53 / 19), SSE2
   12 / 1 / 0 of 948 (123 / 101 / 47).
+### Two holes in the gates: kept paths and empty lanes (2026-11-04)
+
+**Found** by the fleet rebench of the cells parasail / SeqAn won in October: the new code
+(`main` + glocal) ran some long cells 1.5-8x slower than the October build, everything
+else 3-21 % faster. Bisected on nighthaven to #15 (`0b52842`, this section's predecessor).
+Two separate causes:
+
+1. **`grad_mode="none"` with `keep_paths=True` skipped the byte budget.** #15 exempted
+   grad_mode None from `inter_pair_fits` ("score only keeps rows"), but a call that keeps
+   paths runs the HARD shared fill, whole tables and all. Protein L1000 int32: 8 lanes x
+   1e6 cells x 3 tables x 4 B = 96 MB per group, streamed from DRAM: 46.5 ms against 23.5
+   for the own fill and 23.3 for the same pairs' hard gradient (which kept the budget);
+   DNA L10000 int64 linear 433 vs 298 ms. Fix: two plans, `plan_` (tables: every call
+   but score_only_) and `plan_rows_` (score_only_, no budget); streaming `align()` drops
+   the budget only when its score kernel actually runs (Full band, grad None,
+   `has_inter_score_`). `_inter_plan(score_only=True)` shows the second plan.
+2. **A group of mostly empty lanes still shared.** The empty lanes repeat the last pair,
+   so a group costs the same with 1 real pair as with W: the shared/own ratio scales as
+   W / real (solace DNA int32 L100 score: 0.55 full, 1.10 at 8 of 16, 7.89 at 1). Long
+   pairs in a small batch come one or two to a group (the fleet's L10000 fixtures are 2
+   pairs): solace DNA L10000 score int32 ran 425 ms against 52 striped. Every level, type,
+   output (score, hard, path) and length agrees. New gate `inter_min_fill` (percent of W,
+   default 75; 0 / None: any group shares) applied where groups form: the plan, the band
+   groups, streaming. Threshold from a sweep of 1, 2, W/4, W/2, 5W/8, 3W/4, 7W/8 and W
+   real pairs (1 thread, L100 / L300, every type, both alphabets, modes and gap models;
+   `scratchpad/rebench/underfill*.py`): geomean loss against the better arm per cell,
+   score / hard -- at 0 (before) nighthaven 1.16 / 1.85, solace 2.30 / 2.16; at 62.5 %
+   1.020 / 1.038 and 1.033 / 1.030; at 75 % 1.014 / 1.027 and 1.030 / 1.038. Full-group
+   winners cross over at 0.4-0.7 W, so no single fraction is exact; 75 % is the v3 best.
+   The test suite turns the gate off (conftest), so small test batches still exercise the
+   shared kernels.
+
+3. **(Found by the fix's rebench.) DNA alone lost its shared fill to protein's integer
+   budgets.** Applying the byte budget to path calls (1.) sent nighthaven's DNA L100 int16
+   affine path from 9.9 to 15.6 ms: the one-thread int16 budget is 450 KiB on AVX2 (1 MiB
+   int32 / int16 on AVX-512), measured on protein, whose shared fill gathers and loses
+   early. The same budget had been costing DNA hard gradients since #15 (13.4 ms default /
+   7.6 shared, L100 int16 affine). Swept (`dnabudget.py`: full groups, shared with the
+   budget off vs striped, DNA every type, 1 thread and all logical threads): alone the
+   mask-blend shared fill wins for every type through L400 on AVX2 (15 MB of affine
+   tables; 0.38-0.85) and L300 on AVX-512 (17 MB; 0.29-0.94), and loses past ~30 MB.
+   New level field `group_small_kb_1` = 16 MiB on AVX2 and AVX-512, a floor under the
+   type's one-thread budget for alphabets <= 8; SSE and NEON unmeasured, unchanged.
+   At the default thread count (physical cores: 6 on nighthaven) #15's 3 MiB holds for
+   DNA and protein alike (L150 wins 0.50-0.86, L200 loses 1.06-2.2 and is routed own).
+   With every LOGICAL thread (12 / 16: two threads share an L2) it does not: affine loses
+   from L150 (1.3-3x; solace float L100 1.13-1.64x), linear from L200-300 (2-6x) while
+   the budget still shares there. Not changed (TODO.md): only an explicit n_threads above
+   the core count reaches it.
+
+Also from the same sweep, **AVX-512 float score caps** the original sweep had not reached
+(they were "no cap"): DNA float32 crosses over at ~L5500 Local / ~L6300 Global (L10000
+1.18-1.25x), float64 at ~L4000 / ~L5600 (L7000 1.37-1.54x), protein float32 affine at
+~L720 (L1000 1.33-1.57x). Open: on nighthaven DNA float32 linear Global L1000 (1.30x)
+and float64 linear Global L300 (1.24-1.28x) lose with full groups while their neighbours
+win (L3000 0.66x, float64 L1000 0.78x); reproduced, not chased.
+
 ### Score-only integer kernel: two segments a trip (branch `perf/int-unroll`, 2026-10-31)
 
 **Why.** The gcc-vs-clang residue on the integer striped kernels (clang 4-20 % faster on

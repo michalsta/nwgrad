@@ -233,6 +233,32 @@ and int64 kernels are slower than SSE4's (the shared fills win further there); a
 the sweep only has square protein pairs and 22 x L DNA pairs, so a short-A shape
 (`la` under the lane count) is not separated from the alphabet effect.
 
+## Gate follow-ups from the 2026-11-04 rebench (AGENTS.md, "Two holes in the gates")
+
+- nighthaven (AVX2): DNA float32 linear Global L1000 loses 1.30x with full shared groups,
+  float64 linear Global L300 1.24-1.28x, while L300 / L3000 (float32) and L1000 (float64)
+  win. Reproduced twice; likely the own fill being unusually fast there, not the gate.
+- `inter_min_fill` is one fraction for every level and type; the full-group winners cross
+  over at 0.4-0.7 W. A per-level/type value would gain ~1-3 % geomean on small batches.
+- The AVX-512 float score caps came from 1 thread; the threaded crossover is not measured.
+- Soft groups get the same fill rule unmeasured (the soft pass was not in the sweep).
+- The byte budget with hyperthreads: at n_threads = logical cores (nighthaven 12, solace
+  16) the hard shared fill loses from L150 affine (1.3-3x; solace float L100 1.1-1.6x)
+  and L200-300 linear (2-6x) inside the 3 MiB budget, measured for DNA and protein. At
+  the default (physical cores) the budget is right. A budget that halves when threads
+  outnumber cores would cover it; needs the core count the scheduler already knows.
+- `group_small_kb_1` (DNA, one thread) is measured on AVX2 / AVX-512 only; SSE and NEON
+  keep the type's budget.
+- **The SSE table follows forced-SSE4 runs on AVX2 / AVX-512 Intel (#15), not the hardware
+  that runs SSE by default.** wloczykij (Piledriver, SSE4; another user's job on ~5 of 64
+  cores) disagrees, 1 thread: the DNA score kernel wins Global int32 to L50 affine / L100
+  linear (cap 800 cells: miRNA 22x50 runs own at 55 ms vs 36 shared, 0.59-0.67x of the
+  October build), int16 to L100-200 (cap 1900), float32 to L200 and loses past (no cap,
+  1.07-1.23x at L300+); the hard byte budget loses from L300 (4.2 MB, 1.08-1.39x) for
+  protein and DNA alike where the one-thread SSE budget is 12 MiB (protein L300 path int32
+  0.77x of October). Which hardware the SSE table should follow is a decision to make
+  before changing it (Westmere / Sandy Bridge unmeasured; cudak has no bench setup).
+
 ## Per-pair gradients stored contiguously (weighted_grad, grads)
 
 `weighted_grad()` and `grads()` read every pair's cached gradient from its own
