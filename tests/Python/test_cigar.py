@@ -58,11 +58,9 @@ def _consumed(cigar):
 
 
 @pytest.mark.parametrize("gap_model", ["affine", "linear"])
-@pytest.mark.parametrize("mode", ["local", "global"])
+@pytest.mark.parametrize("mode", ["local", "global", "glocal"])
 @pytest.mark.parametrize("traceback", ["pointers", "scores", "hirschberg"])
 def test_matches_aligned(gap_model, mode, traceback):
-    if traceback == "hirschberg" and gap_model == "linear":
-        pytest.skip("Hirschberg is affine only")
     p = _params(1, 1.5 if gap_model == "affine" else 0.0, 0.6)
     for a, b in zip(_seqs(60, 1, 40, 2), _seqs(60, 1, 60, 3)):
         sp = nwgrad.SeqPairDouble(a, b, p, gap_model=gap_model, mode=mode, traceback=traceback)
@@ -78,6 +76,9 @@ def test_matches_aligned(gap_model, mode, traceback):
                 assert q == (len(a) if clip else c[0, -1] - c[0, 0])
         if mode == "global":
             assert _consumed(sp.cigar()) == (len(a), len(b))
+            assert sp.cigar(soft_clip=True) == sp.cigar()
+        if mode == "glocal":
+            assert _consumed(sp.cigar())[0] == len(a)
             assert sp.cigar(soft_clip=True) == sp.cigar()
 
 
@@ -123,7 +124,7 @@ def test_needs_a_stored_path():
         sp.cigar()
 
 
-@pytest.mark.parametrize("mode", ["local", "global"])
+@pytest.mark.parametrize("mode", ["local", "global", "glocal"])
 def test_batch_cigars(mode):
     p = _params(4, 1.5, 0.6)
     sa, sb = _seqs(50, 1, 40, 5), _seqs(50, 1, 50, 6)
