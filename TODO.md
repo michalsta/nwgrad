@@ -356,7 +356,7 @@ Also open from the same work:
 Tracks landed on branch `tracks` (2026-10-11; see AGENTS.md, "Tracks").  Deferred:
 
 - **Glocal mode** (global in A, local in B: free leading and trailing gaps along B) —
-  PosimiR's second DP mode.  STARTED 2026-11-01 on branch `feat/glocal` as a third
+  PosimiR's second DP mode.  MERGED 2026-11-04 (#24, `36e9b35`), begun 2026-11-01 as a third
   `AlignMode` (AGENTS.md "Glocal mode"): the scalar fills, both tracebacks, the log-space
   soft path, the batch and streaming surfaces and the Python functions are in and tested
   against an exhaustive oracle.  Since then: the leveled striped / score / pointer
@@ -384,9 +384,10 @@ Tracks landed on branch `tracks` (2026-10-11; see AGENTS.md, "Tracks").  Deferre
   After merging #23 (`e75d80a`, float32 soft; fuzz_fill now compares float32 soft scores
   at rtol 1e-5): Global float32 affine hard, seeds 0-299, fails 10, 27, 80, 125, 144, 145,
   178, 190, 234, all `traceback="auto"`; glocal and local 0 of 300.
-- **Fleet runs not yet done: spot (neon) and solace (avx512).**  Correctness
-  (`ctest`, `NWGRAD_FORCE_KERNEL=simd pytest tests/Python`) and `tools/bench_tracks.py`.
-  Everything on the branch was verified on sse2 (skynet, wloczykij) and avx2 (nighthaven).
+- **Fleet runs not yet done: spot (neon) and `tools/bench_tracks.py`.**  Correctness was
+  verified on sse2 (skynet, wloczykij), avx2 (nighthaven) and avx512 (solace WSL, 2026-11-04
+  at `c9ed87e`: ctest 17/17, `NWGRAD_FORCE_KERNEL=simd` pytest 22744 passed, 72 skipped);
+  NEON only through CI's ARM64 job.
 - **Python track conversion** (`to_tracks` in py_exports.cpp) casts each pair's list
   separately: ~1-2 µs per pair, seconds for millions.  Accepting one flat int array plus
   offsets would remove it.
