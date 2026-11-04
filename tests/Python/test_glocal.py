@@ -441,12 +441,12 @@ def test_interpair_matches_striped(generic_matrix, cls, gap_model, grad_mode):
         b.fill = fill
         if fill == "interpair":
             elig, other, groups = b._inter_plan()
-            # linear double below 4 lanes (sse2 / sse4) stays on its own fill by design
+            # linear double below 4 lanes (sse2 / sse4 / neon) stays on its own fill by design
             # (linear_fill_ok_: Global's rule); every other case must share
             # (and a forced scalar backend has no shared fill at all)
             if os.environ.get("NWGRAD_FORCE_KERNEL") != "scalar_fallback" and not (
                     gap_model == "linear" and cls == "SeqPairBatchDouble"
-                    and _level() in ("sse2", "sse4", "scalar_fallback")):
+                    and _level() in ("sse2", "sse4", "neon", "scalar_fallback")):
                 assert elig > 0 and groups > 0, (elig, other, groups)
         b.score_and_grad()
         g = None
