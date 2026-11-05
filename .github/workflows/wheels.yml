@@ -307,7 +307,7 @@ jobs:
 
       - uses: pypa/gh-action-pypi-publish@release/v1
 
-  # A DRAFT GitHub release for the tag, with the exact files PyPI received attached and
+  # A DRAFT GitHub release for the tag, with the sdist attached (wheels: PyPI) and
   # notes generated from the merged PRs since the previous tag.  After publish, so a
   # release whose PyPI upload failed is never prepared; a draft, so the notes are read
   # and edited by hand before anyone sees them (publishing it is a click on the release
@@ -325,12 +325,7 @@ jobs:
       GH_REPO: ${{ github.repository }}
       TAG: ${{ github.ref_name }}
     steps:
-      - uses: actions/download-artifact@v8
-        with:
-          pattern: wheels-*
-          path: dist
-          merge-multiple: true
-
+      # Only the sdist is attached: binary wheels are on PyPI, and the notes say so.
       - uses: actions/download-artifact@v8
         with:
           name: sdist
@@ -342,9 +337,11 @@ jobs:
           # PEP 440 pre-releases (v0.8.0rc1, v0.8.0b2, v0.8.0.dev1) are marked as such.
           pre=""
           if [[ "$TAG" =~ (a|b|rc|\.dev)[0-9]+$ ]]; then pre="--prerelease"; fi
+          ver="${TAG#v}"
+          notes="Binary wheels (Linux, macOS, Windows) are on PyPI: \`pip install nwgrad==$ver\`, or download them from https://pypi.org/project/nwgrad/$ver/#files. The source distribution is attached below."
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" dist/* --clobber
+            gh release upload "$TAG" dist/*.tar.gz --clobber
           else
-            gh release create "$TAG" dist/* --draft --verify-tag $pre \
-              --title "nwgrad ${TAG#v}" --generate-notes
+            gh release create "$TAG" dist/*.tar.gz --draft --verify-tag $pre \
+              --title "nwgrad $ver" --notes "$notes" --generate-notes
           fi
