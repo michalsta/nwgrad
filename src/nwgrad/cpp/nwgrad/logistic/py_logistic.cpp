@@ -3,6 +3,7 @@
 
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
+#include <nanobind/stl/string.h>   // __repr__ returns std::string
 
 #include "logistic.hpp"
 

@@ -42,11 +42,16 @@ params = params + 0.01 * grad   # every matrix cell and all four gap costs move 
 pip install nwgrad
 ```
 
-Prebuilt wheels cover CPython 3.10–3.14 on Linux x86_64 / aarch64 and macOS arm64.
+Prebuilt wheels cover CPython 3.10–3.14 on Linux x86_64 / aarch64, macOS arm64 and
+Windows x86_64 (built with MinGW-w64 gcc; the free-threaded 3.13t / 3.14t builds are
+not yet available on Windows).
 Anywhere else pip builds from source, which needs a C++20 compiler with libstdc++'s
 `<experimental/simd>`: GCC 11+, or Clang 13+ built against libstdc++. Apple's
-system clang (libc++) and MSVC lack that header — on macOS use Homebrew `gcc`;
-Windows is not supported.
+system clang (libc++) and MSVC lack that header — on macOS use Homebrew `gcc`; on
+Windows use MinGW-w64 gcc from MSYS2's UCRT64 environment
+(`pacman -S mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-ninja`, its `bin` on
+`PATH`), then `set CMAKE_GENERATOR=Ninja` and `set CC=gcc` / `set CXX=g++` before
+`pip install nwgrad --no-binary nwgrad`.
 
 ## Quick start
 

@@ -35,9 +35,12 @@ def params(k, sets):
     if sets == 1 and arm == "untracked":
         return nwgrad.AlignParams(M * k, "ACGT", *G)
     return nwgrad.AlignParams.from_arrays(np.stack([M * k] * sets), np.stack([G] * sets), "ACGT")
-def rss_mb():
-    for l in open("/proc/self/status"):
-        if l.startswith("VmRSS:"): return int(l.split()[1]) / 1024
+def rss_mb():   # resident MB; without /proc (macOS) the peak, in bytes there
+    try:
+        for l in open("/proc/self/status"):
+            if l.startswith("VmRSS:"): return int(l.split()[1]) / 1024
+    except OSError:
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20
 cls = nwgrad.SeqPairBatchDouble if prec == "double" else nwgrad.SeqPairBatch
 sets = K if arm == "trackedK" else 1
 tracks = None

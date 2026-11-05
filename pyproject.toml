@@ -42,7 +42,9 @@ testpaths = ["tests/Python"]
 # has a prebuilt wheel, so nothing is compiled at test time.  PyPy was never a target.
 [tool.cibuildwheel]
 # cibuildwheel 4 no longer builds CPython < 3.9; this keeps 3.9 out (requires-python).
-skip = ["cp39-*"]
+# Free-threaded Windows (cp3XXt-win*) is not built yet: the MinGW link against
+# python3XXt.lib is untested.  Linux and macOS build it as before.
+skip = ["cp39-*", "cp3??t-win*"]
 test-command = "python -m pytest {project}/tests/Python"
 test-extras = ["dev"]
 
