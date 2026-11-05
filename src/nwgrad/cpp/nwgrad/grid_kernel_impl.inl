@@ -35,7 +35,7 @@
 #  error "grid_kernel_impl.inl must be included inside a level namespace by a level TU"
 #endif
 
-template <class T, bool Local, bool Sat>
+template <class T, bool Local, bool Sat, bool Best = false>
 static void grid_fwd_impl(GridFwdJob<T>& J) {
     using vd = stdx::native_simd<T>;
     const int W = (int)vd::size();
@@ -101,7 +101,33 @@ static void grid_fwd_impl(GridFwdJob<T>& J) {
         return stdx::max(ld(pA + (std::size_t)s * W), ld(pY + (std::size_t)s * W));
     };
 
+    // Best (Local, the top level, every gap parameter >= 0): the best M cell in one pass,
+    // as the Pointers kernel's `monly` -- per lane the largest M and the FIRST segment
+    // reaching it (strict >), reduced after the row only when it beats the running best,
+    // the first lane holding it being the leftmost column.  With the gap parameters >= 0
+    // the first cell reaching a row's max(M, X, Y) is an M cell, so this is
+    // local_row_best_'s cell, and it saves the separate end scan (hb_scan): skynet sse4,
+    // int32 Local L1000 2.14 ns/cell against 4.56 with the scan (Pointers 3.57).  Padding
+    // needs no mask: a padding M is D of the row above, at most the running best.
+    // Best = false compiles all of it out (the Global instantiations are main's code).
+    [[maybe_unused]] T best = T(0);
+    [[maybe_unused]] int best_i = 0, best_j = 0;
+    [[maybe_unused]] vd lmax, ls, vs;
+    auto track = [&](const vd& vmv) NWGRAD_ALWAYS_INLINE_LAMBDA {
+        if constexpr (Best) {
+#if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
+            if constexpr (sizeof(T) == 8) ls = avx512d_blend(avx512d_gt(vmv, lmax), ls, vs);
+            else                          stdx::where(vmv > lmax, ls) = vs;
+#else
+            stdx::where(vmv > lmax, ls) = vs;
+#endif
+            lmax = stdx::max(lmax, vmv);
+            vs += vd(T(1));
+        } else { (void)vmv; }
+    };
+
     for (int ii = 1; ii <= h; ++ii) {
+        if constexpr (Best) { lmax = vd(NINF); ls = vd(T(0)); vs = vd(T(0)); }
         const int i = J.r0 + ii;
         const T lM = left(0, ii), lX = left(1, ii), lY = left(2, ii);
         const T nbOpen = nw_sub_s<Sat>(nw_sub_s<Sat>(std::max(lM, lX), go_a), ge_a);
@@ -127,6 +153,7 @@ static void grid_fwd_impl(GridFwdJob<T>& J) {
             const vd uD = Dp(s);
             vd vmv = dD + ld(sub + (std::size_t)s * W);
             if constexpr (Local) vmv = stdx::max(vmv, vd(T(0)));   // viterbi_affine_ptr's clamp
+            track(vmv);
             const vd vxv = stdx::max((uD - vgo_b) - vge_b, ld(pX + (std::size_t)s * W) - vge_b);
             mx = stdx::max(vmv, vxv);
             stv(vxv, cX + (std::size_t)s * W);
@@ -178,6 +205,7 @@ static void grid_fwd_impl(GridFwdJob<T>& J) {
         auto icell = [&](int s, const vd& dD, const vd& uD) NWGRAD_ALWAYS_INLINE_LAMBDA {
             vd vmv = vadd<Sat>(dD, ld(sub + (std::size_t)s * W));
             if constexpr (Local) vmv = stdx::max(vmv, vd(T(0)));
+            track(vmv);
             const vd vxv = stdx::max(open_pen<Sat>(uD, vgo_b, vge_b, vgoe_b), vsub<Sat>(ld(pX + (std::size_t)s * W), vge_b));
             const vd mx = stdx::max(vmv, vxv);
             stv(vxv, cX + (std::size_t)s * W);
@@ -252,6 +280,16 @@ static void grid_fwd_impl(GridFwdJob<T>& J) {
         }
         }
 
+        if constexpr (Best) {   // the row's best M cell, if it beats the running best
+            T rmax = lmax[0];
+            for (int qq = 1; qq < W; ++qq) rmax = std::max(rmax, T(lmax[qq]));
+            if (rmax > best) {
+                int l = 0;
+                while (!(lmax[l] == rmax)) ++l;
+                best = rmax; best_i = i; best_j = J.c0 + l * seg + (int)ls[l] + 1;
+            }
+        }
+
         // ── the saved lines ──
         auto Mat = [&](int s3) NWGRAD_ALWAYS_INLINE_LAMBDA {   // M of segment s3, as the row pass formed it
             const vd d = s3 == 0 ? lane_shift_in(Dp(seg - 1), bD) : Dp(s3 - 1);
@@ -294,6 +332,7 @@ static void grid_fwd_impl(GridFwdJob<T>& J) {
                 lr[j] = std::max(pA[k], pY[k]);
             }
     }
+    if constexpr (Best) { J.best = best; J.best_i = best_i; J.best_j = best_j; }
     J.W = W; J.q = q;
 }
 
@@ -301,11 +340,11 @@ template <class T>
 static void grid_fwd_entry(GridFwdJob<T>& J) {
     if constexpr (nw_sat<T>)
         if (J.sat) {
-            if (J.local) grid_fwd_impl<T, true, true>(J);
+            if (J.local) { if (J.find_best) grid_fwd_impl<T, true, true, true>(J); else grid_fwd_impl<T, true, true>(J); }
             else         grid_fwd_impl<T, false, true>(J);
             return;
         }
-    if (J.local) grid_fwd_impl<T, true, false>(J);
+    if (J.local) { if (J.find_best) grid_fwd_impl<T, true, false, true>(J); else grid_fwd_impl<T, true, false>(J); }
     else         grid_fwd_impl<T, false, false>(J);
 }
 

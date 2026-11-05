@@ -271,6 +271,8 @@ struct GridFwdJob {
     int W, q;                               // out
     typename DpBufferT<T>::GVec* last = nullptr;   // out if set: row r1's max(M, X, Y), columns c0+1..c1 at [1..w]
     int local = 0;                          // Local: M clamped at 0 (the walk stops at a start)
+    int find_best = 0;                      // Local, top level: the best M cell (strict >, row then column order)
+    T best = T(0); int best_i = 0, best_j = 0;   // out (find_best)
 };
 
 // ── Hirschberg linear-space sweep ─────────────────────────────────────────────

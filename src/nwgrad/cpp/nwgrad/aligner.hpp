@@ -1531,6 +1531,9 @@ private:
     int  grid_end_ = 0;              // the Grid path's end column (Glocal: row m's best)
     bool grid_pick_end_ = false;     // Glocal Grid: the end column is still to be picked
     bool grid_stop_ = false;         // Local Grid: the walk has reached its start
+    bool grid_find_best_ = false;    // Local Grid: the top level's forward finds the end cell
+    bool grid_empty_ = false;        // Local Grid: nothing above 0 (the empty alignment)
+    int  grid_end_i_ = -1;           // Local Grid, one pass: the end row the forward found
     // Local Hirschberg only: the 0-based cell where the recovered local path STARTS.
     // hops_ is a path within the sub-rectangle A[hb_start_i_..ie) x B[hb_start_j_..je),
     // so every consumer replays it from this origin rather than (0, 0).  For Global (and
@@ -4308,24 +4311,43 @@ private:
         grid_end_ = n_;
         grid_pick_end_ = AM == AlignMode::Glocal;   // the end column comes from row m
         grid_stop_ = false;
+        grid_find_best_ = false; grid_empty_ = false; grid_end_i_ = -1;
         if constexpr (AM == AlignMode::Local) {
-            // The end cell: the exact forward scan (no pmax) keeps viterbi_affine_ptr's rule
-            // -- the topmost row, then the leftmost column, strict >, over max(M, X, Y) --
-            // and its values are the fill's, so (ie, je) is Pointers' end cell.
-            T s; int ie, je;
-            sat_dispatch1_([&]<bool Sat>() { hb_scan<Sat>(buf, true, false, 0, m_, 0, n_, s, ie, je); });
-            if (!(s > static_cast<T>(0)) || ie <= 0 || je <= 0) {   // the empty alignment
+            // Every gap parameter >= 0 and a top level above the base size: the top level's
+            // forward pass finds the end cell itself (GridFwdJob::find_best, one pass; see
+            // grid_kernel_impl.inl).  Otherwise the exact end scan first.
+            const bool one_pass = ge_a >= T(0) && ge_b >= T(0) && grid_splits_(m_, n_);
+            if (one_pass) grid_find_best_ = true;
+            else {
+                // The end cell: the exact forward scan (no pmax) keeps viterbi_affine_ptr's rule
+                // -- the topmost row, then the leftmost column, strict >, over max(M, X, Y) --
+                // and its values are the fill's, so (ie, je) is Pointers' end cell.
+                T s; int ie, je;
+                sat_dispatch1_([&]<bool Sat>() { hb_scan<Sat>(buf, true, false, 0, m_, 0, n_, s, ie, je); });
+                if (!(s > static_cast<T>(0)) || ie <= 0 || je <= 0) {   // the empty alignment
+                    viterbi_score_ = static_cast<T>(0);
+                    best_i_ = 0; best_j_ = 0; best_tbl_ = TBTable::M;
+                    hb_start_i_ = 0; hb_start_j_ = 0;
+                    hirschberg_ = true; grid_ = true;
+                    return;
+                }
+                i = ie; j = je; grid_end_ = je;
+            }
+        }
+        int end_i = i;
+        grid_solve(buf, K, 0, 0, GridLine{buf.gtop.data(), n1, 1}, GridLine{buf.gleft.data(), m1, 1},
+                   0, i, j, st);
+        if constexpr (AM == AlignMode::Local) {
+            if (grid_empty_) {   // the one-pass end search found nothing above 0: the empty alignment
+                hops_.clear();
                 viterbi_score_ = static_cast<T>(0);
                 best_i_ = 0; best_j_ = 0; best_tbl_ = TBTable::M;
                 hb_start_i_ = 0; hb_start_j_ = 0;
                 hirschberg_ = true; grid_ = true;
                 return;
             }
-            i = ie; j = je; grid_end_ = je;
+            if (grid_end_i_ >= 0) end_i = grid_end_i_;
         }
-        const int end_i = i;
-        grid_solve(buf, K, 0, 0, GridLine{buf.gtop.data(), n1, 1}, GridLine{buf.gleft.data(), m1, 1},
-                   0, i, j, st);
         if (st < 0) {   // Glocal ending in column 0 (no block walked): the border cell (m, 0)
             const T vm = buf.gleft[m_], vx = buf.gleft[m1 + m_], vy = buf.gleft[2 * m1 + m_];
             viterbi_score_ = std::max({vm, vx, vy});
@@ -4346,11 +4368,15 @@ private:
         grid_ = true;
     }
 
+    // A rectangle of h x w cells runs the grid kernel (else the scalar base block).
+    static bool grid_splits_(int h, int w) noexcept {
+        return !(static_cast<long>(h) * w <= kGridBase || h < 2 * kGridMin || w < 2 * kGridMin);
+    }
+
     void grid_solve(DpBuffer& buf, const LevelKernels& K, int r0, int c0, const GridLine& top,
                     const GridLine& left, int depth, int& i, int& j, int& st) {
         const int r1 = i, c1 = j, h = r1 - r0, w = c1 - c0;
-        if (static_cast<long>(h) * w <= kGridBase || h < 2 * kGridMin || w < 2 * kGridMin ||
-            depth + 1 >= kGridDepth) {
+        if (!grid_splits_(h, w) || depth + 1 >= kGridDepth) {
             grid_base(buf, r0, r1, c0, c1, top, left, i, j, st);
             return;
         }
@@ -4368,8 +4394,14 @@ private:
         if (grid_pick_end_) J.last = &buf.glast;   // Glocal, top level: row m comes back
         J.local = AM == AlignMode::Local ? 1 : 0;
         J.sat = sat_;
+        J.find_best = grid_find_best_ ? 1 : 0;
         K.template of<T>().grid_fwd(J);
         const int W = J.W, q = J.q;
+        if (grid_find_best_) {   // Local, top level, one pass: the walk starts at the best cell
+            grid_find_best_ = false;
+            if (!(J.best > static_cast<T>(0))) { grid_empty_ = true; grid_stop_ = true; return; }
+            i = J.best_i; j = J.best_j; grid_end_ = J.best_j; grid_end_i_ = J.best_i;
+        }
         if (grid_pick_end_) {   // glocal_end_rows_'s rule: the first column holding row m's best
             const T* lr = buf.glast.data();
             int bj = c0; T best = std::max({left(0, h), left(1, h), left(2, h)});

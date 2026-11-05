@@ -1244,7 +1244,35 @@ really takes (`test_tracked_long_global_float32_pairs_run_their_own_fill`).  fuz
   tracked pairs / the scalar backend keep pmax; the planners ask hb_splits of pmax, true
   either way, so these pairs keep their own fill.  Scores are unchanged (pmax is exact for
   integers); paths become Pointers' wherever Hirschberg broke a tie differently.
-MEASUREMENTS_PLACEHOLDER
+- **Local, one pass** (same branch): with every gap parameter >= 0 and a top level above the
+  base size, the top level's forward finds the end cell itself (`GridFwdJob::find_best`, a
+  `Best` instantiation: per lane the largest M and its first segment, as the Pointers
+  kernel's `monly`), so the walk needs no separate `hb_scan` pass; otherwise (a negative
+  extend, a small problem) `feat/grid-modes`' end scan runs.  The Global instantiations are
+  untouched (`Best` / `Sat` compile out): float32 / double Global grid L3000 12.06 / 16.82
+  instructions per cell against main's 12.02 / 17.10.
+- Measured against main `85e0eb0` (skynet sse4, 1 thread, `bench_one.py` related protein
+  pairs BLOSUM62 11/1, hard path; ns/cell / instructions per cell by differencing two rep
+  counts; A/A main-auto twice within 1-2 % except one 3.77 / 4.15 ns wall outlier at equal
+  instructions):
+
+  | L | type mode | main auto | **branch auto** | branch grid | main grid | pointers |
+  |---|---|---|---|---|---|---|
+  | 1000 | i32 Global | 3.33 / 23.9 | **1.92 / 12.3** | 1.92 / 12.3 | (= Pointers) 3.24 | 3.22 / 22.2 |
+  | 1000 | i16 Global | 1.75 / 13.0 | **1.45 / 8.8** | 1.42 / 8.8 | (= Pointers) 1.54 | 1.57 / 10.8 |
+  | 1000 | i32 Local | 3.55 / 26.3 | 3.57 / 26.3 (Pointers) | **2.13 / 14.9** | (= Pointers) 3.59 | 3.56 / 26.2 |
+  | 1000 | f32 Local | 3.77 / 26.6 | 3.61 / 26.7 (Pointers) | **2.32 / 15.9** | 4.84 / 31.7 | 3.60 / 26.7 |
+  | 3000 | i32 Global | 3.53 / 23.6 | **1.55 / 9.5** | 1.52 / 9.6 | (= Pointers) 3.33 | 3.33 / 21.9 |
+  | 3000 | i32 Local | 3.68 / 25.9 | 3.65 / 25.9 (Pointers) | **1.64 / 11.9** | (= Pointers) 3.70 | 3.65 / 25.9 |
+  | 3000 | f32 Local | 3.65 / 26.2 | 3.65 / 26.2 (Pointers) | **1.92 / 13.4** | 4.50 / 28.9 | 3.75 / 26.2 |
+  | 3000 | f32 / f64 Global | 2.02 / 12.05, 2.93 / 17.1 | 2.04 / 12.06, 2.97 / 16.8 | 1.98, 2.96 | 2.01, 3.17 | 3.59, 6.19 |
+
+  Integer Global `auto` 1.2-2.3x faster than main's (pmax).  Local within the 2^25 budget:
+  `auto` stays Pointers on both sides (with one pass Grid would win 1.7-2.2x there on sse4;
+  the budget was set against the two-pass form and is left to a fleet re-measure).  Above
+  it (6300 x 6050, before the merge): int32 `auto` 1.94 ns/cell against pmax's 8.61.
+  fuzz_ab main `85e0eb0` vs the branch: 300 seeds, 0 differ; grid-vs-pointers fuzz (every
+  type and mode, three fills, 1-3 threads): 300 seeds, 0 differ.
 - Tests: `tests/cpp/test_grid.cpp` (every mode at int16 / int32 / int64, int16 in both
   regimes, every backend here, `ran_grid()` per type; integer `auto` routing),
   `tests/Python/test_grid.py` (every mode x integer type through the batch, `auto`).
