@@ -1,5 +1,7 @@
 """nwgrad.logistic: a binary logistic link over per-pair scores (DiscrimAlign's likelihood)."""
 
+import sys
+
 import numpy as np
 import pytest
 from scipy.optimize import brentq
@@ -23,9 +25,16 @@ def root(s, y, center=0.0, width=400.0):
 
 
 def test_probabilities_are_scipy_expit_bit_for_bit():
+    """Bit for bit where nwgrad and scipy call the same libm exp.  Not on Windows: the
+    MinGW build calls ucrtbase's exp, scipy's Windows wheel does not reach the same one,
+    and the two differ in the last bit (docs/windows.md).  There the bound is one ULP."""
     s, _ = data(1)
     for alpha in (0.0, -1.3, 7.5):
-        assert np.array_equal(L.probabilities(s, alpha), expit(alpha + s))
+        got, ref = L.probabilities(s, alpha), expit(alpha + s)
+        if sys.platform == "win32":
+            np.testing.assert_array_max_ulp(got, ref, maxulp=1)
+        else:
+            assert np.array_equal(got, ref)
 
 
 @pytest.mark.parametrize("start", [0.0, 1e-3, -0.7, 5.0, -50.0, 500.0, -500.0])

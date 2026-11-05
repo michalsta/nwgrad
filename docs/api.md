@@ -486,7 +486,7 @@ give a meaningless `alpha` instead of an error. The log-likelihood itself is not
 |---|---|---|
 | `step(batch, labels, alpha0)` | `Step` | One optimisation iteration's logistic work after `batch.score_and_grad()`: the fitted `alpha` (as `fit_alpha`) and `grad = Σᵢ (labels[i] − expit(alpha + scoreᵢ)) gradᵢ` as an `AlignParams` (as `weighted_grad` returns it). Uses the batch's `n_threads`. `SeqPairBatch` and `SeqPairBatchDouble`. |
 | `fit_alpha(scores, labels, alpha0, n_threads=0, tol=1e-12, max_newton=8, maxiter=200)` | `float` | The intercept maximising the likelihood: the root of dL/dα = Σ(y − p), which is strictly decreasing in α. Plain Newton steps while \|step\| ≤ 1, otherwise a bracketed safeguarded Newton (Numerical Recipes' rtsafe). Exact to rounding from any start. A NaN or infinite score (any non-finite derivative), a non-finite `alpha0` or a negative `tol` raises `ValueError`. |
-| `probabilities(scores, alpha, n_threads=0)` | `numpy.ndarray` | expit(α + scores), bit-identical to `scipy.special.expit`. |
+| `probabilities(scores, alpha, n_threads=0)` | `numpy.ndarray` | expit(α + scores), bit-identical to `scipy.special.expit` on Linux and macOS; within one ULP of it on Windows, where the two use different `exp` implementations ([windows.md](windows.md)). |
 
 ## `BatchResult`
 
