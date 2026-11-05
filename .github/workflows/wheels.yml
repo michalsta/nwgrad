@@ -238,6 +238,9 @@ jobs:
       - uses: astral-sh/setup-uv@v8.3.2
 
       - name: Install and test each wheel with its matching interpreter
+        env:
+          # CPython minors the abi3 wheel is re-tested on (those >= its python tag).
+          ABI3_TEST_MINORS: "12 13 14 15"
         run: |
           set -eu
           for whl in wheelhouse/*.whl; do
@@ -261,20 +264,32 @@ jobs:
             # free-threaded-only wheel, and uv's install rejected it as an
             # incompatible platform.
             abi_tag=$(echo "$fname" | cut -d- -f4)
-            pyver=$(echo "$abi_tag" | sed -E 's/^cp([0-9])([0-9]+)t?$/\1.\2/')
-            case "$abi_tag" in
-              *t) pyver="${pyver}t" ;;
-            esac
-            # Keyed on the full filename, not just the Python tag: a platform can ship
-            # multiple wheels for the same tag (e.g. manylinux + musllinux cp310), and
-            # those must not share a venv directory.
-            venvdir=".venv-$fname"
-            echo "::group::$whl on Python $pyver"
-            uv venv "$venvdir" --python "$pyver"
-            uv pip install --python "$venvdir/bin/python" "${whl}[dev]"
-            "$venvdir/bin/python" -c "import nwgrad; print('isa', nwgrad.simd_isa(), nwgrad.compiled_with())"
-            "$venvdir/bin/python" -m pytest tests/Python -q
-            echo "::endgroup::"
+            if [ "$abi_tag" = abi3 ]; then
+              # The stable-ABI wheel (cp312-abi3) serves every CPython from its python
+              # tag up, so it is tested on each of them, as cibuildwheel does.
+              floor=$(echo "$fname" | cut -d- -f3 | sed -E 's/^cp([0-9])([0-9]+)$/\2/')
+              pyvers=""
+              for minor in $ABI3_TEST_MINORS; do
+                [ "$minor" -ge "$floor" ] && pyvers="$pyvers 3.$minor"
+              done
+            else
+              pyvers=$(echo "$abi_tag" | sed -E 's/^cp([0-9])([0-9]+)t?$/\1.\2/')
+              case "$abi_tag" in
+                *t) pyvers="${pyvers}t" ;;
+              esac
+            fi
+            for pyver in $pyvers; do
+              # Keyed on the full filename and the interpreter: a platform can ship
+              # multiple wheels for the same tag (e.g. manylinux + musllinux cp310), and
+              # the abi3 wheel is installed into one venv per Python.
+              venvdir=".venv-$fname-$pyver"
+              echo "::group::$whl on Python $pyver"
+              uv venv "$venvdir" --python "$pyver"
+              uv pip install --python "$venvdir/bin/python" "${whl}[dev]"
+              "$venvdir/bin/python" -c "import nwgrad; print('isa', nwgrad.simd_isa(), nwgrad.compiled_with())"
+              "$venvdir/bin/python" -m pytest tests/Python -q
+              echo "::endgroup::"
+            done
           done
 
   # Trusted publishing (OIDC) -- no stored token. This repo+workflow must be
