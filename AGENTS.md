@@ -109,8 +109,8 @@ Build dependencies: `scikit-build-core`, `nanobind>=3.0` (the bindings call its 
   the guide without a Viterbi (`soft_guide="posterior"`), the inter-pair soft pass for
   alphabets > 8 and for mixed B lengths, float32 batches sharing the soft pass.
   Remaining candidates: (1) **memory** at len ≥ 1000: the checkpointed forward is in
-  (per pair, from 64 MiB of tables; "Checkpointed forward" below), a memory win (10-20x
-  RSS) at 1.0-1.4x the time on skynet; re-measure on v3 for a lower threshold. The double
+  (per pair, multi-threaded batches, from 4 MiB of tables; "Checkpointed forward" below):
+  0.31-0.85 of the time at 6 threads on nighthaven, 10-20x less RSS. The double
   pass's real slowdown at L1000 on skynet is denormals (same section): flush them in double
   too; (2) a vector-scan gap carry (the four-cell
   stepping already puts one FMA per 4 cells on the chain); (3) the soft pass's size cap
@@ -2757,13 +2757,24 @@ addresses, so a vectorized sum may peel differently): 1e-12 double, 1e-5 float32
 tests. GuideBanded pairs and tracked pairs are included: each row's span is zeroed right
 before the row is computed (the full-table path used to zero every span up front: the same
 values, since a row writes only itself), and the tracked weights are per row anyway.
-- **When**: forward tables (states × (m+1)(n+1) × the soft type's bytes) ≥ 64 MiB
-  (`kSoftCkptMinBytes`; double affine from L ~1650, float32 affine ~2350, double linear
-  ~2900); k = ceil(sqrt(m)) (block ≈ checkpoints, the least memory). Overrides
+- **When** (revised after the fleet run, below): the pair runs beside other workers (the
+  batch has more than one thread and more than one pair; `Aligner::set_soft_ckpt_shared`,
+  set by `BatchEngine::fwdbwd_` and the stream path; a standalone `SeqPair` or a 1-thread
+  batch never checkpoints by default) AND its forward tables (states × (m+1)(n+1) × the
+  soft type's bytes) reach 4 MiB (`kSoftCkptMinBytes`; double affine from L ~420, float32
+  affine ~590, double linear ~720); k = ceil(sqrt(m)) capped at 32. An explicit
+  `soft_ckpt_min_bytes` applies at any thread count. Fleet result (nighthaven, v3, 6 cores,
+  `results/nighthaven.md`): 1 thread, every checkpointed cell 1.13-1.48x slower; 6 threads,
+  main memory-bound from L1000 affine and checkpointed / full = L1000 affine double 0.31,
+  float32 0.48; L2000 affine 0.40 / 0.44; linear 0.82-0.90; L4000 float32 affine 0.85,
+  linear 0.83-0.85; L300 (2.1 MB) at a 2 MiB threshold 1.31, hence 4 MiB; L4000 double
+  affine 1.45x slower at both thread counts (main anomalous there, 14 ns/cell vs 6.4 at
+  L2000: the double subnormals, paid twice by the recomputation; FTZ, below, should
+  remove it); k = 16 / 32 / sqrt equal, 64 slower at 6 threads, hence the cap. Overrides
   (`nwgrad._tuning`, documented there): `soft_ckpt_min_bytes` (None: never), `soft_ckpt_rows`
   (k ≥ 1 at every size, 0 = the full tables, None = one block, no recomputation), and the
   environment `NWGRAD_SOFT_CKPT_ROWS=k` while that gate is unset.
-- **Why 64 MiB and not 2 MiB**: on skynet it is a memory switch, not a speed one. Measured
+- **The first default (64 MiB, any thread count)**: on skynet it was a memory switch, not a speed one. Measured
   (protein, BLOSUM62 × 0.3, 11/1 × 0.3, 20 % mutated, Global, `fill="striped"`, lazy guide,
   `scratchpad/bench_ck.py`; instructions from `perf stat` differences of 1 and 3 calls;
   A/A = the full arm twice):

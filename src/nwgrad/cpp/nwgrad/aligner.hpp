@@ -1105,6 +1105,10 @@ struct Aligner {
     // a pair's precision depends on that pair alone.  (A batch remembers its pairs'
     // refusals itself, per pair, and turns float32 off here for a pair that refused.)
     void set_soft_f32(bool v) noexcept { soft_f32_ = v; }
+    // Whether this pair's soft pass runs beside other worker threads (BatchEngine sets it:
+    // more than one thread and more than one pair).  The default checkpoint rule needs it
+    // (soft_ckpt_rows): alone, a pair streams its tables and checkpointing only costs.
+    void set_soft_ckpt_shared(bool v) noexcept { soft_ckpt_shared_ = v; }
     bool soft_f32() const noexcept { return soft_f32_; }
     bool soft_f32_used() const noexcept { return soft_f32_used_; }
 
@@ -1163,6 +1167,7 @@ private:
     int                 band_       = 0;
     int                 m_ = 0, n_ = 0;
     size_t              stride_ = 0, sz_ = 0;
+    bool                soft_ckpt_shared_ = false;   // set_soft_ckpt_shared
     std::vector<int>    guide_j_;  // used only when AB == GuideBanded
 
     // The body both set_problem overloads share (inlined into each: the untracked one
@@ -5223,9 +5228,10 @@ private:
 
     // Rows per block of the checkpointed forward (0: the full tables; soft_kernel_impl.inl,
     // "Checkpoints").  The soft_ckpt_rows gate, else NWGRAD_SOFT_CKPT_ROWS, forces k (k >= 1;
-    // 0: the full tables; the gate off: one block of every row); otherwise pairs whose
-    // forward tables reach soft_ckpt_min_bytes (kSoftCkptMinBytes) checkpoint, with k from
-    // soft_ckpt_auto_rows.
+    // 0: the full tables; the gate off: one block of every row).  Otherwise a pair
+    // checkpoints when its forward tables reach soft_ckpt_min_bytes -- that override, when
+    // set, at any thread count; by default kSoftCkptMinBytes and only when the pair runs
+    // beside other workers (soft_ckpt_shared_) -- with k from soft_ckpt_auto_rows.
     template <class SF>
     int soft_ckpt_rows() const noexcept {
         const int64_t o = gate_override(Gate::SoftCkptRows);
@@ -5233,15 +5239,17 @@ private:
         const int64_t mm = std::max(m_, 1);
         if (r >= 0) return static_cast<int>(std::min(r, mm));
         const size_t states = (GM == GapModel::Linear) ? 1 : 3;
+        const int64_t ob = gate_override(Gate::SoftCkptMinBytes);
+        if (ob < 0 && !soft_ckpt_shared_) return 0;   // the default: never on one thread
         if (states * sz_ * sizeof(SF) < gate_value(Gate::SoftCkptMinBytes, kSoftCkptMinBytes)) return 0;
         return static_cast<int>(std::min<int64_t>(soft_ckpt_auto_rows(m_), mm));
     }
-    // k = ceil(sqrt(m)): the block (k+1 rows) and the checkpoints (m/k rows) about equal, the
-    // least memory.  The time barely depends on k: at L4000, 8 threads, skynet, k = 12 / 32 /
-    // 64 ran within the run-to-run noise of each other (instructions +0.5 %); only k = 4 was
-    // slower (float32 affine 1.3x of k = 32).
+    // k = ceil(sqrt(m)), at most 32: the block (k+1 rows) and the checkpoints (m/k rows) about
+    // equal, the least memory.  The time barely depends on k: skynet, L4000, 8 threads, k = 12
+    // / 32 / 64 within noise, k = 4 1.3x slower; nighthaven, 6 threads, k = 16 / 32 / sqrt(m)
+    // equal and 64 slower (64 rows of a long pair's block crowd the shared cache), hence the cap.
     static int soft_ckpt_auto_rows(int m) noexcept {
-        return std::max(1, static_cast<int>(std::ceil(std::sqrt(static_cast<double>(m)))));
+        return std::clamp(static_cast<int>(std::ceil(std::sqrt(static_cast<double>(m)))), 1, 32);
     }
 
     // Both gap models: build the SoftPairJob and run the per-pair kernel of this

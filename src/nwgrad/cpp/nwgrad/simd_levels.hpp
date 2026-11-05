@@ -672,16 +672,22 @@ inline bool soft_ckpt_env_check() noexcept {
     return v;
 }
 // The forward tables' size (bytes: states x (m+1)(n+1) x the soft type's) from which the
-// per-pair soft pass checkpoints (soft_ckpt_min_bytes overrides; off = never).  A new
-// switch for a new code path, not a fill gate retuned: see Aligner::soft_ckpt_rows.
-// 64 MiB is a MEMORY decision, not a speed one: on skynet (sse4, 2026-11-05) the
-// checkpointed pass was never faster -- the recomputation adds ~30 instructions a cell
-// (affine; linear ~13), 1.2-1.4x the time at 1 thread from L300 to L4000, 1.0-1.3x at 8
-// threads (float32 affine L2000-4000 at parity) -- while it cut the peak RSS of 8 threads
-// at L4000 from 3.0 GB to 0.16 GB (double affine) and 1.5 GB to 0.10 GB (float32).  64 MiB:
-// double affine from L ~1650, float32 affine ~2350, double linear ~2900.  Re-measure on a
-// v3 host, where the per-cell compute is ~5x faster and memory may bound sooner.
-inline constexpr size_t kSoftCkptMinBytes = size_t(64) << 20;
+// per-pair soft pass checkpoints by default -- and then only when the pair runs beside other
+// worker threads (Aligner::soft_ckpt_rows; soft_ckpt_min_bytes set explicitly applies at any
+// thread count, off = never).  A new switch for a new code path, not a fill gate retuned.
+// Measured 2026-11-05: at ONE thread checkpointing never wins -- one pair's tables stream
+// fine and the recomputation costs ~30 instructions a cell affine (~13 linear): nighthaven
+// (v3) 1.13-1.48x slower in every cell, skynet (sse4) 1.2-1.4x.  With the cores busy, main
+// is memory-bound from L1000 affine and checkpointing wins: nighthaven, 6 threads,
+// checkpointed / full time: L1000 affine double 0.31, float32 0.48; L2000 affine 0.40 /
+// 0.44; linear L1000-2000 0.82-0.90; L4000 float32 affine 0.85, linear 0.83-0.85; but L300
+// (2.1 MB of tables) 1.31 at a 2 MiB threshold, hence 4 MiB (the crossover lies at
+// ~2.5-4 MiB).  L4000 double affine ran 1.45x slower at both thread counts, with main itself
+// anomalous there (14 ns/cell vs 6.4 at L2000): the double subnormals, paid twice by the
+// recomputation (branch proto/soft-denormal).  skynet, 8 threads: 1.0-1.3x (its single
+// cores stream better); peak RSS 10-20x lower everywhere (L4000 double affine 3.0 GB ->
+// 0.16 GB).  k = 16 / 32 / sqrt(m) equal on nighthaven, 64 slower at 6 threads.
+inline constexpr size_t kSoftCkptMinBytes = size_t(4) << 20;
 // ── The fill gates: which pairs join a shared (inter-pair) fill ────────────────
 //
 // Per ISA level and scalar type, measured by tools/gate_sweep.py (2026-10-31 / 11-01) on
