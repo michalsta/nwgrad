@@ -204,7 +204,9 @@ TEST_CASE("auto pointer budget: which pairs split", "[traceback][hirschberg]") {
     STATIC_REQUIRE(Aligner<GapModel::Affine, AlignMode::Global, AlignBand::Full, double>::kAutoPointerBudget);
     STATIC_REQUIRE(Aligner<GapModel::Affine, AlignMode::Local, AlignBand::Full, float>::kAutoPointerBudget);
     STATIC_REQUIRE(!Aligner<GapModel::Affine, AlignMode::Global, AlignBand::Full, float>::kAutoPointerBudget);
-    STATIC_REQUIRE(!Aligner<GapModel::Affine, AlignMode::Local, AlignBand::Full, double>::kAutoPointerBudget);
+    STATIC_REQUIRE(Aligner<GapModel::Affine, AlignMode::Local, AlignBand::Full, double>::kAutoPointerBudget);   // Grid above it (2026-11-05)
+    STATIC_REQUIRE(Aligner<GapModel::Affine, AlignMode::Local, AlignBand::Full, double>::kAutoPointerCells == kAutoHbPointerCells);
+    STATIC_REQUIRE(!Aligner<GapModel::Affine, AlignMode::Glocal, AlignBand::Full, float>::kAutoPointerBudget);
     STATIC_REQUIRE(!Aligner<GapModel::Affine, AlignMode::Global, AlignBand::Full, int32_t>::kAutoPointerBudget);
     STATIC_REQUIRE(Aligner<GapModel::Affine, AlignMode::Local, AlignBand::Full, int32_t>::kAutoPointerBudget);
     STATIC_REQUIRE(Aligner<GapModel::Affine, AlignMode::Global, AlignBand::Full, int64_t>::kAutoPointerBudget);

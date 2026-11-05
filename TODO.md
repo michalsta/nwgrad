@@ -361,20 +361,13 @@ Tracks landed on branch `tracks` (2026-10-11; see AGENTS.md, "Tracks").  Deferre
   soft path, the batch and streaming surfaces and the Python functions are in and tested
   against an exhaustive oracle.  Since then: the leveled striped / score / pointer
   kernels, the inter-pair hard, score-only, banded and soft fills, the scaled soft
-  kernels, the row kernels and Hirschberg (2026-11-03).  Not yet: Grid (below).
+  kernels, the row kernels and Hirschberg (2026-11-03), Grid (2026-11-05).
   Then PosimiR's backend can switch from the emulation to `mode="glocal"`.
-- **Grid traceback for Local and Glocal** (now affine Global Full only; the others run AS
-  Pointers: same result, table memory).  Glocal: the forward kernel's row 0 M = 0 at
-  every column and no Y series (column 0 Global's chain, no clamp), the walk entered at
-  row m's first best column (row m is in hand after the forward pass) and stopped at
-  row 0.  Local: the forward kernel also needs the clamp at 0 and a running argmax for
-  the end cell, and the walk stops at a zero cell.  Tests against Pointers, bit for bit,
-  as `test_grid.cpp` / `test_grid.py` do for Global.  (Not for PosimiR: its miRNA rows
-  never exceed hb_cutoff, and it is tracked; for long glocal / local alignments.)
-- **Fleet runs not yet done: spot (neon) and `tools/bench_tracks.py`.**  Correctness was
-  verified on sse2 (skynet, wloczykij), avx2 (nighthaven) and avx512 (solace WSL, 2026-11-04
-  at `c9ed87e`: ctest 17/17, `NWGRAD_FORCE_KERNEL=simd` pytest 22744 passed, 72 skipped);
-  NEON only through CI's ARM64 job.
+- **Tracked linear batches now cost 1.12-1.42x untracked** (was 0.95-1.04 when tracks
+  landed; 2026-11-05, nighthaven and spot alike, AGENTS "Tracked cost"): the untracked
+  walk got faster, the tracked replay did not.  Mostly the tracked code path (tracked1),
+  not K: the per-pair path replay in `weighted_grad` and the tracked walk are the places
+  to look (PosimiR's training step is linear and tracked).
 - **Python track conversion** (`to_tracks` in py_exports.cpp) casts each pair's list
   separately: ~1-2 µs per pair, seconds for millions.  Accepting one flat int array plus
   offsets would remove it.
