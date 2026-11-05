@@ -284,6 +284,10 @@ def test_tracked_long_global_float32_pairs_run_their_own_fill():
             assert x == y
         else:
             assert np.array_equal(x, y)
-    # untracked, Grid applies (no split): the long pairs may share a fill
-    u = nwgrad.SeqPairBatch(A, B, _params("random", "affine"), n_threads=3)
-    assert u._inter_plan()[:2] == [48, 0]
+    # untracked, Grid applies (no split): the long pairs may share a fill.  The byte budget
+    # is out of the way: 3 threads on a 2-core runner take its hyperthread share (9/16),
+    # which an AVX-512 group of these pairs (~3.1 MB) exceeds.
+    from nwgrad import _tuning
+    with _tuning.override(inter_group_bytes=10**9):
+        u = nwgrad.SeqPairBatch(A, B, _params("random", "affine"), n_threads=3)
+        assert u._inter_plan()[:2] == [48, 0]
