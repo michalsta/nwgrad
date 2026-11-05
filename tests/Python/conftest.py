@@ -44,6 +44,46 @@ def running_under_asan():
         return False
 
 
+def peak_rss_bytes():
+    """This process's peak resident set (a high-water mark), in bytes.
+
+    POSIX: getrusage's ru_maxrss (KiB on Linux).  Windows has no `resource` module;
+    there it is the peak working set from GetProcessMemoryInfo, the same high-water
+    mark under Windows' name.
+    """
+    import sys
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+            _fields_ = [("cb", wintypes.DWORD),
+                        ("PageFaultCount", wintypes.DWORD),
+                        ("PeakWorkingSetSize", ctypes.c_size_t),
+                        ("WorkingSetSize", ctypes.c_size_t),
+                        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                        ("PagefileUsage", ctypes.c_size_t),
+                        ("PeakPagefileUsage", ctypes.c_size_t)]
+
+        counters = PROCESS_MEMORY_COUNTERS()
+        counters.cb = ctypes.sizeof(counters)
+        psapi = ctypes.WinDLL("psapi")
+        kernel32 = ctypes.WinDLL("kernel32")
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        psapi.GetProcessMemoryInfo.argtypes = [wintypes.HANDLE,
+                                               ctypes.POINTER(PROCESS_MEMORY_COUNTERS),
+                                               wintypes.DWORD]
+        if not psapi.GetProcessMemoryInfo(kernel32.GetCurrentProcess(),
+                                          ctypes.byref(counters), counters.cb):
+            raise OSError(ctypes.get_last_error(), "GetProcessMemoryInfo failed")
+        return counters.PeakWorkingSetSize
+    import resource
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+
+
 def run_isolated(code, timeout=120):
     """Run `code` in a fresh interpreter and return the CompletedProcess.
 

@@ -789,9 +789,9 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
         .def("__len__", &SPB::size)
         .def(
             "__getitem__",
-            [](nb::object self_obj, long i) -> nb::object {
+            [](nb::object self_obj, std::int64_t i) -> nb::object {
                 SPB& self = nb::cast<SPB&>(self_obj);
-                const long n = static_cast<long>(self.size());
+                const std::int64_t n = static_cast<std::int64_t>(self.size());
                 if (i < 0) i += n;
                 if (i < 0 || i >= n) throw nb::index_error("SeqPairBatch index out of range");
                 nb::object w = nb::cast(SP(self, static_cast<size_t>(i)));
@@ -1341,8 +1341,8 @@ NB_MODULE(nwgrad_ext, m) {
             "gap_open_a, gap_extend_a, gap_open_b, gap_extend_b.  Assignable.")
         .def(
             "__getitem__",
-            [](const AlignParams& self, long k) {
-                const long K = self.num_sets();
+            [](const AlignParams& self, std::int64_t k) {
+                const std::int64_t K = self.num_sets();
                 if (k < 0) k += K;
                 if (k < 0 || k >= K) throw nb::index_error("nwgrad: parameter set index out of range");
                 return self.set(static_cast<int>(k));
@@ -1350,8 +1350,8 @@ NB_MODULE(nwgrad_ext, m) {
             nb::arg("k"), "Set k as a one-set AlignParams (a copy).")
         .def(
             "__setitem__",
-            [](AlignParams& self, long k, const AlignParams& p) {
-                const long K = self.num_sets();
+            [](AlignParams& self, std::int64_t k, const AlignParams& p) {
+                const std::int64_t K = self.num_sets();
                 if (k < 0) k += K;
                 if (k < 0 || k >= K) throw nb::index_error("nwgrad: parameter set index out of range");
                 self.assign_set(static_cast<int>(k), p);

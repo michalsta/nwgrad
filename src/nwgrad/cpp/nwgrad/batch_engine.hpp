@@ -274,7 +274,7 @@ public:
     struct PhaseProfile {
         double chunk_s = 0.0, reserve_s = 0.0;
         double chunk_cells = 0.0, reserve_cells = 0.0;
-        long   chunk_tasks = 0, reserve_tasks = 0;
+        long long chunk_tasks = 0, reserve_tasks = 0;
         double finish_s = 0.0;
     };
     std::vector<PhaseProfile> profile_out;   // per worker, after a profiled sorted run

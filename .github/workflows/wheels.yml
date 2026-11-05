@@ -46,10 +46,18 @@ name: Wheels
 #   * macOS arm64   -> Homebrew gcc.  Apple's own clang ships libc++, which has NO
 #     <experimental/simd> at all, so the vectorized kernels cannot be built with the
 #     system toolchain; and gcc is the faster NEON backend besides.
-#   * Windows       -> not built.  MSVC has no <experimental/simd>, so a Windows build
-#     has no vectorized kernels and would be slower than tools already available there.
-#     A source install under MSVC fails honestly at the missing header (by design — the
-#     level-TU gate in CMakeLists is on the CPU, never the compiler).
+#   * Windows x86_64 -> MinGW-w64 gcc (MSYS2 UCRT64), against the official MSVC-built
+#     CPython.  MSVC is not an option: its STL has no <experimental/simd>, and the
+#     kernels are the point of the library.  UCRT64, not the runner's preinstalled
+#     C:\mingw64 or Strawberry Perl's gcc: those link MSVCRT, while CPython links the UCRT,
+#     and two C runtimes in one process share no heap, FILE* or errno.  The gcc runtime
+#     (libstdc++, libgcc, winpthread) is linked statically (CMakeLists, MinGW block), and
+#     tools/check_windows_wheel.py — the Windows "repair" step — fails the build if the
+#     .pyd imports any MinGW DLL or msvcrt.dll.  Not built: win32 and win_arm64 (no
+#     mature MinGW gcc for Windows on ARM), and free-threaded cp3XXt (pyproject skip).
+#     The avx2/avx512 TUs carry -Wa,-muse-unaligned-vector-move: older gcc on Win64
+#     spilled 32/64-byte vectors with aligned moves onto a 16-byte-aligned stack (GCC PR
+#     54412).  Current gcc no longer does; the flag keeps it that way for any gcc.
 #
 # Deliberately NO LTO: register_level() must be emitted as baseline code (it runs at
 # static-init on every CPU, including ones without AVX-512), and LTO could hoist a wide
@@ -62,6 +70,14 @@ on:
   workflow_dispatch:
   push:
     tags: ["v*"]
+  # A PR that touches the packaging builds and tests every wheel (publish stays gated
+  # on tag pushes below), so a broken wheel build is seen before the release tag.
+  pull_request:
+    paths:
+      - ".github/workflows/wheels.yml"
+      - "CMakeLists.txt"
+      - "pyproject.toml"
+      - "tools/check_windows_wheel.py"
 
 concurrency:
   group: wheels-${{ github.ref }}
@@ -99,9 +115,13 @@ jobs:
             # CIBW_ENVIRONMENT_LINUX template below from expanding to a bare "CC= CXX=".
             cc: gcc
             cxx: g++
-          # No Windows: MSVC lacks <experimental/simd>, so a Windows build has no
-          # vectorized kernels and would be slower than tools already available there.
-          # A source install under MSVC fails honestly at the missing header.
+          # cc/cxx unused on Windows, like macOS — CIBW_ENVIRONMENT_WINDOWS (set in the
+          # MSYS2 step) points at the UCRT64 gcc by full path.
+          - name: windows-x86_64 (mingw-gcc)
+            runner: windows-latest
+            archs: AMD64
+            cc: gcc
+            cxx: g++
     steps:
       - uses: actions/checkout@v7
 
@@ -124,6 +144,29 @@ jobs:
           GCC="$(ls "$(brew --prefix)"/bin/gcc-[0-9]* | sort -V | tail -1)"
           echo "Using $GXX / $GCC"
           echo "CIBW_ENVIRONMENT_MACOS=CC=$GCC CXX=$GXX MACOSX_DEPLOYMENT_TARGET=11.0 LDFLAGS='-static-libstdc++ -static-libgcc'" >> "$GITHUB_ENV"
+
+      # Windows: MSYS2's UCRT64 gcc (see COMPILER POLICY).  Its bin/ goes FIRST on PATH
+      # inside cibuildwheel: cc1plus loads its own DLLs (gmp, mpfr, isl, zstd) from there,
+      # and the runner already has two other gccs on PATH (C:\mingw64, Strawberry Perl),
+      # both MSVCRT.  CC/CXX are full paths besides, so a PATH mix-up cannot swap the
+      # compiler silently; compiled_with() in the test command prints what was used.
+      # Ninja because scikit-build-core would otherwise pick a Visual Studio generator.
+      - name: Set up MSYS2 UCRT64 gcc (Windows)
+        if: runner.os == 'Windows'
+        id: msys2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: mingw-w64-ucrt-x86_64-gcc
+
+      - name: Point cibuildwheel at the UCRT64 gcc (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          UCRT="$(cygpath -m '${{ steps.msys2.outputs.msys2-location }}')/ucrt64"
+          "$UCRT/bin/g++.exe" --version
+          echo "CIBW_ENVIRONMENT_WINDOWS=PATH=\"$UCRT/bin;\$PATH\" CC=$UCRT/bin/gcc.exe CXX=$UCRT/bin/g++.exe CMAKE_GENERATOR=Ninja" >> "$GITHUB_ENV"
 
       - name: Install cibuildwheel
         run: python -m pip install cibuildwheel
@@ -159,8 +202,12 @@ jobs:
           # entry (the arms are already split by arch) rather than by a runtime uname test.
           CIBW_ENVIRONMENT_LINUX: CC=${{ matrix.cc }} CXX=${{ matrix.cxx }}
 
-          # Windows: MSVC default; nothing to override.  (CIBW_ENVIRONMENT_MACOS is set
-          # dynamically in the step above.)
+          # (CIBW_ENVIRONMENT_MACOS and CIBW_ENVIRONMENT_WINDOWS are set dynamically in
+          # the steps above.)
+
+          # Windows has no auditwheel/delocate step to bundle DLLs, and needs none: the
+          # runtime is static.  The repair hook instead VERIFIES that — see the script.
+          CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: python {project}/tools/check_windows_wheel.py {wheel} {dest_dir}
 
           # Every built wheel is import-tested and run through the full Python suite,
           # including the forced-simd pass, so a wheel that dispatched a broken kernel
@@ -227,6 +274,11 @@ jobs:
             runner: ubuntu-24.04-arm
           - name: macos-arm64 (gcc)
             runner: macos-14
+          - name: windows-x86_64 (mingw-gcc)
+            runner: windows-latest
+    defaults:
+      run:
+        shell: bash   # also on Windows (Git Bash): the loop below is a bash script
     steps:
       - uses: actions/checkout@v7
 
@@ -271,9 +323,12 @@ jobs:
             venvdir=".venv-$fname"
             echo "::group::$whl on Python $pyver"
             uv venv "$venvdir" --python "$pyver"
-            uv pip install --python "$venvdir/bin/python" "${whl}[dev]"
-            "$venvdir/bin/python" -c "import nwgrad; print('isa', nwgrad.simd_isa(), nwgrad.compiled_with())"
-            "$venvdir/bin/python" -m pytest tests/Python -q
+            # Windows venvs keep the interpreter in Scripts/, not bin/.
+            py="$venvdir/bin/python"
+            [ -e "$py" ] || py="$venvdir/Scripts/python.exe"
+            uv pip install --python "$py" "${whl}[dev]"
+            "$py" -c "import nwgrad; print('isa', nwgrad.simd_isa(), nwgrad.compiled_with())"
+            "$py" -m pytest tests/Python -q
             echo "::endgroup::"
           done
 
