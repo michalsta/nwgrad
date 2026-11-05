@@ -4,6 +4,7 @@ import sys
 
 import numpy as np
 import pytest
+import scipy
 from scipy.optimize import brentq
 from scipy.special import expit
 
@@ -25,14 +26,16 @@ def root(s, y, center=0.0, width=400.0):
 
 
 def test_probabilities_are_scipy_expit_bit_for_bit():
-    """Bit for bit where nwgrad and scipy call the same libm exp.  Not on Windows: the
-    MinGW build calls ucrtbase's exp, scipy's Windows wheel does not reach the same one,
-    and the two differ in the last bit (docs/windows.md).  There the bound is one ULP."""
+    """Bit for bit.  The one known exception: scipy's Windows wheels before 1.18 (1.15.3,
+    1.17.1 measured) compute expit differently and are up to 2 ULP off; scipy 1.18.1 there
+    is bit-identical, as is 1 / (1 + numpy.exp(-x)) with either (docs/windows.md)."""
     s, _ = data(1)
+    old_windows_scipy = (sys.platform == "win32"
+                         and tuple(int(x) for x in scipy.__version__.split(".")[:2]) < (1, 18))
     for alpha in (0.0, -1.3, 7.5):
         got, ref = L.probabilities(s, alpha), expit(alpha + s)
-        if sys.platform == "win32":
-            np.testing.assert_array_max_ulp(got, ref, maxulp=1)
+        if old_windows_scipy:
+            np.testing.assert_array_max_ulp(got, ref, maxulp=2)
         else:
             assert np.array_equal(got, ref)
 
