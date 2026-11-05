@@ -557,31 +557,40 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
                 vcin.copy_from(cin, stdx::element_aligned);
             }
             vcin = stdx::max(vcin, Q0);
-            // The second pass forms the prefix again, seeded with the carry-in: P(s) =
-            // max(P(s-1), open(s-1) + ramp(s)), P(-1) = vcin, open(s-1) from the D row as
-            // pass 1 stored it (max(M, X), read before this pass overwrites it with
-            // max(D, Y)).  The same operands in the same order as pass 1's fP, and max is
-            // exact and associative, so P(s) == max(fP(s), vcin) bit for bit: Y and D are
-            // the stored-prefix form's.  One store (pass 1) and one load (here) fewer a
-            // vector cell, for an add and a subtraction here, and no Y row: four rolling
-            // rows instead of five (with the profile and Local's mask, 5-6 rows of
-            // working set instead of 6-7).
-            vd P = vcin, Op = vsub<Sat>(vninf, fBase), rq = fBase;   // Op: pass 1's seed
-            auto step2 = [&]<bool Mk>(int s) __attribute__((always_inline)) {
+            // The second pass forms Y again from the D row as pass 1 stored it (max(M, X),
+            // read before this pass overwrites it with max(D, Y)), with the lanes' carry-in
+            // known.  Segment 0 as the prefix form has it, y(0) = max(vcin, Q(0)) - ramp(0)
+            // (Q(0) is pass 1's seed, exactly -inf + base); then the serial step
+            // y(s) = max(y(s-1) - ge_a, open(s-1)), which is max(P(s-1), open(s-1) +
+            // ramp(s)) - ramp(s) with the ramp cancelled: ramp(s) = ramp(s-1) + ge_a.  In
+            // the plain regime nothing wraps (the quarter rule bounds every operand), so
+            // the integer identities hold exactly and Y is the stored-prefix form's bit for
+            // bit.  Saturating (int16 past the quarter rule): with ge_a >= 0 no operand
+            // clamps but at the bottom, and a bottom clamp commutes with max and with the
+            // subtractions, so again the same Y; with ge_a < 0 the prefix form lifts a
+            // saturated open to lowest() + |ramp| where the serial step keeps lowest():
+            // only sentinel-derived values differ, and those stay below every reachable
+            // value (nw_int_bound_check), so every reachable cell and the score are the
+            // same.  Per vector cell: a subtraction and a max on the chain and the open off
+            // it, no ramp, no Y row -- one store (pass 1) and the Y load (here) fewer than
+            // the stored-prefix form, four rolling rows instead of five.
+            vd Op, y;
+            auto step2 = [&]<bool Mk, bool First>(int s) __attribute__((always_inline)) {
                 vd d; d.copy_from(cD + (std::size_t)s * W, stdx::element_aligned);
-                P = stdx::max(P, vadd<Sat>(Op, rq));
+                if constexpr (First) y = vsub<Sat>(stdx::max(vcin, vadd<Sat>(vsub<Sat>(vninf, fBase), fBase)), fBase);
+                else                 y = stdx::max(vsub<Sat>(y, vge_a), Op);
                 Op = open_pen<Sat>(d, vgo_a, vge_a, vgoe_a);
-                const vd y = vsub<Sat>(P, rq);
                 d = stdx::max(d, y);
                 d.copy_to(cD + (std::size_t)s * W, stdx::element_aligned);
                 if constexpr (Local && !MOnly) vbest = stdx::max(vbest, mpad.template operator()<Mk>(y, s));
-                rq += vge_a;
             };
-            int s = 0;
+            if (s0 == 0) step2.template operator()<true, true>(0);
+            else         step2.template operator()<false, true>(0);
+            int s = 1;
             if constexpr (Local && !MOnly) {
-                for (; s < s0; ++s) step2.template operator()<false>(s);
+                for (; s < s0; ++s) step2.template operator()<false, false>(s);
             }
-            for (; s < seg; ++s) step2.template operator()<true>(s);
+            for (; s < seg; ++s) step2.template operator()<true, false>(s);
         } else
         for (int r = 0; r < W; ++r) {
             vd last; last.copy_from(cY + (std::size_t)(seg - 1) * W, stdx::element_aligned);
