@@ -68,7 +68,46 @@ template <class V> [[gnu::always_inline]] static inline V ivmax(V a, V b) noexce
 #endif
     return a < b ? b : a;
 }
-template <class L, class V> [[gnu::always_inline]] static inline V ivsel(L m, V a, V b) noexcept { return m ? a : b; }
+// Lane-wise m ? a : b for a mask m whose lanes are 0 or -1 (every mask here: comparisons,
+// the B residues' bit masks, `live`), taken as is.  `m ? a : b` on a vector means m != 0,
+// so where m is not a comparison in view -- a mask loaded from memory, as the blend tree's
+// bits are -- gcc first compares it against zero (pcmpeq* before every pblendvb at sse4;
+// perf annotate of inter_score_affine_pos<short> put that compare among the column
+// loop's five hottest instructions).  A blend moves bits, so the float lanes stay exact.
+// SSE2 has no blend: the and / andnot / or a select lowers to anyway, minus the compare.
+template <class L, class V> [[gnu::always_inline]] static inline V ivsel(L m, V a, V b) noexcept {
+    static_assert(sizeof(L) == sizeof(V));
+    using E [[maybe_unused]] = std::remove_cvref_t<decltype(a[0])>;
+#if defined(__AVX512F__)
+    if constexpr (sizeof(V) == 64)   // bitwise m ? a : b in one op (A ? B : C = 0xCA)
+        return (V)_mm512_ternarylogic_epi64((__m512i)m, (__m512i)a, (__m512i)b, 0xCA);
+    else
+#endif
+#if defined(__AVX2__)
+    if constexpr (sizeof(V) == 32) {
+        if constexpr (std::is_same_v<E, double>)     return (V)_mm256_blendv_pd((__m256d)b, (__m256d)a, (__m256d)m);
+        else if constexpr (std::is_same_v<E, float>) return (V)_mm256_blendv_ps((__m256)b, (__m256)a, (__m256)m);
+        else                                         return (V)_mm256_blendv_epi8((__m256i)b, (__m256i)a, (__m256i)m);
+    } else
+#endif
+#if defined(__SSE4_1__)
+    if constexpr (sizeof(V) == 16) {
+        if constexpr (std::is_same_v<E, double>)     return (V)_mm_blendv_pd((__m128d)b, (__m128d)a, (__m128d)m);
+        else if constexpr (std::is_same_v<E, float>) return (V)_mm_blendv_ps((__m128)b, (__m128)a, (__m128)m);
+        else                                         return (V)_mm_blendv_epi8((__m128i)b, (__m128i)a, (__m128i)m);
+    } else
+#elif defined(__SSE2__)
+    if constexpr (sizeof(V) == 16) {
+        const __m128i mi = (__m128i)m;
+        return (V)_mm_or_si128(_mm_and_si128(mi, (__m128i)a), _mm_andnot_si128(mi, (__m128i)b));
+    } else
+#elif defined(__ARM_NEON)
+    if constexpr (sizeof(V) == 16)
+        return (V)vbslq_u8((uint8x16_t)m, (uint8x16_t)a, (uint8x16_t)b);
+    else
+#endif
+    return m ? a : b;
+}
 // Lane-wise add / subtract (plain: the inter-pair kernels never run a problem past the
 // quarter-range bound -- the engine keeps such pairs on their own fill, whose kernels
 // have a saturating variant; see nw_sat in scalar_traits.hpp).
