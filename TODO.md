@@ -242,11 +242,16 @@ the sweep only has square protein pairs and 22 x L DNA pairs, so a short-A shape
   over at 0.4-0.7 W. A per-level/type value would gain ~1-3 % geomean on small batches.
 - The AVX-512 float score caps came from 1 thread; the threaded crossover is not measured.
 - Soft groups get the same fill rule unmeasured (the soft pass was not in the sweep).
-- The byte budget with hyperthreads: at n_threads = logical cores (nighthaven 12, solace
-  16) the hard shared fill loses from L150 affine (1.3-3x; solace float L100 1.1-1.6x)
-  and L200-300 linear (2-6x) inside the 3 MiB budget, measured for DNA and protein. At
-  the default (physical cores) the budget is right. A budget that halves when threads
-  outnumber cores would cover it; needs the core count the scheduler already knows.
+- The byte budget with hyperthreads: done (2026-11-05: 9/16 of it when threads outnumber
+  physical cores; AGENTS `inter_group_bytes`), measured on nighthaven AVX2 and solace
+  AVX2 / AVX-512. Not measured: DNA linear L200-300 (2-6x before; the gate_sweep DNA
+  sections stop at 22 x 200), SSE, NEON (the M1 has no SMT anyway).
+- solace AVX-512 linear Global L160 (float32, double): the shared fill loses 1.38x at 16
+  threads and 1.11x at 8, the default takes it; L120 and L200 tie. One length, both thread
+  counts, so not the hyperthread budget: the linear gather cap (33000 cells) or a lane
+  count effect. 2026-11-05.
+  Left at 12 threads on nighthaven, present before the change: linear float32 L120 / L400
+  1.13-1.20x, affine double / int32 L80-120 1.05-1.10x.
 - `group_small_kb_1` (DNA, one thread) is measured on AVX2 / AVX-512 only; SSE and NEON
   keep the type's budget.
 - **The SSE table follows forced-SSE4 runs on AVX2 / AVX-512 Intel (#15), not the hardware

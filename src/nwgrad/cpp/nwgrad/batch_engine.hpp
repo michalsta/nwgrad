@@ -872,7 +872,7 @@ private:
             if (la == 0 || lb == 0 || (hb_case && hb_splits(own_tb, s_.traceback == TracebackMode::Default ? FullAl::kAutoPointerCells : 0, s_.hb_cutoff, la, lb)) ||
                 (!rows &&   // the score kernel keeps rows, not tables
                  !inter_pair_fits<T>(la, lb, GM == GapModel::Affine, soft, inter_w_(K), K.d.inter_w, s_.n_threads == 1, backend,
-                                    params.matrix.size() <= 8))) {
+                                    params.matrix.size() <= 8, threads_share_cores(s_.n_threads)))) {
                 other.push_back(i); continue;
             }
             if constexpr (nw_sat<T>)
@@ -2244,7 +2244,7 @@ private:
         if (!rows &&
             !inter_pair_fits<T>(len_a(i), len_b(i), GM == GapModel::Affine,
                                 grad_mode_ == GradMode::Soft, inter_w_(K), K.d.inter_w, s_.n_threads == 1, K.level,
-                                alpha_->size() <= 8))
+                                alpha_->size() <= 8, threads_share_cores(s_.n_threads)))
             return false;
         // Linear hard fill: the shared fill gathers per lane-cell over 8 letters (the own
         // striped kernel reads a profile row) and blends on masks up to 8; its cell cap per
