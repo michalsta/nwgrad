@@ -96,26 +96,36 @@ template <class V, int W, class F>
 static inline V ivlanes(F f) noexcept { return ivlanes_<V>(f, std::make_index_sequence<static_cast<std::size_t>(W)>{}); }
 
 
+// The substitution lookup's form, a template parameter of every inter-pair kernel (Lv):
+// kLvGather (-1) for alphabets over 8 letters (each row gathered into srow), 2 or 3 for
+// a blend tree of that many levels (<= 4 / <= 8 letters).  Chosen once per job
+// (inter_lv_dispatch).  It was a runtime `levels` tested at every column: perf annotate of
+// inter_score_affine_pos<short> (sse4) put that compare and branch among the column loop's
+// five hottest instructions.  Alphabets of 1 or 2 letters take the 2-level tree: their
+// bit-1 masks are all 0 and P[2], P[3] repeat P[0], so it selects the same P[b].
+inline constexpr int kLvGather = -1;
+
 // Per lane, the score of this row's A residue against the column's B residue: a blend
-// tree on the B residue's bits (bits[3*j + k] = bit k of each lane's b[j-1], as masks).
-template <class V, class L>
-static inline V inter_sub(const V* P, const L* bits, int j, int levels) noexcept {
-    if (levels == 0) return P[0];
-    const L b0 = bits[3 * j];
+// tree on the B residue's bits (bits[Lv*j + k] = bit k of each lane's b[j-1], as masks).
+template <int Lv, class V, class L>
+[[gnu::always_inline]] static inline V inter_sub(const V* P, const L* bits, int j) noexcept {
+    static_assert(Lv == 2 || Lv == 3);
+    const L b0 = bits[Lv * j];
     const V t0 = ivsel(b0, P[1], P[0]);
-    if (levels == 1) return t0;
-    const L b1 = bits[3 * j + 1];
+    const L b1 = bits[Lv * j + 1];
     const V u0 = ivsel(b1, ivsel(b0, P[3], P[2]), t0);
-    if (levels == 2) return u0;
-    const V u1 = ivsel(b1, ivsel(b0, P[7], P[6]), ivsel(b0, P[5], P[4]));
-    return ivsel(bits[3 * j + 2], u1, u0);
+    if constexpr (Lv == 2) return u0;
+    else {
+        const V u1 = ivsel(b1, ivsel(b0, P[7], P[6]), ivsel(b0, P[5], P[4]));
+        return ivsel(bits[Lv * j + 2], u1, u0);
+    }
 }
 
 // The shared per-job setup: the B residues' bit masks and, per row, the profile.
 // Alphabets over 8 letters (levels = -1) take no blend tree: each row's scores are
 // GATHERED per lane into srow — one scalar load per lane-cell, outside the carry chain
 // (Rognes' query profile cannot serve here: each lane has its own row residue).
-template <class T>
+template <class T, int Lv>
 struct InterCommon {
     using ivd = typename IVT<T>::v; using ivl = typename IVT<T>::l;
     static constexpr int IW = IVT<T>::W;
@@ -125,14 +135,13 @@ struct InterCommon {
     static constexpr bool kMaskTranspose = IW >= 16 || (IW >= 8 && sizeof(T) == 2);
 #endif
     const InterJobT<T>& J;
-    int levels;
+    static constexpr int levels = Lv;
     std::vector<ivl>& bits;
     std::vector<ivd>& srow;
     explicit InterCommon(const InterJobT<T>& job) : J(job), bits(bits_buf()), srow(srow_buf()) {
-        const int na = J.nalpha, n = J.n;
-        levels = na <= 1 ? 0 : na <= 2 ? 1 : na <= 4 ? 2 : na <= 8 ? 3 : -1;
+        const int n = J.n;
         if (levels < 0 && srow.size() < static_cast<size_t>(n + 1)) srow.resize(n + 1);
-        if (bits.size() < static_cast<size_t>(3 * (n + 1))) bits.resize(3 * (n + 1));
+        if (levels > 0 && bits.size() < static_cast<size_t>(Lv * (n + 1))) bits.resize(Lv * (n + 1));
         // The masks from the lanes' residues: the W residues of column j gathered as bytes
         // (one byte load and store per lane), widened to the lane width in one convert, and
         // each bit's mask as an arithmetic shift pair -- where building each mask vector
@@ -162,12 +171,12 @@ struct InterCommon {
                 u8v bv; std::memcpy(&bv, btp + static_cast<size_t>(j) * IW, IW);
                 const ivl wv = __builtin_convertvector(bv, ivl);
                 for (int k = 0; k < levels; ++k)
-                    bits[3 * j + k] = (wv << (EB - 1 - k)) >> (EB - 1);   // bit k, as 0 / -1
+                    bits[Lv * j + k] = (wv << (EB - 1 - k)) >> (EB - 1);   // bit k, as 0 / -1
             }
         } else
         for (int j = 1; j <= n; ++j)
             for (int k = 0; k < levels; ++k) {
-                bits[3 * j + k] = ivlanes<ivl, IW>([&](int l) {
+                bits[Lv * j + k] = ivlanes<ivl, IW>([&](int l) {
                     const int bl = (!J.nb || j <= J.nb[l]) ? J.b[l][j - 1] : 0;   // ragged: pad
                     return ((bl >> k) & 1) ? -1 : 0;
                 });
@@ -220,7 +229,7 @@ struct InterCommon {
     void row(int i, ivd* P, ivl& live) const {
         const int na = J.nalpha;
         for (int l = 0; l < IW; ++l) live[l] = (i <= J.m[l]) ? -1 : 0;
-        if (levels < 0) {
+        if constexpr (Lv < 0) {
             const int n = J.n;
             // A local pointer, not srow[j]: clang reloaded the vector's data pointer from
             // the object after every lane store (two dependent loads per element; this
@@ -237,7 +246,7 @@ struct InterCommon {
                 for (int j = nl + 1; j <= n; ++j) sr[j][l] = pr[0];   // ragged: pad
             }
             return;
-        }
+        } else {
         if constexpr (Tr) {   // each lane's row once, then its letters (the P inter_sub reads)
             const T* rowp[IW];
             for (int l = 0; l < IW; ++l) rowp[l] = J.blk + brow<Tr>(l, i) * na;
@@ -257,24 +266,23 @@ struct InterCommon {
             const int cc = c < na ? c : 0;
             P[c] = ivlanes<ivd, IW>([&](int l) { return J.blk[ro[l] + cc]; });
         }
+        }
     }
-    ivd s(const ivd* P, int j) const {
-        return levels < 0 ? srow[j] : inter_sub(P, bits.data(), j, levels);
-    }
-    // s() over values copied out of the object, for the column loops.  `cm` escapes (row()
-    // takes `this`), so through s() clang reloaded `levels` and the srow vector's data
-    // pointer from memory at EVERY column — a store to the table through a vector type
-    // may alias them as far as it can tell — and kept the loads on the critical path
-    // (protein inter-pair fill, sse4).  A local copy whose address is never taken stays in
-    // registers under either compiler.  Taken once per job: srow and bits are sized in
-    // the constructor and never reallocated during the fill.
+    // The lookup, over values copied out of the object, for the column loops.  `cm`
+    // escapes (row() takes `this`), so through a member function clang reloaded the srow
+    // vector's data pointer from memory at EVERY column — a store to the table through a
+    // vector type may alias it as far as it can tell — and kept the loads on the critical
+    // path (protein inter-pair fill, sse4).  A local copy whose address is never taken
+    // stays in registers under either compiler.  Taken once per job: srow and bits are
+    // sized in the constructor and never reallocated during the fill.
     struct Sub {
-        const ivd* srow; const ivl* bits; int levels;
-        ivd operator()(const ivd* P, int j) const {
-            return levels < 0 ? srow[j] : inter_sub(P, bits, j, levels);
+        const ivd* srow; const ivl* bits;
+        [[gnu::always_inline]] ivd operator()(const ivd* P, int j) const {
+            if constexpr (Lv < 0) return srow[j];
+            else return inter_sub<Lv>(P, bits, j);
         }
     };
-    Sub sub() const { return Sub{srow.data(), bits.data(), levels}; }
+    Sub sub() const { return Sub{srow.data(), bits.data()}; }
     // Banded (InterJobT::blo != nullptr): row i's columns [j0, j1] to compute (the union
     // of the lanes' initialised spans) and the per-lane band [lo, hi] as T vectors.
     void band(int i, int& j0, int& j1, ivd& lo, ivd& hi) const {
@@ -316,9 +324,9 @@ struct InterCommon {
 // the operands of its own fill; the cells outside its span are never read by its own
 // traceback or gradient.
 // Tr: tracked lanes (J.tr) — each lane's borders, penalties and rows from its own arrays.
-template <class T, bool Banded, bool Ragged, bool Tr = false, bool Local = false>
+template <class T, int Lv, bool Banded, bool Ragged, bool Tr = false, bool Local = false>
 static void inter_fill_linear(InterJobT<T>& J) noexcept {
-    using C = InterCommon<T>;
+    using C = InterCommon<T, Lv>;
     using ivd = typename C::ivd; using ivl = typename C::ivl;
     const C cm(J);
     const auto sub = cm.sub();
@@ -394,9 +402,9 @@ static void inter_fill_linear(InterJobT<T>& J) noexcept {
 // Affine.  T = double or float32: the operations are the same in either precision, each
 // in T — at float32 exactly the scalar viterbi_affine<float>, whose penalties are cast to
 // T once and whose borders are -(go + T(i)*ge) in T.  Banded: as for linear above.
-template <class T, bool Banded, bool Ragged, bool Tr = false, bool Local = false>
+template <class T, int Lv, bool Banded, bool Ragged, bool Tr = false, bool Local = false>
 static void inter_fill_affine(InterJobT<T>& J) noexcept {
-    using C = InterCommon<T>;
+    using C = InterCommon<T, Lv>;
     using ivd = typename C::ivd; using ivl = typename C::ivl;
     const C cm(J);
     const auto sub = cm.sub();
@@ -498,20 +506,31 @@ static void inter_fill_affine(InterJobT<T>& J) noexcept {
 // Local is a template parameter, not a runtime flag in the column loop: clang (sse4,
 // protein, 2026-10-27) tested it twice per column in the affine fill and kept the
 // Local best-tracking out of line, where gcc unswitched it (clang 0.83x gcc).
-template <class T, bool Tr, bool Local>
+template <class T, int Lv, bool Tr, bool Local>
 static void inter_fill_tl(InterJobT<T>& J) noexcept {
     const bool lin = J.linear, rag = Local && J.nb != nullptr;
-    if (J.blo) { if (lin) inter_fill_linear<T, true, false, Tr, Local>(J); else inter_fill_affine<T, true, false, Tr, Local>(J); }
+    if (J.blo) { if (lin) inter_fill_linear<T, Lv, true, false, Tr, Local>(J); else inter_fill_affine<T, Lv, true, false, Tr, Local>(J); }
     else if constexpr (Local) {
-        if (rag) { if (lin) inter_fill_linear<T, false, true, Tr, Local>(J); else inter_fill_affine<T, false, true, Tr, Local>(J); }
-        else     { if (lin) inter_fill_linear<T, false, false, Tr, Local>(J); else inter_fill_affine<T, false, false, Tr, Local>(J); }
+        if (rag) { if (lin) inter_fill_linear<T, Lv, false, true, Tr, Local>(J); else inter_fill_affine<T, Lv, false, true, Tr, Local>(J); }
+        else     { if (lin) inter_fill_linear<T, Lv, false, false, Tr, Local>(J); else inter_fill_affine<T, Lv, false, false, Tr, Local>(J); }
     }
-    else       { if (lin) inter_fill_linear<T, false, false, Tr, Local>(J); else inter_fill_affine<T, false, false, Tr, Local>(J); }
+    else       { if (lin) inter_fill_linear<T, Lv, false, false, Tr, Local>(J); else inter_fill_affine<T, Lv, false, false, Tr, Local>(J); }
+}
+// The lookup form for a job (see kLvGather), as a compile-time constant for f.
+template <class T, bool Tr, class F>
+static void inter_lv_dispatch(const InterJobT<T>& J, F&& f) {
+    const int na = J.nalpha;
+    if (na > 8)      f(std::integral_constant<int, kLvGather>{});
+    else if (na > 4) f(std::integral_constant<int, 3>{});
+    else             f(std::integral_constant<int, 2>{});
 }
 template <class T, bool Tr>
 static void inter_fill_tr(InterJobT<T>& J) noexcept {
-    if (J.align_mode == 1) inter_fill_tl<T, Tr, true>(J);
-    else                   inter_fill_tl<T, Tr, false>(J);
+    inter_lv_dispatch<T, Tr>(J, [&](auto lv) {
+        constexpr int Lv = decltype(lv)::value;
+        if (J.align_mode == 1) inter_fill_tl<T, Lv, Tr, true>(J);
+        else                   inter_fill_tl<T, Lv, Tr, false>(J);
+    });
 }
 template <class T>
 static void inter_fill_t(InterJobT<T>& J) noexcept {
@@ -533,9 +552,9 @@ static void inter_fill_entry(InterJobT<T>& J) noexcept { inter_fill_t<T>(J); }
 // best cell of that row (columns 0..n_l, every state), and Local
 // the maximum over the lane's own cells (rows <= m_l, columns <= n_l), which is the
 // fill's best value (max is exact in any order; the strict-first rule only places it).
-template <class T, bool Ragged, bool Tr = false>
+template <class T, int Lv, bool Ragged, bool Tr = false>
 static void inter_score_affine(InterJobT<T>& J) noexcept {
-    using C = InterCommon<T>;
+    using C = InterCommon<T, Lv>;
     using ivd = typename C::ivd; using ivl = typename C::ivl;
     constexpr int W = C::IW;
     const C cm(J);
@@ -610,9 +629,9 @@ static void inter_score_affine(InterJobT<T>& J) noexcept {
     if (local) for (int l = 0; l < W; ++l) J.best[l] = vbest[l];
 }
 
-template <class T, bool Ragged, bool Tr = false>
+template <class T, int Lv, bool Ragged, bool Tr = false>
 static void inter_score_linear(InterJobT<T>& J) noexcept {
-    using C = InterCommon<T>;
+    using C = InterCommon<T, Lv>;
     using ivd = typename C::ivd; using ivl = typename C::ivl;
     constexpr int W = C::IW;
     const C cm(J);
@@ -688,9 +707,9 @@ static void inter_score_linear(InterJobT<T>& J) noexcept {
 // row keeps D and X; M is never stored, Y lives in a register.  With the extends >= 0
 // too, no gap cell exceeds the cell it extends from, so the Local maximum is the
 // maximum over M alone (MOnly).
-template <class T, bool Ragged, bool MOnly, bool Tr = false>
+template <class T, int Lv, bool Ragged, bool MOnly, bool Tr = false>
 static void inter_score_affine_pos(InterJobT<T>& J) noexcept {
-    using C = InterCommon<T>;
+    using C = InterCommon<T, Lv>;
     using ivd = typename C::ivd; using ivl = typename C::ivl;
     constexpr int W = C::IW;
     const C cm(J);
@@ -758,11 +777,11 @@ static void inter_score_affine_pos(InterJobT<T>& J) noexcept {
     if (local) for (int l = 0; l < W; ++l) J.best[l] = vbest[l];
 }
 
-template <class T, bool Tr>
+template <class T, int Lv, bool Tr>
 static void inter_score_tr(InterJobT<T>& J) noexcept {
     const bool rag = J.nb != nullptr;
     if (J.linear) {
-        if (rag) inter_score_linear<T, true, Tr>(J); else inter_score_linear<T, false, Tr>(J);
+        if (rag) inter_score_linear<T, Lv, true, Tr>(J); else inter_score_linear<T, Lv, false, Tr>(J);
         return;
     }
     // NaN penalties compare false and take the general form.  Tracked: on every lane's
@@ -783,17 +802,21 @@ static void inter_score_tr(InterJobT<T>& J) noexcept {
         pos_ext = J.ge_a >= T(0) && J.ge_b >= T(0);
     }
     if (pos_open && pos_ext) {
-        if (rag) inter_score_affine_pos<T, true, true, Tr>(J);  else inter_score_affine_pos<T, false, true, Tr>(J);
+        if (rag) inter_score_affine_pos<T, Lv, true, true, Tr>(J);  else inter_score_affine_pos<T, Lv, false, true, Tr>(J);
     } else if (pos_open) {
-        if (rag) inter_score_affine_pos<T, true, false, Tr>(J); else inter_score_affine_pos<T, false, false, Tr>(J);
+        if (rag) inter_score_affine_pos<T, Lv, true, false, Tr>(J); else inter_score_affine_pos<T, Lv, false, false, Tr>(J);
     } else {
-        if (rag) inter_score_affine<T, true, Tr>(J); else inter_score_affine<T, false, Tr>(J);
+        if (rag) inter_score_affine<T, Lv, true, Tr>(J); else inter_score_affine<T, Lv, false, Tr>(J);
     }
+}
+template <class T, bool Tr>
+static void inter_score_lv(InterJobT<T>& J) noexcept {
+    inter_lv_dispatch<T, Tr>(J, [&](auto lv) { inter_score_tr<T, decltype(lv)::value, Tr>(J); });
 }
 template <class T>
 static void inter_score_t(InterJobT<T>& J) noexcept {
-    if (J.tr) inter_score_tr<T, true>(J);
-    else      inter_score_tr<T, false>(J);
+    if (J.tr) inter_score_lv<T, true>(J);
+    else      inter_score_lv<T, false>(J);
 }
 template <class T>
 static void inter_score_entry(InterJobT<T>& J) noexcept { inter_score_t<T>(J); }
