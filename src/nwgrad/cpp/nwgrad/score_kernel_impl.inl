@@ -339,13 +339,17 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
 
     const int seg = (n + W - 1) / W;
     const std::size_t sw = (std::size_t)seg * W;
-    // five rolling rows and Local's padding mask: one block (spread_rows, dp_buffer.hpp)
-    std::size_t rs; T* const rows = spread_rows<T>(buf.srows, sw, 6, rs);
+    // the rolling rows and Local's padding mask: one block (spread_rows, dp_buffer.hpp).
+    // An integer T (from 4 lanes) keeps no Y row: four rolling rows (D, X twice) and the
+    // mask, where the lazy-F form keeps five (see the carry below).
+    constexpr bool kIntCarry = nw_is_int<T> && (int)stdx::native_simd<T>::size() >= 4;
+    constexpr int kRolling = kIntCarry ? 4 : 5;
+    std::size_t rs; T* const rows = spread_rows<T>(buf.srows, sw, kRolling + 1, rs);
     const T* pad = nullptr;
     // (MOnly's M padding is clamped to exactly 0 for floating T — the padding profile is
     // -inf — but an integer T pads the profile with 0 (nw_pad), so its padding M is a
     // real value and needs the mask too.)
-    if constexpr ((Local && (!MOnly || nw_is_int<T>)) || Glocal) pad = striped_pad_into<T, Sat>(rows + 5 * rs, n, seg, W);
+    if constexpr ((Local && (!MOnly || nw_is_int<T>)) || Glocal) pad = striped_pad_into<T, Sat>(rows + kRolling * rs, n, seg, W);
     auto padded = [&](const vd& v, int s) {
         vd p; p.copy_from(pad + (std::size_t)s * W, stdx::element_aligned);
         return vadd<Sat>(v, p);
@@ -353,8 +357,9 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
 
     striped_profile_build<T, Tr>(buf.sprof, job.blk, nalpha, b, n, seg, W, tr);
 
-    T* pD = rows + 3 * rs; T* pX = rows + 4 * rs;                          // row i-1
-    T* cD = rows;          T* cX = rows + rs;     T* cY = rows + 2 * rs;   // row i
+    T* pD = rows + (kRolling - 2) * rs; T* pX = rows + (kRolling - 1) * rs;   // row i-1
+    T* cD = rows;          T* cX = rows + rs;                              // row i
+    [[maybe_unused]] T* cY = kIntCarry ? nullptr : rows + 2 * rs;          // row i (lazy-F form)
 
     // row 0: D = max(M, X, Y) of the three-state row 0, X = -inf; padding -inf
     for (std::size_t k = 0; k < sw; ++k) { pD[k] = NINF; pX[k] = NINF; }
@@ -428,7 +433,6 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
             };
             auto carry = [&](const vd& mx, const vd& vmv, int s) __attribute__((always_inline)) {
                 fP = stdx::max(fP, vadd<Sat>(fOprev, fR));
-                nv_store(cY + (std::size_t)s * W, fP);
                 fOprev = open_pen<Sat>(mx, vgo_a, vge_a, vgoe_a);
                 fR += vge_a;
                 if constexpr (Local) {
@@ -486,10 +490,11 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
             if constexpr (nw_is_int<T> && W >= 4) {
                 // D without Y for now (the carry raises it below).  Q(s) = open(s-1) +
                 // ramp(s) into the running prefix max (s >= 1; segment 0's Q needs the
-                // LAST segment's open, shifted a lane, and is folded in after the row)
+                // LAST segment's open, shifted a lane, and is folded in after the row).
+                // Only the row's total is needed here (the lanes' carry-in): the second
+                // pass forms the prefix again from the stored D.
                 mx.copy_to(cD + (std::size_t)s * W, stdx::element_aligned);
                 fP = stdx::max(fP, vadd<Sat>(fOprev, fR));
-                nv_store(cY + (std::size_t)s * W, fP);
                 fOprev = open_pen<Sat>(mx, vgo_a, vge_a, vgoe_a);
                 fR += vge_a;
                 if constexpr (Local) {
@@ -529,10 +534,21 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
                 vcin.copy_from(cin, stdx::element_aligned);
             }
             vcin = stdx::max(vcin, Q0);
-            vd rq = fBase;
+            // The second pass forms the prefix again, seeded with the carry-in: P(s) =
+            // max(P(s-1), open(s-1) + ramp(s)), P(-1) = vcin, open(s-1) from the D row as
+            // pass 1 stored it (max(M, X), read before this pass overwrites it with
+            // max(D, Y)).  The same operands in the same order as pass 1's fP, and max is
+            // exact and associative, so P(s) == max(fP(s), vcin) bit for bit: Y and D are
+            // the stored-prefix form's.  One store (pass 1) and one load (here) fewer a
+            // vector cell, for an add and a subtraction here, and no Y row: four rolling
+            // rows instead of five (with the profile and Local's mask, 5-6 rows of
+            // working set instead of 6-7).
+            vd P = vcin, Op = vsub<Sat>(vninf, fBase), rq = fBase;   // Op: pass 1's seed
             for (int s = 0; s < seg; ++s) {
-                const vd y = vsub<Sat>(stdx::max(nv_load<vd>(cY + (std::size_t)s * W), vcin), rq);
                 vd d; d.copy_from(cD + (std::size_t)s * W, stdx::element_aligned);
+                P = stdx::max(P, vadd<Sat>(Op, rq));
+                Op = open_pen<Sat>(d, vgo_a, vge_a, vgoe_a);
+                const vd y = vsub<Sat>(P, rq);
                 d = stdx::max(d, y);
                 d.copy_to(cD + (std::size_t)s * W, stdx::element_aligned);
                 if constexpr (Local && !MOnly) vbest = stdx::max(vbest, padded(y, s));
