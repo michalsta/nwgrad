@@ -407,6 +407,12 @@ template <class SF, bool Tr>
 NWGRAD_SP_FMA_FN static void soft_pair_linear_t(SoftPairJobT<SF>& J) noexcept {
     NWGRAD_SP_FMA_BODY
     constexpr bool kSpCountF = std::is_same_v<SF, float> && NWGRAD_SP_COUNT_F32;   // the float32 instantiation accounts for flushed products (sp_count_*)
+    // Double charges the flushed products' worst case too (it never needs the recount): its
+    // products flush below DBL_MIN only with posterior factors past ~2^900, but under
+    // soft_double_ftz a product that was subnormal is now zero, and the bound must say so.
+    // Its gap sums are plain products (not std::fma), so they count as products that can flush.
+    constexpr bool kSpProdLoss = kSpCountF || std::is_same_v<SF, double>;
+    constexpr int kMacCounts = kSpCountF ? NWGRAD_SP_MAC_COUNTS : 1;
     const int m = J.m, n = J.n;
     // Glocal (local == 2): row 0 a free start (no moves along it), column 0 Global's
     // chain, no free start inside, Z = row m's sum, the backward seeded along row m.
@@ -539,17 +545,17 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear_t(SoftPairJobT<SF>& J) noexcept {
                 NWGRAD_SP_MAC(sa, Fi[j - 1], b);
             }
         }
-        if constexpr (kSpCountF) {   // the flushed products: the worst case, or the count where it could matter
+        if constexpr (kSpProdLoss) {   // the flushed products: the worst case, or the count where it could matter
             const double gv0 = i >= 1 ? sp_post(S[i - 1] + Tn - ze, izr, bad) : 0.0;
-            const int kinds = (i >= 1 ? 1 : 0) + (i >= 1 ? 2 : 1) * NWGRAD_SP_MAC_COUNTS;
+            const int kinds = (i >= 1 ? 1 : 0) + (i >= 1 ? 2 : 1) * kMacCounts;
             lossp = sp_loss_products_max<SF>(hi0 - j1 + 1, kinds, mx, gh0, gv0);
             if (!(loss + lossu * kSpMin<SF> + lossp <= kSpCountBudget * SoftRange<SF>::tol)) {
                 SF lb = 0.0, lc = 0.0;
                 if (i >= 1) {
                     const SF* Fp = Fi - st;
                     sp_count_match<SF>(Fp, P + sp_row<Tr>(J, i) * w, cb, j1, hi0, lb, lc);
-                    if (NWGRAD_SP_MAC_COUNTS) { sp_count_prod<SF, -1>(Fi, cb, j1, hi0, lc); sp_count_prod<SF, 0>(Fp, cb, j1, hi0, lc); }
-                } else if (NWGRAD_SP_MAC_COUNTS) sp_count_prod<SF, -1>(Fi, cb, j1, hi0, lc);
+                    if (kMacCounts) { sp_count_prod<SF, -1>(Fi, cb, j1, hi0, lc); sp_count_prod<SF, 0>(Fp, cb, j1, hi0, lc); }
+                } else if (kMacCounts) sp_count_prod<SF, -1>(Fi, cb, j1, hi0, lc);
                 lossp = sp_loss_products<SF>(lb, lc, gh0, gv0);
             }
         }
@@ -569,7 +575,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear_t(SoftPairJobT<SF>& J) noexcept {
         // Sums were taken before any rescale: their factor uses Tn (gh0), the bound uses Ti.
         const double gh = sp_post(S[i] + Ti - ze, izr, bad);
         lossu += sp_loss(kSpTermsLinear, n, i > 0 ? S[i] - S[i - 1] : 0, kb, mf[i], mx, gh);
-        if constexpr (kSpCountF) loss += lossp;
+        if constexpr (kSpProdLoss) loss += lossp;
         if (i >= kmin) {
             g_ea += sa * ea * gh0;
             if constexpr (Tr) J.grow[4 * i + 1] = -(sa * ea * gh0);
@@ -674,6 +680,12 @@ template <class SF, bool Tr>
 NWGRAD_SP_FMA_FN static void soft_pair_affine_t(SoftPairJobT<SF>& J) noexcept {
     NWGRAD_SP_FMA_BODY
     constexpr bool kSpCountF = std::is_same_v<SF, float> && NWGRAD_SP_COUNT_F32;   // the float32 instantiation accounts for flushed products (sp_count_*)
+    // Double charges the flushed products' worst case too (it never needs the recount): its
+    // products flush below DBL_MIN only with posterior factors past ~2^900, but under
+    // soft_double_ftz a product that was subnormal is now zero, and the bound must say so.
+    // Its gap sums are plain products (not std::fma), so they count as products that can flush.
+    constexpr bool kSpProdLoss = kSpCountF || std::is_same_v<SF, double>;
+    constexpr int kMacCounts = kSpCountF ? NWGRAD_SP_MAC_COUNTS : 1;
     const int m = J.m, n = J.n;
     // Glocal (local == 2): row 0 a free start (no moves along it), column 0 Global's
     // chain, no free start inside, Z = row m's sum, the backward seeded along row m.
@@ -862,20 +874,20 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine_t(SoftPairJobT<SF>& J) noexcept {
             for (int j = j1; j <= hi0; ++j) mx = NWGRAD_SP_VMAX(mx, bM[j] + bX[j] + bY[j]);
 #endif
         }
-        if constexpr (kSpCountF) {   // the flushed products: the worst case, or the count where it could matter
+        if constexpr (kSpProdLoss) {   // the flushed products: the worst case, or the count where it could matter
             const double gv0 = i >= 1 ? sp_post(S[i - 1] + Tn - ze, izr, bad) : 0.0;
-            const int kinds = (i >= 1 ? 1 : 0) + (i >= 1 ? 4 : 2) * NWGRAD_SP_MAC_COUNTS;
+            const int kinds = (i >= 1 ? 1 : 0) + (i >= 1 ? 4 : 2) * kMacCounts;
             lossp = sp_loss_products_max<SF>(hi0 - j1 + 1, kinds, mx, gh0, gv0);
             if (!(loss + lossu * kSpMin<SF> + lossp <= kSpCountBudget * SoftRange<SF>::tol)) {
                 SF lb = 0.0, lc = 0.0;
                 if (i >= 1) {
                     const SF* qM = fM - st; const SF* qX = fX - st; const SF* qY = fY - st;
                     sp_count_match3<SF>(qM, qX, qY, P + sp_row<Tr>(J, i) * w, bM, j1, hi0, lb, lc);
-                    if (NWGRAD_SP_MAC_COUNTS) {
+                    if (kMacCounts) {
                         sp_count_prod<SF, 0>(fX, bX, j1, hi0, lc); sp_count_prod<SF, 0>(fY, bY, j1, hi0, lc);
                         sp_count_prod2<SF, -1>(fM, fX, bY, j1, hi0, lc); sp_count_prod2<SF, 0>(qM, qY, bX, j1, hi0, lc);
                     }
-                } else if (NWGRAD_SP_MAC_COUNTS) { sp_count_prod<SF, 0>(fY, bY, j1, hi0, lc); sp_count_prod2<SF, -1>(fM, fX, bY, j1, hi0, lc); }
+                } else if (kMacCounts) { sp_count_prod<SF, 0>(fY, bY, j1, hi0, lc); sp_count_prod2<SF, -1>(fM, fX, bY, j1, hi0, lc); }
                 lossp = sp_loss_products<SF>(lb, lc, gh0, gv0);
             }
         }
@@ -894,7 +906,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine_t(SoftPairJobT<SF>& J) noexcept {
         const int Ti = Tn + kb;
         const double gh = sp_post(S[i] + Ti - ze, izr, bad);
         lossu += sp_loss(kSpTermsAffine, n, i > 0 ? S[i] - S[i - 1] : 0, kb, mf[i], mx, gh);
-        if constexpr (kSpCountF) loss += lossp;
+        if constexpr (kSpProdLoss) loss += lossp;
         g_eb += sx * gh0;
         g_ea += sy * gh0;
         if (i >= kmin) g_oa += so * oa * gh0;
