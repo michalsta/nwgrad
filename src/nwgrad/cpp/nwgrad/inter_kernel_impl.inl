@@ -239,6 +239,17 @@ struct InterCommon {
     const sbv* btl = nullptr;   // kLvLut: per column, each lane's B code (ragged: pad 0)
     const sbv* atl = nullptr;   // kLvLut: per row, 4 * each lane's A code (0 past its A)
     isb16 tbl{};                // kLvLut: t[4a + b]
+    // The per-row work, which scaled with W lane by lane (at W = 32, int16 AVX-512, the
+    // tree's profile was 128 scalar loads and inserts a row): untracked tree rows build
+    // P from the transposed A codes (atr), by byte shuffle where the scores are int8
+    // (colt[c][a] = score(a, c); pshuf), `live` is one vector compare against the lanes'
+    // m (mv; vlive: the row index fits the lane type), and Global's capture visits only
+    // the lanes whose A ends at the row, in order of m (ord).
+    const sbv* atr = nullptr;
+    isb16 colt[8] = {};
+    bool pshuf = false, vlive = false;
+    ivl mv{};
+    int ord[IW];
     explicit InterCommon(const InterJobT<T>& job) : J(job), bits(bits_buf()), srow(srow_buf()) {
         const int n = J.n;
         if (levels < 0 && srow.size() < static_cast<size_t>(n + 1)) srow.resize(n + 1);
@@ -263,6 +274,35 @@ struct InterCommon {
             for (int a = 0; a < na; ++a)
                 for (int b = 0; b < na; ++b) tbl[4 * a + b] = static_cast<signed char>(J.blk[a * na + b]);
             btl = bb.data(); atl = ab.data();
+        }
+        if constexpr (kTree) if (!J.tr) {
+            const int na = J.nalpha, M = J.M;
+            std::vector<sbv>& ab = sbv_buf<1>();
+            if (ab.size() < static_cast<size_t>(M + 1)) ab.resize(M + 1);
+            for (int i = 1; i <= M; ++i) {
+                sbv v{};
+                for (int l = 0; l < IW; ++l) v[l] = static_cast<signed char>((i <= J.m[l]) ? J.a[l][i - 1] : 0);
+                ab[i] = v;
+            }
+            atr = ab.data();
+            if constexpr (kByteShuffle) {
+                pshuf = true;
+                for (int k = 0; k < na * na; ++k) pshuf &= fits_i8(J.blk[k]);
+                if (pshuf)
+                    for (int c = 0; c < (1 << Lv); ++c)
+                        for (int a = 0; a < na; ++a)
+                            colt[c][a] = static_cast<signed char>(J.blk[a * na + (c < na ? c : 0)]);
+            }
+        }
+        {
+            using E = std::remove_cvref_t<decltype(ivl{}[0])>;
+            vlive = J.M <= static_cast<int>(std::numeric_limits<E>::max());
+            for (int l = 0; l < IW; ++l) {
+                mv[l] = static_cast<E>(std::min<long long>(J.m[l], std::numeric_limits<E>::max()));
+                int k = l;   // insertion sort of the lanes by m, stable
+                while (k > 0 && J.m[ord[k - 1]] > J.m[l]) { ord[k] = ord[k - 1]; --k; }
+                ord[k] = l;
+            }
         }
         if (levels > 0 && bits.size() < static_cast<size_t>(Lv * (n + 1))) bits.resize(Lv * (n + 1));
         // The masks from the lanes' residues: the W residues of column j gathered as bytes
@@ -353,7 +393,8 @@ struct InterCommon {
     template <bool Tr = false>
     void row(int i, Prof& P, ivl& live) const {
         const int na = J.nalpha;
-        for (int l = 0; l < IW; ++l) live[l] = (i <= J.m[l]) ? -1 : 0;
+        if (vlive) live = ivsplat<ivl>(i) <= mv;
+        else for (int l = 0; l < IW; ++l) live[l] = (i <= J.m[l]) ? -1 : 0;
         if constexpr (Lv == kLvLut) {
             P.ar = atl[i];
         } else if constexpr (Lv < 0) {
@@ -384,11 +425,16 @@ struct InterCommon {
             }
             return;
         }
-        // Each lane's row once, then the 1 << levels vectors inter_sub reads, built in
-        // registers.
-        size_t ro[IW];
-        for (int l = 0; l < IW; ++l) ro[l] = static_cast<size_t>((i <= J.m[l]) ? J.a[l][i - 1] : 0) * na;
+        // The 1 << levels vectors inter_sub reads: by shuffle from the transposed row, or
+        // each lane's row once, then the vectors built in registers.
         const int np = 1 << levels;
+        if (pshuf) {
+            const sbv ai = atr[i];
+            for (int c = 0; c < np; ++c) P.p[c] = ibwiden<ivd, IW>(ibshuf(colt[c], ai));
+            return;
+        }
+        size_t ro[IW];
+        for (int l = 0; l < IW; ++l) ro[l] = static_cast<size_t>(static_cast<unsigned char>(atr[i][l])) * na;
         for (int c = 0; c < np; ++c) {
             const int cc = c < na ? c : 0;
             P.p[c] = ivlanes<ivd, IW>([&](int l) { return J.blk[ro[l] + cc]; });
@@ -709,9 +755,10 @@ static void inter_score_affine(InterJobT<T>& J) noexcept {
         if constexpr (Tr) VY[j] = (local || glocal || j == 0) ? ninf : cm.border_y0(j, false);
         else VY[j] = (local || glocal || j == 0) ? ninf : ivsplat<ivd>(-(J.go_a + static_cast<T>(j) * J.ge_a));
     }
+    int ci = 0;                        // the next lane to capture, in order of m
     auto capture = [&](int i) {        // Global / Glocal: lanes whose A ends at row i
-        for (int l = 0; l < W; ++l)
-            if (J.m[l] == i) {
+        for (; ci < W && J.m[cm.ord[ci]] == i; ++ci) {
+                const int l = cm.ord[ci];
                 const int nl = Ragged ? J.nb[l] : n;
                 if (glocal) {          // the best cell of the lane's last row (max is exact)
                     T b = std::max({VM[0][l], VX[0][l], VY[0][l]});
@@ -781,9 +828,10 @@ static void inter_score_linear(InterJobT<T>& J) noexcept {
         if constexpr (Tr) H[j] = (local || glocal || j == 0) ? z : cm.border_y0(j, true);
         else H[j] = (local || glocal || j == 0) ? z : ivsplat<ivd>(-static_cast<T>(j) * J.ge_a);
     }
+    int ci = 0;                        // the next lane to capture, in order of m
     auto capture = [&](int i) {
-        for (int l = 0; l < W; ++l)
-            if (J.m[l] == i) {
+        for (; ci < W && J.m[cm.ord[ci]] == i; ++ci) {
+                const int l = cm.ord[ci];
                 const int nl = Ragged ? J.nb[l] : n;
                 if (glocal) {          // Glocal: the best cell of the lane's last row
                     T b = H[0][l];
@@ -862,9 +910,10 @@ static void inter_score_affine_pos(InterJobT<T>& J) noexcept {
         else D[j] = (local || glocal) ? z : (j == 0 ? z : ivsplat<ivd>(-(J.go_a + static_cast<T>(j) * J.ge_a)));
         X[j] = ninf;
     }
+    int ci = 0;                        // the next lane to capture, in order of m
     auto capture = [&](int i) {
-        for (int l = 0; l < W; ++l)
-            if (J.m[l] == i) {
+        for (; ci < W && J.m[cm.ord[ci]] == i; ++ci) {
+                const int l = cm.ord[ci];
                 const int nl = Ragged ? J.nb[l] : n;
                 if (glocal) {          // Glocal: the best cell of the lane's last row (D = every state)
                     T b = D[0][l];
