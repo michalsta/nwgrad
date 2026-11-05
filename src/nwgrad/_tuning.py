@@ -22,7 +22,12 @@ results within tolerance: ``soft_ckpt_min_bytes``, the forward tables' size in b
 which a pair checkpoints (``None``: never), and ``soft_ckpt_rows``, k forced at every size
 (an int >= 1; 0: the full tables at every size; ``None``: one block of every row, the
 checkpointed code without a recomputation; the environment variable
-``NWGRAD_SOFT_CKPT_ROWS`` gives it a value while the gate is not set).  A batch regroups its
+``NWGRAD_SOFT_CKPT_ROWS`` gives it a value while the gate is not set); and two prototype
+switches of the double soft pass's denormal handling, which move double soft results within
+tolerance: ``soft_window_log2`` (e: rows are rescaled when their max leaves [2^-e, 2^e];
+default 256) and ``soft_double_ftz`` (1: flush denormals to zero around the double soft
+kernels, as float32 always does), with ``NWGRAD_SOFT_WINDOW_LOG2`` / ``NWGRAD_SOFT_DOUBLE_FTZ``
+as their environment fallbacks.  A batch regroups its
 cached inter-pair plan on the next call after any change.  Not thread-safe to change
 while work is in flight.
 """

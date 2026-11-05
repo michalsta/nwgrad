@@ -450,6 +450,11 @@ using InterSoftJobF = InterSoftJobT<float>;
 using inter_soft_fn   = void (*)(InterSoftJob&);
 using inter_soft_fn_f = void (*)(InterSoftJobF&);
 
+// (SoftRange: the lazy rescale's default window and the lost-mass tolerance per soft type;
+// see sp_lazy / sp_loss.)
+template <class F> struct SoftRange;
+template <> struct SoftRange<double> { static constexpr double win = 0x1p256;  static constexpr double tol = 0x1p-45; };
+template <> struct SoftRange<float>  { static constexpr float  win = 0x1p8f;   static constexpr double tol = 0x1p-20; };
 // Per-pair scaled forward-backward (Aligner's SoftImpl::Scaled), double: one pair, Full
 // or GuideBanded, any alphabet.  Bodies in soft_kernel_impl.inl — compiled once per
 // level (LevelKernels::soft_pair_*) and once at baseline inside aligner.hpp.  The Aligner
@@ -503,6 +508,10 @@ struct SoftPairJobT {
     // differently counts into ck_bad.
     uint64_t* ckh = nullptr;
     int ck_bad = 0;
+    // The lazy rescale's window (sp_lazy): a row is rescaled when its max leaves
+    // [1/win, win].  SoftRange<F>::win by default; the soft_window_log2 gate overrides it.
+    F win = SoftRange<F>::win;
+    int nresc = 0;                  // backward rows rescaled (NWGRAD_SOFT_DEBUG)
 };
 using SoftPairJob  = SoftPairJobT<double>;
 using SoftPairJobF = SoftPairJobT<float>;
@@ -548,9 +557,6 @@ struct FlushDenormalsScope {
     FlushDenormalsScope(const FlushDenormalsScope&) = delete;
     FlushDenormalsScope& operator=(const FlushDenormalsScope&) = delete;
 };
-template <class F> struct SoftRange;
-template <> struct SoftRange<double> { static constexpr double win = 0x1p256;  static constexpr double tol = 0x1p-45; };
-template <> struct SoftRange<float>  { static constexpr float  win = 0x1p8f;   static constexpr double tol = 0x1p-20; };
 // The gradient pass's flushed products (soft_kernel_impl.inl, "The gradient pass
 // multiplies table values"): lb is the sum of the other factor over the F̂·P
 // intermediates that flushed, lc the number of two-factor products that did, in the
@@ -591,14 +597,15 @@ enum class Gate : int {
     InterGroupBytes, InterSoftBytes, InterScoreGatherCells,
     InterLinearIntGatherCells, InterLinearF32GatherCells, InterLinearF64GatherCells,
     InterGlobalLinearIntCells, InterGlobalLinearF32Cells, LinearStripedMinN, SoftF32MinCells,
-    InterMinFill, SoftCkptRows, SoftCkptMinBytes, Count_
+    InterMinFill, SoftCkptRows, SoftCkptMinBytes, SoftWindowLog2, SoftDoubleFtz, Count_
 };
 inline constexpr const char* kGateNames[] = {
     "inter_group_bytes", "inter_soft_bytes", "inter_score_gather_cells",
     "inter_linear_int_gather_cells", "inter_linear_f32_gather_cells",
     "inter_linear_f64_gather_cells", "inter_global_linear_int_cells",
     "inter_global_linear_f32_cells", "linear_striped_min_n", "soft_f32_min_cells",
-    "inter_min_fill", "soft_ckpt_rows", "soft_ckpt_min_bytes"};
+    "inter_min_fill", "soft_ckpt_rows", "soft_ckpt_min_bytes", "soft_window_log2",
+    "soft_double_ftz"};
 static_assert(sizeof(kGateNames) / sizeof(kGateNames[0]) == static_cast<size_t>(Gate::Count_));
 inline constexpr int64_t kGateUnset = -1;
 inline constexpr int64_t kGateOff = INT64_MAX;
@@ -634,6 +641,31 @@ inline int64_t soft_ckpt_env_rows() noexcept {
         return (end && *end == 0 && k >= 0) ? int64_t(k) : int64_t(-1);
     }();
     return v;
+}
+// A non-negative integer from the environment, read once by the caller's static; -1 unset.
+inline int64_t env_nonneg_int(const char* name) noexcept {
+    const char* e = std::getenv(name);
+    if (!e || !*e) return -1;
+    char* end = nullptr;
+    const long long k = std::strtoll(e, &end, 10);
+    return (end && *end == 0 && k >= 0) ? int64_t(k) : int64_t(-1);
+}
+// The double soft pass's denormal handling (prototype switches, branch proto/soft-denormal):
+// soft_window_log2 / NWGRAD_SOFT_WINDOW_LOG2 = e sets the double lazy-rescale window to
+// [2^-e, 2^e] (default 256, SoftRange<double>::win; float32 keeps its 2^8); soft_double_ftz /
+// NWGRAD_SOFT_DOUBLE_FTZ = 1 runs the double soft kernels under FlushDenormalsScope, as
+// float32 always does.  The gate wins over the environment; -1: neither set.
+inline int64_t soft_window_log2_override() noexcept {
+    const int64_t o = gate_override(Gate::SoftWindowLog2);
+    if (o >= 0) return o;
+    static const int64_t v = env_nonneg_int("NWGRAD_SOFT_WINDOW_LOG2");
+    return v;
+}
+inline bool soft_double_ftz() noexcept {
+    const int64_t o = gate_override(Gate::SoftDoubleFtz);
+    if (o >= 0) return o != 0;
+    static const int64_t v = env_nonneg_int("NWGRAD_SOFT_DOUBLE_FTZ");
+    return v > 0;
 }
 inline bool soft_ckpt_env_check() noexcept {
     static const bool v = [] { const char* e = std::getenv("NWGRAD_SOFT_CKPT_CHECK"); return e && *e && std::strcmp(e, "0") != 0; }();

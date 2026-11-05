@@ -830,6 +830,7 @@ private:
             sj.logz = logz; sj.counts = counts; sj.gaps = gaps; sj.ok = ok; sj.gpost = gpost;
             sj.rs = rs; sj.rw = rw;
             if constexpr (std::is_same_v<SFx, float>) { FlushDenormalsScope ftz; K.template inter_soft_of<SFx>()(sj); }
+            else if (soft_double_ftz()) { FlushDenormalsScope ftz; K.template inter_soft_of<SFx>()(sj); }
             else K.template inter_soft_of<SFx>()(sj);
         }
     };
