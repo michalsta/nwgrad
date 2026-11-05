@@ -24,7 +24,7 @@
 #  error "grid_kernel_impl.inl must be included inside a level namespace by a level TU"
 #endif
 
-template <class T>
+template <class T, bool Local>
 static void grid_fwd_impl(GridFwdJob<T>& J) {
     using vd = stdx::native_simd<T>;
     const int W = (int)vd::size();
@@ -110,7 +110,8 @@ static void grid_fwd_impl(GridFwdJob<T>& J) {
         vd dD = lane_shift_in(Dp(seg - 1), bD);
         auto cell = [&](int s, vd& mx) NWGRAD_ALWAYS_INLINE_LAMBDA {
             const vd uD = Dp(s);
-            const vd vmv = dD + ld(sub + (std::size_t)s * W);
+            vd vmv = dD + ld(sub + (std::size_t)s * W);
+            if constexpr (Local) vmv = stdx::max(vmv, vd(T(0)));   // viterbi_affine_ptr's clamp
             const vd vxv = stdx::max((uD - vgo_b) - vge_b, ld(pX + (std::size_t)s * W) - vge_b);
             mx = stdx::max(vmv, vxv);
             stv(vxv, cX + (std::size_t)s * W);
@@ -161,7 +162,9 @@ static void grid_fwd_impl(GridFwdJob<T>& J) {
         // ── the saved lines ──
         auto Mat = [&](int s3) NWGRAD_ALWAYS_INLINE_LAMBDA {   // M of segment s3, as the row pass formed it
             const vd d = s3 == 0 ? lane_shift_in(Dp(seg - 1), bD) : Dp(s3 - 1);
-            return d + ld(sub + (std::size_t)s3 * W);
+            const vd mv = d + ld(sub + (std::size_t)s3 * W);
+            if constexpr (Local) return stdx::max(mv, vd(T(0)));
+            else return mv;
         };
         for (int t = 0; t < q; ++t) {
             const int s3 = st[(std::size_t)t];
@@ -187,11 +190,25 @@ static void grid_fwd_impl(GridFwdJob<T>& J) {
         std::swap(pA, cA); std::swap(pX, cX); std::swap(pY, cY);
         bD = std::max({lM, lX, lY});
     }
+    if (J.last) {   // row r1 (pA after the last swap): D = max(A, Y) = max(M, X, Y)
+        J.last->resize((std::size_t)w + 1);
+        T* const lr = J.last->data();
+        for (int s3 = 0; s3 < seg; ++s3)
+            for (int l = 0; l < W; ++l) {
+                const int j = l * seg + s3 + 1;
+                if (j > w) continue;
+                const std::size_t k = (std::size_t)s3 * W + l;
+                lr[j] = std::max(pA[k], pY[k]);
+            }
+    }
     J.W = W; J.q = q;
 }
 
 template <class T>
-static void grid_fwd_entry(GridFwdJob<T>& J) { grid_fwd_impl<T>(J); }
+static void grid_fwd_entry(GridFwdJob<T>& J) {
+    if (J.local) grid_fwd_impl<T, true>(J);
+    else         grid_fwd_impl<T, false>(J);
+}
 
 // The registered pointer: floating T only (integer T runs as Pointers).
 template <class T>

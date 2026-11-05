@@ -1,7 +1,10 @@
 """nwgrad.logistic: a binary logistic link over per-pair scores (DiscrimAlign's likelihood)."""
 
+import sys
+
 import numpy as np
 import pytest
+import scipy
 from scipy.optimize import brentq
 from scipy.special import expit
 
@@ -23,9 +26,18 @@ def root(s, y, center=0.0, width=400.0):
 
 
 def test_probabilities_are_scipy_expit_bit_for_bit():
+    """Bit for bit.  The one known exception: scipy's Windows wheels before 1.18 (1.15.3,
+    1.17.1 measured) compute expit differently and are up to 2 ULP off; scipy 1.18.1 there
+    is bit-identical, as is 1 / (1 + numpy.exp(-x)) with either (docs/windows.md)."""
     s, _ = data(1)
+    old_windows_scipy = (sys.platform == "win32"
+                         and tuple(int(x) for x in scipy.__version__.split(".")[:2]) < (1, 18))
     for alpha in (0.0, -1.3, 7.5):
-        assert np.array_equal(L.probabilities(s, alpha), expit(alpha + s))
+        got, ref = L.probabilities(s, alpha), expit(alpha + s)
+        if old_windows_scipy:
+            np.testing.assert_array_max_ulp(got, ref, maxulp=2)
+        else:
+            assert np.array_equal(got, ref)
 
 
 @pytest.mark.parametrize("start", [0.0, 1e-3, -0.7, 5.0, -50.0, 500.0, -500.0])
@@ -103,6 +115,16 @@ def test_step_is_its_parts_composed(cls):
     got = st.grad.to_dict()
     assert np.array_equal(got["matrix"], expected["matrix"])
     assert all(got[f] == expected[f] for f in FIELDS)
+
+
+def test_step_repr():
+    """Step.__repr__ returns a std::string; its TU once lacked nanobind's string
+    caster, so repr(step) raised TypeError (seen when an assertion tried to print one)."""
+    a, b, y = many_pairs(64, seed=3)
+    batch = nwgrad.SeqPairBatchDouble(a, b, dna_params(), gap_model="affine", mode="local")
+    batch.score_and_grad()
+    st = L.step(batch, y, 0.0)
+    assert repr(st).startswith("Step(alpha=")
 
 
 def test_step_does_not_depend_on_threads():

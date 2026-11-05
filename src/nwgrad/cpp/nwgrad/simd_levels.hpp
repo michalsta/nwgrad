@@ -271,6 +271,8 @@ struct GridFwdJob {
     std::vector<int>* colid;
     DpBufferT<T>* buf;                      // scratch: grows, gprof, gbuilt
     int W, q;                               // out
+    typename DpBufferT<T>::GVec* last = nullptr;   // out if set: row r1's max(M, X, Y), columns c0+1..c1 at [1..w]
+    int local = 0;                          // Local: M clamped at 0 (the walk stops at a start)
 };
 
 // ── Hirschberg linear-space sweep ─────────────────────────────────────────────
@@ -816,13 +818,24 @@ inline size_t inter_linear_cap(size_t nalpha, int level) noexcept {
 // tables within the byte budget (single: n_threads == 1), and for a soft pair the soft
 // pass's tables (Ws lanes of double; the float32 pass has twice the lanes of half the
 // size, the same bytes) too.  Not for a score-only call, which keeps rows, not tables.
+// shared_core: more threads than physical cores (threads_share_cores), so two threads
+// split each core's caches and the hard budget's default is 9/16 of group_kb
+// (kInterSmtBudget16).  Measured 2026-11-05 (nighthaven AVX2, 6 vs 12 threads, hard
+// affine Global, protein L40-300): the shared/own crossover falls from ~L180 at 6 threads
+// to between L120 and L140 at 12 for float32, double and int32 alike; the default lost
+// 1.12-1.70x at L140-160.  9/16 puts float32 and double at L134, int32 at L122 (a half
+// would cost int32 its 0.89x win at L120).  Linear hard fills, under their cell caps, and
+// DNA up to 22 x 200 did not move.  The override is taken as given.
+inline constexpr size_t kInterSmtBudget16 = 9;
 template <class T>
 inline bool inter_pair_fits(size_t la, size_t lb, bool affine, bool soft, int W, int Ws,
-                            bool single, int level, bool small_alpha = false) noexcept {
+                            bool single, int level, bool small_alpha = false,
+                            bool shared_core = false) noexcept {
     const size_t cells = (la + 1) * (lb + 1);
     const GateLevelCaps& lc = gate_caps(level);
     const GateTypeCaps& tc = lc.template of<T>();
-    const size_t kb = single ? std::max(tc.group_kb_1, small_alpha ? lc.group_small_kb_1 : 0u) : tc.group_kb;
+    size_t kb = single ? std::max(tc.group_kb_1, small_alpha ? lc.group_small_kb_1 : 0u) : tc.group_kb;
+    if (shared_core && !single) kb = kb * kInterSmtBudget16 / 16;
     const size_t cap = gate_cap(Gate::InterGroupBytes, kb << 10);
     if (cells * static_cast<size_t>(W) * (affine ? 3 : 1) * sizeof(T) > cap) return false;
     if (!soft) return true;
