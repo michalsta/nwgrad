@@ -318,13 +318,21 @@ step, tracked / untracked, 1 and 12 threads): double linear 0.95-1.04; double af
 local 1.04-1.08, global 1.16-1.22; float linear 0.95-1.04; float affine local 1.07-1.12,
 global 1.21-1.27; soft (double) 1.18-1.34. Memory: 31 MB tracked vs 24 MB untracked
 (hard paths); soft records 168 MB.
-spot (M1, NEON, macOS, 2026-11-05 at `74657cb`; 100k Manakov pairs, 1 and 8 threads,
-trackedK / untracked): affine local 1.08-1.10 (double and float), glocal 1.14-1.16;
-linear local 1.12 double / 1.19-1.22 float, glocal 1.39-1.41 double / 1.24-1.25 float.
-Most of it is already in tracked1 (one set, all-zero track: linear glocal double 1.24),
-so it is the tracked code path, not K.  **NEON's linear tracked cost is above x86's**
-(0.95-1.04 there, local and global; glocal not measured on x86): open, TODO.md.  Peak RSS
-42 vs 37 MB.
+Those ratios are from when tracks landed.  Re-measured 2026-11-05 (100k Manakov pairs,
+trackedK / untracked, controls 0.98-1.01), at `2013bc8` / `74657cb`:
+
+| | nighthaven AVX2, 1 / 6 thr | spot NEON (macOS), 1 / 8 thr |
+|---|---|---|
+| double linear local / glocal | 1.22, 1.20 / 1.36, 1.33 | 1.12, 1.12 / 1.41, 1.39 |
+| float linear local / glocal | 1.31, 1.25 / 1.42, 1.36 | 1.19, 1.22 / 1.25, 1.24 |
+| double affine local / glocal | 1.12, 1.10 / 1.20, 1.15 | 1.08, 1.08 / 1.15, 1.14 |
+| float affine local / glocal | 1.17, 1.11 / 1.24, 1.18 | 1.10, 1.08 / 1.15, 1.16 |
+
+Linear's tracked cost has grown from 0.95-1.04 to 1.12-1.42, on both architectures alike:
+the untracked linear batch no longer walks each traceback twice (the fix this section
+anticipated), so tracked linear now pays its path replay in full.  Most of it is in
+tracked1 already (one set, all-zero track), so it is the tracked code path, not K.
+Memory: 32 vs 26 MB (nighthaven), peak RSS 42 vs 37 MB (spot).
 
 Where it goes (perf, 1 thread; `score_and_grad` = sg, `weighted_grad` = wg):
 - **Linear sg: tracked is faster than untracked — because the untracked batch walks
