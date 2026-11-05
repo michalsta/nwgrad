@@ -288,7 +288,11 @@ jobs:
           -Dnanobind_DIR="$(python -m nanobind --cmake_dir)"
 
       - name: Build
-        run: cmake --build build-san --target nwgrad_tests -j"$(nproc)"
+        # -j2, not nproc: the four level TUs compiled side by side under ASan+UBSan
+        # exhaust the 4-core runner's memory once the kernels grow (2026-11-05: the
+        # build was killed at ~11 min on three branches that add kernel instantiations;
+        # make reports "Terminated", the job "cancelled"), where -j2 fits.
+        run: cmake --build build-san --target nwgrad_tests -j2
 
       - name: Test
         run: ctest --test-dir build-san --output-on-failure
@@ -340,7 +344,7 @@ jobs:
           -Dnanobind_DIR="$(python -m nanobind --cmake_dir)"
 
       - name: Build
-        run: cmake --build build-tsan --target nwgrad_tests -j"$(nproc)"
+        run: cmake --build build-tsan --target nwgrad_tests -j2   # as the ASan build: memory
 
       - name: Test
         run: ctest --test-dir build-tsan --output-on-failure -j"$(nproc)"
