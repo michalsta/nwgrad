@@ -361,16 +361,12 @@ Tracks landed on branch `tracks` (2026-10-11; see AGENTS.md, "Tracks").  Deferre
   soft path, the batch and streaming surfaces and the Python functions are in and tested
   against an exhaustive oracle.  Since then: the leveled striped / score / pointer
   kernels, the inter-pair hard, score-only, banded and soft fills, the scaled soft
-  kernels, the row kernels and Hirschberg (2026-11-03).  Not yet: Grid (below).
+  kernels, the row kernels and Hirschberg (2026-11-03), Grid (2026-11-05).
   Then PosimiR's backend can switch from the emulation to `mode="glocal"`.
-- **Grid traceback for Local and Glocal** (now affine Global Full only; the others run AS
-  Pointers: same result, table memory).  Glocal: the forward kernel's row 0 M = 0 at
-  every column and no Y series (column 0 Global's chain, no clamp), the walk entered at
-  row m's first best column (row m is in hand after the forward pass) and stopped at
-  row 0.  Local: the forward kernel also needs the clamp at 0 and a running argmax for
-  the end cell, and the walk stops at a zero cell.  Tests against Pointers, bit for bit,
-  as `test_grid.cpp` / `test_grid.py` do for Global.  (Not for PosimiR: its miRNA rows
-  never exceed hb_cutoff, and it is tracked; for long glocal / local alignments.)
+- **Grid traceback: tracks and linear gaps** (Local, Glocal and integer T done 2026-11-05,
+  AGENTS.md "Grid traceback").  Left: tracked pairs (per-row penalties in the forward and
+  the base re-fill), linear gaps (one state per saved line), negative opens.  Not yet
+  measured beyond skynet sse4: AVX2 / AVX-512 / NEON compile only.
 - **Fleet runs not yet done: spot (neon) and `tools/bench_tracks.py`.**  Correctness was
   verified on sse2 (skynet, wloczykij), avx2 (nighthaven) and avx512 (solace WSL, 2026-11-04
   at `c9ed87e`: ctest 17/17, `NWGRAD_FORCE_KERNEL=simd` pytest 22744 passed, 72 skipped);
