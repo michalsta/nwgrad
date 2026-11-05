@@ -1,6 +1,55 @@
 cmake_minimum_required(VERSION 3.15)
 
 project(nwgrad LANGUAGES CXX)
+
+if (MSVC)
+    message(FATAL_ERROR
+        "nwgrad cannot be built with MSVC or clang-cl: the vectorized kernels use "
+        "<experimental/simd>, which only libstdc++ ships.  On Windows, build with "
+        "MinGW-w64 gcc (MSYS2 UCRT64: pacman -S mingw-w64-ucrt-x86_64-gcc), e.g. "
+        "CMAKE_GENERATOR=Ninja CC=gcc CXX=g++ pip install nwgrad --no-binary nwgrad, "
+        "or install the prebuilt win_amd64 wheel.")
+endif()
+
+# CPython 3.10 / 3.11's Windows pyconfig.h sets MS_WIN64 only under _MSC_VER (3.12 added
+# a __MINGW32__ branch); without it Py_ssize_t is a 32-bit int against a 64-bit
+# interpreter.  Defined empty so it is identical to pyconfig's own #define where both
+# exist.  Directory-wide, so nanobind's static library (built in this directory by
+# nanobind_add_module) gets it too.
+if (MINGW AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+    add_compile_definitions("MS_WIN64=")
+endif()
+# MinGW must target the UCRT, as CPython does (MSYS2's UCRT64 environment, not MINGW64,
+# winlibs-msvcrt or Strawberry Perl).  An MSVCRT MinGW is not just a second C runtime in
+# the process: its libmsvcrt.a links mingw-w64's own x87 exp / log / log1p, whose last
+# bit follows the calling thread's x87 precision-control word — and a thread the batch
+# engine starts does not share the interpreter thread's.  Seen (cross build, wine): batch
+# scores 1 ULP apart between thread counts, logistic probabilities off scipy's expit.
+# The UCRT build imports the SSE2 ones from ucrtbase.  NWGRAD_ALLOW_MSVCRT=ON overrides,
+# for experiments only.
+if (MINGW)
+    include(CheckCXXSourceCompiles)
+    check_cxx_source_compiles("#include <cstdlib>
+#ifndef _UCRT
+#error not a UCRT MinGW
+#endif
+int main() { return 0; }" NWGRAD_MINGW_UCRT)
+    option(NWGRAD_ALLOW_MSVCRT "Allow building with an MSVCRT (non-UCRT) MinGW" OFF)
+    if (NOT NWGRAD_MINGW_UCRT AND NOT NWGRAD_ALLOW_MSVCRT)
+        message(FATAL_ERROR
+            "nwgrad: this MinGW targets MSVCRT, not the UCRT that CPython uses; its x87 "
+            "exp/log make results depend on the thread that computes them.  Use MSYS2's "
+            "UCRT64 gcc (pacman -S mingw-w64-ucrt-x86_64-gcc).  "
+            "-DNWGRAD_ALLOW_MSVCRT=ON builds anyway.")
+    endif()
+endif()
+
+# PE/COFF caps an object at 32767 sections, and the template-heavy TUs (every kernel
+# instantiated per scalar type, each in its own COMDAT section) pass it: "too many
+# sections" / "file too big" from the assembler.  -mbig-obj lifts the cap.
+if (MINGW)
+    add_compile_options(-Wa,-mbig-obj)
+endif()
 find_package(Python 3.10
   REQUIRED COMPONENTS Interpreter Development.Module
   OPTIONAL_COMPONENTS Development.SABIModule)
@@ -44,13 +93,10 @@ set(NWGRAD_LEVEL_SOURCES "")
 # flags below touch it): its struct build/store runs at static init on every CPU, so
 # it must be baseline-legal code.  See the note in simd_levels.hpp.
 #
-# There is deliberately no MSVC special-case here.  The level TUs #include
-# <experimental/simd>, which MSVC's STL does not ship, so a source build under MSVC fails
-# at that include — an honest compile error, not a silently-degraded scalar wheel.  The
-# library does not support Windows: its reason to exist is the vectorized kernels, and a
-# scalar-only build there would be slower than tools already available.  The gate is on
-# the CPU only, never the compiler, so the day MSVC ships <experimental/simd> this begins
-# to work with no change (mingw/gcc, which use libstdc++, already do).
+# Windows is built with MinGW-w64 gcc (libstdc++), never MSVC: the level TUs #include
+# <experimental/simd>, which MSVC's STL does not ship.  Rather than fail at that include,
+# an MSVC (or clang-cl) configure stops here with the way out; see the MinGW block below
+# for what the gcc build on Windows needs.
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
     set(NWGRAD_LEVEL_SOURCES
         ${NWGRAD_LEVEL_DIR}/simd_levels.cpp
@@ -112,6 +158,20 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
         COMPILE_OPTIONS "-mavx2;-mfma;${NWGRAD_JCC_CLANG_OPTS}")
     set_source_files_properties(${NWGRAD_LEVEL_DIR}/level_avx512.cpp ${NWGRAD_LEVEL_DIR}/level_avx512_soft.cpp ${NWGRAD_LEVEL_DIR}/level_avx512_inter.cpp PROPERTIES
         COMPILE_OPTIONS "-mavx512f;-mavx512dq;-mavx512vl;-mavx512bw;${NWGRAD_JCC_CLANG_OPTS}")
+    # MinGW: the Win64 ABI only guarantees a 16-byte-aligned stack, and older gcc spilled
+    # 32- and 64-byte vectors there with ALIGNED moves (vmovapd / vmovdqa64; GCC PR 54412)
+    # — a fault the first time a kernel spills at the wrong offset.  gcc 13 and 16 already
+    # emit only unaligned forms in these TUs (checked: no vmovap*/vmovdqa* with a memory
+    # operand in either level object), so this is insurance for the older gcc a source
+    # build may use (README: GCC 11+): the assembler rewrites every aligned vector move
+    # into its unaligned twin (binutils >= 2.38), free on aligned data on any AVX core.
+    # Only the 32/64-byte TUs need it; the 16-byte SSE levels are aligned by the ABI.
+    if (MINGW)
+        foreach(wide_tu level_avx2.cpp level_avx2_soft.cpp level_avx512.cpp level_avx512_soft.cpp)
+            set_property(SOURCE ${NWGRAD_LEVEL_DIR}/${wide_tu} APPEND PROPERTY
+                COMPILE_OPTIONS "-Wa,-muse-unaligned-vector-move")
+        endforeach()
+    endif()
 elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
     # NEON is mandatory baseline on AArch64 — one level, no runtime dispatch.
     set(NWGRAD_LEVEL_SOURCES
@@ -151,6 +211,16 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64|i.86")
 endif()
 set_source_files_properties(src/nwgrad/cpp/nwgrad/py_exports.cpp PROPERTIES
     COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:Clang,AppleClang>:${NWGRAD_SCALAR_TU_CLANG_OPTS}>")
+
+# MinGW: link the gcc runtime (libstdc++, libgcc, winpthread) statically, so the .pyd
+# imports nothing but Windows system DLLs, the UCRT and python3XY.dll.  Shipped wheels
+# would otherwise need libstdc++-6.dll & co. on the user's PATH — and whichever copies
+# another MinGW-built extension put there first.  The wheel workflow checks the result.
+# The test and benchmark executables likewise, so they run without the runtime DLLs on PATH.
+if (MINGW)
+    target_link_options(nwgrad_ext PRIVATE -static)
+    string(APPEND CMAKE_EXE_LINKER_FLAGS " -static")
+endif()
 
 # Add -Wall -Wextra for Unix-style compilers (GCC/Clang)
 if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
