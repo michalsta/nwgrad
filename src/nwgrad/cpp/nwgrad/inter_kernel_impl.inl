@@ -167,8 +167,11 @@ template <class S, std::size_t... I>
 template <class V, int W, class S> [[gnu::always_inline]] static inline V ibwiden(S r) noexcept {
 #if defined(__SSE4_1__)
     // 2 int64 lanes: gcc moved the 2-byte vector through a general register first
-    if constexpr (W == 2 && sizeof(V) == 16 && std::is_integral_v<std::remove_cvref_t<decltype(V{}[0])>>)
+    using E = std::remove_cvref_t<decltype(V{}[0])>;
+    if constexpr (W == 2 && sizeof(V) == 16 && std::is_integral_v<E>)
         return (V)_mm_cvtepi8_epi64((__m128i)r);
+    else if constexpr (W == 2 && sizeof(V) == 16)   // 2 doubles: the same detour
+        return (V)_mm_cvtepi32_pd(_mm_cvtepi8_epi32((__m128i)r));
     else
 #endif
     return __builtin_convertvector(iblow_(r, std::make_index_sequence<static_cast<std::size_t>(W)>{}), V);
@@ -192,11 +195,12 @@ template <class T> static inline bool fits_i8(T v) noexcept {
 // five hottest instructions.  Alphabets of 1 or 2 letters take the 2-level tree: their
 // bit-1 masks are all 0 and P[2], P[3] repeat P[0], so it selects the same P[b].
 inline constexpr int kLvGather = -1;
-// kLvLut (4): integer lanes, alphabets of at most 4 letters, every score an int8, at a
-// level with a byte shuffle.  The 4x4 matrix is one 16-byte table, t[4a + b]; per row each
+// kLvLut (4): alphabets of at most 4 letters, every score exactly an int8 (for float
+// lanes as a bit pattern: an integral matrix without -0), at a level with a byte shuffle.  The 4x4 matrix is one 16-byte table, t[4a + b]; per row each
 // lane's 4a as a byte vector, per column its b (the transposed B codes), and the score is
-// one add, one shuffle and one widen per vector cell, for the tree's 3 blends and 2 mask
-// loads.  Values past int8, or tracked lanes (a block per row), take the tree.
+// one add, one shuffle and one widen per vector cell (float lanes: and a convert, exact
+// for an int8), for the tree's 3 blends and 2 mask loads.  Values past int8 or
+// non-integral, or tracked lanes (a block per row), take the tree.
 inline constexpr int kLvLut = 4;
 
 // Per lane, the score of this row's A residue against the column's B residue: a blend
@@ -697,7 +701,7 @@ static void inter_lv_dispatch(const InterJobT<T>& J, F&& f) {
     if (na > 8)      f(std::integral_constant<int, kLvGather>{});
     else if (na > 4) f(std::integral_constant<int, 3>{});
     else {
-        if constexpr (kByteShuffle && std::is_integral_v<T> && !Tr) {
+        if constexpr (kByteShuffle && !Tr) {
             bool fit = true;
             for (int k = 0; k < na * na; ++k) fit &= fits_i8(J.blk[k]);
             if (fit) { f(std::integral_constant<int, kLvLut>{}); return; }
