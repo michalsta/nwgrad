@@ -833,6 +833,44 @@ skynet (Piledriver, W=2, 1 thread, 200k pairs): rowwise 12.4 µs/pair, interpair
   18.2 ms (the gate costs 1.54x; wloczykij 1.5x), int16 13.4 / 18.5 ms (the gate is right).
   So on Piledriver the score gate's crossover depends on the type, not only the level.
 
+**The substitution lookup, recast (branch `proto/inter-lookup`, 2026-11-05).** perf annotate of
+`inter_score_affine_pos<short>` (sse4) had the runtime `levels` test in `inter_sub` and the
+`pcmpeqw` gcc put before every `pblendvb` (a mask loaded from memory is compared against 0
+first: `m ? a : b` means m != 0) among the column loop's five hottest instructions. Four
+changes, all bit-identical (every lane against the pair's own scalar fill:
+`tests/Python/test_interpair_lookup.py` at every level, int8 / wider / non-integral / -0
+matrices, 4 and 6 letters, ragged B):
+1. `Lv`, the lookup form, is a template parameter of every inter-pair kernel, chosen once
+   per job (`inter_lv_dispatch`): -1 gather, 2 / 3 tree levels (alphabets of 1-2 letters
+   take the 2-level tree), 4 = the byte table below. No branch left in the column loops.
+2. `ivsel` blends on the mask as is (`blendv*` at SSE4.1 / AVX2, `vpternlogq` 0xCA at
+   AVX-512, `vbslq` on NEON, and / andnot / or at SSE2): the tree loops lost every
+   `pcmpeq*`. Also reaches the soft kernels (their masks are all 0 / -1).
+3. `kLvLut`: up to 4 letters, every score exactly an int8 (floats: integral, no -0), a
+   level with a byte shuffle (sse4 and up, NEON; not SSE2): the matrix is one 16-byte table
+   `t[4a + b]`, the row's `4a` and the column's `b` are pre-transposed byte vectors, and a
+   cell's score is `paddb` + `pshufb` + `pmovsx*` (+ `cvtdq2ps` / `cvtdq2pd`). Past int8,
+   non-integral or tracked: the tree. (int16 inside the quarter rule always fits:
+   step_max <= 8191 / 66.)
+4. Per-row work: untracked tree rows build P by shuffle from the transposed A codes where
+   the scores are int8, `live` is one compare against the lanes' m, Global capture visits
+   only the lanes ending at the row (lanes pre-sorted by m). Aimed at W = 32 (int16
+   AVX-512); at W <= 8 it measured 0-2 %.
+Measured on skynet (sse4, perf stat, differential instructions per pair, 1 thread,
+affine Global unless noted, gates off; A/A 0.986-1.009): miRNA 22x50 int16 score 0.587, hard
+0.800; int32 hard 0.737; float32 score 0.646, hard 0.809, Local hard 0.768; int16 Local score
+0.586; DNA L100 hard int16 0.683, int32 0.649, float32 0.746, float32 score 0.648. Per
+step (miRNA int16 score / float32 score / DNA int32 hard): (1) 0.81 / 0.77 / 0.78, (2) 0.78 /
+0.69 / 0.74, (3, integer table) 0.60 / 0.69 / 0.65, (4) 0.58 / 0.69 / 0.65, (3b, float
+table) 0.59 / 0.65 / 0.65. sse2: 0.73-0.88 on the same cells. Integer score-only on DNA
+L100 and miRNA int32 stays on the striped score kernel (the small-alphabet score cap, not
+overridable) and reads 0.99-1.01: an extra control. Instructions, not time: the float
+table trades blends for a convert (latency, off the Y carry chain); cycles unmeasured on
+a v3 host. AVX2 / AVX-512 / NEON compile (gcc, clang syntax; NEON gcc cross) and are
+untested at runtime. Not done: 5-8 letters as two shuffles + a blend (the global 8a + b
+table is 64 entries, four shuffles: no gain over the 7-blend tree at W = 8), protein by
+`vpermi2b` (needs VBMI, which the avx512 level does not enable, and a runtime check).
+
 ### Score only: `compute_score` and the inter-pair score kernel (2026-10-08)
 
 `Aligner::compute_score()` returns the optimal score with no table and no traceback:

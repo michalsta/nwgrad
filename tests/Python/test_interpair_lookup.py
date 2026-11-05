@@ -3,8 +3,7 @@
 inter_kernel_impl.inl picks the lookup per job (inter_lv_dispatch): a byte table indexed
 by 4a + b on <= 4 letters whose scores are all exactly int8 (floats: integral, no -0; at
 levels with a byte shuffle), a blend tree otherwise (2 levels up to 4 letters, 3 up to
-8), whose row profile
-is built by byte shuffle where every score is exactly an int8 (floats: -0 is not) and
+8), whose row profile is built by byte shuffle where every score is exactly an int8 and
 gathered lane by lane where not.  Every form must leave each lane's scores, paths and
 hard gradients bit-identical to the scalar own fill, at every level; these fixtures
 reach each one: int8-fitting and wider integer matrices, integral, non-integral and
