@@ -782,6 +782,7 @@ private:
         if (grad_mode_ == GradMode::Hard) {
             al.compute_viterbi(buf); scores[i] = al.score(); al.hard_grad(buf, local_grad);
         } else if (grad_mode_ == GradMode::Soft) {
+            al.set_soft_ckpt_shared(s_.n_threads > 1 && problems.size() > 1);
             al.compute_forward_back(buf); scores[i] = al.log_z(); al.soft_grad(buf, local_grad);
         } else {
             scores[i] = al.compute_score(buf);   // no table, no traceback (exact fill's score)
@@ -1119,6 +1120,7 @@ private:
     void fwdbwd_(size_t i, Al& al, DpBuffer& buf) {
         const bool f32 = soft_f32_() && !(flags_[i] & kF32Refused);
         al.set_soft_f32(f32);
+        al.set_soft_ckpt_shared(s_.n_threads > 1 && size() > 1);
         al.compute_forward_back(buf);
         if (f32 && s_.soft_impl != SoftImpl::Log && !al.soft_f32_used()) flags_[i] |= kF32Refused;
     }
