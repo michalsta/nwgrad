@@ -260,15 +260,20 @@ struct DpBufferT {
     // FY affine — its own, not the log path's B-less tables above), six rolling backward
     // rows, the exp'd query profile qp (exp(score(a, b[j-1]) / T) per residue a), the
     // row sums and maxima, the tracked per-row weights and the match-scatter row.  sexp:
-    // the per-row power-of-two exponents of the forward tables.
+    // the per-row power-of-two exponents of the forward tables.  Checkpointed (large pairs,
+    // Aligner::soft_ckpt_rows): F / FM..FY hold a block of k+1 rows, CK the checkpoints
+    // (the first row of each block; affine M, X, Y and the row sum, each a stride of its own
+    // per block), q0/q1 the forward's scratch rows, ckh the debug check's row hashes.
     template <class SF>
     struct SoftScratch {
         using V = std::vector<SF, AlignedAllocator<SF>>;
-        V F, FM, FX, FY, r0, r1, r2, r3, r4, r5, qp, rs, mf, srow, rw;
+        V F, FM, FX, FY, r0, r1, r2, r3, r4, r5, qp, rs, mf, srow, rw, CK, q0, q1;
+        std::vector<uint64_t> ckh;
         void clear() noexcept {
-            for (V* v : {&F, &FM, &FX, &FY, &r0, &r1, &r2, &r3, &r4, &r5, &qp, &rs, &mf, &srow, &rw}) {
+            for (V* v : {&F, &FM, &FX, &FY, &r0, &r1, &r2, &r3, &r4, &r5, &qp, &rs, &mf, &srow, &rw, &CK, &q0, &q1}) {
                 v->clear(); v->shrink_to_fit();
             }
+            ckh.clear(); ckh.shrink_to_fit();
         }
     };
     SoftScratch<double> sd;

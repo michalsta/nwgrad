@@ -5221,6 +5221,27 @@ private:
         }
     }
 
+    // Rows per block of the checkpointed forward (0: the full tables; soft_kernel_impl.inl,
+    // "Checkpoints").  The soft_ckpt_rows gate, else NWGRAD_SOFT_CKPT_ROWS, forces k (k >= 1;
+    // 0: the full tables; the gate off: one block of every row); otherwise pairs whose
+    // forward tables reach soft_ckpt_min_bytes (kSoftCkptMinBytes) checkpoint, with k from
+    // soft_ckpt_auto_rows.
+    template <class SF>
+    int soft_ckpt_rows() const noexcept {
+        const int64_t o = gate_override(Gate::SoftCkptRows);
+        const int64_t r = o >= 0 ? o : soft_ckpt_env_rows();
+        const int64_t mm = std::max(m_, 1);
+        if (r >= 0) return static_cast<int>(std::min(r, mm));
+        const size_t states = (GM == GapModel::Linear) ? 1 : 3;
+        if (states * sz_ * sizeof(SF) < gate_value(Gate::SoftCkptMinBytes, kSoftCkptMinBytes)) return 0;
+        return static_cast<int>(std::min<int64_t>(soft_ckpt_auto_rows(m_, stride_ * states * sizeof(SF)), mm));
+    }
+    // k for a pair of m rows of `row_bytes` (all states).
+    static int soft_ckpt_auto_rows(int m, size_t row_bytes) noexcept {
+        (void)row_bytes;
+        return std::max(1, static_cast<int>(std::ceil(std::sqrt(static_cast<double>(m)))));
+    }
+
     // Both gap models: build the SoftPairJob and run the per-pair kernel of this
     // aligner's backend (soft_kernel_impl.inl; the baseline copy when the backend is
     // scalar_fallback or its level has none).  False: out of range (see run_fwdbwd).
@@ -5281,10 +5302,21 @@ private:
             J.ea = static_cast<SF>(ea); J.eb = static_cast<SF>(eb);
             J.oa = static_cast<SF>(oa); J.ob = static_cast<SF>(ob);
         }
-        if constexpr (lin) { if (sc.F.size() < sz_) sc.F.resize(sz_); }
-        else for (auto* v : {&sc.FM, &sc.FX, &sc.FY}) if (v->size() < sz_) v->resize(sz_);
+        const int ck = soft_ckpt_rows<SF>();
+        // Checkpointed: the tables are a block of ck+1 rows, plus the checkpoints.
+        const size_t tsz = ck ? (static_cast<size_t>(ck) + 1) * stride_ : sz_;
+        if constexpr (lin) { if (sc.F.size() < tsz) sc.F.resize(tsz); }
+        else for (auto* v : {&sc.FM, &sc.FX, &sc.FY}) if (v->size() < tsz) v->resize(tsz);
         for (auto* r : {&sc.r0, &sc.r1, &sc.r2, &sc.r3, &sc.r4, &sc.r5})
             if (r->size() < w) r->resize(w);
+        size_t nck = 0;   // checkpoint rows per state
+        if (ck) {
+            nck = m_ ? (static_cast<size_t>(m_) + ck - 1) / ck : 1;
+            const size_t need = nck * stride_ * (lin ? 1 : 4);
+            if (sc.CK.size() < need) sc.CK.resize(need);
+            if constexpr (!lin) for (auto* r : {&sc.q0, &sc.q1}) if (r->size() < w) r->resize(w);
+            if (soft_ckpt_env_check()) { sc.ckh.assign(static_cast<size_t>(m_) + 1, 0); J.ckh = sc.ckh.data(); }
+        }
         const size_t mm = static_cast<size_t>(m_) + 1;
         sband_.resize(6 * mm);
         int* bl = sband_.data();
@@ -5308,6 +5340,13 @@ private:
         J.stride = stride_;
         if constexpr (lin) J.FM = sc.F.data();
         else { J.FM = sc.FM.data(); J.FX = sc.FX.data(); J.FY = sc.FY.data(); }
+        if (ck) {
+            J.ck = ck;
+            SF* C = sc.CK.data();
+            const size_t cs = nck * stride_;
+            J.cM = C;
+            if constexpr (!lin) { J.cX = C + cs; J.cY = C + 2 * cs; J.cT = C + 3 * cs; J.q0 = sc.q0.data(); J.q1 = sc.q1.data(); }
+        }
         J.r0 = sc.r0.data(); J.r1 = sc.r1.data(); J.r2 = sc.r2.data();
         J.r3 = sc.r3.data(); J.r4 = sc.r4.data(); J.r5 = sc.r5.data();
         J.S = buf.sexp.data(); J.rowsum = sc.rs.data(); J.fmax = sc.mf.data();
@@ -5323,9 +5362,12 @@ private:
         if constexpr (std::is_same_v<SF, float>) { FlushDenormalsScope ftz; fn(J); }
         else fn(J);
         if (std::getenv("NWGRAD_SOFT_DEBUG"))
-            std::fprintf(stderr, "soft<%s> m=%d n=%d ok=%d loss=%.3e tol=%.3e logz=%.6f\n",
-                         std::is_same_v<SF, float> ? "float" : "double", m_, n_, J.ok, J.loss,
+            std::fprintf(stderr, "soft<%s> m=%d n=%d ck=%d ok=%d loss=%.3e tol=%.3e logz=%.6f\n",
+                         std::is_same_v<SF, float> ? "float" : "double", m_, n_, ck, J.ok, J.loss,
                          SoftRange<SF>::tol, J.log_z);
+        if (J.ck_bad)
+            throw std::logic_error("nwgrad: soft path: " + std::to_string(J.ck_bad) +
+                                   " recomputed forward rows differ from the first pass (NWGRAD_SOFT_CKPT_CHECK)");
         if (!J.ok) return false;
         log_z_ = J.log_z;
         sg_go_a_ = J.g_oa; sg_ge_a_ = J.g_ea; sg_go_b_ = J.g_ob; sg_ge_b_ = J.g_eb;

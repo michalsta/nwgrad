@@ -488,6 +488,21 @@ struct SoftPairJobT {
     // g_ob, g_eb, negative).  The scalar weights and g_* are then unused.
     const F* rw = nullptr;
     double* grow = nullptr;
+    // Checkpointed forward (ck > 0; soft_kernel_impl.inl, "Checkpoints"): FM/FX/FY are a
+    // BLOCK of ck+1 rows instead of the full tables (row i of block c, c = 0, 1, ..., at
+    // (i - c*ck)*stride, block c holding rows c*ck .. c*ck+ck), and cM/cX/cY/cT hold, for every
+    // block c (c*stride), its first row c*ck: M, X, Y and the forward's previous-row sum
+    // (affine; linear: cM only).  q0/q1 (n+2 each, affine): the forward's two scratch rows
+    // (row sum, Y carry input), apart from r0..r5, which the backward holds while a block is
+    // recomputed.  ck = 0: the full tables, FM/FX/FY of (m+1)*stride.
+    int ck = 0;
+    F *cM = nullptr, *cX = nullptr, *cY = nullptr, *cT = nullptr;
+    F *q0 = nullptr, *q1 = nullptr;
+    // Debug (NWGRAD_SOFT_CKPT_CHECK): m+1 hashes of the forward rows as first computed
+    // (M, X, Y over the row's span, its exponent and max); a recomputed row that hashes
+    // differently counts into ck_bad.
+    uint64_t* ckh = nullptr;
+    int ck_bad = 0;
 };
 using SoftPairJob  = SoftPairJobT<double>;
 using SoftPairJobF = SoftPairJobT<float>;
@@ -576,14 +591,14 @@ enum class Gate : int {
     InterGroupBytes, InterSoftBytes, InterScoreGatherCells,
     InterLinearIntGatherCells, InterLinearF32GatherCells, InterLinearF64GatherCells,
     InterGlobalLinearIntCells, InterGlobalLinearF32Cells, LinearStripedMinN, SoftF32MinCells,
-    InterMinFill, Count_
+    InterMinFill, SoftCkptRows, SoftCkptMinBytes, Count_
 };
 inline constexpr const char* kGateNames[] = {
     "inter_group_bytes", "inter_soft_bytes", "inter_score_gather_cells",
     "inter_linear_int_gather_cells", "inter_linear_f32_gather_cells",
     "inter_linear_f64_gather_cells", "inter_global_linear_int_cells",
     "inter_global_linear_f32_cells", "linear_striped_min_n", "soft_f32_min_cells",
-    "inter_min_fill"};
+    "inter_min_fill", "soft_ckpt_rows", "soft_ckpt_min_bytes"};
 static_assert(sizeof(kGateNames) / sizeof(kGateNames[0]) == static_cast<size_t>(Gate::Count_));
 inline constexpr int64_t kGateUnset = -1;
 inline constexpr int64_t kGateOff = INT64_MAX;
@@ -605,6 +620,29 @@ inline size_t gate_value(Gate g, size_t def) {
     const int64_t v = gate_override(g);
     return v < 0 ? def : static_cast<size_t>(v);
 }
+// The per-pair soft pass's checkpointed forward (Aligner::soft_ckpt_rows): environment
+// overrides, read once.  NWGRAD_SOFT_CKPT_ROWS=k (an integer >= 0): as the soft_ckpt_rows
+// gate when that is not set (k >= 1 blocks of k rows at every size, 0 the full tables at
+// every size); -1: unset.  NWGRAD_SOFT_CKPT_CHECK (set, not "0"): hash every forward row
+// and check its recomputation (a std::logic_error on a mismatch).
+inline int64_t soft_ckpt_env_rows() noexcept {
+    static const int64_t v = [] {
+        const char* e = std::getenv("NWGRAD_SOFT_CKPT_ROWS");
+        if (!e || !*e) return int64_t(-1);
+        char* end = nullptr;
+        const long long k = std::strtoll(e, &end, 10);
+        return (end && *end == 0 && k >= 0) ? int64_t(k) : int64_t(-1);
+    }();
+    return v;
+}
+inline bool soft_ckpt_env_check() noexcept {
+    static const bool v = [] { const char* e = std::getenv("NWGRAD_SOFT_CKPT_CHECK"); return e && *e && std::strcmp(e, "0") != 0; }();
+    return v;
+}
+// The forward tables' size (bytes: states x (m+1)(n+1) x the soft type's) from which the
+// per-pair soft pass checkpoints (soft_ckpt_min_bytes overrides; off = never).  A new
+// switch for a new code path, not a fill gate retuned: see Aligner::soft_ckpt_rows.
+inline constexpr size_t kSoftCkptMinBytes = size_t(2) << 20;
 // ── The fill gates: which pairs join a shared (inter-pair) fill ────────────────
 //
 // Per ISA level and scalar type, measured by tools/gate_sweep.py (2026-10-31 / 11-01) on

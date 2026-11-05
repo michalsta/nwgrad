@@ -296,6 +296,111 @@ static inline bool sp_log_z(SoftPairJobT<SF>& J, const int* S, const SF* rowsum_
     return true;
 }
 
+// ── Checkpoints (J.ck > 0) ─────────────────────────────────────────────────────
+// The full forward tables are 8 B (float32: 4) per cell and state; from L ~1000 they leave
+// the cache and the backward, which reads rows i and i-1 of them once each, turns
+// memory-bound (AGENTS.md, "The soft path").  Checkpointed, the forward keeps only the
+// first row of every block of ck rows (cM..cT) and computes into a block buffer of ck+1
+// rows; the backward walks the blocks from the top down, recomputing each block from its
+// checkpoint (the last block is still in the buffer) and running unchanged over it.
+// The recomputation is the SAME function over the SAME inputs at the SAME addresses
+// (every row of block c lands in slot i - c*ck, the scratch rows are q0/q1 both times), so
+// it reproduces the first pass bit for bit, exponents and maxima included -- the
+// backward's S, fmax and Z, taken from the first pass, describe the recomputed rows
+// exactly, and the lost-mass bound is charged once per row as before
+// (NWGRAD_SOFT_CKPT_CHECK hashes every row both times and compares).  Banded rows are
+// zeroed over their span right before they are computed (the full-table path zeroed every
+// span up front: the same values, since a row writes only itself).
+#if defined(__GNUC__) || defined(__clang__)
+#  define NWGRAD_SP_NOINLINE __attribute__((noinline))
+#else
+#  define NWGRAD_SP_NOINLINE
+#endif
+template <class SF>
+static inline void sp_copy_span(SF* __restrict dst, const SF* __restrict src, int lo, int hi) noexcept {
+    for (int j = lo; j <= hi; ++j) dst[j] = src[j];
+}
+// FNV-1a over the bits of row i (up to three states, nullptr skips) over its span, with its
+// exponent and max.
+template <class SF>
+static inline uint64_t sp_row_hash(const SoftPairJobT<SF>& J, int i, const SF* a, const SF* b, const SF* c) noexcept {
+    using U = std::conditional_t<sizeof(SF) == 4, uint32_t, uint64_t>;
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&h](uint64_t v) { h = (h ^ v) * 1099511628211ull; };
+    for (const SF* r : {a, b, c})
+        if (r) for (int j = J.slo[i]; j <= J.shi[i]; ++j) mix(std::bit_cast<U>(r[j]));
+    mix(static_cast<uint64_t>(static_cast<int64_t>(J.S[i])));
+    mix(std::bit_cast<U>(J.fmax[i]));
+    return h;
+}
+// Rows i0..i1 of the block whose slot 0 is row `base`: record (first pass) or check them.
+template <class SF>
+static inline void sp_ck_hash(SoftPairJobT<SF>& J, const SF* A, const SF* B, const SF* C, int base,
+                              int i0, int i1, bool check) noexcept {
+    const size_t st = J.stride;
+    for (int i = i0; i <= i1; ++i) {
+        const size_t o = static_cast<size_t>(i - base) * st;
+        const uint64_t h = sp_row_hash(J, i, A + o, B ? B + o : nullptr, C ? C + o : nullptr);
+        if (!check) J.ckh[i] = h;
+        else if (J.ckh[i] != h) ++J.ck_bad;
+    }
+}
+
+// Forward rows i0..i1 of the linear model into F, row i at F + (i - base)*stride (base 0:
+// the full table; else the block buffer, slot 0 holding row base = i0 - 1).  Writes S, fmax
+// and the row sums.  False: a row overflowed.
+template <class SF, bool Tr>
+NWGRAD_SP_FMA_FN NWGRAD_SP_NOINLINE static bool sp_linear_fwd(const SoftPairJobT<SF>& J, SF* F, int base,
+                                                              int i0, int i1) noexcept {
+    NWGRAD_SP_FMA_BODY
+    const int m = J.m;
+    const bool L = J.local == 1, G = J.local == 2;
+    SF ea = J.ea, eb = J.eb;
+    const SF* RW = J.rw;
+    const size_t st = J.stride, w = static_cast<size_t>(J.n) + 2;
+    int* S = J.S;
+    SF* rs = J.rowsum;
+    SF* mf = J.fmax;
+    const SF* P = J.P;
+    bool bad = false;
+    for (int i = i0; i <= i1; ++i) {
+        SF* __restrict r = F + static_cast<size_t>(i - base) * st;
+        const SF* __restrict p = r - st;
+        if (!J.full) for (int j = J.slo[i]; j <= J.shi[i]; ++j) r[j] = 0.0;
+        if constexpr (Tr) { ea = RW[4 * i + 1]; eb = RW[4 * i + 3]; }
+        SF fr = 0.0;
+        if (L) { fr = sp_ldexp(SF(1), -S[i - 1]); r[0] = fr; }
+        else   r[0] = (i <= J.bi) ? p[0] * eb : 0.0;
+        const SF* __restrict pr = P + sp_row<Tr>(J, i) * w;
+        const int lo = J.jlo[i], hi = J.jhi[i];
+        for (int j = lo; j <= hi; ++j) r[j] = p[j - 1] * pr[j] + p[j] * eb + fr;
+        if (lo <= hi) sp_carry_fwd(r, r, lo, hi, ea);
+        SF mx = 0.0;
+        NWGRAD_SP_MAX(mx)
+        for (int j = J.slo[i]; j <= J.shi[i]; ++j) mx = NWGRAD_SP_VMAX(mx, r[j]);
+        S[i] = S[i - 1] + sp_lazy(mx, J.slo[i], J.shi[i], bad, r);
+        if (bad) return false;
+        mf[i] = mx;
+        if (L || (G && i == m)) {
+            SF s = 0.0;
+            NWGRAD_SP_SUM(s)
+            for (int j = J.jlo0[i]; j <= J.jhi0[i]; ++j) s += r[j];
+            rs[i] = s;
+        }
+    }
+    return true;
+}
+// Block c of a checkpointed linear forward, recomputed into the buffer from its checkpoint.
+template <class SF, bool Tr>
+static inline bool sp_linear_reload(SoftPairJobT<SF>& J, int c) noexcept {
+    const int k = J.ck, i0 = c * k, i1 = std::min(i0 + k, J.m);
+    const size_t st = J.stride;
+    sp_copy_span(J.FM, J.cM + static_cast<size_t>(c) * st, J.slo[i0], J.shi[i0]);
+    if (!sp_linear_fwd<SF, Tr>(J, J.FM, i0, i0 + 1, i1)) return false;
+    if (J.ckh) sp_ck_hash<SF>(J, J.FM, nullptr, nullptr, i0, i0 + 1, i1, true);
+    return true;
+}
+
 // Tr: tracked (J.rw) — each row's weights, its own profile and count row, and the gap
 // gradient per row into J.grow.
 template <class SF, bool Tr>
@@ -323,11 +428,9 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear_t(SoftPairJobT<SF>& J) noexcept {
     bool bad = false;
     J.ok = 0;
 
-    if (!J.full)
-        for (int i = 0; i <= m; ++i) {
-            SF* r = F + static_cast<size_t>(i) * st;
-            for (int j = J.slo[i]; j <= J.shi[i]; ++j) r[j] = 0.0;
-        }
+    const int ck = J.ck;
+    const int nb = (ck && m) ? (m + ck - 1) / ck : 1;   // blocks (one: the full table)
+    if (!J.full) for (int j = J.slo[0]; j <= J.shi[0]; ++j) F[j] = 0.0;
     if (L || G) { for (int j = 0; j <= n; ++j) F[j] = 1.0; }
     else {
         if (J.full) for (int j = 0; j <= n; ++j) F[j] = 0.0;
@@ -341,32 +444,18 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear_t(SoftPairJobT<SF>& J) noexcept {
         mf[0] = mx;
         if (L || (G && m == 0)) { SF s = 0.0; for (int j = J.jlo0[0]; j <= J.jhi0[0]; ++j) s += F[j]; rs[0] = s; }
     }
-    for (int i = 1; i <= m; ++i) {
-        SF* __restrict r = F + static_cast<size_t>(i) * st;
-        const SF* __restrict p = r - st;
-        if constexpr (Tr) { ea = RW[4 * i + 1]; eb = RW[4 * i + 3]; }
-        SF fr = 0.0;
-        if (L) { fr = sp_ldexp(SF(1), -S[i - 1]); r[0] = fr; }
-        else   r[0] = (i <= J.bi) ? p[0] * eb : 0.0;
-        const SF* __restrict pr = P + sp_row<Tr>(J, i) * w;
-        const int lo = J.jlo[i], hi = J.jhi[i];
-        for (int j = lo; j <= hi; ++j) r[j] = p[j - 1] * pr[j] + p[j] * eb + fr;
-        if (lo <= hi) sp_carry_fwd(r, r, lo, hi, ea);
-        SF mx = 0.0;
-        NWGRAD_SP_MAX(mx)
-        for (int j = J.slo[i]; j <= J.shi[i]; ++j) mx = NWGRAD_SP_VMAX(mx, r[j]);
-        S[i] = S[i - 1] + sp_lazy(mx, J.slo[i], J.shi[i], bad, r);
-        if (bad) return;
-        mf[i] = mx;
-        if (L || (G && i == m)) {
-            SF s = 0.0;
-            NWGRAD_SP_SUM(s)
-            for (int j = J.jlo0[i]; j <= J.jhi0[i]; ++j) s += r[j];
-            rs[i] = s;
+    if (!ck) { if (!sp_linear_fwd<SF, Tr>(J, F, 0, 1, m)) return; }
+    else
+        for (int c = 0; c < nb; ++c) {
+            const int i0 = c * ck, i1 = std::min(i0 + ck, m);
+            if (c > 0) sp_copy_span(F, F + static_cast<size_t>(ck) * st, J.slo[i0], J.shi[i0]);
+            sp_copy_span(J.cM + static_cast<size_t>(c) * st, F, J.slo[i0], J.shi[i0]);
+            if (i0 < i1 && !sp_linear_fwd<SF, Tr>(J, F, i0, i0 + 1, i1)) return;
+            if (J.ckh) sp_ck_hash<SF>(J, F, nullptr, nullptr, i0, i0 + 1, i1, false);
         }
-    }
+    int base = (nb - 1) * ck, curb = nb - 1;   // the block in the buffer, and its slot-0 row
     const bool mn_in = n >= J.jlo0[m] && n <= J.jhi0[m];
-    const SF corner = mn_in ? F[static_cast<size_t>(m) * st + n] : 0.0;
+    const SF corner = mn_in ? F[static_cast<size_t>(m - base) * st + n] : 0.0;
     int ze; double izr;
     if (!sp_log_z(J, S, rs, corner, ze, izr)) {
         if (!L && !G && !mn_in) {   // Global, (m, n) outside the band: log Z = -inf, genuinely
@@ -383,6 +472,13 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear_t(SoftPairJobT<SF>& J) noexcept {
     int Tn = 0;
     double g_ea = 0.0, g_eb = 0.0, loss = 0.0, lossu = 0.0;   // lossu: sp_loss's, in units of MIN
     for (int i = m; i >= 0; --i) {
+        if (ck) {   // row i reads forward rows i and i-1: block (i-1)/ck (row 0: block 0)
+            const int cb = i ? (i - 1) / ck : 0;
+            if (cb != curb) {
+                curb = cb; base = cb * ck;
+                if (!sp_linear_reload<SF, Tr>(J, cb)) return;
+            }
+        }
         const int lo0 = J.jlo0[i], hi0 = J.jhi0[i];
         for (int j = clo; j <= chi; ++j) cur[j] = 0.0;
         const SF init = L ? sp_ldexp(SF(1), -Tn) : 0.0;
@@ -402,7 +498,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear_t(SoftPairJobT<SF>& J) noexcept {
         clo = lo0; chi = hi0;
 
         // One vector pass: row max and every gradient sum, on the pre-rescale values.
-        const SF* __restrict Fi = F + static_cast<size_t>(i) * st;
+        const SF* __restrict Fi = F + static_cast<size_t>(i - base) * st;
         const SF* __restrict cb = cur;
         const int j1 = std::max(1, lo0);
         SF mx = 0.0, sa = 0.0, sb = 0.0;
@@ -494,63 +590,30 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear_t(SoftPairJobT<SF>& J) noexcept {
     J.ok = 1;
 }
 
+// Forward rows i0..i1 of the affine model, as sp_linear_fwd (row i at FM/FX/FY + (i -
+// base)*stride).  tp: the previous row's M+X+Y on entry (row i0-1), row i1's on exit; uy:
+// the Y carry's input.
 template <class SF, bool Tr>
-NWGRAD_SP_FMA_FN static void soft_pair_affine_t(SoftPairJobT<SF>& J) noexcept {
+NWGRAD_SP_FMA_FN NWGRAD_SP_NOINLINE static bool sp_affine_fwd(const SoftPairJobT<SF>& J, SF* FM, SF* FX, SF* FY,
+                                                              int base, int i0, int i1, SF* tp, SF* uy) noexcept {
     NWGRAD_SP_FMA_BODY
-    constexpr bool kSpCountF = std::is_same_v<SF, float> && NWGRAD_SP_COUNT_F32;   // the float32 instantiation accounts for flushed products (sp_count_*)
-    const int m = J.m, n = J.n;
-    // Glocal (local == 2): row 0 a free start (no moves along it), column 0 Global's
-    // chain, no free start inside, Z = row m's sum, the backward seeded along row m.
+    const int m = J.m;
     const bool L = J.local == 1, G = J.local == 2;
-    const int kmin = (L || G) ? 1 : 0;    // first row whose horizontal moves count
-    const int kmin0 = L ? 1 : 0;          // first row whose column-0 vertical move counts
     SF oa = J.oa, ea = J.ea, ob = J.ob, eb = J.eb;
     const SF* RW = J.rw;
-    if constexpr (Tr) {
-        oa = RW[0]; ea = RW[1];
-        for (int i = 0; i <= m; ++i) for (int f = 0; f < 4; ++f) J.grow[4 * i + f] = 0.0;
-    }
-    const size_t st = J.stride, w = static_cast<size_t>(n) + 2;
-    SF* FM = J.FM; SF* FX = J.FX; SF* FY = J.FY;
+    const size_t st = J.stride, w = static_cast<size_t>(J.n) + 2;
     int* S = J.S;
     SF* rs = J.rowsum;
     SF* mf = J.fmax;
     const SF* P = J.P;
     bool bad = false;
-    J.ok = 0;
-    SF* tp = J.r5;   // M+X+Y of the previous forward row; later the match scratch
-    SF* uy = J.r4;   // forward: the Y carry's carry-free input
-
-    if (!J.full) {
-        for (int i = 0; i <= m; ++i) {
-            const size_t ro = static_cast<size_t>(i) * st;
-            for (int j = J.slo[i]; j <= J.shi[i]; ++j) { FM[ro + j] = 0.0; FX[ro + j] = 0.0; FY[ro + j] = 0.0; }
-        }
-    } else {
-        for (int j = 0; j <= n; ++j) { FM[j] = 0.0; FX[j] = 0.0; FY[j] = 0.0; }
-    }
-    if (L || G) { for (int j = 0; j <= n; ++j) FM[j] = 1.0; }
-    else {
-        FM[0] = 1.0;
-        if (J.bj >= 1) FY[1] = oa;
-        for (int j = 2; j <= J.bj; ++j) FY[j] = FY[j - 1] * ea;
-    }
-    {
-        SF mx = 0.0;
-        for (int j = J.slo[0]; j <= J.shi[0]; ++j) {
-            tp[j] = FM[j] + FX[j] + FY[j];
-            mx = NWGRAD_SP_VMAX(mx, tp[j]);
-        }
-        mf[0] = mx;
-    }
-    S[0] = 0;
-    if (L || (G && m == 0)) { SF s = 0.0; for (int j = J.jlo0[0]; j <= J.jhi0[0]; ++j) s += tp[j]; rs[0] = s; }
-    for (int i = 1; i <= m; ++i) {
-        const size_t ro = static_cast<size_t>(i) * st;
+    for (int i = i0; i <= i1; ++i) {
+        const size_t ro = static_cast<size_t>(i - base) * st;
         SF* __restrict rM = FM + ro; SF* __restrict rX = FX + ro;
         SF* __restrict rY = FY + ro;
         const SF* __restrict pM = rM - st; const SF* __restrict pX = rX - st;
         const SF* __restrict pY = rY - st;
+        if (!J.full) for (int j = J.slo[i]; j <= J.shi[i]; ++j) { rM[j] = 0.0; rX[j] = 0.0; rY[j] = 0.0; }
         if constexpr (Tr) { oa = RW[4 * i]; ea = RW[4 * i + 1]; ob = RW[4 * i + 2]; eb = RW[4 * i + 3]; }
         SF fr = 0.0;
         if (L) { fr = sp_ldexp(SF(1), -S[i - 1]); rM[0] = fr; rX[0] = 0.0; rY[0] = 0.0; }
@@ -582,7 +645,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine_t(SoftPairJobT<SF>& J) noexcept {
             mx = NWGRAD_SP_VMAX(mx, v);
         }
         S[i] = S[i - 1] + sp_lazy(mx, J.slo[i], J.shi[i], bad, rM, rX, rY, tp);
-        if (bad) return;
+        if (bad) return false;
         mf[i] = mx;
         if (L || (G && i == m)) {
             SF s = 0.0;
@@ -591,8 +654,86 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine_t(SoftPairJobT<SF>& J) noexcept {
             rs[i] = s;
         }
     }
+    return true;
+}
+// Block c of a checkpointed affine forward, recomputed into the buffer from its checkpoint.
+template <class SF, bool Tr>
+static inline bool sp_affine_reload(SoftPairJobT<SF>& J, int c) noexcept {
+    const int k = J.ck, i0 = c * k, i1 = std::min(i0 + k, J.m);
+    const size_t co = static_cast<size_t>(c) * J.stride;
+    const int lo = J.slo[i0], hi = J.shi[i0];
+    sp_copy_span(J.FM, J.cM + co, lo, hi); sp_copy_span(J.FX, J.cX + co, lo, hi);
+    sp_copy_span(J.FY, J.cY + co, lo, hi); sp_copy_span(J.q0, J.cT + co, lo, hi);
+    if (!sp_affine_fwd<SF, Tr>(J, J.FM, J.FX, J.FY, i0, i0 + 1, i1, J.q0, J.q1)) return false;
+    if (J.ckh) sp_ck_hash<SF>(J, J.FM, J.FX, J.FY, i0, i0 + 1, i1, true);
+    return true;
+}
+
+template <class SF, bool Tr>
+NWGRAD_SP_FMA_FN static void soft_pair_affine_t(SoftPairJobT<SF>& J) noexcept {
+    NWGRAD_SP_FMA_BODY
+    constexpr bool kSpCountF = std::is_same_v<SF, float> && NWGRAD_SP_COUNT_F32;   // the float32 instantiation accounts for flushed products (sp_count_*)
+    const int m = J.m, n = J.n;
+    // Glocal (local == 2): row 0 a free start (no moves along it), column 0 Global's
+    // chain, no free start inside, Z = row m's sum, the backward seeded along row m.
+    const bool L = J.local == 1, G = J.local == 2;
+    const int kmin = (L || G) ? 1 : 0;    // first row whose horizontal moves count
+    const int kmin0 = L ? 1 : 0;          // first row whose column-0 vertical move counts
+    SF oa = J.oa, ea = J.ea, ob = J.ob, eb = J.eb;
+    const SF* RW = J.rw;
+    if constexpr (Tr) {
+        oa = RW[0]; ea = RW[1];
+        for (int i = 0; i <= m; ++i) for (int f = 0; f < 4; ++f) J.grow[4 * i + f] = 0.0;
+    }
+    const size_t st = J.stride, w = static_cast<size_t>(n) + 2;
+    SF* FM = J.FM; SF* FX = J.FX; SF* FY = J.FY;
+    int* S = J.S;
+    SF* rs = J.rowsum;
+    SF* mf = J.fmax;
+    const SF* P = J.P;
+    bool bad = false;
+    J.ok = 0;
+    const int ck = J.ck;
+    const int nb = (ck && m) ? (m + ck - 1) / ck : 1;   // blocks (one: the full tables)
+    // tp: M+X+Y of the previous forward row; uy: the Y carry's carry-free input.  Full
+    // tables: r5 / r4 (r5 later the match scratch); checkpointed: q0 / q1, which the
+    // recomputations inside the backward use again.
+    SF* tp = ck ? J.q0 : J.r5;
+    SF* uy = ck ? J.q1 : J.r4;
+
+    if (!J.full) for (int j = J.slo[0]; j <= J.shi[0]; ++j) { FM[j] = 0.0; FX[j] = 0.0; FY[j] = 0.0; }
+    else for (int j = 0; j <= n; ++j) { FM[j] = 0.0; FX[j] = 0.0; FY[j] = 0.0; }
+    if (L || G) { for (int j = 0; j <= n; ++j) FM[j] = 1.0; }
+    else {
+        FM[0] = 1.0;
+        if (J.bj >= 1) FY[1] = oa;
+        for (int j = 2; j <= J.bj; ++j) FY[j] = FY[j - 1] * ea;
+    }
+    {
+        SF mx = 0.0;
+        for (int j = J.slo[0]; j <= J.shi[0]; ++j) {
+            tp[j] = FM[j] + FX[j] + FY[j];
+            mx = NWGRAD_SP_VMAX(mx, tp[j]);
+        }
+        mf[0] = mx;
+    }
+    S[0] = 0;
+    if (L || (G && m == 0)) { SF s = 0.0; for (int j = J.jlo0[0]; j <= J.jhi0[0]; ++j) s += tp[j]; rs[0] = s; }
+    if (!ck) { if (!sp_affine_fwd<SF, Tr>(J, FM, FX, FY, 0, 1, m, tp, uy)) return; }
+    else
+        for (int c = 0; c < nb; ++c) {
+            const int i0 = c * ck, i1 = std::min(i0 + ck, m);
+            const int lo = J.slo[i0], hi = J.shi[i0];
+            const size_t ko = static_cast<size_t>(ck) * st, co = static_cast<size_t>(c) * st;
+            if (c > 0) { sp_copy_span(FM, FM + ko, lo, hi); sp_copy_span(FX, FX + ko, lo, hi); sp_copy_span(FY, FY + ko, lo, hi); }
+            sp_copy_span(J.cM + co, FM, lo, hi); sp_copy_span(J.cX + co, FX, lo, hi);
+            sp_copy_span(J.cY + co, FY, lo, hi); sp_copy_span(J.cT + co, tp, lo, hi);
+            if (i0 < i1 && !sp_affine_fwd<SF, Tr>(J, FM, FX, FY, i0, i0 + 1, i1, tp, uy)) return;
+            if (J.ckh) sp_ck_hash<SF>(J, FM, FX, FY, i0, i0 + 1, i1, false);
+        }
+    int base = (nb - 1) * ck, curb = nb - 1;   // the block in the buffer, and its slot-0 row
     const bool mn_in = n >= J.jlo0[m] && n <= J.jhi0[m];
-    const size_t cmn = static_cast<size_t>(m) * st + n;
+    const size_t cmn = static_cast<size_t>(m - base) * st + n;
     const SF corner = mn_in ? FM[cmn] + FX[cmn] + FY[cmn] : 0.0;
     int ze; double izr;
     if (!sp_log_z(J, S, rs, corner, ze, izr)) {
@@ -605,12 +746,19 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine_t(SoftPairJobT<SF>& J) noexcept {
     }
 
     SF *cM = J.r0, *cX = J.r1, *cY = J.r2, *nM = J.r3, *nX = J.r4;
-    SF* tmp = tp;
+    SF* tmp = J.r5;
     for (size_t j = 0; j < w; ++j) { cM[j] = cX[j] = cY[j] = nM[j] = nX[j] = 0.0; }
     int clo = 0, chi = n, nlo = 0, nhi = n;
     int Tn = 0;
     double g_ea = 0.0, g_eb = 0.0, g_oa = 0.0, g_ob = 0.0, loss = 0.0, lossu = 0.0;   // as soft_pair_linear_t
     for (int i = m; i >= 0; --i) {
+        if (ck) {   // row i reads forward rows i and i-1: block (i-1)/ck (row 0: block 0)
+            const int cb = i ? (i - 1) / ck : 0;
+            if (cb != curb) {
+                curb = cb; base = cb * ck;
+                if (!sp_affine_reload<SF, Tr>(J, cb)) return;
+            }
+        }
         const int lo0 = J.jlo0[i], hi0 = J.jhi0[i];
         for (int j = clo; j <= chi; ++j) { cM[j] = 0.0; cX[j] = 0.0; }
         // cY is not swapped (only M and X of the next row are read): it still holds
@@ -644,7 +792,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine_t(SoftPairJobT<SF>& J) noexcept {
 
         // One vector pass: final M/X, the row max, every gradient sum and the match
         // posteriors, all on the pre-rescale values.
-        const size_t ro = static_cast<size_t>(i) * st;
+        const size_t ro = static_cast<size_t>(i - base) * st;
         const SF* __restrict fM = FM + ro; const SF* __restrict fX = FX + ro;
         const SF* __restrict fY = FY + ro;
         SF* __restrict bM = cM; SF* __restrict bX = cX;
