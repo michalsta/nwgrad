@@ -676,6 +676,8 @@ struct Aligner {
     // scalar backend): the batch planner must see it too, or it puts a pair this aligner
     // would split (Hirschberg past hb_cutoff) on a shared fill that computes Pointers'.
     static constexpr TracebackMode grid_fallback_tb() noexcept { return kGridFallbackTb; }
+    // The last compute_viterbi() ran the Grid traceback (not its Pointers fallback): for tests.
+    bool used_grid() const noexcept { return grid_; }
     void set_traceback(TracebackMode t) noexcept {
         tb_auto_ = (t == TracebackMode::Default);
         tb_ = tb_auto_ ? kDefaultTb : t;
@@ -1703,6 +1705,20 @@ private:
                 const int be = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
                 if (be == kBackendScalar || !grid_ok_(level_kernels(be))) return kGridFallbackTb;
             }
+        // `auto` resolved to a Hirschberg mode (Local float32 / integers, Global integers,
+        // Glocal float32 / integers) on a pair that SPLITS — past hb_cutoff and, where the
+        // type has one, past the pointer budget: Grid where it applies (2026-11-05).  It is
+        // Pointers' result (exact, where hirschberg_pmax at float32 is not; Pointers' ties,
+        // where Hirschberg has its own) at ~1x a score-only pass in O(k (m + n)) memory,
+        // against 2-3.5x for the recursion (AGENTS.md, "Grid traceback").  Within the
+        // budget the Pointers fill stays; a tracked pair or the scalar backend keeps the
+        // Hirschberg mode — the batch planners ask hb_splits of that mode, which is true
+        // either way, so such pairs run their own fill in both cases.
+        if constexpr (GM == GapModel::Affine && AB == AlignBand::Full)
+            if (tb_auto_ && is_hirschberg(tb_) && hb_splits(tb_, kAutoPointerCells, hb_cutoff_, m_, n_)) {
+                const int be = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
+                if (be != kBackendScalar && grid_ok_(level_kernels(be))) return TracebackMode::Grid;
+            }
         return tb_;
     }
 
@@ -2452,8 +2468,7 @@ private:
             return;
         }
         // Grid: where it is implemented (grid_ok_), else Pointers below — the same result.
-        if constexpr (GM == GapModel::Affine && AM == AlignMode::Global && AB == AlignBand::Full &&
-                      std::is_floating_point_v<T>)
+        if constexpr (GM == GapModel::Affine && AB == AlignBand::Full)
             if (tb_ == TracebackMode::Grid && grid_ok_(level_kernels(backend))) {
                 viterbi_affine_grid(buf, level_kernels(backend));
                 return;
@@ -4165,7 +4180,7 @@ private:
     std::vector<int> guide_j_grid_() const {
         std::vector<int> gj;
         guide_affine_init(gj);
-        int i = 0, j = 0;
+        int i = hb_start_i_, j = hb_start_j_;   // Local / Glocal: the path's start
         for (unsigned char op : hops_) {
             if (op == 0)      { gj[static_cast<std::size_t>(i)] = j; ++i; ++j; }
             else if (op == 1) { gj[static_cast<std::size_t>(i)] = j; ++i; }
@@ -4203,54 +4218,82 @@ private:
         }
     };
 
+    // Opens >= 0: the D/X form.  Local also needs the extends >= 0: the forward pass tracks
+    // the best cell over M alone (the Pointers kernel's `monly` argument, grid_kernel_impl.inl).
     bool grid_ok_(const LevelKernels& K) const noexcept {
-        if (!K.template of<T>().grid_fwd || tr_ || m_ <= hb_cutoff_ || n_ == 0) return false;
-        return static_cast<T>(params_->gap_open_a) >= T(0) && static_cast<T>(params_->gap_open_b) >= T(0);
+        if constexpr (GM != GapModel::Affine || AB != AlignBand::Full) return false;
+        else {
+            if (!K.template of<T>().grid_fwd || tr_ || m_ <= hb_cutoff_ || n_ == 0) return false;
+            const bool opens = static_cast<T>(params_->gap_open_a) >= T(0) && static_cast<T>(params_->gap_open_b) >= T(0);
+            if constexpr (AM == AlignMode::Local)
+                return opens && static_cast<T>(params_->gap_extend_a) >= T(0) && static_cast<T>(params_->gap_extend_b) >= T(0);
+            else return opens;
+        }
     }
 
+    // The borders are viterbi_affine_ptr's row 0 and column 0 (M, X, Y) for the mode; the
+    // walk starts at the mode's end cell: (m, n) for Global, the best cell for Local (found
+    // by the top-level forward pass, find = 1), the best cell of row m for Glocal (find = 2).
     void viterbi_affine_grid(DpBuffer& buf, const LevelKernels& K) {
         const T go_a = static_cast<T>(params_->gap_open_a), ge_a = static_cast<T>(params_->gap_extend_a);
         const T go_b = static_cast<T>(params_->gap_open_b), ge_b = static_cast<T>(params_->gap_extend_b);
-        // the borders, as viterbi_affine_ptr leaves row 0 and column 0 (M, X, Y)
+        const T ninf = NINF();
         const std::size_t n1 = static_cast<std::size_t>(n_) + 1, m1 = static_cast<std::size_t>(m_) + 1;
         buf.gtop.resize(3 * n1); buf.gleft.resize(3 * m1);
         for (std::size_t j = 0; j < n1; ++j) {
-            buf.gtop[j] = j == 0 ? T(0) : NEG_INF;
-            buf.gtop[n1 + j] = NEG_INF;
-            buf.gtop[2 * n1 + j] = j == 0 ? NEG_INF : -(go_a + static_cast<T>(j) * ge_a);
+            if constexpr (AM != AlignMode::Global) {   // row 0: every cell a start
+                buf.gtop[j] = T(0); buf.gtop[n1 + j] = ninf; buf.gtop[2 * n1 + j] = ninf;
+            } else {
+                buf.gtop[j] = j == 0 ? T(0) : ninf;
+                buf.gtop[n1 + j] = ninf;
+                buf.gtop[2 * n1 + j] = j == 0 ? ninf : -(go_a + static_cast<T>(j) * ge_a);
+            }
         }
         for (std::size_t i = 0; i < m1; ++i) {
-            buf.gleft[i] = i == 0 ? T(0) : NEG_INF;
-            buf.gleft[m1 + i] = i == 0 ? NEG_INF : -(go_b + static_cast<T>(i) * ge_b);
-            buf.gleft[2 * m1 + i] = NEG_INF;
+            if constexpr (AM == AlignMode::Local) {
+                buf.gleft[i] = T(0); buf.gleft[m1 + i] = ninf;
+            } else {
+                buf.gleft[i] = i == 0 ? T(0) : ninf;
+                buf.gleft[m1 + i] = i == 0 ? ninf : -(go_b + static_cast<T>(i) * ge_b);
+            }
+            buf.gleft[2 * m1 + i] = ninf;
         }
         if (buf.glv.size() < static_cast<std::size_t>(kGridDepth)) buf.glv.resize(kGridDepth);   // never again: grid_solve holds references
         hops_.clear();
         hops_.reserve(static_cast<std::size_t>(m_ + n_));
+        best_i_ = m_; best_j_ = n_; best_tbl_ = TBTable::M;
         int i = m_, j = n_, st = -1;
+        constexpr int find = AM == AlignMode::Local ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
         grid_solve(buf, K, 0, 0, GridLine{buf.gtop.data(), n1, 1}, GridLine{buf.gleft.data(), m1, 1},
-                   0, i, j, st);
-        // the borders: forced moves, as walk_affine's
-        for (; i == 0 && j > 0; --j) hops_.push_back(2);
-        for (; j == 0 && i > 0; --i) hops_.push_back(1);
+                   0, i, j, st, find);
+        // the borders: forced moves, as walk_affine's (Local: none, its borders are starts;
+        // Glocal: row 0 is a start, column 0 climbs to it)
+        if constexpr (AM == AlignMode::Global)
+            for (; i == 0 && j > 0; --j) hops_.push_back(2);
+        if constexpr (AM != AlignMode::Local)
+            for (; j == 0 && i > 0; --i) hops_.push_back(1);
         std::reverse(hops_.begin(), hops_.end());
-        best_i_ = m_; best_j_ = n_;
-        hb_start_i_ = 0; hb_start_j_ = 0;
+        hb_start_i_ = i; hb_start_j_ = j;
         hirschberg_ = true;
         grid_ = true;
     }
 
+    // find (the top level only): 1 = Local, the walk starts at the best cell (none above 0:
+    // the empty path); 2 = Glocal, at the best cell of row m.  st = 3 after a Local stop
+    // (an M cell with code 3, as the Pointers walk), which ends every level's walk.
     void grid_solve(DpBuffer& buf, const LevelKernels& K, int r0, int c0, const GridLine& top,
-                    const GridLine& left, int depth, int& i, int& j, int& st) {
+                    const GridLine& left, int depth, int& i, int& j, int& st, int find = 0) {
         const int r1 = i, c1 = j, h = r1 - r0, w = c1 - c0;
         if (static_cast<long>(h) * w <= kGridBase || h < 2 * kGridMin || w < 2 * kGridMin ||
             depth + 1 >= kGridDepth) {
-            grid_base(buf, r0, r1, c0, c1, top, left, i, j, st);
+            grid_base(buf, r0, r1, c0, c1, top, left, i, j, st, find);
             return;
         }
         auto& L = buf.glv[static_cast<std::size_t>(depth)];
         const int R = std::max(kGridMin, (h + kGridK - 1) / kGridK);
         GridFwdJob<T> J{};
+        J.sat = sat_;
+        J.local = AM == AlignMode::Local; J.find_best = find == 1; J.end_row = find == 2;
         J.a = a_idx_.data(); J.b = b_idx_.data(); J.blk = blkT_; J.nalpha = nalpha_;
         J.go_a = static_cast<T>(params_->gap_open_a); J.ge_a = static_cast<T>(params_->gap_extend_a);
         J.go_b = static_cast<T>(params_->gap_open_b); J.ge_b = static_cast<T>(params_->gap_extend_b);
@@ -4260,13 +4303,14 @@ private:
         J.R = R; J.spacing = std::max(kGridMin, (w + kGridK - 1) / kGridK);
         J.rows = &L.rows; J.cols = &L.cols; J.colid = &L.colid; J.buf = &buf;
         K.template of<T>().grid_fwd(J);
+        if (find != 0 && !grid_end_(J.best, J.best_i, J.best_j, find, i, j, st)) return;
         const int W = J.W, q = J.q;
         L.gcols.clear();
         L.gcols.push_back({c0, -1});                     // the rectangle's left line
         for (int t = 0; t < q * W; ++t)
             if (L.colid[static_cast<std::size_t>(t)] >= 0) L.gcols.push_back({L.colid[static_cast<std::size_t>(t)], t});
         std::sort(L.gcols.begin(), L.gcols.end());
-        while (i > r0 && j > c0) {
+        while (i > r0 && j > c0 && st != 3) {
             const int br0 = r0 + ((i - r0 - 1) / R) * R;   // the band holding row i
             auto it = std::lower_bound(L.gcols.begin(), L.gcols.end(), std::make_pair(j, -2));
             --it;                                           // the last line left of column j
@@ -4283,10 +4327,22 @@ private:
         }
     }
 
+    // The end cell a Local / Glocal walk starts from (find 1 / 2), as viterbi_affine_ptr
+    // picks it.  False: Local with nothing above 0 — the empty path at (0, 0), score 0.
+    bool grid_end_(T bv, int bi, int bj, int find, int& i, int& j, int& st) {
+        if (find == 1 && !(bv > T(0))) {
+            viterbi_score_ = 0; best_i_ = 0; best_j_ = 0; best_tbl_ = TBTable::M;
+            i = 0; j = 0; st = 3;
+            return false;
+        }
+        best_i_ = bi; best_j_ = bj; i = bi; j = bj;
+        return true;
+    }
+
     // The base block: viterbi_affine_ptr's fill over [r0, r1] x [c0, c1] from its borders,
-    // then the walk from (i, j) until the top row or the left column.
+    // then the walk from (i, j) until the top row or the left column (or a Local stop).
     void grid_base(DpBuffer& buf, int r0, int r1, int c0, int c1, const GridLine& top,
-                   const GridLine& left, int& i, int& j, int& st) {
+                   const GridLine& left, int& i, int& j, int& st, int find = 0) {
         const T go_a = static_cast<T>(params_->gap_open_a), ge_a = static_cast<T>(params_->gap_extend_a);
         const T go_b = static_cast<T>(params_->gap_open_b), ge_b = static_cast<T>(params_->gap_extend_b);
         const std::size_t bw = static_cast<std::size_t>(c1 - c0) + 1, sz = (static_cast<std::size_t>(r1 - r0) + 1) * bw;
@@ -4313,15 +4369,38 @@ private:
             for (int jj = c0 + 1; jj <= c1; ++jj) {
                 const std::size_t k = at(ii, jj), up = k - bw, dg = up - 1, lf = k - 1;
                 const T dgM = bM[dg], dgX = bX[dg], dgY = bY[dg];
-                bM[k] = nw_add<T>(std::max({dgM, dgX, dgY}), subTu(ii, jj));
-                dM[k] = pick(dgM, dgX, dgY);
+                T m_val = nw_add<T>(std::max({dgM, dgX, dgY}), subTu(ii, jj));
+                unsigned char km = pick(dgM, dgX, dgY);
+                if constexpr (AM == AlignMode::Local) {   // viterbi_affine_ptr's clamp and stop code
+                    m_val = std::max(m_val, static_cast<T>(0));
+                    km = static_cast<unsigned char>(km | (3u * static_cast<unsigned>(m_val <= static_cast<T>(0))));
+                }
+                bM[k] = m_val; dM[k] = km;
                 const T ux = nw_sub(nw_sub(bM[up], go_b), ge_b), vx = nw_sub(bX[up], ge_b), wx = nw_sub(nw_sub(bY[up], go_b), ge_b);
                 bX[k] = std::max({ux, vx, wx}); dX[k] = pick(ux, vx, wx);
                 const T uy = nw_sub(nw_sub(bM[lf], go_a), ge_a), vy = nw_sub(nw_sub(bX[lf], go_a), ge_a), wy = nw_sub(bY[lf], ge_a);
                 bY[k] = std::max({uy, vy, wy}); dY[k] = pick(uy, vy, wy);
             }
         }
-        if (st < 0) {   // the end cell (m, n): its argmax and the score, as viterbi_affine_ptr
+        if (find == 1) {   // Local: the best cell, local_row_best_'s rule (rows, then columns; strict >)
+            T bv = T(0); int bi = 0, bj = 0;
+            for (int ii = r0 + 1; ii <= r1; ++ii)
+                for (int jj = c0 + 1; jj <= c1; ++jj) {
+                    const std::size_t k = at(ii, jj);
+                    const T v = std::max({bM[k], bX[k], bY[k]});
+                    if (v > bv) { bv = v; bi = ii; bj = jj; }
+                }
+            if (!grid_end_(bv, bi, bj, find, i, j, st)) return;
+        } else if (find == 2) {   // Glocal: the best cell of row r1 (glocal_end_rows_)
+            T bv = std::max({bM[at(r1, c0)], bX[at(r1, c0)], bY[at(r1, c0)]}); int bj = c0;
+            for (int jj = c0 + 1; jj <= c1; ++jj) {
+                const std::size_t k = at(r1, jj);
+                const T v = std::max({bM[k], bX[k], bY[k]});
+                if (v > bv) { bv = v; bj = jj; }
+            }
+            grid_end_(bv, r1, bj, find, i, j, st);
+        }
+        if (st < 0) {   // the end cell: its argmax and the score, as viterbi_affine_ptr
             const std::size_t k = at(i, j);
             const T vm = bM[k], vx = bX[k], vy = bY[k];
             viterbi_score_ = std::max({vm, vx, vy});
@@ -4330,6 +4409,8 @@ private:
         }
         while (i > r0 && j > c0) {
             const std::size_t k = at(i, j);
+            if constexpr (AM == AlignMode::Local)
+                if (st == 0 && dM[k] == 3) { st = 3; return; }   // a clamped M cell: the path's start
             hops_.push_back(static_cast<unsigned char>(st));
             if (st == 0)      { st = dM[k]; --i; --j; }
             else if (st == 1) { st = dX[k]; --i; }

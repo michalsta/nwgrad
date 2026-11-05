@@ -252,9 +252,16 @@ struct ScoreJob {
 // sets of segment-aligned columns (cols[((t*3 + s)*(h+1) + (i-r0))*W + lane], the column
 // of set t / lane l in colid[t*W + l], -1 past the rectangle).  The kernel picks q from
 // `spacing` (columns between lines) and its own width, resizes the outputs, and reports
-// W and q.  Every value is the full fill's, bit for bit (opens >= 0, floating T).
+// W and q.  Every value is the full fill's, bit for bit (opens >= 0; every scalar type).
+// local: M clamps at 0 (Local); find_best (Local, the top level): the best M cell, strict >,
+// row then column order, into best / best_i / best_j; end_row (Glocal, the top level): the
+// best cell of row r1 over max(M, X, Y), column order, likewise; sat: the saturating
+// int16 regime (nw_sat).
 template <class T>
 struct GridFwdJob {
+    bool sat = false;
+    bool local = false, find_best = false, end_row = false;
+    T best = T(0); int best_i = 0, best_j = 0;   // out (find_best / end_row)
     const unsigned char* a;                 // full encoded sequences
     const unsigned char* b;
     const T* blk; int nalpha;
@@ -917,7 +924,7 @@ struct TypedKernels {
     inter_fn           inter_score = nullptr;        // inter-pair score only (Full)
     int                inter_w = 0;                  // the inter-pair lane count (pairs per call)
     using grid_fn = void (*)(GridFwdJob<T>&);
-    grid_fn            grid_fwd = nullptr;           // TracebackMode::Grid's forward pass (floating T)
+    grid_fn            grid_fwd = nullptr;           // TracebackMode::Grid's forward pass
 };
 
 struct LevelKernels {

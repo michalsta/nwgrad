@@ -91,3 +91,55 @@ def test_auto_grid_fallback_sizes_its_tables(cls, fill):
         b.score_and_grad(keep_paths=True)
         res[tb] = b.scores()
     np.testing.assert_array_equal(res["auto"], res["pointers"])
+
+
+BATCHES = {"float32": nwgrad.SeqPairBatch, "float64": nwgrad.SeqPairBatchDouble,
+           "int16": nwgrad.SeqPairBatchInt16, "int32": nwgrad.SeqPairBatchInt32,
+           "int64": nwgrad.SeqPairBatchInt64}
+
+
+def _run(cls, A, B, p, tb, mode, threads, cutoff=16, kernel=None):
+    b = cls(A, B, p, n_threads=threads, traceback=tb, mode=mode)
+    b.fill = "striped"
+    b.hb_cutoff = cutoff
+    if kernel is not None:
+        b.kernel = kernel
+    b.score_and_grad(keep_paths=True)
+    mats, gaps = b.grads()
+    return (b.scores(), mats, gaps, [b[i].aligned() for i in range(len(b))],
+            [list(b[i].guide_j) for i in range(len(b))])
+
+
+def _same(got, ref):
+    np.testing.assert_array_equal(got[0], ref[0])
+    np.testing.assert_array_equal(got[1], ref[1])
+    np.testing.assert_array_equal(got[2], ref[2])
+    assert got[3] == ref[3]
+    assert got[4] == ref[4]
+
+
+@pytest.mark.parametrize("tname", list(BATCHES))
+@pytest.mark.parametrize("mode", ["global", "local", "glocal"])
+@pytest.mark.parametrize("pi", range(len(PARAMS)))
+def test_batch_grid_equals_pointers_every_mode_and_type(tname, mode, pi):
+    if tname.startswith("int") and pi == 1:
+        pytest.skip("integer types take integral parameters only")
+    # int16 BLOSUM62 11/1 crosses the quarter rule at ~L300: the saturating regime
+    A, B = related_pairs(10, 40, 600 if tname == "int16" else 400, seed=pi + 17)
+    if mode == "local":   # unrelated flanks, so the local path starts and ends inside
+        rng = np.random.default_rng(pi)
+        fl = lambda: "".join(rng.choice(list(AA), int(rng.integers(0, 60))))
+        A = [fl() + a + fl() for a in A]
+        B = [fl() + b + fl() for b in B]
+    cls, p = BATCHES[tname], PARAMS[pi]
+    _same(_run(cls, A, B, p, "grid", mode, 2), _run(cls, A, B, p, "pointers", mode, 2))
+
+
+@pytest.mark.parametrize("tname", ["float32", "int32"])
+@pytest.mark.parametrize("mode", ["global", "local", "glocal"])
+def test_auto_takes_grid_where_it_split(tname, mode):
+    # pairs past hb_cutoff that `auto` used to split (hirschberg_pmax): now Grid, i.e.
+    # Pointers' result (Global float32 was already Grid)
+    A, B = related_pairs(6, 200, 400, seed=3)
+    cls, p = BATCHES[tname], PARAMS[0]
+    _same(_run(cls, A, B, p, "auto", mode, 2, cutoff=64), _run(cls, A, B, p, "pointers", mode, 2, cutoff=64))

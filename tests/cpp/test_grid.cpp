@@ -4,13 +4,16 @@
 // aligned strings and hard gradient, ties included — on every backend, both floating
 // precisions.  Pairs above hb_cutoff take the grid (a small cutoff here, so the recursion
 // and its block borders are exercised at modest lengths); the rest, and every case Grid
-// does not implement (Local, linear, tracks, negative opens, integer T, scalar backend),
-// run as Pointers, which this checks too.  Random problems mix ties (small-integer
+// does not implement (linear, tracks, negative opens, Local with a negative extend, scalar
+// backend), run as Pointers, which this checks too.  Since 2026-11-05: Global, Local and
+// Glocal, floating and integer T (int16 in both of its regimes).  Random problems mix ties (small-integer
 // matrices and gaps), non-representable extends (0.1) and planted homology (long gap
 // runs).  NWGRAD_GRID_FUZZ=<n> scales the iteration count.
 
 #include "catch.hpp"
 
+#include <array>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <random>
@@ -67,7 +70,7 @@ void check_grid(const std::string& a, const std::string& b, const AlignParams& p
     REQUIRE(gg.gap_open_b == gr.gap_open_b);
     REQUIRE(gg.gap_extend_b == gr.gap_extend_b);
     for (std::size_t k = 0; k < 400; ++k) REQUIRE(gg.matrix.data()[k] == gr.matrix.data()[k]);
-    if (static_cast<int>(a.size()) > cutoff) ++n_grid;
+    if (got.used_grid()) ++n_grid;
 }
 
 AlignParams random_params(std::mt19937& rng, int scheme) {
@@ -122,6 +125,64 @@ TEST_CASE("Grid traceback is bit-identical to Pointers (affine Global)", "[grid]
     REQUIRE(n_grid > 0);
 }
 
+// Integral parameters (the integer types take no other); scheme 3: BLOSUM-like range with
+// large opens, which puts int16 past the quarter rule (the saturating regime) at ~L300.
+AlignParams random_int_params(std::mt19937& rng, int scheme) {
+    std::array<double, 400> src{};
+    std::uniform_int_distribution<int> sc(-4, 6), sb(-4, 11);
+    for (int i = 0; i < 20; ++i)
+        for (int j = 0; j < 20; ++j)
+            src[i * 20 + j] = scheme == 0 ? (i == j ? 2.0 : -1.0) : (scheme == 3 ? sb(rng) : sc(rng));
+    AlignParams p(SubstMatrix(src.data()));
+    if (scheme == 1)      { p.gap_open_a = 0; p.gap_extend_a = 1; p.gap_open_b = 2; p.gap_extend_b = 0; }
+    else if (scheme == 3) { p.gap_open_a = 11; p.gap_extend_a = 1; p.gap_open_b = 10; p.gap_extend_b = 2; }
+    else                  { p.gap_open_a = 3; p.gap_extend_a = 1; p.gap_open_b = 2; p.gap_extend_b = 1; }
+    return p;
+}
+
+template <AlignMode AM>
+void grid_mode_round(std::uint32_t seed, long iters, bool ints) {
+    std::mt19937 rng(seed);
+    long n_grid = 0, ng[5] = {0, 0, 0, 0, 0};   // per type: double, float, int32, int64, int16
+    std::uniform_int_distribution<int> cut(1, 40);
+    for (long t = 0; t < iters; ++t) {
+        auto [A, B] = random_pair(rng, t % 10 == 0 ? 1000 : 400);
+        const int cutoff = cut(rng);
+        if (!ints) {
+            const AlignParams p = random_params(rng, static_cast<int>(t % 3));
+            for (int kern : grid_backends()) {
+                check_grid<GapModel::Affine, AM, double>(A, B, p, kern, cutoff, ng[0]);
+                check_grid<GapModel::Affine, AM, float>(A, B, p, kern, cutoff, ng[1]);
+            }
+        } else {
+            const int scheme = static_cast<int>(t % 4);
+            const AlignParams p = random_int_params(rng, scheme == 2 ? 0 : scheme);
+            for (int kern : grid_backends()) {
+                check_grid<GapModel::Affine, AM, int32_t>(A, B, p, kern, cutoff, ng[2]);
+                check_grid<GapModel::Affine, AM, int64_t>(A, B, p, kern, cutoff, ng[3]);
+                // int16 within its bound (the plain or the saturating regime) only
+                if (A.size() + B.size() < 1400 || scheme == 0)
+                    check_grid<GapModel::Affine, AM, int16_t>(A, B, p, kern, cutoff, ng[4]);
+            }
+        }
+    }
+    // every type the round ran took the grid on some pair (not only its Pointers fallback)
+    for (int k = ints ? 2 : 0; k < (ints ? 5 : 2); ++k) REQUIRE(ng[k] > 0);
+    (void)n_grid;
+}
+
+TEST_CASE("Grid traceback is bit-identical to Pointers (affine Local)", "[grid][traceback]") {
+    grid_mode_round<AlignMode::Local>(20261105, grid_iters(40), false);
+}
+TEST_CASE("Grid traceback is bit-identical to Pointers (affine Glocal)", "[grid][traceback]") {
+    grid_mode_round<AlignMode::Glocal>(20261106, grid_iters(30), false);
+}
+TEST_CASE("Grid traceback is bit-identical to Pointers (integer T, every mode)", "[grid][traceback]") {
+    grid_mode_round<AlignMode::Global>(20261107, grid_iters(30), true);
+    grid_mode_round<AlignMode::Local>(20261108, grid_iters(30), true);
+    grid_mode_round<AlignMode::Glocal>(20261109, grid_iters(20), true);
+}
+
 TEST_CASE("Grid traceback runs as Pointers where it is not implemented", "[grid][traceback]") {
     std::mt19937 rng(7);
     long n_grid = 0;
@@ -129,8 +190,10 @@ TEST_CASE("Grid traceback runs as Pointers where it is not implemented", "[grid]
         AlignParams p = random_params(rng, t % 3);
         auto [A, B] = random_pair(rng, 300);
         for (int kern : grid_backends()) {
-            check_grid<GapModel::Affine, AlignMode::Local, double>(A, B, p, kern, 8, n_grid);
             check_grid<GapModel::Linear, AlignMode::Global, float>(A, B, p, kern, 8, n_grid);
+            AlignParams r = p;   // Local with a negative extend: the best cell is not an M cell
+            r.gap_extend_b = -0.25;
+            check_grid<GapModel::Affine, AlignMode::Local, double>(A, B, r, kern, 8, n_grid);
             AlignParams q = p;   // a negative open: the D/X form does not apply
             q.gap_open_a = -0.5;
             check_grid<GapModel::Affine, AlignMode::Global, double>(A, B, q, kern, 8, n_grid);
