@@ -561,36 +561,59 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
             // read before this pass overwrites it with max(D, Y)), with the lanes' carry-in
             // known.  Segment 0 as the prefix form has it, y(0) = max(vcin, Q(0)) - ramp(0)
             // (Q(0) is pass 1's seed, exactly -inf + base); then the serial step
-            // y(s) = max(y(s-1) - ge_a, open(s-1)), which is max(P(s-1), open(s-1) +
-            // ramp(s)) - ramp(s) with the ramp cancelled: ramp(s) = ramp(s-1) + ge_a.  In
-            // the plain regime nothing wraps (the quarter rule bounds every operand), so
-            // the integer identities hold exactly and Y is the stored-prefix form's bit for
-            // bit.  Saturating (int16 past the quarter rule): with ge_a >= 0 no operand
-            // clamps but at the bottom, and a bottom clamp commutes with max and with the
-            // subtractions, so again the same Y; with ge_a < 0 the prefix form lifts a
-            // saturated open to lowest() + |ramp| where the serial step keeps lowest():
-            // only sentinel-derived values differ, and those stay below every reachable
-            // value (nw_int_bound_check), so every reachable cell and the score are the
-            // same.  Per vector cell: a subtraction and a max on the chain and the open off
-            // it, no ramp, no Y row -- one store (pass 1) and the Y load (here) fewer than
-            // the stored-prefix form, four rolling rows instead of five.
+            // y(s) = max(y(s-1) - ge_a, open(s-1)) -- max(P(s-1), open(s-1) + ramp(s)) -
+            // ramp(s) with the ramp cancelled, ramp(s) = ramp(s-1) + ge_a -- two segments
+            // per dependent step: y(s+1) = max(max(open(s), open(s-1) - ge_a), y(s-1) -
+            // 2 ge_a), one subtraction and one max on the chain per two segments (the max
+            // off it pinned against gcc's re-association, as in carry_pass).  In the plain
+            // regime nothing wraps (the quarter rule bounds every operand), so the integer
+            // identities hold exactly and Y is the stored-prefix form's bit for bit.
+            // Saturating (int16 past the quarter rule): with ge_a >= 0 nothing clamps but
+            // at the bottom, and a bottom clamp commutes with max and composes over the
+            // subtractions, so again the same Y; with ge_a < 0 a saturated open lifted by
+            // the ramp (the prefix form) or not (this one) differs, but only
+            // sentinel-derived values differ, and those stay below every reachable value
+            // (nw_int_bound_check), so every reachable cell and the score are the same.
+            // Measured (skynet sse4, instructions per vector cell, Global / Local):
+            // stored prefix 31.5 / 36.0, recomputed prefix (ramp kept) 34.0 / 39.0,
+            // serial one segment a step 31.0 / 33.9 but 1.02-1.08x SLOWER (sub + max on
+            // the chain, 2-cycle latencies on Piledriver), this form see AGENTS.md.
             vd Op, y;
-            auto step2 = [&]<bool Mk, bool First>(int s) __attribute__((always_inline)) {
-                vd d; d.copy_from(cD + (std::size_t)s * W, stdx::element_aligned);
-                if constexpr (First) y = vsub<Sat>(stdx::max(vcin, vadd<Sat>(vsub<Sat>(vninf, fBase), fBase)), fBase);
-                else                 y = stdx::max(vsub<Sat>(y, vge_a), Op);
-                Op = open_pen<Sat>(d, vgo_a, vge_a, vgoe_a);
-                d = stdx::max(d, y);
+            const vd vge2_a = vge_a + vge_a;
+            auto fin = [&]<bool Mk>(vd d, const vd& yv, int s) __attribute__((always_inline)) {
+                d = stdx::max(d, yv);
                 d.copy_to(cD + (std::size_t)s * W, stdx::element_aligned);
-                if constexpr (Local && !MOnly) vbest = stdx::max(vbest, mpad.template operator()<Mk>(y, s));
+                if constexpr (Local && !MOnly) vbest = stdx::max(vbest, mpad.template operator()<Mk>(yv, s));
             };
-            if (s0 == 0) step2.template operator()<true, true>(0);
-            else         step2.template operator()<false, true>(0);
+            {
+                vd d; d.copy_from(cD, stdx::element_aligned);
+                y = vsub<Sat>(stdx::max(vcin, vadd<Sat>(vsub<Sat>(vninf, fBase), fBase)), fBase);
+                Op = open_pen<Sat>(d, vgo_a, vge_a, vgoe_a);
+                if (s0 == 0) fin.template operator()<true>(d, y, 0);
+                else         fin.template operator()<false>(d, y, 0);
+            }
+            auto trip2 = [&]<bool Mk>(int s) __attribute__((always_inline)) {
+                vd d0, d1;
+                d0.copy_from(cD + (std::size_t)s * W, stdx::element_aligned);
+                d1.copy_from(cD + (std::size_t)(s + 1) * W, stdx::element_aligned);
+                const vd O0 = open_pen<Sat>(d0, vgo_a, vge_a, vgoe_a);
+                const vd O1 = open_pen<Sat>(d1, vgo_a, vge_a, vgoe_a);
+                const vd y0 = stdx::max(vsub<Sat>(y, vge_a), Op);
+                const vd y1 = stdx::max(carry_pin(stdx::max(O0, vsub<Sat>(Op, vge_a))), vsub<Sat>(y, vge2_a));   // chain
+                fin.template operator()<Mk>(d0, y0, s);
+                fin.template operator()<Mk>(d1, y1, s + 1);
+                y = y1; Op = O1;
+            };
             int s = 1;
             if constexpr (Local && !MOnly) {
-                for (; s < s0; ++s) step2.template operator()<false, false>(s);
+                for (; s + 1 < s0; s += 2) trip2.template operator()<false>(s);
             }
-            for (; s < seg; ++s) step2.template operator()<true, false>(s);
+            for (; s + 1 < seg; s += 2) trip2.template operator()<true>(s);
+            if (s < seg) {
+                vd d; d.copy_from(cD + (std::size_t)s * W, stdx::element_aligned);
+                y = stdx::max(vsub<Sat>(y, vge_a), Op);
+                fin.template operator()<true>(d, y, s);
+            }
         } else
         for (int r = 0; r < W; ++r) {
             vd last; last.copy_from(cY + (std::size_t)(seg - 1) * W, stdx::element_aligned);
