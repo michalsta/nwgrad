@@ -1766,8 +1766,13 @@ private:
         // than Pointers and 2.1-5.5x than pmax (skynet sse4, AGENTS.md "Grid traceback").
         // Within the budget Pointers stays; a tracked pair or the scalar backend keeps pmax.
         // The batch planners ask hb_splits of pmax, true either way, so such pairs run their
-        // own fill in both cases.
-        if constexpr (GM == GapModel::Affine && AB == AlignBand::Full && nw_is_int<T>)
+        // own fill in both cases.  NOT int16 Global / Glocal: at 32 int16 lanes (AVX-512,
+        // solace) pmax beat Grid on L1000-class protein pairs, `auto` 1.09-1.24x slower
+        // with Grid (DNA L3000 0.53x faster; nighthaven AVX2 int16 Global L1000 0.84-0.91x),
+        // so they keep pmax, as on main; traceback="grid" stays available for them.  int16
+        // Local takes Grid (above the budget, where pmax's two endpoint scans are the cost).
+        if constexpr (GM == GapModel::Affine && AB == AlignBand::Full && nw_is_int<T> &&
+                      !(sizeof(T) == 2 && AM != AlignMode::Local))
             if (tb_auto_ && tb_ == TracebackMode::HirschbergPmax &&
                 hb_splits(tb_, kAutoPointerCells, hb_cutoff_, m_, n_)) {
                 const int be = (backend_ == kBackendAuto) ? global_default_backend() : backend_;

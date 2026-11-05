@@ -1239,8 +1239,10 @@ really takes (`test_tracked_long_global_float32_pairs_run_their_own_fill`).  fuz
   Local's end scan (`hb_scan`) runs in the problem's regime (`sat_dispatch1_`).
 - **`auto`** (`run_tb_`): integer `auto` stays `hirschberg_pmax` (kDefaultTb) and a pair that
   SPLITS (`hb_splits`: past hb_cutoff and, where the type has one, past the pointer budget —
-  Local and Global int64 2^25; Global int16 / int32 and Glocal have none) runs Grid where
-  grid_ok_.  This is the floating rule's integer half: floating T resolves to Grid and runs
+  Local and Global int64 2^25; Global int32 and Glocal have none) runs Grid where
+  grid_ok_ — except int16 Global / Glocal, which keep pmax: on solace (AVX-512, 32 int16
+  lanes) Grid made int16 Global `auto` 1.09-1.24x SLOWER at L1000 protein (DNA L3000 0.53x;
+  nighthaven AVX2 0.84-0.91x), and the merge rule is no regression on any host.  This is the floating rule's integer half: floating T resolves to Grid and runs
   Pointers within Local's budget; integer T resolves to pmax and runs Grid past it — the
   same Pointers-within / Grid-beyond split in both.  Within the budget Pointers stays;
   tracked pairs / the scalar backend keep pmax; the planners ask hb_splits of pmax, true
@@ -1261,7 +1263,7 @@ really takes (`test_tracked_long_global_float32_pairs_run_their_own_fill`).  fuz
   | L | type mode | main auto | **branch auto** | branch grid | main grid | pointers |
   |---|---|---|---|---|---|---|
   | 1000 | i32 Global | 3.33 / 23.9 | **1.92 / 12.3** | 1.92 / 12.3 | (= Pointers) 3.24 | 3.22 / 22.2 |
-  | 1000 | i16 Global | 1.75 / 13.0 | **1.45 / 8.8** | 1.42 / 8.8 | (= Pointers) 1.54 | 1.57 / 10.8 |
+  | 1000 | i16 Global | 1.75 / 13.0 | = main (pmax kept; Grid was 1.45 / 8.8 here) | 1.42 / 8.8 | (= Pointers) 1.54 | 1.57 / 10.8 |
   | 1000 | i32 Local | 3.55 / 26.3 | 3.57 / 26.3 (Pointers) | **2.13 / 14.9** | (= Pointers) 3.59 | 3.56 / 26.2 |
   | 1000 | f32 Local | 3.77 / 26.6 | 3.61 / 26.7 (Pointers) | **2.32 / 15.9** | 4.84 / 31.7 | 3.60 / 26.7 |
   | 3000 | i32 Global | 3.53 / 23.6 | **1.55 / 9.5** | 1.52 / 9.6 | (= Pointers) 3.33 | 3.33 / 21.9 |
@@ -1269,7 +1271,7 @@ really takes (`test_tracked_long_global_float32_pairs_run_their_own_fill`).  fuz
   | 3000 | f32 Local | 3.65 / 26.2 | 3.65 / 26.2 (Pointers) | **1.92 / 13.4** | 4.50 / 28.9 | 3.75 / 26.2 |
   | 3000 | f32 / f64 Global | 2.02 / 12.05, 2.93 / 17.1 | 2.04 / 12.06, 2.97 / 16.8 | 1.98, 2.96 | 2.01, 3.17 | 3.59, 6.19 |
 
-  Integer Global `auto` 1.2-2.3x faster than main's (pmax).  Local within the 2^25 budget:
+  int32 Global `auto` 1.7-2.3x faster than main's (pmax); int16 Global keeps pmax.  Local within the 2^25 budget:
   `auto` stays Pointers on both sides (with one pass Grid would win 1.7-2.2x there on sse4;
   the budget was set against the two-pass form and is left to a fleet re-measure).  Above
   it (6300 x 6050, before the merge): int32 `auto` 1.94 ns/cell against pmax's 8.61.

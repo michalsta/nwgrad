@@ -140,7 +140,7 @@ def test_batch_grid_equals_pointers_integer_types(tname, mode, pi):
     _same(_run(cls, A, B, p, "grid", mode, 2), _run(cls, A, B, p, "pointers", mode, 2))
 
 
-@pytest.mark.parametrize("tname", ["int16", "int32", "int64"])
+@pytest.mark.parametrize("tname", ["int32", "int64"])   # int16 Global / Glocal keep pmax
 @pytest.mark.parametrize("mode", ["global", "local", "glocal"])
 def test_auto_integer_takes_grid_where_it_split(tname, mode):
     # integer pairs past hb_cutoff that `auto` splits (hirschberg_pmax; Global int16 / int32

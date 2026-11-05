@@ -284,8 +284,9 @@ TEST_CASE("auto takes Grid for Glocal, and for Local above the pointer budget", 
 
 TEST_CASE("auto takes Grid for integer T where it splits", "[grid][traceback]") {
     // run_tb_ (2026-11-05): integer `auto` is hirschberg_pmax; a pair that splits (past
-    // hb_cutoff = 512 rows; Global int16 / int32 and Glocal have no pointer budget, Local
-    // and Global int64 have 2^25) runs Grid on a simd level, Pointers within the budget.
+    // hb_cutoff = 512 rows; Global int32 and Glocal have no pointer budget, Local and Global
+    // int64 have 2^25) runs Grid on a simd level, Pointers within the budget; int16 Global /
+    // Glocal keep pmax.
     std::mt19937 rng(20261110);
     const AlignParams p = random_int_params(rng, 0);
     auto run = [&](auto& al, TracebackMode tb, int kern, const std::string& a, const std::string& b) {
@@ -306,10 +307,18 @@ TEST_CASE("auto takes Grid for integer T where it splits", "[grid][traceback]") 
         REQUIRE(g.ran_grid() == simd);
         REQUIRE(g.score() == gp.score());
         if (simd) REQUIRE(g.alignment() == gp.alignment());
-        Aligner<GapModel::Affine, AlignMode::Glocal, AlignBand::Full, int16_t> c, cp;
+        Aligner<GapModel::Affine, AlignMode::Glocal, AlignBand::Full, int32_t> c, cp;
         run(c, TracebackMode::Default, kern, A, B); run(cp, TracebackMode::Pointers, kern, A, B);
         REQUIRE(c.ran_grid() == simd);
         if (simd) REQUIRE(c.alignment() == cp.alignment());
+        // int16 Global / Glocal keep hirschberg_pmax (it beat Grid at 32 lanes, AVX-512)
+        Aligner<GapModel::Affine, AlignMode::Global, AlignBand::Full, int16_t> g16, g16p;
+        run(g16, TracebackMode::Default, kern, A, B); run(g16p, TracebackMode::Pointers, kern, A, B);
+        REQUIRE_FALSE(g16.ran_grid());
+        REQUIRE(g16.score() == g16p.score());
+        Aligner<GapModel::Affine, AlignMode::Glocal, AlignBand::Full, int16_t> c16;
+        run(c16, TracebackMode::Default, kern, A, B);
+        REQUIRE_FALSE(c16.ran_grid());
         Aligner<GapModel::Affine, AlignMode::Local, AlignBand::Full, int32_t> l;
         run(l, TracebackMode::Default, kern, A, B);
         REQUIRE_FALSE(l.ran_grid());   // within the pointer budget: Pointers
