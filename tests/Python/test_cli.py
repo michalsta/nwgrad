@@ -67,6 +67,14 @@ def test_headers_are_importable_from_the_advertised_path():
     cxx = shutil.which("c++") or shutil.which("g++")
     if cxx is None:
         pytest.skip("no C++ compiler available")
+    # The headers need C++20 and <experimental/simd> (GCC 11+, README).  A Windows
+    # runner's PATH can carry an older gcc that nwgrad never claimed to support
+    # (Strawberry Perl's); the test is about the headers, not about that compiler.
+    ver = subprocess.run([cxx, "-dumpversion"], capture_output=True, text=True).stdout.strip()
+    major = int(ver.split(".")[0]) if ver.split(".")[0].isdigit() else 0
+    probe = subprocess.run([cxx, "--version"], capture_output=True, text=True).stdout
+    if "clang" not in probe.lower() and major < 11:
+        pytest.skip(f"{cxx} is gcc {ver}; the headers need GCC 11+")
 
     include_dir = run("--include").stdout.strip()
     source = "#include <nwgrad/seq_pair_batch.hpp>\nint main() { return 0; }\n"
