@@ -46,6 +46,12 @@ skip = ["cp39-*"]
 test-command = "python -m pytest {project}/tests/Python"
 test-extras = ["dev"]
 
+# One abi3 wheel for CPython >= 3.12 (CMakeLists: STABLE_ABI).  scikit-build-core builds
+# an ordinary per-version wheel below 3.12 and on free-threaded interpreters; cibuildwheel
+# then skips building for 3.13+ and only tests the cp312-abi3 wheel there.
+[tool.scikit-build.wheel]
+py-api = "cp312"
+
 # Package builds need only the extension; tests and benchmarks are not in the sdist.
 [tool.scikit-build.cmake.define]
 NWGRAD_BUILD_TESTS = "OFF"

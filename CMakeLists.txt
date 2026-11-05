@@ -115,8 +115,12 @@ elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
         ${NWGRAD_LEVEL_DIR}/level_neon_soft.cpp)
 endif()
 
+# STABLE_ABI: on CPython >= 3.12 the extension targets the stable ABI (abi3), so one
+# cp312-abi3 wheel serves 3.12 and every later CPython; pyproject's wheel.py-api tags it.
+# nanobind drops the flag by itself on 3.10 / 3.11 and on free-threaded interpreters
+# (no linked-mode abi3 there), which keep a wheel per version.
 nanobind_add_module(nwgrad_ext
-    NB_STATIC NOMINSIZE
+    NB_STATIC NOMINSIZE STABLE_ABI
     src/nwgrad/cpp/nwgrad/py_exports.cpp
     src/nwgrad/cpp/nwgrad/logistic/py_logistic.cpp
     ${NWGRAD_LEVEL_SOURCES})
