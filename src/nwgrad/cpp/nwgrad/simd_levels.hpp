@@ -642,7 +642,14 @@ inline bool soft_ckpt_env_check() noexcept {
 // The forward tables' size (bytes: states x (m+1)(n+1) x the soft type's) from which the
 // per-pair soft pass checkpoints (soft_ckpt_min_bytes overrides; off = never).  A new
 // switch for a new code path, not a fill gate retuned: see Aligner::soft_ckpt_rows.
-inline constexpr size_t kSoftCkptMinBytes = size_t(2) << 20;
+// 64 MiB is a MEMORY decision, not a speed one: on skynet (sse4, 2026-11-05) the
+// checkpointed pass was never faster -- the recomputation adds ~30 instructions a cell
+// (affine; linear ~13), 1.2-1.4x the time at 1 thread from L300 to L4000, 1.0-1.3x at 8
+// threads (float32 affine L2000-4000 at parity) -- while it cut the peak RSS of 8 threads
+// at L4000 from 3.0 GB to 0.16 GB (double affine) and 1.5 GB to 0.10 GB (float32).  64 MiB:
+// double affine from L ~1650, float32 affine ~2350, double linear ~2900.  Re-measure on a
+// v3 host, where the per-cell compute is ~5x faster and memory may bound sooner.
+inline constexpr size_t kSoftCkptMinBytes = size_t(64) << 20;
 // ── The fill gates: which pairs join a shared (inter-pair) fill ────────────────
 //
 // Per ISA level and scalar type, measured by tools/gate_sweep.py (2026-10-31 / 11-01) on

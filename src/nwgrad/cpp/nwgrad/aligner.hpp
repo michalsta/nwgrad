@@ -5234,11 +5234,13 @@ private:
         if (r >= 0) return static_cast<int>(std::min(r, mm));
         const size_t states = (GM == GapModel::Linear) ? 1 : 3;
         if (states * sz_ * sizeof(SF) < gate_value(Gate::SoftCkptMinBytes, kSoftCkptMinBytes)) return 0;
-        return static_cast<int>(std::min<int64_t>(soft_ckpt_auto_rows(m_, stride_ * states * sizeof(SF)), mm));
+        return static_cast<int>(std::min<int64_t>(soft_ckpt_auto_rows(m_), mm));
     }
-    // k for a pair of m rows of `row_bytes` (all states).
-    static int soft_ckpt_auto_rows(int m, size_t row_bytes) noexcept {
-        (void)row_bytes;
+    // k = ceil(sqrt(m)): the block (k+1 rows) and the checkpoints (m/k rows) about equal, the
+    // least memory.  The time barely depends on k: at L4000, 8 threads, skynet, k = 12 / 32 /
+    // 64 ran within the run-to-run noise of each other (instructions +0.5 %); only k = 4 was
+    // slower (float32 affine 1.3x of k = 32).
+    static int soft_ckpt_auto_rows(int m) noexcept {
         return std::max(1, static_cast<int>(std::ceil(std::sqrt(static_cast<double>(m)))));
     }
 

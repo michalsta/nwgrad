@@ -150,7 +150,8 @@ def test_checkpointed_tracked(prec, gm, mode):
 @pytest.mark.parametrize("gm", ["linear", "affine"])
 def test_large_pair_checkpoints_by_default(prec, gm):
     """A pair whose forward tables pass soft_ckpt_min_bytes checkpoints with the automatic
-    k; the same pair on the full tables (the switch off) agrees to rounding."""
+    k; the same pair on the full tables (the switch off) agrees to rounding.  (The
+    threshold lowered to 1 MiB, which this 420 x 400 pair passes in every type.)"""
     rng = np.random.default_rng(3)
     alpha = nwgrad.PROTEIN.symbols
     P = params_for(rng, alpha)
@@ -162,7 +163,8 @@ def test_large_pair_checkpoints_by_default(prec, gm):
     A, B = [a], ["".join(b[:400])]
     cls = CLASSES[prec]
     for mode in ("global", "local"):
-        auto = run(cls, A, B, P, gm, mode, "default")
+        with _tuning.override(soft_ckpt_min_bytes=1 << 20):
+            auto = run(cls, A, B, P, gm, mode, "default")
         with _tuning.override(soft_ckpt_min_bytes=None):
             full = run(cls, A, B, P, gm, mode, "default")
         check(full, auto, prec)

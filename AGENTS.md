@@ -108,9 +108,11 @@ Build dependencies: `scikit-build-core`, `nanobind>=3.0` (the bindings call its 
 - **Soft path: what is left** (see "The soft path" below). Done since the last list:
   the guide without a Viterbi (`soft_guide="posterior"`), the inter-pair soft pass for
   alphabets > 8 and for mixed B lengths, float32 batches sharing the soft pass.
-  Remaining candidates: (1) **memory** at len ≥ 1000 (three forward tables of 8 B/cell
-  leave L3; a checkpointed forward — every k-th row kept, recomputed in backward — would
-  trade ~1.5× compute for ~k× less traffic); (2) a vector-scan gap carry (the four-cell
+  Remaining candidates: (1) **memory** at len ≥ 1000: the checkpointed forward is in
+  (per pair, from 64 MiB of tables; "Checkpointed forward" below), a memory win (10-20x
+  RSS) at 1.0-1.4x the time on skynet; re-measure on v3 for a lower threshold. The double
+  pass's real slowdown at L1000 on skynet is denormals (same section): flush them in double
+  too; (2) a vector-scan gap carry (the four-cell
   stepping already puts one FMA per 4 cells on the chain); (3) the soft pass's size cap
   (512 KiB per group) is set from one host — re-derive it on others.
   Unmeasured: AVX-512 (W=8), NEON speed, wloczykij.
@@ -2733,6 +2735,77 @@ sequences, BLOSUM62 ×0.3, gaps 11/1 ×0.3, affine, 200 pairs, 1 thread; hard = 
 Before the leveled kernel the same protein runs were 23–26 ns/cell on skynet and
 7.2 ns/cell on nighthaven (baseline copy). At len 1000 the three forward tables (24
 B/cell, 24 MB) leave L3 and the kernel turns memory-bound (Open TODOs).
+(Not on skynet, 2026-11-05: there the double pass at L1000 is DENORMAL-bound, below.)
+
+**Checkpointed forward (branch `proto/soft-checkpoint`, 2026-11-05).** The per-pair kernels
+(`soft_kernel_impl.inl`, "Checkpoints") can keep only the first forward row of every block
+of k rows (M, X, Y and the forward's previous-row sum `tp`; linear F alone: `cM..cT`) and
+compute into a block buffer of k+1 rows; the backward walks the blocks from the top, and
+when row i needs a block not in the buffer (block (i-1)/k: rows i and i-1), recomputes it
+from its checkpoint (`sp_affine_reload` / `sp_linear_reload`); the last block is still in the
+buffer after the forward. The forward rows are one `noinline` function (`sp_affine_fwd` /
+`sp_linear_fwd`) that the full-table path calls once over rows 1..m and the checkpointed one
+per block, with the same inputs at the same addresses both times (a row of block c always
+lands in slot i - c·k, the scratch rows are `q0`/`q1` both times), so a recomputed block
+equals the first pass BIT FOR BIT, exponents and maxima included: the backward's S, fmax and
+Z come from the first pass, and the lost-mass bound is charged once per row as before.
+`NWGRAD_SOFT_CKPT_CHECK=1` hashes every row in both passes (M, X, Y over its span, S[i],
+fmax[i]) and raises `std::logic_error` on a mismatch (`test_soft_checkpoint.py`
+`test_recompute_is_bit_exact`; the soft test files all pass under it at k = 1, 2, 7, 64).
+Against the full tables the results agree to rounding only (the block's rows sit at other
+addresses, so a vectorized sum may peel differently): 1e-12 double, 1e-5 float32 in the
+tests. GuideBanded pairs and tracked pairs are included: each row's span is zeroed right
+before the row is computed (the full-table path used to zero every span up front: the same
+values, since a row writes only itself), and the tracked weights are per row anyway.
+- **When**: forward tables (states × (m+1)(n+1) × the soft type's bytes) ≥ 64 MiB
+  (`kSoftCkptMinBytes`; double affine from L ~1650, float32 affine ~2350, double linear
+  ~2900); k = ceil(sqrt(m)) (block ≈ checkpoints, the least memory). Overrides
+  (`nwgrad._tuning`, documented there): `soft_ckpt_min_bytes` (None: never), `soft_ckpt_rows`
+  (k ≥ 1 at every size, 0 = the full tables, None = one block, no recomputation), and the
+  environment `NWGRAD_SOFT_CKPT_ROWS=k` while that gate is unset.
+- **Why 64 MiB and not 2 MiB**: on skynet it is a memory switch, not a speed one. Measured
+  (protein, BLOSUM62 × 0.3, 11/1 × 0.3, 20 % mutated, Global, `fill="striped"`, lazy guide,
+  `scratchpad/bench_ck.py`; instructions from `perf stat` differences of 1 and 3 calls;
+  A/A = the full arm twice):
+
+  | L | type, gap | 1 thr full (A/A) ns/cell | 1 thr ckpt | 8 thr full (A/A) | 8 thr ckpt | instr/cell full → ckpt | RSS 8 thr full → ckpt |
+  |---|---|---|---|---|---|---|---|
+  | 300 | double affine | 25.5 / 25.9 | 30.9 | | | 81.6 → 113.1 | |
+  | 1000 | double affine | 97 / 103 | 127 | 172 / 200 | 196 | 79 → 110 | 235 → 57 MB |
+  | 1000 | float32 affine | 25.5 / 30.3 | 33.5 | 44 / 44 | 50 | 61 → 90 | 140 → 47 MB |
+  | 1000 | float32 linear | 8.0 / 9.3 | 11.3 | 16 / 16 | 20 | 35 → 48 | 75 → 43 MB |
+  | 2000 | double affine | 84 / 85 | 110 | 101 / 110 | 161 | 79 → 109 | 793 → 86 MB |
+  | 2000 | float32 affine | 20.5 / 20.3 | 24.3 | 29 / 36 | 33 | 61 → 89 | 420 → 61 MB |
+  | 4000 | double affine | 112 / 113 | 157 | 136 / 156 | 181 | 78 → 109 | 2984 → 161 MB |
+  | 4000 | double linear | 37 / 37 | 50 | 46 / 50 | 92 | 46 → 63 | 1028 → 80 MB |
+  | 4000 | float32 affine | 22.2 / 22.0 | 30.7 | 34 / 41 | 41 (k=32: 33) | 60 → 89 | 1526 → 102 MB |
+  | 4000 | float32 linear | 9.1 / 9.0 | 11.4 | 18 / 14 | 22 (k=32: 16) | 34 → 46 | 540 → 60 MB |
+
+  (8 thr: ns/cell × threads, i.e. per core; the host was at load 30-45 throughout, so the
+  8-thread wall is ±20 %; instructions are not.) The recomputation costs one more forward:
+  +29-31 instructions a cell affine, +12-17 linear, 1.35-1.47x the instructions; the full
+  path's own instructions are unchanged by the refactor (main bc4db25 vs this branch, L300,
+  the four type × gap cells: 81.6/81.7 vs 81.3/82.2, 49.9/50.1 vs 49.4/49.7, 64.8/64.8 vs
+  64.8/64.9, 38.2/38.7 vs 37.6/37.7). skynet's single core streams the full tables without
+  slowing (float32 affine 25 → 22 ns/cell from L1000 to L4000), so nothing is won back there;
+  at 8 threads float32 L2000-4000 reach parity. k barely matters (L4000, 8 threads: k = 12,
+  32, 64 within noise; k = 4 1.3x slower). The gain is the footprint: 10-20x less RSS.
+  Not measured: any v3/v4/ARM host, where the per-cell compute is ~5x faster and the
+  memory-bound regime starts sooner; that is where a lower threshold could pay.
+
+**Double at long lengths is DENORMAL-bound on skynet, not memory-bound (2026-11-05).** The
+double per-pair pass ran 95 ns/cell at protein L1000 against 21-25 at L300 with the same
+instructions per cell (79 vs 82): cells far from the alignment hold mass below DBL_MIN of
+their row's max at these lengths (the float32 pass flushes them, `FlushDenormalsScope`, and
+ran 26 ns/cell). Setting FTZ|DAZ on the calling thread (a ctypes probe,
+`scratchpad/bench_ck_ftz.py`, 1 thread) took L1000 double affine 97.7 → 30.9 ns/cell and
+linear 57.0 → 12.9; L300 unchanged (25.5 / 25.5). So the "L1000 float32 0.21-0.46 of double"
+in "The float32 soft path" is mostly this, and checkpoints cannot fix it. Flushing in double
+loses only terms below DBL_MIN, which the table bound already charges as lost; the
+gradient-product hole of float32 (item 2 there) would exist in double at 2^-1022 instead of
+2^-1074, ~2^-300 for the largest posterior factors seen. Not changed here: it moves default
+double results (within tolerance) and is the contract's call -- the follow-up is a
+`FlushDenormalsScope` around the double kernels too, with that argument written down.
 
 ### Glocal mode (branch `feat/glocal`, 2026-11-01)
 
