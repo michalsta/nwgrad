@@ -19,33 +19,23 @@
 // (the D/X form's argument: opens >= 0), which is what makes the grid's re-filled blocks
 // reproduce the Pointers fill's codes.
 //
-// Local (2026-11-05): M clamps at 0 (every level of the recursion: it is the recurrence),
-// and the top level (Best) tracks the best cell as the Pointers kernel's `monly` does —
-// per lane the largest M and the FIRST segment reaching it (strict >), reduced after the
-// row only when it beats the running best, the first lane holding it being the leftmost
-// column.  With every gap parameter >= 0 (grid_ok_) the first cell reaching a row's
-// maximum of max(M, X, Y) is an M cell, so this is local_row_best_'s / striped_row_best's
-// cell.  Padding needs no mask: a padding M is D of the row above (<= the running best).
-// Glocal: the top level (J.end_row) reports the best cell of the last row, column order,
-// strict >, over max(M, X, Y) — glocal_end_rows_'s scan.
-//
-// Integer T: lazy-F carrying F - ge would step an integer sentinel down by ge per segment
-// (it could wrap), so Y takes score_affine_striped_pos's FUSED exact prefix-max carry from
-// 4 lanes (the opens never reach memory, the ramp in registers, one pass after the row
-// applies the lanes' carry-in and subtracts the ramp: exact, max being associative), and
-// the plain exact lazy-F (F = max(v, F) - ge) below 4 lanes (int64 at 128 bits).  The
-// left column's Y enters as one more open at column c0: max(open(c0), Y(c0) - ge).
-// Saturating int16 (Sat): every add / subtract saturates, the sentinel is lowest() — the
-// score kernel's regime, whose bound (nw_int_bound_check) keeps every sentinel-derived
-// value below every reachable one, so the walk's codes (taken on reachable cells only)
-// are the full fill's.  An integer profile pads with 0 (nw_pad), as every striped kernel.
+// Integer T (2026-11-05): lazy-F carrying F - ge would step an integer sentinel down by ge
+// per segment (it could wrap), so Y takes score_affine_striped_pos's FUSED exact prefix-max
+// carry from 4 lanes (the opens never reach memory, the ramp in registers, one pass after
+// the row applies the lanes' carry-in and subtracts the ramp: exact, max being
+// associative), and the plain exact lazy-F (F = max(v, F) - ge) below 4 lanes (int64 at
+// 128 bits).  The left column's Y enters as one more open at column c0: max(open(c0),
+// Y(c0) - ge).  Saturating int16 (Sat): every add / subtract saturates and the sentinel is
+// lowest() -- the score kernel's regime, whose bound (nw_int_bound_check) keeps every
+// sentinel-derived value below every reachable one, so the walk's codes (read on reachable
+// cells only) are the full fill's.  An integer profile pads with 0 (nw_pad), as every
+// striped kernel does.
 
 #ifndef NWGRAD_LEVEL_NS
 #  error "grid_kernel_impl.inl must be included inside a level namespace by a level TU"
 #endif
 
-
-template <class T, bool Local, bool Best, bool Sat>
+template <class T, bool Local, bool Sat>
 static void grid_fwd_impl(GridFwdJob<T>& J) {
     using vd = stdx::native_simd<T>;
     const int W = (int)vd::size();
@@ -96,7 +86,7 @@ static void grid_fwd_impl(GridFwdJob<T>& J) {
 
     const vd vgo_a(go_a), vge_a(ge_a), vgo_b(go_b), vge_b(ge_b);
     const vd vgoe_a = vgo_a + vge_a, vgoe_b = vgo_b + vge_b;   // open_pen (integer T)
-    const vd vzero(T(0)), vninf(NINF);
+    const vd vninf(NINF);
     auto any_gt = [](const vd& x, const vd& y) -> bool {
 #if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
         if constexpr (sizeof(T) == 8) return avx512d_gt(x, y) != 0;
@@ -109,24 +99,6 @@ static void grid_fwd_impl(GridFwdJob<T>& J) {
     auto stv = [](const vd& v, T* p) NWGRAD_ALWAYS_INLINE_LAMBDA { v.copy_to(p, stdx::element_aligned); };
     auto Dp = [&](int s) NWGRAD_ALWAYS_INLINE_LAMBDA {   // D of the previous row, segment s
         return stdx::max(ld(pA + (std::size_t)s * W), ld(pY + (std::size_t)s * W));
-    };
-
-    // Local, top level: the best M cell (see the note at the top)
-    [[maybe_unused]] T best = T(0);
-    [[maybe_unused]] int best_i = 0, best_j = 0;
-    [[maybe_unused]] vd lmax, ls, vs;
-    [[maybe_unused]] const vd one(T(1));
-    auto track = [&](const vd& vmv) NWGRAD_ALWAYS_INLINE_LAMBDA {
-        if constexpr (Best) {
-#if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
-            if constexpr (sizeof(T) == 8) ls = avx512d_blend(avx512d_gt(vmv, lmax), ls, vs);
-            else                          stdx::where(vmv > lmax, ls) = vs;
-#else
-            stdx::where(vmv > lmax, ls) = vs;
-#endif
-            lmax = stdx::max(lmax, vmv);
-            vs += one;
-        } else { (void)vmv; }
     };
 
     for (int ii = 1; ii <= h; ++ii) {
@@ -144,79 +116,85 @@ static void grid_fwd_impl(GridFwdJob<T>& J) {
                     sub[(std::size_t)s * W + l] = (j <= w) ? row[bb[j - 1]] : nw_pad<T>;
                 }
         }
-        if constexpr (Best) { lmax = vd(nw_ninf_s<T, Sat>); ls = vzero; vs = vzero; }
-
-        // one cell of the row pass: M (clamped for Local), X, A = max(M, X) stored
-        auto cell = [&](int s, const vd& dD, const vd& uD, vd& mx) NWGRAD_ALWAYS_INLINE_LAMBDA {
-            vd vmv = vadd<Sat>(dD, ld(sub + (std::size_t)s * W));
-            if constexpr (Local) vmv = stdx::max(vmv, vzero);
-            track(vmv);
-            const vd vxv = stdx::max(open_pen<Sat>(uD, vgo_b, vge_b, vgoe_b), vsub<Sat>(ld(pX + (std::size_t)s * W), vge_b));
-            mx = stdx::max(vmv, vxv);
-            stv(vxv, cX + (std::size_t)s * W);
-            stv(mx, cA + (std::size_t)s * W);
-        };
 
         if constexpr (!kInt) {
-            // ── the row pass: Y's carry two segments per dependent step (see
-            // score_affine_striped_pos_fp) ──
-            vd Oin([&](int qq) { return qq == 0 ? nbOpen : NINF; });   // Y's open from the column before
-            vd Yin([&](int qq) { return qq == 0 ? lY : NINF; });       // Y of the column before
-            vd dD = lane_shift_in(Dp(seg - 1), bD);
-            int s = 0;
-            for (; s + 1 < seg; s += 2) {
-                vd mx0, mx1;
-                const vd uD0 = Dp(s);
-                cell(s, dD, uD0, mx0);
-                const vd uD1 = Dp(s + 1);
-                cell(s + 1, uD0, uD1, mx1);
-                dD = uD1;
-                const vd O0 = (mx0 - vgo_a) - vge_a;
-                const vd t = Yin - vge_a;
-                const vd y0 = stdx::max(Oin, t);
-                const vd y1 = stdx::max(carry_pin(stdx::max(O0, Oin - vge_a)), t - vge_a);
-                stv(y0, cY + (std::size_t)s * W);
-                stv(y1, cY + (std::size_t)(s + 1) * W);
-                Oin = (mx1 - vgo_a) - vge_a;
-                Yin = y1;
-            }
-            if (s < seg) {
-                vd mx;
-                const vd uD = Dp(s);
-                cell(s, dD, uD, mx);
-                const vd y = stdx::max(Oin, Yin - vge_a);
-                stv(y, cY + (std::size_t)s * W);
-                Oin = (mx - vgo_a) - vge_a;
-                Yin = y;
-            }
-            const vd Olast = Oin;
+        // ── the row pass: Y's carry two segments per dependent step (see
+        // score_affine_striped_pos_fp) ──
+        vd Oin([&](int qq) { return qq == 0 ? nbOpen : NINF; });   // Y's open from the column before
+        vd Yin([&](int qq) { return qq == 0 ? lY : NINF; });       // Y of the column before
+        vd dD = lane_shift_in(Dp(seg - 1), bD);
+        auto cell = [&](int s, vd& mx) NWGRAD_ALWAYS_INLINE_LAMBDA {
+            const vd uD = Dp(s);
+            vd vmv = dD + ld(sub + (std::size_t)s * W);
+            if constexpr (Local) vmv = stdx::max(vmv, vd(T(0)));   // viterbi_affine_ptr's clamp
+            const vd vxv = stdx::max((uD - vgo_b) - vge_b, ld(pX + (std::size_t)s * W) - vge_b);
+            mx = stdx::max(vmv, vxv);
+            stv(vxv, cX + (std::size_t)s * W);
+            dD = uD;
+        };
+        int s = 0;
+        for (; s + 1 < seg; s += 2) {
+            vd mx0, mx1;
+            cell(s, mx0);
+            cell(s + 1, mx1);
+            const vd O0 = (mx0 - vgo_a) - vge_a;
+            const vd t = Yin - vge_a;
+            const vd y0 = stdx::max(Oin, t);
+            const vd y1 = stdx::max(carry_pin(stdx::max(O0, Oin - vge_a)), t - vge_a);
+            stv(y0, cY + (std::size_t)s * W);
+            stv(y1, cY + (std::size_t)(s + 1) * W);
+            stv(mx0, cA + (std::size_t)s * W);
+            stv(mx1, cA + (std::size_t)(s + 1) * W);
+            Oin = (mx1 - vgo_a) - vge_a;
+            Yin = y1;
+        }
+        if (s < seg) {
+            vd mx;
+            cell(s, mx);
+            const vd y = stdx::max(Oin, Yin - vge_a);
+            stv(y, cY + (std::size_t)s * W);
+            stv(mx, cA + (std::size_t)s * W);
+            Oin = (mx - vgo_a) - vge_a;
+            Yin = y;
+        }
+        const vd Olast = Oin;
 
-            // ── lazy-F, carrying F - ge (lazy_f_next, kernels_impl.inl) ──
-            for (int r = 0; r < W; ++r) {
-                vd F = lane_shift_in(ld(cY + (std::size_t)(seg - 1) * W), NINF) - vge_a;
-                if (r == 0) F = stdx::max(lane_shift_in(Olast, NINF), F);
-                bool changed = false;
-                for (int s2 = 0; s2 < seg; ++s2) {
-                    const vd v = ld(cY + (std::size_t)s2 * W);
-                    if (!any_gt(F, v)) break;
-                    stv(stdx::max(v, F), cY + (std::size_t)s2 * W);
-                    F = F - vge_a;
-                    changed = true;
-                }
-                if (!changed) break;
+        // ── lazy-F, carrying F - ge (lazy_f_next, kernels_impl.inl) ──
+        for (int r = 0; r < W; ++r) {
+            vd F = lane_shift_in(ld(cY + (std::size_t)(seg - 1) * W), NINF) - vge_a;
+            if (r == 0) F = stdx::max(lane_shift_in(Olast, NINF), F);
+            bool changed = false;
+            for (int s2 = 0; s2 < seg; ++s2) {
+                const vd v = ld(cY + (std::size_t)s2 * W);
+                if (!any_gt(F, v)) break;
+                stv(stdx::max(v, F), cY + (std::size_t)s2 * W);
+                F = F - vge_a;
+                changed = true;
             }
-        } else if (W >= 4) {
-            // ── the row pass with the fused prefix-max carry (score_affine_striped_pos):
-            // Q(s) = open(s-1) + ramp(s) into a running prefix max per lane, stored to Y's
-            // row; the lanes' carry-in and the ramp after the row ──
+            if (!changed) break;
+        }
+        } else {
+        // one cell of the integer row passes: M (clamped for Local), X, A = max(M, X) stored
+        auto icell = [&](int s, const vd& dD, const vd& uD) NWGRAD_ALWAYS_INLINE_LAMBDA {
+            vd vmv = vadd<Sat>(dD, ld(sub + (std::size_t)s * W));
+            if constexpr (Local) vmv = stdx::max(vmv, vd(T(0)));
+            const vd vxv = stdx::max(open_pen<Sat>(uD, vgo_b, vge_b, vgoe_b), vsub<Sat>(ld(pX + (std::size_t)s * W), vge_b));
+            const vd mx = stdx::max(vmv, vxv);
+            stv(vxv, cX + (std::size_t)s * W);
+            stv(mx, cA + (std::size_t)s * W);
+            return mx;
+        };
+        if (W >= 4) {
+            // ── the fused prefix-max carry (score_affine_striped_pos): Q(s) = open(s-1) +
+            // ramp(s) into a running prefix max per lane, stored to Y's row; the lanes'
+            // carry-in and the ramp after the row ──
             const vd fBase([&](int l) { return static_cast<T>(static_cast<T>(l * seg) * ge_a); });
             vd fR = fBase, fP = vninf;
             vd fOprev = vsub<Sat>(vninf, fBase);   // segment 0 has no Q term here (see the score kernel)
             vd dD = lane_shift_in(Dp(seg - 1), bD);
             for (int s = 0; s < seg; ++s) {
-                vd mx;
                 const vd uD = Dp(s);
-                cell(s, dD, uD, mx);
+                const vd mx = icell(s, dD, uD);
                 dD = uD;
                 fP = stdx::max(fP, vadd<Sat>(fOprev, fR));
                 nv_store(cY + (std::size_t)s * W, fP);
@@ -248,9 +226,8 @@ static void grid_fwd_impl(GridFwdJob<T>& J) {
             vd Yin([&](int qq) { return qq == 0 ? lY : NINF; });
             vd dD = lane_shift_in(Dp(seg - 1), bD);
             for (int s = 0; s < seg; ++s) {
-                vd mx;
                 const vd uD = Dp(s);
-                cell(s, dD, uD, mx);
+                const vd mx = icell(s, dD, uD);
                 dD = uD;
                 const vd y = stdx::max(Oin, vsub<Sat>(Yin, vge_a));
                 stv(y, cY + (std::size_t)s * W);
@@ -273,23 +250,14 @@ static void grid_fwd_impl(GridFwdJob<T>& J) {
                 if (!changed) break;
             }
         }
-
-        if constexpr (Best) {   // the row's best M cell, if it beats the running best
-            T rmax = lmax[0];
-            for (int qq = 1; qq < W; ++qq) rmax = std::max(rmax, T(lmax[qq]));
-            if (rmax > best) {
-                int l = 0;
-                while (!(lmax[l] == rmax)) ++l;
-                best = rmax; best_i = i; best_j = J.c0 + l * seg + (int)ls[l] + 1;
-            }
         }
 
         // ── the saved lines ──
         auto Mat = [&](int s3) NWGRAD_ALWAYS_INLINE_LAMBDA {   // M of segment s3, as the row pass formed it
             const vd d = s3 == 0 ? lane_shift_in(Dp(seg - 1), bD) : Dp(s3 - 1);
-            vd mv = vadd<Sat>(d, ld(sub + (std::size_t)s3 * W));
-            if constexpr (Local) mv = stdx::max(mv, vzero);
-            return mv;
+            const vd mv = vadd<Sat>(d, ld(sub + (std::size_t)s3 * W));
+            if constexpr (Local) return stdx::max(mv, vd(T(0)));
+            else return mv;
         };
         for (int t = 0; t < q; ++t) {
             const int s3 = st[(std::size_t)t];
@@ -312,36 +280,35 @@ static void grid_fwd_impl(GridFwdJob<T>& J) {
                 }
             }
         }
-        if (J.end_row && ii == h) {   // Glocal: the best cell of the last row (glocal_end_rows_)
-            T eb = std::max({lM, lX, lY}); int ej = 0;
-            for (int j = 1; j <= w; ++j) {
-                const std::size_t k = (std::size_t)((j - 1) % seg) * W + (std::size_t)((j - 1) / seg);
-                const T v = std::max(cA[k], cY[k]);
-                if (v > eb) { eb = v; ej = j; }
-            }
-            J.best = eb; J.best_i = i; J.best_j = J.c0 + ej;
-        }
         std::swap(pA, cA); std::swap(pX, cX); std::swap(pY, cY);
         bD = std::max({lM, lX, lY});
     }
-    if constexpr (Best) { J.best = best; J.best_i = best_i; J.best_j = best_j; }
+    if (J.last) {   // row r1 (pA after the last swap): D = max(A, Y) = max(M, X, Y)
+        J.last->resize((std::size_t)w + 1);
+        T* const lr = J.last->data();
+        for (int s3 = 0; s3 < seg; ++s3)
+            for (int l = 0; l < W; ++l) {
+                const int j = l * seg + s3 + 1;
+                if (j > w) continue;
+                const std::size_t k = (std::size_t)s3 * W + l;
+                lr[j] = std::max(pA[k], pY[k]);
+            }
+    }
     J.W = W; J.q = q;
 }
 
 template <class T>
 static void grid_fwd_entry(GridFwdJob<T>& J) {
-    auto go = [&]<bool Sat>() {
-        if (J.local) {
-            if (J.find_best) grid_fwd_impl<T, true, true, Sat>(J);
-            else             grid_fwd_impl<T, true, false, Sat>(J);
-        } else {
-            grid_fwd_impl<T, false, false, Sat>(J);
+    if constexpr (nw_sat<T>)
+        if (J.sat) {
+            if (J.local) grid_fwd_impl<T, true, true>(J);
+            else         grid_fwd_impl<T, false, true>(J);
+            return;
         }
-    };
-    if constexpr (nw_sat<T>) { if (J.sat) { go.template operator()<true>(); return; } }
-    go.template operator()<false>();
+    if (J.local) grid_fwd_impl<T, true, false>(J);
+    else         grid_fwd_impl<T, false, false>(J);
 }
 
-// The registered pointer: every scalar type (floating, and the integers since 2026-11-05).
+// The registered pointer: every scalar type (the integers since 2026-11-05).
 template <class T>
 constexpr typename TypedKernels<T>::grid_fn grid_fwd_ptr() { return &grid_fwd_entry<T>; }

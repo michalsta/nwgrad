@@ -36,12 +36,17 @@ PARAMS = [
 @pytest.mark.parametrize("cls", [nwgrad.SeqPairBatch, nwgrad.SeqPairBatchDouble])
 @pytest.mark.parametrize("pi", range(len(PARAMS)))
 @pytest.mark.parametrize("threads", [1, 3])
-def test_batch_grid_equals_pointers(cls, pi, threads):
+@pytest.mark.parametrize("mode", ["global", "glocal", "local"])
+def test_batch_grid_equals_pointers(cls, pi, threads, mode):
     A, B = related_pairs(12, 40, 400, seed=pi)
+    if mode != "global":   # B a window of a longer target: free flanks along B
+        rng = np.random.default_rng(pi + 10)
+        B = ["".join(rng.choice(list(AA), int(rng.integers(0, 60)))) + b +
+             "".join(rng.choice(list(AA), int(rng.integers(0, 60)))) for b in B]
     p = PARAMS[pi]
     res = {}
     for tb in ("pointers", "grid"):
-        b = cls(A, B, p, n_threads=threads, traceback=tb)
+        b = cls(A, B, p, n_threads=threads, traceback=tb, mode=mode)
         b.fill = "striped"
         b.hb_cutoff = 16          # pairs above it take the grid
         b.score_and_grad(keep_paths=True)
@@ -93,8 +98,7 @@ def test_auto_grid_fallback_sizes_its_tables(cls, fill):
     np.testing.assert_array_equal(res["auto"], res["pointers"])
 
 
-BATCHES = {"float32": nwgrad.SeqPairBatch, "float64": nwgrad.SeqPairBatchDouble,
-           "int16": nwgrad.SeqPairBatchInt16, "int32": nwgrad.SeqPairBatchInt32,
+BATCHES = {"int16": nwgrad.SeqPairBatchInt16, "int32": nwgrad.SeqPairBatchInt32,
            "int64": nwgrad.SeqPairBatchInt64}
 
 
@@ -121,8 +125,9 @@ def _same(got, ref):
 @pytest.mark.parametrize("tname", list(BATCHES))
 @pytest.mark.parametrize("mode", ["global", "local", "glocal"])
 @pytest.mark.parametrize("pi", range(len(PARAMS)))
-def test_batch_grid_equals_pointers_every_mode_and_type(tname, mode, pi):
-    if tname.startswith("int") and pi == 1:
+def test_batch_grid_equals_pointers_integer_types(tname, mode, pi):
+    # integer T: the fused prefix-max forward; int16 also in its saturating regime
+    if pi == 1:
         pytest.skip("integer types take integral parameters only")
     # int16 BLOSUM62 11/1 crosses the quarter rule at ~L300: the saturating regime
     A, B = related_pairs(10, 40, 600 if tname == "int16" else 400, seed=pi + 17)
@@ -135,11 +140,11 @@ def test_batch_grid_equals_pointers_every_mode_and_type(tname, mode, pi):
     _same(_run(cls, A, B, p, "grid", mode, 2), _run(cls, A, B, p, "pointers", mode, 2))
 
 
-@pytest.mark.parametrize("tname", ["float32", "int32"])
+@pytest.mark.parametrize("tname", ["int16", "int32", "int64"])
 @pytest.mark.parametrize("mode", ["global", "local", "glocal"])
-def test_auto_takes_grid_where_it_split(tname, mode):
-    # pairs past hb_cutoff that `auto` used to split (hirschberg_pmax): now Grid, i.e.
-    # Pointers' result (Global float32 was already Grid)
+def test_auto_integer_takes_grid_where_it_split(tname, mode):
+    # integer pairs past hb_cutoff that `auto` splits (hirschberg_pmax; Global int16 / int32
+    # and Glocal have no pointer budget): Grid, i.e. Pointers' result and ties
     A, B = related_pairs(6, 200, 400, seed=3)
     cls, p = BATCHES[tname], PARAMS[0]
     _same(_run(cls, A, B, p, "auto", mode, 2, cutoff=64), _run(cls, A, B, p, "pointers", mode, 2, cutoff=64))

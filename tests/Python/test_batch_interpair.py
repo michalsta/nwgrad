@@ -224,8 +224,9 @@ def test_protein(prec, gm, mode, grad):
 
 
 def test_long_local_float32_pairs_keep_their_hirschberg_default():
-    """Local float32 affine defaults to hirschberg_pmax, whose pairs within the auto
-    pointer budget (2**25 cells) run as pointers: the planner may group them or run them
+    """Local float32 affine pairs within the auto pointer budget (2**25 cells) run as
+    pointers (grid above it since 2026-11-05; hirschberg_pmax before, and still where grid
+    does not apply): the planner may group them or run them
     on their own, and either way the fills must agree with fill='striped'."""
     A, B = _seqs(12, 500, 700, 81), _seqs(12, 600, 640, 82)
     A += _seqs(40, 10, 30, 83); B += _seqs(40, 50, 51, 84)
@@ -284,6 +285,10 @@ def test_tracked_long_global_float32_pairs_run_their_own_fill():
             assert x == y
         else:
             assert np.array_equal(x, y)
-    # untracked, Grid applies (no split): the long pairs may share a fill
-    u = nwgrad.SeqPairBatch(A, B, _params("random", "affine"), n_threads=3)
-    assert u._inter_plan()[:2] == [48, 0]
+    # untracked, Grid applies (no split): the long pairs may share a fill.  The byte budget
+    # is out of the way: 3 threads on a 2-core runner take its hyperthread share (9/16),
+    # which an AVX-512 group of these pairs (~3.1 MB) exceeds.
+    from nwgrad import _tuning
+    with _tuning.override(inter_group_bytes=10**9):
+        u = nwgrad.SeqPairBatch(A, B, _params("random", "affine"), n_threads=3)
+        assert u._inter_plan()[:2] == [48, 0]
