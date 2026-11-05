@@ -4189,7 +4189,7 @@ private:
     // Tuning (measured on the prototype, tools/gridgrad): kGridK lines per dimension, base
     // blocks of kGridBase cells; memory ~ kGridK (m + n) * 3 values over all levels.
     static constexpr int  kGridK = 32;
-    static constexpr long kGridBase = 64 * 64;
+    static constexpr long long kGridBase = 64 * 64;   // long long: `long` is 32-bit on Windows (LLP64)
     static constexpr int  kGridMin = 8;      // rows / columns per block, at least
     static constexpr int  kGridDepth = 64;   // recursion levels (never reached: ~log_k(m))
 
@@ -4243,7 +4243,7 @@ private:
     void grid_solve(DpBuffer& buf, const LevelKernels& K, int r0, int c0, const GridLine& top,
                     const GridLine& left, int depth, int& i, int& j, int& st) {
         const int r1 = i, c1 = j, h = r1 - r0, w = c1 - c0;
-        if (static_cast<long>(h) * w <= kGridBase || h < 2 * kGridMin || w < 2 * kGridMin ||
+        if (static_cast<long long>(h) * w <= kGridBase || h < 2 * kGridMin || w < 2 * kGridMin ||
             depth + 1 >= kGridDepth) {
             grid_base(buf, r0, r1, c0, c1, top, left, i, j, st);
             return;

@@ -105,6 +105,16 @@ def test_step_is_its_parts_composed(cls):
     assert all(got[f] == expected[f] for f in FIELDS)
 
 
+def test_step_repr():
+    """Step.__repr__ returns a std::string; its TU once lacked nanobind's string
+    caster, so repr(step) raised TypeError (seen when an assertion tried to print one)."""
+    a, b, y = many_pairs(64, seed=3)
+    batch = nwgrad.SeqPairBatchDouble(a, b, dna_params(), gap_model="affine", mode="local")
+    batch.score_and_grad()
+    st = L.step(batch, y, 0.0)
+    assert repr(st).startswith("Step(alpha=")
+
+
 def test_step_does_not_depend_on_threads():
     a, b, y = many_pairs(2 * 4096 + 5, seed=7)
     out = []

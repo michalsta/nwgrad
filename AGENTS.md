@@ -75,6 +75,8 @@ python -m nwgrad --include
 
 Build dependencies: `scikit-build-core`, `nanobind>=3.0` (the bindings call its backend keep-alive entry; enforced by pyproject and CMake), C++20 compiler (GCC 11+ or Clang 13+).
 
+Windows (MinGW-w64 gcc, UCRT64): see `docs/windows.md` for what the port needed and why.
+
 ## Open TODOs
 
 - **gcc's `scalar_fallback` soft path on AArch64 misses its FMA contraction.** `CMakeLists.txt`

@@ -15,13 +15,53 @@
 #if defined(__linux__)
 #  include <sched.h>
 #endif
+#if defined(_WIN32)
+// Lean and without the min/max macros, which would break every std::min / std::max in
+// a TU that includes this header.  Both are restored to the includer's own setting.
+#  if !defined(NOMINMAX)
+#    define NOMINMAX
+#    define NWGRAD_UNDEF_NOMINMAX
+#  endif
+#  if !defined(WIN32_LEAN_AND_MEAN)
+#    define WIN32_LEAN_AND_MEAN
+#    define NWGRAD_UNDEF_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+#  if defined(NWGRAD_UNDEF_NOMINMAX)
+#    undef NOMINMAX
+#    undef NWGRAD_UNDEF_NOMINMAX
+#  endif
+#  if defined(NWGRAD_UNDEF_LEAN_AND_MEAN)
+#    undef WIN32_LEAN_AND_MEAN
+#    undef NWGRAD_UNDEF_LEAN_AND_MEAN
+#  endif
+
+// The process affinity mask, when the machine has a single processor group (<= 64
+// logical CPUs) — the only case GetProcessAffinityMask describes fully.  0 when it is
+// unknown or there is more than one group.
+inline DWORD_PTR nwgrad_win_affinity_mask() noexcept {
+    if (GetActiveProcessorGroupCount() != 1) return 0;
+    DWORD_PTR proc = 0, sys = 0;
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys)) return 0;
+    return proc;
+}
+#endif
 
 // The CPU ids this process may run on (Linux: its affinity mask, so taskset, cpusets
 // and container pinning are respected, and ids need not be contiguous); empty when
-// unknown, and always empty elsewhere.
+// unknown, and always empty elsewhere.  Windows: the process affinity mask, on a
+// machine with one processor group.
 inline std::vector<int> allowed_cpus() noexcept {
     std::vector<int> ids;
-#if defined(__linux__)
+#if defined(_WIN32)
+    try {
+        const DWORD_PTR mask = nwgrad_win_affinity_mask();
+        for (int i = 0; i < static_cast<int>(8 * sizeof mask); ++i)
+            if ((mask >> i) & 1) ids.push_back(i);
+    } catch (...) {
+        ids.clear();
+    }
+#elif defined(__linux__)
     try {
         cpu_set_t set;
         CPU_ZERO(&set);
@@ -87,6 +127,31 @@ inline int physical_cores() noexcept {
         size_t sz = sizeof(n);
         if (sysctlbyname("hw.physicalcpu", &n, &sz, nullptr, 0) == 0 && n > 0)
             return n;
+#elif defined(_WIN32)
+        // One RelationProcessorCore record per physical core; on a single-group machine
+        // only cores with a logical CPU in the process affinity mask count (the Linux
+        // branch's taskset rule, for `start /affinity`).
+        DWORD len = 0;
+        GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
+        if (len > 0 && GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
+            std::vector<unsigned char> buf(len);
+            if (GetLogicalProcessorInformationEx(
+                    RelationProcessorCore,
+                    reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data()), &len)) {
+                const DWORD_PTR mask = nwgrad_win_affinity_mask();
+                int n = 0;
+                for (DWORD off = 0; off < len;) {
+                    const auto* rec =
+                        reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buf.data() + off);
+                    if (rec->Size == 0) break;
+                    if (rec->Relationship == RelationProcessorCore &&
+                        (mask == 0 || (rec->Processor.GroupMask[0].Mask & mask) != 0))
+                        ++n;
+                    off += rec->Size;
+                }
+                if (n > 0) return n;
+            }
+        }
 #endif
     } catch (...) {
         // Topology discovery must never be the thing that breaks a batch.

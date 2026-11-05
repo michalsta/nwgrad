@@ -142,6 +142,83 @@ jobs:
           # tolerance being loosened.
           NWGRAD_FORCE_KERNEL=simd pytest tests/Python/ -q
 
+  windows:
+    # Windows is built with MinGW-w64 gcc (MSYS2 UCRT64) against the official MSVC-built
+    # CPython — MSVC has no <experimental/simd>.  See wheels.yml (COMPILER POLICY) and the
+    # MinGW block in CMakeLists.  This job keeps the port from rotting between releases:
+    # the C++ suite (every ISA level the runner has, forced in turn by ctest) and the
+    # Python suite on an editable build.  No sanitizers: MinGW gcc ships none.
+    #
+    # Python 3.11 on purpose: its pyconfig.h does not define MS_WIN64 for MinGW (3.12+
+    # does), so this is the build that exercises the CMakeLists workaround.
+    name: Windows / MinGW-w64 gcc
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    env:
+      CMAKE_GENERATOR: Ninja
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Set up MSYS2 UCRT64 gcc
+        id: msys2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-ninja
+
+      # FIRST on PATH: the runner has two MSVCRT gccs on it already (C:\mingw64, Strawberry
+      # Perl).  setup-python's interpreter stays ahead of anything here only because
+      # UCRT64 ships no python unless asked for one.
+      - name: Put UCRT64 on PATH
+        run: |
+          UCRT="$(cygpath -w '${{ steps.msys2.outputs.msys2-location }}')\\ucrt64\\bin"
+          echo "$UCRT" >> "$GITHUB_PATH"
+          echo "CC=$(cygpath -m "$UCRT")/gcc.exe" >> "$GITHUB_ENV"
+          echo "CXX=$(cygpath -m "$UCRT")/g++.exe" >> "$GITHUB_ENV"
+
+      - name: Toolchain
+        run: |
+          "$CXX" --version
+          which python ninja cmake objdump
+
+      - name: Install nanobind
+        run: python -m pip install "nanobind>=3.0"
+
+      # Debug, like the Linux job: nwgrad_ext is in the default target, so this also
+      # links the extension against python311.lib with MinGW ld.
+      - name: Configure
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+          -Dnanobind_DIR="$(cygpath -m "$(python -m nanobind --cmake_dir)")"
+
+      - name: Build
+        run: cmake --build build -j4
+
+      - name: Test (C++)
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Install (editable)
+        run: python -m pip install -v -e ".[dev]"
+
+      - name: Extension imports no MinGW runtime DLL
+        run: >
+          python tools/check_windows_wheel.py --pyd
+          "$(python -c 'import nwgrad.nwgrad_ext as e; print(e.__file__)')"
+
+      - name: Test (Python)
+        run: |
+          python -c "import nwgrad; print('simd_isa() ->', nwgrad.simd_isa(), nwgrad.compiled_with())"
+          python -m pytest tests/Python -q
+          # As on ARM: the whole suite through the simd kernels, no tolerance loosened.
+          NWGRAD_FORCE_KERNEL=simd python -m pytest tests/Python -q
+
   header-only-sanitizers:
     # Link no ISA kernel TUs: the test asserts empty dispatch slots and exercises
     # alignment and buffer reuse through the actual header-only fallback.
