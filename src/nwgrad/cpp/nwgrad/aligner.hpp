@@ -1595,6 +1595,9 @@ private:
         std::is_same_v<T, float> ? TracebackMode::HirschbergPmax
         : AM == AlignMode::Global ? TracebackMode::Hirschberg
                                   : TracebackMode::Pointers;
+    // Local `auto` takes the one-pass Grid inside the pointer budget too (run_tb_): every
+    // type but int16, which tied Pointers there (nighthaven 0.98 at L1000).
+    static constexpr bool kLocalGridAuto = !(nw_is_int<T> && sizeof(T) == 2);
     static constexpr TracebackMode kDefaultTb =
         (GM == GapModel::Affine && AB == AlignBand::Full)
             ? (nw_is_int<T> ? TracebackMode::HirschbergPmax : TracebackMode::Grid)
@@ -1749,8 +1752,25 @@ private:
     // The traceback this run takes: `auto` resolved to Grid where Grid does not apply runs
     // kGridFallbackTb.  Shared by run_viterbi and the buffer sizing (uses_rowwise_full),
     // which runs first and must see the same mode.
-    // Local: a pair within the pointer budget runs Pointers (Grid's result, faster there).
+    // Local: see kLocalGridAuto below; otherwise a pair within the pointer budget runs
+    // Pointers (Grid's result, faster there than the two-pass Grid).
     TracebackMode run_tb_() const {
+        // Local affine `auto` where the ONE-PASS Grid applies (every gap parameter >= 0, so
+        // the top-level forward finds the end cell itself; untracked, a simd level, m >
+        // hb_cutoff: grid_ok_): Grid at every size, the pointer budget no longer consulted.
+        // The budget kept Pointers because the two-pass Grid (end scan + grid) lost to it
+        // (1.25x, nighthaven); one pass wins inside it: nighthaven AVX2 grid / pointers,
+        // float32 L1000 0.65, L3000 0.51 (6 threads 0.66 / 0.47), int32 0.57 / 0.42 (0.60 /
+        // 0.41), int64 0.51 / 0.41, memory lower; skynet sse4 see AGENTS.md ("Grid at integer
+        // T").  The floor is hb_cutoff (grid_ok_: m > hb_cutoff, Pointers below), as for
+        // Global.  int16 excluded (kLocalGridAuto): a tie on nighthaven (0.98 at L1000).
+        if constexpr (GM == GapModel::Affine && AB == AlignBand::Full && AM == AlignMode::Local &&
+                      kLocalGridAuto)
+            if (tb_auto_ && (tb_ == TracebackMode::Grid || tb_ == TracebackMode::HirschbergPmax) &&
+                static_cast<T>(params_->gap_extend_a) >= T(0) && static_cast<T>(params_->gap_extend_b) >= T(0)) {
+                const int be = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
+                if (be != kBackendScalar && grid_ok_(level_kernels(be))) return TracebackMode::Grid;
+            }
         if constexpr (GM == GapModel::Affine && AB == AlignBand::Full && std::is_floating_point_v<T>)
             if (tb_ == TracebackMode::Grid && tb_auto_) {
                 if constexpr (AM == AlignMode::Local)

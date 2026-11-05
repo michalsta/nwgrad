@@ -263,9 +263,15 @@ TEST_CASE("auto takes Grid for Glocal, and for Local above the pointer budget", 
             REQUIRE(same_bits(gf.score(), rf.score()));
             REQUIRE(gf.alignment() == rf.alignment());
         }
-        Aligner<GapModel::Affine, AlignMode::Local, AlignBand::Full, float> lf;
-        run(lf, TracebackMode::Default, kern, A, B);
-        REQUIRE_FALSE(lf.ran_grid());   // 801 x 1201 cells: within the budget, Pointers
+        // Local within the budget: the one-pass Grid (every gap parameter >= 0), Pointers' result
+        Aligner<GapModel::Affine, AlignMode::Local, AlignBand::Full, float> lf, lfp;
+        run(lf, TracebackMode::Default, kern, A, B); run(lfp, TracebackMode::Pointers, kern, A, B);
+        REQUIRE(lf.ran_grid() == (kern != kBackendScalar));
+        REQUIRE(same_bits(lf.score(), lfp.score()));
+        REQUIRE(lf.alignment() == lfp.alignment());
+        Aligner<GapModel::Affine, AlignMode::Local, AlignBand::Full, double> ld;
+        run(ld, TracebackMode::Default, kern, A, B);
+        REQUIRE(ld.ran_grid() == (kern != kBackendScalar));
     }
     // above 2^25 cells, on the best level only (a 5900 x 5900 Pointers reference)
     const auto levels = detect_available_levels();
@@ -284,9 +290,9 @@ TEST_CASE("auto takes Grid for Glocal, and for Local above the pointer budget", 
 
 TEST_CASE("auto takes Grid for integer T where it splits", "[grid][traceback]") {
     // run_tb_ (2026-11-05): integer `auto` is hirschberg_pmax; a pair that splits (past
-    // hb_cutoff = 512 rows; Global int32 and Glocal have no pointer budget, Local and Global
-    // int64 have 2^25) runs Grid on a simd level, Pointers within the budget; int16 Global /
-    // Glocal keep pmax.
+    // hb_cutoff = 512 rows; Global int32 and Glocal have no pointer budget, Global int64 has
+    // 2^25) runs Grid on a simd level, Pointers within the budget; int16 Global / Glocal keep
+    // pmax; Local (not int16) takes Grid past hb_cutoff at every size.
     std::mt19937 rng(20261110);
     const AlignParams p = random_int_params(rng, 0);
     auto run = [&](auto& al, TracebackMode tb, int kern, const std::string& a, const std::string& b) {
@@ -319,9 +325,13 @@ TEST_CASE("auto takes Grid for integer T where it splits", "[grid][traceback]") 
         Aligner<GapModel::Affine, AlignMode::Glocal, AlignBand::Full, int16_t> c16;
         run(c16, TracebackMode::Default, kern, A, B);
         REQUIRE_FALSE(c16.ran_grid());
-        Aligner<GapModel::Affine, AlignMode::Local, AlignBand::Full, int32_t> l;
-        run(l, TracebackMode::Default, kern, A, B);
-        REQUIRE_FALSE(l.ran_grid());   // within the pointer budget: Pointers
+        Aligner<GapModel::Affine, AlignMode::Local, AlignBand::Full, int32_t> l, lp;
+        run(l, TracebackMode::Default, kern, A, B); run(lp, TracebackMode::Pointers, kern, A, B);
+        REQUIRE(l.ran_grid() == simd);   // Local: the one-pass Grid inside the budget too
+        if (simd) REQUIRE(l.alignment() == lp.alignment());
+        Aligner<GapModel::Affine, AlignMode::Local, AlignBand::Full, int16_t> l16;
+        run(l16, TracebackMode::Default, kern, A, B);
+        REQUIRE_FALSE(l16.ran_grid());   // int16 Local inside the budget: Pointers (a tie)
         Aligner<GapModel::Affine, AlignMode::Global, AlignBand::Full, int64_t> g64;
         run(g64, TracebackMode::Default, kern, A, B);
         REQUIRE_FALSE(g64.ran_grid());

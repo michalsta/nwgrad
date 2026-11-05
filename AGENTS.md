@@ -1277,6 +1277,33 @@ really takes (`test_tracked_long_global_float32_pairs_run_their_own_fill`).  fuz
   it (6300 x 6050, before the merge): int32 `auto` 1.94 ns/cell against pmax's 8.61.
   fuzz_ab main `85e0eb0` vs the branch: 300 seeds, 0 differ; grid-vs-pointers fuzz (every
   type and mode, three fills, 1-3 threads): 300 seeds, 0 differ.
+- **Local `auto` = the one-pass Grid at every size past hb_cutoff** (gate change allowed by the
+  owner, 2026-11-05; `run_tb_`, `kLocalGridAuto`).  Where the one-pass form applies (every gap
+  parameter >= 0, untracked, a simd level, m > hb_cutoff: grid_ok_) Local `auto` runs Grid
+  inside the pointer budget too, for float32, double, int32 and int64; int16 keeps Pointers
+  there (nighthaven 0.98 at L1000, a tie) and Grid above the budget.  The budget existed
+  because the two-pass Grid lost to Pointers (1.25x, nighthaven); it still applies to the
+  two-pass case (a negative extend) and to the fallbacks.  nighthaven AVX2 (explicit modes,
+  grid / pointers): float32 L1000 0.65, L3000 0.51 (6 threads 0.66 / 0.47); int32 0.57 /
+  0.42 (0.60 / 0.41); int64 0.51 / 0.41.  skynet sse4, 1 thread, Local protein (related core
+  in unrelated flanks, BLOSUM62 11/1), hb_cutoff 16 to expose the small sizes, ns/cell
+  pointers -> grid:
+
+  | L | float32 | double | int32 | int64 | int16 |
+  |---|---|---|---|---|---|
+  | 100 | 4.80 -> 4.70 | 7.56 -> 5.95 | 4.24 -> 4.27 | 7.47 -> 6.25 | 2.51 -> 3.42 |
+  | 200 | 3.96 -> 3.33 | 7.30 -> 5.14 | 3.75 -> 3.12 | 6.70 -> 5.42 | 1.97 -> 2.22 |
+  | 300 | 3.96 -> 2.91 | 7.02 -> 4.68 | 3.78 -> 2.61 | 6.68 -> 4.86 | 1.88 -> 1.76 |
+  | 500 | 3.74 -> 2.62 | 7.00 -> 4.06 | 3.92 -> 2.37 | 6.59 -> 4.26 | 1.95 -> 1.48 |
+  | 800 | 3.66 -> 2.35 | 6.90 -> 3.70 | 3.72 -> 2.20 | 6.55 -> 4.00 | 1.71 -> 1.33 |
+  | 1000 | 3.67 -> 2.26 | 6.98 -> 3.62 | 3.79 -> 1.99 | 6.54 -> 3.84 | 1.73 -> 1.44 |
+
+  Crossover ~L100 (float32 / int32 tie there), ~L250 for int16; double and int64 win from
+  L100.  The floor stays hb_cutoff (512 rows: grid_ok_, as for Global; below it every
+  mode runs Pointers), well past every crossover, so no new threshold.  Double Local was
+  Pointers at every size on main; on v3 expect the float32 / int64 ratio or better (its
+  Pointers fill moves 1 byte of codes per cell like float32 but its forward is half the
+  lanes, and skynet's double ratio, 0.52 at L1000, is the best of the five).
 - Tests: `tests/cpp/test_grid.cpp` (every mode at int16 / int32 / int64, int16 in both
   regimes, every backend here, `ran_grid()` per type; integer `auto` routing),
   `tests/Python/test_grid.py` (every mode x integer type through the batch, `auto`).
