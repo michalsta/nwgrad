@@ -2429,6 +2429,16 @@ slower than the better arm, up to 2.65x. What the data said, gate by gate:
   fast): ~1 MiB; the M1 keeps every type shared to L250-300 (3-5 MiB). So the cap is per
   type and knows `n_threads == 1`. Before, L120-160 float32 / double / int64 affine ran
   1.4-1.7x slower than the shared fill at 12 threads, L200-300 at 1 thread 1.3-1.7x.
+  **With more threads than physical cores the budget is 9/16 of it** (2026-11-05,
+  `threads_share_cores`, `kInterSmtBudget16`): two hyperthreads split a core's L1/L2, and
+  on nighthaven (AVX2, hard affine protein, 6 vs 12 threads) the shared/own crossover
+  fell from ~L180 to between L120 and L140 for float32, double and int32, Global and
+  Local alike, where the default lost 1.12-1.70x at L140-160. A half would have cost
+  int32 its 0.89x win at L120; 9/16 puts float32 / double at L134, int32 at L122. After:
+  12 threads, L140-160, default/best 1.00-1.05 (was 1.12-1.70); 6 threads (the default
+  count) unchanged; linear hard fills (under their cell caps) and DNA to 22 x 200 did not
+  move. Applies to the compiled default only; an `inter_group_bytes` override is taken as
+  given. Measured on AVX2 only: the other levels take the same factor unmeasured.
 - **A score-only call is exempt from the byte budget.** Its shared kernel keeps one row
   per table, so the budget (sized for W pairs' full tables) had been sending every
   score-only pair past ~L120 (AVX2) or ~L80 (AVX-512, 16 lanes) to its own fill, where the
