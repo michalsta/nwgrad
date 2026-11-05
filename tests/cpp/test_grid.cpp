@@ -187,3 +187,52 @@ TEST_CASE("Grid traceback runs as Pointers where it is not implemented", "[grid]
     }
     REQUIRE(n_grid == 0);
 }
+
+TEST_CASE("auto takes Grid for Glocal, and for Local above the pointer budget", "[grid][traceback]") {
+    // kDefaultTb (2026-11-05): Glocal past hb_cutoff (512 rows) runs Grid on every simd level (the
+    // scalar backend falls back, pmax / Pointers); Local runs Pointers within
+    // kAutoPointerCells and Grid above it.  Every run is Pointers' result.
+    std::mt19937 rng(20261106);
+    const AlignParams p = random_params(rng, 0);
+    auto run = [&](auto& al, TracebackMode tb, int kern, const std::string& a, const std::string& b) {
+        al.alloc_buf();
+        al.set_kernel(kern);
+        al.set_traceback(tb);
+        al.set_problem(a, b, p);
+        al.compute_viterbi();
+    };
+    std::uniform_int_distribution<int> aa(0, 19);
+    std::string A, B;
+    for (int i = 0; i < 800; ++i) A += kAA[aa(rng)];
+    for (int i = 0; i < 1200; ++i) B += kAA[aa(rng)];
+    for (int kern : grid_backends()) {
+        Aligner<GapModel::Affine, AlignMode::Glocal, AlignBand::Full, float> gf, rf;
+        Aligner<GapModel::Affine, AlignMode::Glocal, AlignBand::Full, double> gd, rd;
+        run(gf, TracebackMode::Default, kern, A, B); run(rf, TracebackMode::Pointers, kern, A, B);
+        run(gd, TracebackMode::Default, kern, A, B); run(rd, TracebackMode::Pointers, kern, A, B);
+        REQUIRE(gf.ran_grid() == (kern != kBackendScalar));
+        REQUIRE(gd.ran_grid() == (kern != kBackendScalar));
+        REQUIRE(same_bits(gd.score(), rd.score()));
+        REQUIRE(gd.alignment() == rd.alignment());
+        if (kern != kBackendScalar) {   // the scalar fallback is pmax at float32
+            REQUIRE(same_bits(gf.score(), rf.score()));
+            REQUIRE(gf.alignment() == rf.alignment());
+        }
+        Aligner<GapModel::Affine, AlignMode::Local, AlignBand::Full, float> lf;
+        run(lf, TracebackMode::Default, kern, A, B);
+        REQUIRE_FALSE(lf.ran_grid());   // 801 x 1201 cells: within the budget, Pointers
+    }
+    // above 2^25 cells, on the best level only (a 5900 x 5900 Pointers reference)
+    const auto levels = detect_available_levels();
+    if (levels.empty()) return;
+    const int kern = static_cast<int>(levels.back());
+    std::string LA, LB;
+    for (int i = 0; i < 5900; ++i) LA += kAA[aa(rng)];
+    for (char c : LA) LB += aa(rng) < 6 ? kAA[aa(rng)] : c;
+    Aligner<GapModel::Affine, AlignMode::Local, AlignBand::Full, float> lg, lp;
+    run(lg, TracebackMode::Default, kern, LA, LB);
+    run(lp, TracebackMode::Pointers, kern, LA, LB);
+    REQUIRE(lg.ran_grid());
+    REQUIRE(same_bits(lg.score(), lp.score()));
+    REQUIRE(lg.alignment() == lp.alignment());
+}

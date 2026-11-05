@@ -656,13 +656,15 @@ struct Aligner {
     // double, Pointers beat the exact recursion at every length and thread count within
     // the budget (nighthaven, wloczykij 64 cores); Global int64, Pointers beat pmax on both
     // fixtures; Local, Pointers beat pmax 1.5-3x on homologous pairs and lose 0-14 %
-    // (float32) / 6-37 % (integers) on unrelated ones.  Local double keeps plain Pointers
-    // (kDefaultTb); Global float32 / int16 / int32 keep hirschberg_pmax past hb_cutoff,
-    // which won there (homologous float32, both int32 fixtures).
+    // (float32) / 6-37 % (integers) on unrelated ones.  Since 2026-11-05 Local floating
+    // T runs Grid above the budget, not pmax (kDefaultTb, run_tb_), and Local double has
+    // the budget too; Global float32 / int16 / int32 keep their default past hb_cutoff
+    // (Grid; pmax for the integers, which won there).
+    // Local double joined 2026-11-05: its `auto` is Grid above the budget (kDefaultTb).
     static constexpr bool kAutoPointerBudget =
         GM == GapModel::Affine && AB == AlignBand::Full &&
         ((AM == AlignMode::Global && (std::is_same_v<T, double> || std::is_same_v<T, int64_t>)) ||
-         (AM == AlignMode::Local && (std::is_same_v<T, float> || nw_is_int<T>)));
+         AM == AlignMode::Local);
     // ... and up to how many cells (0 = no budget).  Global double 2^26: with the dense codes
     // (dense_gate_) Pointers kept beating the exact recursion to L8000 at 1 and 6 threads
     // (nighthaven 2026-10-26: Hirschberg 1.07-1.32x unrelated, 1.38-1.81x homologous); only
@@ -1529,7 +1531,8 @@ private:
     // the computation (~9.1e-13 against the exact mode's ~1.6e-12) rather than a rounding
     // lost in the noise.  Either default is overridable per problem.
     //
-    // LOCAL affine Full at T=float defaults to HirschbergPmax too (2026-10-05), since its
+    // LOCAL affine Full at T=float defaulted to HirschbergPmax too (2026-10-05; Grid above the
+    // pointer budget since 2026-11-05, below), since its
     // endpoint scans took the prefix-max carry: measured (nighthaven, AVX2, float32,
     // 1000-3000 aa, 1 / 12 threads) 1.6x / 1.5-2.3x Pointers on 30%-mutated homologues
     // and 2.8-3.6x / 3.7-5x on unrelated pairs, identical totals; pairs <= hb_cutoff run
@@ -1543,14 +1546,22 @@ private:
     // score-only pass, against 2-3.5x for the Hirschberg modes it replaced (AGENTS.md, "Grid
     // traceback").  Where Grid does not apply, `auto` runs kGridFallbackTb instead (see
     // run_viterbi), so a tracked or scalar-backend pair keeps Hirschberg's O(m+n) memory.
+    //
+    // Affine Glocal and Local Full at floating T: Grid too (2026-11-05, nighthaven AVX2,
+    // protein L300-10000, B in unrelated flanks of L/2; AGENTS.md "Grid for Glocal and
+    // Local").  Glocal picks its end in the forward kernel, one pass: from L1000 Grid ran
+    // 0.33-0.67 ns/cell against Pointers' 0.72-1.31 and pmax's 1.03-2.44, 1 and 6 threads,
+    // both precisions.  Local scans for its end first, two passes: Pointers stays within
+    // the pointer budget (kAutoPointerCells; 1 thread it wins 1-15 %), Grid replaces pmax
+    // above it (1.45-1.7x).  Their fallback is what `auto` ran before: pmax at float,
+    // Pointers at double (Glocal's tracked pairs, PosimiR's, keep Pointers).
     static constexpr TracebackMode kGridFallbackTb =
-        std::is_same_v<T, float> ? TracebackMode::HirschbergPmax : TracebackMode::Hirschberg;
+        std::is_same_v<T, float> ? TracebackMode::HirschbergPmax
+        : AM == AlignMode::Global ? TracebackMode::Hirschberg
+                                  : TracebackMode::Pointers;
     static constexpr TracebackMode kDefaultTb =
-        (GM == GapModel::Affine && AB == AlignBand::Full && AM == AlignMode::Global)
-            ? (nw_is_int<T> ? TracebackMode::HirschbergPmax
-                            : TracebackMode::Grid)
-        : (GM == GapModel::Affine && AB == AlignBand::Full && (std::is_same_v<T, float> || nw_is_int<T>))
-            ? TracebackMode::HirschbergPmax
+        (GM == GapModel::Affine && AB == AlignBand::Full)
+            ? (nw_is_int<T> ? TracebackMode::HirschbergPmax : TracebackMode::Grid)
             : TracebackMode::Pointers;
     TracebackMode tb_ = kDefaultTb;
     bool          tb_auto_ = true;   // tb_ came from "auto" (see linear_ptr_fill)
@@ -1702,10 +1713,13 @@ private:
     // The traceback this run takes: `auto` resolved to Grid where Grid does not apply runs
     // kGridFallbackTb.  Shared by run_viterbi and the buffer sizing (uses_rowwise_full),
     // which runs first and must see the same mode.
+    // Local: a pair within the pointer budget runs Pointers (Grid's result, faster there).
     TracebackMode run_tb_() const {
-        if constexpr (GM == GapModel::Affine && AM == AlignMode::Global && AB == AlignBand::Full &&
-                      std::is_floating_point_v<T>)
+        if constexpr (GM == GapModel::Affine && AB == AlignBand::Full && std::is_floating_point_v<T>)
             if (tb_ == TracebackMode::Grid && tb_auto_) {
+                if constexpr (AM == AlignMode::Local)
+                    if ((static_cast<std::size_t>(m_) + 1) * (static_cast<std::size_t>(n_) + 1) <= kAutoPointerCells)
+                        return TracebackMode::Pointers;
                 const int be = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
                 if (be == kBackendScalar || !grid_ok_(level_kernels(be))) return kGridFallbackTb;
             }

@@ -1171,8 +1171,32 @@ borders; what each mode adds:
   test it replaced could not see a silent fallback), and the fallback case now requires 0
   Grid runs; `test_grid.py` runs the batch layer in all three modes.  skynet: 4.45 M
   assertions at `NWGRAD_GRID_FUZZ=600`, every backend.
-- **`auto` is unchanged** (Local / Glocal float32: hirschberg_pmax past hb_cutoff; double:
-  Pointers); whether it should take Grid there is measured below.
+- **`auto` takes Grid there too** (`kDefaultTb`, affine Full floating T in every mode).
+  `tools/bench_tracebacks.py --align local|glocal` (protein, B = the related sequence
+  inside unrelated flanks of L/2 each side; ns per DP cell, best of 5):
+
+  | host, threads | mode | prec | L | pointers | hirschberg_pmax | grid |
+  |---|---|---|---|---|---|---|
+  | nighthaven AVX2, 1 | glocal | f32 | 1000 / 10000 | 0.732 / 0.720 | 1.033 / 1.180 | 0.449 / 0.333 |
+  | | glocal | f64 | 1000 / 10000 | 1.314 / 1.251 | 2.116 / 2.438 | 0.667 / 0.642 |
+  | | local | f32 | 1000 / 10000 | 0.777 / 0.810 | 1.233 / 1.387 | 0.848 / 0.819 |
+  | | local | f64 | 1000 / 10000 | 1.345 / 1.412 | 2.561 / 2.846 | 1.552 / 1.469 |
+  | nighthaven AVX2, 6 | local | f32 | 3000 / 10000 | 0.198 / 0.196 | 0.251 / 0.258 | 0.170 / 0.155 |
+  | | local | f64 | 3000 / 10000 | 0.305 / 0.338 | 0.506 / 0.545 | 0.306 / 0.296 |
+  | spot NEON, 1 | glocal | f32 | 1000 / 10000 | 1.316 / 1.369 | 1.501 / 1.985 | 0.733 / 0.562 |
+  | | local | f32 | 1000 / 10000 | 1.423 / 1.496 | 1.770 / 2.262 | 1.435 / 1.501 |
+  | | local | f64 | 1000 / 10000 | 2.243 / 2.523 | 3.802 / 4.964 | 2.408 / 2.764 |
+
+  At L300 (below `hb_cutoff`) all three are Pointers.  Glocal is one pass (the end comes
+  out of the forward kernel) and wins outright, under score-only's striped kernel from L3000
+  (0.83-0.98x); `auto` is Grid there for both precisions, falling back (tracked pairs --
+  PosimiR's --, the scalar backend, <= hb_cutoff rows) to what it ran before: pmax at
+  float32, Pointers at double (`kGridFallbackTb` per mode).  Local pays the end scan, a
+  second pass: Pointers wins at one thread (1-15 %), Grid from L3000 at 6 threads, and Grid
+  beats pmax 1.2-1.8x everywhere; so Local keeps Pointers within the pointer budget
+  (`kAutoPointerCells`, 2^25 cells, now for double too: `run_tb_`) and takes Grid above it,
+  where float32 ran pmax and double unbounded Pointers.  `test_grid.cpp` "auto takes Grid
+  ..." pins the routing with `ran_grid()`.
 
 **`auto`'s Grid and the planner (fixed 2026-11-04).**  Grid refuses a tracked pair
 (`grid_ok_`: `tr_`), which then runs `kGridFallbackTb` -- `hirschberg_pmax` at float32,

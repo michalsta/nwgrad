@@ -228,12 +228,14 @@ def test_is_the_default_where_it_applies(params):
                           mode="global").traceback == "grid"
     assert nwgrad.SeqPairDouble("ACDE", "ACDE", params, gap_model="affine",
                                 mode="global").traceback == "grid"
-    # Local affine: pmax at float32 (its endpoint scans take the carry), pointers at
-    # double; linear resolves to pointers
-    assert nwgrad.SeqPair("ACDE", "ACDE", params, gap_model="affine",
-                          mode="local").traceback == "hirschberg_pmax"
-    assert nwgrad.SeqPairDouble("ACDE", "ACDE", params, gap_model="affine",
-                                mode="local").traceback == "pointers"
+    # Local and Glocal affine: grid too (since 2026-11-05; Local runs Pointers within the
+    # pointer budget, and where grid does not apply both fall back to pmax at float32,
+    # pointers at double); linear resolves to pointers
+    for mode in ("local", "glocal"):
+        assert nwgrad.SeqPair("ACDE", "ACDE", params, gap_model="affine",
+                              mode=mode).traceback == "grid"
+        assert nwgrad.SeqPairDouble("ACDE", "ACDE", params, gap_model="affine",
+                                    mode=mode).traceback == "grid"
     assert nwgrad.SeqPair("ACDE", "ACDE", params, gap_model="linear",
                           mode="global").traceback == "pointers"
 
