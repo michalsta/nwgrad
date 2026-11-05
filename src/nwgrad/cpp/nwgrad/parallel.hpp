@@ -109,6 +109,13 @@ inline int default_thread_count() noexcept {
     return cached;
 }
 
+// Whether n_threads threads must share physical cores (hyperthreads): more threads than
+// physical_cores(), computed once.  False where the topology is unknown.
+inline bool threads_share_cores(int n_threads) noexcept {
+    static const int p = physical_cores();
+    return p > 0 && n_threads > p;
+}
+
 // Run `worker` on `n_threads` threads, one of which is the calling thread.
 //
 // An exception escaping a std::thread's callable calls std::terminate, which
