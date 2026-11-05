@@ -346,13 +346,26 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
     constexpr int kRolling = kIntCarry ? 4 : 5;
     std::size_t rs; T* const rows = spread_rows<T>(buf.srows, sw, kRolling + 1, rs);
     const T* pad = nullptr;
-    // (MOnly's M padding is clamped to exactly 0 for floating T — the padding profile is
-    // -inf — but an integer T pads the profile with 0 (nw_pad), so its padding M is a
-    // real value and needs the mask too.)
-    if constexpr ((Local && (!MOnly || nw_is_int<T>)) || Glocal) pad = striped_pad_into<T, Sat>(rows + kRolling * rs, n, seg, W);
+    // MOnly needs no mask at an integer T either, though its padding profile is 0
+    // (nw_pad) and a padding M is a real value: M(i, j > n) = max(D(i-1, j-1) + 0, 0),
+    // and with every gap parameter >= 0 no D exceeds the best M at or before it (a gap
+    // cell never exceeds the cell it extends from), real or padding alike -- padding
+    // only follows real columns, never feeds them.  So the padding M never exceeds the
+    // running best and the unmasked max is the same.  (The W < 4 form below always ran
+    // it unmasked.)
+    if constexpr ((Local && !MOnly) || Glocal) pad = striped_pad_into<T, Sat>(rows + kRolling * rs, n, seg, W);
     auto padded = [&](const vd& v, int s) {
         vd p; p.copy_from(pad + (std::size_t)s * W, stdx::element_aligned);
         return vadd<Sat>(v, p);
+    };
+    // The padding slots (column l*seg + s + 1 > n) are in segments s >= s0 only (lane W-1
+    // reaches past n first; with seg >= W that is the last segment alone), so the row
+    // passes add the mask from s0 on (a load and an add fewer a vector cell before it).
+    // The mask's real slots are 0 and v + 0 == v at an integer T: the same maxima.
+    const int s0 = std::max(0, n - (W - 1) * seg);
+    auto mpad = [&]<bool Mk>(const vd& v, int s) __attribute__((always_inline)) {
+        if constexpr (Mk) return padded(v, s);
+        else              return v;
     };
 
     striped_profile_build<T, Tr>(buf.sprof, job.blk, nalpha, b, n, seg, W, tr);
@@ -431,13 +444,13 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
                 vxv.copy_to(cX + (std::size_t)s * W, stdx::element_aligned);
                 mx.copy_to(cD + (std::size_t)s * W, stdx::element_aligned);
             };
-            auto carry = [&](const vd& mx, const vd& vmv, int s) __attribute__((always_inline)) {
+            auto carry = [&]<bool Mk>(const vd& mx, const vd& vmv, int s) __attribute__((always_inline)) {
                 fP = stdx::max(fP, vadd<Sat>(fOprev, fR));
                 fOprev = open_pen<Sat>(mx, vgo_a, vge_a, vgoe_a);
                 fR += vge_a;
                 if constexpr (Local) {
-                    if constexpr (MOnly) vbest = stdx::max(vbest, padded(vmv, s));
-                    else                 vbest = stdx::max(vbest, padded(mx, s));
+                    if constexpr (MOnly) vbest = stdx::max(vbest, vmv);   // no mask: see `pad`
+                    else                 vbest = stdx::max(vbest, mpad.template operator()<Mk>(mx, s));
                 }
             };
             vd dD;
@@ -445,8 +458,7 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
                 vd lD; lD.copy_from(pD + (std::size_t)(seg - 1) * W, stdx::element_aligned);
                 dD = lane_shift_in(lD, bD);
             }
-            int s = 0;
-            for (; s + 1 < seg; s += 2) {
+            auto trip = [&]<bool Mk>(int s) __attribute__((always_inline)) {
                 vd sb0, sb1, uD0, uX0, uD1, uX1;
                 sb0.copy_from(sub + (std::size_t)s * W, stdx::element_aligned);
                 sb1.copy_from(sub + (std::size_t)(s + 1) * W, stdx::element_aligned);
@@ -457,20 +469,25 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
                 vd mx0, vmv0, mx1, vmv1;
                 cell(dD, uD0, uX0, sb0, s, mx0, vmv0);
                 cell(uD0, uD1, uX1, sb1, s + 1, mx1, vmv1);
-                carry(mx0, vmv0, s);
-                carry(mx1, vmv1, s + 1);
+                carry.template operator()<Mk>(mx0, vmv0, s);
+                carry.template operator()<Mk>(mx1, vmv1, s + 1);
                 dD = uD1;
+            };
+            int s = 0;
+            if constexpr (Local) {   // the trips before the padding, unmasked
+                for (; s + 1 < s0; s += 2) trip.template operator()<false>(s);
             }
+            for (; s + 1 < seg; s += 2) trip.template operator()<true>(s);
             if (s < seg) {
                 vd sb0, uD0, uX0, mx0, vmv0;
                 sb0.copy_from(sub + (std::size_t)s * W, stdx::element_aligned);
                 uD0.copy_from(pD + (std::size_t)s * W, stdx::element_aligned);
                 uX0.copy_from(pX + (std::size_t)s * W, stdx::element_aligned);
                 cell(dD, uD0, uX0, sb0, s, mx0, vmv0);
-                carry(mx0, vmv0, s);
+                carry.template operator()<true>(mx0, vmv0, s);
             }
-        } else
-        for (int s = 0; s < seg; ++s) {
+        } else {
+        auto seg1 = [&]<bool Mk>(int s) __attribute__((always_inline)) {
             vd dD;
             if (s == 0) {
                 vd lD; lD.copy_from(pD + (std::size_t)(seg - 1) * W, stdx::element_aligned);
@@ -498,8 +515,8 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
                 fOprev = open_pen<Sat>(mx, vgo_a, vge_a, vgoe_a);
                 fR += vge_a;
                 if constexpr (Local) {
-                    if constexpr (MOnly) vbest = stdx::max(vbest, padded(vmv, s));
-                    else                 vbest = stdx::max(vbest, padded(mx, s));
+                    if constexpr (MOnly) vbest = stdx::max(vbest, vmv);   // no mask: see `pad`
+                    else                 vbest = stdx::max(vbest, mpad.template operator()<Mk>(mx, s));
                 }
             } else {
             const vd vyv = stdx::max(Oin, vsub<Sat>(Yin, vge_a));
@@ -513,6 +530,12 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
             Oin = open_pen<Sat>(mx, vgo_a, vge_a, vgoe_a);
             Yin = vyv;
             }
+        };
+        int s = 0;
+        if constexpr (Local && !MOnly && nw_is_int<T> && W >= 4) {
+            for (; s < s0; ++s) seg1.template operator()<false>(s);
+        }
+        for (; s < seg; ++s) seg1.template operator()<true>(s);
         }
         const vd Olast = Oin;
 
@@ -544,16 +567,21 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
             // rows instead of five (with the profile and Local's mask, 5-6 rows of
             // working set instead of 6-7).
             vd P = vcin, Op = vsub<Sat>(vninf, fBase), rq = fBase;   // Op: pass 1's seed
-            for (int s = 0; s < seg; ++s) {
+            auto step2 = [&]<bool Mk>(int s) __attribute__((always_inline)) {
                 vd d; d.copy_from(cD + (std::size_t)s * W, stdx::element_aligned);
                 P = stdx::max(P, vadd<Sat>(Op, rq));
                 Op = open_pen<Sat>(d, vgo_a, vge_a, vgoe_a);
                 const vd y = vsub<Sat>(P, rq);
                 d = stdx::max(d, y);
                 d.copy_to(cD + (std::size_t)s * W, stdx::element_aligned);
-                if constexpr (Local && !MOnly) vbest = stdx::max(vbest, padded(y, s));
+                if constexpr (Local && !MOnly) vbest = stdx::max(vbest, mpad.template operator()<Mk>(y, s));
                 rq += vge_a;
+            };
+            int s = 0;
+            if constexpr (Local && !MOnly) {
+                for (; s < s0; ++s) step2.template operator()<false>(s);
             }
+            for (; s < seg; ++s) step2.template operator()<true>(s);
         } else
         for (int r = 0; r < W; ++r) {
             vd last; last.copy_from(cY + (std::size_t)(seg - 1) * W, stdx::element_aligned);
