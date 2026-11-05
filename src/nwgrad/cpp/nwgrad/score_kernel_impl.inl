@@ -891,7 +891,11 @@ static void score_linear_striped_int(ScoreJob<T>& job) {
         // Saturating regime: the D/X kernel's form, as a clamped U - ge_a is not U - ge_a.
         vd fR = Sat ? fBase : vd(fBase - vge_a), fP = vninf;
         vd fOprev = vsub<Sat>(vninf, fBase);    // segment 0 has no Q term (see the D/X kernel)
-        vd Uq = vninf - fR;                     // (plain regime)
+        // (plain regime only: the saturating regime's sentinel is lowest() itself, where
+        // - fR would overflow -- UB, caught by UBSan; the plain one is lowest()/2, and the
+        // bound keeps -fR within its depth, as fOprev's seed)
+        vd Uq = vninf;
+        if constexpr (!Sat) Uq = vninf - fR;
         vd U = vninf;
         auto step = [&](int s) NWGRAD_ALWAYS_INLINE_LAMBDA {
             const std::size_t o = (std::size_t)s * W;
