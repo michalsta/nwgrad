@@ -2803,9 +2803,59 @@ linear 57.0 → 12.9; L300 unchanged (25.5 / 25.5). So the "L1000 float32 0.21-0
 in "The float32 soft path" is mostly this, and checkpoints cannot fix it. Flushing in double
 loses only terms below DBL_MIN, which the table bound already charges as lost; the
 gradient-product hole of float32 (item 2 there) would exist in double at 2^-1022 instead of
-2^-1074, ~2^-300 for the largest posterior factors seen. Not changed here: it moves default
-double results (within tolerance) and is the contract's call -- the follow-up is a
-`FlushDenormalsScope` around the double kernels too, with that argument written down.
+2^-1074, ~2^-300 for the largest posterior factors seen.
+
+**The two fixes, prototyped (branch `proto/soft-denormal`, 2026-11-05)**, both behind
+switches (`nwgrad._tuning`; environment fallbacks `NWGRAD_SOFT_WINDOW_LOG2`,
+`NWGRAD_SOFT_DOUBLE_FTZ`), default OFF:
+- (A) `soft_window_log2 = e`: the double lazy-rescale window [2^-e, 2^e] instead of 2^256
+  (`SoftPairJobT::win`, `sp_lazy`'s new argument; the inter-pair kernel keeps its constant).
+  **It buys nothing.** Rescales per row go up as expected (protein L1000 affine, backward /
+  forward rows rescaled: 7 / 7 at 2^256, 28 at 2^64, 111 at 2^16, ~all at 2^0; L4000 29 →
+  117 → 451), but the time does not move (table below): keeping the row max near 1 instead
+  of anywhere in [2^-256, 2^256] only slides the 52-binary-order subnormal band
+  [2^-1074, 2^-1022] x max outwards to cells farther from the diagonal, and mass decays
+  roughly geometrically with that distance, so about as many cells sit in the band.
+- (B) `soft_double_ftz = 1`: the double soft kernels (per pair, `Aligner::fwdbwd_scaled`,
+  every thread that runs one; and the inter-pair pass, `BatchEngine::SoftGroup`) under
+  `FlushDenormalsScope`, as float32 always ran. **3.2-5x at L ≥ 1000, and 1.9x already at
+  L300 linear.** The bound stays valid: a table or carry term below DBL_MIN in its row's
+  stored units is charged as wholly lost by `sp_loss` whether it was kept as a subnormal or
+  flushed; the gradient pass's products, which double never charged, now are charged their
+  worst case (`kSpProdLoss`: every product of the row flushed, `sp_loss_products_max`; the
+  recount runs only past a quarter of the tolerance, which no test or benchmark reached;
+  the gap sums count as products, double's are not `std::fma`). That charge is ~1e-300 in
+  every row measured (bound totals at L4000: 8e-301 affine, 1e-301 linear, against
+  2^-45), costs no measurable instruction (79.2 main vs 79.4, 47.6 vs 47.3 at L1000), and
+  applies in both forms. `test_soft_denormal.py`: every form (2^256 / 2^64 / 2^16 / 2^0,
+  FTZ, FTZ + 2^64) against the log path at 1e-11 on L250 related protein pairs (which go
+  subnormal), low temperature (0.3 / 0.1, `scaled_or_log`), banded; out-of-range pairs
+  still raise.
+
+  Protein (as above), Global, own fill, lazy guide, 1 thread, skynet sse4, ns/cell
+  (instructions/cell); "branch" is this branch with both switches off, run twice (A/A):
+
+  | L | gap | main | branch A/A | (A) 2^64 | (A) 2^16 | (B) FTZ |
+  |---|---|---|---|---|---|---|
+  | 300 | affine | 18.6 (81.6) | 20.2 / 21.0 (82.1 / 81.8) | 21.2 (83.0) | 21.0 (84.5) | 19.9 (82.0) |
+  | 300 | linear | 18.4 (49.7) | 18.7 / 18.0 (49.8 / 49.5) | 24.4 (49.9) | 25.2 (50.6) | **9.5** (49.4) |
+  | 1000 | affine | 80.8 (79.2) | 89.4 / 88.4 (79.4) | 94.4 (79.9) | 103.8 (81.7) | **26.3** (78.9) |
+  | 1000 | linear | 48.2 (47.6) | 54.9 / 56.1 (47.3) | 61.5 (47.6) | 61.2 (48.1) | **10.8** (47.0) |
+  | 2000 | affine | 73.9 (78.6) | 80.3 / 78.4 (78.6) | 79.3 (79.0) | 70.6 (80.8) | **24.3** (78.2) |
+  | 2000 | linear | 45.1 (47.1) | 42.9 / 46.0 (46.7) | 50.7 (46.9) | 52.7 (47.5) | **11.2** (46.4) |
+  | 4000 | affine | 96.8 (78.4) | 97.6 / 94.2 (78.4) | 86.8 (78.8) | 91.4 (80.6) | **25.0** (77.8) |
+  | 4000 | linear | 33.5 (46.8) | 32.4 / 31.5 (46.4) | 32.7 (46.5) | 37.4 (47.1) | **11.2** (46.2) |
+
+  float32 (untouched by both switches; branch vs main, instructions/cell): 64.5-64.8 vs 64.8,
+  38.3/37.9 vs 38.2 at L300; 60.4 vs 60.2 affine and 34.4 vs 34.6 linear at L4000, wall
+  15.9 vs 15.9. Double FTZ is now about float32's speed (L4000 affine 25.0 vs 15.9, linear
+  11.2 vs 7.3-7.8). Short pairs: DNA 22 x 50 local, 20k pairs, inter-pair 15.6 / 15.8 base
+  vs 15.9 FTZ µs, own fill within the run-to-run noise (±15 % at load ~20). All switch
+  forms pass the soft test files and the full suite (5620 passed, 18 skipped, each).
+  Recommendation: make (B) the default (drop (A)); the double soft results then move
+  within tolerance, as float32's did when its flush went in. Not measured: AArch64 (FPCR.FZ
+  is set by the same guard; the M1's denormal handling is in hardware, so the gain there
+  may be small), AVX2/AVX-512 hosts.
 
 ### Glocal mode (branch `feat/glocal`, 2026-11-01)
 
