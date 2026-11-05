@@ -1058,10 +1058,11 @@ prototyped in `tools/gridgrad/` and integrated as `TracebackMode::Grid`:
   steps, ties included.  Tested: `tests/cpp/test_grid.cpp` (every backend, both precisions,
   ties, 0.1 extends, small `hb_cutoff` so the recursion and its block borders run; a mutated
   base-block tie-break fails it), `tests/Python/test_grid.py` (SeqPairBatch / SeqPair).
-- **Scope:** affine Global Full, untracked, floating T, opens >= 0 (the D/X form), a simd
-  level with the kernel, m > `hb_cutoff`.  Everything else — Local, linear, tracks, negative
-  opens, integer T, `scalar_fallback`, short pairs — runs AS Pointers, which is the same result
-  by definition, so no fallback can change an answer.  Not the `auto` default (yet).
+- **Scope:** affine Full, untracked, opens >= 0 (the D/X form; Local also extends >= 0), a simd
+  level with the kernel, m > `hb_cutoff`; Global, Local and Glocal, every scalar type (Local,
+  Glocal and integer T since 2026-11-05, below).  Everything else — linear, tracks, negative
+  opens, `scalar_fallback`, short pairs — runs AS Pointers, which is the same result by
+  definition, so no fallback can change an answer.
 - **Tuning:** `kGridK` = 32 lines per dimension per level, `kGridMin` = 8, `kGridBase` = 64 x 64
   cells (the prototype's sweep: k = 32 version B was the best time; k = 8 cuts memory ~3x for
   ~10 %).  Memory ~ kGridK (m + n) * 3 values summed over levels: ~15 MB at 10 000 aa f64.
@@ -1156,6 +1157,58 @@ splitting past `hb_cutoff` rows.  The batch engine resolved `auto` from an untra
 planners now ask `hb_splits` with `own_tb_(tracked)`, the traceback the pair's own fill
 really takes (`test_tracked_long_global_float32_pairs_run_their_own_fill`).  fuzz_fill
 0 of 1000 seeds fail, 0 of 300 under `--mode local` / `glocal`.
+
+**Local, Glocal and integer T (branch `proto/grid-extend`, 2026-11-05).**
+- **Local:** the forward pass clamps M at 0 at every level (it is the recurrence); the TOP
+  level (`GridFwdJob::find_best`) also tracks the best cell as the Pointers kernel's `monly`
+  does (per lane the largest M and its first segment, strict `>`; reduced after the row only
+  when it beats the running best) — with every gap parameter >= 0 the first cell reaching a
+  row's max(M, X, Y) is an M cell, so it is `local_row_best_`'s cell (hence grid_ok_ asks
+  extends >= 0 too for Local).  The walk starts there over the SAME saved lines (no second
+  pass over [0, i*] x [0, j*]) and stops where Pointers' does: in state M at a cell whose
+  code is 3 (`grid_base` re-fills with viterbi_affine_ptr's clamp and stop code), `st = 3`
+  ending every level's walk.  Best <= 0: the empty path at (0, 0), score 0.
+- **Glocal:** the borders of viterbi_affine_ptr (row 0 a start), the end = the best cell of
+  row m over max(M, X, Y), column order (`end_row`, glocal_end_rows_'s scan, at the top
+  level's last row); the walk ends at row 0, column 0 climbs to it.
+- **Integer T:** lazy-F carrying F - ge is floating-only, so Y takes
+  `score_affine_striped_pos`'s fused exact prefix-max carry from 4 lanes (opens never reach
+  memory, ramp in registers, one pass after the row applies the lanes' carry-in and the ramp)
+  and the plain exact lazy-F below 4 lanes (int64 at 128 bits).  The rectangle's left-column
+  Y enters as one more open at column c0: max(open(c0), Y(c0) - ge).  Saturating int16
+  (`job.sat`): saturating adds / subtracts and the lowest() sentinel, the score kernel's
+  regime; the walk reads codes on reachable cells only, whose values are exact.  The guide
+  starts at `hb_start` (Pointers' convention, `guide_j_grid_`).
+- **`auto`** (`run_tb_`): where it resolved to a Hirschberg mode and the pair SPLITS
+  (`hb_splits`: past hb_cutoff and past the pointer budget where the type has one — Local
+  float32 / integers 2^25, Global int64 2^25; Global int16 / int32 and Glocal float32 /
+  integers have none), it runs Grid where grid_ok_.  Below the budget the Pointers fill
+  stays; tracked pairs / scalar backend keep the Hirschberg mode.  The planners ask
+  hb_splits of the resolved Hirschberg mode, true either way, so these pairs keep their own
+  fill.  Visible changes against main: float32 Local / Glocal above the threshold get
+  Pointers' optimum instead of pmax's; integer pairs keep their scores (pmax is exact there)
+  but take Pointers' path wherever Hirschberg broke a tie differently.
+- Measured (skynet sse4, 1 thread, `bench_one.py` related protein pairs BLOSUM62 11/1, striped
+  fill, explicit tracebacks; ns/cell and instructions/cell, the latter by differencing two rep
+  counts; A/A grid vs grid 2.76 / 2.59 ns at the noisiest cell, instructions within 0.5 %):
+
+  | L | type mode | score-only | **grid** | pointers | hirschberg_pmax |
+  |---|---|---|---|---|---|
+  | 1000 | f32 Local | 2.07 / 10.7 | **2.59 / 16.1** | 3.99 / 26.8 | 8.25 / 57.8 |
+  | 1000 | i32 Local | 1.41 / 9.1 | **2.14 / 14.8** | 3.94 / 26.4 | 7.97 / 56.8 |
+  | 1000 | i32 Global | 1.23 / 8.0 | **2.19 / 12.4** | 3.71 / 22.2 | 4.68 / 24.0 |
+  | 3000 | f32 Local | 1.81 / 10.4 | **1.92 / 13.5** | 3.91 / 26.3 | 10.6 / 55.6 |
+  | 3000 | i32 Local | 1.40 / 9.0 | **1.70 / 11.8** | 3.99 / 26.0 | 8.69 / 55.8 |
+  | 3000 | i32 Global | 1.37 / 7.8 | **1.53 / 9.6** | 3.67 / 21.9 | 3.56 / 23.7 |
+
+  Grid 1.5-2.4x faster than Pointers, 2.1-5.5x than hirschberg_pmax, 1.06-1.8x score-only.
+  `auto` above the budget (one Local pair 6300 x 6050, past 2^25): f32 2.11 ns/cell against
+  main's 8.80 (pmax), int32 1.94 against 8.61; same score, Pointers' path (main's differs on
+  ties).  fuzz_ab main vs branch: 300 seeds, 0 differ (its pairs stay within the budget).
+- Tests: `tests/cpp/test_grid.cpp` (Local / Glocal at both floating precisions, every mode at
+  int16 / int32 / int64, int16 in both regimes, every backend here; `used_grid()` asserts
+  the grid ran for each type), `tests/Python/test_grid.py` (every mode x type through the
+  batch, `auto` past the cutoff).
 
 ### Linear gaps: Pointers and Hirschberg (2026-10-05)
 
