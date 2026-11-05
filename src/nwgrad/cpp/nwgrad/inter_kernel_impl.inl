@@ -134,6 +134,55 @@ static inline V ivlanes_(F& f, std::index_sequence<I...>) noexcept {
 template <class V, int W, class F>
 static inline V ivlanes(F f) noexcept { return ivlanes_<V>(f, std::make_index_sequence<static_cast<std::size_t>(W)>{}); }
 
+// Byte lookups (kLvLut below).  A level has them where a 16-entry byte shuffle exists:
+// pshufb from SSSE3 (the sse4 level and up), tbl on NEON; the SSE2 baseline has none.
+#if defined(__SSE4_1__) || defined(__ARM_NEON)
+inline constexpr bool kByteShuffle = true;
+#else
+inline constexpr bool kByteShuffle = false;
+#endif
+typedef signed char isb16 __attribute__((vector_size(16)));
+typedef signed char isb32 __attribute__((vector_size(32)));
+// One byte per lane: 16 bytes, or 32 for the 32 int16 lanes of AVX-512.
+template <int W> using isb = std::conditional_t<(W > 16), isb32, isb16>;
+// r[k] = t[idx[k]] for idx[k] in 0..15, in each 16-byte half (pshufb's semantics).
+template <class S> [[gnu::always_inline]] static inline S ibshuf(isb16 t, S idx) noexcept {
+#if defined(__SSE4_1__)
+    if constexpr (sizeof(S) == 16) return (S)_mm_shuffle_epi8((__m128i)t, (__m128i)idx);
+#  if defined(__AVX2__)
+    else return (S)_mm256_shuffle_epi8(_mm256_broadcastsi128_si256((__m128i)t), (__m256i)idx);
+#  endif
+#elif defined(__ARM_NEON)
+    if constexpr (sizeof(S) == 16) return (S)vqtbl1q_s8((int8x16_t)t, (uint8x16_t)idx);
+#endif
+    S r{};   // levels without a shuffle never run this (kByteShuffle); it only compiles
+    for (unsigned k = 0; k < sizeof(S); ++k) r[k] = t[idx[k] & 15];
+    return r;
+}
+// The low W bytes of r, sign-extended (or converted) to V's W lanes: pmovsx* on x86.
+template <class S, std::size_t... I>
+[[gnu::always_inline]] static inline auto iblow_(S r, std::index_sequence<I...>) noexcept {
+    return __builtin_shufflevector(r, r, static_cast<int>(I)...);
+}
+template <class V, int W, class S> [[gnu::always_inline]] static inline V ibwiden(S r) noexcept {
+#if defined(__SSE4_1__)
+    // 2 int64 lanes: gcc moved the 2-byte vector through a general register first
+    if constexpr (W == 2 && sizeof(V) == 16 && std::is_integral_v<std::remove_cvref_t<decltype(V{}[0])>>)
+        return (V)_mm_cvtepi8_epi64((__m128i)r);
+    else
+#endif
+    return __builtin_convertvector(iblow_(r, std::make_index_sequence<static_cast<std::size_t>(W)>{}), V);
+}
+// v is exactly an int8 (as a bit pattern, for floats: -0 is not).
+template <class T> static inline bool fits_i8(T v) noexcept {
+    if constexpr (std::is_integral_v<T>) return v >= -128 && v <= 127;
+    else {
+        if (!(v >= T(-128) && v <= T(127))) return false;   // NaN too
+        const T r = static_cast<T>(static_cast<int>(v));
+        return std::memcmp(&r, &v, sizeof(T)) == 0;
+    }
+}
+
 
 // The substitution lookup's form, a template parameter of every inter-pair kernel (Lv):
 // kLvGather (-1) for alphabets over 8 letters (each row gathered into srow), 2 or 3 for
@@ -143,6 +192,12 @@ static inline V ivlanes(F f) noexcept { return ivlanes_<V>(f, std::make_index_se
 // five hottest instructions.  Alphabets of 1 or 2 letters take the 2-level tree: their
 // bit-1 masks are all 0 and P[2], P[3] repeat P[0], so it selects the same P[b].
 inline constexpr int kLvGather = -1;
+// kLvLut (4): integer lanes, alphabets of at most 4 letters, every score an int8, at a
+// level with a byte shuffle.  The 4x4 matrix is one 16-byte table, t[4a + b]; per row each
+// lane's 4a as a byte vector, per column its b (the transposed B codes), and the score is
+// one add, one shuffle and one widen per vector cell, for the tree's 3 blends and 2 mask
+// loads.  Values past int8, or tracked lanes (a block per row), take the tree.
+inline constexpr int kLvLut = 4;
 
 // Per lane, the score of this row's A residue against the column's B residue: a blend
 // tree on the B residue's bits (bits[Lv*j + k] = bit k of each lane's b[j-1], as masks).
@@ -175,11 +230,40 @@ struct InterCommon {
 #endif
     const InterJobT<T>& J;
     static constexpr int levels = Lv;
+    static constexpr bool kTree = Lv == 2 || Lv == 3;
+    using sbv = isb<IW>;
+    // A row's profile: the tree's 1 << Lv vectors, or (kLvLut) 4 * each lane's A code.
+    struct Prof { ivd p[8]; sbv ar; };
     std::vector<ivl>& bits;
     std::vector<ivd>& srow;
+    const sbv* btl = nullptr;   // kLvLut: per column, each lane's B code (ragged: pad 0)
+    const sbv* atl = nullptr;   // kLvLut: per row, 4 * each lane's A code (0 past its A)
+    isb16 tbl{};                // kLvLut: t[4a + b]
     explicit InterCommon(const InterJobT<T>& job) : J(job), bits(bits_buf()), srow(srow_buf()) {
         const int n = J.n;
         if (levels < 0 && srow.size() < static_cast<size_t>(n + 1)) srow.resize(n + 1);
+        if constexpr (Lv == kLvLut) {
+            const int na = J.nalpha, M = J.M;
+            std::vector<sbv>& bb = sbv_buf<0>();
+            std::vector<sbv>& ab = sbv_buf<1>();
+            if (bb.size() < static_cast<size_t>(n + 1)) bb.resize(n + 1);
+            if (ab.size() < static_cast<size_t>(M + 1)) ab.resize(M + 1);
+            for (int j = 1; j <= n; ++j) {
+                sbv v{};
+                for (int l = 0; l < IW; ++l)
+                    v[l] = static_cast<signed char>((!J.nb || j <= J.nb[l]) ? J.b[l][j - 1] : 0);   // ragged: pad
+                bb[j] = v;
+            }
+            for (int i = 1; i <= M; ++i) {
+                sbv v{};
+                for (int l = 0; l < IW; ++l)
+                    v[l] = static_cast<signed char>(4 * ((i <= J.m[l]) ? J.a[l][i - 1] : 0));
+                ab[i] = v;
+            }
+            for (int a = 0; a < na; ++a)
+                for (int b = 0; b < na; ++b) tbl[4 * a + b] = static_cast<signed char>(J.blk[a * na + b]);
+            btl = bb.data(); atl = ab.data();
+        }
         if (levels > 0 && bits.size() < static_cast<size_t>(Lv * (n + 1))) bits.resize(Lv * (n + 1));
         // The masks from the lanes' residues: the W residues of column j gathered as bytes
         // (one byte load and store per lane), widened to the lane width in one convert, and
@@ -196,7 +280,8 @@ struct InterCommon {
         // solace); NEON int16 LOST 2-6 % (spot, M1) and AVX2 float32 / int32 read a tie on
         // nighthaven and 3-8 % slower score-only on solace (Tiger Lake), so those keep the
         // lane-by-lane build (2026-10-31, the fleet round).
-        if constexpr (kMaskTranspose) {
+        if constexpr (!kTree) {
+        } else if constexpr (kMaskTranspose) {
             using E = std::remove_cvref_t<decltype(ivl{}[0])>;
             typedef unsigned char u8v __attribute__((vector_size(IW)));
             constexpr int EB = 8 * sizeof(E);
@@ -227,6 +312,7 @@ struct InterCommon {
     static std::vector<ivl>& bits_buf() { static thread_local std::vector<ivl> b; return b; }
     static std::vector<unsigned char>& bt_buf() { static thread_local std::vector<unsigned char> b; return b; }
     static std::vector<ivd>& srow_buf() { static thread_local std::vector<ivd> b; return b; }
+    template <int K> static std::vector<sbv>& sbv_buf() { static thread_local std::vector<sbv> b; return b; }
     // The row of `blk` lane l reads at DP row i: its residue's (tracked: its stacked row),
     // row 0 past the lane's own A (those cells are computed and ignored).
     template <bool Tr>
@@ -265,10 +351,12 @@ struct InterCommon {
     // Row i's profile (P[c] = per lane, score of the lane's A residue i vs letter c) and
     // the lanes still inside their own A.
     template <bool Tr = false>
-    void row(int i, ivd* P, ivl& live) const {
+    void row(int i, Prof& P, ivl& live) const {
         const int na = J.nalpha;
         for (int l = 0; l < IW; ++l) live[l] = (i <= J.m[l]) ? -1 : 0;
-        if constexpr (Lv < 0) {
+        if constexpr (Lv == kLvLut) {
+            P.ar = atl[i];
+        } else if constexpr (Lv < 0) {
             const int n = J.n;
             // A local pointer, not srow[j]: clang reloaded the vector's data pointer from
             // the object after every lane store (two dependent loads per element; this
@@ -292,7 +380,7 @@ struct InterCommon {
             const int np = 1 << levels;
             for (int c = 0; c < np; ++c) {
                 const int cc = c < na ? c : 0;
-                P[c] = ivlanes<ivd, IW>([&](int l) { return rowp[l][cc]; });
+                P.p[c] = ivlanes<ivd, IW>([&](int l) { return rowp[l][cc]; });
             }
             return;
         }
@@ -303,7 +391,7 @@ struct InterCommon {
         const int np = 1 << levels;
         for (int c = 0; c < np; ++c) {
             const int cc = c < na ? c : 0;
-            P[c] = ivlanes<ivd, IW>([&](int l) { return J.blk[ro[l] + cc]; });
+            P.p[c] = ivlanes<ivd, IW>([&](int l) { return J.blk[ro[l] + cc]; });
         }
         }
     }
@@ -315,13 +403,14 @@ struct InterCommon {
     // stays in registers under either compiler.  Taken once per job: srow and bits are
     // sized in the constructor and never reallocated during the fill.
     struct Sub {
-        const ivd* srow; const ivl* bits;
-        [[gnu::always_inline]] ivd operator()(const ivd* P, int j) const {
+        const ivd* srow; const ivl* bits; const sbv* btl; isb16 tbl;
+        [[gnu::always_inline]] ivd operator()(const Prof& P, int j) const {
             if constexpr (Lv < 0) return srow[j];
-            else return inter_sub<Lv>(P, bits, j);
+            else if constexpr (Lv == kLvLut) return ibwiden<ivd, IW>(ibshuf(tbl, P.ar + btl[j]));
+            else return inter_sub<Lv>(P.p, bits, j);
         }
     };
-    Sub sub() const { return Sub{srow.data(), bits.data()}; }
+    Sub sub() const { return Sub{srow.data(), bits.data(), btl, tbl}; }
     // Banded (InterJobT::blo != nullptr): row i's columns [j0, j1] to compute (the union
     // of the lanes' initialised spans) and the per-lane band [lo, hi] as T vectors.
     void band(int i, int& j0, int& j1, ivd& lo, ivd& hi) const {
@@ -399,7 +488,7 @@ static void inter_fill_linear(InterJobT<T>& J) noexcept {
     ivd best = z, bi = z, bj = z;
 
     for (int i = 1; i <= M; ++i) {
-        ivd P[8];
+        typename C::Prof P;
         ivl live;
         cm.template row<Tr>(i, P, live);
         if constexpr (Tr) { ivd ga, gb; cm.row_gaps(i, ga, ge_a, gb, ge_b); }
@@ -485,7 +574,7 @@ static void inter_fill_affine(InterJobT<T>& J) noexcept {
     ivd best = z, bi = z, bj = z;   // Local: running best and its cell, per lane
 
     for (int i = 1; i <= M; ++i) {
-        ivd P[8];
+        typename C::Prof P;
         ivl live;
         cm.template row<Tr>(i, P, live);
         if constexpr (Tr) cm.row_gaps(i, go_a, ge_a, go_b, ge_b);
@@ -561,7 +650,14 @@ static void inter_lv_dispatch(const InterJobT<T>& J, F&& f) {
     const int na = J.nalpha;
     if (na > 8)      f(std::integral_constant<int, kLvGather>{});
     else if (na > 4) f(std::integral_constant<int, 3>{});
-    else             f(std::integral_constant<int, 2>{});
+    else {
+        if constexpr (kByteShuffle && std::is_integral_v<T> && !Tr) {
+            bool fit = true;
+            for (int k = 0; k < na * na; ++k) fit &= fits_i8(J.blk[k]);
+            if (fit) { f(std::integral_constant<int, kLvLut>{}); return; }
+        }
+        f(std::integral_constant<int, 2>{});
+    }
 }
 template <class T, bool Tr>
 static void inter_fill_tr(InterJobT<T>& J) noexcept {
@@ -630,7 +726,7 @@ static void inter_score_affine(InterJobT<T>& J) noexcept {
     ivd vbest = z;
 
     for (int i = 1; i <= M; ++i) {
-        ivd P[8];
+        typename C::Prof P;
         ivl live;
         cm.template row<Tr>(i, P, live);
         if constexpr (Tr) cm.row_gaps(i, go_a, ge_a, go_b, ge_b);
@@ -702,7 +798,7 @@ static void inter_score_linear(InterJobT<T>& J) noexcept {
     ivd vbest = z;
 
     for (int i = 1; i <= M; ++i) {
-        ivd P[8];
+        typename C::Prof P;
         ivl live;
         cm.template row<Tr>(i, P, live);
         if constexpr (Tr) { ivd ga, gb; cm.row_gaps(i, ga, ge_a, gb, ge_b); }
@@ -783,7 +879,7 @@ static void inter_score_affine_pos(InterJobT<T>& J) noexcept {
     ivd vbest = z;
 
     for (int i = 1; i <= M; ++i) {
-        ivd P[8];
+        typename C::Prof P;
         ivl live;
         cm.template row<Tr>(i, P, live);
         if constexpr (Tr) cm.row_gaps(i, go_a, ge_a, go_b, ge_b);
