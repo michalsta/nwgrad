@@ -2268,7 +2268,8 @@ lanes' weights (`Work::srw_of<SFx>`) and the stream path (`stream_inter_<AB, SFx
 follow. Outputs (log Z, counts, gaps, the gradient accumulators) stay double; only the
 tables, the rows, the weights and the row-wise reductions are float32.
 
-**Three things float32 needed that double never did.**
+**Three things float32 needed that double never did** (the first, the flush, double
+now does too: "Double at long lengths is DENORMAL-bound", in "The soft path").
 1. **Subnormals flushed to zero** around the float32 kernels (`FlushDenormalsScope`:
    x86 MXCSR FTZ|DAZ, AArch64 FPCR.FZ, restored on exit). Cells far from the alignment
    hold mass ~2^-100 of their row's max — subnormal in float32, normal in double — and
@@ -2594,6 +2595,11 @@ of 3-5, score-only protein L200 / L1000, 1 thread unless noted; control arms 0.9
 
 ### The soft path: scaled probability space (2026-10-05)
 
+**The scaled path flushes denormals to zero in double too** (default since 2026-11-06,
+`soft_double_ftz`; float32 always did): double results may differ from the log path and
+from the pre-2026-11-06 arithmetic within the tolerance below; `_tuning.set_gate(
+"soft_double_ftz", 0)` restores gradual underflow.
+
 **The soft path is NOT bit-exact** — across `soft_impl`, ISA levels, compilers, `fill`,
 `soft_guide` or architectures — by decision (2026-10-05). Everything in this section is
 tested with tolerances (`tests/Python/test_soft_scaled.py`: 1e-11 relative/absolute
@@ -2818,7 +2824,13 @@ gradient-product hole of float32 (item 2 there) would exist in double at 2^-1022
 
 **The two fixes, prototyped (branch `proto/soft-denormal`, 2026-11-05)**, both behind
 switches (`nwgrad._tuning`; environment fallbacks `NWGRAD_SOFT_WINDOW_LOG2`,
-`NWGRAD_SOFT_DOUBLE_FTZ`), default OFF:
+`NWGRAD_SOFT_DOUBLE_FTZ`). **(B) is the DEFAULT since 2026-11-06** (owner's decision;
+`soft_double_ftz` = 0 restores gradual underflow); (A) stays off, a documented probe.
+nighthaven (v3) confirmed (B): instructions unchanged, 1 thread 0.42-0.71 of main at
+L1000-4000, 6 threads 0.33-0.53, L300 1.00, results bit-identical on every benchmark
+fixture. Its `off` arm read 1.02-1.03 at L300: not the guard (tens of cycles a pair against
+~1 ms; it now skips the MXCSR writes when FTZ|DAZ are already set) -- the noise, or the
+double product charge's per-row work.
 - (A) `soft_window_log2 = e`: the double lazy-rescale window [2^-e, 2^e] instead of 2^256
   (`SoftPairJobT::win`, `sp_lazy`'s new argument; the inter-pair kernel keeps its constant).
   **It buys nothing.** Rescales per row go up as expected (protein L1000 affine, backward /

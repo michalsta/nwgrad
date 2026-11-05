@@ -1,6 +1,6 @@
-"""The double soft pass's denormal handling (prototype switches, branch proto/soft-denormal):
-a tighter lazy-rescale window (``soft_window_log2``) and FTZ/DAZ around the double soft
-kernels (``soft_double_ftz``).
+"""The double soft pass's denormal handling: FTZ/DAZ around the double soft kernels
+(``soft_double_ftz``, the default since 2026-11-06; 0 restores gradual underflow) and a
+tighter lazy-rescale window (``soft_window_log2``, a probe that gained nothing).
 
 Both lose only mass the lost-mass bound already charges: a table or carry term below
 DBL_MIN in its row's stored units is counted as lost whether it is kept as a subnormal or
@@ -17,7 +17,9 @@ import nwgrad
 from nwgrad import _tuning
 
 REL = ABS = 1e-11
-FORMS = [dict(), dict(soft_window_log2=64), dict(soft_window_log2=16), dict(soft_window_log2=0),
+# dict(): the default (FTZ on since 2026-11-06); soft_double_ftz=0: gradual underflow.
+FORMS = [dict(), dict(soft_double_ftz=0), dict(soft_double_ftz=0, soft_window_log2=64),
+         dict(soft_double_ftz=0, soft_window_log2=16), dict(soft_double_ftz=0, soft_window_log2=0),
          dict(soft_double_ftz=1), dict(soft_double_ftz=1, soft_window_log2=64)]
 MODES = [(g, m) for g in ("linear", "affine") for m in ("global", "local", "glocal")]
 
@@ -105,3 +107,7 @@ def test_out_of_range_still_raises():
             b.soft_impl = "scaled"
             with pytest.raises(ValueError):
                 b.score_and_grad()
+
+
+def test_ftz_is_the_default():
+    assert _tuning.defaults()["soft_double_ftz"] == 1

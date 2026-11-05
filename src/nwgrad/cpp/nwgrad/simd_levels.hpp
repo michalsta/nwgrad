@@ -540,17 +540,22 @@ using soft_float_t = std::conditional_t<std::is_same_v<T, float>, float, double>
 // so the bound stays rigorous; results move within that bound.
 struct FlushDenormalsScope {
 #if defined(__x86_64__) || defined(__i386__)
+    // Writes MXCSR only when FTZ|DAZ are not already set (a nested or repeated scope then
+    // costs one read).  The cost per pair is tens of cycles either way: nothing at the
+    // ~1 ms a per-pair soft pass of L300 takes.
     unsigned csr;
-    FlushDenormalsScope() noexcept : csr(_mm_getcsr()) { _mm_setcsr(csr | 0x8040u); }
-    ~FlushDenormalsScope() noexcept { _mm_setcsr(csr); }
+    bool set;
+    FlushDenormalsScope() noexcept : csr(_mm_getcsr()), set((csr & 0x8040u) != 0x8040u) { if (set) _mm_setcsr(csr | 0x8040u); }
+    ~FlushDenormalsScope() noexcept { if (set) _mm_setcsr(csr); }
 #elif defined(__aarch64__)
     uint64_t fpcr;
+    bool set;
     FlushDenormalsScope() noexcept {
         asm volatile("mrs %0, fpcr" : "=r"(fpcr));
-        const uint64_t v = fpcr | (uint64_t(1) << 24);
-        asm volatile("msr fpcr, %0" : : "r"(v));
+        set = !(fpcr & (uint64_t(1) << 24));
+        if (set) { const uint64_t v = fpcr | (uint64_t(1) << 24); asm volatile("msr fpcr, %0" : : "r"(v)); }
     }
-    ~FlushDenormalsScope() noexcept { asm volatile("msr fpcr, %0" : : "r"(fpcr)); }
+    ~FlushDenormalsScope() noexcept { if (set) asm volatile("msr fpcr, %0" : : "r"(fpcr)); }
 #else
     FlushDenormalsScope() noexcept {}
 #endif
@@ -650,11 +655,15 @@ inline int64_t env_nonneg_int(const char* name) noexcept {
     const long long k = std::strtoll(e, &end, 10);
     return (end && *end == 0 && k >= 0) ? int64_t(k) : int64_t(-1);
 }
-// The double soft pass's denormal handling (prototype switches, branch proto/soft-denormal):
+// The double soft pass's denormal handling (AGENTS.md, "Double at long lengths is
+// DENORMAL-bound"): soft_double_ftz / NWGRAD_SOFT_DOUBLE_FTZ (DEFAULT 1, since 2026-11-06)
+// runs the double soft kernels under FlushDenormalsScope, as float32 always does: 2-5x at
+// L >= 1000 (skynet 3.2-5x, nighthaven 1 thread 0.42-0.71, 6 threads 0.33-0.53 of the
+// time; L300 1.00; instructions unchanged); 0 restores gradual underflow.
 // soft_window_log2 / NWGRAD_SOFT_WINDOW_LOG2 = e sets the double lazy-rescale window to
-// [2^-e, 2^e] (default 256, SoftRange<double>::win; float32 keeps its 2^8); soft_double_ftz /
-// NWGRAD_SOFT_DOUBLE_FTZ = 1 runs the double soft kernels under FlushDenormalsScope, as
-// float32 always does.  The gate wins over the environment; -1: neither set.
+// [2^-e, 2^e] (default 256, SoftRange<double>::win; float32 keeps its 2^8): it gained
+// nothing (the subnormal band only moves outwards) and stays a documented probe.  The gate
+// wins over the environment; -1: neither set.
 inline int64_t soft_window_log2_override() noexcept {
     const int64_t o = gate_override(Gate::SoftWindowLog2);
     if (o >= 0) return o;
@@ -665,7 +674,7 @@ inline bool soft_double_ftz() noexcept {
     const int64_t o = gate_override(Gate::SoftDoubleFtz);
     if (o >= 0) return o != 0;
     static const int64_t v = env_nonneg_int("NWGRAD_SOFT_DOUBLE_FTZ");
-    return v > 0;
+    return v != 0;   // unset (-1): the default, on
 }
 inline bool soft_ckpt_env_check() noexcept {
     static const bool v = [] { const char* e = std::getenv("NWGRAD_SOFT_CKPT_CHECK"); return e && *e && std::strcmp(e, "0") != 0; }();
