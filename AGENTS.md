@@ -2438,7 +2438,11 @@ slower than the better arm, up to 2.65x. What the data said, gate by gate:
   12 threads, L140-160, default/best 1.00-1.05 (was 1.12-1.70); 6 threads (the default
   count) unchanged; linear hard fills (under their cell caps) and DNA to 22 x 200 did not
   move. Applies to the compiled default only; an `inter_group_bytes` override is taken as
-  given. Measured on AVX2 only: the other levels take the same factor unmeasured.
+  given. solace (Tiger Lake 8c/16t, WSL, 16 vs 8 threads, same sections): AVX-512 affine
+  at 16 threads, where the shared fill already loses at L100 (1.2-2.4x), default/best
+  0.96-1.02 at every length (9/16 puts float32 at ~L95); AVX2 affine 1.00-1.04 except
+  float32 L140 1.13 (its crossover sits at L140-160, nighthaven's at L120-140; unchanged it
+  would lose 1.37x at L160 instead). SSE and NEON take the same factor unmeasured.
 - **A score-only call is exempt from the byte budget.** Its shared kernel keeps one row
   per table, so the budget (sized for W pairs' full tables) had been sending every
   score-only pair past ~L120 (AVX2) or ~L80 (AVX-512, 16 lanes) to its own fill, where the
