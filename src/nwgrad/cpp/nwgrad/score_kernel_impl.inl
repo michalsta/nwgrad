@@ -315,7 +315,9 @@ static void score_affine_striped(ScoreJob<T>& job) {
 // (skynet) 0.60-0.95; int64 (AVX2 / AVX-512) 0.56-0.82; int16 0.74-0.93.  Bit-identical:
 // max is exact and associative, so Y is the separate carry's.  (A middle form, the ramp
 // in registers but the opens row kept, moved the cliff only and lost 3-10 % on NEON.)
-// U2 (integer T): the row pass two segments a trip (see the loop).
+// U2 (integer T): the row pass two segments a trip (see the loop).  Since 2026-11-05 the
+// prefix is not stored either: pass 2 re-forms Y from the D row (four rolling rows, not
+// five), and Local masks the padding segments only (see the passes; AGENTS.md).
 template <class T, bool Local, bool MOnly, bool Tr = false, bool Sat = false, bool U2 = false, bool Glocal = false>
 static void score_affine_striped_pos(ScoreJob<T>& job) {
     using vd = stdx::native_simd<T>;

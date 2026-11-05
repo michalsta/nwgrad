@@ -2590,6 +2590,68 @@ of 3-5, score-only protein L200 / L1000, 1 thread unless noted; control arms 0.9
   the residual gap is clang's scheduling of the whole kernel, not the unroll count; not
   closable this way.
 
+### Score-only integer kernel: four rows, the Local mask, half-width lanes (branch `proto/int-score-rows`, 2026-11-05)
+
+Review proposal 5 (the D/X integer kernel, `score_affine_striped_pos`, against parasail's
+scan).  Four changes, all bit-identical in the score (the [score] fuzz at 20000, now with an
+integer arm; `tests/cpp/test_integer.cpp`; an integer A/B fuzz of base vs branch, 1800
+batches at sse4 and at sse2, 0 differ):
+- **No Y row.**  Pass 1 no longer stores the running prefix; it keeps it in a register for
+  the lanes' totals only.  Pass 2 re-forms Y from the D row as pass 1 stored it (max(M, X),
+  read before it is overwritten), with the carry-in known.  Rolling rows 5 -> 4 (working set
+  with the profile row 6 -> 5, Local 7 -> 6 or 5, below).  The first form re-formed the
+  PREFIX (max(P, open + ramp) - ramp): +2.5 instructions a vector cell, yet 0.80-0.93x at
+  L >= 1000 on skynet (fewer stores and loads past the 16 KB L1D).  Then pass 2 as the
+  serial step y(s) = max(y(s-1) - ge, open(s-1)) (the ramp cancels): -3 instructions but
+  1.02-1.08x SLOWER (sub + max on the chain, 2-cycle latencies on Piledriver); unrolled by
+  two, -5, still mixed.  Kept: two segments per dependent step, y(s+1) = max(max(open(s),
+  open(s-1) - ge), y(s-1) - 2ge), the off-chain max `carry_pin`ned (now with integer
+  vectors).  Exactness: plain regime, nothing wraps under the quarter rule, so the integer
+  identities are exact; saturating int16 with ge >= 0, bottom clamps commute; with ge < 0
+  only sentinel-derived values differ (the prefix form lifts a clamped open by the ramp),
+  which stay below every reachable value -- the rows are not bit-identical there, the score
+  is (see the comment at the pass).
+- **Local mask.**  Padding slots (l*seg + s + 1 > n) live in segments s >= n - (W-1)*seg
+  only; the passes take the mask from there (templated trips, no per-segment branch).  With
+  MOnly (all gap parameters >= 0) no mask at all, integer T too: a padding M is max(D(i-1,
+  j-1) + 0, 0) and no D exceeds the best M at or before it (the W < 4 form always ran it so).
+  -2 instructions a vector cell in Local.
+- **Half-width lanes** (`Aligner::narrow_score_`, aligner.hpp): an untracked int32 problem
+  whose step_max fits int16's cap and which passes `nw_int_bound_check<int16_t>` (plain or
+  saturating regime) runs the int16 score kernel; int64 -> int32 likewise.  Per-thread
+  scratch (buffer + the block cast per problem).  `NWGRAD_INT_NARROW=0` (and
+  `int_narrow_mode()` for the tests) turns it off.  BLOSUM62 11/1 fits int16 to ~L2300, so
+  L3000 and DNA L10000 (2/-4, 4/2) stay int32.  The inter-pair score kernels are untouched.
+
+Measured (skynet sse4, Piledriver, 16 KB L1D; one process per arm, alternated, 4 rounds;
+instructions per VECTOR cell from `perf stat` (two rep counts differenced), ns/cell best of
+4; striped fill, 30 %-mutated pairs, BLOSUM62 11/1, DNA 2/-4 4/2; B/A against main, the
+control arm A'/A 0.93-1.04, the host loaded):
+
+| config | main instr | +rows | +mask | +2-step | +narrow | ns/cell main | all / main |
+|---|---|---|---|---|---|---|---|
+| int32 protein L300 G / L | 34.5 / 38.9 | 37.0 / 41.8 | 37.0 / 39.8 | 33.9 / 36.8 | 18.1 / 19.5 | 1.16 / 1.15 | 0.44 / 0.48 |
+| int32 protein L1000 G / L | 32.1 / 36.5 | 34.6 / 39.5 | 34.5 / 37.5 | 31.5 / 34.4 | 15.4 / 17.1 | 1.24 / 1.39 | 0.39 / 0.36 |
+| int32 protein L2000 G / L | 31.5 / 36.0 | 34.0 / 39.0 | 34.0 / 37.0 | 31.0 / 34.0 | 15.0 / 16.8 | 1.36 / 1.46 | 0.38 / 0.36 |
+| int32 protein L3000 G / L | 31.4 / 35.9 | 33.9 / 38.9 | 33.9 / 36.9 | 30.8 / 33.8 | (refused) | 1.37 / 1.37 | 0.80 / 0.85 |
+| int32 DNA L1000 G / L | 31.5 / 36.0 | 34.0 / 39.0 | 34.0 / 37.0 | 31.0 / 33.9 | 15.3 / 17.0 | 1.24 / 1.38 | 0.38 / 0.35 |
+| int32 DNA L10000 G / L | 31.1 / 35.6 | 33.6 / 38.6 | 33.6 / 36.6 | 30.6 / 33.6 | (refused) | 1.47 / 1.42 | 0.72 / 0.80 |
+| int16 protein L300 G / L | 35.7 / 40.5 | 38.8 / 43.5 | 39.4 / 42.2 | 36.1 / 38.9 | -- | 0.54 / 0.60 | 0.94 / 0.89 |
+| int16 protein L1000 G / L | 31.9 / 36.7 | 33.3 / 38.2 | 33.3 / 36.2 | 30.8 / 34.2 | -- | 0.57 / 0.61 | 0.85 / 0.83 |
+| int16 protein L2000 G / L | 31.2 / 36.2 | 32.8 / 37.6 | 32.7 / 35.7 | 30.1 / 33.5 | -- | 0.64 / 0.69 | 0.81 / 0.80 |
+| int16 DNA L1000 G / L | 31.6 / 36.6 | 33.1 / 38.0 | 33.1 / 36.1 | 30.5 / 34.0 | -- | 0.56 / 0.57 | 0.85 / 0.83 |
+
+Per change, ns B/A: rows (the recomputed-prefix form) 0.75-0.93 at L >= 1000, 0.92-1.07 at
+L300; mask (Local) 0.86-0.96 on top; two-step pass 2 0.89-1.05 against the recomputed
+prefix (mostly 0.94-0.97); narrow int32 0.36-0.48 where the bound allows.  On this host every
+int32 length here but L300 is past the L1 (16 KB: six 4-byte rows cross at ~L680, five at
+~L820; int16 at twice that), so the row change pays as traffic, not as a cliff crossed.
+Expected elsewhere (not measured): 48 KB L1D, int32 Global's working set crosses at ~L2000
+before, ~L2450 after; int32 problems narrowed to int16 cross at ~L4900, beyond the int16
+bound.  Instruction count is still ~31 a vector cell in Global (parasail scan ~22): pass 1
+is ~19.5 of them (sse4 disassembly: three loads, two stores, the cell, the opens, the
+running prefix), pass 2 ~8 plus the loop; what remains is the cell, not the carry.  AVX2 / AVX-512 / NEON compiled, not run.
+
 ### The soft path: scaled probability space (2026-10-05)
 
 **The soft path is NOT bit-exact** — across `soft_impl`, ISA levels, compilers, `fill`,
