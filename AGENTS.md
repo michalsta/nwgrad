@@ -843,9 +843,12 @@ matrices, 4 and 6 letters, ragged B):
 1. `Lv`, the lookup form, is a template parameter of every inter-pair kernel, chosen once
    per job (`inter_lv_dispatch`): -1 gather, 2 / 3 tree levels (alphabets of 1-2 letters
    take the 2-level tree), 4 = the byte table below. No branch left in the column loops.
-2. `ivsel` blends on the mask as is (`blendv*` at SSE4.1 / AVX2, `vpternlogq` 0xCA at
-   AVX-512, `vbslq` on NEON, and / andnot / or at SSE2): the tree loops lost every
-   `pcmpeq*`. Also reaches the soft kernels (their masks are all 0 / -1).
+2. The tree blends on its bit masks as they are (`ivblend`: `blendv*` at SSE4.1 / AVX2,
+   `vpternlogq` 0xCA at AVX-512, `vbslq` on NEON, and / andnot / or at SSE2): the tree
+   loops lost every `pcmpeq*`. Only the tree: `ivsel` stays `m ? a : b`, which lets gcc
+   fold the Local best's select into a max (`rb < v ? v : rb`); the first form forced the
+   blend everywhere and cost the protein (gather) fills 2-6 % and DNA L300 int16 linear
+   Local +4.7 % instructions (nighthaven / skynet).
 3. `kLvLut`: up to 4 letters, every score exactly an int8 (floats: integral, no -0), a
    level with a byte shuffle (sse4 and up, NEON; not SSE2): the matrix is one 16-byte table
    `t[4a + b]`, the row's `4a` and the column's `b` are pre-transposed byte vectors, and a
@@ -853,8 +856,18 @@ matrices, 4 and 6 letters, ragged B):
    non-integral or tracked: the tree. (int16 inside the quarter rule always fits:
    step_max <= 8191 / 66.)
 4. Per-row work: untracked tree rows build P by shuffle from the transposed A codes where
-   the scores are int8, `live` is one compare against the lanes' m, Global capture visits
-   only the lanes ending at the row (lanes pre-sorted by m). Aimed at W = 32 (int16
+   the scores are int8 (the transposed A is built only then), `live` is one compare
+   against the lanes' m, Global capture visits only the lanes ending at the row (lanes
+   pre-sorted by m). The gather path (Lv = -1) keeps main's per-row code.
+5. The inter-pair hard kernels compile in a TU of their own per level
+   (`level_<lv>_inter.cpp`, `NWGRAD_LEVEL_INTER_TU`, `register_level_inter`), as the soft
+   kernels do. With `Lv` their instances tripled, and in the shared TU gcc inlined less
+   into the striped kernels beside them (`striped_linear_ptr_entry<short>` 4620 -> 3929
+   instructions at sse4): int16 linear Local own fills +1.5 % instructions (protein L100,
+   DNA L300). In the new TU the gather row is `noinline` (inlined, gcc compiled its lane
+   loop to 9 instructions an element instead of 8: float32 protein +4.7 %) and the tree /
+   table row `always_inline`. After the split, protein L100 (gather) path / hard, skynet
+   sse4, instructions vs main: 0.970-1.004; DNA L300 path 0.47-0.998. Aimed at W = 32 (int16
    AVX-512); at W <= 8 it measured 0-2 %.
 Measured on skynet (sse4, perf stat, differential instructions per pair, 1 thread,
 affine Global unless noted, gates off; A/A 0.986-1.009): miRNA 22x50 int16 score 0.587, hard

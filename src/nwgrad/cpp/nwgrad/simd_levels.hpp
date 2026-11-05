@@ -994,8 +994,12 @@ void register_level_typed(SimdLevel l,
                           typename TypedKernels<T>::hb_fn hb_sweep_pmax,
                           typename TypedKernels<T>::hbbase_fn hb_base,
                           typename TypedKernels<T>::hbscan_fn hb_scan,
-                          typename TypedKernels<T>::score_fn score,
-                          typename TypedKernels<T>::inter_fn inter_fill,
+                          typename TypedKernels<T>::score_fn score);
+// The inter-pair hard kernels, from the level's inter TU (level_<name>_inter.cpp; see
+// level_common.inc).
+template <class T>
+NWGRAD_BASELINE_ONLY
+void register_level_inter(SimdLevel l, typename TypedKernels<T>::inter_fn inter_fill,
                           typename TypedKernels<T>::inter_fn inter_score, int inter_w);
 
 // TracebackMode::Grid's forward pass (null for a type without one: it runs as Pointers).

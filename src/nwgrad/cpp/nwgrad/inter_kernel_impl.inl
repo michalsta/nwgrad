@@ -68,14 +68,18 @@ template <class V> [[gnu::always_inline]] static inline V ivmax(V a, V b) noexce
 #endif
     return a < b ? b : a;
 }
-// Lane-wise m ? a : b for a mask m whose lanes are 0 or -1 (every mask here: comparisons,
-// the B residues' bit masks, `live`), taken as is.  `m ? a : b` on a vector means m != 0,
+// ivblend: lane-wise m ? a : b for a mask m whose lanes are 0 or -1, taken as is -- for the
+// blend tree, whose bit masks come from memory.  `m ? a : b` on a vector means m != 0,
 // so where m is not a comparison in view -- a mask loaded from memory, as the blend tree's
 // bits are -- gcc first compares it against zero (pcmpeq* before every pblendvb at sse4;
 // perf annotate of inter_score_affine_pos<short> put that compare among the column
 // loop's five hottest instructions).  A blend moves bits, so the float lanes stay exact.
 // SSE2 has no blend: the and / andnot / or a select lowers to anyway, minus the compare.
-template <class L, class V> [[gnu::always_inline]] static inline V ivsel(L m, V a, V b) noexcept {
+// Only the tree takes it: where the mask is a comparison in view, `m ? a : b` lets gcc fold
+// the pair into a max (rb = rb < v ? v : rb) or skip the compare by itself, and forcing the
+// blend there cost the protein (gather) fills 2-6 % on nighthaven (AVX2, 2026-11-05).
+template <class L, class V> [[gnu::always_inline]] static inline V ivsel(L m, V a, V b) noexcept { return m ? a : b; }
+template <class L, class V> [[gnu::always_inline]] static inline V ivblend(L m, V a, V b) noexcept {
     static_assert(sizeof(L) == sizeof(V));
     using E [[maybe_unused]] = std::remove_cvref_t<decltype(a[0])>;
 #if defined(__AVX512F__)
@@ -209,13 +213,13 @@ template <int Lv, class V, class L>
 [[gnu::always_inline]] static inline V inter_sub(const V* P, const L* bits, int j) noexcept {
     static_assert(Lv == 2 || Lv == 3);
     const L b0 = bits[Lv * j];
-    const V t0 = ivsel(b0, P[1], P[0]);
+    const V t0 = ivblend(b0, P[1], P[0]);
     const L b1 = bits[Lv * j + 1];
-    const V u0 = ivsel(b1, ivsel(b0, P[3], P[2]), t0);
+    const V u0 = ivblend(b1, ivblend(b0, P[3], P[2]), t0);
     if constexpr (Lv == 2) return u0;
     else {
-        const V u1 = ivsel(b1, ivsel(b0, P[7], P[6]), ivsel(b0, P[5], P[4]));
-        return ivsel(bits[Lv * j + 2], u1, u0);
+        const V u1 = ivblend(b1, ivblend(b0, P[7], P[6]), ivblend(b0, P[5], P[4]));
+        return ivblend(bits[Lv * j + 2], u1, u0);
     }
 }
 
@@ -258,7 +262,7 @@ struct InterCommon {
         const int n = J.n;
         if (levels < 0 && srow.size() < static_cast<size_t>(n + 1)) srow.resize(n + 1);
         if constexpr (Lv == kLvLut) {
-            const int na = J.nalpha, M = J.M;
+            const int na = std::min(J.nalpha, 4), M = J.M;   // <= 4 by dispatch; says so to gcc
             std::vector<sbv>& bb = sbv_buf<0>();
             std::vector<sbv>& ab = sbv_buf<1>();
             if (bb.size() < static_cast<size_t>(n + 1)) bb.resize(n + 1);
@@ -279,26 +283,25 @@ struct InterCommon {
                 for (int b = 0; b < na; ++b) tbl[4 * a + b] = static_cast<signed char>(J.blk[a * na + b]);
             btl = bb.data(); atl = ab.data();
         }
-        if constexpr (kTree) if (!J.tr) {
+        if constexpr (kTree && kByteShuffle) if (!J.tr) {   // atr only where a shuffle reads it
             const int na = J.nalpha, M = J.M;
-            std::vector<sbv>& ab = sbv_buf<1>();
-            if (ab.size() < static_cast<size_t>(M + 1)) ab.resize(M + 1);
-            for (int i = 1; i <= M; ++i) {
-                sbv v{};
-                for (int l = 0; l < IW; ++l) v[l] = static_cast<signed char>((i <= J.m[l]) ? J.a[l][i - 1] : 0);
-                ab[i] = v;
-            }
-            atr = ab.data();
-            if constexpr (kByteShuffle) {
-                pshuf = true;
-                for (int k = 0; k < na * na; ++k) pshuf &= fits_i8(J.blk[k]);
-                if (pshuf)
-                    for (int c = 0; c < (1 << Lv); ++c)
-                        for (int a = 0; a < na; ++a)
-                            colt[c][a] = static_cast<signed char>(J.blk[a * na + (c < na ? c : 0)]);
+            pshuf = true;
+            for (int k = 0; k < na * na; ++k) pshuf &= fits_i8(J.blk[k]);
+            if (pshuf) {
+                for (int c = 0; c < (1 << Lv); ++c)
+                    for (int a = 0; a < na; ++a)
+                        colt[c][a] = static_cast<signed char>(J.blk[a * na + (c < na ? c : 0)]);
+                std::vector<sbv>& ab = sbv_buf<1>();
+                if (ab.size() < static_cast<size_t>(M + 1)) ab.resize(M + 1);
+                for (int i = 1; i <= M; ++i) {
+                    sbv v{};
+                    for (int l = 0; l < IW; ++l) v[l] = static_cast<signed char>((i <= J.m[l]) ? J.a[l][i - 1] : 0);
+                    ab[i] = v;
+                }
+                atr = ab.data();
             }
         }
-        {
+        if constexpr (Lv >= 0) {   // the gather path keeps the lane-by-lane live and capture
             using E = std::remove_cvref_t<decltype(ivl{}[0])>;
             vlive = J.M <= static_cast<int>(std::numeric_limits<E>::max());
             for (int l = 0; l < IW; ++l) {
@@ -394,30 +397,41 @@ struct InterCommon {
     }
     // Row i's profile (P[c] = per lane, score of the lane's A residue i vs letter c) and
     // the lanes still inside their own A.
+    // The gather path's row, out of line as main had it: inlined into the fill (or in the
+    // unit of its own, level_<name>_inter.cpp) gcc compiled the lane loops below to 9
+    // instructions an element where the out-of-line form takes ~3, +4.7 % instructions on
+    // protein L100 float32 (skynet, sse4, 2026-11-05).
+    template <bool Tr>
+    [[gnu::noinline]] void row_gather(int i, ivl& live) const {
+        const int na = J.nalpha;
+        for (int l = 0; l < IW; ++l) live[l] = (i <= J.m[l]) ? -1 : 0;
+        const int n = J.n;
+        // A local pointer, not srow[j]: clang reloaded the vector's data pointer from
+        // the object after every lane store (two dependent loads per element; this
+        // gather is the larger half of a protein L100 inter-pair fill, clang 1.35x
+        // gcc's samples here at sse4).
+        ivd* const sr = srow.data();
+        for (int l = 0; l < IW; ++l) {
+            const T* pr;
+            if constexpr (Tr) pr = J.blk + brow<Tr>(l, i) * na;
+            else pr = J.blk + static_cast<size_t>((i <= J.m[l]) ? J.a[l][i - 1] : 0) * na;
+            const unsigned char* bl = J.b[l];
+            const int nl = J.nb ? J.nb[l] : n;
+            for (int j = 1; j <= nl; ++j) sr[j][l] = pr[bl[j - 1]];
+            for (int j = nl + 1; j <= n; ++j) sr[j][l] = pr[0];   // ragged: pad
+        }
+    }
+    // The tree and table rows: always_inline (in the inter TU gcc otherwise left this out of
+    // line in the fills).
     template <bool Tr = false>
-    void row(int i, Prof& P, ivl& live) const {
+    [[gnu::always_inline]] void row(int i, Prof& P, ivl& live) const {
+        if constexpr (Lv < 0) { row_gather<Tr>(i, live); return; }
+        else {
         const int na = J.nalpha;
         if (vlive) live = ivsplat<ivl>(i) <= mv;
         else for (int l = 0; l < IW; ++l) live[l] = (i <= J.m[l]) ? -1 : 0;
         if constexpr (Lv == kLvLut) {
             P.ar = atl[i];
-        } else if constexpr (Lv < 0) {
-            const int n = J.n;
-            // A local pointer, not srow[j]: clang reloaded the vector's data pointer from
-            // the object after every lane store (two dependent loads per element; this
-            // gather is the larger half of a protein L100 inter-pair fill, clang 1.35x
-            // gcc's samples here at sse4).
-            ivd* const sr = srow.data();
-            for (int l = 0; l < IW; ++l) {
-                const T* pr;
-                if constexpr (Tr) pr = J.blk + brow<Tr>(l, i) * na;
-                else pr = J.blk + static_cast<size_t>((i <= J.m[l]) ? J.a[l][i - 1] : 0) * na;
-                const unsigned char* bl = J.b[l];
-                const int nl = J.nb ? J.nb[l] : n;
-                for (int j = 1; j <= nl; ++j) sr[j][l] = pr[bl[j - 1]];
-                for (int j = nl + 1; j <= n; ++j) sr[j][l] = pr[0];   // ragged: pad
-            }
-            return;
         } else {
         if constexpr (Tr) {   // each lane's row once, then its letters (the P inter_sub reads)
             const T* rowp[IW];
@@ -438,10 +452,11 @@ struct InterCommon {
             return;
         }
         size_t ro[IW];
-        for (int l = 0; l < IW; ++l) ro[l] = static_cast<size_t>(static_cast<unsigned char>(atr[i][l])) * na;
+        for (int l = 0; l < IW; ++l) ro[l] = static_cast<size_t>((i <= J.m[l]) ? J.a[l][i - 1] : 0) * na;
         for (int c = 0; c < np; ++c) {
             const int cc = c < na ? c : 0;
             P.p[c] = ivlanes<ivd, IW>([&](int l) { return J.blk[ro[l] + cc]; });
+        }
         }
         }
     }
@@ -761,8 +776,10 @@ static void inter_score_affine(InterJobT<T>& J) noexcept {
     }
     int ci = 0;                        // the next lane to capture, in order of m
     auto capture = [&](int i) {        // Global / Glocal: lanes whose A ends at row i
-        for (; ci < W && J.m[cm.ord[ci]] == i; ++ci) {
-                const int l = cm.ord[ci];
+        for (int k = Lv < 0 ? 0 : ci; k < W; ++k) {
+                const int l = Lv < 0 ? k : cm.ord[k];
+                if (J.m[l] != i) { if (Lv < 0) continue; else break; }
+                ci = k + 1;
                 const int nl = Ragged ? J.nb[l] : n;
                 if (glocal) {          // the best cell of the lane's last row (max is exact)
                     T b = std::max({VM[0][l], VX[0][l], VY[0][l]});
@@ -834,8 +851,10 @@ static void inter_score_linear(InterJobT<T>& J) noexcept {
     }
     int ci = 0;                        // the next lane to capture, in order of m
     auto capture = [&](int i) {
-        for (; ci < W && J.m[cm.ord[ci]] == i; ++ci) {
-                const int l = cm.ord[ci];
+        for (int k = Lv < 0 ? 0 : ci; k < W; ++k) {
+                const int l = Lv < 0 ? k : cm.ord[k];
+                if (J.m[l] != i) { if (Lv < 0) continue; else break; }
+                ci = k + 1;
                 const int nl = Ragged ? J.nb[l] : n;
                 if (glocal) {          // Glocal: the best cell of the lane's last row
                     T b = H[0][l];
@@ -916,8 +935,10 @@ static void inter_score_affine_pos(InterJobT<T>& J) noexcept {
     }
     int ci = 0;                        // the next lane to capture, in order of m
     auto capture = [&](int i) {
-        for (; ci < W && J.m[cm.ord[ci]] == i; ++ci) {
-                const int l = cm.ord[ci];
+        for (int k = Lv < 0 ? 0 : ci; k < W; ++k) {
+                const int l = Lv < 0 ? k : cm.ord[k];
+                if (J.m[l] != i) { if (Lv < 0) continue; else break; }
+                ci = k + 1;
                 const int nl = Ragged ? J.nb[l] : n;
                 if (glocal) {          // Glocal: the best cell of the lane's last row (D = every state)
                     T b = D[0][l];
