@@ -387,6 +387,13 @@ inline std::atomic<size_t>& track_profile_bytes() {
     return v;
 }
 
+// The do-nothing move sink of the traceback walks that can also report the path's moves
+// (hard_grad_and_guide, hard_fields, hard_path_packed, path_and_guide): a sink is called
+// with each move, 0 diagonal, 1 gap in B, 2 gap in A, LAST move first.  The batch passes
+// a run-length writer when it keeps the path (BatchEngine::with_path_), so one walk gives
+// the gradient or guide AND the stored path; otherwise this, which compiles away.
+struct NoMoves { void operator()(uint8_t) const noexcept {} };
+
 template<GapModel GM, AlignMode AM, AlignBand AB = AlignBand::Full, class T = double>
 struct Aligner {
 
@@ -502,21 +509,38 @@ struct Aligner {
     // The same path packed 2 bits a move straight into `dst` (whose (cap+3)/4 bytes the
     // caller zeroed; cap >= the path's length, len_a + len_b serves): written from the
     // back, so it ends at move cap-1; returns the first move's index, cap - steps.
+    // mv: the moves to a sink as well (see NoMoves).
+    template <class Mv = NoMoves>
     int hard_path_packed(const DpBuffer& buf, uint8_t* dst, int cap, int& i0, int& j0,
-                         std::vector<int>* gj) const {
+                         std::vector<int>* gj, Mv&& mv = Mv{}) const {
         auto put = [dst](int pos, uint8_t k) {
             dst[pos >> 2] = static_cast<uint8_t>(dst[pos >> 2] | (k << ((pos & 3) * 2)));
         };
         if (hirschberg_) {
             const int off = cap - static_cast<int>(hops_.size());
             for (size_t q = 0; q < hops_.size(); ++q) put(off + static_cast<int>(q), hops_[q]);
+            hops_moves_(mv);
             i0 = hb_start_i_; j0 = hb_start_j_;
             if (gj) *gj = guide_j_affine_hb();
             return off;
         }
         int pos = cap;
-        path_walk_(buf, [&](uint8_t k) { put(--pos, k); }, i0, j0, gj);
+        path_walk_(buf, [&](uint8_t k) { put(--pos, k); mv(k); }, i0, j0, gj);
         return pos;
+    }
+    // The path's moves into mv (last first) and its guide into gj, after compute_viterbi():
+    // guide_j_from_viterbi(buf) and the path in one walk (the same walk, so the same
+    // guide), into a caller-owned gj (no allocation once it has grown).
+    template <class Mv>
+    void path_and_guide(const DpBuffer& buf, Mv&& mv, std::vector<int>& gj) const {
+        if (hirschberg_) { hops_moves_(mv); gj = guide_j_affine_hb(); return; }
+        int i0 = 0, j0 = 0;
+        path_walk_(buf, mv, i0, j0, &gj);
+    }
+    // A held path (Hirschberg / Grid: hops_, start to end) to a move sink, last first.
+    template <class Mv>
+    void hops_moves_(Mv& mv) const {
+        for (size_t q = hops_.size(); q-- > 0;) mv(static_cast<uint8_t>(hops_[q]));
     }
     // The walk of both: emit(k) for each move, LAST move first; the start cell into
     // (i0, j0) and the guide into gj.
@@ -565,8 +589,8 @@ struct Aligner {
     // stand for -1 each — and (with gj) the guide, from one walk: the same walk, and so
     // the same path, as hard_grad() (a tracked batch's hard gradients stored as counts:
     // see BatchEngine).
-    template <class Add>
-    void hard_fields(const DpBuffer& buf, Add&& add, std::vector<int>* gj) const {
+    template <class Add, class Mv = NoMoves>
+    void hard_fields(const DpBuffer& buf, Add&& add, std::vector<int>* gj, Mv&& mv = Mv{}) const {
         const uint32_t gbase = static_cast<uint32_t>(params_->num_sets()) * static_cast<uint32_t>(nalpha_ * nalpha_);
         auto gk = [&](int i, int f) {
             const int set = (f == AlignParams::kOpenA || f == AlignParams::kExtendA) ? gset(i) : tset(i);
@@ -588,6 +612,7 @@ struct Aligner {
                 }
                 prev = op;
             }
+            hops_moves_(mv);
             if (gj) *gj = guide_j_affine_hb();
             return;
         }
@@ -600,6 +625,7 @@ struct Aligner {
                 (*gj)[static_cast<size_t>(i_end)] = (AM == AlignMode::Global) ? n_ : best_j_;
             }
             walk_linear(buf, [&](int k, int i, int j) {
+                mv(static_cast<uint8_t>(k));
                 if (k == 0) {
                     add(sk(i, j));
                     if (gj) (*gj)[static_cast<size_t>(i - 1)] = j - 1;
@@ -613,6 +639,7 @@ struct Aligner {
         } else {
             if (gj) guide_affine_init(*gj);
             walk_affine(buf, [&](TBTable st, int i, int j, bool open) {
+                mv(static_cast<uint8_t>(st == TBTable::M ? 0 : st == TBTable::X ? 1 : 2));
                 if (st == TBTable::M) {
                     add(sk(i, j));
                     if (gj) (*gj)[static_cast<size_t>(i - 1)] = j - 1;
@@ -1035,7 +1062,9 @@ struct Aligner {
     }
 
     std::pair<std::string, std::string> aligned(const DpBuffer& buf) const {
-        std::string a, b;
+        std::string a, b;   // (the batch stores run-length ops instead: with_path_)
+        a.reserve(static_cast<size_t>(m_ + n_));
+        b.reserve(static_cast<size_t>(m_ + n_));
         if (hirschberg_) { aligned_hb(a, b); return {std::move(a), std::move(b)}; }
         if constexpr (GM == GapModel::Linear) aligned_linear(buf, a, b);
         else                                   aligned_affine(buf, a, b);
@@ -1045,14 +1074,18 @@ struct Aligner {
     // guide_j_from_viterbi(buf) and hard_grad(buf, grad) in one traceback walk where
     // the path is walked back over the DP's own record (scores or Pointers, either gap
     // model); two walks for Hirschberg.  Same guide, same gradient either way.
-    void hard_grad_and_guide(const DpBuffer& buf, AlignParams& grad, std::vector<int>& gj) const {
+    // mv: the path's moves to a sink in the same walk (see NoMoves).
+    template <class Mv = NoMoves>
+    void hard_grad_and_guide(const DpBuffer& buf, AlignParams& grad, std::vector<int>& gj,
+                             Mv&& mv = Mv{}) const {
         if (!hirschberg_) {
-            if constexpr (GM == GapModel::Affine) hard_grad_affine(buf, grad, &gj);
-            else                                   hard_grad_linear(buf, grad, &gj);
+            if constexpr (GM == GapModel::Affine) hard_grad_affine(buf, grad, &gj, mv);
+            else                                   hard_grad_linear(buf, grad, &gj, mv);
             return;
         }
         gj = guide_j_from_viterbi(buf);
         hard_grad(buf, grad);
+        hops_moves_(mv);
     }
 
     void hard_grad(const DpBuffer& buf, AlignParams& grad) const {
@@ -2267,12 +2300,14 @@ private:
     // gj != nullptr: also record the guide path in the same walk.  Each gap move charges
     // one extend, plus one open if it opens its run; the score subtracts penalties, so
     // the gap fields count down (see the sign convention).
+    template <class Mv = NoMoves>
     void hard_grad_affine(const DpBuffer& buf, AlignParams& grad,
-                          std::vector<int>* gj = nullptr) const {
-        if (tr_) { hard_grad_affine_impl<true>(buf, grad, gj); return; }
+                          std::vector<int>* gj = nullptr, Mv&& mv = Mv{}) const {
+        if (tr_) { hard_grad_affine_impl<true>(buf, grad, gj, mv); return; }
         double* gblk = grad_block(grad);
         if (gj) guide_affine_init(*gj);
         walk_affine(buf, [&](TBTable s, int i, int j, bool open) {
+            mv(static_cast<uint8_t>(s == TBTable::M ? 0 : s == TBTable::X ? 1 : 2));
             if (s == TBTable::M) {
                 gblk[sub_off_u(i, j)] += 1.0;
                 if (gj) (*gj)[static_cast<size_t>(i - 1)] = j - 1;
@@ -2289,11 +2324,13 @@ private:
     }
     // Tr: each count lands in its row's set (sub_off / grad_gap); otherwise the walk
     // the untracked gradient always took, with no per-step branch on tr_.
-    template <bool Tr>
-    void hard_grad_affine_impl(const DpBuffer& buf, AlignParams& grad, std::vector<int>* gj) const {
+    template <bool Tr, class Mv>
+    void hard_grad_affine_impl(const DpBuffer& buf, AlignParams& grad, std::vector<int>* gj,
+                               Mv& mv) const {
         double* gblk = grad_block(grad);
         if (gj) guide_affine_init(*gj);
         walk_affine(buf, [&](TBTable s, int i, int j, bool open) {
+            mv(static_cast<uint8_t>(s == TBTable::M ? 0 : s == TBTable::X ? 1 : 2));
             if (s == TBTable::M) {
                 gblk[Tr ? sub_off(i, j) : sub_off_u(i, j)] += 1.0;
                 if (gj) (*gj)[static_cast<size_t>(i - 1)] = j - 1;
@@ -2814,7 +2851,9 @@ private:
     }
 
     // With gj: the guide too, from the same walk (guide_j_linear's, move for move).
-    void hard_grad_linear(const DpBuffer& buf, AlignParams& grad, std::vector<int>* gj = nullptr) const {
+    template <class Mv = NoMoves>
+    void hard_grad_linear(const DpBuffer& buf, AlignParams& grad, std::vector<int>* gj = nullptr,
+                          Mv&& mv = Mv{}) const {
         double* gblk = grad_block(grad);
         if (gj) {
             gj->assign(static_cast<size_t>(m_ + 1), -1);
@@ -2825,6 +2864,7 @@ private:
         }
         if (tr_) {
             walk_linear(buf, [&](int k, int i, int j) {
+                mv(static_cast<uint8_t>(k));
                 if (k == 0) {
                     gblk[sub_off(i, j)] += 1.0;
                     if (gj) (*gj)[static_cast<size_t>(i - 1)] = j - 1;
@@ -2839,6 +2879,7 @@ private:
             return;
         }
         walk_linear(buf, [&](int k, int i, int j) {
+            mv(static_cast<uint8_t>(k));
             if (k == 0) {
                 gblk[sub_off_u(i, j)] += 1.0;
                 if (gj) (*gj)[static_cast<size_t>(i - 1)] = j - 1;
