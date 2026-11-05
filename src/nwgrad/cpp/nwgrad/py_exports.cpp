@@ -36,14 +36,28 @@ template <> struct type_caster<SeqViews> {
         if (PyUnicode_Check(o) || PyBytes_Check(o) || !PySequence_Check(o)) return false;
         object seq = steal(PySequence_Fast(o, ""));   // o itself for a list / tuple
         if (!seq.is_valid()) { PyErr_Clear(); return false; }
+#if defined(Py_LIMITED_API)
+        // abi3: the PySequence_Fast_* macros read list / tuple internals the stable ABI
+        // does not expose.  PySequence_Fast returned a list or a tuple; their GetItem
+        // functions return BORROWED references, owned by `seq`, as the macro path's are.
+        const bool is_list = PyList_Check(seq.ptr());
+        const Py_ssize_t n = is_list ? PyList_Size(seq.ptr()) : PyTuple_Size(seq.ptr());
+        if (n < 0) { PyErr_Clear(); return false; }
+        auto item = [&](Py_ssize_t i) {
+            return is_list ? PyList_GetItem(seq.ptr(), i) : PyTuple_GetItem(seq.ptr(), i);
+        };
+#else
         const Py_ssize_t n = PySequence_Fast_GET_SIZE(seq.ptr());
         PyObject** items = PySequence_Fast_ITEMS(seq.ptr());
+        auto item = [items](Py_ssize_t i) { return items[i]; };
+#endif
         std::vector<std::string_view> v;
         try { v.reserve(static_cast<size_t>(n)); } catch (...) { return false; }
         for (Py_ssize_t i = 0; i < n; ++i) {
-            if (!PyUnicode_Check(items[i])) return false;
+            PyObject* it = item(i);
+            if (!it || !PyUnicode_Check(it)) { PyErr_Clear(); return false; }
             Py_ssize_t len = 0;
-            const char* s = PyUnicode_AsUTF8AndSize(items[i], &len);
+            const char* s = PyUnicode_AsUTF8AndSize(it, &len);
             if (!s) { PyErr_Clear(); return false; }
             v.emplace_back(s, static_cast<size_t>(len));
         }
