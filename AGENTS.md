@@ -318,6 +318,13 @@ step, tracked / untracked, 1 and 12 threads): double linear 0.95-1.04; double af
 local 1.04-1.08, global 1.16-1.22; float linear 0.95-1.04; float affine local 1.07-1.12,
 global 1.21-1.27; soft (double) 1.18-1.34. Memory: 31 MB tracked vs 24 MB untracked
 (hard paths); soft records 168 MB.
+spot (M1, NEON, macOS, 2026-11-05 at `74657cb`; 100k Manakov pairs, 1 and 8 threads,
+trackedK / untracked): affine local 1.08-1.10 (double and float), glocal 1.14-1.16;
+linear local 1.12 double / 1.19-1.22 float, glocal 1.39-1.41 double / 1.24-1.25 float.
+Most of it is already in tracked1 (one set, all-zero track: linear glocal double 1.24),
+so it is the tracked code path, not K.  **NEON's linear tracked cost is above x86's**
+(0.95-1.04 there, local and global; glocal not measured on x86): open, TODO.md.  Peak RSS
+42 vs 37 MB.
 
 Where it goes (perf, 1 thread; `score_and_grad` = sg, `weighted_grad` = wg):
 - **Linear sg: tracked is faster than untracked — because the untracked batch walks

@@ -363,10 +363,12 @@ Tracks landed on branch `tracks` (2026-10-11; see AGENTS.md, "Tracks").  Deferre
   kernels, the inter-pair hard, score-only, banded and soft fills, the scaled soft
   kernels, the row kernels and Hirschberg (2026-11-03), Grid (2026-11-05).
   Then PosimiR's backend can switch from the emulation to `mode="glocal"`.
-- **Fleet runs not yet done: spot (neon) and `tools/bench_tracks.py`.**  Correctness was
-  verified on sse2 (skynet, wloczykij), avx2 (nighthaven) and avx512 (solace WSL, 2026-11-04
-  at `c9ed87e`: ctest 17/17, `NWGRAD_FORCE_KERNEL=simd` pytest 22744 passed, 72 skipped);
-  NEON only through CI's ARM64 job.
+- **Tracked linear batches cost more on NEON than on x86.**  spot (M1, macOS, 2026-11-05,
+  `tools/bench_tracks.py`, AGENTS "Tracked cost"): linear local 1.12-1.22x untracked, linear
+  glocal 1.24-1.41x, against 0.95-1.04 on x86 (whose glocal is not measured: run
+  `bench_tracks.py --modes glocal` on nighthaven first).  Mostly the tracked code path
+  (tracked1), not K.  (Correctness on NEON was checked the same day at `74657cb`, macOS:
+  ctest 17/17, pytest 5426 passed with the default kernel and forced simd.)
 - **Python track conversion** (`to_tracks` in py_exports.cpp) casts each pair's list
   separately: ~1-2 µs per pair, seconds for millions.  Accepting one flat int array plus
   offsets would remove it.
