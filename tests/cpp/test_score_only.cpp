@@ -4,17 +4,22 @@
 // Its contract is bit-identity (but for the sign of a zero score) with score() after
 // compute_viterbi() under an exact
 // traceback mode (Pointers and Scores both checked) — at every backend the CPU offers,
-// both precisions, Global and Local, affine and linear (linear runs through the affine
-// kernel with zero opens).  Random problems mix ties (small-integer matrices and gaps),
-// non-representable extends (0.1), empty sequences and planted homology (long gap runs
-// for lazy-F to carry across lanes).  NWGRAD_SCORE_FUZZ=<n> scales the iteration count
+// both precisions, Global and Local, affine and linear (linear through its own one-row
+// kernel, score_linear_striped; NWGRAD_SCORE_LINEAR=affine runs the zero-open affine one).
+// Random problems mix ties (small-integer matrices and gaps), non-representable extends
+// (0.1), empty sequences and planted homology (long gap runs for lazy-F to carry across
+// lanes).  NWGRAD_SCORE_FUZZ=<n> scales the iteration count
 // (the fleet runs use it); NWGRAD_SCORE_VARIANT=twopass checks the unfused kernel.
 
 #include "catch.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <span>
+#include <stdexcept>
+#include <type_traits>
 #include <string>
 #include <vector>
 
@@ -284,4 +289,117 @@ TEST_CASE("inter-pair score: every lane equals its pair's compute_score", "[scor
     }
     INFO(n_levels << " levels, " << n_checked << " lanes");
     REQUIRE(n_levels > 0);
+}
+
+// ── Linear gaps: the one-row kernel (score_linear_striped) at every scalar type ──
+// The float / double fuzz above runs Global and Local untracked; this sweep adds the
+// integer types (int16 in both regimes: scale 10 pushes pairs past ~L100 out of the
+// quarter rule into the saturating one), Glocal and tracked rows (K = 2 sets, a random
+// track and gap track), each against the scalar Scores fill, which is the oracle.
+namespace {
+
+template <class T, AlignMode AM>
+void lin_check(const std::string& a, const std::string& b, const AlignParams& p,
+               std::span<const uint16_t> trk, std::span<const uint16_t> gtrk, int kern,
+               long& n_checked, long& n_sat) {
+    Aligner<GapModel::Linear, AM, AlignBand::Full, T> ref;
+    ref.set_kernel(kBackendScalar);
+    ref.set_traceback(TracebackMode::Scores);
+    DpBufferT<T> rbuf;
+    try {
+        ref.set_problem(a, b, p, 0, {}, trk, gtrk);
+    } catch (const std::overflow_error&) {
+        return;   // an int16 pair past even the saturating bound: refused alike everywhere
+    }
+    ref.compute_viterbi(rbuf);
+    const double want = ref.score();
+    Aligner<GapModel::Linear, AM, AlignBand::Full, T> al;
+    al.set_kernel(kern);
+    DpBufferT<T> buf;
+    al.set_problem(a, b, p, 0, {}, trk, gtrk);
+    const double got = al.compute_score(buf);
+    INFO("a=" << a << " b=" << b << " kern=" << kern << " T=" << sizeof(T)
+         << (std::is_floating_point_v<T> ? "f" : "i") << " AM=" << static_cast<int>(AM)
+         << " tracked=" << !trk.empty() << " want=" << want << " got=" << got
+         << " ge " << p.gap_extend_a << "/" << p.gap_extend_b);
+    REQUIRE(same_bits(got, want));
+    ++n_checked;
+    if constexpr (std::is_same_v<T, int16_t>) n_sat += a.size() + b.size() > 200;
+}
+
+template <class T>
+void lin_check_modes(const std::string& a, const std::string& b, const AlignParams& p,
+                     std::span<const uint16_t> trk, std::span<const uint16_t> gtrk, int kern,
+                     long& n, long& ns) {
+    lin_check<T, AlignMode::Global>(a, b, p, trk, gtrk, kern, n, ns);
+    lin_check<T, AlignMode::Local >(a, b, p, trk, gtrk, kern, n, ns);
+    lin_check<T, AlignMode::Glocal>(a, b, p, trk, gtrk, kern, n, ns);
+}
+
+}  // namespace
+
+TEST_CASE("compute_score, linear gaps: every type, mode and tracks", "[score][linear]") {
+    std::mt19937_64 rng(20261105);
+    auto ri = [&](int lo, int hi) { return std::uniform_int_distribution<int>(lo, hi)(rng); };
+    const Alphabet* alphas[2] = {&Alphabet::dna(), &Alphabet::protein()};
+    const std::vector<int> kerns = score_backends();
+    const long iters = std::max(1L, fuzz_iters(300) / 2);
+    long n_checked = 0, n_sat = 0;
+    for (long it = 0; it < iters; ++it) {
+        const Alphabet& A = *alphas[ri(0, 2) == 0];
+        const int na = A.size();
+        const int K = ri(0, 2) == 0 ? 2 : 1;
+        const bool real = ri(0, 3) == 0;           // floating types only
+        const int scale = ri(0, 1) ? 10 : 1;
+        std::vector<double> mats(static_cast<size_t>(K * na * na)), gaps(static_cast<size_t>(4 * K));
+        for (int k = 0; k < K; ++k) {
+            for (int x = 0; x < na; ++x)
+                for (int y = 0; y < na; ++y)
+                    mats[static_cast<size_t>((k * na + x) * na + y)] = real
+                        ? std::uniform_real_distribution<double>(-2, 3)(rng)
+                        : scale * static_cast<double>(x == y ? ri(1, 3) : ri(-2, 1));
+            for (int f = 0; f < 4; ++f) {
+                double g = real ? std::uniform_real_distribution<double>(0, 1.5)(rng)
+                                : scale * static_cast<double>(ri(0, 2));
+                if ((f & 1) && ri(0, 5) == 0) g = -(real ? 0.5 * g : static_cast<double>(ri(0, scale)));
+                gaps[static_cast<size_t>(4 * k + f)] = g;
+            }
+        }
+        const AlignParams p(SubstMatrix(mats.data(), A, K), gaps.data());
+        auto seq = [&](int len) {
+            std::string s;
+            for (int k = 0; k < len; ++k) s.push_back(A.symbols()[ri(0, na - 1)]);
+            return s;
+        };
+        auto len = [&] {
+            const int r = ri(0, 19);
+            if (r == 0) return ri(0, 2);
+            if (r <= 3) return ri(150, 400);
+            return ri(1, 90);
+        };
+        std::string a = seq(len()), b = seq(len());
+        if (ri(0, 2) == 0 && !a.empty()) {   // planted homology: b = a with indels
+            b = a;
+            for (int k = ri(1, 6); k > 0 && !b.empty(); --k) {
+                if (ri(0, 1)) b.erase(ri(0, (int)b.size() - 1), ri(1, 8));
+                else          b.insert(ri(0, (int)b.size()), seq(ri(1, 8)));
+            }
+        }
+        std::vector<uint16_t> trk, gtrk;
+        if (K > 1) {
+            for (size_t k = 0; k < a.size(); ++k) trk.push_back(static_cast<uint16_t>(ri(0, K - 1)));
+            if (ri(0, 1)) for (size_t k = 0; k <= a.size(); ++k) gtrk.push_back(static_cast<uint16_t>(ri(0, K - 1)));
+        }
+        const int kern = kerns[ri(0, (int)kerns.size() - 1)];
+        lin_check_modes<double>(a, b, p, trk, gtrk, kern, n_checked, n_sat);
+        lin_check_modes<float >(a, b, p, trk, gtrk, kern, n_checked, n_sat);
+        if (!real) {
+            lin_check_modes<int16_t>(a, b, p, trk, gtrk, kern, n_checked, n_sat);
+            lin_check_modes<int32_t>(a, b, p, trk, gtrk, kern, n_checked, n_sat);
+            lin_check_modes<int64_t>(a, b, p, trk, gtrk, kern, n_checked, n_sat);
+        }
+    }
+    INFO(n_checked << " checked, " << n_sat << " long int16");
+    REQUIRE(n_checked > iters * 6);
+    REQUIRE(n_sat > 0);
 }
