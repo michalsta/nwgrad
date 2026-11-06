@@ -36,6 +36,16 @@ long grid_iters(long dflt) {
     return e ? std::atol(e) : dflt;
 }
 
+// SimdLevel::Avx512 exists on x86 builds only (the ARM64 job has no such enumerator).
+bool is_avx512(int kern) {
+#if !(defined(__aarch64__) || defined(_M_ARM64))
+    return kern == static_cast<int>(SimdLevel::Avx512);
+#else
+    (void)kern;
+    return false;
+#endif
+}
+
 bool same_bits(double x, double y) {
     if (x == 0.0 && y == 0.0) return true;
     return std::memcmp(&x, &y, sizeof x) == 0;
@@ -267,7 +277,7 @@ TEST_CASE("auto takes Grid for Glocal, and for Local above the pointer budget", 
         // float32 on AVX-512 only from 2048 rows (kLocalGridMinRows512), so 800 rows: Pointers
         Aligner<GapModel::Affine, AlignMode::Local, AlignBand::Full, float> lf, lfp;
         run(lf, TracebackMode::Default, kern, A, B); run(lfp, TracebackMode::Pointers, kern, A, B);
-        REQUIRE(lf.ran_grid() == (kern != kBackendScalar && kern != static_cast<int>(SimdLevel::Avx512)));
+        REQUIRE(lf.ran_grid() == (kern != kBackendScalar && !is_avx512(kern)));
         REQUIRE(same_bits(lf.score(), lfp.score()));
         REQUIRE(lf.alignment() == lfp.alignment());
         Aligner<GapModel::Affine, AlignMode::Local, AlignBand::Full, double> ld;
