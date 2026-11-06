@@ -22,9 +22,7 @@ void register_level_typed(SimdLevel l,
                           typename TypedKernels<T>::hb_fn hb_sweep_pmax,
                           typename TypedKernels<T>::hbbase_fn hb_base,
                           typename TypedKernels<T>::hbscan_fn hb_scan,
-                          typename TypedKernels<T>::score_fn score,
-                          typename TypedKernels<T>::inter_fn inter_fill,
-                          typename TypedKernels<T>::inter_fn inter_score, int inter_w) {
+                          typename TypedKernels<T>::score_fn score) {
     TypedKernels<T>& k = level_table()[(int)l].template of<T>();
     k.viterbi           = viterbi;
     k.viterbi_ptr       = viterbi_ptr;
@@ -38,9 +36,15 @@ void register_level_typed(SimdLevel l,
     k.hb_base           = hb_base;
     k.hb_scan           = hb_scan;
     k.score             = score;
-    k.inter_fill        = inter_fill;
-    k.inter_score       = inter_score;
-    k.inter_w           = inter_w;
+}
+
+template <class T>
+void register_level_inter(SimdLevel l, typename TypedKernels<T>::inter_fn inter_fill,
+                          typename TypedKernels<T>::inter_fn inter_score, int inter_w) {
+    TypedKernels<T>& k = level_table()[(int)l].template of<T>();
+    k.inter_fill  = inter_fill;
+    k.inter_score = inter_score;
+    k.inter_w     = inter_w;
 }
 
 template <class T>
@@ -53,7 +57,8 @@ void register_level_grid(SimdLevel l, typename TypedKernels<T>::grid_fn grid_fwd
         TypedKernels<T>::viterbi_fn, TypedKernels<T>::viterbi_fn, TypedKernels<T>::viterbi_fn, \
         void (*)(LhbJob<T>&), banded_row_fn_t<T>, banded_row_fn_t<T>, \
         TypedKernels<T>::hb_fn, TypedKernels<T>::hb_fn, TypedKernels<T>::hbbase_fn, \
-        TypedKernels<T>::hbscan_fn, TypedKernels<T>::score_fn, TypedKernels<T>::inter_fn, \
+        TypedKernels<T>::hbscan_fn, TypedKernels<T>::score_fn); \
+    template void register_level_inter<T>(SimdLevel, TypedKernels<T>::inter_fn, \
         TypedKernels<T>::inter_fn, int); \
     template void register_level_grid<T>(SimdLevel, TypedKernels<T>::grid_fn);
 NWGRAD_INSTANTIATE_REGISTER(double)

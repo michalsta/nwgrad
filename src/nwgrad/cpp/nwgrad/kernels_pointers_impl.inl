@@ -119,6 +119,19 @@ template <class V>
 // byte per lane a group.  The codes are the same choices; only where their bits go differs.
 // Glocal: as striped_affine_full's (row 0 M = 0, the best of row m; row 0's codes are
 // never read: the walk stops at row 0).
+// The kernel's per-call setup, out of line: whether gcc inlines the vector growth and
+// spread_rows' allocation paths depends on the unit's size (its inlining budget), and when
+// the inter-pair kernels moved to a unit of their own (level_<lv>_inter.cpp) it began to,
+// striped_affine_full_ptr<int> 837 -> 1264 instructions at avx512 and a protein L100 int32
+// Global path 1.035x main on solace (+1 % instructions, +5 % cycles; the hot loops were the
+// same).  Out of line, the kernel keeps main's form in any unit composition.
+template <class V>
+[[gnu::noinline]] static void ptr_grow(V& v, std::size_t n) { if (v.size() < n) v.resize(n); }
+template <class T, class Vec>
+[[gnu::noinline]] static T* ptr_spread_rows(Vec& block, std::size_t len, int nrows, std::size_t& stride) {
+    return spread_rows<T>(block, len, nrows, stride);
+}
+
 template <class T, bool Local, bool Tr = false, bool Dense = false, bool Sat = false, bool Glocal = false>
 static void striped_affine_full_ptr(ViterbiJob<T>& job) {
     static_assert(!Dense || sizeof(T) >= 4, "dense codes: lanes >= 32 bits");
@@ -146,12 +159,12 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
 
     const std::size_t drow = Dense ? dense_codes_row_bytes(seg, W, 3) : rowsz;   // code bytes a row
     const std::size_t dsz = (std::size_t)(m + 1) * drow;
-    if (buf.DM.size() < dsz) buf.DM.resize(dsz);   // the packed codes (the linear fill's table too)
+    ptr_grow(buf.DM, dsz);   // the packed codes (the linear fill's table too)
     // rolling score rows: 2 x rowsz instead of (m+1) x rowsz -- the whole point; with the
     // opens, open codes, Q (integer T), y-code and M+X-code scratch and Local's padding
     // mask, twelve rows of one block (spread_rows, dp_buffer.hpp: no two in one L1 set,
     // and none in the set of another stream read every row)
-    std::size_t rs; T* const rows = spread_rows<T>(buf.prows, rowsz, 12, rs);
+    std::size_t rs; T* const rows = ptr_spread_rows<T>(buf.prows, rowsz, 12, rs);
 
     auto scol = [seg](int j) -> std::size_t {
         return (std::size_t)((j - 1) % seg) * W + (j - 1) / seg;
