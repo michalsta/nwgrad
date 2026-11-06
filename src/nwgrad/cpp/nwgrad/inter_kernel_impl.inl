@@ -397,12 +397,19 @@ struct InterCommon {
     }
     // Row i's profile (P[c] = per lane, score of the lane's A residue i vs letter c) and
     // the lanes still inside their own A.
-    // The gather path's row, out of line as main had it: inlined into the fill (or in the
-    // unit of its own, level_<name>_inter.cpp) gcc compiled the lane loops below to 9
-    // instructions an element where the out-of-line form takes ~3, +4.7 % instructions on
-    // protein L100 float32 (skynet, sse4, 2026-11-05).
+    // The gather path's row, inlined or not as main's gcc had it per level: at sse2 / sse4
+    // main kept row() out of line, and inlined (or in the unit of its own) gcc compiled the
+    // lane loops below to 9 instructions an element instead of 8 (+4.7 % on protein L100
+    // float32, skynet); at AVX2 / AVX-512 main inlined it, and the out-of-line call (a
+    // vzeroupper, ymm spills) cost 2-6 % cycles at equal instructions per row on nighthaven
+    // (protein L100 float32 affine, 2026-11-06).
+#if defined(__AVX__)
+#  define NWGRAD_GATHER_ROW_INLINE [[gnu::always_inline]]
+#else
+#  define NWGRAD_GATHER_ROW_INLINE [[gnu::noinline]]
+#endif
     template <bool Tr>
-    [[gnu::noinline]] void row_gather(int i, ivl& live) const {
+    NWGRAD_GATHER_ROW_INLINE void row_gather(int i, ivl& live) const {
         const int na = J.nalpha;
         for (int l = 0; l < IW; ++l) live[l] = (i <= J.m[l]) ? -1 : 0;
         const int n = J.n;
