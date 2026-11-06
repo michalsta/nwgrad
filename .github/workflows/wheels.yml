@@ -108,7 +108,7 @@ jobs:
             cc: gcc
             cxx: g++
           - name: macos-arm64 (gcc)
-            runner: macos-14
+            runner: macos-15   # macos-14 was retired by GitHub on 2026-11-02 (jobs fail to schedule)
             archs: arm64
             # cc/cxx unused on macOS — CIBW_ENVIRONMENT_MACOS (set dynamically in the
             # Homebrew step) pins the versioned Homebrew g++.  Placeholders keep the
@@ -273,7 +273,7 @@ jobs:
           - name: linux-aarch64 (gcc)
             runner: ubuntu-24.04-arm
           - name: macos-arm64 (gcc)
-            runner: macos-14
+            runner: macos-15   # macos-14 was retired by GitHub on 2026-11-02 (jobs fail to schedule)
           - name: windows-x86_64 (mingw-gcc)
             runner: windows-latest
     defaults:
