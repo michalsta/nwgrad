@@ -403,7 +403,9 @@ static inline bool sp_linear_reload(SoftPairJobT<SF>& J, int c) noexcept {
 
 // Tr: tracked (J.rw) — each row's weights, its own profile and count row, and the gap
 // gradient per row into J.grow.
-template <class SF, bool Tr>
+// Ck: checkpointed (J.ck > 0).  A template flag, not a runtime test: with the block
+// offset a variable, the full-table path ran ~0.5 % more instructions on miRNA-sized pairs.
+template <class SF, bool Tr, bool Ck>
 NWGRAD_SP_FMA_FN static void soft_pair_linear_t(SoftPairJobT<SF>& J) noexcept {
     NWGRAD_SP_FMA_BODY
     constexpr bool kSpCountF = std::is_same_v<SF, float> && NWGRAD_SP_COUNT_F32;   // the float32 instantiation accounts for flushed products (sp_count_*)
@@ -428,7 +430,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear_t(SoftPairJobT<SF>& J) noexcept {
     bool bad = false;
     J.ok = 0;
 
-    const int ck = J.ck;
+    const int ck = Ck ? J.ck : 0;
     const int nb = (ck && m) ? (m + ck - 1) / ck : 1;   // blocks (one: the full table)
     if (!J.full) for (int j = J.slo[0]; j <= J.shi[0]; ++j) F[j] = 0.0;
     if (L || G) { for (int j = 0; j <= n; ++j) F[j] = 1.0; }
@@ -444,7 +446,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear_t(SoftPairJobT<SF>& J) noexcept {
         mf[0] = mx;
         if (L || (G && m == 0)) { SF s = 0.0; for (int j = J.jlo0[0]; j <= J.jhi0[0]; ++j) s += F[j]; rs[0] = s; }
     }
-    if (!ck) { if (!sp_linear_fwd<SF, Tr>(J, F, 0, 1, m)) return; }
+    if constexpr (!Ck) { if (!sp_linear_fwd<SF, Tr>(J, F, 0, 1, m)) return; }
     else
         for (int c = 0; c < nb; ++c) {
             const int i0 = c * ck, i1 = std::min(i0 + ck, m);
@@ -472,7 +474,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear_t(SoftPairJobT<SF>& J) noexcept {
     int Tn = 0;
     double g_ea = 0.0, g_eb = 0.0, loss = 0.0, lossu = 0.0;   // lossu: sp_loss's, in units of MIN
     for (int i = m; i >= 0; --i) {
-        if (ck) {   // row i reads forward rows i and i-1: block (i-1)/ck (row 0: block 0)
+        if constexpr (Ck) {   // row i reads forward rows i and i-1: block (i-1)/ck (row 0: block 0)
             const int cb = i ? (i - 1) / ck : 0;
             if (cb != curb) {
                 curb = cb; base = cb * ck;
@@ -669,7 +671,9 @@ static inline bool sp_affine_reload(SoftPairJobT<SF>& J, int c) noexcept {
     return true;
 }
 
-template <class SF, bool Tr>
+// Ck: checkpointed (J.ck > 0).  A template flag, not a runtime test: with the block
+// offset a variable, the full-table path ran ~0.5 % more instructions on miRNA-sized pairs.
+template <class SF, bool Tr, bool Ck>
 NWGRAD_SP_FMA_FN static void soft_pair_affine_t(SoftPairJobT<SF>& J) noexcept {
     NWGRAD_SP_FMA_BODY
     constexpr bool kSpCountF = std::is_same_v<SF, float> && NWGRAD_SP_COUNT_F32;   // the float32 instantiation accounts for flushed products (sp_count_*)
@@ -693,7 +697,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine_t(SoftPairJobT<SF>& J) noexcept {
     const SF* P = J.P;
     bool bad = false;
     J.ok = 0;
-    const int ck = J.ck;
+    const int ck = Ck ? J.ck : 0;
     const int nb = (ck && m) ? (m + ck - 1) / ck : 1;   // blocks (one: the full tables)
     // tp: M+X+Y of the previous forward row; uy: the Y carry's carry-free input.  Full
     // tables: r5 / r4 (r5 later the match scratch); checkpointed: q0 / q1, which the
@@ -719,7 +723,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine_t(SoftPairJobT<SF>& J) noexcept {
     }
     S[0] = 0;
     if (L || (G && m == 0)) { SF s = 0.0; for (int j = J.jlo0[0]; j <= J.jhi0[0]; ++j) s += tp[j]; rs[0] = s; }
-    if (!ck) { if (!sp_affine_fwd<SF, Tr>(J, FM, FX, FY, 0, 1, m, tp, uy)) return; }
+    if constexpr (!Ck) { if (!sp_affine_fwd<SF, Tr>(J, FM, FX, FY, 0, 1, m, tp, uy)) return; }
     else
         for (int c = 0; c < nb; ++c) {
             const int i0 = c * ck, i1 = std::min(i0 + ck, m);
@@ -752,7 +756,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine_t(SoftPairJobT<SF>& J) noexcept {
     int Tn = 0;
     double g_ea = 0.0, g_eb = 0.0, g_oa = 0.0, g_ob = 0.0, loss = 0.0, lossu = 0.0;   // as soft_pair_linear_t
     for (int i = m; i >= 0; --i) {
-        if (ck) {   // row i reads forward rows i and i-1: block (i-1)/ck (row 0: block 0)
+        if constexpr (Ck) {   // row i reads forward rows i and i-1: block (i-1)/ck (row 0: block 0)
             const int cb = i ? (i - 1) / ck : 0;
             if (cb != curb) {
                 curb = cb; base = cb * ck;
@@ -920,16 +924,20 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine_t(SoftPairJobT<SF>& J) noexcept {
 }
 
 NWGRAD_SP_FMA_FN static void soft_pair_linear(SoftPairJob& J) noexcept {
-    if (J.rw) soft_pair_linear_t<double, true>(J); else soft_pair_linear_t<double, false>(J);
+    if (J.ck) { if (J.rw) soft_pair_linear_t<double, true, true>(J); else soft_pair_linear_t<double, false, true>(J); }
+    else if (J.rw) soft_pair_linear_t<double, true, false>(J); else soft_pair_linear_t<double, false, false>(J);
 }
 NWGRAD_SP_FMA_FN static void soft_pair_affine(SoftPairJob& J) noexcept {
-    if (J.rw) soft_pair_affine_t<double, true>(J); else soft_pair_affine_t<double, false>(J);
+    if (J.ck) { if (J.rw) soft_pair_affine_t<double, true, true>(J); else soft_pair_affine_t<double, false, true>(J); }
+    else if (J.rw) soft_pair_affine_t<double, true, false>(J); else soft_pair_affine_t<double, false, false>(J);
 }
 NWGRAD_SP_FMA_FN static void soft_pair_linear_f(SoftPairJobF& J) noexcept {
-    if (J.rw) soft_pair_linear_t<float, true>(J); else soft_pair_linear_t<float, false>(J);
+    if (J.ck) { if (J.rw) soft_pair_linear_t<float, true, true>(J); else soft_pair_linear_t<float, false, true>(J); }
+    else if (J.rw) soft_pair_linear_t<float, true, false>(J); else soft_pair_linear_t<float, false, false>(J);
 }
 NWGRAD_SP_FMA_FN static void soft_pair_affine_f(SoftPairJobF& J) noexcept {
-    if (J.rw) soft_pair_affine_t<float, true>(J); else soft_pair_affine_t<float, false>(J);
+    if (J.ck) { if (J.rw) soft_pair_affine_t<float, true, true>(J); else soft_pair_affine_t<float, false, true>(J); }
+    else if (J.rw) soft_pair_affine_t<float, true, false>(J); else soft_pair_affine_t<float, false, false>(J);
 }
 // The entry of soft type SF (the Aligner's baseline copy picks by type).
 template <class SF>

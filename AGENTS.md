@@ -2737,7 +2737,9 @@ Before the leveled kernel the same protein runs were 23–26 ns/cell on skynet a
 B/cell, 24 MB) leave L3 and the kernel turns memory-bound (Open TODOs).
 (Not on skynet, 2026-11-05: there the double pass at L1000 is DENORMAL-bound, below.)
 
-**Checkpointed forward (branch `proto/soft-checkpoint`, 2026-11-05).** The per-pair kernels
+**Checkpointed forward (branch `proto/soft-checkpoint`, 2026-11-05).** (The kernels take
+checkpointing as a template flag, `Ck`: as a runtime test with the block offset a variable,
+the full-table path ran +0.5 % instructions on miRNA 22 x 50 own-fill pairs, 2026-11-06.) The per-pair kernels
 (`soft_kernel_impl.inl`, "Checkpoints") can keep only the first forward row of every block
 of k rows (M, X, Y and the forward's previous-row sum `tp`; linear F alone: `cM..cT`) and
 compute into a block buffer of k+1 rows; the backward walks the blocks from the top, and
@@ -2762,7 +2764,10 @@ values, since a row writes only itself), and the tracked weights are per row any
   `BatchEngine::fwdbwd_` and the stream path; a standalone `SeqPair` or a batch of 1-3
   threads never checkpoints by default -- nighthaven, FTZ on: at 4 and 6 workers 0.30-0.89
   of the time in every cell, at 2 it LOST, float32 affine L1000 1.30x main, double linear
-  L1000 1.22x the unchecked arm) AND its forward tables (states × (m+1)(n+1) × the
+  L1000 1.22x the unchecked arm; solace, 8 workers, pays) AND the host is x86-64
+  (`kSoftCkptByDefault`: off on AArch64 -- spot, M1, 4 threads: double linear 1.15-1.17x
+  from L1000, float32 affine L1000 1.28x, the M1 not memory-bound with 4 pairs in flight;
+  1 thread equal to main) AND its forward tables (states × (m+1)(n+1) × the
   soft type's bytes) reach 4 MiB (`kSoftCkptMinBytes`; double affine from L ~420, float32
   affine ~590, double linear ~720); k = ceil(sqrt(m)) capped at 32. An explicit
   `soft_ckpt_min_bytes` applies at any thread count. Fleet result (nighthaven, v3, 6 cores,

@@ -5241,7 +5241,7 @@ private:
         if (r >= 0) return static_cast<int>(std::min(r, mm));
         const size_t states = (GM == GapModel::Linear) ? 1 : 3;
         const int64_t ob = gate_override(Gate::SoftCkptMinBytes);
-        if (ob < 0 && !soft_ckpt_shared_) return 0;   // the default: never on one thread
+        if (ob < 0 && !(kSoftCkptByDefault && soft_ckpt_shared_)) return 0;   // the default: x86-64, >= 4 workers
         if (states * sz_ * sizeof(SF) < gate_value(Gate::SoftCkptMinBytes, kSoftCkptMinBytes)) return 0;
         return static_cast<int>(std::min<int64_t>(soft_ckpt_auto_rows(m_), mm));
     }

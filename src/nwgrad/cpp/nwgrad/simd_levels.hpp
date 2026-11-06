@@ -662,6 +662,16 @@ inline constexpr size_t kSoftCkptMinBytes = size_t(4) << 20;
 // unchecked arm: two pairs in flight leave the memory system room, and the recomputation
 // shows), at 1 it lost everywhere (1.13-1.48x).
 inline constexpr size_t kSoftCkptMinWorkers = 4;
+// ... and only on x86-64, where every measured host gains from 4 workers (nighthaven 4 and
+// 6 workers 0.30-0.89 of the time, solace 8 workers pays).  Off on AArch64 and elsewhere:
+// spot (M1, 4 threads) ran SLOWER checkpointed -- double linear 1.15-1.17x from L1000,
+// float32 affine L1000 1.28x; the M1 is not memory-bound with 4 pairs in flight; 1 thread
+// equal to main.  An explicit soft_ckpt_min_bytes or soft_ckpt_rows forces it anywhere.
+#if defined(__x86_64__) || defined(_M_X64)
+inline constexpr bool kSoftCkptByDefault = true;
+#else
+inline constexpr bool kSoftCkptByDefault = false;
+#endif
 // ── The fill gates: which pairs join a shared (inter-pair) fill ────────────────
 //
 // Per ISA level and scalar type, measured by tools/gate_sweep.py (2026-10-31 / 11-01) on
