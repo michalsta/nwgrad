@@ -5378,9 +5378,9 @@ private:
         else if (soft_double_ftz()) { FlushDenormalsScope ftz; fn(J); }
         else fn(J);
         if (std::getenv("NWGRAD_SOFT_DEBUG"))
-            std::fprintf(stderr, "soft<%s> m=%d n=%d ck=%d ok=%d loss=%.3e tol=%.3e logz=%.6f win=2^%d resc_bwd=%d resc_fwd=%d\n",
+            std::fprintf(stderr, "soft<%s> m=%d n=%d ck=%d ok=%d loss=%.3e tol=%.3e logz=%.6f win=2^%d resc_fwd=%d\n",
                          std::is_same_v<SF, float> ? "float" : "double", m_, n_, ck, J.ok, J.loss,
-                         SoftRange<SF>::tol, J.log_z, std::ilogb(J.win), J.nresc,
+                         SoftRange<SF>::tol, J.log_z, std::ilogb(J.win),
                          [&] { int c = 0; for (int i = 1; i <= m_; ++i) c += J.S[i] != J.S[i - 1]; return c; }());
         if (J.ck_bad)
             throw std::logic_error("nwgrad: soft path: " + std::to_string(J.ck_bad) +

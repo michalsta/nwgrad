@@ -511,7 +511,6 @@ struct SoftPairJobT {
     // The lazy rescale's window (sp_lazy): a row is rescaled when its max leaves
     // [1/win, win].  SoftRange<F>::win by default; the soft_window_log2 gate overrides it.
     F win = SoftRange<F>::win;
-    int nresc = 0;                  // backward rows rescaled (NWGRAD_SOFT_DEBUG)
 };
 using SoftPairJob  = SoftPairJobT<double>;
 using SoftPairJobF = SoftPairJobT<float>;
