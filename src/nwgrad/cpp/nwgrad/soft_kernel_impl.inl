@@ -67,6 +67,12 @@
 #  endif
 #  ifndef NWGRAD_SP_VMAX
 #    define NWGRAD_SP_VMAX(m, v) ((v) > (m) ? (v) : (m))
+// clang cannot vectorize the select as a max reduction (above), so the loops that carry one
+// stay scalar here, as measured best, and clang reports each `omp simd` among them as
+// failed (-Wpass-failed); silenced below for this file.
+#    if defined(__clang__)
+#      define NWGRAD_SP_CLANG_SELECT_MAX 1
+#    endif
 #  endif
 #  ifndef NWGRAD_SP_SPLIT_MAX
 #    define NWGRAD_SP_SPLIT_MAX 0
@@ -77,6 +83,18 @@
 #  else
 #    define NWGRAD_SP_MAX(v) NWGRAD_SP_PRAGMA_(omp simd reduction(max:v))
 #  endif
+#endif
+
+// A build without -fopenmp-simd (a header-only consumer compiling with plain -Wall) runs
+// these loops scalar, correctly; gcc would also warn once per `omp simd` it ignores
+// (-Wunknown-pragmas).  Silenced for this file only.  The pop cannot sit in the macros:
+// between the pragma and its loop it breaks the -fopenmp-simd build ("loop nest expected").
+#if defined(__GNUC__) && !defined(__clang__)
+#  pragma GCC diagnostic push
+#  pragma GCC diagnostic ignored "-Wunknown-pragmas"
+#elif defined(__clang__) && defined(NWGRAD_SP_CLANG_SELECT_MAX)
+#  pragma clang diagnostic push
+#  pragma clang diagnostic ignored "-Wpass-failed"
 #endif
 
 
@@ -771,16 +789,16 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine_t(SoftPairJobT<SF>& J) noexcept {
     J.ok = 1;
 }
 
-NWGRAD_SP_FMA_FN static void soft_pair_linear(SoftPairJob& J) noexcept {
+NWGRAD_SP_FMA_FN static inline void soft_pair_linear(SoftPairJob& J) noexcept {
     if (J.rw) soft_pair_linear_t<double, true>(J); else soft_pair_linear_t<double, false>(J);
 }
-NWGRAD_SP_FMA_FN static void soft_pair_affine(SoftPairJob& J) noexcept {
+NWGRAD_SP_FMA_FN static inline void soft_pair_affine(SoftPairJob& J) noexcept {
     if (J.rw) soft_pair_affine_t<double, true>(J); else soft_pair_affine_t<double, false>(J);
 }
-NWGRAD_SP_FMA_FN static void soft_pair_linear_f(SoftPairJobF& J) noexcept {
+NWGRAD_SP_FMA_FN static inline void soft_pair_linear_f(SoftPairJobF& J) noexcept {
     if (J.rw) soft_pair_linear_t<float, true>(J); else soft_pair_linear_t<float, false>(J);
 }
-NWGRAD_SP_FMA_FN static void soft_pair_affine_f(SoftPairJobF& J) noexcept {
+NWGRAD_SP_FMA_FN static inline void soft_pair_affine_f(SoftPairJobF& J) noexcept {
     if (J.rw) soft_pair_affine_t<float, true>(J); else soft_pair_affine_t<float, false>(J);
 }
 // The entry of soft type SF (the Aligner's baseline copy picks by type).
@@ -789,3 +807,9 @@ static inline auto soft_pair_entry(bool linear) noexcept {
     if constexpr (std::is_same_v<SF, float>) return linear ? &soft_pair_linear_f : &soft_pair_affine_f;
     else                                     return linear ? &soft_pair_linear : &soft_pair_affine;
 }
+
+#if defined(__GNUC__) && !defined(__clang__)
+#  pragma GCC diagnostic pop
+#elif defined(__clang__) && defined(NWGRAD_SP_CLANG_SELECT_MAX)
+#  pragma clang diagnostic pop
+#endif

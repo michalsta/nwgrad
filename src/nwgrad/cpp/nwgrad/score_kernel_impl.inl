@@ -780,7 +780,7 @@ static void score_affine_striped_pos_fp(ScoreJob<T>& job) {
 // NWGRAD_SCORE_UNROLL=0 runs the rolled integer row pass (an A/B switch, one binary).
 // Off on NEON by default: the M1 lost 25 % on int16 Global with it (spot, gcc 16, 2026-10-31);
 // NWGRAD_SCORE_UNROLL=1 forces it on there.
-static bool score_unroll2() noexcept {
+static inline bool score_unroll2() noexcept {
     static const bool on = [] {
         const char* e = std::getenv("NWGRAD_SCORE_UNROLL");
 #if defined(__aarch64__) || defined(_M_ARM64)

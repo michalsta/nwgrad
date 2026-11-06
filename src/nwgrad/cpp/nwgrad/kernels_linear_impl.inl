@@ -106,7 +106,9 @@ static void striped_linear_full(ViterbiJob<T>& job) {
     const unsigned char* b = job.b;
     DpBufferT<T>& buf = *job.buf;
 
-    const int seg = (n + W - 1) / W;
+    // n >= 0 always; spelled out so gcc does not take a negative seg into row 0's fill
+    // below, a ~2^64-byte memset (-Wstringop-overflow).
+    const int seg = n > 0 ? (n + W - 1) / W : 0;
     const std::size_t sw = (std::size_t)seg * W;
     const std::size_t rowsz = (std::size_t)(seg + 1) * W;   // slot 0 = column 0; columns from W
     const std::size_t off   = (std::size_t)W;
