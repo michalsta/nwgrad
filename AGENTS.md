@@ -2887,9 +2887,29 @@ segment-limited mask:
   instructions: the chain's latency at 32 lanes.  int16 at >= 32 lanes runs main's forms.
 - spot M1 NEON: int16 1.05-1.33, int32 not narrowed 1.10-1.21, short int16 1.18-1.27.
   AArch64 runs main's forms for every type (`kMainForm`, score_kernel_impl.inl).
-Narrowing (c) stays on everywhere (spot narrowed int32 0.51-0.68).  Not re-measured on the
-fleet after the gate: v3 short int16 (main's pass 2 with the new mask), AVX-512 int16 and
-NEON (main's forms; NEON cross-compiled only).
+Narrowing (c) stays on everywhere (spot narrowed int32 0.51-0.68).
+**Second fleet round (2d0a158).**  solace AVX-512: int16 instruction-equal to main, int32 0.35-
+0.81.  spot NEON: int16 at parity or better (affine Global L100 0.82-0.86), int32 narrowed
+0.48-0.51.  nighthaven AVX2 int16 affine LOST from L200: L200 1.06-1.09 (13 segments of 16, the
+stored-prefix form, main's operations), L300-L3000 1.05-1.11, at 0.88-0.99 of main's
+instructions (cycles +7-15 %); L100 0.93-0.97 and int32 / int64 held.  So:
+- int16 at >= 16 lanes on x86 runs main's forms too (`kMainForm`): only sse2 / sse4 int16
+  (8 lanes, not a target) keeps the re-formed pass 2 and the segment-limited mask.
+- On x86 the entry calls main's form (SQ) directly (`kMainDirect`): through the SQ = false
+  form gcc inlined it into that function (no SQ symbol in the object), and that combined
+  body is what lost at L200 with main's operations.  Called directly it is its own function,
+  inlined into the entry as on main.  AArch64 keeps the combined body, which measured faster
+  than main there.  Narrowed int32 on AVX2 now runs main's int16 kernel (the branch's lost
+  1.05-1.06 at L1000), so its 0.59-0.61 should hold or improve.
+- spot linear Global DNA, narrowed / int32: L70 0.81, L80 0.98, L90 1.10, L100 1.04, L110
+  0.99, L125 0.90, L150 0.60 (Local, affine, protein never lost).  The int16 linear kernel
+  (main's) runs ~32 ns a row at L100 and ~26 at L150 on the M1, so a longer row costs less,
+  and its path has no switch at these lengths (batch: inter-pair up to 4700 cells, i.e.
+  below L68; then compute_score -> narrow_score_ -> score_linear_striped_int, the same loop
+  at every length).  Cause not found from the code.  AArch64 skips narrowing for linear
+  Global at 11-13 int16 segments (n 81-104), an empirical window: both kernels give the
+  same score.
+Not re-measured after this round: everything above (nighthaven int16, the spot window).
 
 ### The soft path: scaled probability space (2026-10-05)
 

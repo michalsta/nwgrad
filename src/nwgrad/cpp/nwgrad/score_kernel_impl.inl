@@ -323,15 +323,31 @@ inline constexpr bool kIntCarryEarly = nw_is_int<T> && (int)stdx::native_simd<T>
 // kMainForm: main's pass 2 (the stored prefix row) and main's Local mask (every segment,
 // MOnly too) at every length, for the targets where the re-formed Y and the segment-limited
 // mask measured slower (2026-11-06, score-only, branch / main): AArch64 every type (spot, M1
-// NEON: int16 1.05-1.33, int32 not narrowed 1.10-1.21, short int16 1.18-1.27) and int16 at
-// 32 lanes (solace AVX-512: Global 1.02-1.11, the rebuilt chain's latency).  x86 int16 at 8 /
-// 16 lanes keeps the rebuild past kStoredPrefixSeg (skynet sse4 L200-L1000 0.82-0.94).
+// NEON: int16 1.05-1.33, int32 not narrowed 1.10-1.21, short int16 1.18-1.27), int16 at 32
+// lanes (solace AVX-512: Global 1.02-1.11, the rebuilt chain's latency) and int16 at 16 lanes
+// (nighthaven AVX2, 2d0a158: L200 1.06-1.09, L300-L3000 1.05-1.11, cycles +7-15 % at FEWER
+// instructions, 0.88-0.99).  Only x86 int16 at 8 lanes (sse2 / sse4, not a target) keeps the
+// rebuild past kStoredPrefixSeg (skynet sse4 L200-L1000 0.82-0.94).
 template <class T>
 inline constexpr bool kMainForm =
 #if defined(__aarch64__)
     true;
 #else
-    sizeof(T) == 2 && (int)stdx::native_simd<T>::size() >= 32;
+    sizeof(T) == 2 && (int)stdx::native_simd<T>::size() >= 16;
+#endif
+// kMainDirect: the entry calls the stored-prefix instantiation (SQ) itself, so main's form
+// compiles as its own function inlined into the entry, as on main.  Through the SQ = false
+// form (which tail-calls it) gcc inlined it into that function, and the combined body is
+// the one nighthaven measured: its L200 cells run the stored-prefix form with main's
+// operations, yet 6-9 % slower at 12 % fewer instructions -- the generated code, not the
+// work.  x86 only: on AArch64 the combined body measured FASTER than main (spot int16
+// affine Global L100 0.82-0.86), so it stays there.
+template <class T>
+inline constexpr bool kMainDirect =
+#if defined(__aarch64__)
+    false;
+#else
+    kMainForm<T> && kIntCarryEarly<T>;
 #endif
 template <class T, bool Local, bool MOnly, bool Tr = false, bool Sat = false, bool U2 = false, bool Glocal = false, bool SQ = false>
 static void score_affine_striped_pos(ScoreJob<T>& job) {
@@ -1325,20 +1341,22 @@ static void score_entry_impl(ScoreJob<T>& job) {
                 score_affine_striped_pos_fp<T, false, false, Tr>(job);
             }
         } else if (score_unroll2()) {
-            if (glocal) score_affine_striped_pos<T, false, false, Tr, Sat, true, true>(job);
+            constexpr bool D = kMainDirect<T>;   // main's form called directly (see kMainDirect)
+            if (glocal) score_affine_striped_pos<T, false, false, Tr, Sat, true, true, D>(job);
             else if (job.local) {
-                if (pos_ext) score_affine_striped_pos<T, true, true, Tr, Sat, true>(job);
-                else         score_affine_striped_pos<T, true, false, Tr, Sat, true>(job);
+                if (pos_ext) score_affine_striped_pos<T, true, true, Tr, Sat, true, false, D>(job);
+                else         score_affine_striped_pos<T, true, false, Tr, Sat, true, false, D>(job);
             } else {
-                score_affine_striped_pos<T, false, false, Tr, Sat, true>(job);
+                score_affine_striped_pos<T, false, false, Tr, Sat, true, false, D>(job);
             }
         } else {
-            if (glocal) score_affine_striped_pos<T, false, false, Tr, Sat, false, true>(job);
+            constexpr bool D = kMainDirect<T>;
+            if (glocal) score_affine_striped_pos<T, false, false, Tr, Sat, false, true, D>(job);
             else if (job.local) {
-                if (pos_ext) score_affine_striped_pos<T, true, true, Tr, Sat>(job);
-                else         score_affine_striped_pos<T, true, false, Tr, Sat>(job);
+                if (pos_ext) score_affine_striped_pos<T, true, true, Tr, Sat, false, false, D>(job);
+                else         score_affine_striped_pos<T, true, false, Tr, Sat, false, false, D>(job);
             } else {
-                score_affine_striped_pos<T, false, false, Tr, Sat>(job);
+                score_affine_striped_pos<T, false, false, Tr, Sat, false, false, D>(job);
             }
         }
         return;
