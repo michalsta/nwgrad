@@ -2763,10 +2763,12 @@ addresses, so a vectorized sum may peel differently): 1e-12 double, 1e-5 float32
 tests. GuideBanded pairs and tracked pairs are included: each row's span is zeroed right
 before the row is computed (the full-table path used to zero every span up front: the same
 values, since a row writes only itself), and the tracked weights are per row anyway.
-- **When** (revised after the fleet run, below): the pair runs beside other workers (the
-  batch has more than one thread and more than one pair; `Aligner::set_soft_ckpt_shared`,
-  set by `BatchEngine::fwdbwd_` and the stream path; a standalone `SeqPair` or a 1-thread
-  batch never checkpoints by default) AND its forward tables (states × (m+1)(n+1) × the
+- **When** (revised after the fleet runs, below): the batch runs at least 4 workers
+  (min(threads, pairs) ≥ `kSoftCkptMinWorkers`; `Aligner::set_soft_ckpt_shared`, set by
+  `BatchEngine::fwdbwd_` and the stream path; a standalone `SeqPair` or a batch of 1-3
+  threads never checkpoints by default -- nighthaven, FTZ on: at 4 and 6 workers 0.30-0.89
+  of the time in every cell, at 2 it LOST, float32 affine L1000 1.30x main, double linear
+  L1000 1.22x the unchecked arm) AND its forward tables (states × (m+1)(n+1) × the
   soft type's bytes) reach 4 MiB (`kSoftCkptMinBytes`; double affine from L ~420, float32
   affine ~590, double linear ~720); k = ceil(sqrt(m)) capped at 32. An explicit
   `soft_ckpt_min_bytes` applies at any thread count. Fleet result (nighthaven, v3, 6 cores,
