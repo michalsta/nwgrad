@@ -1105,9 +1105,10 @@ struct Aligner {
     // a pair's precision depends on that pair alone.  (A batch remembers its pairs'
     // refusals itself, per pair, and turns float32 off here for a pair that refused.)
     void set_soft_f32(bool v) noexcept { soft_f32_ = v; }
-    // Whether this pair's soft pass runs beside other worker threads (BatchEngine sets it:
-    // more than one thread and more than one pair).  The default checkpoint rule needs it
-    // (soft_ckpt_rows): alone, a pair streams its tables and checkpointing only costs.
+    // Whether this pair's soft pass runs beside enough other worker threads (BatchEngine
+    // sets it: min(threads, pairs) >= kSoftCkptMinWorkers).  The default checkpoint rule
+    // needs it (soft_ckpt_rows): alone or with one neighbour, a pair streams its tables and
+    // checkpointing only costs.
     void set_soft_ckpt_shared(bool v) noexcept { soft_ckpt_shared_ = v; }
     bool soft_f32() const noexcept { return soft_f32_; }
     bool soft_f32_used() const noexcept { return soft_f32_used_; }
@@ -5231,7 +5232,7 @@ private:
     // 0: the full tables; the gate off: one block of every row).  Otherwise a pair
     // checkpoints when its forward tables reach soft_ckpt_min_bytes -- that override, when
     // set, at any thread count; by default kSoftCkptMinBytes and only when the pair runs
-    // beside other workers (soft_ckpt_shared_) -- with k from soft_ckpt_auto_rows.
+    // beside at least kSoftCkptMinWorkers - 1 other workers (soft_ckpt_shared_) -- with k from soft_ckpt_auto_rows.
     template <class SF>
     int soft_ckpt_rows() const noexcept {
         const int64_t o = gate_override(Gate::SoftCkptRows);

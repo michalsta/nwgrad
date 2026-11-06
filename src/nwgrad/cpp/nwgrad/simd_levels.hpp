@@ -640,8 +640,8 @@ inline bool soft_ckpt_env_check() noexcept {
     return v;
 }
 // The forward tables' size (bytes: states x (m+1)(n+1) x the soft type's) from which the
-// per-pair soft pass checkpoints by default -- and then only when the pair runs beside other
-// worker threads (Aligner::soft_ckpt_rows; soft_ckpt_min_bytes set explicitly applies at any
+// per-pair soft pass checkpoints by default -- and then only when the batch runs at least
+// kSoftCkptMinWorkers worker threads (Aligner::soft_ckpt_rows; soft_ckpt_min_bytes set explicitly applies at any
 // thread count, off = never).  A new switch for a new code path, not a fill gate retuned.
 // Measured 2026-11-05: at ONE thread checkpointing never wins -- one pair's tables stream
 // fine and the recomputation costs ~30 instructions a cell affine (~13 linear): nighthaven
@@ -656,6 +656,12 @@ inline bool soft_ckpt_env_check() noexcept {
 // cores stream better); peak RSS 10-20x lower everywhere (L4000 double affine 3.0 GB ->
 // 0.16 GB).  k = 16 / 32 / sqrt(m) equal on nighthaven, 64 slower at 6 threads.
 inline constexpr size_t kSoftCkptMinBytes = size_t(4) << 20;
+// ... and the workers the batch runs (min(n_threads, pairs)) from which it does.  nighthaven
+// (FTZ on, 474d01d): at 4 and 6 workers checkpointing paid in every cell (0.30-0.89 of the
+// time), at 2 it LOST (float32 affine L1000 1.30x main, double linear L1000 1.22x the
+// unchecked arm: two pairs in flight leave the memory system room, and the recomputation
+// shows), at 1 it lost everywhere (1.13-1.48x).
+inline constexpr size_t kSoftCkptMinWorkers = 4;
 // ── The fill gates: which pairs join a shared (inter-pair) fill ────────────────
 //
 // Per ISA level and scalar type, measured by tools/gate_sweep.py (2026-10-31 / 11-01) on

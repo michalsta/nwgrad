@@ -226,9 +226,9 @@ def test_env_rows_override():
 
 
 def test_default_is_thread_aware():
-    """By default only a pair that runs beside other workers checkpoints (more than one
-    thread and more than one pair) and only past 4 MiB of tables; an explicit
-    soft_ckpt_min_bytes applies at any thread count."""
+    """By default a pair checkpoints only when the batch runs at least 4 workers
+    (min(threads, pairs)) and only past 4 MiB of tables; an explicit soft_ckpt_min_bytes
+    applies at any thread count."""
     script = (
         "import sys, nwgrad, numpy as np\n"
         "from nwgrad import _tuning\n"
@@ -236,7 +236,7 @@ def test_default_is_thread_aware():
         "if mb != 'default': _tuning.set_gate('soft_ckpt_min_bytes', int(mb))\n"
         "rng = np.random.default_rng(0)\n"
         "p = nwgrad.AlignParams(nwgrad.SubstMatrix(np.eye(4) * 2 - 0.5, 'ACGT'), 1.0, 0.5, 1.0, 0.5)\n"
-        "A = [''.join(rng.choice(list('ACGT'), 500)) for _ in range(2)]\n"
+        "A = [''.join(rng.choice(list('ACGT'), 500)) for _ in range(4)]\n"
         "b = nwgrad.SeqPairBatchDouble(A, A[::-1], p, grad_mode='soft', n_threads=thr)\n"
         "b.fill = 'striped'\n"
         "b.score_and_grad()\n")
@@ -249,6 +249,7 @@ def test_default_is_thread_aware():
         return {tok for tok in r.stderr.split() if tok.startswith("ck=")}
     # 501 x 501 x 3 x 8 B = 6.0 MB of tables: past the 4 MiB default
     assert cks(1, "default") == {"ck=0"}
-    assert cks(2, "default") == {"ck=23"}
+    assert cks(2, "default") == {"ck=0"}
+    assert cks(4, "default") == {"ck=23"}
     assert cks(1, str(1 << 20)) == {"ck=23"}
-    assert cks(2, str(64 << 20)) == {"ck=0"}
+    assert cks(4, str(64 << 20)) == {"ck=0"}
