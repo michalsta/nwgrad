@@ -229,7 +229,9 @@ inline unsigned dense_code_at(const unsigned char* row, int seg, int width, int 
 // (m, n) for Global, the maximum over every cell for Local.  Linear gaps run through it
 // with go_a = go_b = 0, which reduces the affine recurrence to the linear one exactly
 // (v - 0 is exact and rounding is monotone, so max(a-g, b-g) == max(a,b) - g bit for
-// bit) — see Aligner::compute_score.  Scratch (profile, rolling rows) lives in buf.
+// bit) — see Aligner::compute_score; `linear` then selects the one-row kernel
+// (score_linear_striped), the same values with the dead X state dropped.  Scratch
+// (profile, rolling rows) lives in buf.
 template <class T>
 struct ScoreJob {
     bool sat = false;   // nw_sat T past the quarter-range bound: the saturating kernel variant
@@ -239,6 +241,7 @@ struct ScoreJob {
     T go_a, ge_a, go_b, ge_b;
     int local;                              // 0 = Global, 1 = Local, 2 = Glocal (AlignMode)
     int variant;                            // 0 auto, 1 two-pass, 2 fused three-state (measuring)
+    int linear = 0;                         // 1: linear gaps (go_a = go_b = 0), the one-row kernel
     DpBufferT<T>* buf;
     T score;                                // out
     TrackJob<T> tr;                         // tracked rows (tr.on()), else untracked
@@ -252,9 +255,10 @@ struct ScoreJob {
 // sets of segment-aligned columns (cols[((t*3 + s)*(h+1) + (i-r0))*W + lane], the column
 // of set t / lane l in colid[t*W + l], -1 past the rectangle).  The kernel picks q from
 // `spacing` (columns between lines) and its own width, resizes the outputs, and reports
-// W and q.  Every value is the full fill's, bit for bit (opens >= 0, floating T).
+// W and q.  Every value is the full fill's, bit for bit (opens >= 0; every scalar type).
 template <class T>
 struct GridFwdJob {
+    bool sat = false;   // nw_sat T past the quarter-range bound: the saturating kernel variant
     const unsigned char* a;                 // full encoded sequences
     const unsigned char* b;
     const T* blk; int nalpha;
@@ -270,6 +274,8 @@ struct GridFwdJob {
     int W, q;                               // out
     typename DpBufferT<T>::GVec* last = nullptr;   // out if set: row r1's max(M, X, Y), columns c0+1..c1 at [1..w]
     int local = 0;                          // Local: M clamped at 0 (the walk stops at a start)
+    int find_best = 0;                      // Local, top level: the best M cell (strict >, row then column order)
+    T best = T(0); int best_i = 0, best_j = 0;   // out (find_best)
 };
 
 // ── Hirschberg linear-space sweep ─────────────────────────────────────────────
@@ -930,7 +936,7 @@ struct TypedKernels {
     inter_fn           inter_score = nullptr;        // inter-pair score only (Full)
     int                inter_w = 0;                  // the inter-pair lane count (pairs per call)
     using grid_fn = void (*)(GridFwdJob<T>&);
-    grid_fn            grid_fwd = nullptr;           // TracebackMode::Grid's forward pass (floating T)
+    grid_fn            grid_fwd = nullptr;           // TracebackMode::Grid's forward pass
 };
 
 struct LevelKernels {

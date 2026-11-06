@@ -87,14 +87,14 @@ def test_budgeted_auto_is_pointers_past_the_cutoff(params, prec, mode, fill):
     A, B = _problem(11)
     ba, ra = _run(prec, mode, "auto", A, B, params, fill)
     _, rp = _run(prec, mode, "pointers", A, B, params, fill)
-    # resolved: grid for the floating types (Pointers' result; Local float32 since
-    # 2026-11-05, Pointers within the budget, Grid above it), the budgeted mode otherwise
+    # resolved: grid for the floating types (Pointers' result; Local runs the one-pass Grid
+    # past hb_cutoff at every size since 2026-11-05), the budgeted mode otherwise
     assert ba[0].traceback == ("grid" if prec in ("double", "float") else "hirschberg_pmax")
     assert _same(ra, rp)
 
 
 @pytest.mark.parametrize("prec,mode,explicit", [("float", "global", "pointers"),   # grid
-                                                ("int32", "global", "hirschberg_pmax")])
+                                                ("int32", "global", "pointers")])   # grid (2026-11-05)
 def test_unbudgeted_auto_still_splits_as_its_mode(params, prec, mode, explicit):
     A, B = _problem(23)
     _, ra = _run(prec, mode, "auto", A, B, params)
