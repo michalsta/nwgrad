@@ -2832,7 +2832,14 @@ nighthaven (v3) confirmed (B): instructions unchanged, 1 thread 0.42-0.71 of mai
 L1000-4000, 6 threads 0.33-0.53, L300 1.00, results bit-identical on every benchmark
 fixture. Its `off` arm read 1.02-1.03 at L300: not the guard (tens of cycles a pair against
 ~1 ms; it now skips the MXCSR writes when FTZ|DAZ are already set) -- the noise, or the
-double product charge's per-row work.
+double product charge's per-row work. Checked on skynet (2026-11-06, protein L300 double,
+1 thread, instructions per cell from the difference of 1 and 7 calls, branch 453b64c vs
+main): affine Global 81.57 FTZ off / 81.57 on vs 81.30 (+0.33 %), Local 85.20 / 85.19 vs
+84.96 (+0.28 %); linear Global 49.32 / 49.26 vs 49.59 (-0.5 %), Local 52.94 / 52.93 vs
+53.17 (-0.4 %). So the guard costs no instruction, and what affine gains (~0.25 a cell,
+~80 a row) is the per-row product charge plus the checkpoint driver's per-row branch
+(the checkpoint branch alone: +0.1 % whole-process): within 0.5 % of main everywhere, so
+nothing was folded. Cycles at L300 were within the run-to-run noise (±5 % at load 2-15).
 - (A) `soft_window_log2 = e`: the double lazy-rescale window [2^-e, 2^e] instead of 2^256
   (`SoftPairJobT::win`, `sp_lazy`'s new argument; the inter-pair kernel keeps its constant).
   **It buys nothing.** Rescales per row go up as expected (protein L1000 affine, backward /
