@@ -1298,6 +1298,11 @@ really takes (`test_tracked_long_global_float32_pairs_run_their_own_fill`).  fuz
   | 800 | 3.66 -> 2.35 | 6.90 -> 3.70 | 3.72 -> 2.20 | 6.55 -> 4.00 | 1.71 -> 1.33 |
   | 1000 | 3.67 -> 2.26 | 6.98 -> 3.62 | 3.79 -> 1.99 | 6.54 -> 3.84 | 1.73 -> 1.44 |
 
+  AVX-512 exception (`kLocalGridMinRows512`): float32 Local takes it from 2048 rows only —
+  solace, 16 float lanes, `auto` vs main 1.00 at L1000 1 thread, 1.04-1.05 at 8 (controls
+  0.99-1.02), explicit grid / pointers 0.96-1.05 at L1000 and 0.64-0.88 at L3000; int32 /
+  int64 0.45-0.87 and double 0.57-0.84 there keep hb_cutoff (int16 explicit Grid 1.8-1.9x
+  Pointers at L1000 on solace: its exclusion stands).
   Crossover ~L100 (float32 / int32 tie there), ~L250 for int16; double and int64 win from
   L100.  The floor stays hb_cutoff (512 rows: grid_ok_, as for Global; below it every
   mode runs Pointers), well past every crossover, so no new threshold.  Double Local was

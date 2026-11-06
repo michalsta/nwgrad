@@ -263,10 +263,11 @@ TEST_CASE("auto takes Grid for Glocal, and for Local above the pointer budget", 
             REQUIRE(same_bits(gf.score(), rf.score()));
             REQUIRE(gf.alignment() == rf.alignment());
         }
-        // Local within the budget: the one-pass Grid (every gap parameter >= 0), Pointers' result
+        // Local within the budget: the one-pass Grid (every gap parameter >= 0), Pointers' result;
+        // float32 on AVX-512 only from 2048 rows (kLocalGridMinRows512), so 800 rows: Pointers
         Aligner<GapModel::Affine, AlignMode::Local, AlignBand::Full, float> lf, lfp;
         run(lf, TracebackMode::Default, kern, A, B); run(lfp, TracebackMode::Pointers, kern, A, B);
-        REQUIRE(lf.ran_grid() == (kern != kBackendScalar));
+        REQUIRE(lf.ran_grid() == (kern != kBackendScalar && kern != static_cast<int>(SimdLevel::Avx512)));
         REQUIRE(same_bits(lf.score(), lfp.score()));
         REQUIRE(lf.alignment() == lfp.alignment());
         Aligner<GapModel::Affine, AlignMode::Local, AlignBand::Full, double> ld;

@@ -1769,7 +1769,8 @@ private:
             if (tb_auto_ && (tb_ == TracebackMode::Grid || tb_ == TracebackMode::HirschbergPmax) &&
                 static_cast<T>(params_->gap_extend_a) >= T(0) && static_cast<T>(params_->gap_extend_b) >= T(0)) {
                 const int be = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
-                if (be != kBackendScalar && grid_ok_(level_kernels(be))) return TracebackMode::Grid;
+                if (be != kBackendScalar && m_ >= local_grid_min_rows(be) && grid_ok_(level_kernels(be)))
+                    return TracebackMode::Grid;
             }
         if constexpr (GM == GapModel::Affine && AB == AlignBand::Full && std::is_floating_point_v<T>)
             if (tb_ == TracebackMode::Grid && tb_auto_) {
@@ -2631,6 +2632,22 @@ private:
     // n 48 1.13, Local 32 1.18; float32 Local 24 1.36; int64 Local 24 1.50, 32 1.20 — each
     // winning a step later (int16 Global 64 0.79, Local 48 0.84; float32 Local 32 0.89;
     // int64 Local 48 0.88).  The rest keep the shared values (crossing at or before them).
+    // Local `auto` and the one-pass Grid inside the pointer budget (run_tb_): the rows from
+    // which it applies on a level, beyond grid_ok_'s m > hb_cutoff.  AVX-512 float32 only:
+    // at 16 float lanes the one-pass Grid only ties Pointers at L1000 (solace, Tiger Lake,
+    // 2026-11-05, `auto` vs main 1.00 at 1 thread, 1.04-1.05 at 8, controls 0.99-1.02;
+    // explicit grid / pointers 0.96-1.05 at L1000, 0.64-0.88 at L3000), so it starts between
+    // the tie and the win, at 2048 rows.  Every other level and type starts at hb_cutoff:
+    // AVX-512 int32 / int64 0.45-0.87 and double 0.57-0.84 there, nighthaven AVX2 float32
+    // L1000 0.65.  Below the floor a budgeted pair runs Pointers, as on main.
+    static constexpr int kLocalGridMinRows512 = std::is_same_v<T, float> ? 2048 : 0;
+    static int local_grid_min_rows(int backend) noexcept {
+#if !(defined(__aarch64__) || defined(_M_ARM64))
+        if (backend == static_cast<int>(SimdLevel::Avx512)) return kLocalGridMinRows512;
+#endif
+        (void)backend;
+        return 0;
+    }
     static constexpr int kLinearStripedMinN512 =
         (AM == AlignMode::Global)
             ? (std::is_same_v<T, int16_t> ? 56 : kLinearStripedMinN)
