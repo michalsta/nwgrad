@@ -1020,6 +1020,7 @@ struct Aligner {
             job.ge_b = static_cast<N>(params_->gap_extend_b);
             job.local = AM == AlignMode::Local ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
             job.variant = score_variant_env();
+            job.linear = lin && score_linear_env();
             job.buf = &sc.buf;
             fn(job);
             out = static_cast<double>(job.score);

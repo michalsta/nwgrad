@@ -2869,6 +2869,25 @@ bound.  Instruction count is still ~31 a vector cell in Global (parasail scan ~2
 is ~19.5 of them (sse4 disassembly: three loads, two stores, the cell, the opens, the
 running prefix), pass 2 ~8 plus the loop; what remains is the cell, not the carry.  AVX2 / AVX-512 / NEON compiled, not run.
 
+**Gated after the fleet run (2026-11-06).**  The fleet (branch / main, score-only, bit-
+identical everywhere) confirmed the long-cell gains on v3 (nighthaven, oldsolace: int32
+0.53-0.60 narrowed, 0.75-0.93 not; int64 0.25-0.40; int16 DNA L3000 0.61-0.71) and AVX-512
+for int32 / int64 (solace 0.40-0.92 / 0.23-0.74), but found three losses, all in the
+re-formed pass 2 (a dependent chain where the stored prefix's pass 2 has none) and the
+segment-limited mask:
+- v3 int16 short pairs, L100-L200 (7-13 segments of 16 lanes): 1.02-1.04.  skynet sse4 showed
+  it at L100 (13 segments of 8): Global 1.02-1.07, instructions equal.  Now up to 16 segments
+  a row (`kStoredPrefixSeg`) the stored-prefix form runs (template flag SQ: pass 1 stores the
+  prefix, main's pass 2): skynet sse4 int16, against main `15c734d`, control 0.99-1.01: L100
+  0.95-0.98, L200 0.90-0.91, L300 0.91, L1000 0.82-0.83 (and int32 narrowed 0.35-0.69).
+- solace AVX-512 int16 Global 1.02-1.11 (worst DNA L3000), cycles +3-12 % at +1-1.5 %
+  instructions: the chain's latency at 32 lanes.  int16 at >= 32 lanes runs main's forms.
+- spot M1 NEON: int16 1.05-1.33, int32 not narrowed 1.10-1.21, short int16 1.18-1.27.
+  AArch64 runs main's forms for every type (`kMainForm`, score_kernel_impl.inl).
+Narrowing (c) stays on everywhere (spot narrowed int32 0.51-0.68).  Not re-measured on the
+fleet after the gate: v3 short int16 (main's pass 2 with the new mask), AVX-512 int16 and
+NEON (main's forms; NEON cross-compiled only).
+
 ### The soft path: scaled probability space (2026-10-05)
 
 **The soft path is NOT bit-exact** — across `soft_impl`, ISA levels, compilers, `fill`,

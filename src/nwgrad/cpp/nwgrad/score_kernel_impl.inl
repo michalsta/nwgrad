@@ -320,6 +320,19 @@ static void score_affine_striped(ScoreJob<T>& job) {
 // five), and Local masks the padding segments only (see the passes; AGENTS.md).
 template <class T>
 inline constexpr bool kIntCarryEarly = nw_is_int<T> && (int)stdx::native_simd<T>::size() >= 4;
+// kMainForm: main's pass 2 (the stored prefix row) and main's Local mask (every segment,
+// MOnly too) at every length, for the targets where the re-formed Y and the segment-limited
+// mask measured slower (2026-11-06, score-only, branch / main): AArch64 every type (spot, M1
+// NEON: int16 1.05-1.33, int32 not narrowed 1.10-1.21, short int16 1.18-1.27) and int16 at
+// 32 lanes (solace AVX-512: Global 1.02-1.11, the rebuilt chain's latency).  x86 int16 at 8 /
+// 16 lanes keeps the rebuild past kStoredPrefixSeg (skynet sse4 L200-L1000 0.82-0.94).
+template <class T>
+inline constexpr bool kMainForm =
+#if defined(__aarch64__)
+    true;
+#else
+    sizeof(T) == 2 && (int)stdx::native_simd<T>::size() >= 32;
+#endif
 template <class T, bool Local, bool MOnly, bool Tr = false, bool Sat = false, bool U2 = false, bool Glocal = false, bool SQ = false>
 static void score_affine_striped_pos(ScoreJob<T>& job) {
     using vd = stdx::native_simd<T>;
@@ -352,7 +365,7 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
     // (7-13 segments) 1.02-1.04.  So up to 16 segments a row the stored form runs.
     constexpr int kStoredPrefixSeg = 16;
     if constexpr (kIntCarryEarly<T> && !SQ) {
-        if (seg <= kStoredPrefixSeg) {
+        if (kMainForm<T> || seg <= kStoredPrefixSeg) {
             score_affine_striped_pos<T, Local, MOnly, Tr, Sat, U2, Glocal, true>(job);
             return;
         }
@@ -372,7 +385,8 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
     // only follows real columns, never feeds them.  So the padding M never exceeds the
     // running best and the unmasked max is the same.  (The W < 4 form below always ran
     // it unmasked.)
-    if constexpr ((Local && !MOnly) || Glocal) pad = striped_pad_into<T, Sat>(rows + kRolling * rs, n, seg, W);
+    constexpr bool kMaskAll = kMainForm<T> && kIntCarryEarly<T>;   // main's mask (see kMainForm)
+    if constexpr ((Local && (!MOnly || kMaskAll)) || Glocal) pad = striped_pad_into<T, Sat>(rows + kRolling * rs, n, seg, W);
     auto padded = [&](const vd& v, int s) {
         vd p; p.copy_from(pad + (std::size_t)s * W, stdx::element_aligned);
         return vadd<Sat>(v, p);
@@ -381,7 +395,7 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
     // reaches past n first; with seg >= W that is the last segment alone), so the row
     // passes add the mask from s0 on (a load and an add fewer a vector cell before it).
     // The mask's real slots are 0 and v + 0 == v at an integer T: the same maxima.
-    const int s0 = std::max(0, n - (W - 1) * seg);
+    const int s0 = kMaskAll ? 0 : std::max(0, n - (W - 1) * seg);
     auto mpad = [&]<bool Mk>(const vd& v, int s) __attribute__((always_inline)) {
         if constexpr (Mk) return padded(v, s);
         else              return v;
@@ -469,7 +483,7 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
                 fOprev = open_pen<Sat>(mx, vgo_a, vge_a, vgoe_a);
                 fR += vge_a;
                 if constexpr (Local) {
-                    if constexpr (MOnly) vbest = stdx::max(vbest, vmv);   // no mask: see `pad`
+                    if constexpr (MOnly) vbest = stdx::max(vbest, kMaskAll ? padded(vmv, s) : vmv);   // no mask: see `pad`
                     else                 vbest = stdx::max(vbest, mpad.template operator()<Mk>(mx, s));
                 }
             };
@@ -536,7 +550,7 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
                 fOprev = open_pen<Sat>(mx, vgo_a, vge_a, vgoe_a);
                 fR += vge_a;
                 if constexpr (Local) {
-                    if constexpr (MOnly) vbest = stdx::max(vbest, vmv);   // no mask: see `pad`
+                    if constexpr (MOnly) vbest = stdx::max(vbest, kMaskAll ? padded(vmv, s) : vmv);   // no mask: see `pad`
                     else                 vbest = stdx::max(vbest, mpad.template operator()<Mk>(mx, s));
                 }
             } else {
