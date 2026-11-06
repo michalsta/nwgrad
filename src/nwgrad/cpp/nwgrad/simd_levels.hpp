@@ -252,9 +252,10 @@ struct ScoreJob {
 // sets of segment-aligned columns (cols[((t*3 + s)*(h+1) + (i-r0))*W + lane], the column
 // of set t / lane l in colid[t*W + l], -1 past the rectangle).  The kernel picks q from
 // `spacing` (columns between lines) and its own width, resizes the outputs, and reports
-// W and q.  Every value is the full fill's, bit for bit (opens >= 0, floating T).
+// W and q.  Every value is the full fill's, bit for bit (opens >= 0; every scalar type).
 template <class T>
 struct GridFwdJob {
+    bool sat = false;   // nw_sat T past the quarter-range bound: the saturating kernel variant
     const unsigned char* a;                 // full encoded sequences
     const unsigned char* b;
     const T* blk; int nalpha;
@@ -270,6 +271,8 @@ struct GridFwdJob {
     int W, q;                               // out
     typename DpBufferT<T>::GVec* last = nullptr;   // out if set: row r1's max(M, X, Y), columns c0+1..c1 at [1..w]
     int local = 0;                          // Local: M clamped at 0 (the walk stops at a start)
+    int find_best = 0;                      // Local, top level: the best M cell (strict >, row then column order)
+    T best = T(0); int best_i = 0, best_j = 0;   // out (find_best)
 };
 
 // ── Hirschberg linear-space sweep ─────────────────────────────────────────────
@@ -930,7 +933,7 @@ struct TypedKernels {
     inter_fn           inter_score = nullptr;        // inter-pair score only (Full)
     int                inter_w = 0;                  // the inter-pair lane count (pairs per call)
     using grid_fn = void (*)(GridFwdJob<T>&);
-    grid_fn            grid_fwd = nullptr;           // TracebackMode::Grid's forward pass (floating T)
+    grid_fn            grid_fwd = nullptr;           // TracebackMode::Grid's forward pass
 };
 
 struct LevelKernels {
