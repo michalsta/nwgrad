@@ -69,6 +69,11 @@ namespace NWGRAD_LVL_NAME {
 #include "inter_kernel_impl.inl"  // inter-pair affine Full fill (uses KW)
 #include "score_kernel_impl.inl"  // score only: rolling rows, no table
 #include "grid_kernel_impl.inl"   // TracebackMode::Grid's forward pass (score recurrence + grid lines)
+// The inter-pair hard kernels likewise (level_<name>_inter.cpp defines NWGRAD_LEVEL_INTER_TU):
+// with the lookup form a template parameter (inter_kernel_impl.inl, Lv) their instances
+// tripled, and in this unit gcc then inlined less into the striped kernels beside them
+// (striped_linear_ptr_entry<short> 4620 -> 3929 instructions, sse4; int16 linear Local
+// path +1.5 % instructions on the own fill, skynet 2026-11-05).
 #ifdef NWGRAD_LEVEL_SOFT_TU
 // The soft kernels compile in a TU of their own per level (level_<name>_soft.cpp defines
 // NWGRAD_LEVEL_SOFT_TU and a distinct namespace): gcc's inlining budget is per unit
@@ -104,14 +109,24 @@ struct NwgradLevelRegistrar {
                                 &NWGRAD_LVL_NAME::hb_sweep_pmax_entry<T>,     // prefix-max carry sweep
                                 &NWGRAD_LVL_NAME::hb_base_entry<T>,           // Hirschberg base case
                                 &NWGRAD_LVL_NAME::hb_scan_entry<T>,           // Hirschberg local endpoint scan
-                                &NWGRAD_LVL_NAME::score_entry<T>,             // score only
+                                &NWGRAD_LVL_NAME::score_entry<T>);            // score only
+        register_level_grid<T>(NWGRAD_LVL_ENUM, NWGRAD_LVL_NAME::grid_fwd_ptr<T>());
+    }
+    template <class T>
+    static void inter() {
+        register_level_inter<T>(NWGRAD_LVL_ENUM,
                                 &NWGRAD_LVL_NAME::inter_fill_entry<T>,        // inter-pair Full fill
                                 &NWGRAD_LVL_NAME::inter_score_entry<T>,       // inter-pair score only
                                 NWGRAD_LVL_NAME::IVT<T>::W);
-        register_level_grid<T>(NWGRAD_LVL_ENUM, NWGRAD_LVL_NAME::grid_fwd_ptr<T>());
     }
     NwgradLevelRegistrar() {
-#ifdef NWGRAD_LEVEL_SOFT_TU
+#if defined(NWGRAD_LEVEL_INTER_TU)
+        inter<double>();
+        inter<float>();
+        inter<int16_t>();
+        inter<int32_t>();
+        inter<int64_t>();
+#elif defined(NWGRAD_LEVEL_SOFT_TU)
         register_level_soft(NWGRAD_LVL_ENUM,
                             &NWGRAD_LVL_NAME::inter_soft_entry,     // inter-pair soft pass, double
                             &NWGRAD_LVL_NAME::soft_pair_linear,     // per-pair soft, linear
