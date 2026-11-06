@@ -16,7 +16,17 @@ never rejects; ``linear_striped_min_n`` becomes 0, the striped kernel at any len
 bit-identical, so results never change, only speed and memory -- except
 ``soft_f32_min_cells``: the cells from which a float32 batch's soft pass runs in float32
 (below, in double; ``None``: float32 at any size), which moves results within float32's
-tolerance.  A batch regroups its
+tolerance; and the two of the per-pair soft pass's checkpointed forward (large pairs keep
+every k-th forward row and recompute the rest in the backward), which also move soft
+results within tolerance: ``soft_ckpt_min_bytes``, the forward tables' size in bytes from
+which a pair checkpoints (``None``: never), and ``soft_ckpt_rows``, k forced at every size
+(an int >= 1; 0: the full tables at every size; ``None``: one block of every row, the
+checkpointed code without a recomputation; the environment variable
+``NWGRAD_SOFT_CKPT_ROWS`` gives it a value while the gate is not set); and two prototype
+switch of the double soft pass's denormal handling, which moves double soft results within
+tolerance: ``soft_double_ftz`` (1, the default: flush denormals to zero around the double
+soft kernels, as float32 always does; 0 restores gradual underflow, the arithmetic before
+2026-11-06), with ``NWGRAD_SOFT_DOUBLE_FTZ`` as its environment fallback.  A batch regroups its
 cached inter-pair plan on the next call after any change.  Not thread-safe to change
 while work is in flight.
 """
@@ -28,6 +38,7 @@ GATES = tuple(_ext._gate_names())
 _OFF = _ext._gate_off_value()
 _MIN_N = "linear_striped_min_n"
 _SOFT = "soft_f32_min_cells"
+_CKR = "soft_ckpt_rows"
 
 
 def _check(name):
@@ -41,6 +52,7 @@ def defaults():
     d = {k: (v if v > 0 else None) for k, v in _ext._gate_defaults()}
     d[_MIN_N] = "per type"
     d[_SOFT] = "per level, fill, gap model and alphabet"
+    d[_CKR] = "auto"
     return d
 
 

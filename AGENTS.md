@@ -110,9 +110,11 @@ Windows (MinGW-w64 gcc, UCRT64): see `docs/windows.md` for what the port needed 
 - **Soft path: what is left** (see "The soft path" below). Done since the last list:
   the guide without a Viterbi (`soft_guide="posterior"`), the inter-pair soft pass for
   alphabets > 8 and for mixed B lengths, float32 batches sharing the soft pass.
-  Remaining candidates: (1) **memory** at len ≥ 1000 (three forward tables of 8 B/cell
-  leave L3; a checkpointed forward — every k-th row kept, recomputed in backward — would
-  trade ~1.5× compute for ~k× less traffic); (2) a vector-scan gap carry (the four-cell
+  Remaining candidates: (1) **memory** at len ≥ 1000: the checkpointed forward is in
+  (per pair, multi-threaded batches, from 4 MiB of tables; "Checkpointed forward" below):
+  0.31-0.85 of the time at 6 threads on nighthaven, 10-20x less RSS. The double
+  pass's real slowdown at L1000 on skynet is denormals (same section): flush them in double
+  too; (2) a vector-scan gap carry (the four-cell
   stepping already puts one FMA per 4 cells on the chain); (3) the soft pass's size cap
   (512 KiB per group) is set from one host — re-derive it on others.
   Unmeasured: AVX-512 (W=8), NEON speed, wloczykij.
@@ -2523,7 +2525,8 @@ lanes' weights (`Work::srw_of<SFx>`) and the stream path (`stream_inter_<AB, SFx
 follow. Outputs (log Z, counts, gaps, the gradient accumulators) stay double; only the
 tables, the rows, the weights and the row-wise reductions are float32.
 
-**Three things float32 needed that double never did.**
+**Three things float32 needed that double never did** (the first, the flush, double
+now does too: "Double at long lengths is DENORMAL-bound", in "The soft path").
 1. **Subnormals flushed to zero** around the float32 kernels (`FlushDenormalsScope`:
    x86 MXCSR FTZ|DAZ, AArch64 FPCR.FZ, restored on exit). Cells far from the alignment
    hold mass ~2^-100 of their row's max — subnormal in float32, normal in double — and
@@ -2863,6 +2866,11 @@ of 3-5, score-only protein L200 / L1000, 1 thread unless noted; control arms 0.9
 
 ### The soft path: scaled probability space (2026-10-05)
 
+**The scaled path flushes denormals to zero in double too** (default since 2026-11-06,
+`soft_double_ftz`; float32 always did): double results may differ from the log path and
+from the pre-2026-11-06 arithmetic within the tolerance below; `_tuning.set_gate(
+"soft_double_ftz", 0)` restores gradual underflow.
+
 **The soft path is NOT bit-exact** — across `soft_impl`, ISA levels, compilers, `fill`,
 `soft_guide` or architectures — by decision (2026-10-05). Everything in this section is
 tested with tolerances (`tests/Python/test_soft_scaled.py`: 1e-11 relative/absolute
@@ -3004,6 +3012,166 @@ sequences, BLOSUM62 ×0.3, gaps 11/1 ×0.3, affine, 200 pairs, 1 thread; hard = 
 Before the leveled kernel the same protein runs were 23–26 ns/cell on skynet and
 7.2 ns/cell on nighthaven (baseline copy). At len 1000 the three forward tables (24
 B/cell, 24 MB) leave L3 and the kernel turns memory-bound (Open TODOs).
+(Not on skynet, 2026-11-05: there the double pass at L1000 is DENORMAL-bound, below.)
+
+**Checkpointed forward (branch `proto/soft-checkpoint`, 2026-11-05).** (The kernels take
+checkpointing as a template flag, `Ck`: as a runtime test with the block offset a variable,
+the full-table path ran +0.5 % instructions on miRNA 22 x 50 own-fill pairs, 2026-11-06.) The per-pair kernels
+(`soft_kernel_impl.inl`, "Checkpoints") can keep only the first forward row of every block
+of k rows (M, X, Y and the forward's previous-row sum `tp`; linear F alone: `cM..cT`) and
+compute into a block buffer of k+1 rows; the backward walks the blocks from the top, and
+when row i needs a block not in the buffer (block (i-1)/k: rows i and i-1), recomputes it
+from its checkpoint (`sp_affine_reload` / `sp_linear_reload`); the last block is still in the
+buffer after the forward. The forward rows are one `noinline` function (`sp_affine_fwd` /
+`sp_linear_fwd`) that the full-table path calls once over rows 1..m and the checkpointed one
+per block, with the same inputs at the same addresses both times (a row of block c always
+lands in slot i - c·k, the scratch rows are `q0`/`q1` both times), so a recomputed block
+equals the first pass BIT FOR BIT, exponents and maxima included: the backward's S, fmax and
+Z come from the first pass, and the lost-mass bound is charged once per row as before.
+`NWGRAD_SOFT_CKPT_CHECK=1` hashes every row in both passes (M, X, Y over its span, S[i],
+fmax[i]) and raises `std::logic_error` on a mismatch (`test_soft_checkpoint.py`
+`test_recompute_is_bit_exact`; the soft test files all pass under it at k = 1, 2, 7, 64).
+Against the full tables the results agree to rounding only (the block's rows sit at other
+addresses, so a vectorized sum may peel differently): 1e-12 double, 1e-5 float32 in the
+tests. GuideBanded pairs and tracked pairs are included: each row's span is zeroed right
+before the row is computed (the full-table path used to zero every span up front: the same
+values, since a row writes only itself), and the tracked weights are per row anyway.
+- **When** (revised after the fleet runs, below): the batch runs at least 4 workers
+  (min(threads, pairs) ≥ `kSoftCkptMinWorkers`; `Aligner::set_soft_ckpt_shared`, set by
+  `BatchEngine::fwdbwd_` and the stream path; a standalone `SeqPair` or a batch of 1-3
+  threads never checkpoints by default -- nighthaven, FTZ on: at 4 and 6 workers 0.30-0.89
+  of the time in every cell, at 2 it LOST, float32 affine L1000 1.30x main, double linear
+  L1000 1.22x the unchecked arm; solace, 8 workers, pays) AND the host is x86-64
+  (`kSoftCkptByDefault`: off on AArch64 -- spot, M1, 4 threads: double linear 1.15-1.17x
+  from L1000, float32 affine L1000 1.28x, the M1 not memory-bound with 4 pairs in flight;
+  1 thread equal to main) AND its forward tables (states × (m+1)(n+1) × the
+  soft type's bytes) reach 4 MiB (`kSoftCkptMinBytes`; double affine from L ~420, float32
+  affine ~590, double linear ~720); k = ceil(sqrt(m)) capped at 32. An explicit
+  `soft_ckpt_min_bytes` applies at any thread count. Fleet result (nighthaven, v3, 6 cores,
+  `results/nighthaven.md`): 1 thread, every checkpointed cell 1.13-1.48x slower; 6 threads,
+  main memory-bound from L1000 affine and checkpointed / full = L1000 affine double 0.31,
+  float32 0.48; L2000 affine 0.40 / 0.44; linear 0.82-0.90; L4000 float32 affine 0.85,
+  linear 0.83-0.85; L300 (2.1 MB) at a 2 MiB threshold 1.31, hence 4 MiB; L4000 double
+  affine 1.45x slower at both thread counts (main anomalous there, 14 ns/cell vs 6.4 at
+  L2000: the double subnormals, paid twice by the recomputation; FTZ, below, should
+  remove it); k = 16 / 32 / sqrt equal, 64 slower at 6 threads, hence the cap. Overrides
+  (`nwgrad._tuning`, documented there): `soft_ckpt_min_bytes` (None: never), `soft_ckpt_rows`
+  (k ≥ 1 at every size, 0 = the full tables, None = one block, no recomputation), and the
+  environment `NWGRAD_SOFT_CKPT_ROWS=k` while that gate is unset.
+- **The first default (64 MiB, any thread count)**: on skynet it was a memory switch, not a speed one. Measured
+  (protein, BLOSUM62 × 0.3, 11/1 × 0.3, 20 % mutated, Global, `fill="striped"`, lazy guide,
+  `scratchpad/bench_ck.py`; instructions from `perf stat` differences of 1 and 3 calls;
+  A/A = the full arm twice):
+
+  | L | type, gap | 1 thr full (A/A) ns/cell | 1 thr ckpt | 8 thr full (A/A) | 8 thr ckpt | instr/cell full → ckpt | RSS 8 thr full → ckpt |
+  |---|---|---|---|---|---|---|---|
+  | 300 | double affine | 25.5 / 25.9 | 30.9 | | | 81.6 → 113.1 | |
+  | 1000 | double affine | 97 / 103 | 127 | 172 / 200 | 196 | 79 → 110 | 235 → 57 MB |
+  | 1000 | float32 affine | 25.5 / 30.3 | 33.5 | 44 / 44 | 50 | 61 → 90 | 140 → 47 MB |
+  | 1000 | float32 linear | 8.0 / 9.3 | 11.3 | 16 / 16 | 20 | 35 → 48 | 75 → 43 MB |
+  | 2000 | double affine | 84 / 85 | 110 | 101 / 110 | 161 | 79 → 109 | 793 → 86 MB |
+  | 2000 | float32 affine | 20.5 / 20.3 | 24.3 | 29 / 36 | 33 | 61 → 89 | 420 → 61 MB |
+  | 4000 | double affine | 112 / 113 | 157 | 136 / 156 | 181 | 78 → 109 | 2984 → 161 MB |
+  | 4000 | double linear | 37 / 37 | 50 | 46 / 50 | 92 | 46 → 63 | 1028 → 80 MB |
+  | 4000 | float32 affine | 22.2 / 22.0 | 30.7 | 34 / 41 | 41 (k=32: 33) | 60 → 89 | 1526 → 102 MB |
+  | 4000 | float32 linear | 9.1 / 9.0 | 11.4 | 18 / 14 | 22 (k=32: 16) | 34 → 46 | 540 → 60 MB |
+
+  (8 thr: ns/cell × threads, i.e. per core; the host was at load 30-45 throughout, so the
+  8-thread wall is ±20 %; instructions are not.) The recomputation costs one more forward:
+  +29-31 instructions a cell affine, +12-17 linear, 1.35-1.47x the instructions; the full
+  path's own instructions are unchanged by the refactor (main bc4db25 vs this branch, L300,
+  the four type × gap cells: 81.6/81.7 vs 81.3/82.2, 49.9/50.1 vs 49.4/49.7, 64.8/64.8 vs
+  64.8/64.9, 38.2/38.7 vs 37.6/37.7). skynet's single core streams the full tables without
+  slowing (float32 affine 25 → 22 ns/cell from L1000 to L4000), so nothing is won back there;
+  at 8 threads float32 L2000-4000 reach parity. k barely matters (L4000, 8 threads: k = 12,
+  32, 64 within noise; k = 4 1.3x slower). The gain is the footprint: 10-20x less RSS.
+  Not measured: any v3/v4/ARM host, where the per-cell compute is ~5x faster and the
+  memory-bound regime starts sooner; that is where a lower threshold could pay.
+
+**Double at long lengths is DENORMAL-bound on skynet, not memory-bound (2026-11-05).** The
+double per-pair pass ran 95 ns/cell at protein L1000 against 21-25 at L300 with the same
+instructions per cell (79 vs 82): cells far from the alignment hold mass below DBL_MIN of
+their row's max at these lengths (the float32 pass flushes them, `FlushDenormalsScope`, and
+ran 26 ns/cell). Setting FTZ|DAZ on the calling thread (a ctypes probe,
+`scratchpad/bench_ck_ftz.py`, 1 thread) took L1000 double affine 97.7 → 30.9 ns/cell and
+linear 57.0 → 12.9; L300 unchanged (25.5 / 25.5). So the "L1000 float32 0.21-0.46 of double"
+in "The float32 soft path" is mostly this, and checkpoints cannot fix it. Flushing in double
+loses only terms below DBL_MIN, which the table bound already charges as lost; the
+gradient-product hole of float32 (item 2 there) would exist in double at 2^-1022 instead of
+2^-1074, ~2^-300 for the largest posterior factors seen.
+
+**The two fixes, prototyped (branch `proto/soft-denormal`, 2026-11-05)**, both behind
+switches (`nwgrad._tuning`; environment fallbacks `NWGRAD_SOFT_WINDOW_LOG2`,
+`NWGRAD_SOFT_DOUBLE_FTZ`). **(B) is the DEFAULT since 2026-11-06** (owner's decision;
+`soft_double_ftz` = 0 restores gradual underflow); **(A) was REMOVED on 2026-11-06** (the
+gate, `SoftPairJobT::win`, the env variable): it gained nothing, and the window as a
+runtime value cost ~5 instructions a row (miRNA own-fill pairs +0.1 %). The cost hunt of
+that day, against the solace/nighthaven reading of 1.02-1.33x on miRNA 22 x 50 own-fill
+soft pairs (header-only harness, baseline copy, double affine local, instructions per pair:
+main 116186, branch 117123): the checkpoint test per backward row with a variable block
+offset +533 (now the template flag `Ck`), the double product charge per row through the
+float32 path's budget test (now summed, `lossq`, +216), the runtime window +110; after:
+116425 (+0.2 %, the product charge).
+nighthaven (v3) confirmed (B): instructions unchanged, 1 thread 0.42-0.71 of main at
+L1000-4000, 6 threads 0.33-0.53, L300 1.00, results bit-identical on every benchmark
+fixture. Its `off` arm read 1.02-1.03 at L300: not the guard (tens of cycles a pair against
+~1 ms; it now skips the MXCSR writes when FTZ|DAZ are already set) -- the noise, or the
+double product charge's per-row work. Checked on skynet (2026-11-06, protein L300 double,
+1 thread, instructions per cell from the difference of 1 and 7 calls, branch 453b64c vs
+main): affine Global 81.57 FTZ off / 81.57 on vs 81.30 (+0.33 %), Local 85.20 / 85.19 vs
+84.96 (+0.28 %); linear Global 49.32 / 49.26 vs 49.59 (-0.5 %), Local 52.94 / 52.93 vs
+53.17 (-0.4 %). So the guard costs no instruction, and what affine gains (~0.25 a cell,
+~80 a row) is the per-row product charge plus the checkpoint driver's per-row branch
+(the checkpoint branch alone: +0.1 % whole-process): within 0.5 % of main everywhere, so
+nothing was folded. Cycles at L300 were within the run-to-run noise (±5 % at load 2-15).
+- (A) `soft_window_log2 = e`: the double lazy-rescale window [2^-e, 2^e] instead of 2^256
+  (`SoftPairJobT::win`, `sp_lazy`'s new argument; the inter-pair kernel keeps its constant).
+  **It buys nothing.** Rescales per row go up as expected (protein L1000 affine, backward /
+  forward rows rescaled: 7 / 7 at 2^256, 28 at 2^64, 111 at 2^16, ~all at 2^0; L4000 29 →
+  117 → 451), but the time does not move (table below): keeping the row max near 1 instead
+  of anywhere in [2^-256, 2^256] only slides the 52-binary-order subnormal band
+  [2^-1074, 2^-1022] x max outwards to cells farther from the diagonal, and mass decays
+  roughly geometrically with that distance, so about as many cells sit in the band.
+- (B) `soft_double_ftz = 1`: the double soft kernels (per pair, `Aligner::fwdbwd_scaled`,
+  every thread that runs one; and the inter-pair pass, `BatchEngine::SoftGroup`) under
+  `FlushDenormalsScope`, as float32 always ran. **3.2-5x at L ≥ 1000, and 1.9x already at
+  L300 linear.** The bound stays valid: a table or carry term below DBL_MIN in its row's
+  stored units is charged as wholly lost by `sp_loss` whether it was kept as a subnormal or
+  flushed; the gradient pass's products, which double never charged, now are charged their
+  worst case (`kSpProdLoss`: every product of the row flushed, `sp_loss_products_max`; the
+  recount runs only past a quarter of the tolerance, which no test or benchmark reached;
+  the gap sums count as products, double's are not `std::fma`). That charge is ~1e-300 in
+  every row measured (bound totals at L4000: 8e-301 affine, 1e-301 linear, against
+  2^-45), costs no measurable instruction (79.2 main vs 79.4, 47.6 vs 47.3 at L1000), and
+  applies in both forms. `test_soft_denormal.py`: every form (2^256 / 2^64 / 2^16 / 2^0,
+  FTZ, FTZ + 2^64) against the log path at 1e-11 on L250 related protein pairs (which go
+  subnormal), low temperature (0.3 / 0.1, `scaled_or_log`), banded; out-of-range pairs
+  still raise.
+
+  Protein (as above), Global, own fill, lazy guide, 1 thread, skynet sse4, ns/cell
+  (instructions/cell); "branch" is this branch with both switches off, run twice (A/A):
+
+  | L | gap | main | branch A/A | (A) 2^64 | (A) 2^16 | (B) FTZ |
+  |---|---|---|---|---|---|---|
+  | 300 | affine | 18.6 (81.6) | 20.2 / 21.0 (82.1 / 81.8) | 21.2 (83.0) | 21.0 (84.5) | 19.9 (82.0) |
+  | 300 | linear | 18.4 (49.7) | 18.7 / 18.0 (49.8 / 49.5) | 24.4 (49.9) | 25.2 (50.6) | **9.5** (49.4) |
+  | 1000 | affine | 80.8 (79.2) | 89.4 / 88.4 (79.4) | 94.4 (79.9) | 103.8 (81.7) | **26.3** (78.9) |
+  | 1000 | linear | 48.2 (47.6) | 54.9 / 56.1 (47.3) | 61.5 (47.6) | 61.2 (48.1) | **10.8** (47.0) |
+  | 2000 | affine | 73.9 (78.6) | 80.3 / 78.4 (78.6) | 79.3 (79.0) | 70.6 (80.8) | **24.3** (78.2) |
+  | 2000 | linear | 45.1 (47.1) | 42.9 / 46.0 (46.7) | 50.7 (46.9) | 52.7 (47.5) | **11.2** (46.4) |
+  | 4000 | affine | 96.8 (78.4) | 97.6 / 94.2 (78.4) | 86.8 (78.8) | 91.4 (80.6) | **25.0** (77.8) |
+  | 4000 | linear | 33.5 (46.8) | 32.4 / 31.5 (46.4) | 32.7 (46.5) | 37.4 (47.1) | **11.2** (46.2) |
+
+  float32 (untouched by both switches; branch vs main, instructions/cell): 64.5-64.8 vs 64.8,
+  38.3/37.9 vs 38.2 at L300; 60.4 vs 60.2 affine and 34.4 vs 34.6 linear at L4000, wall
+  15.9 vs 15.9. Double FTZ is now about float32's speed (L4000 affine 25.0 vs 15.9, linear
+  11.2 vs 7.3-7.8). Short pairs: DNA 22 x 50 local, 20k pairs, inter-pair 15.6 / 15.8 base
+  vs 15.9 FTZ µs, own fill within the run-to-run noise (±15 % at load ~20). All switch
+  forms pass the soft test files and the full suite (5620 passed, 18 skipped, each).
+  Recommendation: make (B) the default (drop (A)); the double soft results then move
+  within tolerance, as float32's did when its flush went in. Not measured: AArch64 (FPCR.FZ
+  is set by the same guard; the M1's denormal handling is in hardware, so the gain there
+  may be small), AVX2/AVX-512 hosts.
 
 ### Glocal mode (branch `feat/glocal`, 2026-11-01)
 
