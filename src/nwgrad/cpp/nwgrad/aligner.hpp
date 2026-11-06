@@ -994,6 +994,20 @@ struct Aligner {
         if constexpr (std::is_same_v<T, std::int32_t> || std::is_same_v<T, std::int64_t>) {
             using N = std::conditional_t<std::is_same_v<T, std::int32_t>, std::int16_t, std::int32_t>;
             if (!ib_.prepared() || ib_.step_max > static_cast<T>(nw_int_cap<N>)) return false;
+#if defined(__aarch64__) || defined(_M_ARM64)
+            // AArch64, int32 -> int16, linear Global: not at 11-13 int16 segments a row
+            // (n 81-104, 8 lanes).  spot (M1, 1 thread, DNA score-only, narrowed / int32):
+            // L70 0.81, L80 0.98, L90 1.10, L100 1.04, L110 0.99, L125 0.90, L150 0.60.  Main's
+            // int16 linear kernel itself runs ~32 ns a row at L100 against ~26 at L150 there
+            // (main's int16 batch shows it too); the code has no switch at these lengths, so
+            // this is an empirical window, not a fix of its cause.  Exact either way (the
+            // narrowed and the int32 kernel give the same score); Local and affine never lost.
+            if constexpr (std::is_same_v<N, std::int16_t> && GM == GapModel::Linear && AM == AlignMode::Global) {
+                constexpr int kSkipSegLo = 11, kSkipSegHi = 13;
+                const int seg16 = (n_ + 7) / 8;
+                if (seg16 >= kSkipSegLo && seg16 <= kSkipSegHi) return false;
+            }
+#endif
             NwIntBound<N> nb;
             nb.step_max = static_cast<N>(ib_.step_max);
             nb.smax_pos = static_cast<N>(ib_.smax_pos); nb.smax_neg = static_cast<N>(ib_.smax_neg);
