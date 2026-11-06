@@ -318,7 +318,9 @@ static void score_affine_striped(ScoreJob<T>& job) {
 // U2 (integer T): the row pass two segments a trip (see the loop).  Since 2026-11-05 the
 // prefix is not stored either: pass 2 re-forms Y from the D row (four rolling rows, not
 // five), and Local masks the padding segments only (see the passes; AGENTS.md).
-template <class T, bool Local, bool MOnly, bool Tr = false, bool Sat = false, bool U2 = false, bool Glocal = false>
+template <class T>
+inline constexpr bool kIntCarryEarly = nw_is_int<T> && (int)stdx::native_simd<T>::size() >= 4;
+template <class T, bool Local, bool MOnly, bool Tr = false, bool Sat = false, bool U2 = false, bool Glocal = false, bool SQ = false>
 static void score_affine_striped_pos(ScoreJob<T>& job) {
     using vd = stdx::native_simd<T>;
     const int W = (int)vd::size();
@@ -340,12 +342,27 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
     }
 
     const int seg = (n + W - 1) / W;
+    // SQ: the stored-prefix form (pass 1 stores the running prefix to a Y row, pass 2 reads
+    // it back: main's form before 2026-11-05) for short rows.  The re-formed Y (below) puts a
+    // dependent chain through pass 2 -- one sub + max per segment pair -- where the stored
+    // form's pass 2 is independent per segment once the carry-in is known; at a few segments
+    // a row that chain's latency is exposed and the saved row buys nothing (the rows sit in
+    // L1 anyway).  Measured, int16 score-only, the re-formed form / main: skynet sse4 L100
+    // (13 segments) Global 1.02, L200 (25) 0.93-0.94; nighthaven / oldsolace AVX2 L100-L200
+    // (7-13 segments) 1.02-1.04.  So up to 16 segments a row the stored form runs.
+    constexpr int kStoredPrefixSeg = 16;
+    if constexpr (kIntCarryEarly<T> && !SQ) {
+        if (seg <= kStoredPrefixSeg) {
+            score_affine_striped_pos<T, Local, MOnly, Tr, Sat, U2, Glocal, true>(job);
+            return;
+        }
+    }
     const std::size_t sw = (std::size_t)seg * W;
     // the rolling rows and Local's padding mask: one block (spread_rows, dp_buffer.hpp).
     // An integer T (from 4 lanes) keeps no Y row: four rolling rows (D, X twice) and the
     // mask, where the lazy-F form keeps five (see the carry below).
-    constexpr bool kIntCarry = nw_is_int<T> && (int)stdx::native_simd<T>::size() >= 4;
-    constexpr int kRolling = kIntCarry ? 4 : 5;
+    constexpr bool kIntCarry = kIntCarryEarly<T>;
+    constexpr int kRolling = (kIntCarry && !SQ) ? 4 : 5;
     std::size_t rs; T* const rows = spread_rows<T>(buf.srows, sw, kRolling + 1, rs);
     const T* pad = nullptr;
     // MOnly needs no mask at an integer T either, though its padding profile is 0
@@ -374,7 +391,7 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
 
     T* pD = rows + (kRolling - 2) * rs; T* pX = rows + (kRolling - 1) * rs;   // row i-1
     T* cD = rows;          T* cX = rows + rs;                              // row i
-    [[maybe_unused]] T* cY = kIntCarry ? nullptr : rows + 2 * rs;          // row i (lazy-F form)
+    [[maybe_unused]] T* cY = (kIntCarry && !SQ) ? nullptr : rows + 2 * rs;   // row i (lazy-F / SQ form)
 
     // row 0: D = max(M, X, Y) of the three-state row 0, X = -inf; padding -inf
     for (std::size_t k = 0; k < sw; ++k) { pD[k] = NINF; pX[k] = NINF; }
@@ -448,6 +465,7 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
             };
             auto carry = [&]<bool Mk>(const vd& mx, const vd& vmv, int s) __attribute__((always_inline)) {
                 fP = stdx::max(fP, vadd<Sat>(fOprev, fR));
+                if constexpr (SQ) nv_store(cY + (std::size_t)s * W, fP);
                 fOprev = open_pen<Sat>(mx, vgo_a, vge_a, vgoe_a);
                 fR += vge_a;
                 if constexpr (Local) {
@@ -514,6 +532,7 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
                 // pass forms the prefix again from the stored D.
                 mx.copy_to(cD + (std::size_t)s * W, stdx::element_aligned);
                 fP = stdx::max(fP, vadd<Sat>(fOprev, fR));
+                if constexpr (SQ) nv_store(cY + (std::size_t)s * W, fP);
                 fOprev = open_pen<Sat>(mx, vgo_a, vge_a, vgoe_a);
                 fR += vge_a;
                 if constexpr (Local) {
@@ -580,6 +599,22 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
             // stored prefix 31.5 / 36.0, recomputed prefix (ramp kept) 34.0 / 39.0,
             // serial one segment a step 31.0 / 33.9 but 1.02-1.08x SLOWER (sub + max on
             // the chain, 2-cycle latencies on Piledriver), this form see AGENTS.md.
+            if constexpr (SQ) {   // the stored-prefix form's pass 2, as main had it
+                vd rq = fBase;
+                auto stepq = [&]<bool Mk>(int s) __attribute__((always_inline)) {
+                    const vd yq = vsub<Sat>(stdx::max(nv_load<vd>(cY + (std::size_t)s * W), vcin), rq);
+                    vd d; d.copy_from(cD + (std::size_t)s * W, stdx::element_aligned);
+                    d = stdx::max(d, yq);
+                    d.copy_to(cD + (std::size_t)s * W, stdx::element_aligned);
+                    if constexpr (Local && !MOnly) vbest = stdx::max(vbest, mpad.template operator()<Mk>(yq, s));
+                    rq += vge_a;
+                };
+                int s = 0;
+                if constexpr (Local && !MOnly) {
+                    for (; s < s0; ++s) stepq.template operator()<false>(s);
+                }
+                for (; s < seg; ++s) stepq.template operator()<true>(s);
+            } else {
             vd Op, y;
             const vd vge2_a = vge_a + vge_a;
             auto fin = [&]<bool Mk>(vd d, const vd& yv, int s) __attribute__((always_inline)) {
@@ -615,6 +650,7 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
                 vd d; d.copy_from(cD + (std::size_t)s * W, stdx::element_aligned);
                 y = stdx::max(vsub<Sat>(y, vge_a), Op);
                 fin.template operator()<true>(d, y, s);
+            }
             }
         } else
         for (int r = 0; r < W; ++r) {
