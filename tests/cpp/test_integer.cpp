@@ -105,7 +105,7 @@ struct Result {
 template <GapModel GM, AlignMode AM, AlignBand AB, class T>
 Result run_one(const std::vector<uint8_t>& ea, const std::vector<uint8_t>& eb, const AlignParams& p,
                int band, const std::vector<uint16_t>& track, int backend, TracebackMode tb, int cutoff) {
-    Result r{0, {}, {}, AlignParams::zeros_like(p)};
+    Result r{0, {}, {}, AlignParams::zeros_like(p), false, {}};
     Aligner<GM, AM, AB, T> al;
     al.set_kernel(backend);
     al.set_traceback(tb);

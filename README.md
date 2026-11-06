@@ -42,7 +42,7 @@ params = params + 0.01 * grad   # every matrix cell and all four gap costs move 
 pip install nwgrad
 ```
 
-Prebuilt wheels cover CPython 3.10–3.14 on Linux x86_64 / aarch64, macOS arm64 and
+Prebuilt wheels cover CPython 3.10–3.14 on Linux x86_64 / aarch64, macOS arm64 (14 or newer) and
 Windows x86_64 (built with MinGW-w64 gcc; the free-threaded 3.13t / 3.14t builds are
 not yet available on Windows).
 Anywhere else pip builds from source, which needs a C++20 compiler with libstdc++'s

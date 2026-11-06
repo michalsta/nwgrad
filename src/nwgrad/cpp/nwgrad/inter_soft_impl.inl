@@ -55,7 +55,7 @@
 // kernels: wrapped in a class template the double instantiation kept an accumulator on
 // the stack in its column loop, 12 % more cycles for the same instructions (gcc 16, sse4).
 // Outputs (log Z, counts, gaps) stay double.
-#define NWGRAD_IS_LANES using ivd = typename IVT<SF>::v; using ivl = typename IVT<SF>::l; constexpr int IW = IVT<SF>::W; (void)IW
+#define NWGRAD_IS_LANES using ivd = typename IVT<SF>::v; using ivl [[maybe_unused]] = typename IVT<SF>::l; constexpr int IW = IVT<SF>::W; (void)IW
 
 // The flushed products of a FINISHED row, counted from the stored rows and tables (as
 // soft_kernel_impl.inl's sp_count_*, per lane): run by the float32 kernels only, for a
@@ -355,7 +355,7 @@ if constexpr (Tr)
     for (size_t k = 0; k < static_cast<size_t>(IW) * (M + 1) * 4; ++k) J.gaps[k] = 0.0;
 
 for (int i = M; i >= 0; --i) {
-    ivl top;
+    ivl top = {};   // every lane is set below; gcc on AArch64 cannot tell (-Wmaybe-uninitialized)
     ivd init = z;
     for (int l = 0; l < IW; ++l) {
         top[l] = (i == J.m[l]) ? -1 : 0;
@@ -716,7 +716,7 @@ if constexpr (Tr)
     for (size_t k = 0; k < static_cast<size_t>(IW) * (M + 1) * 4; ++k) J.gaps[k] = 0.0;
 
 for (int i = M; i >= 0; --i) {
-    ivl top;
+    ivl top = {};   // every lane is set below; gcc on AArch64 cannot tell (-Wmaybe-uninitialized)
     ivd init = z;
     for (int l = 0; l < IW; ++l) {
         top[l] = (i == J.m[l]) ? -1 : 0;
