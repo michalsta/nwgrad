@@ -136,6 +136,10 @@ jobs:
       # wheel does not depend on Homebrew's copies at the user's runtime; CMake seeds
       # CMAKE_SHARED_LINKER_FLAGS from LDFLAGS at first configure.  The spaced LDFLAGS
       # value is single-quoted because cibuildwheel splits its environment on spaces.
+      # MACOSX_DEPLOYMENT_TARGET matches the runner (macos-14): Homebrew's libstdc++.a,
+      # linked in statically, is built for the macOS it runs on, and an older target
+      # left 14.0 objects inside a wheel tagged 11.0 (ld: "built for newer 'macOS'
+      # version").  Every Apple Silicon Mac runs 14.  Raise both together.
       - name: Set up Homebrew gcc (macOS)
         if: runner.os == 'macOS'
         run: |
@@ -143,7 +147,7 @@ jobs:
           GXX="$(ls "$(brew --prefix)"/bin/g++-[0-9]* | sort -V | tail -1)"
           GCC="$(ls "$(brew --prefix)"/bin/gcc-[0-9]* | sort -V | tail -1)"
           echo "Using $GXX / $GCC"
-          echo "CIBW_ENVIRONMENT_MACOS=CC=$GCC CXX=$GXX MACOSX_DEPLOYMENT_TARGET=11.0 LDFLAGS='-static-libstdc++ -static-libgcc'" >> "$GITHUB_ENV"
+          echo "CIBW_ENVIRONMENT_MACOS=CC=$GCC CXX=$GXX MACOSX_DEPLOYMENT_TARGET=14.0 LDFLAGS='-static-libstdc++ -static-libgcc'" >> "$GITHUB_ENV"
 
       # Windows: MSYS2's UCRT64 gcc (see COMPILER POLICY).  Its bin/ goes FIRST on PATH
       # inside cibuildwheel: cc1plus loads its own DLLs (gmp, mpfr, isl, zstd) from there,
