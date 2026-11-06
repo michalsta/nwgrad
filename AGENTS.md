@@ -891,6 +891,19 @@ matrices, 4 and 6 letters, ragged B):
    table row `always_inline`. After the split, protein L100 (gather) path / hard, skynet
    sse4, instructions vs main: 0.970-1.004; DNA L300 path 0.47-0.998. Aimed at W = 32 (int16
    AVX-512); at W <= 8 it measured 0-2 %.
+6. `inter_fill_affine` is pinned to a page boundary (`aligned(4096)` + `noinline`, every
+   instance; 2026-11-06).  Its row loop's front-end delivery (LSD vs DSB) depends on the
+   function's address mod 4096, and that address is otherwise the size of everything linked
+   before the inter unit: proto/int-score-rows grew the score kernels in the level units and
+   moved it, byte-identical, from 3328 to 3200 mod 4096.  nighthaven, float32 affine Local
+   path, protein L300, 1 thread, placement swept: mod 4096 = 0 1.001, 256 / 512 / 1024 /
+   2048 1.00-1.007, 128 1.014, 768 1.037, 3328 1.010, 3200 1.063 (front-end bubbles track
+   it).  Splitting the score kernels into their own unit and pinning setup helpers
+   `noinline` was tried first and not adopted: it left 56-72 functions per level still
+   depending on the unit's contents and moved the inter unit again.  Regression runs
+   should include an int16 affine Global score-only cell at L180-L220 (a 12-14 segment AVX2
+   band that showed 1.04-1.07 before the int16 >= 16-lane gate) and the protein L300 float32
+   affine Local path cell at 1 thread: both moved on layout alone.
 Measured on skynet (sse4, perf stat, differential instructions per pair, 1 thread,
 affine Global unless noted, gates off; A/A 0.986-1.009): miRNA 22x50 int16 score 0.587, hard
 0.800; int32 hard 0.737; float32 score 0.646, hard 0.809, Local hard 0.768; int16 Local score
