@@ -913,10 +913,11 @@ struct Aligner {
     // a measured hair below this exact optimum (see AGENTS.md).
     //
     // Full: the leveled striped kernel (score_kernel_impl.inl) on a simd backend, a scalar
-    // rolling-row copy of the fill otherwise.  Linear gaps run through the affine kernel
-    // with zero opens, which reduces the recurrence to the linear one exactly (v - 0 is
-    // exact, and rounding is monotone, so max(a-g, b-g) == max(a,b) - g bit for bit;
-    // the borders -(0 + i*ge) are -i*ge).  GuideBanded runs the banded fill: its tables
+    // rolling-row copy of the fill otherwise.  Linear gaps run with zero opens, which
+    // reduces the affine recurrence to the linear one exactly (v - 0 is exact, and
+    // rounding is monotone, so max(a-g, b-g) == max(a,b) - g bit for bit; the borders
+    // -(0 + i*ge) are -i*ge); the leveled kernel then takes the one-row form
+    // (score_linear_striped: the affine kernel's values with its dead X state dropped).  GuideBanded runs the banded fill: its tables
     // are band-sized already, and it is not what score-only callers use.
     double compute_score(DpBuffer& buf) {
         check_problem();
@@ -939,6 +940,7 @@ struct Aligner {
                     job.ge_b = static_cast<T>(params_->gap_extend_b);
                     job.local = AM == AlignMode::Local ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
                     job.variant = score_variant_env();
+                    job.linear = lin && score_linear_env();
                     job.buf = &buf;
                     if (tr_) fill_track_job_(job.tr, true, static_cast<size_t>(n_) + 16, lin);
                     fn(job);
@@ -4569,6 +4571,16 @@ private:
             return s == "twopass" ? 1 : s == "fused3" ? 2 : 0;
         }();
         return v;
+    }
+
+    // NWGRAD_SCORE_LINEAR=affine: linear gaps through the affine D/X kernel with zero opens
+    // (the form before score_linear_striped; for measuring it in one binary).
+    static bool score_linear_env() {
+        static const bool on = [] {
+            const char* e = std::getenv("NWGRAD_SCORE_LINEAR");
+            return !(e && std::string_view(e) == "affine");
+        }();
+        return on;
     }
 
     double score_affine_scalar(DpBuffer& buf) const {

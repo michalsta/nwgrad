@@ -774,8 +774,371 @@ static void score_affine_striped_pos_fp(ScoreJob<T>& job) {
     }
 }
 
+// ── Linear gaps: one rolling row H ─────────────────────────────────────────────
+// compute_score ran linear gaps through the D/X form above with zero opens (exact: see
+// ScoreJob).  There the X state is dead -- X = max((D_up - 0) - ge_b, X_up - ge_b) is
+// D_up - ge_b bit for bit, since D_up >= X_up and rounding is monotone -- and so is the
+// distinction between D and max(M, X): this kernel keeps H = D alone.  Per cell
+//   U = max(H(i-1, j-1) + s, H(i-1, j) - ge_b)     (Local: the diagonal clamped at 0 first)
+//   H = max(U, H(i, j-1) - ge_a)
+// the D/X kernel's values exactly: its Y(j) = max(O(j-1), Y(j-1) - ge_a) with O = mx - ge_a
+// is max(mx, Y)(j-1) - ge_a = H(j-1) - ge_a (monotone rounding again), and its D is
+// max(mx, Y) = H; the borders keep its expressions with go = 0 (job.go_a / go_b are 0 for a
+// linear job) so even their zero signs are the same.  The previous row is one vector a
+// segment (up, and in a register the next segment's diagonal), not two; the gap-in-B open,
+// the X row and its loads and stores go.
+//   Integer T from 4 lanes: score_linear_striped_int (the prefix-max carry, one pass a
+// row).  Floating T (and integer T at fewer lanes: int64 at 128 bits), score_linear_
+// striped_fp: rows H(i-1), H(i), the carry on H itself, two segments per dependent step
+// as score_affine_striped_pos_fp's,
+//   H(s+1) = max(max(U(s+1), U(s) - g), (H(s-1) - g) - g),
+// and lazy-F on H (exit when no lane's F exceeds H: H >= Y, so no later than the D/X
+// kernel's Y test; the values are the recurrence's unique solution either way).  Floating
+// lazy-F carries F - ge (H(s+1) >= H(s) - ge holds after the main pass in every lane, the
+// argument of score_affine_striped_pos_fp); integer T at 2 lanes keeps max(v, F) - ge, as
+// a sentinel stepped by - ge per segment could wrap.
+//   Local: the maximum over every cell; with both extends >= 0 (MOnly) over the clamped
+// diagonal term alone, as the D/X kernel's MOnly (a gap cell never exceeds the cell it
+// extends from).  The padding slots are masked wherever they can reach the maximum (a
+// negative extend makes a run GAIN along them); MOnly's cannot (an integer profile pads
+// with 0, not -inf, but then no padding value exceeds a real one: see the integer form).
+
+// The integer form (from 4 lanes) of score_linear_striped: score_affine_striped_pos's exact
+// prefix-max carry, with no second pass over the row.  The row pass stores U (the cell
+// before the gap in A) and the running prefix max P of (U(s-1) - ge_a) + ramp(s); the row's
+// H(s) = max(U(s), max(P(s), cin) - ramp(s)) -- the D/X kernel's pass 2, the same
+// operations -- is formed where the NEXT row reads it as its up vector (and, in a
+// register, as the diagonal of the segment after).  Both rows are overwritten in place:
+// segment s of row i-1 is read before segment s of row i is stored.  So two rows (U, P) of
+// working set where the D/X form keeps five, and one pass a row where it makes two: the
+// carry-in, the ramp base and the ramp step of the row just finished ride along in
+// registers (pcin, pbase, pge: row 0 is H = U, its P and carry-in -inf, its ramp 0).  The
+// last segment's H (the next row's segment-0 diagonal) is formed at the end of the row
+// from the registers, and the last row's H by one pass after the loop (the score reads it).
+template <class T, bool Local, bool MOnly, bool Tr = false, bool Sat = false, bool Glocal = false>
+static void score_linear_striped_int(ScoreJob<T>& job) {
+    using vd = stdx::native_simd<T>;
+    const int W = (int)vd::size();
+    const T NINF = nw_ninf_s<T, Sat>;
+
+    const int m = job.m, n = job.n, nalpha = job.nalpha;
+    T go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;   // go_a = go_b = 0
+    const TrackJob<T>& tr = job.tr;
+    if constexpr (Tr) { go_a = tr.go_a[0]; ge_a = tr.ge_a[0]; }
+    const unsigned char* a = job.a;
+    const unsigned char* b = job.b;
+    DpBufferT<T>& buf = *job.buf;
+
+    if (n == 0) {
+        if constexpr (Local) job.score = T(0);
+        else if constexpr (Tr) job.score = (m == 0) ? T(0) : tr.bx0[m];
+        else job.score = (m == 0) ? T(0) : static_cast<T>(-(go_b + static_cast<T>(m) * ge_b));
+        return;
+    }
+
+    const int seg = (n + W - 1) / W;
+    const std::size_t sw = (std::size_t)seg * W;
+    std::size_t rs; T* const rows = spread_rows<T>(buf.srows, sw, 3, rs);
+    T* const rU = rows; T* const rP = rows + rs;
+    // (MOnly needs no mask, even though an integer profile pads with 0: see the row pass)
+    const T* pad = nullptr;
+    if constexpr ((Local && !MOnly) || Glocal) pad = striped_pad_into<T, Sat>(rows + 2 * rs, n, seg, W);
+    auto padded = [&](const vd& v, int s) NWGRAD_ALWAYS_INLINE_LAMBDA {
+        return vadd<Sat>(v, nv_load<vd>(pad + (std::size_t)s * W));
+    };
+
+    striped_profile_build<T, Tr>(buf.sprof, job.blk, nalpha, b, n, seg, W, tr);
+
+    // row 0 as U: Global -(go_a + j*ge_a), Local / Glocal 0; padding -inf; P -inf
+    for (std::size_t k = 0; k < sw; ++k) { rU[k] = NINF; rP[k] = NINF; }
+    for (int l = 0; l < W; ++l)
+        for (int s = 0; s < seg; ++s) {
+            const int j = l * seg + s + 1;
+            if (j <= n) {
+                const std::size_t k = (std::size_t)s * W + l;
+                if constexpr (Local || Glocal) rU[k] = 0;
+                else                           rU[k] = -(go_a + j * ge_a);
+            }
+        }
+
+    vd vge_a(ge_a), vge_b(ge_b);
+    const vd vzero(static_cast<T>(0)), vninf(NINF);
+    vd vbest = vzero;
+    T bH = 0;                                   // H of column 0, previous row
+    // the previous row's carry-in, ramp base and step: max(P, -inf) - 0 = -inf <= U at row 0
+    vd pcin = vninf, pbase = vzero, pge = vzero;
+    vd hlast = nv_load<vd>(rU + (std::size_t)(seg - 1) * W);   // the previous row's last-segment H
+
+    for (int i = 1; i <= m; ++i) {
+        if constexpr (Tr) {
+            ge_a = tr.ge_a[i]; ge_b = tr.ge_b[i];
+            vge_a = vd(ge_a); vge_b = vd(ge_b);
+        }
+        T nbH;   // column 0: the D/X kernel's max(M, X) there (its Y is -inf), go_b = 0
+        if constexpr (Local) nbH = T(0);
+        else if constexpr (Tr) nbH = std::max(NINF, tr.bx0[i]);
+        else nbH = std::max(NINF, static_cast<T>(-(go_b + i * ge_b)));
+        const T nbOpen = nw_sub(nw_sub(nbH, go_a), ge_a);   // open_pen with go = 0
+        const T* sub = striped_row_profile<T, Tr>(buf.sprof.data(), job.blk, nalpha, a, b, n, seg, W, i, tr);
+
+        vd dH = lane_shift_in(hlast, bH);       // segment 0's diagonal
+        vd prq = pbase;                         // the previous row's ramp at segment s
+        const vd fBase([&](int l) { return static_cast<T>(static_cast<T>(l * seg) * ge_a); });
+        // The prefix term of segment s is open(s-1) + ramp(s) = (U(s-1) - ge_a) + (fBase +
+        // s*ge_a).  Plain regime: lane arithmetic wraps, so that is U(s-1) + (fBase + (s-1)*ge_a)
+        // exactly, one subtraction fewer a segment (fR then runs one step behind and Uq holds
+        // U(s-1), seeded so that segment 0's term is exactly -inf, as fOprev's seed below).
+        // Saturating regime: the D/X kernel's form, as a clamped U - ge_a is not U - ge_a.
+        vd fR = Sat ? fBase : vd(fBase - vge_a), fP = vninf;
+        vd fOprev = vsub<Sat>(vninf, fBase);    // segment 0 has no Q term (see the D/X kernel)
+        // (plain regime only: the saturating regime's sentinel is lowest() itself, where
+        // - fR would overflow -- UB, caught by UBSan; the plain one is lowest()/2, and the
+        // bound keeps -fR within its depth, as fOprev's seed)
+        vd Uq = vninf;
+        if constexpr (!Sat) Uq = vninf - fR;
+        vd U = vninf;
+        auto step = [&](int s) NWGRAD_ALWAYS_INLINE_LAMBDA {
+            const std::size_t o = (std::size_t)s * W;
+            const vd uH = stdx::max(nv_load<vd>(rU + o), vsub<Sat>(stdx::max(nv_load<vd>(rP + o), pcin), prq));
+            prq += pge;
+            if constexpr (Local && !MOnly) vbest = stdx::max(vbest, padded(uH, s));   // row i-1's H
+            vd vmv = vadd<Sat>(dH, nv_load<vd>(sub + o));
+            if constexpr (Local) vmv = stdx::max(vmv, vzero);
+            // MOnly: unmasked.  The integer profile pads with 0, so a padding slot's diagonal
+            // term is a real number, but with both extends >= 0 every padding value is at most
+            // a real cell's or 0 (by induction over the cells: its diagonal + 0, its up - ge and
+            // its left - ge are each at most a value already bounded so), and the maximum
+            // starts at 0: the same maximum without the mask's load and add.
+            if constexpr (Local && MOnly) vbest = stdx::max(vbest, vmv);
+            dH = uH;
+            U = stdx::max(vmv, vsub<Sat>(uH, vge_b));
+            nv_store(rU + o, U);
+            if constexpr (Sat) {
+                fP = stdx::max(fP, vadd<Sat>(fOprev, fR));
+                fOprev = vsub<Sat>(U, vge_a);
+            } else {
+                fP = stdx::max(fP, Uq + fR);
+                Uq = U;
+            }
+            nv_store(rP + o, fP);
+            fR += vge_a;
+        };
+        // two segments a trip (gcc does not unroll; the loop overhead is a sixth of the body)
+        int s = 0;
+        for (; s + 1 < seg; s += 2) { step(s); step(s + 1); }
+        if (s < seg) step(s);
+        if constexpr (!Sat) { fOprev = U - vge_a; fR += vge_a; }   // the saturating form's state
+        const vd Q0 = vadd<Sat>(lane_shift_in(fOprev, nbOpen), fBase);
+        vd vcin;
+        if constexpr (sizeof(T) == 2) {
+            vcin = int_lane_carry_in<vd, (int)vd::size(), Sat>(stdx::max(Q0, fP), nw_sub<T>(NINF, ge_a));
+        } else {
+            alignas(64) T tot[64], cin[64];
+            stdx::max(Q0, fP).copy_to(tot, stdx::element_aligned);
+            T run = nw_sub<T>(NINF, ge_a);
+            for (int l = 0; l < W; ++l) { cin[l] = run; run = std::max(run, tot[l]); }
+            vcin.copy_from(cin, stdx::element_aligned);
+        }
+        vcin = stdx::max(vcin, Q0);
+        // the last segment's H; its ramp fBase + (seg-1)*ge_a is fR - ge_a (wrapping, as += is)
+        hlast = stdx::max(U, vsub<Sat>(stdx::max(fP, vcin), fR - vge_a));
+        pcin = vcin; pbase = fBase; pge = vge_a;
+        bH = nbH;
+    }
+
+    // the last row's H (row 0's when m == 0)
+    {
+        vd prq = pbase;
+        for (int s = 0; s < seg; ++s) {
+            const std::size_t o = (std::size_t)s * W;
+            const vd h = stdx::max(nv_load<vd>(rU + o), vsub<Sat>(stdx::max(nv_load<vd>(rP + o), pcin), prq));
+            nv_store(rU + o, h);
+            if constexpr (Local && !MOnly) vbest = stdx::max(vbest, padded(h, s));
+            prq += pge;
+        }
+    }
+
+    if constexpr (Local) {
+        T best = 0;
+        for (int q = 0; q < W; ++q) best = std::max(best, static_cast<T>(vbest[q]));
+        job.score = best;
+    } else if constexpr (Glocal) {
+        vd vb = vninf;   // the best cell of the last row, padding masked
+        for (int s = 0; s < seg; ++s) vb = stdx::max(vb, padded(nv_load<vd>(rU + (std::size_t)s * W), s));
+        T best = bH;     // column 0 of the last row: an end too (A all gapped)
+        for (int q = 0; q < W; ++q) best = std::max(best, static_cast<T>(vb[q]));
+        job.score = best;
+    } else {
+        const std::size_t k = (std::size_t)((n - 1) % seg) * W + (std::size_t)((n - 1) / seg);
+        job.score = rU[k];
+    }
+}
+
+template <class T, bool Local, bool MOnly, bool Tr = false, bool Sat = false, bool Glocal = false>
+static void score_linear_striped_fp(ScoreJob<T>& job) {
+    using vd = stdx::native_simd<T>;
+    const int W = (int)vd::size();
+    const T NINF = nw_ninf_s<T, Sat>;
+
+    const int m = job.m, n = job.n, nalpha = job.nalpha;
+    T go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;   // go_a = go_b = 0
+    const TrackJob<T>& tr = job.tr;
+    if constexpr (Tr) { go_a = tr.go_a[0]; ge_a = tr.ge_a[0]; }
+    const unsigned char* a = job.a;
+    const unsigned char* b = job.b;
+    DpBufferT<T>& buf = *job.buf;
+
+    if (n == 0) {
+        if constexpr (Local) job.score = T(0);
+        else if constexpr (Tr) job.score = (m == 0) ? T(0) : tr.bx0[m];
+        else job.score = (m == 0) ? T(0) : static_cast<T>(-(go_b + static_cast<T>(m) * ge_b));
+        return;
+    }
+
+    const int seg = (n + W - 1) / W;
+    const std::size_t sw = (std::size_t)seg * W;
+    // H(i-1), H(i) and the padding mask: one block (spread_rows)
+    std::size_t rs; T* const rows = spread_rows<T>(buf.srows, sw, 3, rs);
+    constexpr bool NeedPad = (Local && !MOnly) || Glocal;   // (MOnly: see score_linear_striped_int)
+    const T* pad = nullptr;
+    if constexpr (NeedPad) pad = striped_pad_into<T, Sat>(rows + 2 * rs, n, seg, W);
+    auto padded = [&](const vd& v, int s) NWGRAD_ALWAYS_INLINE_LAMBDA {
+        vd p; p.copy_from(pad + (std::size_t)s * W, stdx::element_aligned);
+        return vadd<Sat>(v, p);
+    };
+
+    striped_profile_build<T, Tr>(buf.sprof, job.blk, nalpha, b, n, seg, W, tr);
+
+    T* pH = rows + rs; T* cH = rows;
+
+    // row 0: Global -(go_a + j*ge_a) (the D/X kernel's D), Local / Glocal 0; padding -inf
+    for (std::size_t k = 0; k < sw; ++k) pH[k] = NINF;
+    for (int l = 0; l < W; ++l)
+        for (int s = 0; s < seg; ++s) {
+            const int j = l * seg + s + 1;
+            if (j <= n) {
+                const std::size_t k = (std::size_t)s * W + l;
+                if constexpr (Local || Glocal) pH[k] = 0;
+                else                           pH[k] = -(go_a + j * ge_a);
+            }
+        }
+
+    vd vge_a(ge_a), vge_b(ge_b);
+    const vd vzero(static_cast<T>(0)), vninf(NINF);
+    vd vbest = vzero;
+    T bH = 0;                               // H of column 0, previous row
+
+    auto any_gt = [](const vd& x, const vd& y) -> bool {
+#if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
+        if constexpr (sizeof(T) == 8) return avx512d_gt(x, y) != 0;
+        else                                     return stdx::any_of(x > y);
+#else
+        return stdx::any_of(x > y);
+#endif
+    };
+    auto ld = [](const T* p) NWGRAD_ALWAYS_INLINE_LAMBDA { vd v; v.copy_from(p, stdx::element_aligned); return v; };
+
+    for (int i = 1; i <= m; ++i) {
+        if constexpr (Tr) {
+            ge_a = tr.ge_a[i]; ge_b = tr.ge_b[i];
+            vge_a = vd(ge_a); vge_b = vd(ge_b);
+        }
+        // column 0: the D/X kernel's max(M, X) there (its Y is -inf), with go_b = 0
+        T nbH;
+        if constexpr (Local) nbH = T(0);
+        else if constexpr (Tr) nbH = std::max(NINF, tr.bx0[i]);
+        else nbH = std::max(NINF, static_cast<T>(-(go_b + i * ge_b)));
+        const T* sub = striped_row_profile<T, Tr>(buf.sprof.data(), job.blk, nalpha, a, b, n, seg, W, i, tr);
+
+        vd dH = lane_shift_in(ld(pH + (std::size_t)(seg - 1) * W), bH);   // segment 0's diagonal
+        // One segment's carry-free part: U (and the clamped diagonal term, for MOnly).
+        auto cell = [&](int s, vd& vmv) NWGRAD_ALWAYS_INLINE_LAMBDA {
+            const std::size_t o = (std::size_t)s * W;
+            const vd uH = ld(pH + o);
+            vmv = vadd<Sat>(dH, ld(sub + o));
+            if constexpr (Local) vmv = stdx::max(vmv, vzero);
+            dH = uH;
+            return stdx::max(vmv, vsub<Sat>(uH, vge_b));
+        };
+
+        auto fin = [&](int s, const vd& vmv, const vd& h) NWGRAD_ALWAYS_INLINE_LAMBDA {
+            h.copy_to(cH + (std::size_t)s * W, stdx::element_aligned);
+            if constexpr (Local) {
+                if constexpr (MOnly) vbest = stdx::max(vbest, vmv);   // unmasked (padding M: 0, or bounded)
+                else                 vbest = stdx::max(vbest, padded(h, s));
+            }
+        };
+        // H of the column before, lane 0 column 0's; lanes 1.. by lazy-F.  (nbH - go_a)
+        // - ge_a is the D/X kernel's open of column 0, nbH - ge_a with go_a = 0.
+        vd Hin([&](int q) { return q == 0 ? nw_sub(nbH, go_a) : NINF; });
+        int s = 0;
+        if constexpr (std::is_floating_point_v<T>) {
+            for (; s + 1 < seg; s += 2) {
+                vd vm0, vm1;
+                const vd U0 = cell(s, vm0);
+                const vd U1 = cell(s + 1, vm1);
+                const vd t = Hin - vge_a;
+                const vd h0 = stdx::max(U0, t);
+                const vd h1 = stdx::max(carry_pin(stdx::max(U1, U0 - vge_a)), t - vge_a);
+                fin(s, vm0, h0);
+                fin(s + 1, vm1, h1);
+                Hin = h1;
+            }
+        }
+        for (; s < seg; ++s) {
+            vd vm0;
+            const vd U0 = cell(s, vm0);
+            const vd h0 = stdx::max(U0, vsub<Sat>(Hin, vge_a));
+            fin(s, vm0, h0);
+            Hin = h0;
+        }
+
+        // ── lazy-F on H ──
+        for (int r = 0; r < W; ++r) {
+            vd F = vsub<Sat>(lane_shift_in(ld(cH + (std::size_t)(seg - 1) * W), NINF), vge_a);
+            bool changed = false;
+            for (int s2 = 0; s2 < seg; ++s2) {
+                vd v = ld(cH + (std::size_t)s2 * W);
+                if (!any_gt(F, v)) break;
+                v = stdx::max(v, F);
+                v.copy_to(cH + (std::size_t)s2 * W, stdx::element_aligned);
+                if constexpr (Local && !MOnly) vbest = stdx::max(vbest, padded(v, s2));
+                if constexpr (std::is_floating_point_v<T>) F = F - vge_a;
+                else                                       F = vsub<Sat>(v, vge_a);
+                changed = true;
+            }
+            if (!changed) break;
+        }
+
+        std::swap(pH, cH);
+        bH = nbH;
+    }
+
+    if constexpr (Local) {
+        T best = 0;
+        for (int q = 0; q < W; ++q) best = std::max(best, static_cast<T>(vbest[q]));
+        job.score = best;
+    } else if constexpr (Glocal) {
+        vd vb = vninf;   // the best cell of the last row, padding masked
+        for (int s = 0; s < seg; ++s) vb = stdx::max(vb, padded(ld(pH + (std::size_t)s * W), s));
+        T best = bH;     // column 0 of the last row: an end too (A all gapped)
+        for (int q = 0; q < W; ++q) best = std::max(best, static_cast<T>(vb[q]));
+        job.score = best;
+    } else {
+        const std::size_t k = (std::size_t)((n - 1) % seg) * W + (std::size_t)((n - 1) / seg);
+        job.score = pH[k];
+    }
+}
+template <class T, bool Local, bool MOnly, bool Tr = false, bool Sat = false, bool Glocal = false>
+static void score_linear_striped(ScoreJob<T>& job) {
+    if constexpr (nw_is_int<T> && stdx::native_simd<T>::size() >= 4)
+        score_linear_striped_int<T, Local, MOnly, Tr, Sat, Glocal>(job);
+    else
+        score_linear_striped_fp<T, Local, MOnly, Tr, Sat, Glocal>(job);
+}
+
 // The registered entry: Global or Local; job.variant 0 = the D/X form when both opens
-// are >= 0 (else fused three-state), 1 = two-pass, 2 = fused three-state (for measuring
+// are >= 0 (else fused three-state; linear gaps, job.linear: score_linear_striped), 1 = two-pass, 2 = fused three-state (for measuring
 // the forms in one binary; NWGRAD_SCORE_VARIANT=twopass / fused3).
 // NWGRAD_SCORE_UNROLL=0 runs the rolled integer row pass (an A/B switch, one binary).
 // Off on NEON by default: the M1 lost 25 % on int16 Global with it (spot, gcc 16, 2026-10-31);
@@ -813,6 +1176,16 @@ static void score_entry_impl(ScoreJob<T>& job) {
     } else {
         pos_open = job.go_a >= T(0) && job.go_b >= T(0);   // NaN: false
         pos_ext  = job.ge_a >= T(0) && job.ge_b >= T(0);
+    }
+    if (job.variant == 0 && job.linear) {   // linear gaps (go = 0): one row H
+        if (glocal) score_linear_striped<T, false, false, Tr, Sat, true>(job);
+        else if (job.local) {
+            if (pos_ext) score_linear_striped<T, true, true, Tr, Sat>(job);
+            else         score_linear_striped<T, true, false, Tr, Sat>(job);
+        } else {
+            score_linear_striped<T, false, false, Tr, Sat>(job);
+        }
+        return;
     }
     if (job.variant == 0 && pos_open) {
         if constexpr (std::is_floating_point_v<T>) {

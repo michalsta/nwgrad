@@ -872,7 +872,8 @@ which can sit below this exact optimum.
   `NWGRAD_SCORE_VARIANT=twopass|fused3` force the older forms (all three tested). Local: a per-lane vector max, padding slots
   masked by adding 0/-inf (`buf.spad`) — a NEGATIVE gap extend makes a run GAIN score
   along the padding (found by the tests; the fill's argmax scans real columns only).
-  Linear runs through it with zero opens (`max(a-g,b-g) == max(a,b)-g` bit for bit).
+  Linear ran through it with zero opens (`max(a-g,b-g) == max(a,b)-g` bit for bit); now its
+  own one-row kernel, the same values (`score_linear_striped`, below).
   Scalar backend: `score_affine_scalar` / `score_linear_scalar`, rolling copies of the
   fills. GuideBanded runs the banded fill.
 - **Inter-pair, `inter_kernel_impl.inl`** (`inter_score_*`, `LevelKernels::inter_score/
@@ -1047,6 +1048,52 @@ fmaxnm per two segments; lazy-F's carry was already a bare fsub. Pinned vs unpin
 0.89-0.98 (linear 0.88-0.90, Hirschberg 0.92-0.95), score-only protein 0.86-0.92, Manakov 1.00.
 Checked on NEON: the C++ suite (2.73 M assertions), the Python suite, `fuzz_ab.py` vs main (200
 seeds, 0 differ).
+
+**Linear gaps: their own score kernel (branch `proto/linear-score`, 2026-11-05).** Linear
+score-only ran the D/X kernel with zero opens, where the X state is dead (X = max((D_up - 0) -
+ge, X_up - ge) = D_up - ge bit for bit) and so is the split of D into max(M, X) and Y: the same
+instruction count as affine. `score_linear_striped` (score_kernel_impl.inl, `ScoreJob::linear`,
+dispatched in `score_entry_impl` when variant 0) keeps H alone: U = max(H_diag + s, H_up - ge_b),
+H = max(U, H_left - ge_a), the D/X kernel's values exactly (its Y(j) is H(j-1) - ge_a by
+monotone rounding; borders keep its expressions with go = 0). Two forms:
+- **Integer T from 4 lanes (`score_linear_striped_int`):** the fused prefix-max carry with NO
+  second pass. The row stores U and the running prefix P; H = max(U, max(P, cin) - ramp), the
+  D/X kernel's pass 2, is formed where the NEXT row reads it as its up vector (the previous row's
+  carry-in, ramp base and step ride in registers; the last row's H by one pass after the loop).
+  Two rows (U, P) updated in place, where the D/X form keeps five rows and makes two passes.
+  Plain regime: the prefix term (U - ge) + ramp(s) is U + ramp(s-1) (lanes wrap: exact), one
+  subtraction fewer; the saturating regime keeps the clamped form. Two segments a trip.
+- **Floating T, and int64 at 2 lanes (`score_linear_striped_fp`):** rows H(i-1), H(i), the
+  two-segment carry on H (H(s+1) = max(max(U(s+1), U(s) - g), (H(s-1) - g) - g), pinned) and
+  lazy-F on H (F - ge at floating T, max(v, F) - ge at int64).
+- Local with both extends >= 0 takes the max over the clamped diagonal term alone, UNMASKED even
+  for integer T (whose profile pads with 0): every padding value is bounded by a real cell's or 0
+  then, by induction over the cells. The D/X kernel still masks there.
+Bit-identical, checked: `[score]` at NWGRAD_SCORE_FUZZ=20000 (a new case sweeps int16 in both
+regimes, int32, int64, float32, double, Global / Local / Glocal, K = 2 tracks with gap tracks,
+every level, against the scalar Scores fill), the C++ `[integer]`, `[tracks]`, `[glocal]` tags at
+scalar_fallback / sse2 / sse4, the Python suite (5505), `tools/fuzz_ab.py` main vs branch (800
+seeds, 0 differ) and an int16/int32/int64/float32/double x Global/Local/Glocal x level x fill A/B
+of linear score-only batches against main (400 seeds, 36000 batches, every score's bytes equal).
+Two mutations (lazy-F one round; the lane carry-in dropped) fail 3 of the 5 `[score]` cases.
+`NWGRAD_SCORE_LINEAR=affine` runs the old route (an A/B switch in one binary).
+Measured (skynet sse4, 1 thread, `fill="striped"` batches, `perf stat instructions:u` differenced
+between 1 and 4 repetitions, so per cell of the kernel; protein BLOSUM62 0/4, DNA +2/-4 0/2, 20 %
+mutated homologues; new / old instructions, A/A of the new arm 1.00 on every row):
+
+| | int16 | int32 | float32 | double |
+|---|---|---|---|---|
+| L300 Global / Local | 0.57 / 0.57 (2.55 / 2.88 per cell) | 0.56 / 0.57 (4.80 / 5.52) | 0.64 / 0.62 (5.04 / 5.07) | 0.62 / 0.59 (8.39 / 8.66) |
+| L1000 Global / Local | 0.60 / 0.59 (2.38 / 2.73) | 0.53 / 0.55 (4.24 / 4.99) | 0.60 / 0.58 (3.95 / 4.24) | 0.60 / 0.57 (7.59 / 8.01) |
+| L3000 Global / Local | (refused) | 0.52 / 0.54 (4.08 / 4.83) | 0.58 / 0.57 (3.66 / 4.00) | 0.60 / 0.57 (7.37 / 7.84) |
+
+DNA the same to +-0.02. Wall-clock on the loaded host (load 25-70; A/A 0.73-1.32): new / old
+ns per cell 0.45-0.72 on most rows (e.g. protein L1000 int32 Global 1.284 -> 0.603 ns, float32
+1.284 -> 0.764). Read the instruction ratios; re-time on nighthaven / solace / spot. The int32
+inner loop at sse4 is 32 instructions per two segments (16 a vector cell, 4 a cell) against 32 a
+vector cell for the D/X form. First tried: the integer form with pass 2 kept (the D/X kernel's
+shape, three rows): only 0.92-0.93 of the old instructions; dropping pass 2 gave the rest. NEON,
+AVX2 and AVX-512 compile, untested at runtime (skynet cannot run them).
 
 ### Grid traceback: `traceback="grid"` (branch `cc/grid-traceback`, 2026-10-26)
 
