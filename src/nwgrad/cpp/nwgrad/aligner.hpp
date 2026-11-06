@@ -1219,6 +1219,11 @@ struct Aligner {
     // a pair's precision depends on that pair alone.  (A batch remembers its pairs'
     // refusals itself, per pair, and turns float32 off here for a pair that refused.)
     void set_soft_f32(bool v) noexcept { soft_f32_ = v; }
+    // Whether this pair's soft pass runs beside enough other worker threads (BatchEngine
+    // sets it: min(threads, pairs) >= kSoftCkptMinWorkers).  The default checkpoint rule
+    // needs it (soft_ckpt_rows): alone or with one neighbour, a pair streams its tables and
+    // checkpointing only costs.
+    void set_soft_ckpt_shared(bool v) noexcept { soft_ckpt_shared_ = v; }
     bool soft_f32() const noexcept { return soft_f32_; }
     bool soft_f32_used() const noexcept { return soft_f32_used_; }
 
@@ -1277,6 +1282,7 @@ private:
     int                 band_       = 0;
     int                 m_ = 0, n_ = 0;
     size_t              stride_ = 0, sz_ = 0;
+    bool                soft_ckpt_shared_ = false;   // set_soft_ckpt_shared
     std::vector<int>    guide_j_;  // used only when AB == GuideBanded
 
     // The body both set_problem overloads share (inlined into each: the untracked one
@@ -5508,6 +5514,32 @@ private:
         }
     }
 
+    // Rows per block of the checkpointed forward (0: the full tables; soft_kernel_impl.inl,
+    // "Checkpoints").  The soft_ckpt_rows gate, else NWGRAD_SOFT_CKPT_ROWS, forces k (k >= 1;
+    // 0: the full tables; the gate off: one block of every row).  Otherwise a pair
+    // checkpoints when its forward tables reach soft_ckpt_min_bytes -- that override, when
+    // set, at any thread count; by default kSoftCkptMinBytes and only when the pair runs
+    // beside at least kSoftCkptMinWorkers - 1 other workers (soft_ckpt_shared_) -- with k from soft_ckpt_auto_rows.
+    template <class SF>
+    int soft_ckpt_rows() const noexcept {
+        const int64_t o = gate_override(Gate::SoftCkptRows);
+        const int64_t r = o >= 0 ? o : soft_ckpt_env_rows();
+        const int64_t mm = std::max(m_, 1);
+        if (r >= 0) return static_cast<int>(std::min(r, mm));
+        const size_t states = (GM == GapModel::Linear) ? 1 : 3;
+        const int64_t ob = gate_override(Gate::SoftCkptMinBytes);
+        if (ob < 0 && !(kSoftCkptByDefault && soft_ckpt_shared_)) return 0;   // the default: x86-64, >= 4 workers
+        if (states * sz_ * sizeof(SF) < gate_value(Gate::SoftCkptMinBytes, kSoftCkptMinBytes)) return 0;
+        return static_cast<int>(std::min<int64_t>(soft_ckpt_auto_rows(m_), mm));
+    }
+    // k = ceil(sqrt(m)), at most 32: the block (k+1 rows) and the checkpoints (m/k rows) about
+    // equal, the least memory.  The time barely depends on k: skynet, L4000, 8 threads, k = 12
+    // / 32 / 64 within noise, k = 4 1.3x slower; nighthaven, 6 threads, k = 16 / 32 / sqrt(m)
+    // equal and 64 slower (64 rows of a long pair's block crowd the shared cache), hence the cap.
+    static int soft_ckpt_auto_rows(int m) noexcept {
+        return std::clamp(static_cast<int>(std::ceil(std::sqrt(static_cast<double>(m)))), 1, 32);
+    }
+
     // Both gap models: build the SoftPairJob and run the per-pair kernel of this
     // aligner's backend (soft_kernel_impl.inl; the baseline copy when the backend is
     // scalar_fallback or its level has none).  False: out of range (see run_fwdbwd).
@@ -5568,10 +5600,21 @@ private:
             J.ea = static_cast<SF>(ea); J.eb = static_cast<SF>(eb);
             J.oa = static_cast<SF>(oa); J.ob = static_cast<SF>(ob);
         }
-        if constexpr (lin) { if (sc.F.size() < sz_) sc.F.resize(sz_); }
-        else for (auto* v : {&sc.FM, &sc.FX, &sc.FY}) if (v->size() < sz_) v->resize(sz_);
+        const int ck = soft_ckpt_rows<SF>();
+        // Checkpointed: the tables are a block of ck+1 rows, plus the checkpoints.
+        const size_t tsz = ck ? (static_cast<size_t>(ck) + 1) * stride_ : sz_;
+        if constexpr (lin) { if (sc.F.size() < tsz) sc.F.resize(tsz); }
+        else for (auto* v : {&sc.FM, &sc.FX, &sc.FY}) if (v->size() < tsz) v->resize(tsz);
         for (auto* r : {&sc.r0, &sc.r1, &sc.r2, &sc.r3, &sc.r4, &sc.r5})
             if (r->size() < w) r->resize(w);
+        size_t nck = 0;   // checkpoint rows per state
+        if (ck) {
+            nck = m_ ? (static_cast<size_t>(m_) + ck - 1) / ck : 1;
+            const size_t need = nck * stride_ * (lin ? 1 : 4);
+            if (sc.CK.size() < need) sc.CK.resize(need);
+            if constexpr (!lin) for (auto* r : {&sc.q0, &sc.q1}) if (r->size() < w) r->resize(w);
+            if (soft_ckpt_env_check()) { sc.ckh.assign(static_cast<size_t>(m_) + 1, 0); J.ckh = sc.ckh.data(); }
+        }
         const size_t mm = static_cast<size_t>(m_) + 1;
         sband_.resize(6 * mm);
         int* bl = sband_.data();
@@ -5595,6 +5638,13 @@ private:
         J.stride = stride_;
         if constexpr (lin) J.FM = sc.F.data();
         else { J.FM = sc.FM.data(); J.FX = sc.FX.data(); J.FY = sc.FY.data(); }
+        if (ck) {
+            J.ck = ck;
+            SF* C = sc.CK.data();
+            const size_t cs = nck * stride_;
+            J.cM = C;
+            if constexpr (!lin) { J.cX = C + cs; J.cY = C + 2 * cs; J.cT = C + 3 * cs; J.q0 = sc.q0.data(); J.q1 = sc.q1.data(); }
+        }
         J.r0 = sc.r0.data(); J.r1 = sc.r1.data(); J.r2 = sc.r2.data();
         J.r3 = sc.r3.data(); J.r4 = sc.r4.data(); J.r5 = sc.r5.data();
         J.S = buf.sexp.data(); J.rowsum = sc.rs.data(); J.fmax = sc.mf.data();
@@ -5608,11 +5658,16 @@ private:
             if (f) fn = f;
         }
         if constexpr (std::is_same_v<SF, float>) { FlushDenormalsScope ftz; fn(J); }
+        else if (soft_double_ftz()) { FlushDenormalsScope ftz; fn(J); }
         else fn(J);
         if (std::getenv("NWGRAD_SOFT_DEBUG"))
-            std::fprintf(stderr, "soft<%s> m=%d n=%d ok=%d loss=%.3e tol=%.3e logz=%.6f\n",
-                         std::is_same_v<SF, float> ? "float" : "double", m_, n_, J.ok, J.loss,
-                         SoftRange<SF>::tol, J.log_z);
+            std::fprintf(stderr, "soft<%s> m=%d n=%d ck=%d ok=%d loss=%.3e tol=%.3e logz=%.6f resc_fwd=%d\n",
+                         std::is_same_v<SF, float> ? "float" : "double", m_, n_, ck, J.ok, J.loss,
+                         SoftRange<SF>::tol, J.log_z,
+                         [&] { int c = 0; for (int i = 1; i <= m_; ++i) c += J.S[i] != J.S[i - 1]; return c; }());
+        if (J.ck_bad)
+            throw std::logic_error("nwgrad: soft path: " + std::to_string(J.ck_bad) +
+                                   " recomputed forward rows differ from the first pass (NWGRAD_SOFT_CKPT_CHECK)");
         if (!J.ok) return false;
         log_z_ = J.log_z;
         sg_go_a_ = J.g_oa; sg_ge_a_ = J.g_ea; sg_go_b_ = J.g_ob; sg_ge_b_ = J.g_eb;

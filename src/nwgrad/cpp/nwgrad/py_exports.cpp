@@ -1485,7 +1485,10 @@ NB_MODULE(nwgrad_ext, m) {
             {"inter_global_linear_int_cells", int64_t(c.i16.linear_gather)},
             {"inter_global_linear_f32_cells", int64_t(c.f32.linear_gather == kGateNoCap ? 0 : c.f32.linear_gather)},
             {"soft_f32_min_cells", int64_t(c.f32soft_big.own_affine)},
-            {"inter_min_fill", int64_t(kInterMinFillPct)}};
+            {"inter_min_fill", int64_t(kInterMinFillPct)},
+            {"soft_ckpt_rows", int64_t(0)},   // (auto: _tuning.defaults() says so)
+            {"soft_ckpt_min_bytes", int64_t(kSoftCkptMinBytes)},
+            {"soft_double_ftz", int64_t(1)}};
     });
 
     m.def(
