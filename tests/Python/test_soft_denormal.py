@@ -1,6 +1,6 @@
 """The double soft pass's denormal handling: FTZ/DAZ around the double soft kernels
 (``soft_double_ftz``, the default since 2026-11-06; 0 restores gradual underflow) and a
-tighter lazy-rescale window (``soft_window_log2``, a probe that gained nothing).
+tighter lazy-rescale window (a probe that gained nothing; removed 2026-11-06).
 
 Both lose only mass the lost-mass bound already charges: a table or carry term below
 DBL_MIN in its row's stored units is counted as lost whether it is kept as a subnormal or
@@ -18,9 +18,7 @@ from nwgrad import _tuning
 
 REL = ABS = 1e-11
 # dict(): the default (FTZ on since 2026-11-06); soft_double_ftz=0: gradual underflow.
-FORMS = [dict(), dict(soft_double_ftz=0), dict(soft_double_ftz=0, soft_window_log2=64),
-         dict(soft_double_ftz=0, soft_window_log2=16), dict(soft_double_ftz=0, soft_window_log2=0),
-         dict(soft_double_ftz=1), dict(soft_double_ftz=1, soft_window_log2=64)]
+FORMS = [dict(), dict(soft_double_ftz=0), dict(soft_double_ftz=1)]
 MODES = [(g, m) for g in ("linear", "affine") for m in ("global", "local", "glocal")]
 
 

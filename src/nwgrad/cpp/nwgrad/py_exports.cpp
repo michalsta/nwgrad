@@ -1488,7 +1488,6 @@ NB_MODULE(nwgrad_ext, m) {
             {"inter_min_fill", int64_t(kInterMinFillPct)},
             {"soft_ckpt_rows", int64_t(0)},   // (auto: _tuning.defaults() says so)
             {"soft_ckpt_min_bytes", int64_t(kSoftCkptMinBytes)},
-            {"soft_window_log2", int64_t(256)},
             {"soft_double_ftz", int64_t(1)}};
     });
 

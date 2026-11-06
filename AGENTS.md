@@ -3002,7 +3002,15 @@ gradient-product hole of float32 (item 2 there) would exist in double at 2^-1022
 **The two fixes, prototyped (branch `proto/soft-denormal`, 2026-11-05)**, both behind
 switches (`nwgrad._tuning`; environment fallbacks `NWGRAD_SOFT_WINDOW_LOG2`,
 `NWGRAD_SOFT_DOUBLE_FTZ`). **(B) is the DEFAULT since 2026-11-06** (owner's decision;
-`soft_double_ftz` = 0 restores gradual underflow); (A) stays off, a documented probe.
+`soft_double_ftz` = 0 restores gradual underflow); **(A) was REMOVED on 2026-11-06** (the
+gate, `SoftPairJobT::win`, the env variable): it gained nothing, and the window as a
+runtime value cost ~5 instructions a row (miRNA own-fill pairs +0.1 %). The cost hunt of
+that day, against the solace/nighthaven reading of 1.02-1.33x on miRNA 22 x 50 own-fill
+soft pairs (header-only harness, baseline copy, double affine local, instructions per pair:
+main 116186, branch 117123): the checkpoint test per backward row with a variable block
+offset +533 (now the template flag `Ck`), the double product charge per row through the
+float32 path's budget test (now summed, `lossq`, +216), the runtime window +110; after:
+116425 (+0.2 %, the product charge).
 nighthaven (v3) confirmed (B): instructions unchanged, 1 thread 0.42-0.71 of main at
 L1000-4000, 6 threads 0.33-0.53, L300 1.00, results bit-identical on every benchmark
 fixture. Its `off` arm read 1.02-1.03 at L300: not the guard (tens of cycles a pair against

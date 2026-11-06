@@ -513,9 +513,6 @@ struct SoftPairJobT {
     // differently counts into ck_bad.
     uint64_t* ckh = nullptr;
     int ck_bad = 0;
-    // The lazy rescale's window (sp_lazy): a row is rescaled when its max leaves
-    // [1/win, win].  SoftRange<F>::win by default; the soft_window_log2 gate overrides it.
-    F win = SoftRange<F>::win;
 };
 using SoftPairJob  = SoftPairJobT<double>;
 using SoftPairJobF = SoftPairJobT<float>;
@@ -606,14 +603,14 @@ enum class Gate : int {
     InterGroupBytes, InterSoftBytes, InterScoreGatherCells,
     InterLinearIntGatherCells, InterLinearF32GatherCells, InterLinearF64GatherCells,
     InterGlobalLinearIntCells, InterGlobalLinearF32Cells, LinearStripedMinN, SoftF32MinCells,
-    InterMinFill, SoftCkptRows, SoftCkptMinBytes, SoftWindowLog2, SoftDoubleFtz, Count_
+    InterMinFill, SoftCkptRows, SoftCkptMinBytes, SoftDoubleFtz, Count_
 };
 inline constexpr const char* kGateNames[] = {
     "inter_group_bytes", "inter_soft_bytes", "inter_score_gather_cells",
     "inter_linear_int_gather_cells", "inter_linear_f32_gather_cells",
     "inter_linear_f64_gather_cells", "inter_global_linear_int_cells",
     "inter_global_linear_f32_cells", "linear_striped_min_n", "soft_f32_min_cells",
-    "inter_min_fill", "soft_ckpt_rows", "soft_ckpt_min_bytes", "soft_window_log2",
+    "inter_min_fill", "soft_ckpt_rows", "soft_ckpt_min_bytes",
     "soft_double_ftz"};
 static_assert(sizeof(kGateNames) / sizeof(kGateNames[0]) == static_cast<size_t>(Gate::Count_));
 inline constexpr int64_t kGateUnset = -1;
@@ -664,16 +661,8 @@ inline int64_t env_nonneg_int(const char* name) noexcept {
 // runs the double soft kernels under FlushDenormalsScope, as float32 always does: 2-5x at
 // L >= 1000 (skynet 3.2-5x, nighthaven 1 thread 0.42-0.71, 6 threads 0.33-0.53 of the
 // time; L300 1.00; instructions unchanged); 0 restores gradual underflow.
-// soft_window_log2 / NWGRAD_SOFT_WINDOW_LOG2 = e sets the double lazy-rescale window to
-// [2^-e, 2^e] (default 256, SoftRange<double>::win; float32 keeps its 2^8): it gained
-// nothing (the subnormal band only moves outwards) and stays a documented probe.  The gate
-// wins over the environment; -1: neither set.
-inline int64_t soft_window_log2_override() noexcept {
-    const int64_t o = gate_override(Gate::SoftWindowLog2);
-    if (o >= 0) return o;
-    static const int64_t v = env_nonneg_int("NWGRAD_SOFT_WINDOW_LOG2");
-    return v;
-}
+// (A tighter rescale window, the other candidate, gained nothing: sp_lazy.)  The gate wins
+// over the environment; -1: neither set.
 inline bool soft_double_ftz() noexcept {
     const int64_t o = gate_override(Gate::SoftDoubleFtz);
     if (o >= 0) return o != 0;

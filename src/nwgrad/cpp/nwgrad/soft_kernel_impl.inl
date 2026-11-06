@@ -133,13 +133,16 @@ static inline void sp_carry_bwd(SF* y, int lo, int hi, SF e) noexcept {
     for (; j >= lo; --j) { c = y[j] + e * c; y[j] = c; }
 }
 
-// LAZY rescale: only when the row max mx leaves [1/win, win] (or overflows: bad); win is
-// J.win, SoftRange<SF>::win unless the soft_window_log2 gate sets it (Aligner).
-// Scales [lo, hi] of the given rows (nullptr skips) and mx; returns the exponent removed.
+// LAZY rescale: only when the row max mx leaves [2^-256, 2^256] (float32: 2^8; or overflows:
+// bad).  Scales [lo, hi] of the given rows (nullptr skips) and mx; returns the exponent removed.
+// (A tighter double window, [2^-64, 2^64] or [2^-16, 2^16], was tried against the subnormal
+// stalls on 2026-11-05 and gained nothing: it only slides the subnormal band to cells farther
+// from the diagonal.  As a runtime value it also cost ~5 instructions a row.)
 template <class SF>
-static inline int sp_lazy(SF& mx, SF win, int lo, int hi, bool& bad, SF* r0, SF* r1 = nullptr,
+static inline int sp_lazy(SF& mx, int lo, int hi, bool& bad, SF* r0, SF* r1 = nullptr,
                           SF* r2 = nullptr, SF* r3 = nullptr) noexcept {
     NWGRAD_SP_FMA_BODY
+    constexpr SF win = SoftRange<SF>::win;
     if (!(mx <= std::numeric_limits<SF>::max())) { bad = true; return 0; }
     if (mx == SF(0) || (mx <= win && mx >= SF(1) / win)) return 0;
     const int k = std::ilogb(mx);
@@ -378,7 +381,7 @@ NWGRAD_SP_FMA_FN NWGRAD_SP_NOINLINE static bool sp_linear_fwd(const SoftPairJobT
         SF mx = 0.0;
         NWGRAD_SP_MAX(mx)
         for (int j = J.slo[i]; j <= J.shi[i]; ++j) mx = NWGRAD_SP_VMAX(mx, r[j]);
-        S[i] = S[i - 1] + sp_lazy(mx, J.win, J.slo[i], J.shi[i], bad, r);
+        S[i] = S[i - 1] + sp_lazy(mx, J.slo[i], J.shi[i], bad, r);
         if (bad) return false;
         mf[i] = mx;
         if (L || (G && i == m)) {
@@ -575,7 +578,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear_t(SoftPairJobT<SF>& J) noexcept {
             }
             J.gpost[i] = bj;
         }
-        const int kb = sp_lazy(mx, J.win, lo0, hi0, bad, cur);
+        const int kb = sp_lazy(mx, lo0, hi0, bad, cur);
         if (bad) return;
         const int Ti = Tn + kb;
         // Sums were taken before any rescale: their factor uses Tn (gh0), the bound uses Ti.
@@ -657,7 +660,7 @@ NWGRAD_SP_FMA_FN NWGRAD_SP_NOINLINE static bool sp_affine_fwd(const SoftPairJobT
             t[j] = v;
             mx = NWGRAD_SP_VMAX(mx, v);
         }
-        S[i] = S[i - 1] + sp_lazy(mx, J.win, J.slo[i], J.shi[i], bad, rM, rX, rY, tp);
+        S[i] = S[i - 1] + sp_lazy(mx, J.slo[i], J.shi[i], bad, rM, rX, rY, tp);
         if (bad) return false;
         mf[i] = mx;
         if (L || (G && i == m)) {
@@ -913,7 +916,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine_t(SoftPairJobT<SF>& J) noexcept {
             }
             J.gpost[i] = bj;
         }
-        const int kb = sp_lazy(mx, J.win, lo0, hi0, bad, cM, cX, cY);
+        const int kb = sp_lazy(mx, lo0, hi0, bad, cM, cX, cY);
         if (bad) return;
         const int Ti = Tn + kb;
         const double gh = sp_post(S[i] + Ti - ze, izr, bad);
