@@ -9,7 +9,7 @@ throw lands on a spawned thread rather than the caller's.
 import numpy as np
 import pytest
 import nwgrad
-from conftest import running_under_asan
+from conftest import peak_rss_bytes, running_under_asan
 from test_subst_matrix import BLOSUM62
 
 
@@ -102,10 +102,9 @@ def test_set_params_releases_superseded_params():
     """A descent loop builds a fresh AlignParams each step.  nb::keep_alive
     pinned every one of them for the SeqPair's whole life -- 50k swaps retained
     ~16 MiB.  Only the current params should survive."""
-    import gc, resource
+    import gc
 
-    def rss():
-        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+    rss = peak_rss_bytes
 
     sp = nwgrad.SeqPair("ACDEFGHIK", "ACDEFGHIK", make_params(),
                         gap_model="affine", mode="local", grad_mode="hard")
