@@ -458,6 +458,11 @@ using InterSoftJobF = InterSoftJobT<float>;
 using inter_soft_fn   = void (*)(InterSoftJob&);
 using inter_soft_fn_f = void (*)(InterSoftJobF&);
 
+// (SoftRange: the lazy rescale's default window and the lost-mass tolerance per soft type;
+// see sp_lazy / sp_loss.)
+template <class F> struct SoftRange;
+template <> struct SoftRange<double> { static constexpr double win = 0x1p256;  static constexpr double tol = 0x1p-45; };
+template <> struct SoftRange<float>  { static constexpr float  win = 0x1p8f;   static constexpr double tol = 0x1p-20; };
 // Per-pair scaled forward-backward (Aligner's SoftImpl::Scaled), double: one pair, Full
 // or GuideBanded, any alphabet.  Bodies in soft_kernel_impl.inl — compiled once per
 // level (LevelKernels::soft_pair_*) and once at baseline inside aligner.hpp.  The Aligner
@@ -496,6 +501,21 @@ struct SoftPairJobT {
     // g_ob, g_eb, negative).  The scalar weights and g_* are then unused.
     const F* rw = nullptr;
     double* grow = nullptr;
+    // Checkpointed forward (ck > 0; soft_kernel_impl.inl, "Checkpoints"): FM/FX/FY are a
+    // BLOCK of ck+1 rows instead of the full tables (row i of block c, c = 0, 1, ..., at
+    // (i - c*ck)*stride, block c holding rows c*ck .. c*ck+ck), and cM/cX/cY/cT hold, for every
+    // block c (c*stride), its first row c*ck: M, X, Y and the forward's previous-row sum
+    // (affine; linear: cM only).  q0/q1 (n+2 each, affine): the forward's two scratch rows
+    // (row sum, Y carry input), apart from r0..r5, which the backward holds while a block is
+    // recomputed.  ck = 0: the full tables, FM/FX/FY of (m+1)*stride.
+    int ck = 0;
+    F *cM = nullptr, *cX = nullptr, *cY = nullptr, *cT = nullptr;
+    F *q0 = nullptr, *q1 = nullptr;
+    // Debug (NWGRAD_SOFT_CKPT_CHECK): m+1 hashes of the forward rows as first computed
+    // (M, X, Y over the row's span, its exponent and max); a recomputed row that hashes
+    // differently counts into ck_bad.
+    uint64_t* ckh = nullptr;
+    int ck_bad = 0;
 };
 using SoftPairJob  = SoftPairJobT<double>;
 using SoftPairJobF = SoftPairJobT<float>;
@@ -524,26 +544,28 @@ using soft_float_t = std::conditional_t<std::is_same_v<T, float>, float, double>
 // so the bound stays rigorous; results move within that bound.
 struct FlushDenormalsScope {
 #if defined(__x86_64__) || defined(__i386__)
+    // Writes MXCSR only when FTZ|DAZ are not already set (a nested or repeated scope then
+    // costs one read).  The cost per pair is tens of cycles either way: nothing at the
+    // ~1 ms a per-pair soft pass of L300 takes.
     unsigned csr;
-    FlushDenormalsScope() noexcept : csr(_mm_getcsr()) { _mm_setcsr(csr | 0x8040u); }
-    ~FlushDenormalsScope() noexcept { _mm_setcsr(csr); }
+    bool set;
+    FlushDenormalsScope() noexcept : csr(_mm_getcsr()), set((csr & 0x8040u) != 0x8040u) { if (set) _mm_setcsr(csr | 0x8040u); }
+    ~FlushDenormalsScope() noexcept { if (set) _mm_setcsr(csr); }
 #elif defined(__aarch64__)
     uint64_t fpcr;
+    bool set;
     FlushDenormalsScope() noexcept {
         asm volatile("mrs %0, fpcr" : "=r"(fpcr));
-        const uint64_t v = fpcr | (uint64_t(1) << 24);
-        asm volatile("msr fpcr, %0" : : "r"(v));
+        set = !(fpcr & (uint64_t(1) << 24));
+        if (set) { const uint64_t v = fpcr | (uint64_t(1) << 24); asm volatile("msr fpcr, %0" : : "r"(v)); }
     }
-    ~FlushDenormalsScope() noexcept { asm volatile("msr fpcr, %0" : : "r"(fpcr)); }
+    ~FlushDenormalsScope() noexcept { if (set) asm volatile("msr fpcr, %0" : : "r"(fpcr)); }
 #else
     FlushDenormalsScope() noexcept {}
 #endif
     FlushDenormalsScope(const FlushDenormalsScope&) = delete;
     FlushDenormalsScope& operator=(const FlushDenormalsScope&) = delete;
 };
-template <class F> struct SoftRange;
-template <> struct SoftRange<double> { static constexpr double win = 0x1p256;  static constexpr double tol = 0x1p-45; };
-template <> struct SoftRange<float>  { static constexpr float  win = 0x1p8f;   static constexpr double tol = 0x1p-20; };
 // The gradient pass's flushed products (soft_kernel_impl.inl, "The gradient pass
 // multiplies table values"): lb is the sum of the other factor over the F̂·P
 // intermediates that flushed, lc the number of two-factor products that did, in the
@@ -584,14 +606,15 @@ enum class Gate : int {
     InterGroupBytes, InterSoftBytes, InterScoreGatherCells,
     InterLinearIntGatherCells, InterLinearF32GatherCells, InterLinearF64GatherCells,
     InterGlobalLinearIntCells, InterGlobalLinearF32Cells, LinearStripedMinN, SoftF32MinCells,
-    InterMinFill, Count_
+    InterMinFill, SoftCkptRows, SoftCkptMinBytes, SoftDoubleFtz, Count_
 };
 inline constexpr const char* kGateNames[] = {
     "inter_group_bytes", "inter_soft_bytes", "inter_score_gather_cells",
     "inter_linear_int_gather_cells", "inter_linear_f32_gather_cells",
     "inter_linear_f64_gather_cells", "inter_global_linear_int_cells",
     "inter_global_linear_f32_cells", "linear_striped_min_n", "soft_f32_min_cells",
-    "inter_min_fill"};
+    "inter_min_fill", "soft_ckpt_rows", "soft_ckpt_min_bytes",
+    "soft_double_ftz"};
 static_assert(sizeof(kGateNames) / sizeof(kGateNames[0]) == static_cast<size_t>(Gate::Count_));
 inline constexpr int64_t kGateUnset = -1;
 inline constexpr int64_t kGateOff = INT64_MAX;
@@ -613,6 +636,79 @@ inline size_t gate_value(Gate g, size_t def) {
     const int64_t v = gate_override(g);
     return v < 0 ? def : static_cast<size_t>(v);
 }
+// The per-pair soft pass's checkpointed forward (Aligner::soft_ckpt_rows): environment
+// overrides, read once.  NWGRAD_SOFT_CKPT_ROWS=k (an integer >= 0): as the soft_ckpt_rows
+// gate when that is not set (k >= 1 blocks of k rows at every size, 0 the full tables at
+// every size); -1: unset.  NWGRAD_SOFT_CKPT_CHECK (set, not "0"): hash every forward row
+// and check its recomputation (a std::logic_error on a mismatch).
+inline int64_t soft_ckpt_env_rows() noexcept {
+    static const int64_t v = [] {
+        const char* e = std::getenv("NWGRAD_SOFT_CKPT_ROWS");
+        if (!e || !*e) return int64_t(-1);
+        char* end = nullptr;
+        const long long k = std::strtoll(e, &end, 10);
+        return (end && *end == 0 && k >= 0) ? int64_t(k) : int64_t(-1);
+    }();
+    return v;
+}
+// A non-negative integer from the environment, read once by the caller's static; -1 unset.
+inline int64_t env_nonneg_int(const char* name) noexcept {
+    const char* e = std::getenv(name);
+    if (!e || !*e) return -1;
+    char* end = nullptr;
+    const long long k = std::strtoll(e, &end, 10);
+    return (end && *end == 0 && k >= 0) ? int64_t(k) : int64_t(-1);
+}
+// The double soft pass's denormal handling (AGENTS.md, "Double at long lengths is
+// DENORMAL-bound"): soft_double_ftz / NWGRAD_SOFT_DOUBLE_FTZ (DEFAULT 1, since 2026-11-06)
+// runs the double soft kernels under FlushDenormalsScope, as float32 always does: 2-5x at
+// L >= 1000 (skynet 3.2-5x, nighthaven 1 thread 0.42-0.71, 6 threads 0.33-0.53 of the
+// time; L300 1.00; instructions unchanged); 0 restores gradual underflow.
+// (A tighter rescale window, the other candidate, gained nothing: sp_lazy.)  The gate wins
+// over the environment; -1: neither set.
+inline bool soft_double_ftz() noexcept {
+    const int64_t o = gate_override(Gate::SoftDoubleFtz);
+    if (o >= 0) return o != 0;
+    static const int64_t v = env_nonneg_int("NWGRAD_SOFT_DOUBLE_FTZ");
+    return v != 0;   // unset (-1): the default, on
+}
+inline bool soft_ckpt_env_check() noexcept {
+    static const bool v = [] { const char* e = std::getenv("NWGRAD_SOFT_CKPT_CHECK"); return e && *e && std::strcmp(e, "0") != 0; }();
+    return v;
+}
+// The forward tables' size (bytes: states x (m+1)(n+1) x the soft type's) from which the
+// per-pair soft pass checkpoints by default -- and then only when the batch runs at least
+// kSoftCkptMinWorkers worker threads (Aligner::soft_ckpt_rows; soft_ckpt_min_bytes set explicitly applies at any
+// thread count, off = never).  A new switch for a new code path, not a fill gate retuned.
+// Measured 2026-11-05: at ONE thread checkpointing never wins -- one pair's tables stream
+// fine and the recomputation costs ~30 instructions a cell affine (~13 linear): nighthaven
+// (v3) 1.13-1.48x slower in every cell, skynet (sse4) 1.2-1.4x.  With the cores busy, main
+// is memory-bound from L1000 affine and checkpointing wins: nighthaven, 6 threads,
+// checkpointed / full time: L1000 affine double 0.31, float32 0.48; L2000 affine 0.40 /
+// 0.44; linear L1000-2000 0.82-0.90; L4000 float32 affine 0.85, linear 0.83-0.85; but L300
+// (2.1 MB of tables) 1.31 at a 2 MiB threshold, hence 4 MiB (the crossover lies at
+// ~2.5-4 MiB).  L4000 double affine ran 1.45x slower at both thread counts, with main itself
+// anomalous there (14 ns/cell vs 6.4 at L2000): the double subnormals, paid twice by the
+// recomputation (branch proto/soft-denormal).  skynet, 8 threads: 1.0-1.3x (its single
+// cores stream better); peak RSS 10-20x lower everywhere (L4000 double affine 3.0 GB ->
+// 0.16 GB).  k = 16 / 32 / sqrt(m) equal on nighthaven, 64 slower at 6 threads.
+inline constexpr size_t kSoftCkptMinBytes = size_t(4) << 20;
+// ... and the workers the batch runs (min(n_threads, pairs)) from which it does.  nighthaven
+// (FTZ on, 474d01d): at 4 and 6 workers checkpointing paid in every cell (0.30-0.89 of the
+// time), at 2 it LOST (float32 affine L1000 1.30x main, double linear L1000 1.22x the
+// unchecked arm: two pairs in flight leave the memory system room, and the recomputation
+// shows), at 1 it lost everywhere (1.13-1.48x).
+inline constexpr size_t kSoftCkptMinWorkers = 4;
+// ... and only on x86-64, where every measured host gains from 4 workers (nighthaven 4 and
+// 6 workers 0.30-0.89 of the time, solace 8 workers pays).  Off on AArch64 and elsewhere:
+// spot (M1, 4 threads) ran SLOWER checkpointed -- double linear 1.15-1.17x from L1000,
+// float32 affine L1000 1.28x; the M1 is not memory-bound with 4 pairs in flight; 1 thread
+// equal to main.  An explicit soft_ckpt_min_bytes or soft_ckpt_rows forces it anywhere.
+#if defined(__x86_64__) || defined(_M_X64)
+inline constexpr bool kSoftCkptByDefault = true;
+#else
+inline constexpr bool kSoftCkptByDefault = false;
+#endif
 // ── The fill gates: which pairs join a shared (inter-pair) fill ────────────────
 //
 // Per ISA level and scalar type, measured by tools/gate_sweep.py (2026-10-31 / 11-01) on
