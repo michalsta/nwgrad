@@ -10,6 +10,7 @@ checkpointed code with no recomputation).
 """
 
 import os
+import platform
 import subprocess
 import sys
 
@@ -227,8 +228,8 @@ def test_env_rows_override():
 
 def test_default_is_thread_aware():
     """By default a pair checkpoints only when the batch runs at least 4 workers
-    (min(threads, pairs)) and only past 4 MiB of tables; an explicit soft_ckpt_min_bytes
-    applies at any thread count."""
+    (min(threads, pairs)), only past 4 MiB of tables and only on x86-64; an explicit
+    soft_ckpt_min_bytes applies at any thread count and on any architecture."""
     script = (
         "import sys, nwgrad, numpy as np\n"
         "from nwgrad import _tuning\n"
@@ -250,6 +251,8 @@ def test_default_is_thread_aware():
     # 501 x 501 x 3 x 8 B = 6.0 MB of tables: past the 4 MiB default
     assert cks(1, "default") == {"ck=0"}
     assert cks(2, "default") == {"ck=0"}
-    assert cks(4, "default") == {"ck=23"}
+    # on by default only on x86-64 (kSoftCkptByDefault: the M1 lost with 4 workers)
+    x86 = platform.machine().lower() in ("x86_64", "amd64")
+    assert cks(4, "default") == ({"ck=23"} if x86 else {"ck=0"})
     assert cks(1, str(1 << 20)) == {"ck=23"}
     assert cks(4, str(64 << 20)) == {"ck=0"}

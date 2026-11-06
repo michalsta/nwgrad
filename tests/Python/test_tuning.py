@@ -129,6 +129,31 @@ def test_kept_paths_keep_the_byte_budget():
     assert [b[i].aligned() for i in range(len(A))] == [ref[i].aligned() for i in range(len(A))]
 
 
+def test_hyperthreads_shrink_the_byte_budget():
+    _needs_shared_fill()
+    # More threads than physical cores: two threads share a core's caches and the hard
+    # budget's default is 9/16 (inter_pair_fits).  The longest square pair that shares at
+    # 2 threads runs its own fill at 4x the logical count; one 0.7 as long (cells 0.49x,
+    # under 9/16) still shares; an override is taken as given.
+    rng = np.random.default_rng(7)
+
+    def plan(L, n_threads):
+        A = ["".join(rng.choice(list(AA), L)) for _ in range(64)]
+        return nwgrad.SeqPairBatch(A, A, _params(), n_threads=n_threads,
+                                   traceback="pointers")._inter_plan()[:2]
+
+    lo, hi = 10, 4000
+    assert plan(lo, 2) == [64, 0] and plan(hi, 2) == [0, 64]
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        lo, hi = (mid, hi) if plan(mid, 2) == [64, 0] else (lo, mid)
+    many = 4 * (os.cpu_count() or 1)
+    assert plan(lo, many) == [0, 64]
+    assert plan(int(0.7 * lo), many) == [64, 0]
+    _tuning.set_gate("inter_group_bytes", 10**9)
+    assert plan(lo, many) == [64, 0]
+
+
 def test_dna_alone_keeps_a_wider_byte_budget():
     # One thread, alphabet <= 8: the mask-blend shared fill keeps winning to ~16 MiB of
     # tables (protein int16's budget is 450 KiB-1 MiB).  DNA int16 affine L150: ~2-4 MB.

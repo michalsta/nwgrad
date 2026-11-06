@@ -149,16 +149,16 @@ def test_default_is_split_by_precision(params):
 
 
 def test_default_split_does_not_leak_to_other_problem_types(params):
-    """The float32 default is pmax for affine Full in BOTH modes (Local since its endpoint
-    scans took the carry); Local double keeps pointers, and linear resolves to pointers
-    at either precision.  Local float32 `auto` must be bit-identical to explicit pmax —
-    a dispatch-liveness check, as in the test below."""
+    """Affine Full at floating T resolves to grid in every mode (Local and Glocal since
+    2026-11-05; Local runs Pointers within the pointer budget), and linear resolves to
+    pointers at either precision.  Local float32 `auto` within the budget must be
+    bit-identical to explicit pointers."""
     a, b = _seqs(2, 600, 700, 1)
     loc = _pair(a, b, params, "auto", dtype="float", mode="local")
-    assert loc.traceback == "hirschberg_pmax"
-    exp = _pair(a, b, params, "hirschberg_pmax", dtype="float", mode="local")
+    assert loc.traceback == "grid"
+    exp = _pair(a, b, params, "pointers", dtype="float", mode="local")
     assert (loc.score, loc.aligned()) == (exp.score, exp.aligned())
-    assert _pair(a, b, params, "auto", dtype="double", mode="local").traceback == "pointers"
+    assert _pair(a, b, params, "auto", dtype="double", mode="local").traceback == "grid"
     sp = nwgrad.SeqPair(a[0], b[0], params, gap_model="linear", mode="global",
                         grad_mode="hard", traceback="auto")
     assert sp.traceback == "pointers"

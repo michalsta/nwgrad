@@ -274,7 +274,7 @@ public:
     struct PhaseProfile {
         double chunk_s = 0.0, reserve_s = 0.0;
         double chunk_cells = 0.0, reserve_cells = 0.0;
-        long   chunk_tasks = 0, reserve_tasks = 0;
+        long long chunk_tasks = 0, reserve_tasks = 0;
         double finish_s = 0.0;
     };
     std::vector<PhaseProfile> profile_out;   // per worker, after a profiled sorted run
@@ -361,15 +361,21 @@ public:
         check_stored_(i);
         const auto& ops = path_[i];
         auto [i0, j0] = path_start_(i);
-        std::string a, b;
+        size_t cols = 0;
+        for (uint32_t op : ops) cols += op & 0x3fffffffu;
+        // Sized once and written by index, a run at a time: push_back per column reloaded
+        // the strings' data pointers after every store (char stores alias anything).
+        std::string a(cols, '-'), b(cols, '-');
         const auto ca = codes_a(i), cb = codes_b(i);
-        size_t ia = static_cast<size_t>(i0), jb = static_cast<size_t>(j0);
+        const std::string& sym = alpha_->symbols();
+        char* pa = a.data();
+        char* pb = b.data();
+        size_t ia = static_cast<size_t>(i0), jb = static_cast<size_t>(j0), c = 0;
         for (uint32_t op : ops) {
             const uint32_t t = op >> 30, len = op & 0x3fffffffu;
-            for (uint32_t k = 0; k < len; ++k) {
-                a.push_back(t == 2 ? '-' : alpha_->symbol_at(ca[ia++]));
-                b.push_back(t == 1 ? '-' : alpha_->symbol_at(cb[jb++]));
-            }
+            if (t != 2) for (uint32_t k = 0; k < len; ++k) pa[c + k] = sym[ca[ia++]];
+            if (t != 1) for (uint32_t k = 0; k < len; ++k) pb[c + k] = sym[cb[jb++]];
+            c += len;
         }
         return {std::move(a), std::move(b)};
     }
@@ -874,7 +880,7 @@ private:
             if (la == 0 || lb == 0 || (hb_case && hb_splits(own_tb, s_.traceback == TracebackMode::Default ? FullAl::kAutoPointerCells : 0, s_.hb_cutoff, la, lb)) ||
                 (!rows &&   // the score kernel keeps rows, not tables
                  !inter_pair_fits<T>(la, lb, GM == GapModel::Affine, soft, inter_w_(K), K.d.inter_w, s_.n_threads == 1, backend,
-                                    params.matrix.size() <= 8))) {
+                                    params.matrix.size() <= 8, threads_share_cores(s_.n_threads)))) {
                 other.push_back(i); continue;
             }
             if constexpr (nw_sat<T>)
@@ -1331,13 +1337,13 @@ private:
         std::copy(gaps.begin(), gaps.end(), d + cnt.size());
     }
     // Pair i's path (and with gj its guide), packed into its slot.
-    template <class Al>
-    void store_tpath_(size_t i, const Al& al, const DpBuffer& buf, std::vector<int>* gj) {
+    template <class Al, class Mv = NoMoves>
+    void store_tpath_(size_t i, const Al& al, const DpBuffer& buf, std::vector<int>* gj, Mv&& mv = Mv{}) {
         uint8_t* d = tp_.data() + tpo_[i];
         const int cap = static_cast<int>(len_a(i) + len_b(i));
         std::memset(d, 0, (static_cast<size_t>(cap) + 3) / 4);
         int i0 = 0, j0 = 0;
-        const int off = al.hard_path_packed(buf, d, cap, i0, j0, gj);
+        const int off = al.hard_path_packed(buf, d, cap, i0, j0, gj, mv);
         tps_[i] = {i0, j0, cap - off, off};
     }
     struct Work;   // (below: a worker's state)
@@ -1366,14 +1372,15 @@ private:
     }
     // Pair i's hard gradient (and with gj its guide) from the DP `al` just ran: counted
     // field by field along the traceback walk, then appended to w's buffer.
-    template <class Al>
-    void store_tcounts_(size_t i, const Al& al, const DpBuffer& buf, std::vector<int>* gj, Work& w) {
+    template <class Al, class Mv = NoMoves>
+    void store_tcounts_(size_t i, const Al& al, const DpBuffer& buf, std::vector<int>* gj, Work& w,
+                        Mv&& mv = Mv{}) {
         Touched& t = w.tc;
         t.begin(kstride_(), 2 * (len_a(i) + len_b(i)) + 2);
         uint32_t* keys = t.keys.data();
         uint32_t* slot = t.slot.data();
         size_t nk = 0;
-        al.hard_fields(buf, [&](uint32_t k) { if (slot[k]++ == 0) keys[nk++] = k; }, gj);
+        al.hard_fields(buf, [&](uint32_t k) { if (slot[k]++ == 0) keys[nk++] = k; }, gj, mv);
         std::vector<uint32_t>& out = tc_writer_(w);
         const uint64_t off = out.size();
         uint32_t esc = 0;
@@ -1406,10 +1413,11 @@ private:
     }
     // Pair i's hard gradient (and with gj its guide) from the DP `al` just ran, into the
     // batch's store.
-    template <class Al>
-    void store_hard_(size_t i, const Al& al, const DpBuffer& buf, std::vector<int>* gj, Work& w) {
-        if (s_.track_counts) store_tcounts_(i, al, buf, gj, w);
-        else                 store_tpath_(i, al, buf, gj);
+    template <class Al, class Mv = NoMoves>
+    void store_hard_(size_t i, const Al& al, const DpBuffer& buf, std::vector<int>* gj, Work& w,
+                     Mv&& mv = Mv{}) {
+        if (s_.track_counts) store_tcounts_(i, al, buf, gj, w, mv);
+        else                 store_tpath_(i, al, buf, gj, mv);
     }
     // One pair's gradient, sparse: the first n entries of keys / vals are the fields it
     // touches (in first-touch order) and their values.  `slot` has one entry per field of
@@ -1818,12 +1826,13 @@ private:
     }
     // The hard gradient and guide of the DP `al` just ran, into pair i, in one walk —
     // the untracked sequence spelled out at each site (the code it always was).
-#define NWGRAD_HARD_GRAD_GUIDE(i, al, w)                                   \
+// mv: the move sink of with_path_ (the stored path, from the same walk).
+#define NWGRAD_HARD_GRAD_GUIDE(i, al, w, mv)                               \
     do {                                                                    \
-        if (tracked_) { hard_grad_guide_(i, al, w); }                       \
+        if (tracked_) { hard_grad_guide_(i, al, w, mv); }                   \
         else {                                                              \
             (w).g.zero();                                                   \
-            (al).hard_grad_and_guide((w).buf, (w).g, (w).gj);               \
+            (al).hard_grad_and_guide((w).buf, (w).g, (w).gj, mv);           \
             store_grad_(i, (w).g);                                          \
             store_guide_(i, (w).gj);                                        \
         }                                                                   \
@@ -1839,27 +1848,55 @@ private:
             throw std::logic_error("nwgrad: internal: guide of the wrong length");
         std::copy(gj.begin(), gj.end(), guide_ptr_(i));
     }
-    template<class Al>
-    void store_path_(size_t i, const Al& al, const DpBuffer& buf) {
-        const auto [sa, sb] = al.aligned(buf);
-        const auto end = al.alignment_end();
-        auto& ops = path_[i];
-        ops.clear();
-        uint32_t t_prev = 3, len = 0;
-        for (size_t k = 0; k < sa.size(); ++k) {
-            const uint32_t t = (sa[k] == '-') ? 2u : (sb[k] == '-') ? 1u : 0u;
-            if (t != t_prev && len) { ops.push_back((t_prev << 30) | len); len = 0; }
-            t_prev = t; ++len;
+    // The stored path's writer: the walk's moves (last first, see NoMoves) as run-length
+    // ops, written backward from `w`.  Why not the gapped strings: the path used to be
+    // rendered by aligned() into two std::strings (a second traceback walk, a push_back
+    // per step) and re-scanned into ops; on miRNA 22x50 int16 (SSE4, shared fill) that
+    // walk and the re-scan were 31 % of the profile, more than the fill.  t / len are
+    // 64-bit on purpose: a uint32 store through w can then not alias them, so they stay
+    // in registers across the walk (a uint32 member would be reloaded after each store).
+    struct OpsSink {
+        uint32_t* w;
+        uint64_t t = 3, len = 0;
+        void operator()(uint8_t k) noexcept {
+            if (k == t) { ++len; return; }
+            if (len) *--w = static_cast<uint32_t>(t << 30 | len);
+            t = k; len = 1;
         }
-        if (len) ops.push_back((t_prev << 30) | len);
+        uint32_t* finish() noexcept {
+            if (len) *--w = static_cast<uint32_t>(t << 30 | len);
+            return w;
+        }
+    };
+    // fn(mv) runs the one traceback walk of pair i; with keep, mv is an OpsSink into
+    // path_[i] (and the end cell and kStored are recorded), else NoMoves.  A path has at
+    // most len_a + len_b moves, so at most that many runs.
+    template<class Al, class Fn>
+    void with_path_(size_t i, const Al& al, bool keep, Fn&& fn) {
+        if (!keep) { fn(NoMoves{}); return; }
+        auto& ops = path_[i];
+        const size_t cap = len_a(i) + len_b(i);
+        ops.resize(cap);
+        OpsSink sink{ops.data() + cap};
+        fn(sink);
+        const uint32_t* b = sink.finish();
+        ops.erase(ops.begin(), ops.begin() + (b - ops.data()));
+        const auto end = al.alignment_end();
         path_end_[i] = {end.first, end.second};
         flags_[i] |= kStored;
     }
+    // The guide of the DP `al` just ran (guide_j_from_viterbi's), into pair i, and with
+    // keep its path, in one walk.
+    template<class Al>
+    void guide_path_(size_t i, const Al& al, Work& w, bool keep) {
+        with_path_(i, al, keep, [&](auto&& mv) { al.path_and_guide(w.buf, mv, w.gj); });
+        store_guide_(i, w.gj);
+    }
     // The hard gradient and the guide of the DP `al` just ran, into pair i, in one walk:
     // tracked, into the batch's store (store_hard_); otherwise the dense gradient.
-    template<class Al>
-    void hard_grad_guide_(size_t i, Al& al, Work& w) {   // tracked
-        store_hard_(i, al, w.buf, &w.gj, w);
+    template<class Al, class Mv = NoMoves>
+    void hard_grad_guide_(size_t i, Al& al, Work& w, Mv&& mv = Mv{}) {   // tracked
+        store_hard_(i, al, w.buf, &w.gj, w, mv);
         store_guide_(i, w.gj);
     }
     // Hard or soft gradient of the DP `al` just ran, into pair i.
@@ -1882,8 +1919,7 @@ private:
     template<class Al>
     void run_dp_with_buf_(size_t i, Al& al, Work& w, bool keep) {
         al.compute_viterbi(w.buf);
-        store_guide_(i, al.guide_j_from_viterbi(w.buf));
-        if (keep) store_path_(i, al, w.buf);
+        guide_path_(i, al, w, keep);
         if (grad_mode_ == GradMode::Soft) {
             fwdbwd_(i, al, w.buf);
             score_[i] = al.log_z();
@@ -1912,8 +1948,7 @@ private:
         if (grad_mode_ == GradMode::Hard) {
             al.compute_viterbi(w.buf);
             score_[i] = al.score();
-            NWGRAD_HARD_GRAD_GUIDE(i, al, w);
-            if (keep) store_path_(i, al, w.buf);
+            with_path_(i, al, keep, [&](auto&& mv) { NWGRAD_HARD_GRAD_GUIDE(i, al, w, mv); });
             finish_(i, false, false);
             return;
         }
@@ -1954,8 +1989,7 @@ private:
         if (grad_mode_ == GradMode::Hard) {   // one traceback walk for guide and gradient
             al.compute_viterbi(w.buf);
             score_[i] = al.score();
-            NWGRAD_HARD_GRAD_GUIDE(i, al, w);
-            if (keep) store_path_(i, al, w.buf);
+            with_path_(i, al, keep, [&](auto&& mv) { NWGRAD_HARD_GRAD_GUIDE(i, al, w, mv); });
             finish_(i, true, false);
             return;
         }
@@ -1996,14 +2030,13 @@ private:
         if (!pre) set_problem_(al, i);
         al.adopt_interleaved(w.buf, W, lane, best, bi, bj, stride);
         score_[i] = al.score();
-        if (grad_mode_ == GradMode::Hard) {
-            NWGRAD_HARD_GRAD_GUIDE(i, al, w);   // one walk for both
+        if (grad_mode_ == GradMode::Hard) {   // one walk for gradient, guide and path
+            with_path_(i, al, keep, [&](auto&& mv) { NWGRAD_HARD_GRAD_GUIDE(i, al, w, mv); });
         } else {
-            store_guide_(i, al.guide_j_from_viterbi(w.buf));
+            guide_path_(i, al, w, keep);   // (before a forward-backward reuses buf)
             if (grad_mode_ == GradMode::Soft && soft) {
                 apply_soft_lane_(i, *soft);
             } else if (grad_mode_ == GradMode::Soft) {
-                if (keep) store_path_(i, al, w.buf);   // before forward-backward reuses buf
                 fwdbwd_(i, al, w.buf);
                 score_[i] = al.log_z();
                 grad_with_buf_(i, al, w);
@@ -2011,7 +2044,6 @@ private:
                 return;
             }
         }
-        if (keep) store_path_(i, al, w.buf);
         finish_(i, false, false);
     }
 
@@ -2027,8 +2059,7 @@ private:
         else {
             set_problem_(w.full, i);
             w.full.compute_viterbi(w.buf);
-            store_guide_(i, w.full.guide_j_from_viterbi(w.buf));
-            if (keep) store_path_(i, w.full, w.buf);
+            guide_path_(i, w.full, w, keep);
         }
         apply_soft_lane_(i, *soft);
         finish_(i, false, pending);
@@ -2058,9 +2089,9 @@ private:
         al.adopt_interleaved(w.buf, W, lane, best, bi, bj);
         score_[i] = al.score();
         if (grad_mode_ == GradMode::Hard) {
-            NWGRAD_HARD_GRAD_GUIDE(i, al, w);
+            NWGRAD_HARD_GRAD_GUIDE(i, al, w, NoMoves{});
         } else {
-            store_guide_(i, al.guide_j_from_viterbi(w.buf));
+            guide_path_(i, al, w, false);
         }
         finish_(i, true, false);
     }
@@ -2247,7 +2278,7 @@ private:
         if (!rows &&
             !inter_pair_fits<T>(len_a(i), len_b(i), GM == GapModel::Affine,
                                 grad_mode_ == GradMode::Soft, inter_w_(K), K.d.inter_w, s_.n_threads == 1, K.level,
-                                alpha_->size() <= 8))
+                                alpha_->size() <= 8, threads_share_cores(s_.n_threads)))
             return false;
         // Linear hard fill: the shared fill gathers per lane-cell over 8 letters (the own
         // striped kernel reads a profile row) and blends on masks up to 8; its cell cap per
