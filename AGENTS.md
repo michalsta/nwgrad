@@ -871,7 +871,10 @@ matrices, 4 and 6 letters, ragged B):
    `t[4a + b]`, the row's `4a` and the column's `b` are pre-transposed byte vectors, and a
    cell's score is `paddb` + `pshufb` + `pmovsx*` (+ `cvtdq2ps` / `cvtdq2pd`). Past int8,
    non-integral or tracked: the tree. (int16 inside the quarter rule always fits:
-   step_max <= 8191 / 66.)
+   step_max <= 8191 / 66.) On AArch64 the table serves int16 lanes only: spot (M1)
+   measured `tbl` + widen slower than the tree for int32 / float32 (path / hard
+   1.04-1.14x main, worst 1.22-1.27x; with the tree 0.94-0.99x), int16 faster (miRNA score
+   0.78, path / hard 0.90, DNA L100 0.86-0.89); double 1.01-1.02, protein 0.98-1.00.
 4. Per-row work: untracked tree rows build P by shuffle from the transposed A codes where
    the scores are int8 (the transposed A is built only then), `live` is one compare
    against the lanes' m, Global capture visits only the lanes ending at the row (lanes

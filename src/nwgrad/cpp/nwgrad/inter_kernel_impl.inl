@@ -723,7 +723,16 @@ static void inter_lv_dispatch(const InterJobT<T>& J, F&& f) {
     if (na > 8)      f(std::integral_constant<int, kLvGather>{});
     else if (na > 4) f(std::integral_constant<int, 3>{});
     else {
-        if constexpr (kByteShuffle && !Tr) {
+        // AArch64: int16 lanes only.  On spot (M1) the tbl + widen form LOST to the blend
+        // tree for the 4-lane types (int32 / float32: path / hard 1.04-1.14x main, worst
+        // 1.22-1.27x; the tree, forced by a non-integral matrix, 0.94-0.99x), while int16
+        // gained (miRNA score 0.78, path / hard 0.90; DNA L100 0.86-0.89), 2026-11-06.
+#if defined(__aarch64__)
+        constexpr bool kLutType = sizeof(T) == 2;
+#else
+        constexpr bool kLutType = true;
+#endif
+        if constexpr (kByteShuffle && kLutType && !Tr) {
             bool fit = true;
             for (int k = 0; k < na * na; ++k) fit &= fits_i8(J.blk[k]);
             if (fit) { f(std::integral_constant<int, kLvLut>{}); return; }
