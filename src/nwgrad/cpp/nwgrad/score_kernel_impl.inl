@@ -335,13 +335,14 @@ inline constexpr bool kMainForm =
 #else
     sizeof(T) == 2 && (int)stdx::native_simd<T>::size() >= 16;
 #endif
-// kMainDirect: the entry calls the stored-prefix instantiation (SQ) itself, so main's form
-// compiles as its own function inlined into the entry, as on main.  Through the SQ = false
-// form (which tail-calls it) gcc inlined it into that function, and the combined body is
+// kMainDirect: the entry calls main's form itself, compiled as its own function inlined
+// into the entry, as on main.  Through the SQ = false form (which tail-calls the stored-
+// prefix instantiation) gcc inlined it into that function, and the combined body is
 // the one nighthaven measured: its L200 cells run the stored-prefix form with main's
 // operations, yet 6-9 % slower at 12 % fewer instructions -- the generated code, not the
-// work.  x86 only: on AArch64 the combined body measured FASTER than main (spot int16
-// affine Global L100 0.82-0.86), so it stays there.
+// work.  The entry runs main's kernel itself (score_affine_striped_pos_main, below).  x86
+// only: on AArch64 the combined body measured FASTER than main (spot int16 affine Global
+// L100 0.82-0.86), so it stays there.
 template <class T>
 inline constexpr bool kMainDirect =
 #if defined(__aarch64__)
@@ -738,6 +739,283 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
 // AGENTS.md ("The gap carry, shortened").  Floating T only: -inf - ge stays -inf, where an
 // integer sentinel stepped by - ge per segment could wrap (the integer types take the exact
 // prefix-max carry in score_affine_striped_pos instead).
+// score_affine_striped_pos_main: main's integer score kernel (7c69934) verbatim, the form
+// kMainDirect's targets run.  The stored-prefix instantiation of the re-formed kernel above
+// (SQ) does main's operations, but written as lambdas around a second template parameter
+// gcc compiles its row code differently: on AArch64 int32 Global a different once-per-row
+// schedule (spill, reloads), ~9 ns a row more on spot (L1000 1.020, L3000 1.008, Local
+// 1.000).  This copy compiles as main's does (object diff, lvl_neon int32: the entry and the
+// kernels it calls instruction for instruction main's).
+template <class T, bool Local, bool MOnly, bool Tr = false, bool Sat = false, bool U2 = false, bool Glocal = false>
+static void score_affine_striped_pos_main(ScoreJob<T>& job) {
+    using vd = stdx::native_simd<T>;
+    const int W = (int)vd::size();
+    const T NINF = nw_ninf_s<T, Sat>;
+
+    const int m = job.m, n = job.n, nalpha = job.nalpha;
+    T go_a = job.go_a, ge_a = job.ge_a, go_b = job.go_b, ge_b = job.ge_b;
+    const TrackJob<T>& tr = job.tr;
+    if constexpr (Tr) { go_a = tr.go_a[0]; ge_a = tr.ge_a[0]; }
+    const unsigned char* a = job.a;
+    const unsigned char* b = job.b;
+    DpBufferT<T>& buf = *job.buf;
+
+    if (n == 0) {
+        if constexpr (Local) job.score = T(0);
+        else if constexpr (Tr) job.score = (m == 0) ? T(0) : tr.bx0[m];
+        else job.score = (m == 0) ? T(0) : static_cast<T>(-(go_b + static_cast<T>(m) * ge_b));
+        return;
+    }
+
+    const int seg = (n + W - 1) / W;
+    const std::size_t sw = (std::size_t)seg * W;
+    // five rolling rows and Local's padding mask: one block (spread_rows, dp_buffer.hpp)
+    std::size_t rs; T* const rows = spread_rows<T>(buf.srows, sw, 6, rs);
+    const T* pad = nullptr;
+    // (MOnly's M padding is clamped to exactly 0 for floating T — the padding profile is
+    // -inf — but an integer T pads the profile with 0 (nw_pad), so its padding M is a
+    // real value and needs the mask too.)
+    if constexpr ((Local && (!MOnly || nw_is_int<T>)) || Glocal) pad = striped_pad_into<T, Sat>(rows + 5 * rs, n, seg, W);
+    auto padded = [&](const vd& v, int s) {
+        vd p; p.copy_from(pad + (std::size_t)s * W, stdx::element_aligned);
+        return vadd<Sat>(v, p);
+    };
+
+    striped_profile_build<T, Tr>(buf.sprof, job.blk, nalpha, b, n, seg, W, tr);
+
+    T* pD = rows + 3 * rs; T* pX = rows + 4 * rs;                          // row i-1
+    T* cD = rows;          T* cX = rows + rs;     T* cY = rows + 2 * rs;   // row i
+
+    // row 0: D = max(M, X, Y) of the three-state row 0, X = -inf; padding -inf
+    for (std::size_t k = 0; k < sw; ++k) { pD[k] = NINF; pX[k] = NINF; }
+    for (int l = 0; l < W; ++l)
+        for (int s = 0; s < seg; ++s) {
+            const int j = l * seg + s + 1;
+            if (j <= n) {
+                const std::size_t k = (std::size_t)s * W + l;
+                if constexpr (Local || Glocal) pD[k] = 0;
+                else                           pD[k] = -(go_a + j * ge_a);
+            }
+        }
+
+    vd vgo_a(go_a), vge_a(ge_a), vgo_b(go_b), vge_b(ge_b);
+    vd vgoe_a = vgo_a + vge_a, vgoe_b = vgo_b + vge_b;   // open_pen (integer T)
+    const vd vzero(static_cast<T>(0)), vninf(NINF);
+    vd vbest = vzero;
+    T bD = 0;                               // D of column 0, previous row (M(0,0) = 0)
+
+    auto any_gt = [](const vd& x, const vd& y) -> bool {
+#if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
+        if constexpr (sizeof(T) == 8) return avx512d_gt(x, y) != 0;
+        else                                     return stdx::any_of(x > y);
+#else
+        return stdx::any_of(x > y);
+#endif
+    };
+
+    for (int i = 1; i <= m; ++i) {
+        if constexpr (Tr) {
+            go_a = tr.go_a[i]; ge_a = tr.ge_a[i]; go_b = tr.go_b[i]; ge_b = tr.ge_b[i];
+            vgo_a = vd(go_a); vge_a = vd(ge_a); vgo_b = vd(go_b); vge_b = vd(ge_b);
+            vgoe_a = vgo_a + vge_a; vgoe_b = vgo_b + vge_b;
+        }
+        const T nbM = Local ? T(0) : NINF;
+        T nbX;
+        if constexpr (Tr) nbX = Local ? NINF : tr.bx0[i];
+        else              nbX = Local ? NINF : -(go_b + i * ge_b);
+        const T nbD = std::max(nbM, nbX);   // column 0's VY is -inf
+        const T nbOpen = nw_sub(nw_sub(nbD, go_a), ge_a);
+        const T* sub = striped_row_profile<T, Tr>(buf.sprof.data(), job.blk, nalpha, a, b, n, seg, W, i, tr);
+
+        vd Oin([&](int q) { return q == 0 ? nbOpen : NINF; });
+        vd Yin = vninf;
+        // integer carry: running prefix max, the previous segment's opens, the ramp
+        [[maybe_unused]] vd fP = vninf, fOprev = vninf, fR, fBase;
+        if constexpr (nw_is_int<T> && W >= 4) {
+            fBase = vd([&](int l) { return static_cast<T>(static_cast<T>(l * seg) * ge_a); });
+            fR = fBase;
+            // Segment 0 has no Q term; seeded so that its fOprev + fR is exactly -inf (the
+            // lane arithmetic wraps), which leaves fP at -inf with no `s > 0` test in the
+            // loop — gcc kept that test on every segment (sse4: 3 branches per segment).
+            fOprev = vsub<Sat>(vninf, fBase);   // nw_sat: stays -inf; its Q is then -inf + base, a drifted sentinel below every real value
+        }
+        if constexpr (nw_is_int<T> && W >= 4 && U2) {
+            // Two segments a trip: both segments' loads first, the two cells, then the two
+            // carry steps.  The same operations in the same order per cell (bit-identical);
+            // what changes is the instruction order gcc emits -- it schedules a loop body
+            // as written and issued one segment's chain at a time, where clang unrolls the
+            // rolled loop by two and interleaves the iterations itself.  The diagonal of
+            // segment s is segment s-1's up vector, carried in a register (the rolled form
+            // reloads it).
+            auto cell = [&](const vd& dD, const vd& uD, const vd& uX, const vd& sb, int s,
+                            vd& mx, vd& vmv) __attribute__((always_inline)) {
+                vmv = vadd<Sat>(dD, sb);
+                if constexpr (Local) vmv = stdx::max(vmv, vzero);
+                const vd vxv = stdx::max(open_pen<Sat>(uD, vgo_b, vge_b, vgoe_b), vsub<Sat>(uX, vge_b));
+                mx = stdx::max(vmv, vxv);
+                vxv.copy_to(cX + (std::size_t)s * W, stdx::element_aligned);
+                mx.copy_to(cD + (std::size_t)s * W, stdx::element_aligned);
+            };
+            auto carry = [&](const vd& mx, const vd& vmv, int s) __attribute__((always_inline)) {
+                fP = stdx::max(fP, vadd<Sat>(fOprev, fR));
+                nv_store(cY + (std::size_t)s * W, fP);
+                fOprev = open_pen<Sat>(mx, vgo_a, vge_a, vgoe_a);
+                fR += vge_a;
+                if constexpr (Local) {
+                    if constexpr (MOnly) vbest = stdx::max(vbest, padded(vmv, s));
+                    else                 vbest = stdx::max(vbest, padded(mx, s));
+                }
+            };
+            vd dD;
+            {
+                vd lD; lD.copy_from(pD + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                dD = lane_shift_in(lD, bD);
+            }
+            int s = 0;
+            for (; s + 1 < seg; s += 2) {
+                vd sb0, sb1, uD0, uX0, uD1, uX1;
+                sb0.copy_from(sub + (std::size_t)s * W, stdx::element_aligned);
+                sb1.copy_from(sub + (std::size_t)(s + 1) * W, stdx::element_aligned);
+                uD0.copy_from(pD + (std::size_t)s * W, stdx::element_aligned);
+                uX0.copy_from(pX + (std::size_t)s * W, stdx::element_aligned);
+                uD1.copy_from(pD + (std::size_t)(s + 1) * W, stdx::element_aligned);
+                uX1.copy_from(pX + (std::size_t)(s + 1) * W, stdx::element_aligned);
+                vd mx0, vmv0, mx1, vmv1;
+                cell(dD, uD0, uX0, sb0, s, mx0, vmv0);
+                cell(uD0, uD1, uX1, sb1, s + 1, mx1, vmv1);
+                carry(mx0, vmv0, s);
+                carry(mx1, vmv1, s + 1);
+                dD = uD1;
+            }
+            if (s < seg) {
+                vd sb0, uD0, uX0, mx0, vmv0;
+                sb0.copy_from(sub + (std::size_t)s * W, stdx::element_aligned);
+                uD0.copy_from(pD + (std::size_t)s * W, stdx::element_aligned);
+                uX0.copy_from(pX + (std::size_t)s * W, stdx::element_aligned);
+                cell(dD, uD0, uX0, sb0, s, mx0, vmv0);
+                carry(mx0, vmv0, s);
+            }
+        } else
+        for (int s = 0; s < seg; ++s) {
+            vd dD;
+            if (s == 0) {
+                vd lD; lD.copy_from(pD + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                dD = lane_shift_in(lD, bD);
+            } else {
+                dD.copy_from(pD + (std::size_t)(s - 1) * W, stdx::element_aligned);
+            }
+            vd sb; sb.copy_from(sub + (std::size_t)s * W, stdx::element_aligned);
+            vd vmv = vadd<Sat>(dD, sb);
+            if constexpr (Local) vmv = stdx::max(vmv, vzero);
+            vd uD, uX;
+            uD.copy_from(pD + (std::size_t)s * W, stdx::element_aligned);
+            uX.copy_from(pX + (std::size_t)s * W, stdx::element_aligned);
+            const vd vxv = stdx::max(open_pen<Sat>(uD, vgo_b, vge_b, vgoe_b), vsub<Sat>(uX, vge_b));
+            const vd mx = stdx::max(vmv, vxv);
+            vxv.copy_to(cX + (std::size_t)s * W, stdx::element_aligned);
+            if constexpr (nw_is_int<T> && W >= 4) {
+                // D without Y for now (the carry raises it below).  Q(s) = open(s-1) +
+                // ramp(s) into the running prefix max (s >= 1; segment 0's Q needs the
+                // LAST segment's open, shifted a lane, and is folded in after the row)
+                mx.copy_to(cD + (std::size_t)s * W, stdx::element_aligned);
+                fP = stdx::max(fP, vadd<Sat>(fOprev, fR));
+                nv_store(cY + (std::size_t)s * W, fP);
+                fOprev = open_pen<Sat>(mx, vgo_a, vge_a, vgoe_a);
+                fR += vge_a;
+                if constexpr (Local) {
+                    if constexpr (MOnly) vbest = stdx::max(vbest, padded(vmv, s));
+                    else                 vbest = stdx::max(vbest, padded(mx, s));
+                }
+            } else {
+            const vd vyv = stdx::max(Oin, vsub<Sat>(Yin, vge_a));
+            const vd dn = stdx::max(mx, vyv);
+            vyv.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
+            dn.copy_to(cD + (std::size_t)s * W, stdx::element_aligned);
+            if constexpr (Local) {
+                if constexpr (MOnly) vbest = stdx::max(vbest, vmv);
+                else                 vbest = stdx::max(vbest, padded(dn, s));
+            }
+            Oin = open_pen<Sat>(mx, vgo_a, vge_a, vgoe_a);
+            Yin = vyv;
+            }
+        }
+        const vd Olast = Oin;
+
+        if constexpr (nw_is_int<T> && W >= 4) {
+            // segment 0's term, then the lane carry-in, then ONE pass: Y = max(P', cin') - ramp
+            // folded straight into D.  max is exact and associative, so Y is int_pmax_carry's.
+            const vd Q0 = vadd<Sat>(lane_shift_in(fOprev, nbOpen), fBase);
+            // int16: the in-register lane scan (int_lane_carry_in), fused score-only time / the
+            // scalar scan 0.83-0.94 v3, 0.78-0.80 AVX-512, 0.83-0.87 NEON.  Wider types keep the
+            // scalar scan: int32 0.91-1.03 across the three (v3 Global L300 1.027).
+            vd vcin;
+            if constexpr (sizeof(T) == 2) {
+                vcin = int_lane_carry_in<vd, (int)vd::size(), Sat>(stdx::max(Q0, fP), nw_sub<T>(NINF, ge_a));
+            } else {
+                alignas(64) T tot[64], cin[64];
+                stdx::max(Q0, fP).copy_to(tot, stdx::element_aligned);
+                T run = nw_sub<T>(NINF, ge_a);
+                for (int l = 0; l < W; ++l) { cin[l] = run; run = std::max(run, tot[l]); }
+                vcin.copy_from(cin, stdx::element_aligned);
+            }
+            vcin = stdx::max(vcin, Q0);
+            vd rq = fBase;
+            for (int s = 0; s < seg; ++s) {
+                const vd y = vsub<Sat>(stdx::max(nv_load<vd>(cY + (std::size_t)s * W), vcin), rq);
+                vd d; d.copy_from(cD + (std::size_t)s * W, stdx::element_aligned);
+                d = stdx::max(d, y);
+                d.copy_to(cD + (std::size_t)s * W, stdx::element_aligned);
+                if constexpr (Local && !MOnly) vbest = stdx::max(vbest, padded(y, s));
+                rq += vge_a;
+            }
+        } else
+        for (int r = 0; r < W; ++r) {
+            vd last; last.copy_from(cY + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+            vd F = lane_shift_in(last, NINF);
+            F = vsub<Sat>(F, vge_a);
+            if (r == 0) {
+                vd Os = lane_shift_in(Olast, NINF);
+                F = stdx::max(Os, F);
+            }
+            bool changed = false;
+            for (int s = 0; s < seg; ++s) {
+                vd v; v.copy_from(cY + (std::size_t)s * W, stdx::element_aligned);
+                if (!any_gt(F, v)) break;
+                v = stdx::max(v, F);
+                v.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
+                vd d; d.copy_from(cD + (std::size_t)s * W, stdx::element_aligned);
+                d = stdx::max(d, v);
+                d.copy_to(cD + (std::size_t)s * W, stdx::element_aligned);
+                if constexpr (Local && !MOnly) vbest = stdx::max(vbest, padded(v, s));
+                F = vsub<Sat>(v, vge_a);
+                changed = true;
+            }
+            if (!changed) break;
+        }
+
+        std::swap(pD, cD); std::swap(pX, cX);
+        bD = nbD;
+    }
+
+    if constexpr (Local) {
+        T best = 0;
+        for (int q = 0; q < W; ++q) best = std::max(best, static_cast<T>(vbest[q]));
+        job.score = best;
+    } else if constexpr (Glocal) {
+        vd vb = vninf;   // the best cell of the last row (D = every state), padding masked
+        for (int s = 0; s < seg; ++s) {
+            vd v; v.copy_from(pD + (std::size_t)s * W, stdx::element_aligned);
+            vb = stdx::max(vb, padded(v, s));
+        }
+        T best = bD;   // column 0 of the last row: an end too (A all gapped)
+        for (int q = 0; q < W; ++q) best = std::max(best, static_cast<T>(vb[q]));
+        job.score = best;
+    } else {
+        const std::size_t k = (std::size_t)((n - 1) % seg) * W + (std::size_t)((n - 1) / seg);
+        job.score = pD[k];
+    }
+}
+
 template <class T, bool Local, bool MOnly, bool Tr = false, bool Glocal = false>
 static void score_affine_striped_pos_fp(ScoreJob<T>& job) {
     using vd = stdx::native_simd<T>;
@@ -1298,6 +1576,13 @@ static bool score_unroll2() noexcept {
     }();
     return on;
 }
+// The integer positive-open kernel the entry runs: main's verbatim where kMainDirect,
+// else the re-formed one (its stored-prefix form up to kStoredPrefixSeg segments).
+template <class T, bool Local, bool MOnly, bool Tr, bool Sat, bool U2, bool Glocal>
+[[gnu::always_inline]] static inline void score_pos_int(ScoreJob<T>& job) {
+    if constexpr (kMainDirect<T>) score_affine_striped_pos_main<T, Local, MOnly, Tr, Sat, U2, Glocal>(job);
+    else                          score_affine_striped_pos<T, Local, MOnly, Tr, Sat, U2, Glocal>(job);
+}
 template <class T, bool Tr, bool Sat = false>
 static void score_entry_impl(ScoreJob<T>& job) {
     const bool glocal = job.local == 2;   // 0 Global, 1 Local, 2 Glocal (ScoreJob::local)
@@ -1341,22 +1626,20 @@ static void score_entry_impl(ScoreJob<T>& job) {
                 score_affine_striped_pos_fp<T, false, false, Tr>(job);
             }
         } else if (score_unroll2()) {
-            constexpr bool D = kMainDirect<T>;   // main's form called directly (see kMainDirect)
-            if (glocal) score_affine_striped_pos<T, false, false, Tr, Sat, true, true, D>(job);
+            if (glocal) score_pos_int<T, false, false, Tr, Sat, true, true>(job);
             else if (job.local) {
-                if (pos_ext) score_affine_striped_pos<T, true, true, Tr, Sat, true, false, D>(job);
-                else         score_affine_striped_pos<T, true, false, Tr, Sat, true, false, D>(job);
+                if (pos_ext) score_pos_int<T, true, true, Tr, Sat, true, false>(job);
+                else         score_pos_int<T, true, false, Tr, Sat, true, false>(job);
             } else {
-                score_affine_striped_pos<T, false, false, Tr, Sat, true, false, D>(job);
+                score_pos_int<T, false, false, Tr, Sat, true, false>(job);
             }
         } else {
-            constexpr bool D = kMainDirect<T>;
-            if (glocal) score_affine_striped_pos<T, false, false, Tr, Sat, false, true, D>(job);
+            if (glocal) score_pos_int<T, false, false, Tr, Sat, false, true>(job);
             else if (job.local) {
-                if (pos_ext) score_affine_striped_pos<T, true, true, Tr, Sat, false, false, D>(job);
-                else         score_affine_striped_pos<T, true, false, Tr, Sat, false, false, D>(job);
+                if (pos_ext) score_pos_int<T, true, true, Tr, Sat, false, false>(job);
+                else         score_pos_int<T, true, false, Tr, Sat, false, false>(job);
             } else {
-                score_affine_striped_pos<T, false, false, Tr, Sat, false, false, D>(job);
+                score_pos_int<T, false, false, Tr, Sat, false, false>(job);
             }
         }
         return;
