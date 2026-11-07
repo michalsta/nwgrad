@@ -14,7 +14,10 @@
 #include "catch.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
+#include <stdexcept>
+#include <type_traits>
 #include <cstring>
 #include <random>
 #include <span>
@@ -153,6 +156,105 @@ TEST_CASE("compute_score is bit-identical to the exact fill's score", "[score]")
     }
     INFO(n_checked);
     REQUIRE(n_checked == iters * 2 * 4 * 2);
+}
+
+// Integer T: compute_score against the same T's exact fill and against double's, for
+// int16 / int32 / int64 with integral params (negative opens and extends included),
+// lengths to ~1500 (int16's saturating regime, many segments, padding over several
+// lanes), and with the narrow-lane score (int32 -> int16, int64 -> int32) forced on
+// and off.  A problem the type refuses (overflow bound) is skipped.
+template <GapModel GM, AlignMode AM, class T>
+bool int_one(const std::string& a, const std::string& b, const AlignParams& p, int kern,
+             double& got_out) {
+    Aligner<GM, AM, AlignBand::Full, T> ref, al;
+    try { ref.set_problem(a, b, p); } catch (const std::overflow_error&) { return false; }
+    ref.set_kernel(kern); ref.set_traceback(TracebackMode::Pointers);
+    DpBufferT<T> rbuf; ref.compute_viterbi(rbuf);
+    const double want = ref.score();
+    Aligner<GM, AM, AlignBand::Full, double> dref;
+    dref.set_kernel(kBackendScalar); dref.set_traceback(TracebackMode::Pointers);
+    DpBufferT<double> dbuf; dref.set_problem(a, b, p); dref.compute_viterbi(dbuf);
+    for (int narrow : {0, 1}) {
+        int_narrow_mode().store(narrow);
+        al.set_kernel(kern); al.set_problem(a, b, p);
+        DpBufferT<T> buf;
+        const double got = al.compute_score(buf);
+        INFO("a=" << a << " b=" << b << " kern=" << kern << " T=" << sizeof(T) << " narrow=" << narrow
+             << " GM=" << static_cast<int>(GM) << " AM=" << static_cast<int>(AM) << " want=" << want
+             << " double=" << dref.score() << " got=" << got << " gaps " << p.gap_open_a << "/"
+             << p.gap_extend_a << " " << p.gap_open_b << "/" << p.gap_extend_b);
+        REQUIRE(got == want);
+        REQUIRE(got == dref.score());
+        got_out = got;
+    }
+    int_narrow_mode().store(-1);
+    return true;
+}
+
+TEST_CASE("integer compute_score equals the integer and double fills", "[score][integer]") {
+    std::mt19937_64 rng(20261105);
+    auto ri = [&](int lo, int hi) { return std::uniform_int_distribution<int>(lo, hi)(rng); };
+    const Alphabet* alphas[2] = {&Alphabet::dna(), &Alphabet::protein()};
+    const std::vector<int> kerns = score_backends();
+    const long iters = fuzz_iters(300) / 2 + 1;
+    long n_checked = 0, n_refused = 0;
+    for (long it = 0; it < iters; ++it) {
+        const Alphabet& A = *alphas[ri(0, 2) == 0];
+        const int na = A.size();
+        AlignParams p(A);
+        const int big = ri(0, 3) == 0;   // scores large enough to refuse int16 at length
+        for (int x = 0; x < na; ++x)
+            for (int y = 0; y < na; ++y)
+                p.matrix.at(x, y) = static_cast<double>(x == y ? ri(1, big ? 12 : 4) : ri(big ? -8 : -3, 1));
+        auto gap = [&](bool ext) { return static_cast<double>(ri(0, ext ? 3 : big ? 14 : 6)); };
+        p.gap_open_a = gap(false); p.gap_extend_a = gap(true);
+        p.gap_open_b = gap(false); p.gap_extend_b = gap(true);
+        if (ri(0, 3) == 0) {
+            if (ri(0, 1)) p.gap_open_a = -p.gap_open_a;
+            if (ri(0, 1)) p.gap_open_b = -p.gap_open_b;
+            if (ri(0, 2) == 0) p.gap_extend_a = -std::floor(0.5 * p.gap_extend_a);
+            if (ri(0, 2) == 0) p.gap_extend_b = -std::floor(0.5 * p.gap_extend_b);
+        }
+        auto seq = [&](int len) {
+            std::string s;
+            for (int k = 0; k < len; ++k) s.push_back(A.symbols()[ri(0, na - 1)]);
+            return s;
+        };
+        auto len = [&] {
+            const int r = ri(0, 39);
+            if (r == 0) return ri(0, 2);
+            if (r <= 2) return ri(150, 400);
+            if (r == 3) return ri(800, 1500);
+            return ri(1, 90);
+        };
+        std::string a = seq(len()), b = seq(len());
+        if (ri(0, 2) == 0 && !a.empty()) {
+            b = a;
+            for (int k = ri(1, 6); k > 0 && !b.empty(); --k) {
+                if (ri(0, 1)) b.erase(ri(0, (int)b.size() - 1), ri(1, 8));
+                else          b.insert(ri(0, (int)b.size()), seq(ri(1, 8)));
+            }
+        }
+        if ((long)a.size() * (long)b.size() > 400000 && ri(0, 1)) b.resize(b.size() / 4);
+        const int kern = kerns[ri(0, (int)kerns.size() - 1)];
+        double g;
+        auto all = [&](auto tag) {
+            using T = typename decltype(tag)::type;
+            for (int k = 0; k < 4; ++k) {
+                bool ok;
+                if      (k == 0) ok = int_one<GapModel::Affine, AlignMode::Global, T>(a, b, p, kern, g);
+                else if (k == 1) ok = int_one<GapModel::Affine, AlignMode::Local,  T>(a, b, p, kern, g);
+                else if (k == 2) ok = int_one<GapModel::Linear, AlignMode::Global, T>(a, b, p, kern, g);
+                else             ok = int_one<GapModel::Linear, AlignMode::Local,  T>(a, b, p, kern, g);
+                (ok ? n_checked : n_refused)++;
+            }
+        };
+        all(std::type_identity<int16_t>{});
+        all(std::type_identity<int32_t>{});
+        all(std::type_identity<int64_t>{});
+    }
+    INFO(n_checked << " checked, " << n_refused << " refused");
+    REQUIRE(n_checked > iters * 4 * 2);
 }
 
 TEST_CASE("compute_score: edge shapes at every backend", "[score]") {
