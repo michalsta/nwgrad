@@ -14,7 +14,10 @@
 #include "catch.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
+#include <stdexcept>
+#include <type_traits>
 #include <cstring>
 #include <random>
 #include <span>
@@ -153,6 +156,191 @@ TEST_CASE("compute_score is bit-identical to the exact fill's score", "[score]")
     }
     INFO(n_checked);
     REQUIRE(n_checked == iters * 2 * 4 * 2);
+}
+
+// Integer T: compute_score against the same T's exact fill and against double's, for
+// int16 / int32 / int64 with integral params (negative opens and extends included),
+// lengths to ~1500 (int16's saturating regime, many segments, padding over several
+// lanes), and with the narrow-lane score (int32 -> int16, int64 -> int32) forced on
+// and off.  A problem the type refuses (overflow bound) is skipped.
+template <GapModel GM, AlignMode AM, class T>
+bool int_one(const std::string& a, const std::string& b, const AlignParams& p, int kern,
+             double& got_out) {
+    Aligner<GM, AM, AlignBand::Full, T> ref, al;
+    try { ref.set_problem(a, b, p); } catch (const std::overflow_error&) { return false; }
+    ref.set_kernel(kern); ref.set_traceback(TracebackMode::Pointers);
+    DpBufferT<T> rbuf; ref.compute_viterbi(rbuf);
+    const double want = ref.score();
+    Aligner<GM, AM, AlignBand::Full, double> dref;
+    dref.set_kernel(kBackendScalar); dref.set_traceback(TracebackMode::Pointers);
+    DpBufferT<double> dbuf; dref.set_problem(a, b, p); dref.compute_viterbi(dbuf);
+    // narrow 0: off; 1: half-width only (the int8 tier off); 2: the int8 tier, then half-width.
+    for (int narrow : {0, 1, 2}) {
+        int_narrow_mode().store(narrow ? 1 : 0);
+        set_gate_override(Gate::ScoreInt8, narrow == 2 ? 1 : 0);
+        al.set_kernel(kern); al.set_problem(a, b, p);
+        DpBufferT<T> buf;
+        const double got = al.compute_score(buf);
+        INFO("a=" << a << " b=" << b << " kern=" << kern << " T=" << sizeof(T) << " narrow=" << narrow
+             << " GM=" << static_cast<int>(GM) << " AM=" << static_cast<int>(AM) << " want=" << want
+             << " double=" << dref.score() << " got=" << got << " gaps " << p.gap_open_a << "/"
+             << p.gap_extend_a << " " << p.gap_open_b << "/" << p.gap_extend_b);
+        REQUIRE(got == want);
+        REQUIRE(got == dref.score());
+        got_out = got;
+    }
+    int_narrow_mode().store(-1);
+    set_gate_override(Gate::ScoreInt8, -1);
+    return true;
+}
+
+TEST_CASE("integer compute_score equals the integer and double fills", "[score][integer]") {
+    std::mt19937_64 rng(20261105);
+    auto ri = [&](int lo, int hi) { return std::uniform_int_distribution<int>(lo, hi)(rng); };
+    const Alphabet* alphas[2] = {&Alphabet::dna(), &Alphabet::protein()};
+    const std::vector<int> kerns = score_backends();
+    const long iters = fuzz_iters(300) / 2 + 1;
+    long n_checked = 0, n_refused = 0;
+    for (long it = 0; it < iters; ++it) {
+        const Alphabet& A = *alphas[ri(0, 2) == 0];
+        const int na = A.size();
+        AlignParams p(A);
+        const int big = ri(0, 3) == 0;   // scores large enough to refuse int16 at length
+        for (int x = 0; x < na; ++x)
+            for (int y = 0; y < na; ++y)
+                p.matrix.at(x, y) = static_cast<double>(x == y ? ri(1, big ? 12 : 4) : ri(big ? -8 : -3, 1));
+        auto gap = [&](bool ext) { return static_cast<double>(ri(0, ext ? 3 : big ? 14 : 6)); };
+        p.gap_open_a = gap(false); p.gap_extend_a = gap(true);
+        p.gap_open_b = gap(false); p.gap_extend_b = gap(true);
+        if (ri(0, 3) == 0) {
+            if (ri(0, 1)) p.gap_open_a = -p.gap_open_a;
+            if (ri(0, 1)) p.gap_open_b = -p.gap_open_b;
+            if (ri(0, 2) == 0) p.gap_extend_a = -std::floor(0.5 * p.gap_extend_a);
+            if (ri(0, 2) == 0) p.gap_extend_b = -std::floor(0.5 * p.gap_extend_b);
+        }
+        auto seq = [&](int len) {
+            std::string s;
+            for (int k = 0; k < len; ++k) s.push_back(A.symbols()[ri(0, na - 1)]);
+            return s;
+        };
+        auto len = [&] {
+            const int r = ri(0, 39);
+            if (r == 0) return ri(0, 2);
+            if (r <= 2) return ri(150, 400);
+            if (r == 3) return ri(800, 1500);
+            return ri(1, 90);
+        };
+        std::string a = seq(len()), b = seq(len());
+        if (ri(0, 2) == 0 && !a.empty()) {
+            b = a;
+            for (int k = ri(1, 6); k > 0 && !b.empty(); --k) {
+                if (ri(0, 1)) b.erase(ri(0, (int)b.size() - 1), ri(1, 8));
+                else          b.insert(ri(0, (int)b.size()), seq(ri(1, 8)));
+            }
+        }
+        if ((long)a.size() * (long)b.size() > 400000 && ri(0, 1)) b.resize(b.size() / 4);
+        const int kern = kerns[ri(0, (int)kerns.size() - 1)];
+        double g;
+        auto all = [&](auto tag) {
+            using T = typename decltype(tag)::type;
+            for (int k = 0; k < 6; ++k) {
+                bool ok;
+                if      (k == 0) ok = int_one<GapModel::Affine, AlignMode::Global, T>(a, b, p, kern, g);
+                else if (k == 1) ok = int_one<GapModel::Affine, AlignMode::Local,  T>(a, b, p, kern, g);
+                else if (k == 2) ok = int_one<GapModel::Linear, AlignMode::Global, T>(a, b, p, kern, g);
+                else if (k == 3) ok = int_one<GapModel::Linear, AlignMode::Local,  T>(a, b, p, kern, g);
+                else if (k == 4) ok = int_one<GapModel::Affine, AlignMode::Glocal, T>(a, b, p, kern, g);
+                else             ok = int_one<GapModel::Linear, AlignMode::Glocal, T>(a, b, p, kern, g);
+                (ok ? n_checked : n_refused)++;
+            }
+        };
+        all(std::type_identity<int16_t>{});
+        all(std::type_identity<int32_t>{});
+        all(std::type_identity<int64_t>{});
+    }
+    INFO(n_checked << " checked, " << n_refused << " refused");
+    REQUIRE(n_checked > iters * 6 * 2);
+}
+
+// The int8 tier (score8_kernel_impl.inl) at its boundaries: parameters at the int8 limits,
+// Local scores straddling 127 (planted homology of every length), Global / Glocal straddling
+// the G - 128 test and the G <= 126 precondition.  Every result against the int16 exact fill
+// (Pointers) and double's; the stats must show int8 runs that held and runs that overflowed,
+// so neither branch passes vacuously.
+TEST_CASE("int8 score tier: exact at its boundaries", "[score][integer][int8]") {
+    std::mt19937_64 rng(20261107);
+    auto ri = [&](int lo, int hi) { return std::uniform_int_distribution<int>(lo, hi)(rng); };
+    const Alphabet* alphas[2] = {&Alphabet::dna(), &Alphabet::protein()};
+    const std::vector<int> kerns = score_backends();
+    const long iters = fuzz_iters(300) / 2 + 1;
+    Score8Stats& st = score8_stats();
+    st.runs = 0; st.overflows = 0; st.on = true;
+    long n_checked = 0;
+    for (long it = 0; it < iters; ++it) {
+        const Alphabet& A = *alphas[ri(0, 2) == 0];
+        const int na = A.size();
+        AlignParams p(A);
+        const int style = ri(0, 3);   // 0: small, 1: large scores, 2: extremes (+-127), 3: wide range
+        for (int x = 0; x < na; ++x)
+            for (int y = 0; y < na; ++y) {
+                int v;
+                if (style == 0)      v = x == y ? ri(1, 5) : ri(-4, 1);
+                else if (style == 1) v = x == y ? ri(5, 30) : ri(-30, 3);
+                else if (style == 2) v = x == y ? (ri(0, 3) ? 127 : ri(1, 127)) : (ri(0, 1) ? -127 : ri(-127, 0));
+                else                 v = ri(-127, 127);
+                p.matrix.at(x, y) = v;
+            }
+        auto gap = [&](bool ext) {
+            if (style == 2 && ri(0, 1)) return static_cast<double>(ext ? ri(0, 127) : ri(0, 127));
+            return static_cast<double>(ri(0, ext ? 4 : 15));
+        };
+        p.gap_open_a = gap(false); p.gap_extend_a = gap(true);
+        p.gap_open_b = gap(false); p.gap_extend_b = gap(true);
+        if (ri(0, 4) == 0) { p.gap_open_b = p.gap_open_a; p.gap_extend_b = p.gap_extend_a; }
+        auto seq = [&](int len) {
+            std::string s;
+            for (int k = 0; k < len; ++k) s.push_back(A.symbols()[ri(0, na - 1)]);
+            return s;
+        };
+        const int r = ri(0, 9);
+        const int la = r == 0 ? ri(1, 4) : r < 6 ? ri(5, 70) : ri(70, 300);
+        std::string a = seq(la), b;
+        if (ri(0, 1)) {   // planted homology: Local scores of every size
+            b = a;
+            for (int k = ri(0, 6); k > 0 && !b.empty(); --k) {
+                const int q = ri(0, 2);
+                if (q == 0)      b.erase(ri(0, (int)b.size() - 1), ri(1, 5));
+                else if (q == 1) b.insert(ri(0, (int)b.size()), seq(ri(1, 5)));
+                else             b[ri(0, (int)b.size() - 1)] = A.symbols()[ri(0, na - 1)];
+            }
+            if (ri(0, 1)) b = seq(ri(0, 20)) + b + seq(ri(0, 20));
+            if (b.empty()) b = seq(1);
+        } else {
+            b = seq(ri(1, 300));
+        }
+        const int kern = kerns[ri(0, (int)kerns.size() - 1)];
+        double g;
+        auto all = [&](auto tag) {
+            using T = typename decltype(tag)::type;
+            bool ok = true;
+            ok &= int_one<GapModel::Affine, AlignMode::Global, T>(a, b, p, kern, g);
+            ok &= int_one<GapModel::Affine, AlignMode::Local,  T>(a, b, p, kern, g);
+            ok &= int_one<GapModel::Linear, AlignMode::Global, T>(a, b, p, kern, g);
+            ok &= int_one<GapModel::Linear, AlignMode::Local,  T>(a, b, p, kern, g);
+            ok &= int_one<GapModel::Affine, AlignMode::Glocal, T>(a, b, p, kern, g);
+            ok &= int_one<GapModel::Linear, AlignMode::Glocal, T>(a, b, p, kern, g);
+            n_checked += ok;
+        };
+        all(std::type_identity<int16_t>{});
+        all(std::type_identity<int32_t>{});
+    }
+    st.on = false;
+    INFO(n_checked << " checked; int8 runs " << st.runs << ", overflowed " << st.overflows);
+    REQUIRE(n_checked > iters);
+    if (std::find_if(kerns.begin(), kerns.end(), [](int k) { return k != kBackendScalar; }) != kerns.end()) {
+        REQUIRE(st.overflows > 0);
+        REQUIRE(st.runs - st.overflows > 0);
+    }
 }
 
 TEST_CASE("compute_score: edge shapes at every backend", "[score]") {

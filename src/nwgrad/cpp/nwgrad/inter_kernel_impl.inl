@@ -602,8 +602,20 @@ static void inter_fill_linear(InterJobT<T>& J) noexcept {
 // Affine.  T = double or float32: the operations are the same in either precision, each
 // in T — at float32 exactly the scalar viterbi_affine<float>, whose penalties are cast to
 // T once and whose borders are -(go + T(i)*ge) in T.  Banded: as for linear above.
+// Pinned to a page boundary (every instance): its row loop's front-end delivery (LSD vs
+// DSB) depends on the function's address mod 4096, which is otherwise set by the size of
+// everything linked before this unit.  nighthaven (2026-11-06, float32 affine Local path,
+// protein L300, 1 thread, byte-identical code, placement swept): mod 4096 = 0 1.001,
+// 256 / 512 / 1024 / 2048 1.00-1.007, 128 1.014, 768 1.037, 3328 (main 7c69934) 1.010,
+// 3200 (proto/int-score-rows, its score kernels grew the units before) 1.063.  noinline:
+// an inlined copy would not carry the alignment.
+#if defined(__GNUC__)
+#  define NWGRAD_PAGE_ALIGNED_FN __attribute__((aligned(4096), noinline))
+#else
+#  define NWGRAD_PAGE_ALIGNED_FN
+#endif
 template <class T, int Lv, bool Banded, bool Ragged, bool Tr = false, bool Local = false>
-static void inter_fill_affine(InterJobT<T>& J) noexcept {
+NWGRAD_PAGE_ALIGNED_FN static void inter_fill_affine(InterJobT<T>& J) noexcept {
     using C = InterCommon<T, Lv>;
     using ivd = typename C::ivd; using ivl = typename C::ivl;
     const C cm(J);
