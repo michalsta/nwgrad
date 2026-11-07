@@ -278,6 +278,33 @@ struct GridFwdJob {
     T best = T(0); int best_i = 0, best_j = 0;   // out (find_best)
 };
 
+// ── Grid base block (TracebackMode::Grid) ────────────────────────────────────
+//
+// The Pointers fill over a base rectangle rows r0..r1 x columns c0..c1 (DP coordinates)
+// from its top row and left column (all three states, the GridFwdJob layout): the striped
+// Pointers kernel's recurrence with the borders taken from the lines instead of the
+// closed forms.  Writes the packed codes (M | X << 2 | Y << 4, M 3 = Local's start) of rows
+// r0+1..r1, striped: buf.gD[(i - r0 - 1) * seg * W + ((c-1) % seg) * W + (c-1) / seg] for
+// column c = j - c0 in 1..w.  Below `min_seg` segments it declines (done = 0) and the
+// aligner runs its scalar block.  Affine only; the linear Grid (one state, its own codes)
+// would take a sibling entry with this layout (see Aligner::grid_base).
+template <class T>
+struct GridBaseJob {
+    bool sat = false;   // nw_sat T past the quarter-range bound: the saturating kernel variant
+    const unsigned char* a;                 // full encoded sequences
+    const unsigned char* b;
+    const T* blk; int nalpha;
+    T go_a, ge_a, go_b, ge_b;
+    int r0, r1, c0, c1;
+    const T* top;  std::size_t top_ss, top_es;    // as GridFwdJob
+    const T* left; std::size_t left_ss, left_es;
+    DpBufferT<T>* buf;                      // writes gD; scratch prows, gprof, gbuilt, gidx
+    int local = 0;                          // Local: M clamped at 0, code 3
+    int min_seg = 2;                        // decline below this many segments
+    typename DpBufferT<T>::GVec* last = nullptr;   // out if set: row r1's M, X, Y at [s*(w+1) + c], c = 0..w
+    int done = 0, W = 0, seg = 0;           // out
+};
+
 // ── Hirschberg linear-space sweep ─────────────────────────────────────────────
 //
 // One half-sweep of a divide-and-conquer block: fill H rows keeping only rolling rows,
@@ -1033,6 +1060,8 @@ struct TypedKernels {
     int                inter_w = 0;                  // the inter-pair lane count (pairs per call)
     using grid_fn = void (*)(GridFwdJob<T>&);
     grid_fn            grid_fwd = nullptr;           // TracebackMode::Grid's forward pass
+    using gridbase_fn = void (*)(GridBaseJob<T>&);
+    gridbase_fn        grid_base = nullptr;          // Grid's base block (striped Pointers fill)
 };
 
 struct LevelKernels {
@@ -1120,7 +1149,8 @@ void register_level_inter(SimdLevel l, typename TypedKernels<T>::inter_fn inter_
 // TracebackMode::Grid's forward pass (null for a type without one: it runs as Pointers).
 template <class T>
 NWGRAD_BASELINE_ONLY
-void register_level_grid(SimdLevel l, typename TypedKernels<T>::grid_fn grid_fwd);
+void register_level_grid(SimdLevel l, typename TypedKernels<T>::grid_fn grid_fwd,
+                         typename TypedKernels<T>::gridbase_fn grid_base);
 
 NWGRAD_BASELINE_ONLY
 void register_level_common(SimdLevel l, int row_block);
