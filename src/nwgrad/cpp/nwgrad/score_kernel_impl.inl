@@ -340,13 +340,14 @@ inline constexpr bool kMainForm =
 // prefix instantiation) gcc inlined it into that function, and the combined body is
 // the one nighthaven measured: its L200 cells run the stored-prefix form with main's
 // operations, yet 6-9 % slower at 12 % fewer instructions -- the generated code, not the
-// work.  The entry runs main's kernel itself (score_affine_striped_pos_main, below).  x86
-// only: on AArch64 the combined body measured FASTER than main (spot int16 affine Global
-// L100 0.82-0.86), so it stays there.
+// work.  The entry runs main's kernel itself (score_affine_striped_pos_main, below).  On
+// AArch64 int32 only: the combined body measured FASTER than main for int16 there (spot
+// int16 affine Global L100 0.82-0.86), so int16 keeps it, while int32 Global paid ~9 ns a
+// row in it (spot, 2026-11-07: L1000 1.020 .. L4000 1.005, Local 1.000).
 template <class T>
 inline constexpr bool kMainDirect =
 #if defined(__aarch64__)
-    false;
+    sizeof(T) == 4 && kMainForm<T> && kIntCarryEarly<T>;
 #else
     kMainForm<T> && kIntCarryEarly<T>;
 #endif
