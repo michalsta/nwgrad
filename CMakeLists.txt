@@ -340,6 +340,7 @@ if (NWGRAD_BUILD_TESTS)
         tests/cpp/test_preconditions.cpp
         tests/cpp/test_gradient.cpp
         tests/cpp/test_batch.cpp
+        tests/cpp/test_thread_pool.cpp
         tests/cpp/test_banded.cpp
         tests/cpp/test_seq_pair.cpp
         tests/cpp/test_traceback_modes.cpp

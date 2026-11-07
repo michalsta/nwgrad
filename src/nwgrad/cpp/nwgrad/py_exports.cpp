@@ -1491,6 +1491,11 @@ NB_MODULE(nwgrad_ext, m) {
             {"soft_double_ftz", int64_t(1)}};
     });
 
+    // ── The worker pool (parallel.hpp; nwgrad._tuning; unstable, for A/B) ──────────
+    m.def("_thread_pool_get", []() { return thread_pool_enabled(); });
+    m.def("_thread_pool_set", [](bool on) { set_thread_pool_enabled(on); }, nb::arg("on"));
+    m.def("_thread_pool_size", []() { return thread_pool_size(); });
+
     m.def(
         "guide_j_from_aligned",
         [](const std::string& a_aligned, const std::string& b_aligned) {

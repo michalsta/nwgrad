@@ -29,6 +29,11 @@ soft kernels, as float32 always does; 0 restores gradual underflow, the arithmet
 2026-11-06), with ``NWGRAD_SOFT_DOUBLE_FTZ`` as its environment fallback.  A batch regroups its
 cached inter-pair plan on the next call after any change.  Not thread-safe to change
 while work is in flight.
+
+The worker pool (not a gate; results never change): multi-threaded calls run on a
+process-wide pool of parked threads instead of spawning threads per call.
+``set_thread_pool(False)`` (or ``NWGRAD_THREAD_POOL=0`` in the environment) restores
+spawn-per-call, for A/B timing; ``thread_pool()`` reads the switch.
 """
 from contextlib import contextmanager
 
@@ -103,3 +108,24 @@ def override(**values):
     finally:
         for g, raw in saved.items():
             _ext._gate_set(g, raw)
+
+
+def thread_pool():
+    """Whether multi-threaded calls run on the persistent worker pool."""
+    return bool(_ext._thread_pool_get())
+
+
+def set_thread_pool(on):
+    """True: the worker pool (the default); False: spawn threads per call."""
+    _ext._thread_pool_set(bool(on))
+
+
+@contextmanager
+def thread_pool_override(on):
+    """``set_thread_pool(on)`` for the duration of a ``with`` block."""
+    saved = thread_pool()
+    try:
+        set_thread_pool(on)
+        yield
+    finally:
+        set_thread_pool(saved)
