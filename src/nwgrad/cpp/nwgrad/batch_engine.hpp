@@ -461,10 +461,24 @@ public:
         prepare_paths_(keep_paths);
         ++full_calls_;   // guides may have moved: the banded grouping is stale
         tc_begin_full_();
-        if (grad_mode_ == GradMode::None && !keep_paths) score_only_();
-        else if (s_.inter_fill)      score_and_grad_inter_(keep_paths);
-        else if (s_.sorted_schedule) score_and_grad_sorted_(keep_paths);
-        else                      score_and_grad_dynamic_(keep_paths);
+        call_pend_ = soft_pend_(keep_paths);
+        const bool none = grad_mode_ == GradMode::None && !keep_paths;
+        // Every pair this call finishes defers its guide under the params scored now
+        // (score_only_ does the same).  A pair the call does not finish (it threw)
+        // keeps the state it had: pending under the previous snapshot, resolved here.
+        auto prev = gparams_;
+        if (none || (call_pend_ & kSnap)) gparams_ = params_;
+        try {
+            if (none)                    score_only_();
+            else if (s_.inter_fill)      score_and_grad_inter_(keep_paths);
+            else if (s_.sorted_schedule) score_and_grad_sorted_(keep_paths);
+            else                      score_and_grad_dynamic_(keep_paths);
+        } catch (...) {
+            settle_unfinished_(prev);
+            throw;
+        }
+        // Every pair finished: no guide is pending under an older snapshot.
+        if (!none && !(call_pend_ & kSnap)) gparams_.reset();
         return sum_scores_();
     }
 
@@ -508,7 +522,15 @@ public:
     // One pair, on the calling thread (SeqPair's own operations).
     void score_and_grad_one(size_t i, bool keep_path) {
         prepare_paths_(keep_path, /*all=*/false);
+        // gparams_ is one snapshot for the whole batch: one pair may defer its guide only
+        // when that does not move the other pairs' pending guides to new params (a
+        // standalone pair, or a snapshot that IS the current params); otherwise its guide
+        // is computed now, as eagerly as before.
+        call_pend_ = soft_pend_(keep_path);
+        const bool own = size() == 1 || !gparams_ || gparams_ == params_;   // (kSnap needs gparams_)
+        if ((call_pend_ & kSnap) && !own) call_pend_ = 0;
         run_full_(i, solo_work_(), keep_path);
+        if (call_pend_ & kSnap) gparams_ = params_;   // after success: a throw left it as it was
     }
     void banded_one(size_t i, int bandwidth, bool keep_path) {
         if (!path_valid(i))
@@ -1115,6 +1137,8 @@ private:
         kStored = 32,      // path_ holds the current alignment
         kF32Refused = 64,  // the soft pass refused float32 under the current params,
                            // temperature and precision: later calls run it in double directly
+        kSnap = 128,       // with kPending: under the params scored (gparams_), not the
+                           // params current at resolution (the "lazy" guide)
     };
     void forget_f32_refusals_() noexcept {
         for (auto& f : flags_) f &= static_cast<uint8_t>(~kF32Refused);
@@ -1175,10 +1199,26 @@ private:
     std::vector<double>  score_;
     std::vector<uint8_t> flags_;
     std::shared_ptr<const OwnedParams> params_;
-    // The params the PENDING guides belong to: null for the lazy soft guide ("under the
-    // params current then"); set by score_only_() to the params it scored, so a deferred
-    // guide is the one the eager path would have stored.
+    // The params the PENDING kSnap guides belong to: the params the last full call scored
+    // (score_only_(), or a soft call under soft_guide "eager"), so a deferred guide is the
+    // one the eager path would have stored.  A shared snapshot: set_params() replaces
+    // params_ with a new object and this one stays alive, unchanged, while it is needed
+    // (no copy).  Lazy guides (no kSnap) use the params current at resolution instead.
     std::shared_ptr<const OwnedParams> gparams_;
+    // The pending state the running score_and_grad leaves its soft guides in (soft_pend_),
+    // set on the calling thread before the workers start; they only read it.
+    uint8_t call_pend_ = 0;
+    // A soft call's guides: computed now (0: keep_paths, posterior, or the deferral
+    // switched off), lazy (kPending: "lazy"), or deferred under the params scored
+    // (kPending | kSnap: "eager", unless the soft_guide_defer gate is 0).  The deferred
+    // guide is the eager one, bit for bit, computed on first use (guide_j, banded_grad,
+    // banded_align); a call that never asks for it skips the hard fill, 24-26 % of a
+    // double soft step's instructions on skynet (AGENTS.md, "The soft path").
+    uint8_t soft_pend_(bool keep) const noexcept {
+        if (grad_mode_ != GradMode::Soft || keep || s_.soft_guide_posterior) return 0;
+        if (s_.soft_guide_lazy) return kPending;
+        return soft_guide_defer() ? static_cast<uint8_t>(kPending | kSnap) : uint8_t(0);
+    }
     int kernel_ = kBackendAuto;
     std::vector<double>  grad_;             // pair i: gstride() doubles (matrix, 4 gaps); untracked
     // ── Tracks ──
@@ -1847,6 +1887,7 @@ private:
         if (gj.size() != len_a(i) + 1)
             throw std::logic_error("nwgrad: internal: guide of the wrong length");
         std::copy(gj.begin(), gj.end(), guide_ptr_(i));
+        flags_[i] &= static_cast<uint8_t>(~(kPending | kSnap));   // a stored guide is current
     }
     // The stored path's writer: the walk's moves (last first, see NoMoves) as run-length
     // ops, written backward from `w`.  Why not the gapped strings: the path used to be
@@ -1928,12 +1969,13 @@ private:
         }
     }
     // Modern fills publish all computed results together.
-    void finish_(size_t i, bool banded, bool pending) {
+    // pend: 0, kPending (a lazy guide) or kPending | kSnap (deferred under gparams_).
+    void finish_(size_t i, bool banded, uint8_t pend) {
         uint8_t f = flags_[i] & (kStored | kF32Refused);
         f |= kPath | kScore;
         if (grad_mode_ != GradMode::None) f |= kGrad;
         if (banded)  f |= kLastBanded;
-        if (pending) f |= kPending;
+        f |= pend;
         flags_[i] = f;
     }
 
@@ -1944,38 +1986,60 @@ private:
         flags_[i] &= static_cast<uint8_t>(~(kScore | kGrad | kStored));
         auto& al = w.full;
         set_problem_(al, i);
-        const bool lazy = s_.soft_guide_lazy && !keep, post = s_.soft_guide_posterior && !keep;
+        const uint8_t pend = call_pend_;
+        const bool post = s_.soft_guide_posterior && !keep;
         if (grad_mode_ == GradMode::Hard) {
             al.compute_viterbi(w.buf);
             score_[i] = al.score();
             with_path_(i, al, keep, [&](auto&& mv) { NWGRAD_HARD_GRAD_GUIDE(i, al, w, mv); });
-            finish_(i, false, false);
+            finish_(i, false, 0);
             return;
         }
-        if (grad_mode_ == GradMode::Soft && (lazy || post)) {
+        if (grad_mode_ == GradMode::Soft && (pend || post)) {
             al.set_posterior_guide(post);
             fwdbwd_(i, al, w.buf);
             al.set_posterior_guide(false);
             score_[i] = al.log_z();
             grad_with_buf_(i, al, w);
             if (post) store_guide_(i, al.posterior_guide());
-            finish_(i, false, lazy);
+            finish_(i, false, pend);
             return;
         }
         run_dp_with_buf_(i, al, w, keep);
         if (grad_mode_ != GradMode::None) grad_with_buf_(i, al, w);
-        finish_(i, false, false);
+        finish_(i, false, 0);
     }
 
-    // SeqPair::resolve_guide: the pending guide, under the params it belongs to (gparams_;
-    // a lazy soft guide: the params current now).
+    // SeqPair::resolve_guide: the pending guide, under the params it belongs to (kSnap:
+    // the snapshot gparams_, the params scored; a lazy soft guide: the params current now).
+    // The same hard fill the eager path runs (the inter-pair fill's lanes are bit-identical
+    // to it), so a deferred guide is the eager one, bit for bit.  Only the worker that
+    // owns pair i resolves it (banded passes hand each pair to one worker; guide_j() runs
+    // on the calling thread), so no lock is needed.
     void resolve_guide_(size_t i, Work& w) {
         if (!guide_pending(i)) return;
         w.full.set_kernel(kernel_);
-        problem_(w.full, i, gparams_ ? *gparams_ : *params_, 0, {});
+        problem_(w.full, i, (flags_[i] & kSnap) ? *gparams_ : *params_, 0, {});
         w.full.compute_viterbi(w.buf);
         store_guide_(i, w.full.guide_j_from_viterbi(w.buf));
-        flags_[i] &= static_cast<uint8_t>(~(kPending | kStored));
+        flags_[i] &= static_cast<uint8_t>(~(kPending | kSnap | kStored));
+    }
+    // A full call threw: the pairs it did not finish (no kScore: every finished pair
+    // has it, and set_params() cleared it on the rest) may still be pending under the
+    // snapshot before this call (prev), which gparams_ no longer is -- resolve them under
+    // it now, so each keeps exactly the guide it had.  The exception path only.
+    void settle_unfinished_(const std::shared_ptr<const OwnedParams>& prev) {
+        if (prev == gparams_) return;
+        auto cur = gparams_;
+        gparams_ = prev;
+        for (size_t i = 0; i < size(); ++i) {
+            const uint8_t f = flags_[i];
+            if ((f & kPending) && (f & kSnap) && !(f & kScore)) {
+                if (prev) resolve_guide_(i, solo_work_());
+                else flags_[i] &= static_cast<uint8_t>(~(kPath | kPending | kSnap));
+            }
+        }
+        gparams_ = std::move(cur);
     }
 
     // SeqPair::banded_grad_with_dp.
@@ -1990,12 +2054,12 @@ private:
             al.compute_viterbi(w.buf);
             score_[i] = al.score();
             with_path_(i, al, keep, [&](auto&& mv) { NWGRAD_HARD_GRAD_GUIDE(i, al, w, mv); });
-            finish_(i, true, false);
+            finish_(i, true, 0);
             return;
         }
         run_dp_with_buf_(i, al, w, keep);
         if (grad_mode_ != GradMode::None) grad_with_buf_(i, al, w);
-        finish_(i, true, false);
+        finish_(i, true, 0);
     }
 
     // A soft lane's result from the inter-pair soft pass (SeqPair::SoftLane).
@@ -2040,11 +2104,11 @@ private:
                 fwdbwd_(i, al, w.buf);
                 score_[i] = al.log_z();
                 grad_with_buf_(i, al, w);
-                finish_(i, false, false);
+                finish_(i, false, 0);
                 return;
             }
         }
-        finish_(i, false, false);
+        finish_(i, false, 0);
     }
 
     // SeqPair::score_and_grad_with_soft_lane: a soft pair whose forward-backward ran in
@@ -2052,10 +2116,10 @@ private:
     void run_soft_lane_(size_t i, Work& w, const SoftLane* soft, bool keep) {
         if (!soft || grad_mode_ != GradMode::Soft) { run_full_(i, w, keep); return; }
         flags_[i] &= static_cast<uint8_t>(~kStored);
-        const bool lazy = s_.soft_guide_lazy && !keep, post = s_.soft_guide_posterior && !keep;
-        bool pending = false;
-        if (lazy) pending = true;
-        else if (post && soft->gpost) pending = false;   // apply_soft_lane_ sets the guide
+        const bool post = s_.soft_guide_posterior && !keep;
+        const uint8_t pending = call_pend_;
+        if (pending) {}
+        else if (post && soft->gpost) {}   // apply_soft_lane_ sets the guide
         else {
             set_problem_(w.full, i);
             w.full.compute_viterbi(w.buf);
@@ -2093,7 +2157,7 @@ private:
         } else {
             guide_path_(i, al, w, false);
         }
-        finish_(i, true, false);
+        finish_(i, true, 0);
     }
 
     // ── Inter-pair plan ──────────────────────────────────────────────────────
@@ -2380,8 +2444,9 @@ private:
         const auto& groups = plan_.groups;
         const size_t G = groups.size(), tasks = G + other.size();
         const bool soft = grad_mode_ == GradMode::Soft;
-        // A lazy-guide soft group needs no Viterbi at all, nor a posterior-guide one.
-        const bool no_viterbi = soft && (s_.soft_guide_lazy || s_.soft_guide_posterior) && !keep;
+        // A soft group whose guides are deferred (eager or lazy) needs no Viterbi at all,
+        // nor a posterior-guide one.
+        const bool no_viterbi = soft && (call_pend_ || s_.soft_guide_posterior) && !keep;
         const bool want_post = soft && s_.soft_guide_posterior && !keep;
         std::atomic<size_t> idx{0};
         auto worker = [&]() {
@@ -2672,11 +2737,10 @@ private:
     // grad_mode None without stored paths: scores only — compute_score per pair, the
     // inter-pair score kernel for the plan's groups — and no Viterbi table or traceback.
     // The guides banded_grad() bands around become PENDING, resolved on first use under
-    // the params scored here (gparams_), so they are exactly the guides the eager
-    // path would have stored.  Scores are the exact optimum (the Pointers fill's score), as
+    // the params scored here (gparams_, set by score_and_grad), so they are exactly the
+    // guides the eager path would have stored.  Scores are the exact optimum (the Pointers fill's score), as
     // `auto`'s Grid reports too (a float32 hirschberg_pmax pair may report a hair below).
     void score_only_() {
-        gparams_ = params_;
         const size_t N = size();
         const bool inter = s_.inter_fill;
         const InterPlan& PL = inter ? ensure_plan_(true) : plan_;
@@ -2693,7 +2757,7 @@ private:
                 flags_[i] &= static_cast<uint8_t>(~kStored);
                 set_problem_(w.full, i);
                 score_[i] = w.full.compute_score(w.buf);
-                finish_(i, false, true);
+                finish_(i, false, kPending | kSnap);
             };
             for (size_t t; (t = idx.fetch_add(1, std::memory_order_relaxed)) < tasks; ) {
                 if (!inter) { own(t); continue; }
@@ -2739,7 +2803,7 @@ private:
                     const size_t i = PL.elig[s + l];
                     flags_[i] &= static_cast<uint8_t>(~kStored);
                     score_[i] = static_cast<double>(best[l]);
-                    finish_(i, false, true);
+                    finish_(i, false, kPending | kSnap);
                 }
             }
         };
