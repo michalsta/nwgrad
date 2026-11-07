@@ -362,3 +362,92 @@ TEST_CASE("integer score-only equals the integer fill", "[integer][simd]") {
     }
     CHECK(bad == 0);
 }
+
+// ── Path narrowing (Aligner::narrow_viterbi_): on / off bit identity ──────────────────
+// An int32 / int64 problem the narrower type holds runs its Viterbi fill there and the
+// aligner adopts the codes or the held path.  Everything a caller reads after
+// compute_viterbi() -- the score, the aligned strings, the guide, the hard gradient --
+// must be the same bits with the narrowing forced on and off, for every gap model, mode,
+// traceback mode, Hirschberg cutoff and level; the fixture mixes problems that fit the
+// narrower type's quarter rule, only int16's saturating regime, and neither (params up to
+// several hundred), so all three routes run, and the int64 problems that fit int16 run
+// the two-step chain.
+namespace {
+template <GapModel GM, AlignMode AM, class T>
+Result run_narrow(const std::vector<uint8_t>& ea, const std::vector<uint8_t>& eb, const AlignParams& p,
+                  int backend, TracebackMode tb, int cutoff, int narrow) {
+    int_narrow_mode().store(narrow);
+    int_narrow_paths_mode().store(narrow ? (kIntNarrowOwnPath | kIntNarrowInter) : 0);
+    Result r = run_one<GM, AM, AlignBand::Full, T>(ea, eb, p, 0, {}, backend, tb, cutoff);
+    int_narrow_mode().store(-1);
+    int_narrow_paths_mode().store(-1);
+    return r;
+}
+template <GapModel GM, AlignMode AM, class T>
+void narrow_case(const std::string& A, const std::string& B, const AlignParams& p, int backend,
+                 TracebackMode tb, int cutoff, int& bad, int& cases, int& refused, std::string& first) {
+    const auto ea = p.matrix.alphabet().encode(A), eb = p.matrix.alphabet().encode(B);
+    const Result w = run_narrow<GM, AM, T>(ea, eb, p, backend, tb, cutoff, 0);
+    const Result n = run_narrow<GM, AM, T>(ea, eb, p, backend, tb, cutoff, 1);
+    ++cases;
+    if (w.threw) ++refused;
+    const bool ok = w.threw == n.threw && w.what == n.what &&
+                    (w.threw || (w.score == n.score && w.aligned == n.aligned && w.guide == n.guide &&
+                                 same_grad(w.grad, n.grad)));
+    if (!ok) {
+        ++bad;
+        if (first.empty())
+            first = std::string(nw_type_name<T>()) + " GM " + std::to_string(static_cast<int>(GM)) +
+                    " AM " + std::to_string(static_cast<int>(AM)) + " backend " + std::to_string(backend) +
+                    " tb " + std::to_string(static_cast<int>(tb)) + " cutoff " + std::to_string(cutoff) +
+                    " |A|=" + std::to_string(A.size()) + " |B|=" + std::to_string(B.size()) +
+                    " wide " + std::to_string(w.score) + (w.threw ? " (threw " + w.what + ")" : "") +
+                    " narrow " + std::to_string(n.score) + (n.threw ? " (threw " + n.what + ")" : "");
+    }
+}
+template <class T>
+void narrow_sweep(uint64_t seed, int rounds, int& bad, int& cases, int& refused, std::string& first) {
+    Rng rng(seed);
+    const Alphabet* alphas[] = {&Alphabet::get("ACGT"), &Alphabet::get("ACDEFGHIKLMNPQRSTVWY")};
+    const auto backends = backends_under_test();
+    const TracebackMode tbs[] = {TracebackMode::Default, TracebackMode::Default, TracebackMode::Pointers,
+                                 TracebackMode::Grid, TracebackMode::Hirschberg, TracebackMode::HirschbergPmax,
+                                 TracebackMode::Scores};
+    for (int r = 0; r < rounds; ++r) {
+        const Alphabet& alpha = *alphas[rng.in(0, 1)];
+        const bool affine = rng.in(0, 2) != 0;
+        const int scale = rng.in(0, 9) < 6 ? 1 : rng.in(0, 3) ? 12 : 120;   // step ~12, ~150, ~1500
+        const AlignParams p0 = int_params(rng, alpha, affine, 1, rng.in(0, 4) == 0);
+        std::vector<double> blk(p0.matrix.data(), p0.matrix.data() + alpha.size() * alpha.size());
+        for (double& v : blk) v *= scale;
+        AlignParams p(SubstMatrix(blk.data(), alpha, 1));
+        for (int f = 0; f < 4; ++f) p.gap_ref(0, f) = p0.gap(0, f) * scale;
+        const int big = rng.in(0, 9);
+        const int la = big < 6 ? rng.in(1, 60) : big < 9 ? rng.in(60, 400) : rng.in(400, 1400);
+        const int lb = rng.in(0, 2) ? la + rng.in(-la / 4, la / 4) : rng.in(1, 2 * la + 2);
+        std::string A = random_seq(rng, alpha, la), B = random_seq(rng, alpha, std::max(1, lb));
+        if (rng.in(0, 1)) for (size_t q = 0; q < B.size() && q < A.size(); ++q) if (rng.in(0, 3)) B[q] = A[q];
+        const int backend = backends[static_cast<size_t>(rng.in(0, static_cast<int>(backends.size()) - 1))];
+        const TracebackMode tb = tbs[rng.in(0, 6)];
+        const int cutoff = rng.in(0, 2) ? 512 : rng.in(0, 1) ? 24 : 8;
+        switch (rng.in(0, 2) + (affine ? 0 : 3)) {
+            case 0: narrow_case<GapModel::Affine, AlignMode::Global, T>(A, B, p, backend, tb, cutoff, bad, cases, refused, first); break;
+            case 1: narrow_case<GapModel::Affine, AlignMode::Local,  T>(A, B, p, backend, tb, cutoff, bad, cases, refused, first); break;
+            case 2: narrow_case<GapModel::Affine, AlignMode::Glocal, T>(A, B, p, backend, tb, cutoff, bad, cases, refused, first); break;
+            case 3: narrow_case<GapModel::Linear, AlignMode::Global, T>(A, B, p, backend, tb, cutoff, bad, cases, refused, first); break;
+            case 4: narrow_case<GapModel::Linear, AlignMode::Local,  T>(A, B, p, backend, tb, cutoff, bad, cases, refused, first); break;
+            default: narrow_case<GapModel::Linear, AlignMode::Glocal, T>(A, B, p, backend, tb, cutoff, bad, cases, refused, first); break;
+        }
+    }
+}
+}  // namespace
+
+TEMPLATE_TEST_CASE("integer path narrowing is bit-identical to the wide fill", "[integer][simd][narrow]",
+                   int32_t, int64_t) {
+    int bad = 0, cases = 0, refused = 0;
+    std::string first;
+    narrow_sweep<TestType>(0x6e61727277ULL, 700, bad, cases, refused, first);
+    INFO("first mismatch: " << first << "  (" << refused << " refused of " << cases << ")");
+    CHECK(bad == 0);
+    CHECK(cases == 700);
+}
