@@ -606,7 +606,7 @@ enum class Gate : int {
     InterGroupBytes, InterSoftBytes, InterScoreGatherCells,
     InterLinearIntGatherCells, InterLinearF32GatherCells, InterLinearF64GatherCells,
     InterGlobalLinearIntCells, InterGlobalLinearF32Cells, LinearStripedMinN, SoftF32MinCells,
-    InterMinFill, SoftCkptRows, SoftCkptMinBytes, SoftDoubleFtz, Count_
+    InterMinFill, SoftCkptRows, SoftCkptMinBytes, SoftDoubleFtz, SoftGuideDefer, Count_
 };
 inline constexpr const char* kGateNames[] = {
     "inter_group_bytes", "inter_soft_bytes", "inter_score_gather_cells",
@@ -614,7 +614,7 @@ inline constexpr const char* kGateNames[] = {
     "inter_linear_f64_gather_cells", "inter_global_linear_int_cells",
     "inter_global_linear_f32_cells", "linear_striped_min_n", "soft_f32_min_cells",
     "inter_min_fill", "soft_ckpt_rows", "soft_ckpt_min_bytes",
-    "soft_double_ftz"};
+    "soft_double_ftz", "soft_guide_defer"};
 static_assert(sizeof(kGateNames) / sizeof(kGateNames[0]) == static_cast<size_t>(Gate::Count_));
 inline constexpr int64_t kGateUnset = -1;
 inline constexpr int64_t kGateOff = INT64_MAX;
@@ -670,6 +670,17 @@ inline bool soft_double_ftz() noexcept {
     const int64_t o = gate_override(Gate::SoftDoubleFtz);
     if (o >= 0) return o != 0;
     static const int64_t v = env_nonneg_int("NWGRAD_SOFT_DOUBLE_FTZ");
+    return v != 0;   // unset (-1): the default, on
+}
+// soft_guide "eager"'s guide Viterbi: soft_guide_defer / NWGRAD_SOFT_GUIDE_DEFER (DEFAULT 1)
+// defers it to first use, under the params the soft call scored (BatchEngine::soft_pend_):
+// the same guide, bit for bit, and no hard fill at all for a call that never asks for
+// it; 0 runs it inside the soft call, as before (the A/B switch).  Results never change.
+// The gate wins over the environment.
+inline bool soft_guide_defer() noexcept {
+    const int64_t o = gate_override(Gate::SoftGuideDefer);
+    if (o >= 0) return o != 0;
+    static const int64_t v = env_nonneg_int("NWGRAD_SOFT_GUIDE_DEFER");
     return v != 0;   // unset (-1): the default, on
 }
 inline bool soft_ckpt_env_check() noexcept {
