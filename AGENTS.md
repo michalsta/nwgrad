@@ -2965,9 +2965,23 @@ instructions (cycles +7-15 %); L100 0.93-0.97 and int32 / int64 held.  So:
 - On x86 the entry calls main's form (SQ) directly (`kMainDirect`): through the SQ = false
   form gcc inlined it into that function (no SQ symbol in the object), and that combined
   body is what lost at L200 with main's operations.  Called directly it is its own function,
-  inlined into the entry as on main.  AArch64 keeps the combined body, which measured faster
-  than main there.  Narrowed int32 on AVX2 now runs main's int16 kernel (the branch's lost
-  1.05-1.06 at L1000), so its 0.59-0.61 should hold or improve.
+  inlined into the entry as on main.  Narrowed int32 on AVX2 now runs main's int16 kernel
+  (the branch's lost 1.05-1.06 at L1000), so its 0.59-0.61 should hold or improve.
+- So the int16 >= 16-lane path on x86 is `kMainForm` + `kMainDirect` into the original
+  stored-prefix instantiation, called at each site directly (an always-inline wrapper made
+  gcc inline a different set of forms into the avx2 int16 entry).  A verbatim copy of main's
+  kernel (`score_affine_striped_pos_main`, `kMainCopy`) serves AArch64 int32 only: there
+  main's form reached through the re-formed kernel compiled its once-per-row code
+  differently (a spill and reloads; Global rolled 654 vs 591 instructions), ~9 ns a row
+  over main on spot (int32 Global NARROW=0 L1000 1.020, L2500 1.010, L3000 1.008, L4000
+  1.005; Local 1.000), and the copy fixed it (spot clean on 80f04b9).  On x86 the copy did
+  not pay: AVX-512 int16 ran 27-322 fewer instructions a pair yet 1-2 % slower at protein
+  L200-L300 (solace), and AVX2 int16 Global L150 stayed at 1.011-1.016 (nighthaven).
+  AArch64 int16 keeps the combined body, which measured faster than main there (L100 affine
+  Global 0.82-0.86).  The score entries are page-aligned (`score_entry`, one per type and
+  level), as `inter_fill_affine` is.
+- Open: nighthaven AVX2 int16 affine Global score-only L130-L170 +0.4-1.2 % at equal
+  instructions (codegen of the entry's per-row code; not removed by any of the above).
 - spot linear Global DNA, narrowed / int32: L70 0.81, L80 0.98, L90 1.10, L100 1.04, L110
   0.99, L125 0.90, L150 0.60 (Local, affine, protein never lost).  The int16 linear kernel
   (main's) runs ~32 ns a row at L100 and ~26 at L150 on the M1, so a longer row costs less,
