@@ -53,14 +53,18 @@ bool same_bits(double x, double y) {
 
 const char* kAA = "ACDEFGHIKLMNPQRSTVWY";
 
+// base_cells > 0: Grid's base-block size and fill (Aligner::set_grid_base; min_seg 1 = the
+// striped block at any width, -1 = the scalar block); striped counts the striped blocks run.
 template <GapModel GM, AlignMode AM, class T>
 void check_grid(const std::string& a, const std::string& b, const AlignParams& p, int kern,
-                int cutoff, long& n_grid) {
+                int cutoff, long& n_grid, long long base_cells = 0, int min_seg = 2,
+                long* striped = nullptr) {
     auto run = [&](TracebackMode tb, Aligner<GM, AM, AlignBand::Full, T>& al) {
         al.alloc_buf();
         al.set_kernel(kern);
         al.set_traceback(tb);
         al.set_hb_cutoff(cutoff);
+        if (base_cells > 0) al.set_grid_base(base_cells, min_seg);
         al.set_problem(a, b, p);
         al.compute_viterbi();
     };
@@ -80,6 +84,7 @@ void check_grid(const std::string& a, const std::string& b, const AlignParams& p
     REQUIRE(gg.gap_extend_b == gr.gap_extend_b);
     for (std::size_t k = 0; k < 400; ++k) REQUIRE(gg.matrix.data()[k] == gr.matrix.data()[k]);
     if (got.ran_grid()) ++n_grid;
+    if (striped) *striped += got.grid_striped_blocks();
 }
 
 AlignParams random_params(std::mt19937& rng, int scheme) {
@@ -347,4 +352,80 @@ TEST_CASE("auto takes Grid for integer T where it splits", "[grid][traceback]") 
         run(g64, TracebackMode::Default, kern, A, B);
         REQUIRE_FALSE(g64.ran_grid());
     }
+}
+
+// The striped base block (grid_base_striped, 2026-11-07) against Pointers, at its edges:
+// base blocks of 1..64 cells (so most blocks are partial, many one row or one column
+// tall: the walk cuts each to its entry cell) and the default 4096; B from 1 column to a
+// few vectors (one segment, a partial last segment, padding lanes); the end cell in the
+// first or last block (Local: homology at either end of unrelated flanks; Glocal: B
+// short); the striped block forced at every width (min_seg 1) and the scalar block
+// (min_seg -1), which stays the reference.  Every type, every mode.
+template <AlignMode AM, class T>
+void grid_base_edges(std::uint32_t seed, long iters, bool ints) {
+    std::mt19937 rng(seed);
+    long n_grid = 0, striped = 0, scalar_striped = 0;
+    const long long cells[] = {1, 2, 7, 16, 64, 300, 4096};
+    std::uniform_int_distribution<int> aa(0, 19), coin(0, 99), cut(1, 24);
+    for (long t = 0; t < iters; ++t) {
+        const AlignParams p = ints ? random_int_params(rng, static_cast<int>(t % 3) == 2 ? 0 : static_cast<int>(t % 3))
+                                   : random_params(rng, static_cast<int>(t % 3));
+        auto [A, B] = random_pair(rng, 160);
+        const int shape = static_cast<int>(t % 6);
+        if (shape == 0) B = B.substr(0, std::min<std::size_t>(B.size(), 1 + t % 40));   // narrow: 1..40 columns
+        if (shape == 1) A = A.substr(0, std::min<std::size_t>(A.size(), 1 + t % 40));   // short A
+        if (shape == 2 || shape == 3) {   // homology at the start (shape 2) or the end (3) of unrelated flanks
+            std::uniform_int_distribution<int> L(20, 120);
+            std::string f1, f2;
+            for (int k = L(rng); k > 0; --k) f1 += kAA[aa(rng)];
+            for (int k = L(rng); k > 0; --k) f2 += kAA[aa(rng)];
+            if (shape == 2) { A = A + f1; B = B + f2; } else { A = f1 + A; B = f2 + B; }
+        }
+        if (A.empty() || B.empty()) continue;
+        const int cutoff = cut(rng);
+        const long long bc = cells[t % 7];
+        for (int kern : grid_backends()) {
+            check_grid<GapModel::Affine, AM, T>(A, B, p, kern, cutoff, n_grid, bc, 1, &striped);
+            check_grid<GapModel::Affine, AM, T>(A, B, p, kern, cutoff, n_grid, bc, -1, &scalar_striped);
+        }
+    }
+    REQUIRE(n_grid > 0);
+    REQUIRE(striped > 0);
+    REQUIRE(scalar_striped == 0);
+}
+
+TEST_CASE("Grid's striped base block is Pointers' at block edges (every type and mode)", "[grid][traceback]") {
+    const long it = grid_iters(30);
+    grid_base_edges<AlignMode::Global, double>(1, it, false);
+    grid_base_edges<AlignMode::Global, float>(2, it, false);
+    grid_base_edges<AlignMode::Local, double>(3, it, false);
+    grid_base_edges<AlignMode::Local, float>(4, it, false);
+    grid_base_edges<AlignMode::Glocal, double>(5, it, false);
+    grid_base_edges<AlignMode::Glocal, float>(6, it, false);
+    grid_base_edges<AlignMode::Global, int32_t>(7, it, true);
+    grid_base_edges<AlignMode::Global, int64_t>(8, it, true);
+    grid_base_edges<AlignMode::Global, int16_t>(9, it, true);
+    grid_base_edges<AlignMode::Local, int32_t>(10, it, true);
+    grid_base_edges<AlignMode::Local, int64_t>(11, it, true);
+    grid_base_edges<AlignMode::Local, int16_t>(12, it, true);
+    grid_base_edges<AlignMode::Glocal, int32_t>(13, it, true);
+    grid_base_edges<AlignMode::Glocal, int64_t>(14, it, true);
+    grid_base_edges<AlignMode::Glocal, int16_t>(15, it, true);
+}
+
+TEST_CASE("Grid's striped base block, int16 in the saturating regime", "[grid][traceback]") {
+    // scheme 3 (large opens, BLOSUM-like range) past the quarter rule from ~L300
+    std::mt19937 rng(20261107);
+    long n_grid = 0, striped = 0;
+    for (long t = 0; t < grid_iters(10); ++t) {
+        const AlignParams p = random_int_params(rng, 3);
+        auto [A, B] = random_pair(rng, 650);
+        if (A.size() < 300) continue;
+        for (int kern : grid_backends()) {
+            check_grid<GapModel::Affine, AlignMode::Global, int16_t>(A, B, p, kern, 16, n_grid, 64, 1, &striped);
+            check_grid<GapModel::Affine, AlignMode::Local, int16_t>(A, B, p, kern, 16, n_grid, 64, 1, &striped);
+            check_grid<GapModel::Affine, AlignMode::Glocal, int16_t>(A, B, p, kern, 16, n_grid, 64, 1, &striped);
+        }
+    }
+    REQUIRE(striped > 0);
 }
