@@ -247,6 +247,26 @@ struct ScoreJob {
     TrackJob<T> tr;                         // tracked rows (tr.on()), else untracked
 };
 
+// ── Score only at int8 (score8_kernel_impl.inl) ───────────────────────────────
+// An integer problem's score in saturating int8 lanes, tried before the int16 / int32
+// kernels (Aligner::score_i8_); `overflow` set = the result may have saturated, so the
+// caller runs the wider kernel.  Gap parameters >= 0, go + ge <= 127 per side, every
+// substitution within [-127, 127]; Global / Glocal `gain` = min(m, n) * smax_pos <= 126
+// (the bound the overflow test rests on).  Scratch grows in `scratch`.
+struct Score8Job {
+    const unsigned char* a; int m;
+    const unsigned char* b; int n;
+    const int8_t* blk; int nalpha;
+    int8_t go_a, ge_a, go_b, ge_b;
+    int local;                              // 0 = Global, 1 = Local, 2 = Glocal
+    int linear;                             // 1: linear gaps (go_a = go_b = 0)
+    int gain;                               // Global / Glocal: min(m, n) * smax_pos
+    std::vector<int8_t>* scratch;
+    int score;                              // out
+    int overflow;                           // out: 1 = re-run wider
+};
+using score8_fn = void (*)(Score8Job&);
+
 // ── Grid forward pass (TracebackMode::Grid) ──────────────────────────────────
 //
 // The score kernel's D/X recurrence over the rectangle rows r0..r1 x columns c0..c1
@@ -606,7 +626,7 @@ enum class Gate : int {
     InterGroupBytes, InterSoftBytes, InterScoreGatherCells,
     InterLinearIntGatherCells, InterLinearF32GatherCells, InterLinearF64GatherCells,
     InterGlobalLinearIntCells, InterGlobalLinearF32Cells, LinearStripedMinN, SoftF32MinCells,
-    InterMinFill, SoftCkptRows, SoftCkptMinBytes, SoftDoubleFtz, Count_
+    InterMinFill, SoftCkptRows, SoftCkptMinBytes, SoftDoubleFtz, ScoreInt8, Count_
 };
 inline constexpr const char* kGateNames[] = {
     "inter_group_bytes", "inter_soft_bytes", "inter_score_gather_cells",
@@ -614,7 +634,7 @@ inline constexpr const char* kGateNames[] = {
     "inter_linear_f64_gather_cells", "inter_global_linear_int_cells",
     "inter_global_linear_f32_cells", "linear_striped_min_n", "soft_f32_min_cells",
     "inter_min_fill", "soft_ckpt_rows", "soft_ckpt_min_bytes",
-    "soft_double_ftz"};
+    "soft_double_ftz", "score_int8"};
 static_assert(sizeof(kGateNames) / sizeof(kGateNames[0]) == static_cast<size_t>(Gate::Count_));
 inline constexpr int64_t kGateUnset = -1;
 inline constexpr int64_t kGateOff = INT64_MAX;
@@ -672,6 +692,21 @@ inline bool soft_double_ftz() noexcept {
     static const int64_t v = env_nonneg_int("NWGRAD_SOFT_DOUBLE_FTZ");
     return v != 0;   // unset (-1): the default, on
 }
+// The int8 score tier (Aligner::score_i8_, score8_kernel_impl.inl): score_int8 /
+// NWGRAD_INT8 (default 1: integer score-only tries the int8 kernel first where the
+// parameters fit; 0: never).  Exact either way (an int8 run that may have saturated is
+// re-run wider), so it moves speed only.  NWGRAD_INT_NARROW=0 turns it off too (every
+// narrowing).  The gate wins over the environment.
+inline bool score_int8_on() noexcept {
+    const int64_t o = gate_override(Gate::ScoreInt8);
+    if (o >= 0) return o != 0;
+    static const int64_t v = env_nonneg_int("NWGRAD_INT8");
+    return v != 0;   // unset (-1): the default, on
+}
+// Counters of the int8 tier (problems run, of which overflowed), for the tests; counted
+// only while switched on (score8_count_on()), so a production run pays one relaxed load.
+struct Score8Stats { std::atomic<bool> on{false}; std::atomic<long long> runs{0}, overflows{0}; };
+inline Score8Stats& score8_stats() noexcept { static Score8Stats s; return s; }
 inline bool soft_ckpt_env_check() noexcept {
     static const bool v = [] { const char* e = std::getenv("NWGRAD_SOFT_CKPT_CHECK"); return e && *e && std::strcmp(e, "0") != 0; }();
     return v;
@@ -1043,6 +1078,7 @@ struct LevelKernels {
     TypedKernels<int64_t> i64;
     int           row_block = 0;                // columns per interleaved block (per-µarch)
     int           level = 0;                    // this level's SimdLevel id (the gates read it)
+    score8_fn     score_i8 = nullptr;           // score only in int8 lanes (score8_kernel_impl.inl)
     inter_soft_fn inter_soft = nullptr;         // inter-pair soft pass, double (W = d.inter_w)
     soft_pair_fn  soft_pair_linear = nullptr;   // per-pair scaled forward-backward ↓
     soft_pair_fn  soft_pair_affine = nullptr;
@@ -1123,7 +1159,7 @@ NWGRAD_BASELINE_ONLY
 void register_level_grid(SimdLevel l, typename TypedKernels<T>::grid_fn grid_fwd);
 
 NWGRAD_BASELINE_ONLY
-void register_level_common(SimdLevel l, int row_block);
+void register_level_common(SimdLevel l, int row_block, score8_fn score_i8);
 // The soft kernels, from the level's soft TU (level_<name>_soft.cpp; see level_common.inc).
 NWGRAD_BASELINE_ONLY
 void register_level_soft(SimdLevel l, inter_soft_fn inter_soft,

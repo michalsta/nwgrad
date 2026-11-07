@@ -934,6 +934,10 @@ struct Aligner {
         } else {
             const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
             if (backend != kBackendScalar) {
+                if constexpr (nw_is_int<T>) {
+                    double r;
+                    if (!tr_ && int_narrow_env() && score_int8_on() && score_i8_(backend, r)) return r;
+                }
                 if constexpr (std::is_same_v<T, std::int32_t> || std::is_same_v<T, std::int64_t>) {
                     double r;
                     if (!tr_ && int_narrow_env() && narrow_score_(backend, r)) return r;
@@ -1037,6 +1041,59 @@ struct Aligner {
             job.linear = lin && score_linear_env();
             job.buf = &sc.buf;
             fn(job);
+            out = static_cast<double>(job.score);
+            return true;
+        } else {
+            (void)backend; (void)out;
+            return false;
+        }
+    }
+
+    // ── Score-only in int8 lanes (any integer T; score8_kernel_impl.inl) ─────────
+    // Tried first, before the half-width narrowing: four times int32's lanes.  The kernel
+    // proves its own result (see the file's head): Local exact unless its maximum reached
+    // 127, Global / Glocal exact when the score clears G - 128 with G = min(m, n) *
+    // smax_pos <= 126 -- the a-priori part, checked here.  On `overflow` this returns
+    // false and the caller runs the wider kernel, so the score is always the integer the
+    // int16 / int32 kernels give.  Preconditions (else false, nothing run): untracked,
+    // m, n >= 1, gap parameters >= 0 with go + ge <= 127 per side (the kernel subtracts
+    // only, and opens in one saturating step), every substitution within [-127, 127].
+    // Per-thread scratch: the int8 block (cast per problem) and the kernel's rows.
+    bool score_i8_(int backend, double& out) {
+        if constexpr (nw_is_int<T>) {
+            const auto fn = level_kernels(backend).score_i8;
+            if (!fn || m_ < 1 || n_ < 1 || !ib_.prepared()) return false;
+            if (ib_.smax_pos > T(127) || ib_.smax_neg > T(127)) return false;
+            const bool lin = GM == GapModel::Linear;
+            const long long goa = lin ? 0 : static_cast<long long>(params_->gap_open_a);
+            const long long gob = lin ? 0 : static_cast<long long>(params_->gap_open_b);
+            const long long gea = static_cast<long long>(params_->gap_extend_a);
+            const long long geb = static_cast<long long>(params_->gap_extend_b);
+            if (goa < 0 || gob < 0 || gea < 0 || geb < 0 || goa + gea > 127 || gob + geb > 127) return false;
+            const long long gain = static_cast<long long>(std::min(m_, n_)) * static_cast<long long>(ib_.smax_pos);
+            if (AM != AlignMode::Local && gain > 126) return false;
+            struct Scratch { std::vector<int8_t> blk, rows; };
+            static thread_local Scratch sc;
+            const std::size_t nn = static_cast<std::size_t>(nalpha_) * nalpha_;
+            sc.blk.resize(nn);
+            for (std::size_t k = 0; k < nn; ++k) sc.blk[k] = static_cast<int8_t>(blkT_[k]);
+            Score8Job job{};
+            job.a = a_idx_.data(); job.m = m_;
+            job.b = b_idx_.data(); job.n = n_;
+            job.blk = sc.blk.data(); job.nalpha = nalpha_;
+            job.go_a = static_cast<int8_t>(goa); job.ge_a = static_cast<int8_t>(gea);
+            job.go_b = static_cast<int8_t>(gob); job.ge_b = static_cast<int8_t>(geb);
+            job.local = AM == AlignMode::Local ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
+            job.linear = lin ? 1 : 0;
+            job.gain = static_cast<int>(std::min<long long>(gain, 126));
+            job.scratch = &sc.rows;
+            fn(job);
+            Score8Stats& st = score8_stats();
+            if (st.on.load(std::memory_order_relaxed)) {
+                st.runs.fetch_add(1, std::memory_order_relaxed);
+                if (job.overflow) st.overflows.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (job.overflow) return false;
             out = static_cast<double>(job.score);
             return true;
         } else {

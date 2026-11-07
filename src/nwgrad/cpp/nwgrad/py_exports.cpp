@@ -1468,6 +1468,15 @@ NB_MODULE(nwgrad_ext, m) {
               set_gate_override(gate_of(name), v);
           }, nb::arg("name"), nb::arg("value"));
     m.def("_gate_off_value", []() { return kGateOff; });
+    // The int8 score tier's counters (tests): (problems run in int8, of which overflowed).
+    // reset=True zeroes them; count=True/False switches counting (off by default).
+    m.def("_score8_stats", [](bool reset, nb::handle count) {
+              Score8Stats& st = score8_stats();
+              const auto r = std::make_pair(st.runs.load(), st.overflows.load());
+              if (reset) { st.runs.store(0); st.overflows.store(0); }
+              if (!count.is_none()) st.on.store(nb::cast<bool>(count));
+              return r;
+          }, nb::arg("reset") = false, nb::arg("count").none() = nb::none());
     // The compiled defaults of the single-valued caps (0 = no cap);
     // linear_striped_min_n is per mode, type and level (Aligner::kLinearStripedMinN).
     m.def("_gate_defaults", []() {
@@ -1488,7 +1497,8 @@ NB_MODULE(nwgrad_ext, m) {
             {"inter_min_fill", int64_t(kInterMinFillPct)},
             {"soft_ckpt_rows", int64_t(0)},   // (auto: _tuning.defaults() says so)
             {"soft_ckpt_min_bytes", int64_t(kSoftCkptMinBytes)},
-            {"soft_double_ftz", int64_t(1)}};
+            {"soft_double_ftz", int64_t(1)},
+            {"score_int8", int64_t(1)}};
     });
 
     m.def(
