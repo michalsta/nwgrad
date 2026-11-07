@@ -338,6 +338,57 @@ inline std::atomic<int>& int_narrow_mode() noexcept {
     static std::atomic<int> m{-1};
     return m;
 }
+// ... and its sub-switch for everything beyond the own score-only fill, a mask:
+// kIntNarrowOwnPath (an Aligner's Viterbi fill, which every path, guide and hard gradient
+// reads: Pointers, Grid, Hirschberg / pmax, the linear fills) and kIntNarrowInter (the
+// batch's inter-pair fills, hard and score-only).  -1 = the NWGRAD_INT_NARROW_PATHS env:
+// unset or "1" both, "0" neither, "own" / "inter" one of them.  NWGRAD_INT_NARROW=0
+// turns all of it off as well.
+inline constexpr int kIntNarrowOwnPath = 1, kIntNarrowInter = 2;
+inline std::atomic<int>& int_narrow_paths_mode() noexcept {
+    static std::atomic<int> m{-1};
+    return m;
+}
+inline int int_narrow_paths() noexcept {
+    const int m = int_narrow_paths_mode().load(std::memory_order_relaxed);
+    if (m >= 0) return m;
+    static const int env = [] {
+        const char* e = std::getenv("NWGRAD_INT_NARROW_PATHS");
+        if (!e || !*e) return kIntNarrowOwnPath | kIntNarrowInter;
+        const std::string_view v(e);
+        if (v == "0") return 0;
+        if (v == "own") return kIntNarrowOwnPath;
+        if (v == "inter") return kIntNarrowInter;
+        return kIntNarrowOwnPath | kIntNarrowInter;
+    }();
+    return env;
+}
+
+// The next narrower lane type an integer problem may run in when its bound allows:
+// int32 -> int16, int64 -> int32 (void: none).  One tier per step; a problem two tiers
+// down (int64 fitting int16) gets there by chaining (the narrow aligner narrows again).
+// The path fills, Grid, Hirschberg and the inter-pair kernels exist for int16 / int32 /
+// int64 only, so a tier below int16 (int8, score-only kernels) would be added for the
+// score path alone (Aligner::narrow_score_), not here.
+template <class T> struct nw_int_narrower { using type = void; };
+template <> struct nw_int_narrower<std::int32_t> { using type = std::int16_t; };
+template <> struct nw_int_narrower<std::int64_t> { using type = std::int32_t; };
+template <class T> using nw_int_narrower_t = typename nw_int_narrower<T>::type;
+
+// T's bound facts in the narrower N, when they fit it: every fact is bounded by step_max
+// (step_max >= every |s|, every |go| + |ge|, and so every positive part, the gain and
+// |negative open|), so step_max <= nw_int_cap<N> is the whole condition -- and with it
+// every parameter is within N's cap, as nw_int_checked<N> would require.
+template <class N, class T>
+inline bool nw_int_bound_narrow(const NwIntBound<T>& ib, NwIntBound<N>& nb) noexcept {
+    if (!ib.prepared() || ib.step_max > static_cast<T>(nw_int_cap<N>)) return false;
+    nb.step_max = static_cast<N>(ib.step_max);
+    nb.smax_pos = static_cast<N>(ib.smax_pos); nb.smax_neg = static_cast<N>(ib.smax_neg);
+    nb.gain = static_cast<N>(ib.gain); nb.goneg = static_cast<N>(ib.goneg);
+    nb.goa_pos = static_cast<N>(ib.goa_pos); nb.gob_pos = static_cast<N>(ib.gob_pos);
+    nb.gea_pos = static_cast<N>(ib.gea_pos); nb.geb_pos = static_cast<N>(ib.geb_pos);
+    return true;
+}
 
 // ── Aligner ───────────────────────────────────────────────────────────────────
 //
@@ -992,8 +1043,9 @@ struct Aligner {
     }
     bool narrow_score_(int backend, double& out) {
         if constexpr (std::is_same_v<T, std::int32_t> || std::is_same_v<T, std::int64_t>) {
-            using N = std::conditional_t<std::is_same_v<T, std::int32_t>, std::int16_t, std::int32_t>;
-            if (!ib_.prepared() || ib_.step_max > static_cast<T>(nw_int_cap<N>)) return false;
+            using N = nw_int_narrower_t<T>;
+            NwIntBound<N> nb;
+            if (!nw_int_bound_narrow(ib_, nb)) return false;
 #if defined(__aarch64__) || defined(_M_ARM64)
             // AArch64, int32 -> int16, linear Global: not at 11-13 int16 segments a row
             // (n 81-104, 8 lanes).  spot (M1, 1 thread, DNA score-only, narrowed / int32):
@@ -1008,12 +1060,6 @@ struct Aligner {
                 if (seg16 >= kSkipSegLo && seg16 <= kSkipSegHi) return false;
             }
 #endif
-            NwIntBound<N> nb;
-            nb.step_max = static_cast<N>(ib_.step_max);
-            nb.smax_pos = static_cast<N>(ib_.smax_pos); nb.smax_neg = static_cast<N>(ib_.smax_neg);
-            nb.gain = static_cast<N>(ib_.gain); nb.goneg = static_cast<N>(ib_.goneg);
-            nb.goa_pos = static_cast<N>(ib_.goa_pos); nb.gob_pos = static_cast<N>(ib_.gob_pos);
-            nb.gea_pos = static_cast<N>(ib_.gea_pos); nb.geb_pos = static_cast<N>(ib_.geb_pos);
             const int why = nw_int_bound_check<N, AM == AlignMode::Local, false>(nb, m_, n_);
             if (why < 0) return false;
             const auto fn = level_kernels(backend).template of<N>().score;
@@ -1041,6 +1087,100 @@ struct Aligner {
             return true;
         } else {
             (void)backend; (void)out;
+            return false;
+        }
+    }
+
+    // ── The Viterbi fill at half the lane width (int32 -> int16, int64 -> int32) ──────
+    // The path-producing counterpart of narrow_score_: an untracked Full integer problem
+    // whose params fit the narrower type N and which passes N's own bound (the quarter
+    // rule, or int16's saturating regime) runs its Viterbi fill as an Aligner<..., N> --
+    // twice the lanes, half the bytes a row -- and this aligner adopts the result.  Exact:
+    // under N's bound every reachable DP value of the narrow fill is the wide fill's, as
+    // an integer, and no sentinel-derived value wins a max; every direction code and every
+    // walk step comes from comparisons of those values in the same order, so the score,
+    // the path, its ties, the guide and the hard gradient are the wide fill's.
+    //   What is adopted: Pointers' direction codes (one byte or the dense 2-bit fields;
+    //   type-free, swapped into `buf`, with the layout the narrow kernel chose), or the
+    //   held path (Grid, Hirschberg: hops_ and its start), the end cell and state, and the
+    //   score, widened.  Every consumer then walks or replays exactly what it would have.
+    //   The narrow run must take an algorithm of the same CLASS as this one's (path_class_):
+    //   the Pointers class (Pointers, Grid, an unsplit Hirschberg pair -- one result,
+    //   ties included) or the same splitting Hirschberg mode (a different tie-break).
+    //   `auto` resolves per type (pointer budgets, int16's pmax), so where the narrow
+    //   type's own choice leaves the class it is told which mode to run: Grid (Pointers'
+    //   result; where Grid does not apply it runs Pointers) or this aligner's Hirschberg
+    //   mode.  Linear runs the direction-code fill (explicit Pointers) where `auto` would
+    //   keep the H table: H is T-typed, codes are not; the same path either way.
+    // Not narrowed: tracked problems (per-row gaps), banded ones, the scalar backend
+    // (the same scalar loop at either width), Scores / rowwise tables (kept for reading),
+    // empty sides.  int64 fitting int16 narrows twice (the int32 aligner narrows again).
+    // The narrow aligner and its buffer are per thread (the code table moves into `buf`
+    // and the replaced one is kept for the next problem).  NWGRAD_INT_NARROW=0 or
+    // NWGRAD_INT_NARROW_PATHS=0 / =inter turn it off (int_narrow_paths()).
+    template <GapModel, AlignMode, AlignBand, class> friend struct Aligner;
+    // 0: the Pointers class; 1: a splitting Hirschberg mode (run_tb_()); -1: this run
+    // throws (an explicit Hirschberg mode with a negative penalty).  run_viterbi's dispatch.
+    int path_class_() const {
+        const TracebackMode rt = run_tb_();
+        if (is_hirschberg(rt) && hb_splits(rt, tb_auto_ ? kAutoPointerCells : 0, hb_cutoff_, m_, n_)) {
+            if (!hb_penalties_ok_()) return tb_auto_ ? 0 : -1;
+            return 1;
+        }
+        return 0;
+    }
+    bool narrow_viterbi_(DpBuffer& buf) {
+        if constexpr (AB == AlignBand::Full && (std::is_same_v<T, std::int32_t> || std::is_same_v<T, std::int64_t>)) {
+            using N = nw_int_narrower_t<T>;
+            if (tr_ || m_ == 0 || n_ == 0 || rowwise_full_ || !int_narrow_env() ||
+                !(int_narrow_paths() & kIntNarrowOwnPath)) return false;
+            if (!tb_auto_ && tb_ == TracebackMode::Scores) return false;
+            const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
+            if (backend == kBackendScalar) return false;
+            NwIntBound<N> nb;
+            if (!nw_int_bound_narrow(ib_, nb)) return false;
+            if (nw_int_bound_check<N, AM == AlignMode::Local, false>(nb, m_, n_) < 0) return false;
+            const int cls = path_class_();
+            if (cls < 0) return false;
+            struct Scratch { Aligner<GM, AM, AlignBand::Full, N> al; DpBufferT<N> buf; std::vector<N> blk; };
+            static thread_local Scratch sc;
+            const std::size_t nn = static_cast<std::size_t>(nalpha_) * nalpha_;
+            sc.blk.resize(nn);
+            for (std::size_t k = 0; k < nn; ++k) sc.blk[k] = static_cast<N>(blkT_[k]);
+            auto& na = sc.al;
+            na.backend_ = backend_;
+            na.hb_cutoff_ = hb_cutoff_;
+            na.dense_mode_ = dense_mode_;
+            na.rowwise_full_ = false;
+            na.tb_ = tb_; na.tb_auto_ = tb_auto_;
+            na.set_problem(a_idx_, b_idx_, *params_, 0, {}, {}, {}, sc.blk.data(), nullptr, &nb);
+            if (na.path_class_() != cls) {
+                if (cls == 0) na.set_traceback(GM == GapModel::Affine ? TracebackMode::Grid : TracebackMode::Pointers);
+                else          na.set_traceback(run_tb_());
+                if (na.path_class_() != cls) return false;
+            }
+            if constexpr (GM == GapModel::Linear)
+                if (cls == 0 && !na.linear_ptr_fill()) na.set_traceback(TracebackMode::Pointers);
+            na.ensure_viterbi_ptruf(sc.buf);
+            na.run_viterbi(sc.buf);
+            // Every Pointers-class fill above leaves codes or a held path, never T-typed
+            // tables; anything else would not be adoptable (this aligner then runs its own).
+            if (!na.pointers_ && !na.hirschberg_) return false;
+            viterbi_score_ = static_cast<T>(na.viterbi_score_);
+            best_i_ = na.best_i_; best_j_ = na.best_j_;
+            best_tbl_ = static_cast<TBTable>(static_cast<int>(na.best_tbl_));   // (one enum per instantiation)
+            pointers_ = na.pointers_; dense_ = na.dense_;
+            tables_striped_ = na.tables_striped_;
+            striped_seg_ = na.striped_seg_; striped_w_ = na.striped_w_; striped_rs_ = na.striped_rs_;
+            inter_w_ = 0;
+            hirschberg_ = na.hirschberg_; grid_ = na.grid_;
+            grid_end_ = na.grid_end_; grid_end_i_ = na.grid_end_i_; grid_empty_ = na.grid_empty_;
+            hb_start_i_ = na.hb_start_i_; hb_start_j_ = na.hb_start_j_;
+            hops_.swap(na.hops_);
+            if (pointers_) std::swap(buf.DM, sc.buf.DM);
+            return true;
+        } else {
+            (void)buf;
             return false;
         }
     }
@@ -2547,6 +2687,7 @@ private:
     // vectorize linear ACROSS pairs instead — SeqPairBatch fill="interpair", one pair per
     // lane, bit-identical — which sidesteps the chain.)
     void run_viterbi(DpBuffer& buf) {
+        if (narrow_viterbi_(buf)) return;   // an integer problem the narrower type holds
         // `auto` resolved to Grid where Grid does not apply: this run takes the previous
         // default (kGridFallbackTb) — its memory bound — and tb_ is restored after it.
         struct TbRestore {
