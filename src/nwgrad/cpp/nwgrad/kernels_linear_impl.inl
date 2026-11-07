@@ -88,7 +88,8 @@ static inline void striped_row_best1(const T* cH, const T* pad, int seg, int i,
 // simd_levels.hpp: 0.25 B/cell), for the memory-bound regime -- each lane accumulates its
 // 2-bit codes by Horner over a group of four segments and stores one byte per lane a group.
 // Glocal (Local false): row 0 = 0 (a free start), column 0 Global's chain, no clamp, the
-// end the best cell of row m (column 0 first, then the striped columns, strict >).
+// end the best cell of row m (column 0 first, then the striped columns, strict >) -- with
+// job.sg the other semi-global ends as striped_affine_full's (kernels_impl.inl).
 template <class T, bool Local, bool Ptr, bool Tr, bool Dense = false, bool Sat = false, bool Glocal = false>
 static void striped_linear_full(ViterbiJob<T>& job) {
     static_assert(!Dense || (Ptr && sizeof(T) >= 4), "dense codes: pointer fill, lanes >= 32 bits");
@@ -146,13 +147,18 @@ static void striped_linear_full(ViterbiJob<T>& job) {
         pH = buf.H.data(); cH = pH + hstride;
     }
 
+    // The semi-global ends (Glocal only).
+    const int sg = Glocal ? job.sg : 0;
+    const bool sg_ab = Glocal && (sg & kSgFreeABegin), sg_ae = Glocal && (sg & kSgFreeAEnd),
+               sg_bb = Glocal && (sg & kSgFreeBBegin), sg_be = Glocal && (sg & kSgFreeBEnd);
+
     // ── row 0 ──  H[0][0] = 0; H[0][j] = -(j * ge_a) (Global) or 0 (Local); pads NINF.
     pH[0] = static_cast<T>(0);
     for (int l = 0; l < W; ++l)
         for (int s = 0; s < seg; ++s) {
             const int j = l * seg + s + 1;
             const std::size_t k = off + (std::size_t)s * W + l;
-            if (j <= n) pH[k] = (Local || Glocal) ? static_cast<T>(0) : -static_cast<T>(j) * ge_a;
+            if (j <= n) pH[k] = (Local || sg_bb) ? static_cast<T>(0) : -static_cast<T>(j) * ge_a;
             else        pH[k] = K_NINF;
         }
     if constexpr (Ptr) {
@@ -170,6 +176,21 @@ static void striped_linear_full(ViterbiJob<T>& job) {
     const vd vninf(K_NINF);
     T best_local = static_cast<T>(0); int best_i = 0, best_j = 0;
     const T* pad = (Local || Glocal) ? striped_pad_into<T, Sat>(rows + 2 * rs, n, seg, W) : nullptr;
+    // Glocal: the end, offered in row-major order (strict >), a row's cells from its H row
+    // (slot 0 = column 0), as striped_affine_full's.
+    [[maybe_unused]] bool have = false;
+    [[maybe_unused]] auto offer = [&](int ci, int cj, T v) {
+        if (have && !(v > best_local)) return;
+        have = true; best_local = v; best_i = ci; best_j = cj;
+    };
+    const std::size_t coln = (n == 0) ? 0 : off + scol(n);
+    [[maybe_unused]] auto offer_row = [&](int ci, const T* rH) {
+        if (ci < m) { if (sg_ae) offer(ci, n, rH[coln]); return; }
+        if (!sg_be) { offer(m, n, rH[coln]); return; }
+        offer(m, 0, rH[0]);   // column 0 first, then the striped columns
+        if (seg > 0) striped_row_best1<T, Sat>(rH + off, pad, seg, ci, best_local, best_i, best_j);
+    };
+    if constexpr (Glocal) offer_row(0, pH);   // row 0 (row m when m == 0)
 
     for (int i = 1; i <= m; ++i) {
         if constexpr (Tr) {
@@ -178,8 +199,8 @@ static void striped_linear_full(ViterbiJob<T>& job) {
         }
         // column 0 of this row, and the previous row's (the diagonal into column 1)
         T nb;
-        if constexpr (Tr) nb = Local ? static_cast<T>(0) : tr.bx0[i];
-        else              nb = Local ? static_cast<T>(0) : -static_cast<T>(i) * ge_b;
+        if constexpr (Tr) nb = (Local || sg_ab) ? static_cast<T>(0) : tr.bx0[i];
+        else              nb = (Local || sg_ab) ? static_cast<T>(0) : -static_cast<T>(i) * ge_b;
         const T bprev = pH[0];
         cH[0] = nb;
         const T nbOpen = nw_sub(nb, ge_a);                     // the open into column 1
@@ -317,10 +338,7 @@ static void striped_linear_full(ViterbiJob<T>& job) {
             if constexpr (Local) striped_row_best1<T, Sat>(cH + off, pad, seg, i, best_local, best_i, best_j);
         }
         if constexpr (Glocal)
-            if (i == m) {   // the end: column 0 first, then the striped columns
-                best_local = cH[0]; best_i = m; best_j = 0;
-                if (seg > 0) striped_row_best1<T, Sat>(cH + off, pad, seg, i, best_local, best_i, best_j);
-            }
+            if (i == m || sg_ae) offer_row(i, cH);   // column n of rows < m, row m
 
         if constexpr (Ptr) std::swap(pH, cH);
         else { pH = cH; cH += hstride; }

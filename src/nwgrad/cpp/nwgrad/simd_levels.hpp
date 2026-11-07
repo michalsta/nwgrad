@@ -166,6 +166,20 @@ struct TrackJob {
     bool on() const noexcept { return go_a != nullptr; }
 };
 
+// ── Semi-global free ends (AlignMode::Glocal's runtime refinement) ────────────
+// The Glocal template mode is the whole semi-global family: four runtime flags say which
+// flanks are free (unaligned residues, not gap moves).  A = the rows (i), B = the columns
+// (j).  kSgFreeABegin: column 0 a free start (M = 0, no X chain down it); kSgFreeAEnd: every
+// cell of column n an end; kSgFreeBBegin: row 0 a free start (M = 0, no Y chain along it);
+// kSgFreeBEnd: every cell of row m an end.  "glocal" (A within B) is kSgGlocal; no flag is
+// Global's DP exactly.  The end cell, among equal maxima: the FIRST candidate in row-major
+// order (i ascending, then j), the state by M > X > Y -- glocal's rule (the first column of
+// row m) and Local's, extended.  Every job struct defaults to kSgGlocal, so a caller that
+// predates the flags runs glocal.
+inline constexpr int kSgFreeABegin = 1, kSgFreeAEnd = 2, kSgFreeBBegin = 4, kSgFreeBEnd = 8;
+inline constexpr int kSgGlocal = kSgFreeBBegin | kSgFreeBEnd;
+inline constexpr int kSgAll = 15;
+
 // Everything a forward pass needs, and everything it produces — no std::simd, no
 // Aligner: the only currency that crosses a level boundary.  Templated on the Viterbi
 // precision T (double or float32): the substitution block, gap penalties and DP buffer
@@ -179,6 +193,7 @@ struct ViterbiJob {
     const T* blk; int nalpha;               // substitution block, row-major nalpha×nalpha
     T go_a, ge_a, go_b, ge_b;               // gap penalties (in the Viterbi precision)
     int   align_mode;                       // 0 = Global, 1 = Local, 2 = Glocal
+    int   sg = kSgGlocal;                   // align_mode 2: the free ends (kSgFree*)
     int   align_band;                       // 0 = Full,   1 = GuideBanded
     int   band;                             // half-width (band>0)
     const int* guide_j; int guide_len;      // guide path for GuideBanded (may be null)
@@ -240,6 +255,7 @@ struct ScoreJob {
     const T* blk; int nalpha;
     T go_a, ge_a, go_b, ge_b;
     int local;                              // 0 = Global, 1 = Local, 2 = Glocal (AlignMode)
+    int sg = kSgGlocal;                     // local 2: the free ends (kSgFree*)
     int variant;                            // 0 auto, 1 two-pass, 2 fused three-state (measuring)
     int linear = 0;                         // 1: linear gaps (go_a = go_b = 0), the one-row kernel
     DpBufferT<T>* buf;
