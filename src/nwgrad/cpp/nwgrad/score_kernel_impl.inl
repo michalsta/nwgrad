@@ -1365,8 +1365,19 @@ static void score_entry_impl(ScoreJob<T>& job) {
     else if (job.local) score_affine_striped<T, true, true, Tr, Sat>(job);
     else                score_affine_striped<T, false, true, Tr, Sat>(job);
 }
+// The registered entry is pinned to a page boundary (one per type and level; the default
+// forms are inlined into it, so their row loops sit at fixed offsets from the page), as
+// inter_fill_affine is (inter_kernel_impl.inl): otherwise their address mod 4096 is the
+// size of everything linked before, and it moved int32 Global score-only cells on spot
+// (L3000 0.999 -> 1.007 when fbd7bf9 relaid the inter units) with no change to the code.
+// At most 4 KiB of padding per entry (5 per level).
+#if defined(__GNUC__)
+#  define NWGRAD_SCORE_ENTRY_ALIGNED __attribute__((aligned(4096), noinline))
+#else
+#  define NWGRAD_SCORE_ENTRY_ALIGNED
+#endif
 template <class T>
-static void score_entry(ScoreJob<T>& job) {
+NWGRAD_SCORE_ENTRY_ALIGNED static void score_entry(ScoreJob<T>& job) {
     if constexpr (nw_sat<T>) {   // past the quarter-range bound: the saturating variant
         if (job.sat) {
             if (job.tr.on()) score_entry_impl<T, true, true>(job);
