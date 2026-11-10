@@ -44,8 +44,8 @@ pairs and batches) run the narrowest lanes that are provably exact:
 - **int16** for an int32 problem whose bound fits it, int32 for an int64 one ("narrowing").
 
 An int8 run that overflows is wasted work (a Local run stops at the row where it reaches
-127), so after an overflow a thread skips the int8 tier for the next 1, 3, 7, … 63
-problems (back to every problem after a success). Switches, process-wide: `NWGRAD_INT8`
+127), so a thread tries the int8 tier only when its previous Local problem of the same
+type scored below 127 (the wide kernel's score tells exactly whether int8 would have held). Switches, process-wide: `NWGRAD_INT8`
 or `_tuning.set_gate("score_int8", v)`: 0 off, 1 Local with back-off (default), 2 every
 mode and every problem; `NWGRAD_INT_NARROW=0` turns off all narrowing, the int8 tier included.
 Results never change, only speed. The batch's shared inter-pair score kernel (short pairs)
@@ -147,8 +147,8 @@ An `int` is the threshold, `None` turns the gate off, and `"default"` removes th
 override. A batch regroups on its next call after any change.
 
 `score_int8` is a mode, not a threshold: 0 never runs the int8 score kernel, 1 (the
-default) runs it first for Local integer score-only calls with a back-off after
-overflows, 2 for every mode and problem ([Integer types](#integer-types)); `NWGRAD_INT8`
+default) runs it first for Local integer score-only calls unless the thread's previous one
+overflowed, 2 for every mode and problem ([Integer types](#integer-types)); `NWGRAD_INT8`
 is its environment fallback.
 
 ## Performance notes

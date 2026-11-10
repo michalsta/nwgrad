@@ -933,11 +933,30 @@ struct Aligner {
             return viterbi_score_;
         } else {
             const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
-            if (backend != kBackendScalar) {
-                if constexpr (nw_is_int<T>) {
+            if constexpr (nw_is_int<T>) {
+                if (backend != kBackendScalar && !tr_ && int_narrow_env()) {
                     double r;
-                    if (!tr_ && int_narrow_env() && score_i8_(backend, r)) return r;
+                    const int e = score_i8_(backend, r);
+                    if (e > 0) return r;
+                    if (e < 0) {   // Local, predicted or found to overflow: note the wide score
+                        r = score_wide_(buf, backend);
+                        score8_tl().last_over = r >= 127.0;
+                        return r;
+                    }
                 }
+            }
+            return score_wide_(buf, backend);
+        }
+    }
+    // compute_score past the int8 tier: the half-width narrowing, the type's own kernel,
+    // the scalar fill.
+    double score_wide_(DpBuffer& buf, int backend) {
+        if constexpr (AB == AlignBand::GuideBanded) {
+            (void)backend;
+            compute_viterbi(buf);
+            return viterbi_score_;
+        } else {
+            if (backend != kBackendScalar) {
                 if constexpr (std::is_same_v<T, std::int32_t> || std::is_same_v<T, std::int64_t>) {
                     double r;
                     if (!tr_ && int_narrow_env() && narrow_score_(backend, r)) return r;
@@ -1059,29 +1078,38 @@ struct Aligner {
     // m, n >= 1, gap parameters >= 0 with go + ge <= 127 per side (the kernel subtracts
     // only, and opens in one saturating step), every substitution within [-127, 127].
     // Per-thread scratch: the int8 block (cast per problem) and the kernel's rows.
-    bool score_i8_(int backend, double& out) {
+    // Per thread and problem type: the int8 run's scratch, and whether the last Local
+    // problem's score reached 127 (score8 predictor, below).
+    struct Score8Tl { std::vector<int8_t> blk, rows; bool last_over = false; };
+    static Score8Tl& score8_tl() { static thread_local Score8Tl t; return t; }
+    // 1: the int8 score in `out`; 0: not run (the tier off, the problem not eligible, or
+    // gate 2's overflow); -1: Local at gate 1, predicted to overflow or overflowed -- the
+    // caller notes the wide score for the predictor.
+    int score_i8_(int backend, double& out) {
         if constexpr (nw_is_int<T>) {
             const int mode = score_int8_mode();
-            if (mode == 0 || (mode == 1 && AM != AlignMode::Local)) return false;
+            if (mode == 0 || (mode == 1 && AM != AlignMode::Local)) return 0;
             const auto fn = level_kernels(backend).score_i8;
-            if (!fn || m_ < 1 || n_ < 1 || !ib_.prepared()) return false;
-            if (ib_.smax_pos > T(127) || ib_.smax_neg > T(127)) return false;
+            if (!fn || m_ < 1 || n_ < 1 || !ib_.prepared()) return 0;
+            if (ib_.smax_pos > T(127) || ib_.smax_neg > T(127)) return 0;
             const bool lin = GM == GapModel::Linear;
             const long long goa = lin ? 0 : static_cast<long long>(params_->gap_open_a);
             const long long gob = lin ? 0 : static_cast<long long>(params_->gap_open_b);
             const long long gea = static_cast<long long>(params_->gap_extend_a);
             const long long geb = static_cast<long long>(params_->gap_extend_b);
-            if (goa < 0 || gob < 0 || gea < 0 || geb < 0 || goa + gea > 127 || gob + geb > 127) return false;
+            if (goa < 0 || gob < 0 || gea < 0 || geb < 0 || goa + gea > 127 || gob + geb > 127) return 0;
             const long long gain = static_cast<long long>(std::min(m_, n_)) * static_cast<long long>(ib_.smax_pos);
-            if (AM != AlignMode::Local && gain > 126) return false;
-            // Back-off: a Local run that overflows is wasted (up to the row that reached
+            if (AM != AlignMode::Local && gain > 126) return 0;
+            // Predictor: a Local run that overflows is wasted (up to the row that reached
             // 127), and related pairs overflow in runs -- protein L100 30 %-mutated Local
-            // cost 2.0x the int16 instructions trying every pair (skynet sse4).  After an
-            // overflow this thread skips the next 1, 3, 7 ... 63 problems, back to 0 on a
-            // success; a batch of overflowing pairs then pays one wasted run in 64.
-            struct Scratch { std::vector<int8_t> blk, rows; int skip = 0, backoff = 0; };
-            static thread_local Scratch sc;
-            if (mode == 1 && sc.skip > 0) { --sc.skip; return false; }
+            // cost 2.0x the int16 instructions trying every pair (skynet sse4); a geometric
+            // back-off (skip 1, 3, ... 63 after an overflow) still left 1.01-1.03.  The
+            // wide kernel's score says exactly whether int8 would have held (Local: score
+            // < 127), so the thread tries int8 only when its previous Local problem of this
+            // type scored below 127: an all-overflowing batch pays one wasted run per
+            // thread, an i.i.d. mix p(1-p) of its pairs.
+            Score8Tl& sc = score8_tl();
+            if (mode == 1 && sc.last_over) return -1;
             const std::size_t nn = static_cast<std::size_t>(nalpha_) * nalpha_;
             sc.blk.resize(nn);
             for (std::size_t k = 0; k < nn; ++k) sc.blk[k] = static_cast<int8_t>(blkT_[k]);
@@ -1101,18 +1129,13 @@ struct Aligner {
                 st.runs.fetch_add(1, std::memory_order_relaxed);
                 if (job.overflow) st.overflows.fetch_add(1, std::memory_order_relaxed);
             }
-            if (job.overflow) {
-                if (mode == 2) return false;   // every problem tried (tests, measuring)
-                sc.backoff = std::min(2 * sc.backoff + 1, 63);
-                sc.skip = sc.backoff;
-                return false;
-            }
-            sc.backoff = 0; sc.skip = 0;
+            if (job.overflow) return mode == 2 ? 0 : -1;   // gate 2: every problem tried
+            sc.last_over = false;
             out = static_cast<double>(job.score);
-            return true;
+            return 1;
         } else {
             (void)backend; (void)out;
-            return false;
+            return 0;
         }
     }
 

@@ -3004,8 +3004,10 @@ so a saturated value never leaks and the score is the int16 / int32 integer bit 
   passes the test, every other V <= S <= max.
 - **Preconditions** (else int16 directly): params within +-127, gaps >= 0, go + ge <= 127
   per side, m, n >= 1.
-- **Gate** `score_int8` / `NWGRAD_INT8`: 0 off, 1 Local only with a per-thread back-off
-  after an overflow (skip the next 1, 3, ... 63 problems; reset on a success), 2 every mode,
+- **Gate** `score_int8` / `NWGRAD_INT8`: 0 off, 1 Local only with a per-thread predictor
+  (try int8 only if the previous Local problem of this type, on this thread, scored < 127 --
+  the wide kernel's score answers it exactly; it replaced a geometric back-off, skip 1, 3,
+  ... 63 after an overflow, which left the overflowing cells at 1.01-1.03), 2 every mode,
   every problem (tests).  `NWGRAD_INT_NARROW=0` turns it off with the other narrowing.
 - **Python**: `*_int8` names / `SeqPairInt8` / `SeqPairBatchInt8` (`nwgrad/_int8.py`) are the
   int16 ones with the parameter range checked (ValueError past +-127); paths and gradients

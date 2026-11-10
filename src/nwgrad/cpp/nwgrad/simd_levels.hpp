@@ -693,8 +693,9 @@ inline bool soft_double_ftz() noexcept {
     return v != 0;   // unset (-1): the default, on
 }
 // The int8 score tier (Aligner::score_i8_, score8_kernel_impl.inl): score_int8 /
-// NWGRAD_INT8.  0: never; 1 (the default): Local only, backing off after overflows
-// (Aligner::score_i8_); 2: every mode and every problem (no back-off).
+// NWGRAD_INT8.  0: never; 1 (the default): Local only, skipped after a problem that
+// overflowed
+// (Aligner::score_i8_'s predictor); 2: every mode and every problem.
 // Exact at every value (an int8 run that may have saturated is re-run wider), so it moves
 // speed only.  Global / Glocal are off by default: their rows fall away from column 0 and
 // lazy-F then carries F across every lane boundary of every row (16+ passes), so miRNA x

@@ -190,7 +190,7 @@ def test_int8_pairs_and_batches():
             assert sp.align() == s16.align() and sp.aligned() == s16.aligned()
 
 
-def test_default_mode_is_local_with_back_off():
+def test_default_mode_is_local_with_a_predictor():
     m = np.where(np.eye(4, dtype=bool), 2.0, -2.0)
     p = nwgrad.AlignParams(nwgrad.SubstMatrix(m, alphabet=DNA), 2.0, 1.0, 2.0, 1.0)
     a = "ACGTTGCA" * 4
@@ -205,5 +205,7 @@ def test_default_mode_is_local_with_back_off():
         big = "ACGT" * 40                              # Local score 320: overflows every time
         got = [nwgrad.sw_score_int16(big, big, p) for _ in range(20)]
         assert len(set(got)) == 1 and got[0] == nwgrad.sw_score_double(big, big, p)
-        runs, over = E._score8_stats()
-        assert runs == over and 1 <= runs <= 5       # tried at 0, 2, 6, 14: backing off
+        assert E._score8_stats(True) == (1, 1)       # tried once, then predicted to overflow
+        nwgrad.sw_score_int16(a, a, p)               # skipped (the last score was >= 127) ...
+        nwgrad.sw_score_int16(a, a, p)               # ... and its score 64 re-arms int8
+        assert E._score8_stats(True) == (1, 0)
