@@ -2908,6 +2908,19 @@ functions:
   so other pending pairs keep theirs); a call that throws resolves its unfinished pairs'
   guides under the previous snapshot (`settle_unfinished_`). Gate `soft_guide_defer` /
   `NWGRAD_SOFT_GUIDE_DEFER` = 0 runs the Viterbi inside the call as before (A/B).
+  Under fill "interpair" a deferred guide resolves with its whole plan group from one
+  shared fill (`resolve_group_`; `banded_grad` resolves every group first, in parallel,
+  one worker a group): resolving pair by pair (each pair's own fill, as "lazy" still does)
+  cost 21-33 % MORE than eager when every guide was used, since the shared fill is the
+  cheaper one. Measured (skynet-class sse4 on wloczykij, instructions/cell of one soft
+  step, 1 thread, perf counting only the steps; A/A repeats within 0.01 %), eager /
+  deferred, guide unused | every guide read (guide_j):
+  miRNA 22x50 double Global 95.6 / 72.9 | 99.6 / 100.4, Local 99.6 / 73.2 | 103.7 / 104.4;
+  float32 Global 57.8 / 44.8 | 61.8 / 62.2, Local 59.6 / 45.4 | 63.7 / 64.1;
+  protein L300 double Global 91.1 / 67.6 | 91.4 / 91.4, Local 95.7 / 67.6 | 96.0 / 96.0;
+  float32 Global 64.4 / 48.4 | 64.6 / 64.6, Local 67.3 / 49.0 | 67.5 / 67.5.
+  So -24 to -30 % when unused, +0 to +0.7 % when used (miRNA: the per-group setup).
+  "lazy" used: 125.7 (miRNA double Global), 110.3 (protein double Global) -- per pair.
   Tests: `test_soft_guide_defer.py`. `"lazy"` — it does not, and the guide
   is computed on first use (`guide_j`, `banded_align`, `banded_grad`) under the params
   CURRENT THEN. Deliberately opt-in: `score_and_grad(); set_params(params + lr*g); banded_grad()`
