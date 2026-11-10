@@ -296,9 +296,13 @@ struct ModeSpec { AlignMode am; int sg; };
 static int parse_free_ends(nb::handle h) {
     const char* msg = "nwgrad: free_ends must be four booleans (a_begin, a_end, b_begin, b_end) "
                       "or the names of the free ends (\"a_begin\", \"a_end\", \"b_begin\", \"b_end\")";
-    if (nb::isinstance<nb::str>(h)) h = nb::make_tuple(h);
+    // A lone name is a one-name set.  (Held in an object: assigning the temporary tuple to
+    // the borrowed handle left it dangling -- a use-after-free of a Python object that
+    // corrupted the interpreter's heap later, a bus error under ASan in CI.)
+    nb::object src = nb::borrow(h);
+    if (nb::isinstance<nb::str>(h)) src = nb::make_tuple(h);
     nb::list items;
-    try { items = nb::list(nb::iter(h)); } catch (...) { throw nb::value_error(msg); }
+    try { items = nb::list(nb::iter(src)); } catch (...) { throw nb::value_error(msg); }
     const size_t k = nb::len(items);
     if (k == 0) return 0;   // no free end: global's DP
     bool named = k > 0;
