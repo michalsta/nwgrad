@@ -659,19 +659,55 @@ static inline void striped_profile_index(unsigned char* idx, const unsigned char
             idx[(std::size_t)s * W + l] = (j <= n) ? b[j - 1] : 0;
         }
 }
-// int16 rows over alphabets of up to 32 symbols: the lookup as byte shuffles.  The row is
-// split into its low and high byte planes (two 32-entry byte tables each); 16 / 32 symbol
-// indices at a time select from them (pshufb / tbl: a 16-entry table per 128-bit lane, so
-// two shuffles and an OR per plane on x86, where an index + 0x70 sets bit 7 -- a zero
-// lane -- for symbols >= 16 and an index - 16 does so for symbols < 16; one tbl2 on NEON)
-// and the planes are interleaved back into words.  The scalar form (one byte load, one
-// word load and one word store per slot, ~4 instructions) was 18 % of the int16 L200
-// score-only time on AVX2 (nighthaven, perf, 2026-10-30).  Same values: a lookup is a
-// lookup.  Alphabets over 32 symbols, and SSE2 (no pshufb), keep the scalar loop.
+// The row lookup dst[k] = row[idx[k]] as vector permutes, per level, for the alphabets a
+// register-resident table covers.  Each returns how many leading slots it wrote (a whole
+// number of vectors, or all sw where a masked tail exists); the caller finishes the rest
+// with the scalar loop, which is also the whole build for every other type, alphabet and
+// level (SSE2 has no byte shuffle).  The lookup moves bit patterns, never values, so the
+// bytes are the scalar loop's by construction (a float's NaN or -0 included).
+//
+// int16, up to 32 symbols (SSSE3 / AVX2 / NEON): the row is split into its low and high
+// byte planes (two 16-entry byte tables each); 16 / 32 symbol indices at a time select
+// from them (pshufb / tbl: a 16-entry table per 128-bit lane, so two shuffles and an OR
+// per plane on x86, where an index + 0x70 sets bit 7 -- a zero lane -- for symbols >= 16
+// and an index - 16 does so for symbols < 16; one tbl2 on NEON) and the planes are
+// interleaved back into words.  The scalar form (one byte load, one word load and one
+// word store per slot, ~4 instructions) was 18 % of the int16 L200 score-only time on
+// AVX2 (nighthaven, perf, 2026-10-30).
+// int32 / float32, up to 32 symbols: the same with four byte planes, interleaved by two
+// rounds of unpacks (x86) or one vst4 (NEON, whose vld4 also splits the row into its
+// planes).  ~1.6 instructions per slot at 16 slots per iteration (sse4) against ~4.
+// AVX-512 (F + BW + VL, the level's flags): whole-element two-table permutes, a word /
+// dword / qword index zero-extended from the slot's byte -- vpermt2w (64 symbols at
+// once), vpermt2d (32), vpermt2q (16; two and a blend on bit 4 for up to 32) -- and a
+// masked tail.  int64 / double below AVX-512 keep the scalar loop: eight byte planes
+// cost as many instructions as the loop they would replace.
 #if (defined(__SSSE3__) || defined(__ARM_NEON)) && !defined(NWGRAD_SCALAR_PROFILE_BUILD)
 #define NWGRAD_PROFILE_SHUFFLE 1
-static inline void striped_profile_row_idx_i16(std::int16_t* dst, const std::int16_t* row,
-                                               const unsigned char* idx, int nalpha, std::size_t sw) {
+#if defined(__AVX512BW__) && defined(__AVX512VL__)
+#define NWGRAD_PROFILE_AVX512 1
+#endif
+static inline std::size_t striped_lookup_i16(std::int16_t* dst, const std::int16_t* row,
+                                             const unsigned char* idx, int nalpha, std::size_t sw) {
+    std::size_t k = 0;
+#if defined(NWGRAD_PROFILE_AVX512)
+    if (nalpha <= 64) {
+        alignas(64) std::int16_t tab[64] = {};
+        std::memcpy(tab, row, (std::size_t)nalpha * sizeof(std::int16_t));
+        const __m512i t0 = _mm512_load_si512((const void*)tab), t1 = _mm512_load_si512((const void*)(tab + 32));
+        for (; k + 32 <= sw; k += 32) {
+            const __m512i ix = _mm512_cvtepu8_epi16(_mm256_loadu_si256((const __m256i*)(idx + k)));
+            _mm512_storeu_si512((void*)(dst + k), _mm512_permutex2var_epi16(t0, ix, t1));
+        }
+        if (k < sw) {
+            const __mmask32 m = (__mmask32)((1u << (sw - k)) - 1u);
+            const __m512i ix = _mm512_cvtepu8_epi16(_mm256_maskz_loadu_epi8(m, idx + k));
+            _mm512_mask_storeu_epi16((void*)(dst + k), m, _mm512_permutex2var_epi16(t0, ix, t1));
+        }
+        return sw;
+    }
+#endif
+    if (nalpha > 32) return 0;
     // the byte planes, 32 entries each (symbols past nalpha are never indexed)
     alignas(32) unsigned char lo[32], hi[32];
     for (int c = 0; c < 32; ++c) {
@@ -679,22 +715,23 @@ static inline void striped_profile_row_idx_i16(std::int16_t* dst, const std::int
         lo[c] = static_cast<unsigned char>(v & 0xFF);
         hi[c] = static_cast<unsigned char>(v >> 8);
     }
-    std::size_t k = 0;
 #if defined(__AVX2__)
-    const __m256i loA = _mm256_broadcastsi128_si256(_mm_load_si128((const __m128i*)lo));
-    const __m256i loB = _mm256_broadcastsi128_si256(_mm_load_si128((const __m128i*)(lo + 16)));
-    const __m256i hiA = _mm256_broadcastsi128_si256(_mm_load_si128((const __m128i*)hi));
-    const __m256i hiB = _mm256_broadcastsi128_si256(_mm_load_si128((const __m128i*)(hi + 16)));
-    const __m256i c70 = _mm256_set1_epi8(0x70), c16 = _mm256_set1_epi8(16);
-    for (; k + 32 <= sw; k += 32) {
-        const __m256i ix = _mm256_loadu_si256((const __m256i*)(idx + k));
-        const __m256i ia = _mm256_add_epi8(ix, c70), ib = _mm256_sub_epi8(ix, c16);
-        const __m256i l = _mm256_or_si256(_mm256_shuffle_epi8(loA, ia), _mm256_shuffle_epi8(loB, ib));
-        const __m256i h = _mm256_or_si256(_mm256_shuffle_epi8(hiA, ia), _mm256_shuffle_epi8(hiB, ib));
-        const __m256i w0 = _mm256_unpacklo_epi8(l, h);   // words 0-7 | 16-23
-        const __m256i w1 = _mm256_unpackhi_epi8(l, h);   // words 8-15 | 24-31
-        _mm256_storeu_si256((__m256i*)(dst + k), _mm256_permute2x128_si256(w0, w1, 0x20));
-        _mm256_storeu_si256((__m256i*)(dst + k + 16), _mm256_permute2x128_si256(w0, w1, 0x31));
+    {
+        const __m256i loA = _mm256_broadcastsi128_si256(_mm_load_si128((const __m128i*)lo));
+        const __m256i loB = _mm256_broadcastsi128_si256(_mm_load_si128((const __m128i*)(lo + 16)));
+        const __m256i hiA = _mm256_broadcastsi128_si256(_mm_load_si128((const __m128i*)hi));
+        const __m256i hiB = _mm256_broadcastsi128_si256(_mm_load_si128((const __m128i*)(hi + 16)));
+        const __m256i c70 = _mm256_set1_epi8(0x70), c16 = _mm256_set1_epi8(16);
+        for (; k + 32 <= sw; k += 32) {
+            const __m256i ix = _mm256_loadu_si256((const __m256i*)(idx + k));
+            const __m256i ia = _mm256_add_epi8(ix, c70), ib = _mm256_sub_epi8(ix, c16);
+            const __m256i l = _mm256_or_si256(_mm256_shuffle_epi8(loA, ia), _mm256_shuffle_epi8(loB, ib));
+            const __m256i h = _mm256_or_si256(_mm256_shuffle_epi8(hiA, ia), _mm256_shuffle_epi8(hiB, ib));
+            const __m256i w0 = _mm256_unpacklo_epi8(l, h);   // words 0-7 | 16-23
+            const __m256i w1 = _mm256_unpackhi_epi8(l, h);   // words 8-15 | 24-31
+            _mm256_storeu_si256((__m256i*)(dst + k), _mm256_permute2x128_si256(w0, w1, 0x20));
+            _mm256_storeu_si256((__m256i*)(dst + k + 16), _mm256_permute2x128_si256(w0, w1, 0x31));
+        }
     }
 #endif
 #if defined(__SSSE3__)
@@ -723,28 +760,170 @@ static inline void striped_profile_row_idx_i16(std::int16_t* dst, const std::int
         }
     }
 #endif
-    for (; k < sw; ++k) dst[k] = row[idx[k]];
+    return k;
 }
-#endif
-template <class T>
-static inline void striped_profile_row_idx(T* dst, const T* row, const unsigned char* idx,
-                                           int n, int seg, int W, int nalpha) {
-    const std::size_t sw = (std::size_t)seg * W;
-#ifdef NWGRAD_PROFILE_SHUFFLE
-    if constexpr (std::is_same_v<T, std::int16_t>) {
-        if (nalpha <= 32) {
-            striped_profile_row_idx_i16(dst, row, idx, nalpha, sw);
-            for (int j = n + 1; j <= seg * W; ++j)
-                dst[(std::size_t)((j - 1) % seg) * W + (std::size_t)((j - 1) / seg)] = nw_pad<T>;
-            return;
+// 4-byte elements (int32 / float32), as bit patterns.
+static inline std::size_t striped_lookup_b32(void* dstv, const void* row, const unsigned char* idx,
+                                             int nalpha, std::size_t sw) {
+    if (nalpha > 32) return 0;
+    std::uint32_t* dst = static_cast<std::uint32_t*>(dstv);
+    alignas(64) std::uint32_t tab[32] = {};
+    std::memcpy(tab, row, (std::size_t)nalpha * 4);
+    std::size_t k = 0;
+#if defined(NWGRAD_PROFILE_AVX512)
+    {
+        const __m512i t0 = _mm512_load_si512((const void*)tab), t1 = _mm512_load_si512((const void*)(tab + 16));
+        for (; k + 16 <= sw; k += 16) {
+            const __m512i ix = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i*)(idx + k)));
+            _mm512_storeu_si512((void*)(dst + k), _mm512_permutex2var_epi32(t0, ix, t1));
+        }
+        if (k < sw) {
+            const __mmask16 m = (__mmask16)((1u << (sw - k)) - 1u);
+            const __m512i ix = _mm512_cvtepu8_epi32(_mm_maskz_loadu_epi8(m, idx + k));
+            _mm512_mask_storeu_epi32((void*)(dst + k), m, _mm512_permutex2var_epi32(t0, ix, t1));
+        }
+        return sw;
+    }
+#elif defined(__SSSE3__)
+    // The planes: P[p][h] = byte p of entries 16h..16h+15.  A shuffle groups each 4-entry
+    // block's bytes by plane (dword p = byte p of the 4 entries), a 4 x 4 dword transpose
+    // gathers the 16 entries'.
+    __m128i P[4][2];
+    {
+        const __m128i tm = _mm_setr_epi8(0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15);
+        for (int h = 0; h < 2; ++h) {
+            const __m128i x0 = _mm_shuffle_epi8(_mm_load_si128((const __m128i*)(tab + 16 * h)), tm);
+            const __m128i x1 = _mm_shuffle_epi8(_mm_load_si128((const __m128i*)(tab + 16 * h + 4)), tm);
+            const __m128i x2 = _mm_shuffle_epi8(_mm_load_si128((const __m128i*)(tab + 16 * h + 8)), tm);
+            const __m128i x3 = _mm_shuffle_epi8(_mm_load_si128((const __m128i*)(tab + 16 * h + 12)), tm);
+            const __m128i u0 = _mm_unpacklo_epi32(x0, x1), u1 = _mm_unpacklo_epi32(x2, x3);
+            const __m128i u2 = _mm_unpackhi_epi32(x0, x1), u3 = _mm_unpackhi_epi32(x2, x3);
+            P[0][h] = _mm_unpacklo_epi64(u0, u1);
+            P[1][h] = _mm_unpackhi_epi64(u0, u1);
+            P[2][h] = _mm_unpacklo_epi64(u2, u3);
+            P[3][h] = _mm_unpackhi_epi64(u2, u3);
         }
     }
+#if defined(__AVX2__)
+    {
+        __m256i A[4], B[4];
+        for (int p = 0; p < 4; ++p) {
+            A[p] = _mm256_broadcastsi128_si256(P[p][0]);
+            B[p] = _mm256_broadcastsi128_si256(P[p][1]);
+        }
+        const __m256i c70 = _mm256_set1_epi8(0x70), c16 = _mm256_set1_epi8(16);
+        for (; k + 32 <= sw; k += 32) {
+            const __m256i ix = _mm256_loadu_si256((const __m256i*)(idx + k));
+            const __m256i ia = _mm256_add_epi8(ix, c70), ib = _mm256_sub_epi8(ix, c16);
+            __m256i q[4];
+            for (int p = 0; p < 4; ++p)
+                q[p] = _mm256_or_si256(_mm256_shuffle_epi8(A[p], ia), _mm256_shuffle_epi8(B[p], ib));
+            const __m256i a = _mm256_unpacklo_epi8(q[0], q[1]), b = _mm256_unpackhi_epi8(q[0], q[1]);
+            const __m256i c = _mm256_unpacklo_epi8(q[2], q[3]), d = _mm256_unpackhi_epi8(q[2], q[3]);
+            const __m256i e0 = _mm256_unpacklo_epi16(a, c);   // slots 0-3 | 16-19
+            const __m256i e1 = _mm256_unpackhi_epi16(a, c);   // 4-7 | 20-23
+            const __m256i e2 = _mm256_unpacklo_epi16(b, d);   // 8-11 | 24-27
+            const __m256i e3 = _mm256_unpackhi_epi16(b, d);   // 12-15 | 28-31
+            _mm256_storeu_si256((__m256i*)(dst + k), _mm256_permute2x128_si256(e0, e1, 0x20));
+            _mm256_storeu_si256((__m256i*)(dst + k + 8), _mm256_permute2x128_si256(e2, e3, 0x20));
+            _mm256_storeu_si256((__m256i*)(dst + k + 16), _mm256_permute2x128_si256(e0, e1, 0x31));
+            _mm256_storeu_si256((__m256i*)(dst + k + 24), _mm256_permute2x128_si256(e2, e3, 0x31));
+        }
+    }
+#endif
+    {
+        const __m128i c70 = _mm_set1_epi8(0x70), c16 = _mm_set1_epi8(16);
+        for (; k + 16 <= sw; k += 16) {
+            const __m128i ix = _mm_loadu_si128((const __m128i*)(idx + k));
+            const __m128i ia = _mm_add_epi8(ix, c70), ib = _mm_sub_epi8(ix, c16);
+            __m128i q[4];
+            for (int p = 0; p < 4; ++p)
+                q[p] = _mm_or_si128(_mm_shuffle_epi8(P[p][0], ia), _mm_shuffle_epi8(P[p][1], ib));
+            const __m128i a = _mm_unpacklo_epi8(q[0], q[1]), b = _mm_unpackhi_epi8(q[0], q[1]);
+            const __m128i c = _mm_unpacklo_epi8(q[2], q[3]), d = _mm_unpackhi_epi8(q[2], q[3]);
+            _mm_storeu_si128((__m128i*)(dst + k), _mm_unpacklo_epi16(a, c));
+            _mm_storeu_si128((__m128i*)(dst + k + 4), _mm_unpackhi_epi16(a, c));
+            _mm_storeu_si128((__m128i*)(dst + k + 8), _mm_unpacklo_epi16(b, d));
+            _mm_storeu_si128((__m128i*)(dst + k + 12), _mm_unpackhi_epi16(b, d));
+        }
+    }
+#elif defined(__ARM_NEON)
+    {
+        const uint8x16x4_t lo = vld4q_u8((const std::uint8_t*)tab);          // lo.val[p]: byte p, entries 0-15
+        const uint8x16x4_t hi = vld4q_u8((const std::uint8_t*)(tab + 16));   // entries 16-31
+        const uint8x16x2_t t0 = {lo.val[0], hi.val[0]}, t1 = {lo.val[1], hi.val[1]};
+        const uint8x16x2_t t2 = {lo.val[2], hi.val[2]}, t3 = {lo.val[3], hi.val[3]};
+        for (; k + 16 <= sw; k += 16) {
+            const uint8x16_t ix = vld1q_u8(idx + k);
+            uint8x16x4_t o;
+            o.val[0] = vqtbl2q_u8(t0, ix);
+            o.val[1] = vqtbl2q_u8(t1, ix);
+            o.val[2] = vqtbl2q_u8(t2, ix);
+            o.val[3] = vqtbl2q_u8(t3, ix);
+            vst4q_u8((std::uint8_t*)(dst + k), o);
+        }
+    }
+#endif
+    return k;
+}
+// 8-byte elements (int64 / double), AVX-512 only.
+static inline std::size_t striped_lookup_b64(void* dstv, const void* row, const unsigned char* idx,
+                                             int nalpha, std::size_t sw) {
+#if defined(NWGRAD_PROFILE_AVX512)
+    if (nalpha > 32) return 0;
+    std::uint64_t* dst = static_cast<std::uint64_t*>(dstv);
+    alignas(64) std::uint64_t tab[32] = {};
+    std::memcpy(tab, row, (std::size_t)nalpha * 8);
+    const __m512i t0 = _mm512_load_si512((const void*)tab), t1 = _mm512_load_si512((const void*)(tab + 8));
+    const __m512i t2 = _mm512_load_si512((const void*)(tab + 16)), t3 = _mm512_load_si512((const void*)(tab + 24));
+    const __m512i c16 = _mm512_set1_epi64(16);
+    const bool two = nalpha > 16;
+    auto look = [&](__m512i ix) {   // vpermt2q reads index bits 0-3; bit 4 picks the table pair
+        const __m512i v = _mm512_permutex2var_epi64(t0, ix, t1);
+        if (!two) return v;
+        return _mm512_mask_blend_epi64(_mm512_test_epi64_mask(ix, c16), v, _mm512_permutex2var_epi64(t2, ix, t3));
+    };
+    std::size_t k = 0;
+    for (; k + 8 <= sw; k += 8)
+        _mm512_storeu_si512((void*)(dst + k), look(_mm512_cvtepu8_epi64(_mm_loadl_epi64((const __m128i*)(idx + k)))));
+    if (k < sw) {
+        const __mmask8 m = (__mmask8)((1u << (sw - k)) - 1u);
+        _mm512_mask_storeu_epi64((void*)(dst + k), m, look(_mm512_cvtepu8_epi64(_mm_maskz_loadu_epi8(m, idx + k))));
+    }
+    return sw;
+#else
+    (void)dstv; (void)row; (void)idx; (void)nalpha; (void)sw;
+    return 0;
+#endif
+}
+#endif
+// One profile row from the slot index: dst[k] = row[idx[k]] for k < sw (the padding slots
+// included; striped_profile_build overwrites them after).
+template <class T>
+static inline void striped_profile_row_idx(T* dst, const T* row, const unsigned char* idx,
+                                           std::size_t sw, int nalpha) {
+    std::size_t k = 0;
+#ifdef NWGRAD_PROFILE_SHUFFLE
+    if constexpr (std::is_same_v<T, std::int16_t>)
+        k = striped_lookup_i16(dst, row, idx, nalpha, sw);
+    else if constexpr (sizeof(T) == 4)
+        k = striped_lookup_b32(dst, row, idx, nalpha, sw);
+    else if constexpr (sizeof(T) == 8)
+        k = striped_lookup_b64(dst, row, idx, nalpha, sw);
 #else
     (void)nalpha;
 #endif
-    for (std::size_t k = 0; k < sw; ++k) dst[k] = row[idx[k]];
-    for (int j = n + 1; j <= seg * W; ++j)
-        dst[(std::size_t)((j - 1) % seg) * W + (std::size_t)((j - 1) / seg)] = nw_pad<T>;
+    for (; k < sw; ++k) dst[k] = row[idx[k]];
+}
+// The padding slots (columns n+1..seg*W, fewer than W) of `nrow` consecutive rows: each
+// slot's position is computed once, not once per row (a division and a modulo each).
+template <class T>
+static inline void striped_profile_pad(T* prof, int nrow, int n, int seg, int W) {
+    const std::size_t sw = (std::size_t)seg * W;
+    for (int j = n + 1; j <= seg * W; ++j) {
+        const std::size_t slot = (std::size_t)((j - 1) % seg) * W + (std::size_t)((j - 1) / seg);
+        for (int c = 0; c < nrow; ++c) prof[(std::size_t)c * sw + slot] = nw_pad<T>;
+    }
 }
 // The profile rows a striped fill reads (see TrackJob): Tr with tr.ra builds one per
 // compact symbol; Tr without it builds none here (striped_row_profile builds each DP
@@ -768,7 +947,8 @@ template <class T, bool Tr>
             striped_profile_index(idx, b, n, seg, W);
             for (int c = 0; c < tr.nrow; ++c)
                 striped_profile_row_idx(prof.data() + (std::size_t)c * sw,
-                                        blk + (std::size_t)tr.crow[c] * nalpha, idx, n, seg, W, nalpha);
+                                        blk + (std::size_t)tr.crow[c] * nalpha, idx, sw, nalpha);
+            striped_profile_pad(prof.data(), tr.nrow, n, seg, W);
         } else if (prof.size() < sw) {
             prof.resize(sw);
         }
@@ -780,8 +960,29 @@ template <class T, bool Tr>
         striped_profile_index(idx, b, n, seg, W);
         for (int c = 0; c < nalpha; ++c)
             striped_profile_row_idx(prof.data() + (std::size_t)c * sw, blk + (std::size_t)c * nalpha,
-                                    idx, n, seg, W, nalpha);
+                                    idx, sw, nalpha);
+        striped_profile_pad(prof.data(), nalpha, n, seg, W);
     }
+}
+// Test hook (TypedKernels::profile_build): the build above into dst, every row
+// (crow null) or the tracked rows crow[0..nrow).  test_profile_build.cpp checks it against
+// the definition at every level.
+template <class T>
+static void profile_build_entry(T* dst, const T* blk, int nalpha, const unsigned char* b, int n,
+                                int seg, int W, const std::uint32_t* crow, int nrow) {
+    typename DpBufferT<T>::TVec prof;
+    const std::size_t sw = (std::size_t)seg * W;
+    if (crow) {
+        TrackJob<T> tr{};
+        tr.ra = crow;   // non-null: the compact-profile form
+        tr.crow = crow;
+        tr.nrow = nrow;
+        striped_profile_build<T, true>(prof, blk, nalpha, b, n, seg, W, tr);
+    } else {
+        striped_profile_build<T, false>(prof, blk, nalpha, b, n, seg, W, TrackJob<T>{});
+        nrow = nalpha;
+    }
+    std::memcpy(dst, prof.data(), (std::size_t)nrow * sw * sizeof(T));
 }
 // DP row i's profile row (1-based i).
 template <class T, bool Tr>

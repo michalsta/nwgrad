@@ -361,6 +361,7 @@ if (NWGRAD_BUILD_TESTS)
         tests/cpp/test_integer.cpp
         tests/cpp/test_linear_striped.cpp
         tests/cpp/test_grid.cpp
+        tests/cpp/test_profile_build.cpp
         ${NWGRAD_LEVEL_SOURCES}   # per-ISA kernel TUs, so kernel="simd" exercises the dispatched striped path
     )
     target_include_directories(nwgrad_tests PRIVATE
