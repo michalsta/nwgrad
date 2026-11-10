@@ -1166,6 +1166,14 @@ struct Aligner {
             na.rowwise_full_ = false;
             na.tb_ = tb_; na.tb_auto_ = tb_auto_;
             na.set_problem(a_idx_, b_idx_, *params_, 0, {}, {}, {}, sc.blk.data(), nullptr, &nb);
+            // Where this type's `auto` takes Grid, the narrow run takes Grid too (an explicit
+            // request), whatever its own `auto` would: int16 Local `auto` keeps Pointers
+            // within the pointer budget, and an int32 Local path narrowed onto it lost
+            // (nighthaven AVX2, DNA L3000: 1.07 at 1 thread, 1.43 and 3.3x the RSS at 6;
+            // explicit Grid there 0.39).  Elsewhere the narrow type's own choice stands
+            // (int64 Global within its budget runs Pointers, narrowed int32 Grid).
+            if (cls == 0 && tb_auto_ && run_tb_() == TracebackMode::Grid && grid_ok_(level_kernels(backend)))
+                na.set_traceback(TracebackMode::Grid);
             if (na.path_class_() != cls) {
                 if (cls == 0) na.set_traceback(GM == GapModel::Affine ? TracebackMode::Grid : TracebackMode::Pointers);
                 else          na.set_traceback(run_tb_());
