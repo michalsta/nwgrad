@@ -2921,6 +2921,17 @@ functions:
   float32 Global 64.4 / 48.4 | 64.6 / 64.6, Local 67.3 / 49.0 | 67.5 / 67.5.
   So -24 to -30 % when unused, +0 to +0.7 % when used (miRNA: the per-group setup).
   "lazy" used: 125.7 (miRNA double Global), 110.3 (protein double Global) -- per pair.
+  Hence the ADAPTIVE default (gate 1, 2026-11-10): a soft call fills its guides in the
+  call, as eager did, when at least half the batch's guides were read (`guide_j`,
+  `banded_grad`; `guide_reads_`) since its previous soft call, and defers them otherwise;
+  gate 2 always defers, 0 never. The first step of a loop defers and decides the next.
+  Measured as above with two warm-up steps (the first eager step after a deferred one
+  allocates the workers' Viterbi tables once, ~500k instructions), adaptive vs eager,
+  used: miRNA double Global 99.65 vs 99.61 (A/A 99.65), Local 103.67 vs 103.66 (103.70);
+  float32 61.82 vs 61.82 (61.85), 63.68 vs 63.68 (63.66); protein double 91.37 vs 91.37
+  (91.37), 95.97 vs 95.96 (95.96); float32 64.60 vs 64.61 (64.60), 67.52 vs 67.52 (67.52):
+  all within the A/A spread. Unused: as "deferred" above (72.87, 73.24, 44.76, 45.35,
+  67.56, 67.64, 48.36, 49.02).
   Tests: `test_soft_guide_defer.py`. `"lazy"` — it does not, and the guide
   is computed on first use (`guide_j`, `banded_align`, `banded_grad`) under the params
   CURRENT THEN. Deliberately opt-in: `score_and_grad(); set_params(params + lr*g); banded_grad()`
