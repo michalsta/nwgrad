@@ -26,7 +26,10 @@ checkpointed code without a recomputation; the environment variable
 switch of the double soft pass's denormal handling, which moves double soft results within
 tolerance: ``soft_double_ftz`` (1, the default: flush denormals to zero around the double
 soft kernels, as float32 always does; 0 restores gradual underflow, the arithmetic before
-2026-11-06), with ``NWGRAD_SOFT_DOUBLE_FTZ`` as its environment fallback.  A batch regroups its
+2026-11-06), with ``NWGRAD_SOFT_DOUBLE_FTZ`` as its environment fallback.  And
+``inter_group_tiles``, the inter-pair planner's tile size in groups (default: sqrt of the
+eligible pairs over W; 0 or 1: the old grouping by (len B, len A); ``None``: one tile per
+ragged len-B window), which moves only speed.  A batch regroups its
 cached inter-pair plan on the next call after any change.  Not thread-safe to change
 while work is in flight.
 """
@@ -53,6 +56,7 @@ def defaults():
     d[_MIN_N] = "per type"
     d[_SOFT] = "per level, fill, gap model and alphabet"
     d[_CKR] = "auto"
+    d["inter_group_tiles"] = "auto"
     return d
 
 

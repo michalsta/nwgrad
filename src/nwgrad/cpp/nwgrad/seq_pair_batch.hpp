@@ -91,6 +91,9 @@ public:
     std::array<size_t, 3> inter_plan_counts(bool score_only = false) {
         return visit([score_only](auto& e) { return e.inter_plan_counts(score_only); });
     }
+    std::vector<std::vector<size_t>> inter_plan_groups(bool score_only = false) {
+        return visit([score_only](auto& e) { return e.inter_plan_groups(score_only); });
+    }
     bool tracked() const noexcept { return visit([](const auto& e) { return e.tracked(); }); }
     int num_sets() const noexcept { return visit([](const auto& e) { return e.num_sets(); }); }
     const Alphabet& alphabet() const {

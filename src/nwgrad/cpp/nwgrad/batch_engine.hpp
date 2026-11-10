@@ -2305,6 +2305,14 @@ public:
         const InterPlan& P = ensure_plan_(score_only && grad_mode_ == GradMode::None);
         return {P.elig.size(), P.other.size(), P.groups.size()};
     }
+    // The plan's groups as pair indices, in group order (nwgrad._tuning, tests).
+    std::vector<std::vector<size_t>> inter_plan_groups(bool score_only = false) {
+        const InterPlan& P = ensure_plan_(score_only && grad_mode_ == GradMode::None);
+        std::vector<std::vector<size_t>> g;
+        g.reserve(P.groups.size());
+        for (auto [s, e] : P.groups) g.emplace_back(P.elig.begin() + s, P.elig.begin() + e);
+        return g;
+    }
 private:
     struct InterPlan {
         int default_backend = -1000, hb_cutoff = -1;   // what it was built for
@@ -2321,8 +2329,9 @@ private:
     // Built once and reused until the default ISA changes, the Hirschberg cutoff moves or
     // a fill gate is overridden (nwgrad._tuning):
     // re-sorting 2.5M pairs every training iteration was ~0.9 s of serial work per call.
-    // Groups: len B runs of len-A-sorted pairs, cut every W and wherever len B outgrows
-    // the group's shortest past ragged_ok().
+    // Groups: see the tiles below (default) -- or, with inter_group_tiles = 1, len B runs
+    // of len-A-sorted pairs, cut every W and wherever len B outgrows the group's shortest
+    // past ragged_ok().
     const InterPlan& ensure_plan_(bool rows = false) {
         InterPlan& dst = rows ? plan_rows_ : plan_;
         const int def_backend = global_default_backend();
@@ -2352,19 +2361,36 @@ private:
             if (x.len_a != y.len_a) return x.len_a < y.len_a;
             return x.i < y.i;
         });
+        // Tiles of up to `tile` groups within ragged_ok of the tile's shortest B, each
+        // re-sorted by (len A, len B) and cut every W (inter_group_tiles, simd_levels.hpp;
+        // tile = 1 is the old grouping exactly).  A tile that the ragged window ends on a
+        // partial group too empty to share gives that tail back to the next tile instead.
         // A group of mostly padding lanes runs its pairs' own fills (inter_group_filled).
         P.elig.reserve(keys.size());
         const size_t W = static_cast<size_t>(inter_w_(K));
+        const size_t tile = inter_group_tiles(keys.size(), W);
+        const size_t tmax = tile > SIZE_MAX / W ? SIZE_MAX : tile * W;
         for (size_t s = 0; s < keys.size();) {
-            size_t e = s + 1;
-            while (e < keys.size() && e - s < W && ragged_ok(keys[s].len_b, keys[e].len_b)) ++e;
-            if (inter_group_filled(e - s, W)) {
-                P.groups.emplace_back(P.elig.size(), P.elig.size() + (e - s));
-                for (size_t k = s; k < e; ++k) P.elig.push_back(keys[k].i);
-            } else {
-                for (size_t k = s; k < e; ++k) P.other.push_back(keys[k].i);
+            size_t t = s + 1;
+            while (t < keys.size() && t - s < tmax && ragged_ok(keys[s].len_b, keys[t].len_b)) ++t;
+            if (tile > 1 && t < keys.size() && t - s > W && !inter_group_filled((t - s) % W, W))
+                t = s + (t - s) / W * W;
+            if (tile > 1)
+                std::sort(keys.begin() + s, keys.begin() + t, [](const Key& x, const Key& y) {
+                    if (x.len_a != y.len_a) return x.len_a < y.len_a;
+                    if (x.len_b != y.len_b) return x.len_b < y.len_b;
+                    return x.i < y.i;
+                });
+            for (size_t g = s; g < t; g += W) {
+                const size_t e = std::min(t, g + W);
+                if (inter_group_filled(e - g, W)) {
+                    P.groups.emplace_back(P.elig.size(), P.elig.size() + (e - g));
+                    for (size_t k = g; k < e; ++k) P.elig.push_back(keys[k].i);
+                } else {
+                    for (size_t k = g; k < e; ++k) P.other.push_back(keys[k].i);
+                }
             }
-            s = e;
+            s = t;
         }
         dst = std::move(P);
         return dst;
