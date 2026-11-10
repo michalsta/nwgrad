@@ -227,6 +227,7 @@ TEST_CASE("Grid traceback is bit-identical to Pointers (integer T, every mode)",
 }
 
 TEST_CASE("Grid traceback runs as Pointers where it is not implemented", "[grid][traceback]") {
+    IntNarrowOff narrow_off;   // checks the type's own kernel routing (narrowing tested in test_integer)
     std::mt19937 rng(7);
     long n_grid = 0;
     for (int t = 0; t < 12; ++t) {
@@ -244,6 +245,7 @@ TEST_CASE("Grid traceback runs as Pointers where it is not implemented", "[grid]
 }
 
 TEST_CASE("auto takes Grid for Glocal, and for Local above the pointer budget", "[grid][traceback]") {
+    IntNarrowOff narrow_off;   // checks the type's own kernel routing (narrowing tested in test_integer)
     // kDefaultTb (2026-11-05): Glocal past hb_cutoff (512 rows) runs Grid on every simd level (the
     // scalar backend falls back, pmax / Pointers); Local runs Pointers within
     // kAutoPointerCells and Grid above it.  Every run is Pointers' result.
@@ -300,6 +302,7 @@ TEST_CASE("auto takes Grid for Glocal, and for Local above the pointer budget", 
 }
 
 TEST_CASE("auto takes Grid for integer T where it splits", "[grid][traceback]") {
+    IntNarrowOff narrow_off;   // checks the type's own kernel routing (narrowing tested in test_integer)
     // run_tb_ (2026-11-05): integer `auto` is hirschberg_pmax; a pair that splits (past
     // hb_cutoff = 512 rows; Global int32 and Glocal have no pointer budget, Global int64 has
     // 2^25) runs Grid on a simd level, Pointers within the budget; int16 Global / Glocal keep

@@ -156,6 +156,7 @@ void sweep(uint64_t seed, int rounds, int& mismatches, int& cases, int& kernel_r
 
 TEMPLATE_TEST_CASE("striped linear kernels equal the scalar linear fills bit for bit", "[linear][simd]",
                    double, float, int16_t, int32_t, int64_t) {
+    IntNarrowOff narrow_off;   // checks the type's own kernel routing (narrowing tested in test_integer)
     int mismatches = 0, cases = 0, kernel_runs = 0, expected_runs = 0;
     std::string first;
     sweep<TestType>(0x5eedf00d, 800, mismatches, cases, kernel_runs, expected_runs, first);

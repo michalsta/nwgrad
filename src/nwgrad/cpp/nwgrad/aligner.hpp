@@ -349,6 +349,15 @@ inline std::atomic<int>& int_narrow_paths_mode() noexcept {
     static std::atomic<int> m{-1};
     return m;
 }
+// Scoped: every narrowing off (the tests that check which kernel or traceback a type's
+// own fill ran -- the dense codes, the striped layout, ran_grid -- not results).
+struct IntNarrowOff {
+    int m0 = int_narrow_mode().exchange(0), p0 = int_narrow_paths_mode().exchange(0);
+    ~IntNarrowOff() { int_narrow_mode().store(m0); int_narrow_paths_mode().store(p0); }
+    IntNarrowOff() = default;
+    IntNarrowOff(const IntNarrowOff&) = delete;
+    IntNarrowOff& operator=(const IntNarrowOff&) = delete;
+};
 inline int int_narrow_paths() noexcept {
     const int m = int_narrow_paths_mode().load(std::memory_order_relaxed);
     if (m >= 0) return m;
