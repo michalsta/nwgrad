@@ -2581,7 +2581,10 @@ private:
                 if (backend != kBackendScalar && n_ >= linear_striped_min_n(backend)) {
                     const LevelKernels& K = level_kernels(backend);
                     const TypedKernels<T>& KT = K.template of<T>();
-                    if (lin_ptr ? KT.linear_ptr != nullptr : KT.linear != nullptr) {
+                    // semi-global runtime ends: the level's sg fills (their own unit)
+                    const bool sgk = !sg_is_glocal_();
+                    if (lin_ptr ? (sgk ? KT.linear_ptr_sg : KT.linear_ptr) != nullptr
+                                : (sgk ? KT.linear_sg : KT.linear) != nullptr) {
                         run_dispatched_linear(buf, K, lin_ptr);
                         return;
                     }
@@ -2722,7 +2725,8 @@ private:
         if (tr_) fill_track_job_(job.tr, true, static_cast<size_t>(n_) + 16, true);
         const TypedKernels<T>& KT = K.template of<T>();
         job.dense = (use_ptr && want_dense_()) ? 1 : 0;
-        if (use_ptr) KT.linear_ptr(job); else KT.linear(job);
+        if (!sg_is_glocal_()) { if (use_ptr) KT.linear_ptr_sg(job); else KT.linear_sg(job); }
+        else if (use_ptr) KT.linear_ptr(job); else KT.linear(job);
         pointers_ = use_ptr;
         dense_ = use_ptr && job.dense;
         if (job.table_layout == 1) {

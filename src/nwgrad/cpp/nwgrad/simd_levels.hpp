@@ -1033,6 +1033,8 @@ struct TypedKernels {
     viterbi_fn         viterbi_ptr = nullptr;        // TracebackMode::Pointers
     viterbi_fn         linear = nullptr;             // striped LINEAR Full, H table (kernels_linear_impl.inl)
     viterbi_fn         linear_ptr = nullptr;         // ... recording direction bytes
+    viterbi_fn         linear_sg = nullptr;          // linear, semi-global runtime ends (job.sg)
+    viterbi_fn         linear_ptr_sg = nullptr;      // ... recording direction bytes
     using lhb_fn = void (*)(LhbJob<T>&);
     lhb_fn             lhb = nullptr;                // linear Hirschberg sweeps / base / scans
     banded_row_fn_t<T> banded_row_global = nullptr;  // row-wise banded whole-row kernels
@@ -1129,6 +1131,10 @@ void register_level_typed(SimdLevel l,
                           typename TypedKernels<T>::score_fn score);
 // The inter-pair hard kernels, from the level's inter TU (level_<name>_inter.cpp; see
 // level_common.inc).
+template <class T>
+NWGRAD_BASELINE_ONLY
+void register_level_sg(SimdLevel l, typename TypedKernels<T>::viterbi_fn linear_sg,
+                       typename TypedKernels<T>::viterbi_fn linear_ptr_sg);
 template <class T>
 NWGRAD_BASELINE_ONLY
 void register_level_inter(SimdLevel l, typename TypedKernels<T>::inter_fn inter_fill,
