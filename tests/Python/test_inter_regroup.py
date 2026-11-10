@@ -82,7 +82,7 @@ def test_grouping_invariants(kind, n, level):
     rng = np.random.default_rng(n + len(kind))
     la, lb = _lengths(kind, n, rng)
     b = _batch(la, lb, rng, t="int16", level=level)
-    with _tuning.override(inter_group_tiles=1):
+    with _tuning.override(inter_group_tiles=1, inter_group_bytes=None):
         old = b._inter_groups()
     W = max(len(g) for g in old) if old else 0
     if W < 2:
@@ -90,7 +90,10 @@ def test_grouping_invariants(kind, n, level):
     W = 1 << (W - 1).bit_length()     # a full group may not exist in a small batch
     auto = int(math.sqrt(n / W) + 0.5) if math.sqrt(n / W) >= 1.5 else 1
     for k, gate in ((1, 1), (1, 0), (auto, "default"), (3, 3), (None, None)):
-        with _tuning.override(inter_group_tiles=gate):
+        # The byte budget (inter_pair_fits) depends on W and the threads: lifted, so every
+        # pair is eligible and the reference sees the planner's input (at 32 lanes it
+        # excluded the longest pairs).
+        with _tuning.override(inter_group_tiles=gate, inter_group_bytes=None):
             groups = b._inter_groups()
             elig, other, ng = b._inter_plan()
         assert ng == len(groups) and elig == sum(map(len, groups)) and elig + other == n
@@ -100,9 +103,10 @@ def test_grouping_invariants(kind, n, level):
             assert W * 3 // 4 <= len(g) <= W
             assert _ragged_ok(min(lb[i] for i in g), max(lb[i] for i in g))
         assert groups == _reference(list(la), list(lb), W, k), (k, gate)
-    with _tuning.override(inter_group_tiles=1):
+    with _tuning.override(inter_group_tiles=1, inter_group_bytes=None):
         u_old = _util(b._inter_groups(), la, lb, W)
-    u_new = _util(b._inter_groups(), la, lb, W)
+    with _tuning.override(inter_group_bytes=None):
+        u_new = _util(b._inter_groups(), la, lb, W)
     if kind == "independent" and n == 600:
         assert u_new > u_old + 0.05, (u_old, u_new)   # the point of the tiles
     else:
@@ -143,11 +147,12 @@ def test_old_and_new_grouping_identical(t, grad, mode, gm, level):
         out.append(r)
     if plans[0][0] or plans[0][1]:
         assert any(p != plans[0] for p in plans[1:]), "the gate did not regroup"
-    # Float32 soft scores (log Z) and gradients follow the group in their last bits (the
-    # float32 soft pass runs under flushed denormals over the group's padded columns), as
-    # shared vs own fills do (test_batch_interpair: rel 2e-4).  Double soft, the paths, and
-    # every hard score and gradient are bit-identical.
-    exact = not (t == "float32" and grad == "soft")
+    # Soft scores (log Z) and gradients follow the group in their last bits (float32 under
+    # flushed denormals; double too at 4+ lanes, CI avx2 / avx512 / neon), as shared vs own
+    # fills do (test_batch_interpair).  The paths, and every hard score and gradient, are
+    # bit-identical.
+    exact = grad != "soft"
+    tol = 2e-4 if t == "float32" else 1e-7
     for o in out[1:]:
         assert len(o) == len(out[0])
         for x, y in zip(out[0], o):
@@ -155,6 +160,6 @@ def test_old_and_new_grouping_identical(t, grad, mode, gm, level):
                 if exact:
                     assert x.tobytes() == y.tobytes()
                 else:
-                    np.testing.assert_allclose(y, x, rtol=2e-4, atol=2e-4 * np.abs(x).max())
+                    np.testing.assert_allclose(y, x, rtol=tol, atol=tol * np.abs(x).max())
             else:
                 assert x == y

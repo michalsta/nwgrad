@@ -105,6 +105,34 @@ struct BatchSettings {
     }
 };
 
+// The inter-pair groups of `keys` (sorted by len B, then len A, then index): tiles of up
+// to `tile` groups within the ragged len-B window of the tile's shortest, each tile
+// stable-sorted by (len A, len B) and cut every W; emit(s, e, filled) per group, a range
+// of the reordered keys.  tile = 1 is the grouping before 2026-11-10 exactly.  A tile
+// that the ragged window ends on a partial group too empty to share gives that tail back
+// to the next tile.  Both planners (ensure_plan_, stream_inter_) cut through this one
+// function: the soft results' last bits follow the group, and the batch and the stream
+// must keep agreeing (test_batch_constructor, test_tracks_batch).
+template<class Key, class LenA, class LenB, class Emit>
+void inter_cut_groups(std::vector<Key>& keys, size_t W, size_t tile, LenA la, LenB lb, Emit emit) {
+    const size_t tmax = tile > SIZE_MAX / W ? SIZE_MAX : tile * W;
+    for (size_t s = 0; s < keys.size();) {
+        size_t t = s + 1;
+        while (t < keys.size() && t - s < tmax && lb(keys[t]) * 4 <= lb(keys[s]) * 5 + 16) ++t;   // ragged_ok
+        if (tile > 1 && t < keys.size() && t - s > W && !inter_group_filled((t - s) % W, W))
+            t = s + (t - s) / W * W;
+        if (tile > 1)
+            std::stable_sort(keys.begin() + s, keys.begin() + t, [&](const Key& x, const Key& y) {
+                return la(x) != la(y) ? la(x) < la(y) : lb(x) < lb(y);
+            });
+        for (size_t g = s; g < t; g += W) {
+            const size_t e = std::min(t, g + W);
+            emit(g, e, inter_group_filled(e - g, W));
+        }
+        s = t;
+    }
+}
+
 template<class T, GapModel GM, AlignMode AM>
 class BatchEngine {
 public:
@@ -853,7 +881,7 @@ private:
             return -1;
         return backend;
     }
-    // Problems grouped W at a time, sorted by len B then len A (counting sorts: each call
+    // Problems sorted by len B then len A, then grouped as the batch plan (inter_cut_groups; counting sorts: each call
     // brings new problems, nothing is cached).  The rest run their own path in the same
     // pass: empty sequences, and Full pairs the traceback would split (Hirschberg past
     // the cutoff).  A guided band-0 call is GuideBanded and stays so.
@@ -907,15 +935,13 @@ private:
         csort([&](size_t i) { return problems[i].seq_a.size(); }, maxa);
         csort([&](size_t i) { return problems[i].seq_b.size(); }, maxb);
         std::vector<std::pair<size_t, size_t>> groups;
-        for (size_t s = 0; s < elig.size();) {
-            const size_t lb = problems[elig[s]].seq_b.size();
-            size_t e = s + 1;
-            while (e < elig.size() && e - s < static_cast<size_t>(W) &&
-                   problems[elig[e]].seq_b.size() * 4 <= lb * 5 + 16) ++e;
-            if (inter_group_filled(e - s, static_cast<size_t>(W))) groups.emplace_back(s, e);
-            else other.insert(other.end(), elig.begin() + s, elig.begin() + e);   // mostly padding
-            s = e;
-        }
+        inter_cut_groups(elig, static_cast<size_t>(W), inter_group_tiles(elig.size(), static_cast<size_t>(W)),
+                         [&](size_t i) { return problems[i].seq_a.size(); },
+                         [&](size_t i) { return problems[i].seq_b.size(); },
+                         [&](size_t g, size_t e, bool filled) {
+                             if (filled) groups.emplace_back(g, e);
+                             else other.insert(other.end(), elig.begin() + g, elig.begin() + e);   // mostly padding
+                         });
         // Tracked lanes (per-lane rows into the kernels): params with sets, or any track.
         const bool trk = params.num_sets() > 1 || st.any();
         std::atomic<size_t> idx{0};
@@ -2361,37 +2387,16 @@ private:
             if (x.len_a != y.len_a) return x.len_a < y.len_a;
             return x.i < y.i;
         });
-        // Tiles of up to `tile` groups within ragged_ok of the tile's shortest B, each
-        // re-sorted by (len A, len B) and cut every W (inter_group_tiles, simd_levels.hpp;
-        // tile = 1 is the old grouping exactly).  A tile that the ragged window ends on a
-        // partial group too empty to share gives that tail back to the next tile instead.
-        // A group of mostly padding lanes runs its pairs' own fills (inter_group_filled).
+        // Tiles of groups (inter_cut_groups; inter_group_tiles, simd_levels.hpp).  A group
+        // of mostly padding lanes runs its pairs' own fills (inter_group_filled).
         P.elig.reserve(keys.size());
         const size_t W = static_cast<size_t>(inter_w_(K));
-        const size_t tile = inter_group_tiles(keys.size(), W);
-        const size_t tmax = tile > SIZE_MAX / W ? SIZE_MAX : tile * W;
-        for (size_t s = 0; s < keys.size();) {
-            size_t t = s + 1;
-            while (t < keys.size() && t - s < tmax && ragged_ok(keys[s].len_b, keys[t].len_b)) ++t;
-            if (tile > 1 && t < keys.size() && t - s > W && !inter_group_filled((t - s) % W, W))
-                t = s + (t - s) / W * W;
-            if (tile > 1)
-                std::sort(keys.begin() + s, keys.begin() + t, [](const Key& x, const Key& y) {
-                    if (x.len_a != y.len_a) return x.len_a < y.len_a;
-                    if (x.len_b != y.len_b) return x.len_b < y.len_b;
-                    return x.i < y.i;
-                });
-            for (size_t g = s; g < t; g += W) {
-                const size_t e = std::min(t, g + W);
-                if (inter_group_filled(e - g, W)) {
-                    P.groups.emplace_back(P.elig.size(), P.elig.size() + (e - g));
-                    for (size_t k = g; k < e; ++k) P.elig.push_back(keys[k].i);
-                } else {
-                    for (size_t k = g; k < e; ++k) P.other.push_back(keys[k].i);
-                }
-            }
-            s = t;
-        }
+        inter_cut_groups(keys, W, inter_group_tiles(keys.size(), W),
+                         [](const Key& k) { return k.len_a; }, [](const Key& k) { return k.len_b; },
+                         [&](size_t g, size_t e, bool filled) {
+                             if (filled) P.groups.emplace_back(P.elig.size(), P.elig.size() + (e - g));
+                             for (size_t k = g; k < e; ++k) (filled ? P.elig : P.other).push_back(keys[k].i);
+                         });
         dst = std::move(P);
         return dst;
     }
