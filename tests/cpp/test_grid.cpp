@@ -4,8 +4,8 @@
 // aligned strings and hard gradient, ties included — on every backend, both floating
 // precisions.  Pairs above hb_cutoff take the grid (a small cutoff here, so the recursion
 // and its block borders are exercised at modest lengths); the rest, and every case Grid
-// does not implement (linear, tracks, negative opens, scalar backend), run as Pointers,
-// which this checks too.  Integer T (every mode, int16 in both regimes) since 2026-11-05.  Random problems mix ties (small-integer
+// does not implement (tracks, negative opens, linear Local with a negative extend, scalar
+// backend), run as Pointers, which this checks too.  Linear gaps since 2026-11-07 (below).  Integer T (every mode, int16 in both regimes) since 2026-11-05.  Random problems mix ties (small-integer
 // matrices and gaps), non-representable extends (0.1) and planted homology (long gap
 // runs).  NWGRAD_GRID_FUZZ=<n> scales the iteration count.
 
@@ -233,8 +233,12 @@ TEST_CASE("Grid traceback runs as Pointers where it is not implemented", "[grid]
         AlignParams p = random_params(rng, t % 3);
         auto [A, B] = random_pair(rng, 300);
         for (int kern : grid_backends()) {
-            check_grid<GapModel::Linear, AlignMode::Global, float>(A, B, p, kern, 8, n_grid);
-            check_grid<GapModel::Linear, AlignMode::Local, double>(A, B, p, kern, 8, n_grid);
+            AlignParams r = p;   // linear Local with a gaining gap: degenerate, not gridded
+            r.gap_extend_a = -0.5;
+            check_grid<GapModel::Linear, AlignMode::Local, double>(A, B, r, kern, 8, n_grid);
+            AlignParams ri = random_int_params(rng, 0);
+            ri.gap_extend_b = -1;
+            check_grid<GapModel::Linear, AlignMode::Local, int32_t>(A, B, ri, kern, 8, n_grid);
             AlignParams q = p;   // a negative open: the D/X form does not apply
             q.gap_open_a = -0.5;
             check_grid<GapModel::Affine, AlignMode::Global, double>(A, B, q, kern, 8, n_grid);
@@ -346,5 +350,155 @@ TEST_CASE("auto takes Grid for integer T where it splits", "[grid][traceback]") 
         Aligner<GapModel::Affine, AlignMode::Global, AlignBand::Full, int64_t> g64;
         run(g64, TracebackMode::Default, kern, A, B);
         REQUIRE_FALSE(g64.ran_grid());
+    }
+}
+
+// ── Linear gaps (2026-11-07): Grid over H (viterbi_linear_grid), bit-identical to the linear
+// Pointers fill (striped or scalar) -- score bits, path, ties, guide, aligned strings,
+// gradient -- in every mode, every scalar type, every backend (the scalar one runs as
+// Pointers).  Floating: ties (small-integer matrices), 0.1 / 0.3 extends, a zero extend,
+// negative extends (Global / Glocal; Local with one is not gridded, above); integer: int16
+// in both regimes, int32, int64 (the fused prefix-max forward from 4 lanes, lazy-F below).
+// Block edge cases: cutoff 1, one-column and narrow B, short A, the whole problem one base
+// block (Local's end from the base block's scan, Glocal's from its last row).
+namespace {
+
+AlignParams random_linear_params(std::mt19937& rng, int scheme, bool allow_negative) {
+    AlignParams p = random_params(rng, scheme % 3);
+    if (scheme == 3) { p.gap_extend_a = 0.0; p.gap_extend_b = 0.7; }
+    if (scheme == 4 && allow_negative) { p.gap_extend_a = -0.25; p.gap_extend_b = 0.5; }
+    if (scheme == 5 && allow_negative) { p.gap_extend_a = 1.5; p.gap_extend_b = -0.1; }
+    return p;
+}
+
+std::pair<std::string, std::string> linear_edge_pair(std::mt19937& rng, long t, int maxlen) {
+    auto [A, B] = random_pair(rng, t % 10 == 0 ? 3 * maxlen : maxlen);
+    std::uniform_int_distribution<int> aa(0, 19), L(0, 150);
+    switch (t % 9) {
+        case 1: B = B.substr(0, std::min<std::size_t>(B.size(), 1)); break;   // one column
+        case 2: B = B.substr(0, B.size() / 9); break;                          // narrow B
+        case 3: A = A.substr(0, A.size() / 7); break;                          // short A
+        case 4: {                                                               // homology inside flanks
+            std::string f1, f2, f3, f4;
+            for (int k = L(rng); k > 0; --k) f1 += kAA[aa(rng)];
+            for (int k = L(rng); k > 0; --k) f2 += kAA[aa(rng)];
+            for (int k = L(rng); k > 0; --k) f3 += kAA[aa(rng)];
+            for (int k = L(rng); k > 0; --k) f4 += kAA[aa(rng)];
+            A = f1 + A + f2; B = f3 + B + f4;
+            break;
+        }
+        default: break;
+    }
+    return {A, B};
+}
+
+template <AlignMode AM>
+void grid_linear_float_round(std::uint32_t seed, long iters) {
+    std::mt19937 rng(seed);
+    long ng = 0;
+    std::uniform_int_distribution<int> cut(1, 60);
+    for (long t = 0; t < iters; ++t) {
+        const AlignParams p = random_linear_params(rng, static_cast<int>(t % 6), AM != AlignMode::Local);
+        auto [A, B] = linear_edge_pair(rng, t, 400);
+        const int cutoff = t % 4 == 0 ? 1 : cut(rng);
+        for (int kern : grid_backends()) {
+            check_grid<GapModel::Linear, AM, double>(A, B, p, kern, cutoff, ng);
+            check_grid<GapModel::Linear, AM, float>(A, B, p, kern, cutoff, ng);
+        }
+    }
+    REQUIRE(ng > 0);
+}
+
+template <AlignMode AM>
+void grid_linear_int_round(std::uint32_t seed, long iters) {
+    std::mt19937 rng(seed);
+    long ng[3] = {0, 0, 0};   // int32, int64, int16
+    std::uniform_int_distribution<int> cut(1, 60);
+    for (long t = 0; t < iters; ++t) {
+        auto [A, B] = linear_edge_pair(rng, t, 350);
+        const int cutoff = t % 4 == 0 ? 1 : cut(rng);
+        const int scheme = static_cast<int>(t % 5);
+        AlignParams p = random_int_params(rng, scheme == 3 ? 3 : (scheme == 4 ? 0 : scheme));
+        if (scheme == 4) { p.gap_extend_a = 0; p.gap_extend_b = 3; }
+        if (scheme == 2 && AM != AlignMode::Local) { p.gap_extend_a = -1; p.gap_extend_b = 2; }
+        for (int kern : grid_backends()) {
+            check_grid<GapModel::Linear, AM, int32_t>(A, B, p, kern, cutoff, ng[0]);
+            check_grid<GapModel::Linear, AM, int64_t>(A, B, p, kern, cutoff, ng[1]);
+            if (A.size() + B.size() < 1400 || scheme == 0)
+                check_grid<GapModel::Linear, AM, int16_t>(A, B, p, kern, cutoff, ng[2]);
+        }
+    }
+    for (long c : ng) REQUIRE(c > 0);
+}
+
+}  // namespace
+
+TEST_CASE("Grid traceback is bit-identical to Pointers (linear, floating T)", "[grid][traceback][linear]") {
+    grid_linear_float_round<AlignMode::Global>(20261111, grid_iters(40));
+    grid_linear_float_round<AlignMode::Local>(20261112, grid_iters(40));
+    grid_linear_float_round<AlignMode::Glocal>(20261113, grid_iters(40));
+}
+
+TEST_CASE("Grid traceback is bit-identical to Pointers (linear, integer T)", "[grid][traceback][linear]") {
+    grid_linear_int_round<AlignMode::Global>(20261114, grid_iters(30));
+    grid_linear_int_round<AlignMode::Local>(20261115, grid_iters(30));
+    grid_linear_int_round<AlignMode::Glocal>(20261116, grid_iters(30));
+}
+
+TEST_CASE("Grid traceback, linear: int16 in the saturating regime", "[grid][traceback][linear]") {
+    // BLOSUM-like range with large values (scheme 3) at L400-900: past the quarter rule, so
+    // the saturating kernels run (the fill and the grid forward alike).
+    std::mt19937 rng(20261117);
+    long ng = 0;
+    for (long t = 0; t < grid_iters(12); ++t) {
+        const AlignParams p = random_int_params(rng, 3);
+        std::uniform_int_distribution<int> aa(0, 19), L(400, 900);
+        std::string A, B;
+        for (int k = L(rng); k > 0; --k) A += kAA[aa(rng)];
+        for (char c : A) B += aa(rng) < 4 ? kAA[aa(rng)] : c;
+        for (int kern : grid_backends()) {
+            check_grid<GapModel::Linear, AlignMode::Global, int16_t>(A, B, p, kern, 16, ng);
+            check_grid<GapModel::Linear, AlignMode::Local, int16_t>(A, B, p, kern, 16, ng);
+            check_grid<GapModel::Linear, AlignMode::Glocal, int16_t>(A, B, p, kern, 16, ng);
+        }
+    }
+    REQUIRE(ng > 0);
+}
+
+TEST_CASE("auto takes Grid for linear gaps past hb_cutoff", "[grid][traceback][linear]") {
+    // run_tb_ (kLinearGridAuto): linear `auto` (Pointers) runs Grid on a simd level past
+    // hb_cutoff (512 rows); the H / Pointers fill below it and on the scalar backend.
+    std::mt19937 rng(20261118);
+    const AlignParams p = random_int_params(rng, 0);
+    auto run = [&](auto& al, TracebackMode tb, int kern, const std::string& a, const std::string& b) {
+        al.alloc_buf();
+        al.set_kernel(kern);
+        al.set_traceback(tb);
+        al.set_problem(a, b, p);
+        al.compute_viterbi();
+    };
+    std::uniform_int_distribution<int> aa(0, 19);
+    std::string A, B;
+    for (int i = 0; i < 800; ++i) A += kAA[aa(rng)];
+    for (char c : A) B += aa(rng) < 5 ? kAA[aa(rng)] : c;
+    const std::string S = A.substr(0, 300);
+    for (int kern : grid_backends()) {
+        const bool simd = kern != kBackendScalar;
+        Aligner<GapModel::Linear, AlignMode::Global, AlignBand::Full, float> g, gp, sh;
+        run(g, TracebackMode::Default, kern, A, B); run(gp, TracebackMode::Pointers, kern, A, B);
+        REQUIRE(g.ran_grid() == simd);
+        REQUIRE(same_bits(g.score(), gp.score()));
+        REQUIRE(g.alignment() == gp.alignment());
+        run(sh, TracebackMode::Default, kern, S, B);
+        REQUIRE_FALSE(sh.ran_grid());
+        Aligner<GapModel::Linear, AlignMode::Local, AlignBand::Full, int32_t> l, lp;
+        run(l, TracebackMode::Default, kern, A, B); run(lp, TracebackMode::Pointers, kern, A, B);
+        REQUIRE(l.ran_grid() == simd);
+        REQUIRE(l.score() == lp.score());
+        REQUIRE(l.alignment() == lp.alignment());
+        Aligner<GapModel::Linear, AlignMode::Glocal, AlignBand::Full, double> c, cp;
+        run(c, TracebackMode::Default, kern, A, B); run(cp, TracebackMode::Pointers, kern, A, B);
+        REQUIRE(c.ran_grid() == simd);
+        REQUIRE(c.alignment() == cp.alignment());
     }
 }

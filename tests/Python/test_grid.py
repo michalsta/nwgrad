@@ -148,3 +148,41 @@ def test_auto_integer_takes_grid_where_it_split(tname, mode):
     A, B = related_pairs(6, 200, 400, seed=3)
     cls, p = BATCHES[tname], PARAMS[0]
     _same(_run(cls, A, B, p, "auto", mode, 2, cutoff=64), _run(cls, A, B, p, "pointers", mode, 2, cutoff=64))
+
+
+# Linear gaps (2026-11-07): Grid over H, linear Pointers' result bit for bit, every type
+# and mode, through the batch (per-pair fills, threads) and `auto` (Grid past hb_cutoff).
+LIN_PARAMS = [
+    nwgrad.AlignParams(BLOSUM62, 0.0, 4.0, 0.0, 4.0),                 # integral: ties
+    nwgrad.AlignParams(BLOSUM62, 0.0, 1.0, 0.0, 0.0),                 # a free gap in B
+    nwgrad.AlignParams(BLOSUM62, 0.0, 1.0 / 3.0, 0.0, 0.7) * 0.3,     # non-representable
+]
+LIN_BATCHES = {"float32": nwgrad.SeqPairBatch, "double": nwgrad.SeqPairBatchDouble, **BATCHES}
+
+
+def _run_lin(cls, A, B, p, tb, mode, threads, cutoff=16):
+    b = cls(A, B, p, n_threads=threads, traceback=tb, mode=mode, gap_model="linear")
+    b.fill = "striped"
+    b.hb_cutoff = cutoff
+    b.score_and_grad(keep_paths=True)
+    mats, gaps = b.grads()
+    return (b.scores(), mats, gaps, [b[i].aligned() for i in range(len(b))],
+            [list(b[i].guide_j) for i in range(len(b))])
+
+
+@pytest.mark.parametrize("tname", list(LIN_BATCHES))
+@pytest.mark.parametrize("mode", ["global", "local", "glocal"])
+@pytest.mark.parametrize("pi", range(len(LIN_PARAMS)))
+@pytest.mark.parametrize("tb", ["grid", "auto"])
+def test_linear_grid_equals_pointers(tname, mode, pi, tb):
+    if pi == 2 and tname.startswith("int"):
+        pytest.skip("integer types take integral parameters only")
+    A, B = related_pairs(10, 40, 600 if tname == "int16" else 400, seed=pi + 31)
+    if mode != "global":
+        rng = np.random.default_rng(pi + 40)
+        fl = lambda: "".join(rng.choice(list(AA), int(rng.integers(0, 60))))
+        B = [fl() + b + fl() for b in B]
+        if mode == "local":
+            A = [fl() + a + fl() for a in A]
+    cls, p = LIN_BATCHES[tname], LIN_PARAMS[pi]
+    _same(_run_lin(cls, A, B, p, tb, mode, 3), _run_lin(cls, A, B, p, "pointers", mode, 3))
