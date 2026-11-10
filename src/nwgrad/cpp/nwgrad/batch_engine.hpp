@@ -2680,8 +2680,16 @@ private:
         const size_t N = size();
         const bool inter = s_.inter_fill;
         const InterPlan& PL = inter ? ensure_plan_(true) : plan_;
-        const size_t G = inter ? PL.groups.size() : 0;
-        const size_t tasks = inter ? G + PL.other.size() : N;
+        // The int8 groups (inter8_kernel_impl.inl) when the call qualifies: then the plan is
+        // plan8_'s split of PL, else PL itself.
+        Inter8Call c8;
+        const Inter8Plan* P8 = inter ? ensure_plan8_(PL, c8) : nullptr;
+        const std::vector<size_t>& elig = P8 ? P8->elig16 : PL.elig;
+        const std::vector<size_t>& other = P8 ? P8->other : PL.other;
+        const auto& groups = P8 ? P8->groups16 : PL.groups;
+        const size_t G8 = P8 ? P8->groups8.size() : 0;
+        const size_t G = inter ? groups.size() : 0;
+        const size_t tasks = inter ? G8 + G + other.size() : N;
         std::atomic<size_t> idx{0};
         auto worker = [&]() {
             WorkLease lease(*this);
@@ -2689,21 +2697,21 @@ private:
             std::vector<const unsigned char*> a, b;
             std::vector<int> m, nb;
             std::vector<T> best, blkT;
+            std::vector<size_t> spill;   // int8 lanes that may have saturated: re-run at T
             auto own = [&](size_t i) {
                 flags_[i] &= static_cast<uint8_t>(~kStored);
                 set_problem_(w.full, i);
                 score_[i] = w.full.compute_score(w.buf);
                 finish_(i, false, true);
             };
-            for (size_t t; (t = idx.fetch_add(1, std::memory_order_relaxed)) < tasks; ) {
-                if (!inter) { own(t); continue; }
-                if (t >= G) { own(PL.other[t - G]); continue; }
-                const auto [s, e] = PL.groups[t];
-                const size_t real = e - s;
-                const LevelKernels& K = level_kernels(PL.backend);
+            const LevelKernels* Kp = inter ? &level_kernels(PL.backend) : nullptr;
+            // One group of `real` pairs vec[s0 .. s0 + real) on the T score kernel.
+            auto run16 = [&](const std::vector<size_t>& vec, size_t s0, size_t real) {
+                const size_t* ids = vec.data() + s0;
+                const LevelKernels& K = *Kp;
                 if (!has_inter_score_(K) || !linear_fill_ok_(K)) {
-                    for (size_t l = 0; l < real; ++l) own(PL.elig[s + l]);
-                    continue;
+                    for (size_t l = 0; l < real; ++l) own(ids[l]);
+                    return;
                 }
                 const int W = inter_w_(K);
                 a.assign(W, nullptr); b.assign(W, nullptr); m.assign(W, 0); nb.assign(W, 0);
@@ -2711,7 +2719,7 @@ private:
                 int M = 0, n = 0;
                 bool ragged = false;
                 for (int l = 0; l < W; ++l) {
-                    const size_t i = PL.elig[s + std::min<size_t>(l, real - 1)];
+                    const size_t i = ids[std::min<size_t>(l, real - 1)];
                     a[l] = codes_a(i).data(); b[l] = codes_b(i).data();
                     m[l] = static_cast<int>(len_a(i));
                     nb[l] = static_cast<int>(len_b(i));
@@ -2720,15 +2728,15 @@ private:
                     ragged |= nb[l] != nb[0];
                 }
                 if (!inter_score_ok<T>(alpha_->size(), M, n, GM == GapModel::Affine, AM == AlignMode::Local, s_.n_threads == 1, PL.backend)) {   // short pairs only
-                    for (size_t l = 0; l < real; ++l) own(PL.elig[s + l]);
-                    continue;
+                    for (size_t l = 0; l < real; ++l) own(ids[l]);
+                    return;
                 }
                 InterJobT<T> job{};
                 job.a = a.data(); job.m = m.data(); job.b = b.data(); job.n = n; job.M = M;
                 job.align_mode = (AM == AlignMode::Local) ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
                 if (ragged) job.nb = nb.data();
                 if (tracked_) {
-                    tracked_lanes_(w, w.lanes, W, real, PL.elig, s);
+                    tracked_lanes_(w, w.lanes, W, real, vec, s0);
                     job.tr = w.tjobs.data();
                 }
                 block_for_(job, blkT);
@@ -2736,14 +2744,197 @@ private:
                 job.best = best.data();
                 run_inter_score_(K, job);
                 for (size_t l = 0; l < real; ++l) {
-                    const size_t i = PL.elig[s + l];
+                    const size_t i = ids[l];
                     flags_[i] &= static_cast<uint8_t>(~kStored);
                     score_[i] = static_cast<double>(best[l]);
                     finish_(i, false, true);
                 }
+            };
+            for (size_t t; (t = idx.fetch_add(1, std::memory_order_relaxed)) < tasks; ) {
+                if (!inter) { own(t); continue; }
+                if (t < G8) {
+                    const auto [s, e] = P8->groups8[t];
+                    run8_(P8->elig8.data() + s, e - s, c8, *Kp, spill, own);
+                    const size_t W = static_cast<size_t>(inter_w_(*Kp));
+                    while (spill.size() >= W) {   // a full group of re-runs
+                        run16(spill, spill.size() - W, W);
+                        spill.resize(spill.size() - W);
+                    }
+                    continue;
+                }
+                if (t >= G8 + G) { own(other[t - G8 - G]); continue; }
+                const auto [s, e] = groups[t - G8];
+                run16(elig, s, e - s);
+            }
+            // The last re-runs: a group if it fills one (inter_group_filled), else their own fills.
+            if (!spill.empty()) {
+                if (inter_group_filled(spill.size(), static_cast<size_t>(inter_w_(*Kp)))) run16(spill, 0, spill.size());
+                else for (size_t i : spill) own(i);
             }
         };
         run_workers_(tasks, worker);
+    }
+
+    // ── The inter-pair int8 score tier (inter8_kernel_impl.inl) ──────────────────
+    // A score-only call of an integer batch first runs its short pairs in groups of
+    // inter_w8 int8 lanes (twice int16's, four times int32's), proving each lane's score as
+    // the striped int8 tier does (score8_kernel_impl.inl): Local exact below 127, Global /
+    // Glocal exact above G - 128 with G = min(m, n) * smax_pos <= 126 required up front.
+    // A lane that fails runs again at T, in a group of the T kernel's width once a worker
+    // has gathered enough of them (else its own fill), so every score is the T kernel's
+    // integer.  Preconditions (else the call runs as before): an integer T, untracked, at
+    // most 8 letters, every substitution within [-127, 127], gaps >= 0 with go + ge <= 127
+    // per side, the level's kernel present; per pair: both lengths <= 127 (the kernel's
+    // lane compares are int8) and, Global / Glocal, the gain bound.  Gate inter_score_int8.
+    struct Inter8Call {
+        std::vector<int8_t> blk;
+        int8_t go_a = 0, ge_a = 0, go_b = 0, ge_b = 0;
+        int smax_pos = 0;
+        int lmin = 0;   // the largest min(m, n) a pair may have (Global / Glocal gain bound)
+    };
+    struct Inter8Plan {
+        const InterPlan* base = nullptr;   // the plan it splits, and that plan's identity
+        int base_backend = -1000, base_hb = -1; unsigned base_epoch = ~0u;
+        int lmin = -1;
+        std::vector<size_t> elig8, elig16, other;
+        std::vector<std::pair<size_t, size_t>> groups8, groups16;
+    };
+    Inter8Plan plan8_;
+    static int inter8_mode_() noexcept {
+        const int64_t o = gate_override(Gate::InterScoreInt8);
+        if (o >= 0) return o >= 2 ? 2 : static_cast<int>(o);
+        static const int64_t v = env_nonneg_int("NWGRAD_INTER_INT8");
+        return v < 0 ? 1 : v >= 2 ? 2 : static_cast<int>(v);
+    }
+    // The call's int8 parameters, or false (the tier does not apply).
+    bool inter8_call_(const InterPlan& PL, Inter8Call& c) const {
+        if constexpr (!nw_is_int<T>) { (void)PL; (void)c; return false; }
+        else {
+            const int mode = inter8_mode_();
+            if (mode == 0 || (mode == 1 && !kInter8Default)) return false;
+            if (PL.backend < 0 || tracked_ || grad_mode_ != GradMode::None || alpha_->size() > 8) return false;
+            const LevelKernels& K = level_kernels(PL.backend);
+            if (!K.inter_score_i8 || !has_inter_score_(K) || !linear_fill_ok_(K)) return false;
+            const AlignParams& P = params_->p;
+            if (P.num_sets() != 1) return false;
+            auto i8 = [](double v, int lo, int hi, int& out) {
+                if (!(v >= lo && v <= hi) || v != std::floor(v)) return false;
+                out = static_cast<int>(v); return true;
+            };
+            const size_t nn = static_cast<size_t>(P.matrix.size()) * P.matrix.size();
+            c.blk.resize(nn);
+            int smax = 0;
+            for (size_t k = 0; k < nn; ++k) {
+                int v;
+                if (!i8(P.matrix.data()[k], -127, 127, v)) return false;
+                c.blk[k] = static_cast<int8_t>(v);
+                smax = std::max(smax, v);
+            }
+            constexpr bool lin = GM == GapModel::Linear;
+            int goa = 0, gob = 0, gea, geb;
+            if (!lin && (!i8(P.gap_open_a, 0, 127, goa) || !i8(P.gap_open_b, 0, 127, gob))) return false;
+            if (!i8(P.gap_extend_a, 0, 127, gea) || !i8(P.gap_extend_b, 0, 127, geb)) return false;
+            if (goa + gea > 127 || gob + geb > 127) return false;
+            c.go_a = static_cast<int8_t>(goa); c.ge_a = static_cast<int8_t>(gea);
+            c.go_b = static_cast<int8_t>(gob); c.ge_b = static_cast<int8_t>(geb);
+            c.smax_pos = smax;
+            c.lmin = (AM == AlignMode::Local || smax == 0) ? 127 : std::min(127, 126 / smax);
+            return true;
+        }
+    }
+    // Default modes of the tier (gate value 1): see kInter8Default's measurements.
+    static constexpr bool kInter8Default = true;
+    // plan8_ for this call (rebuilt when PL or the length bound changed), or nullptr.
+    const Inter8Plan* ensure_plan8_(const InterPlan& PL, Inter8Call& c) {
+        if (!inter8_call_(PL, c)) return nullptr;
+        Inter8Plan& P = plan8_;
+        if (P.base == &PL && P.base_backend == PL.default_backend && P.base_hb == PL.hb_cutoff &&
+            P.base_epoch == PL.gate_epoch && P.lmin == c.lmin) return &P;
+        P = Inter8Plan{};
+        P.base = &PL; P.base_backend = PL.default_backend; P.base_hb = PL.hb_cutoff;
+        P.base_epoch = PL.gate_epoch; P.lmin = c.lmin;
+        const LevelKernels& K = level_kernels(PL.backend);
+        struct Key { size_t len_b, len_a, i; };
+        std::vector<Key> k8, k16;
+        for (size_t i : PL.elig) {
+            const size_t la = len_a(i), lb = len_b(i);
+            if (std::max(la, lb) <= 127 && std::min(la, lb) <= static_cast<size_t>(c.lmin)) k8.push_back({lb, la, i});
+            else k16.push_back({lb, la, i});
+        }
+        auto by_len = [](const Key& x, const Key& y) {
+            if (x.len_b != y.len_b) return x.len_b < y.len_b;
+            if (x.len_a != y.len_a) return x.len_a < y.len_a;
+            return x.i < y.i;
+        };
+        // ensure_plan_'s grouping: len B runs cut every W and where ragged_ok() fails.
+        auto group = [&](std::vector<Key>& keys, size_t W, std::vector<size_t>& elig,
+                         std::vector<std::pair<size_t, size_t>>& groups, auto&& reject) {
+            std::sort(keys.begin(), keys.end(), by_len);
+            for (size_t s = 0; s < keys.size();) {
+                size_t e = s + 1;
+                while (e < keys.size() && e - s < W && ragged_ok(keys[s].len_b, keys[e].len_b)) ++e;
+                if (inter_group_filled(e - s, W)) {
+                    groups.emplace_back(elig.size(), elig.size() + (e - s));
+                    for (size_t k = s; k < e; ++k) elig.push_back(keys[k].i);
+                } else {
+                    for (size_t k = s; k < e; ++k) reject(keys[k]);
+                }
+                s = e;
+            }
+        };
+        group(k8, static_cast<size_t>(K.inter_w8), P.elig8, P.groups8, [&](const Key& k) { k16.push_back(k); });
+        group(k16, static_cast<size_t>(inter_w_(K)), P.elig16, P.groups16, [&](const Key& k) { P.other.push_back(k.i); });
+        P.other.insert(P.other.end(), PL.other.begin(), PL.other.end());
+        return &P;
+    }
+    // One int8 group: ids[0..real); proven lanes scored, the rest appended to `spill`.
+    template <class Own>
+    void run8_(const size_t* ids, size_t real, const Inter8Call& c, const LevelKernels& K,
+               std::vector<size_t>& spill, Own&& own) {
+        struct alignas(64) Blk { int8_t v[64]; };
+        static thread_local std::vector<Blk> rows;
+        static thread_local std::vector<const unsigned char*> a, b;
+        static thread_local std::vector<int> m, nb;
+        static thread_local std::vector<int8_t> best;
+        const int W = K.inter_w8;
+        a.assign(W, nullptr); b.assign(W, nullptr); m.assign(W, 0); nb.assign(W, 0); best.assign(W, 0);
+        int M = 0, n = 0;
+        bool ragged = false;
+        for (int l = 0; l < W; ++l) {
+            const size_t i = ids[std::min<size_t>(l, real - 1)];
+            a[l] = codes_a(i).data(); b[l] = codes_b(i).data();
+            m[l] = static_cast<int>(len_a(i));
+            nb[l] = static_cast<int>(len_b(i));
+            M = std::max(M, m[l]);
+            n = std::max(n, nb[l]);
+            ragged |= nb[l] != nb[0];
+        }
+        // the T kernel's own short-pair gate, at int16's caps (the int8 kernel's are unmeasured)
+        if (!inter_score_ok<int16_t>(alpha_->size(), M, n, GM == GapModel::Affine, AM == AlignMode::Local, s_.n_threads == 1, K.level)) {
+            for (size_t l = 0; l < real; ++l) own(ids[l]);
+            return;
+        }
+        InterJobT<int8_t> job{};
+        job.a = a.data(); job.m = m.data(); job.b = b.data(); job.n = n; job.M = M;
+        job.align_mode = (AM == AlignMode::Local) ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
+        job.linear = GM == GapModel::Linear ? 1 : 0;
+        if (ragged) job.nb = nb.data();
+        job.blk = c.blk.data(); job.nalpha = static_cast<int>(alpha_->size());
+        job.go_a = c.go_a; job.ge_a = c.ge_a; job.go_b = c.go_b; job.ge_b = c.ge_b;
+        const size_t row = (static_cast<size_t>(n + 1) * W + sizeof(Blk) - 1) / sizeof(Blk);
+        if (rows.size() < 2 * row) rows.resize(2 * row);
+        job.VM = rows[0].v; job.VX = rows[row].v;
+        job.best = best.data();
+        K.inter_score_i8(job);
+        for (size_t l = 0; l < real; ++l) {
+            const size_t i = ids[l];
+            const int v = best[l];
+            const int g = std::min(m[l], nb[l]) * c.smax_pos;
+            if (AM == AlignMode::Local ? v >= 127 : v <= g - 128) { spill.push_back(i); continue; }
+            flags_[i] &= static_cast<uint8_t>(~kStored);
+            score_[i] = static_cast<double>(v);
+            finish_(i, false, true);
+        }
     }
 
     void score_and_grad_dynamic_(bool keep) {

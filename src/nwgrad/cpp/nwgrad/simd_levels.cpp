@@ -74,6 +74,11 @@ void register_level_common(SimdLevel l, int row_block, score8_fn score_i8) {
     k.level     = static_cast<int>(l);
     k.row_block = row_block;
 }
+void register_level_inter8(SimdLevel l, void (*inter_score_i8)(InterJobT<int8_t>&), int inter_w8) {
+    LevelKernels& k = level_table()[(int)l];
+    k.inter_score_i8 = inter_score_i8;
+    k.inter_w8       = inter_w8;
+}
 void register_level_soft(SimdLevel l, inter_soft_fn inter_soft,
                          soft_pair_fn soft_pair_linear, soft_pair_fn soft_pair_affine,
                          inter_soft_fn_f inter_soft_f, soft_pair_fn_f soft_pair_linear_f,

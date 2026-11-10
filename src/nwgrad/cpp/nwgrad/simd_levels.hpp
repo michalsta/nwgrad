@@ -626,7 +626,7 @@ enum class Gate : int {
     InterGroupBytes, InterSoftBytes, InterScoreGatherCells,
     InterLinearIntGatherCells, InterLinearF32GatherCells, InterLinearF64GatherCells,
     InterGlobalLinearIntCells, InterGlobalLinearF32Cells, LinearStripedMinN, SoftF32MinCells,
-    InterMinFill, SoftCkptRows, SoftCkptMinBytes, SoftDoubleFtz, ScoreInt8, Count_
+    InterMinFill, SoftCkptRows, SoftCkptMinBytes, SoftDoubleFtz, ScoreInt8, InterScoreSmallCells, InterScoreInt8, Count_
 };
 inline constexpr const char* kGateNames[] = {
     "inter_group_bytes", "inter_soft_bytes", "inter_score_gather_cells",
@@ -634,7 +634,8 @@ inline constexpr const char* kGateNames[] = {
     "inter_linear_f64_gather_cells", "inter_global_linear_int_cells",
     "inter_global_linear_f32_cells", "linear_striped_min_n", "soft_f32_min_cells",
     "inter_min_fill", "soft_ckpt_rows", "soft_ckpt_min_bytes",
-    "soft_double_ftz", "score_int8"};
+    "soft_double_ftz", "score_int8", "inter_score_small_cells",
+    "inter_score_int8"};
 static_assert(sizeof(kGateNames) / sizeof(kGateNames[0]) == static_cast<size_t>(Gate::Count_));
 inline constexpr int64_t kGateUnset = -1;
 inline constexpr int64_t kGateOff = INT64_MAX;
@@ -926,7 +927,9 @@ inline bool inter_score_ok(size_t nalpha, int M, int n, bool affine, bool local,
     const GateTypeCaps& c = gate_caps(level).of<T>();
     const uint32_t aff = local ? (single ? c.score_affine_1 : c.score_affine)
                                : (single ? c.score_affine_g1 : c.score_affine_g);
-    const size_t cap = nalpha <= 8 ? size_t(local ? c.score_small_local : c.score_small_global)
+    // Up to 8 letters its own override (inter_score_small_cells): without one, a sweep
+    // that set the gather cap off still sent DNA pairs past ~L43 to their own fill.
+    const size_t cap = nalpha <= 8 ? gate_cap(Gate::InterScoreSmallCells, local ? c.score_small_local : c.score_small_global)
                                    : gate_cap(Gate::InterScoreGatherCells,
                                               affine ? aff : (local ? c.score_linear : c.score_linear_g));
     return static_cast<size_t>(M + 1) * static_cast<size_t>(n + 1) <= cap;
@@ -1084,6 +1087,9 @@ struct LevelKernels {
     int           row_block = 0;                // columns per interleaved block (per-µarch)
     int           level = 0;                    // this level's SimdLevel id (the gates read it)
     score8_fn     score_i8 = nullptr;           // score only in int8 lanes (score8_kernel_impl.inl)
+    // inter-pair score only in saturating int8 lanes (inter8_kernel_impl.inl), inter_w8 pairs per call
+    void (*inter_score_i8)(InterJobT<int8_t>&) = nullptr;
+    int           inter_w8 = 0;
     inter_soft_fn inter_soft = nullptr;         // inter-pair soft pass, double (W = d.inter_w)
     soft_pair_fn  soft_pair_linear = nullptr;   // per-pair scaled forward-backward ↓
     soft_pair_fn  soft_pair_affine = nullptr;
@@ -1165,6 +1171,9 @@ void register_level_grid(SimdLevel l, typename TypedKernels<T>::grid_fn grid_fwd
 
 NWGRAD_BASELINE_ONLY
 void register_level_common(SimdLevel l, int row_block, score8_fn score_i8);
+// The inter-pair int8 score kernel, from the level's inter TU.
+NWGRAD_BASELINE_ONLY
+void register_level_inter8(SimdLevel l, void (*inter_score_i8)(InterJobT<int8_t>&), int inter_w8);
 // The soft kernels, from the level's soft TU (level_<name>_soft.cpp; see level_common.inc).
 NWGRAD_BASELINE_ONLY
 void register_level_soft(SimdLevel l, inter_soft_fn inter_soft,
