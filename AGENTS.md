@@ -2895,8 +2895,20 @@ functions:
   under θ/T (the θ-derivative of that score). Scaled: weights exp(·/T). Log at T ≠ 1: runs
   on a θ/T copy of the params and sweeps the gradient immediately (`soft_counts_ready_`).
   Setting it on a `SeqPair` invalidates its cached score/grad.
-- `SeqPairBatch.soft_guide` (`SeqPair::set_soft_guide_lazy`): `"eager"` (default) — a soft
-  `score_and_grad()` runs the guide Viterbi as always; `"lazy"` — it does not, and the guide
+- `SeqPairBatch.soft_guide` (`SeqPair::set_soft_guide_lazy`): `"eager"` (default) — the
+  guide is the Viterbi path under the params the soft `score_and_grad()` SCORED. Since
+  2026-11-10 it is computed on first use (`guide_j`, `banded_align`, `banded_grad`) from a
+  snapshot of those params (`BatchEngine::gparams_`, flag `kSnap`; the snapshot is the old
+  `OwnedParams` shared_ptr that `set_params()` replaces, so no copy), bit-identical to the
+  eager fill (resolution is the pair's own hard fill; the inter-pair fill's lanes equal it).
+  A call that never asks skips the fill: an inter-pair soft group runs no Viterbi at all.
+  Rules: the snapshot is the params of the last full soft call; a second soft call
+  re-snapshots; a single pair's `score_and_grad(keep_paths=False)` on a batch view defers
+  only when the batch's snapshot is the current params (else it computes its guide now,
+  so other pending pairs keep theirs); a call that throws resolves its unfinished pairs'
+  guides under the previous snapshot (`settle_unfinished_`). Gate `soft_guide_defer` /
+  `NWGRAD_SOFT_GUIDE_DEFER` = 0 runs the Viterbi inside the call as before (A/B).
+  Tests: `test_soft_guide_defer.py`. `"lazy"` — it does not, and the guide
   is computed on first use (`guide_j`, `banded_align`, `banded_grad`) under the params
   CURRENT THEN. Deliberately opt-in: `score_and_grad(); set_params(params + lr*g); banded_grad()`
   is the ordinary training step, and a lazy default
