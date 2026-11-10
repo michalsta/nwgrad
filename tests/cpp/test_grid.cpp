@@ -306,7 +306,7 @@ TEST_CASE("auto takes Grid for integer T where it splits", "[grid][traceback]") 
     // run_tb_ (2026-11-05): integer `auto` is hirschberg_pmax; a pair that splits (past
     // hb_cutoff = 512 rows; Global int32 and Glocal have no pointer budget, Global int64 has
     // 2^25) runs Grid on a simd level, Pointers within the budget; int16 Global / Glocal keep
-    // pmax; Local (not int16) takes Grid past hb_cutoff at every size.
+    // pmax; Local takes Grid past hb_cutoff at every size (int16 from 1000 rows).
     std::mt19937 rng(20261110);
     const AlignParams p = random_int_params(rng, 0);
     auto run = [&](auto& al, TracebackMode tb, int kern, const std::string& a, const std::string& b) {
@@ -345,7 +345,15 @@ TEST_CASE("auto takes Grid for integer T where it splits", "[grid][traceback]") 
         if (simd) REQUIRE(l.alignment() == lp.alignment());
         Aligner<GapModel::Affine, AlignMode::Local, AlignBand::Full, int16_t> l16;
         run(l16, TracebackMode::Default, kern, A, B);
-        REQUIRE_FALSE(l16.ran_grid());   // int16 Local inside the budget: Pointers (a tie)
+        REQUIRE_FALSE(l16.ran_grid());   // int16 Local below kLocalGridMinRowsI16 (800 rows): Pointers
+        {   // ... and from it, Grid: Pointers' result
+            const std::string A2 = A + A.substr(0, 300), B2 = B + B.substr(0, 300);
+            Aligner<GapModel::Affine, AlignMode::Local, AlignBand::Full, int16_t> m16, m16p;
+            run(m16, TracebackMode::Default, kern, A2, B2); run(m16p, TracebackMode::Pointers, kern, A2, B2);
+            REQUIRE(m16.ran_grid() == simd);
+            REQUIRE(m16.score() == m16p.score());
+            REQUIRE(m16.alignment() == m16p.alignment());
+        }
         Aligner<GapModel::Affine, AlignMode::Global, AlignBand::Full, int64_t> g64;
         run(g64, TracebackMode::Default, kern, A, B);
         REQUIRE_FALSE(g64.ran_grid());

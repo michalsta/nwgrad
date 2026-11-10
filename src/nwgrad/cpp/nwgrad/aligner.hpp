@@ -1852,9 +1852,9 @@ private:
         std::is_same_v<T, float> ? TracebackMode::HirschbergPmax
         : AM == AlignMode::Global ? TracebackMode::Hirschberg
                                   : TracebackMode::Pointers;
-    // Local `auto` takes the one-pass Grid inside the pointer budget too (run_tb_): every
-    // type but int16, which tied Pointers there (nighthaven 0.98 at L1000).
-    static constexpr bool kLocalGridAuto = !(nw_is_int<T> && sizeof(T) == 2);
+    // Local `auto` takes the one-pass Grid inside the pointer budget too (run_tb_), every
+    // type; int16 from kLocalGridMinRowsI16 rows (local_grid_min_rows).
+    static constexpr bool kLocalGridAuto = true;
     static constexpr TracebackMode kDefaultTb =
         (GM == GapModel::Affine && AB == AlignBand::Full)
             ? (nw_is_int<T> ? TracebackMode::HirschbergPmax : TracebackMode::Grid)
@@ -2020,7 +2020,7 @@ private:
         // float32 L1000 0.65, L3000 0.51 (6 threads 0.66 / 0.47), int32 0.57 / 0.42 (0.60 /
         // 0.41), int64 0.51 / 0.41, memory lower; skynet sse4 see AGENTS.md ("Grid at integer
         // T").  The floor is hb_cutoff (grid_ok_: m > hb_cutoff, Pointers below), as for
-        // Global.  int16 excluded (kLocalGridAuto): a tie on nighthaven (0.98 at L1000).
+        // Global.  int16 from kLocalGridMinRowsI16 rows (local_grid_min_rows).
         if constexpr (GM == GapModel::Affine && AB == AlignBand::Full && AM == AlignMode::Local &&
                       kLocalGridAuto)
             if (tb_auto_ && (tb_ == TracebackMode::Grid || tb_ == TracebackMode::HirschbergPmax) &&
@@ -2899,12 +2899,23 @@ private:
     // AVX-512 int32 / int64 0.45-0.87 and double 0.57-0.84 there, nighthaven AVX2 float32
     // L1000 0.65.  Below the floor a budgeted pair runs Pointers, as on main.
     static constexpr int kLocalGridMinRows512 = std::is_same_v<T, float> ? 2048 : 0;
+    // int16, every level: from 1000 rows (was: never inside the budget, a tie at L1000 on
+    // nighthaven before round 1).  Re-measured 2026-11-10, DNA Local path: nighthaven AVX2
+    // auto (Pointers) / grid 1 thread 1.32 L2000, 2.75 L3000, 2.25 L4000, Grid 2.7-3x at 6
+    // threads from L3000 (Pointers' code table grows with m * n); wloczykij sse4 user
+    // instructions per cell, pointers / grid: DNA L1000 12.99 / 9.91, L2000 12.80 / 9.31,
+    // L3000 12.76 / 6.31, protein L1000 13.06 / 10.09, L2000 12.83 / 9.45.  The floor between
+    // hb_cutoff and L1000 is not measured on the fleet yet: NEEDS THE FLEET (L500-L1500,
+    // AVX2 / AVX-512 / NEON, 1 and 6 threads) before it is final.
+    static constexpr int kLocalGridMinRowsI16 = 1000;
     static int local_grid_min_rows(int backend) noexcept {
+        int r = 0;
 #if !(defined(__aarch64__) || defined(_M_ARM64))
-        if (backend == static_cast<int>(SimdLevel::Avx512)) return kLocalGridMinRows512;
+        if (backend == static_cast<int>(SimdLevel::Avx512)) r = kLocalGridMinRows512;
 #endif
         (void)backend;
-        return 0;
+        if constexpr (nw_is_int<T> && sizeof(T) == 2) r = std::max(r, kLocalGridMinRowsI16);
+        return r;
     }
     static constexpr int kLinearStripedMinN512 =
         (AM == AlignMode::Global)
