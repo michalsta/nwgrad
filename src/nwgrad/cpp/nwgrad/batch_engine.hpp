@@ -2698,6 +2698,12 @@ private:
             std::vector<int> m, nb;
             std::vector<T> best, blkT;
             std::vector<size_t> spill;   // int8 lanes that may have saturated: re-run at T
+            // Predictor: skip the int8 run of a group when over half the previous group's
+            // lanes failed (or, run at T, would have failed) the int8 test -- exact from the
+            // T scores, as the striped tier's.  An all-overflowing call then wastes one
+            // int8 group per worker: miRNA Global with go 10 / ge 3, every lane re-run,
+            // cost 1.51x the int16 instructions without it (wloczykij sse4).
+            bool skip8 = false;
             auto own = [&](size_t i) {
                 flags_[i] &= static_cast<uint8_t>(~kStored);
                 set_problem_(w.full, i);
@@ -2754,8 +2760,15 @@ private:
                 if (!inter) { own(t); continue; }
                 if (t < G8) {
                     const auto [s, e] = P8->groups8[t];
-                    run8_(P8->elig8.data() + s, e - s, c8, *Kp, spill, own);
                     const size_t W = static_cast<size_t>(inter_w_(*Kp));
+                    if (skip8) {   // predicted to overflow: the T kernel directly, W at a time
+                        for (size_t k = s; k < e; k += W) run16(P8->elig8, k, std::min(W, e - k));
+                        skip8 = inter8_fails_(P8->elig8.data() + s, e - s, c8) * 2 > e - s;
+                        continue;
+                    }
+                    const size_t before = spill.size();
+                    run8_(P8->elig8.data() + s, e - s, c8, *Kp, spill, own);
+                    skip8 = (spill.size() - before) * 2 > e - s;
                     while (spill.size() >= W) {   // a full group of re-runs
                         run16(spill, spill.size() - W, W);
                         spill.resize(spill.size() - W);
@@ -2842,7 +2855,11 @@ private:
             return true;
         }
     }
-    // Default modes of the tier (gate value 1): see kInter8Default's measurements.
+    // Gate value 1 (the default): on in every mode.  Instructions per pair, tier on / off,
+    // miRNA 22 x 50 score only, wloczykij sse4, 1 thread (A/A 0.91-1.07): int16 affine
+    // Global / Local / Glocal 0.51-0.53 / 0.47-0.49 / 0.48-0.54, linear 0.48-0.61; int32
+    // 0.22-0.28.  Where every lane overflows (Local match 8; Global unrelated, go 10 /
+    // ge 3), the predictor keeps it at 0.99-1.015 (1.22-1.51 without one).
     static constexpr bool kInter8Default = true;
     // plan8_ for this call (rebuilt when PL or the length bound changed), or nullptr.
     const Inter8Plan* ensure_plan8_(const InterPlan& PL, Inter8Call& c) {
@@ -2886,6 +2903,19 @@ private:
         group(k16, static_cast<size_t>(inter_w_(K)), P.elig16, P.groups16, [&](const Key& k) { P.other.push_back(k.i); });
         P.other.insert(P.other.end(), PL.other.begin(), PL.other.end());
         return &P;
+    }
+    // How many of ids[0..real), already scored at T, the int8 test would have refused:
+    // Local a score >= 127, Global / Glocal a score <= G - 128 (exact both ways: see
+    // inter8_kernel_impl.inl's head).
+    size_t inter8_fails_(const size_t* ids, size_t real, const Inter8Call& c) const {
+        size_t f = 0;
+        for (size_t l = 0; l < real; ++l) {
+            const size_t i = ids[l];
+            const double v = score_[i];
+            const long long g = static_cast<long long>(std::min(len_a(i), len_b(i))) * c.smax_pos;
+            f += AM == AlignMode::Local ? v >= 127.0 : v <= static_cast<double>(g - 128);
+        }
+        return f;
     }
     // One int8 group: ids[0..real); proven lanes scored, the rest appended to `spill`.
     template <class Own>
