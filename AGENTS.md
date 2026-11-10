@@ -906,6 +906,28 @@ untested at runtime. Not done: 5-8 letters as two shuffles + a blend (the global
 table is 64 entries, four shuffles: no gain over the 7-blend tree at W = 8), protein by
 `vpermi2b` (needs VBMI, which the avx512 level does not enable, and a runtime check).
 
+**Protein: a per-lane query profile instead of the lane-cell gather (branch
+`proto/inter-profile`, 2026-11-10).** Alphabets over 8 letters (`Lv = kLvGather`, untracked)
+no longer gather each row lane-cell by lane-cell (`row_gather`: a load, an indexed load and
+a lane store per lane-cell, 46 % of a protein L100 int16 path fill at sse4). Per group,
+`InterCommon::build_profile` writes each lane's profile rows `score(c, b_l[j])` for the
+letters its A uses (and letter 0, read past a shorter A), padded to whole W-blocks; per
+row, `row_profile` loads the W lanes' rows W columns at a time and transposes them into
+`srow` (`ivtranspose`: log2 W rounds of interleaves, punpckl/h at SSE). The column loops
+are unchanged; values are loaded, never computed, so it is bit-identical
+(`test_interpair_profile.py`: own fill / profile / gather at every level and lane type,
+ragged and short B, banded, the cap). Cap: `kInterProfileMaxBytes` (1 MiB, unmeasured as
+a crossover), gate `inter_profile_bytes` (0 = the gather). Tracked lanes keep the gather.
+wloczykij sse4 (= skynet's core), differential instructions per pair, BLOSUM62 11/1
+affine, 1 thread, gates off, new / main (A/A 0.99-1.01): L100 int16 score 0.53, path 0.55,
+Local hard 0.61; int32 score 0.64, path 0.68; float32 score 0.65, path 0.70; L300 int16
+path 0.44. sse2: 0.51-0.77, the same order. miRNA and DNA L100 (not on this path) 0.99-1.03
+(A/A 1.00-1.03). The profile build is not separately measured (the release build is
+stripped); by count it is ~(letters used + 1) x n x W copies a group, ~6k instructions a
+pair at protein L100 int16, ~9 % of the new fill. AVX2 / AVX-512 / NEON compile and are
+untested at runtime (at W = 16 / 32 the interleaves cross 128-bit halves: gcc's lowering
+there is unexamined).
+
 ### Score only: `compute_score` and the inter-pair score kernel (2026-10-08)
 
 `Aligner::compute_score()` returns the optimal score with no table and no traceback:
