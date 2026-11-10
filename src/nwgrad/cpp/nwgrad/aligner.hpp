@@ -2909,6 +2909,12 @@ private:
     // Pointers' table is in cache there and instructions do not show it (nighthaven measured
     // the tie at L1000 before round 1).  1000 is the conservative floor; NEEDS THE FLEET
     // (L500-L1500, AVX2 / AVX-512 / NEON, 1 and 6 threads) to settle it, possibly lower.
+    // Affine only, at compile time: run_tb_'s Local Grid clause is `if constexpr (GM ==
+    // Affine ...)`, and linear has no Grid (an explicit "grid" runs Pointers), so a linear
+    // int16 Local pair never reads this floor and keeps main's choice (the H table under
+    // `auto`; spot NEON: it beats pointers and grid by 11-15 % up to L1000).  spot measured
+    // affine Grid winning from L700 (0.956-0.978; a tie at L500): a NEON floor near 700 is
+    // open, 1000 kept for every level until the fleet settles it.
     static constexpr int kLocalGridMinRowsI16 = 1000;
     static int local_grid_min_rows(int backend) noexcept {
         int r = 0;
