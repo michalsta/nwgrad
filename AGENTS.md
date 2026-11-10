@@ -2978,6 +2978,69 @@ instructions (cycles +7-15 %); L100 0.93-0.97 and int32 / int64 held.  So:
   same score.
 Not re-measured after this round: everything above (nighthaven int16, the spot window).
 
+### The int8 score tier (branch `proto/int8`, 2026-11-07)
+
+Integer score-only (int16 / int32 / int64, untracked, simd backend) first tries a score
+kernel in saturating int8 lanes (`score8_kernel_impl.inl`, `Aligner::score_i8_`; 16 lanes
+SSE / NEON, 32 AVX2, 64 AVX-512BW), then the half-width narrowing, then its own kernel.
+The int8 kernel PROVES its result or reports `overflow` and the caller runs the wider one,
+so a saturated value never leaks and the score is the int16 / int32 integer bit for bit.
+- **Kernel.** Farrar striped with lazy-F, its own (the D/X form's stored prefix forms
+  open + k*ge ramps that int8 cannot hold).  Gaps >= 0 only, so with go >= 0 the three-state
+  cell is Gotoh's two-state one (X's max(M, Y) - go - ge loses nothing to H - go - ge), and
+  sat((v - go) - ge) == sat(v - (go + ge)) (same floor), one subtraction per open.  The X row
+  starts as X(1, j) = H(0, j) - goe_b (the row holds the NEXT row's X; starting it at the
+  sentinel lost Glocal's free-start vertical opens -- caught by the A/B fuzz).  Lazy-F stops
+  when no carried F - ge beats the cell's PRE-pass H - goe (against the raised H a zero open
+  stops a step early).
+- **Bound, Local.**  M = max(H + s, 0) >= 0, X / Y only subtract, so H is exact unless an
+  add clamped at 127, which leaves H == 127; X / Y are exact or (-128, V <= -128) and never
+  win H.  Score (the max) < 127 => exact; == 127 => overflow, tested per row (early stop).
+  Padding (s = 0, row 0 = 0) never exceeds the real maximum: no mask.
+- **Bound, Global / Glocal.**  Sat ops are monotone, so S >= V; by induction S(c) <=
+  max(V(c), -128 + G), G = min(m, n) * smax_pos the most any path gains (only diagonals
+  gain).  Required G <= 126 up front (then nothing reaches 127), and S > G - 128 at the end
+  (S <= max(V, -128 + G) and S > -128 + G give S <= V).  Glocal's row max: its argmax cell
+  passes the test, every other V <= S <= max.
+- **Preconditions** (else int16 directly): params within +-127, gaps >= 0, go + ge <= 127
+  per side, m, n >= 1.
+- **Gate** `score_int8` / `NWGRAD_INT8`: 0 off, 1 Local only with a per-thread back-off
+  after an overflow (skip the next 1, 3, ... 63 problems; reset on a success), 2 every mode,
+  every problem (tests).  `NWGRAD_INT_NARROW=0` turns it off with the other narrowing.
+- **Python**: `*_int8` names / `SeqPairInt8` / `SeqPairBatchInt8` (`nwgrad/_int8.py`) are the
+  int16 ones with the parameter range checked (ValueError past +-127); paths and gradients
+  run at int16 (fallback, the same integers).
+- **Not done: the inter-pair score kernel at int8** (the batch's short pairs, miRNA).  Its
+  template (`inter_kernel_impl.inl`) runs plain wrapping arithmetic on GCC vector types
+  (`ivadd` / `ivsub`: "never past the quarter rule"), which int8 cannot use (cap 31);
+  admitting int8_t needs IVT<int8_t> and int8 kLvLut tables, saturating ivadd / ivsub,
+  per-lane overflow flags and a per-pair re-run at int16, and the batch plan groups pairs by
+  the type's lane count.  It is where Global int8 would pay (no lazy-F there), but it is a
+  plumbing change of the plan, not of a kernel.
+- **ISA**: sse2 / sse4 run here (A/B fuzz, C++ [int8] case, test_int8.py at every level);
+  avx2, avx512 and neon (gcc and clang, aarch64 cross) compile only.
+
+Measured (skynet sse4, 1 thread, score-only per pair, striped fill; instructions per pair
+from perf, two rep counts differenced; A = NWGRAD_INT8=0, B = tier on in every mode with no
+back-off (the first form), A'/A 0.98-1.02; "rel" = 30 %-mutated copies (miRNA: 20 %-mutated
+site in a 50-mer), "rand" = unrelated; BLOSUM62 11/1 (linear 4), DNA 2/-4, 4/2 (linear 2)):
+
+| cell | affine G | affine L rel | affine L rand | linear G | linear L rel | linear L rand |
+|---|---|---|---|---|---|---|
+| DNA L100 | 1.00 (G > 126) | 0.81 | 0.48 | 0.99 | 0.78 | 0.65 |
+| DNA L300 | 1.00 | 1.33 | 0.35 | 0.99 | 1.27 | 0.49 |
+| DNA L1000 | 1.00 | 1.08 | 0.33 | 1.01 | 1.08 | 0.39 |
+| protein L100 | 1.00 | 1.99 | 0.97 | 1.00 | 1.74 | 0.96 |
+| protein L300 | 1.00 | 1.25 | 0.58 | 0.99 | 1.27 | 0.67 |
+| protein L1000 | 1.00 | 1.06 | 0.41 | 1.00 | 1.06 | 1.19 |
+| miRNA 22x50 | 2.23 | 0.78 | -- | 1.59 | 0.85 | -- |
+
+int32 narrowed (A: int32 -> int16, B: int32 -> int8): DNA L100 L rel 0.80, DNA L300 L rand
+0.35, protein L300 L rand 0.58, protein L1000 linear L rand 1.19, miRNA affine G 2.19, linear
+L 0.83.  Read: int8 halves the instructions where the Local score stays below 127; an
+overflowing pair costs its int8 run (1.06-2.0x), and Global / Glocal lose outright (lazy-F
+across every lane, every row).  Hence the default: Local only, with the back-off.
+
 ### The soft path: scaled probability space (2026-10-05)
 
 **The scaled path flushes denormals to zero in double too** (default since 2026-11-06,

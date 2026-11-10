@@ -936,7 +936,7 @@ struct Aligner {
             if (backend != kBackendScalar) {
                 if constexpr (nw_is_int<T>) {
                     double r;
-                    if (!tr_ && int_narrow_env() && score_int8_on() && score_i8_(backend, r)) return r;
+                    if (!tr_ && int_narrow_env() && score_i8_(backend, r)) return r;
                 }
                 if constexpr (std::is_same_v<T, std::int32_t> || std::is_same_v<T, std::int64_t>) {
                     double r;
@@ -1061,6 +1061,8 @@ struct Aligner {
     // Per-thread scratch: the int8 block (cast per problem) and the kernel's rows.
     bool score_i8_(int backend, double& out) {
         if constexpr (nw_is_int<T>) {
+            const int mode = score_int8_mode();
+            if (mode == 0 || (mode == 1 && AM != AlignMode::Local)) return false;
             const auto fn = level_kernels(backend).score_i8;
             if (!fn || m_ < 1 || n_ < 1 || !ib_.prepared()) return false;
             if (ib_.smax_pos > T(127) || ib_.smax_neg > T(127)) return false;
@@ -1072,8 +1074,14 @@ struct Aligner {
             if (goa < 0 || gob < 0 || gea < 0 || geb < 0 || goa + gea > 127 || gob + geb > 127) return false;
             const long long gain = static_cast<long long>(std::min(m_, n_)) * static_cast<long long>(ib_.smax_pos);
             if (AM != AlignMode::Local && gain > 126) return false;
-            struct Scratch { std::vector<int8_t> blk, rows; };
+            // Back-off: a Local run that overflows is wasted (up to the row that reached
+            // 127), and related pairs overflow in runs -- protein L100 30 %-mutated Local
+            // cost 2.0x the int16 instructions trying every pair (skynet sse4).  After an
+            // overflow this thread skips the next 1, 3, 7 ... 63 problems, back to 0 on a
+            // success; a batch of overflowing pairs then pays one wasted run in 64.
+            struct Scratch { std::vector<int8_t> blk, rows; int skip = 0, backoff = 0; };
             static thread_local Scratch sc;
+            if (mode == 1 && sc.skip > 0) { --sc.skip; return false; }
             const std::size_t nn = static_cast<std::size_t>(nalpha_) * nalpha_;
             sc.blk.resize(nn);
             for (std::size_t k = 0; k < nn; ++k) sc.blk[k] = static_cast<int8_t>(blkT_[k]);
@@ -1093,7 +1101,13 @@ struct Aligner {
                 st.runs.fetch_add(1, std::memory_order_relaxed);
                 if (job.overflow) st.overflows.fetch_add(1, std::memory_order_relaxed);
             }
-            if (job.overflow) return false;
+            if (job.overflow) {
+                if (mode == 2) return false;   // every problem tried (tests, measuring)
+                sc.backoff = std::min(2 * sc.backoff + 1, 63);
+                sc.skip = sc.backoff;
+                return false;
+            }
+            sc.backoff = 0; sc.skip = 0;
             out = static_cast<double>(job.score);
             return true;
         } else {

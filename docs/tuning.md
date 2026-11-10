@@ -38,13 +38,16 @@ pairs and batches) run the narrowest lanes that are provably exact:
   maximum reached 127; Global / Glocal need G = min(len_a, len_b) · (largest substitution
   score) ≤ 126 up front and a score above G − 128 afterwards. Anything else re-runs below.
   In practice: Local pairs whose best score stays under 127 (unrelated or weakly related
-  pairs, miRNA sites, DNA with small scores), Global / Glocal only for short pairs (DNA
-  match 2: up to 63 residues on the shorter side).
+  pairs, miRNA sites, DNA with small scores). By default **Local only**: Global / Glocal
+  qualify only for short pairs (DNA match 2: up to 63 residues on the shorter side), and
+  there the int8 kernel measured slower than int16 (miRNA × target 2.2× the instructions).
 - **int16** for an int32 problem whose bound fits it, int32 for an int64 one ("narrowing").
 
 An int8 run that overflows is wasted work (a Local run stops at the row where it reaches
-127). Switches, process-wide: `NWGRAD_INT8=0` or `_tuning.set_gate("score_int8", 0)` turns
-the int8 tier off; `NWGRAD_INT_NARROW=0` turns off all narrowing, the int8 tier included.
+127), so after an overflow a thread skips the int8 tier for the next 1, 3, 7, … 63
+problems (back to every problem after a success). Switches, process-wide: `NWGRAD_INT8`
+or `_tuning.set_gate("score_int8", v)`: 0 off, 1 Local with back-off (default), 2 every
+mode and every problem; `NWGRAD_INT_NARROW=0` turns off all narrowing, the int8 tier included.
 Results never change, only speed. The batch's shared inter-pair score kernel (short pairs)
 has no int8 form; those pairs run at their own type.
 
@@ -143,9 +146,10 @@ batch._inter_plan()               # [pairs in shared groups, pairs on their own 
 An `int` is the threshold, `None` turns the gate off, and `"default"` removes the
 override. A batch regroups on its next call after any change.
 
-`score_int8` is a switch, not a threshold: 1 (the default) lets integer score-only calls
-try the int8 kernel first ([Integer types](#integer-types)), 0 never; `NWGRAD_INT8` is its
-environment fallback.
+`score_int8` is a mode, not a threshold: 0 never runs the int8 score kernel, 1 (the
+default) runs it first for Local integer score-only calls with a back-off after
+overflows, 2 for every mode and problem ([Integer types](#integer-types)); `NWGRAD_INT8`
+is its environment fallback.
 
 ## Performance notes
 

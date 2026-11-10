@@ -177,7 +177,7 @@ bool int_one(const std::string& a, const std::string& b, const AlignParams& p, i
     // narrow 0: off; 1: half-width only (the int8 tier off); 2: the int8 tier, then half-width.
     for (int narrow : {0, 1, 2}) {
         int_narrow_mode().store(narrow ? 1 : 0);
-        set_gate_override(Gate::ScoreInt8, narrow == 2 ? 1 : 0);
+        set_gate_override(Gate::ScoreInt8, narrow == 2 ? 2 : 0);
         al.set_kernel(kern); al.set_problem(a, b, p);
         DpBufferT<T> buf;
         const double got = al.compute_score(buf);

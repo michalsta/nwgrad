@@ -693,15 +693,19 @@ inline bool soft_double_ftz() noexcept {
     return v != 0;   // unset (-1): the default, on
 }
 // The int8 score tier (Aligner::score_i8_, score8_kernel_impl.inl): score_int8 /
-// NWGRAD_INT8 (default 1: integer score-only tries the int8 kernel first where the
-// parameters fit; 0: never).  Exact either way (an int8 run that may have saturated is
-// re-run wider), so it moves speed only.  NWGRAD_INT_NARROW=0 turns it off too (every
-// narrowing).  The gate wins over the environment.
-inline bool score_int8_on() noexcept {
+// NWGRAD_INT8.  0: never; 1 (the default): Local only, backing off after overflows
+// (Aligner::score_i8_); 2: every mode and every problem (no back-off).
+// Exact at every value (an int8 run that may have saturated is re-run wider), so it moves
+// speed only.  Global / Glocal are off by default: their rows fall away from column 0 and
+// lazy-F then carries F across every lane boundary of every row (16+ passes), so miRNA x
+// target (22 x 50, the case short enough for their G <= 126 precondition) ran 2.2x the
+// int16 instructions (skynet sse4, 2026-11-07).  NWGRAD_INT_NARROW=0 turns it off too
+// (every narrowing).  The gate wins over the environment.
+inline int score_int8_mode() noexcept {
     const int64_t o = gate_override(Gate::ScoreInt8);
-    if (o >= 0) return o != 0;
+    if (o >= 0) return o >= 2 ? 2 : static_cast<int>(o);
     static const int64_t v = env_nonneg_int("NWGRAD_INT8");
-    return v != 0;   // unset (-1): the default, on
+    return v < 0 ? 1 : v >= 2 ? 2 : static_cast<int>(v);
 }
 // Counters of the int8 tier (problems run, of which overflowed), for the tests; counted
 // only while switched on (score8_count_on()), so a production run pays one relaxed load.

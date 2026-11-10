@@ -67,7 +67,7 @@ def _all(fn, a, b, p, kernel="auto"):
             out.append(getattr(nwgrad, name)(a, b, p, kernel=kernel))
         except OverflowError:
             assert not name.endswith("_int32")
-    for gate in (1, 0):
+    for gate in (2, 0):
         with _tuning.override(score_int8=gate):
             run(fn + "_int16")
             run(fn + "_int32")
@@ -188,3 +188,22 @@ def test_int8_pairs_and_batches():
             sp = nwgrad.SeqPairInt8(A[0], B[0], p, gap_model=gm, mode=mode, grad_mode="hard")
             s16 = nwgrad.SeqPairInt16(A[0], B[0], p, gap_model=gm, mode=mode, grad_mode="hard")
             assert sp.align() == s16.align() and sp.aligned() == s16.aligned()
+
+
+def test_default_mode_is_local_with_back_off():
+    m = np.where(np.eye(4, dtype=bool), 2.0, -2.0)
+    p = nwgrad.AlignParams(nwgrad.SubstMatrix(m, alphabet=DNA), 2.0, 1.0, 2.0, 1.0)
+    a = "ACGTTGCA" * 4
+    with _tuning.override(score_int8=2):   # a success clears this thread's back-off
+        nwgrad.sw_score_int16(a, a, p)
+    E._score8_stats(True)
+    nwgrad.nw_score_int16(a, a, p); nwgrad.glocal_score_affine_int16(a, a, p)
+    assert E._score8_stats()[0] == 0                 # Global / Glocal: only at score_int8=2
+    nwgrad.sw_score_int16(a, a, p)
+    if nwgrad.get_isa_level() != "scalar_fallback":
+        assert E._score8_stats(True) == (1, 0)
+        big = "ACGT" * 40                              # Local score 320: overflows every time
+        got = [nwgrad.sw_score_int16(big, big, p) for _ in range(20)]
+        assert len(set(got)) == 1 and got[0] == nwgrad.sw_score_double(big, big, p)
+        runs, over = E._score8_stats()
+        assert runs == over and 1 <= runs <= 5       # tried at 0, 2, 6, 14: backing off
