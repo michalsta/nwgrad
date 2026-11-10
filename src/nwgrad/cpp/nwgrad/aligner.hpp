@@ -1131,6 +1131,10 @@ struct Aligner {
     // and the replaced one is kept for the next problem).  NWGRAD_INT_NARROW=0 or
     // NWGRAD_INT_NARROW_PATHS=0 / =inter turn it off (int_narrow_paths()).
     template <GapModel, AlignMode, AlignBand, class> friend struct Aligner;
+    // AVX-512, a narrowed int16 run that would take Grid takes Pointers up to this many cells
+    // (solace, int16 Local pointers / grid 0.57-0.73 at L1000-L1500, 1 and 8 threads; L1450
+    // is 2^21 cells) -- above it the int32 run stays (unmeasured: NEEDS THE FLEET).
+    static constexpr std::size_t kNarrowI16PtrCells512 = std::size_t(1) << 21;
     // 0: the Pointers class; 1: a splitting Hirschberg mode (run_tb_()); -1: this run
     // throws (an explicit Hirschberg mode with a negative penalty).  run_viterbi's dispatch.
     int path_class_() const {
@@ -1181,6 +1185,32 @@ struct Aligner {
             }
             if constexpr (GM == GapModel::Linear)
                 if (cls == 0 && !na.linear_ptr_fill()) na.set_traceback(TracebackMode::Pointers);
+            if constexpr (sizeof(N) == 2) {
+                const LevelKernels& K = level_kernels(backend);
+                const std::size_t cells = (static_cast<std::size_t>(m_) + 1) * (static_cast<std::size_t>(n_) + 1);
+                auto runs_grid = [&](const auto& al) {
+                    return GM == GapModel::Affine && al.run_tb_() == TracebackMode::Grid && al.grid_ok_(K);
+                };
+#if !(defined(__aarch64__) || defined(_M_ARM64))
+                // AVX-512: int16 Grid at 32 lanes is slow (solace: narrowed int16 Grid / int32
+                // Grid 1.05-1.08 at L1000, int16 grid / pointers 1.6-1.85 at L700-L1500), so the
+                // narrowed run takes int16 Pointers (the same result) within kNarrowI16PtrCells512
+                // and is not narrowed above it.
+                if (cls == 0 && backend == static_cast<int>(SimdLevel::Avx512) && runs_grid(na)) {
+                    if (cells > kNarrowI16PtrCells512) return false;
+                    na.set_traceback(TracebackMode::Pointers);
+                }
+#endif
+                // int16 never writes the dense codes: where this type's fill would (a code
+                // fill past dense_gate_), the narrowed one-byte table is the bigger one and
+                // multi-threaded runs hit the memory wall (solace AVX-512, DNA L2000 linear
+                // Global int32 path: 0.54 at 1 thread, 1.65-1.71 at 8).  Not narrowed there.
+                if (cls == 0 && !runs_grid(na) && want_dense_()) {
+                    const bool wide_codes = GM == GapModel::Linear ? linear_ptr_fill() : !runs_grid(*this);
+                    if (wide_codes) return false;
+                }
+                (void)cells;
+            }
             na.ensure_viterbi_ptruf(sc.buf);
             na.run_viterbi(sc.buf);
             // Every Pointers-class fill above leaves codes or a held path, never T-typed
