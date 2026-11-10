@@ -26,7 +26,9 @@ CLASSES = {"double": nwgrad.SeqPairBatchDouble, "float32": nwgrad.SeqPairBatch}
 
 @pytest.fixture(autouse=True)
 def _reset():
+    # Pure deferral (2) for the semantic tests; the adaptive default (1) has its own test.
     _tuning.reset_gates()
+    _tuning.set_gate("soft_guide_defer", 2)
     yield
     _tuning.reset_gates()
 
@@ -84,7 +86,7 @@ def run(defer, build):
         out = outputs(b)
         pend = b._guides_pending()
     finally:
-        _tuning.reset_gates()
+        _tuning.set_gate("soft_guide_defer", 2)
     return b, out, pend
 
 
@@ -99,7 +101,7 @@ def test_deferred_equals_eager(gm, mode, fill, cname, kind):
     A, B = pairs(rng, kind, 40)
     build = lambda: make(CLASSES[cname], A, B, P, gm, mode, fill)
     e, (es, em, eg), ep = run(0, build)
-    d, (ds, dm, dg), dp = run(1, build)
+    d, (ds, dm, dg), dp = run(2, build)
     assert ep == 0 and dp == len(A)
     np.testing.assert_array_equal(es, ds)
     np.testing.assert_array_equal(em, dm)
@@ -107,7 +109,7 @@ def test_deferred_equals_eager(gm, mode, fill, cname, kind):
     assert guides(d) == guides(e)
     assert d._guides_pending() == 0
     # Banding around a deferred guide == banding around the eager one.
-    d2, _, _ = run(1, build)
+    d2, _, _ = run(2, build)
     assert d2.banded_grad(4) == e.banded_grad(4)
     np.testing.assert_array_equal(outputs(d2)[1], outputs(e)[1])
 
@@ -164,7 +166,7 @@ def test_snapshot_rule(gm, mode, fill):
         _tuning.set_gate("soft_guide_defer", 0)
         r = make(cls, A, B, P, gm, mode, fill)
         r.score_and_grad()
-        _tuning.reset_gates()
+        _tuning.set_gate("soft_guide_defer", 2)
         return guides(r)
 
     g0, g1 = ref(P0), ref(P1)
@@ -182,7 +184,7 @@ def test_snapshot_rule(gm, mode, fill):
     e = make(cls, A, B, P0, gm, mode, fill)
     e.score_and_grad()
     e.set_params(P1)
-    _tuning.reset_gates()
+    _tuning.set_gate("soft_guide_defer", 2)
     d = make(cls, A, B, P0, gm, mode, fill)
     d.score_and_grad()
     d.set_params(P1)
@@ -236,7 +238,7 @@ def test_pair_views_and_standalone():
         _tuning.set_gate("soft_guide_defer", 0)
         r = make(cls, A, B, P, "affine", "local", "striped")
         r.score_and_grad()
-        _tuning.reset_gates()
+        _tuning.set_gate("soft_guide_defer", 2)
         return guides(r)
 
     g0, g1 = ref(P0), ref(P1)
@@ -277,7 +279,7 @@ def test_tracked_batch():
         build = lambda: make(nwgrad.SeqPairBatchDouble, A, B, P0, "affine", "global", fill,
                              tracks=tracks, gap_tracks=gtracks)
         e, eo, ep = run(0, build)
-        d, do, dp = run(1, build)
+        d, do, dp = run(2, build)
         assert ep == 0 and dp == len(A)
         for x, y in zip(eo, do):
             np.testing.assert_array_equal(x, y)
@@ -303,7 +305,7 @@ def test_threads(fill):
     want_sum = e.banded_grad(5)
     want = outputs(e)
     want_g = guides(e)
-    _tuning.reset_gates()
+    _tuning.set_gate("soft_guide_defer", 2)
     for threads in (2, 8, 16):
         for _ in range(2):
             d = make(cls, A, B, P0, "affine", "local", fill, threads=threads)
@@ -318,7 +320,7 @@ def test_threads(fill):
     e = make(cls, A, B, P0, "affine", "local", fill, threads=4)
     e.score_and_grad()
     g0 = guides(e)
-    _tuning.reset_gates()
+    _tuning.set_gate("soft_guide_defer", 2)
     d = make(cls, A, B, P0, "affine", "local", fill, threads=4)
     d.score_and_grad()
     d.set_params(P1)
@@ -361,7 +363,7 @@ def test_exception_keeps_unfinished_guides():
         r.soft_impl = "scaled_or_log"
         r.soft_temperature = T
         r.score_and_grad()
-        _tuning.reset_gates()
+        _tuning.set_gate("soft_guide_defer", 2)
         return guides(r)
 
     P1 = P0 * 3.0
@@ -382,3 +384,43 @@ def test_exception_keeps_unfinished_guides():
     assert not all(done)
     for i in range(len(A)):
         assert got[i] == (g1[i] if done[i] else g0[i]), i
+
+
+@pytest.mark.parametrize("fill", ["striped", "interpair"])
+def test_adaptive_default(fill):
+    """The default (gate 1): a step defers its guides unless at least half of them were
+    read since the previous soft call; then it fills them in the call, as eager always
+    did.  The guides and outputs are the same either way."""
+    rng = np.random.default_rng(53)
+    P0, P1 = dna_params(rng, "affine"), dna_params(rng, "affine")
+    A, B = pairs(rng, "dna", 30)
+    N = len(A)
+    _tuning.set_gate("soft_guide_defer", 0)
+    e = make(nwgrad.SeqPairBatchDouble, A, B, P0, "affine", "local", fill)
+    e.score_and_grad()
+    want0, wout0 = guides(e), outputs(e)
+    e.set_params(P1)
+    e.score_and_grad()
+    want1 = guides(e)
+    _tuning.set_gate("soft_guide_defer", 1)
+    b = make(nwgrad.SeqPairBatchDouble, A, B, P0, "affine", "local", fill)
+    b.score_and_grad()
+    assert b._guides_pending() == N              # nothing read yet: deferred
+    assert guides(b) == want0                    # every guide read
+    b.score_and_grad()
+    assert b._guides_pending() == 0              # read last step: filled in the call
+    for x, y in zip(outputs(b), wout0):
+        np.testing.assert_array_equal(x, y)
+    b.set_params(P1)
+    b.score_and_grad()                           # nothing read since: deferred again
+    assert b._guides_pending() == N
+    b.banded_grad(3)                             # a banded pass reads every guide
+    b.score_and_grad()
+    assert b._guides_pending() == 0
+    assert guides(b) == want1
+    b.score_and_grad()                           # (all read: in the call; counts reset)
+    assert b._guides_pending() == 0
+    for i in range(N // 2 - 1):                  # fewer than half read: deferred
+        b[i].guide_j
+    b.score_and_grad()
+    assert b._guides_pending() == N

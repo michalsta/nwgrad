@@ -344,6 +344,7 @@ public:
     std::vector<int> guide_j(size_t i) {
         if (!path_valid(i))
             throw std::logic_error("nwgrad: alignment not computed; call align() first");
+        ++guide_reads_;
         if (guide_pending(i)) resolve_caller_(i);
         const int* g = guide_ptr_(i);
         return {g, g + len_a(i) + 1};
@@ -461,7 +462,8 @@ public:
         prepare_paths_(keep_paths);
         ++full_calls_;   // guides may have moved: the banded grouping is stale
         tc_begin_full_();
-        call_pend_ = soft_pend_(keep_paths);
+        call_pend_ = soft_pend_(keep_paths, guide_reads_ * 2 >= N);
+        guide_reads_ = 0;
         const bool none = grad_mode_ == GradMode::None && !keep_paths;
         // Every pair this call finishes defers its guide under the params scored now
         // (score_only_ does the same).  A pair the call does not finish (it threw)
@@ -497,6 +499,7 @@ public:
                     "nwgrad: banded_grad() needs a guide path; run score_and_grad() first");
         prepare_paths_(keep_paths);
         tc_begin_full_();
+        guide_reads_ += N;
         resolve_groups_();
         if (s_.inter_fill && !keep_paths) banded_grad_inter_(bandwidth);
         else if (s_.sorted_schedule)      banded_grad_lpt_(bandwidth, keep_paths);
@@ -527,7 +530,7 @@ public:
         // when that does not move the other pairs' pending guides to new params (a
         // standalone pair, or a snapshot that IS the current params); otherwise its guide
         // is computed now, as eagerly as before.
-        call_pend_ = soft_pend_(keep_path);
+        call_pend_ = soft_pend_(keep_path, false);
         const bool own = size() == 1 || !gparams_ || gparams_ == params_;   // (kSnap needs gparams_)
         if ((call_pend_ & kSnap) && !own) call_pend_ = 0;
         run_full_(i, solo_work_(), keep_path);
@@ -1216,11 +1219,20 @@ private:
     // guide is the eager one, bit for bit, computed on first use (guide_j, banded_grad,
     // banded_align); a call that never asks for it skips the hard fill, 24-26 % of a
     // double soft step's instructions on skynet (AGENTS.md, "The soft path").
-    uint8_t soft_pend_(bool keep) const noexcept {
+    // Adaptive (the gate's default 1): `read` -- at least half the batch's guides were read
+    // (guide_j, banded_grad) since its previous full soft call -- runs the Viterbi in the
+    // call: deferring and then resolving every guide cost +0.4-0.7 instructions per cell
+    // over the in-call fill on miRNA (the per-group setup paid twice), so a loop that
+    // reads its guides keeps eager's cost and a loop that does not keeps the saving.  The
+    // first step of a loop decides nothing: it defers, and its reads set the next step.
+    uint8_t soft_pend_(bool keep, bool read) const noexcept {
         if (grad_mode_ != GradMode::Soft || keep || s_.soft_guide_posterior) return 0;
         if (s_.soft_guide_lazy) return kPending;
-        return soft_guide_defer() ? static_cast<uint8_t>(kPending | kSnap) : uint8_t(0);
+        const int d = soft_guide_defer();
+        return d == 2 || (d == 1 && !read) ? static_cast<uint8_t>(kPending | kSnap) : uint8_t(0);
     }
+    // Guide reads since the last full soft call (soft_pend_'s `read`); the calling thread only.
+    size_t guide_reads_ = 0;
     int kernel_ = kBackendAuto;
     std::vector<double>  grad_;             // pair i: gstride() doubles (matrix, 4 gaps); untracked
     // ── Tracks ──
