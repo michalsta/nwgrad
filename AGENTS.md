@@ -3012,13 +3012,25 @@ so a saturated value never leaks and the score is the int16 / int32 integer bit 
 - **Python**: `*_int8` names / `SeqPairInt8` / `SeqPairBatchInt8` (`nwgrad/_int8.py`) are the
   int16 ones with the parameter range checked (ValueError past +-127); paths and gradients
   run at int16 (fallback, the same integers).
-- **Not done: the inter-pair score kernel at int8** (the batch's short pairs, miRNA).  Its
-  template (`inter_kernel_impl.inl`) runs plain wrapping arithmetic on GCC vector types
-  (`ivadd` / `ivsub`: "never past the quarter rule"), which int8 cannot use (cap 31);
-  admitting int8_t needs IVT<int8_t> and int8 kLvLut tables, saturating ivadd / ivsub,
-  per-lane overflow flags and a per-pair re-run at int16, and the batch plan groups pairs by
-  the type's lane count.  It is where Global int8 would pay (no lazy-F there), but it is a
-  plumbing change of the plan, not of a kernel.
+- **The inter-pair int8 score kernel** (`inter8_kernel_impl.inl`, branch `proto/int8-inter`):
+  a score-only integer batch (`BatchEngine::score_only_`) first runs its short pairs in
+  groups of `inter_w8` int8 lanes (16 SSE / NEON, 32 AVX2, 64 AVX-512BW), a plan of its own
+  split from the rows plan (`ensure_plan8_`).  Lane by lane the same proof as above: Local
+  a lane maximum < 127, Global / Glocal G <= 126 per pair up front and a score > G - 128.
+  A lane that fails re-runs at T, in a full T group once a worker has W of them, else its
+  own fill.  An exact predictor (the T scores say whether int8 would have held) skips the
+  int8 run of a group after one where over half the lanes failed.  Preconditions: untracked,
+  <= 8 letters, the int8 parameter limits above, both lengths <= 127 (int8 lane compares);
+  groups under int16's score caps.  Gate `inter_score_int8` / `NWGRAD_INTER_INT8`: 0 off,
+  1 (default) and 2 every mode.  wloczykij sse4, miRNA 22 x 50, instructions per pair on /
+  off (A/A 0.91-1.07): int16 0.47-0.61, int32 0.22-0.28 in every mode and gap model;
+  all-overflowing cells 0.99-1.015 with the predictor (1.22-1.51 without).
+- **The small-alphabet score cap** (`inter_score_ok`, `score_small_local` / `_global`) has
+  its own override, `inter_score_small_cells`: before it, a sweep that switched the gather
+  cap off still sent DNA past ~L43 (int16 at SSE) to the own fill, so "DNA L100 int16 vs
+  int32 inter-pair" measured the narrowed int16 striped kernel twice (1.00).  With the cap
+  off, DNA L100 int16 / int32 inter-pair is 0.50 Global / 0.52 Local; int16 inter-pair /
+  own fill at DNA L100 Global 0.69 (instructions; the caps came from timings, untouched).
 - **ISA**: sse2 / sse4 run here (A/B fuzz, C++ [int8] case, test_int8.py at every level);
   avx2, avx512 and neon (gcc and clang, aarch64 cross) compile only.
 
