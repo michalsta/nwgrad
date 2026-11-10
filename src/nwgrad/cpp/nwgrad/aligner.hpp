@@ -2904,9 +2904,11 @@ private:
     // auto (Pointers) / grid 1 thread 1.32 L2000, 2.75 L3000, 2.25 L4000, Grid 2.7-3x at 6
     // threads from L3000 (Pointers' code table grows with m * n); wloczykij sse4 user
     // instructions per cell, pointers / grid: DNA L1000 12.99 / 9.91, L2000 12.80 / 9.31,
-    // L3000 12.76 / 6.31, protein L1000 13.06 / 10.09, L2000 12.83 / 9.45.  The floor between
-    // hb_cutoff and L1000 is not measured on the fleet yet: NEEDS THE FLEET (L500-L1500,
-    // AVX2 / AVX-512 / NEON, 1 and 6 threads) before it is final.
+    // L3000 12.76 / 6.31, protein L1000 13.06 / 10.09, L2000 12.83 / 9.45; below the floor DNA
+    // L600 13.87 / 9.93, L800 13.24 / 9.91 -- fewer instructions from hb_cutoff on, but
+    // Pointers' table is in cache there and instructions do not show it (nighthaven measured
+    // the tie at L1000 before round 1).  1000 is the conservative floor; NEEDS THE FLEET
+    // (L500-L1500, AVX2 / AVX-512 / NEON, 1 and 6 threads) to settle it, possibly lower.
     static constexpr int kLocalGridMinRowsI16 = 1000;
     static int local_grid_min_rows(int backend) noexcept {
         int r = 0;
