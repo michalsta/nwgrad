@@ -358,6 +358,9 @@ struct IntNarrowOff {
     IntNarrowOff(const IntNarrowOff&) = delete;
     IntNarrowOff& operator=(const IntNarrowOff&) = delete;
 };
+// Viterbi fills this thread ran narrowed (narrow_viterbi_ adoptions; a chained int64 ->
+// int16 run counts twice): the tests' liveness check, a plain per-thread counter.
+inline thread_local unsigned long nw_narrow_path_runs = 0;
 inline int int_narrow_paths() noexcept {
     const int m = int_narrow_paths_mode().load(std::memory_order_relaxed);
     if (m >= 0) return m;
@@ -1187,6 +1190,7 @@ struct Aligner {
             hb_start_i_ = na.hb_start_i_; hb_start_j_ = na.hb_start_j_;
             hops_.swap(na.hops_);
             if (pointers_) std::swap(buf.DM, sc.buf.DM);
+            ++nw_narrow_path_runs;
             return true;
         } else {
             (void)buf;
