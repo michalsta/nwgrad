@@ -1608,8 +1608,16 @@ private:
     // Local `auto` takes the one-pass Grid inside the pointer budget too (run_tb_): every
     // type but int16, which tied Pointers there (nighthaven 0.98 at L1000).
     static constexpr bool kLocalGridAuto = !(nw_is_int<T> && sizeof(T) == 2);
-    // Linear Full `auto` takes Grid past hb_cutoff (run_tb_; 2026-11-07).  TODO measured below.
-    static constexpr bool kLinearGridAuto = true;
+    // Linear Full `auto` takes Grid past hb_cutoff (run_tb_, grid_ok_; 2026-11-10), where it
+    // ran Pointers (or the H table up to 2 MiB).  Instructions per cell, sse4 (wloczykij),
+    // Global, 20 % mutated homologues, own fills, hard path; Grid / Pointers / old `auto` /
+    // score-only: protein L1000 int32 5.68 / 13.8 / 13.8 / 4.48, float32 5.47 / 11.3 / 11.3 /
+    // 4.24; L3000 int32 4.91 / 13.6, float32 4.54 / 10.8; DNA L1000 int16 3.99 / 6.70 / 5.21
+    // (H) / 2.61, L3000 2.87 / 6.55; Local int32 L1000 8.31 / 18.0; Glocal float32 5.46 /
+    // 10.9 (A/A Pointers 0.98-1.02).  int64 is left out: not measured, and below 8 lanes its
+    // linear Pointers fill is the scalar one (linear_kernel_pays) while the grid forward runs
+    // 2 or 4 lanes without a packed 64-bit max -- traceback="grid" stays available for it.
+    static constexpr bool kLinearGridAuto = !(nw_is_int<T> && sizeof(T) == 8);
     // NWGRAD_LINEAR_GRID=0: linear `auto` never takes Grid (the Pointers / H fills as before;
     // an A/B switch in one binary, for measuring).
     static bool linear_grid_env() {
@@ -4662,8 +4670,8 @@ private:
                           const GridLine& left, int& i, int& j, int& st) {
         const T ge_a = static_cast<T>(params_->gap_extend_a), ge_b = static_cast<T>(params_->gap_extend_b);
         const std::size_t bw = static_cast<std::size_t>(c1 - c0) + 1, sz = (static_cast<std::size_t>(r1 - r0) + 1) * bw;
-        if (buf.gbM.size() < sz) buf.gbM.resize(sz);
-        T* const bH = buf.gbM.data();
+        if (buf.gbH.size() < sz) buf.gbH.resize(sz);
+        T* const bH = buf.gbH.data();
         auto at = [&](int ii, int jj) {
             return static_cast<std::size_t>(ii - r0) * bw + static_cast<std::size_t>(jj - c0);
         };
