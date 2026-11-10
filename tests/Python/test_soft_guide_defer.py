@@ -123,8 +123,13 @@ def test_pending_only_when_unasked(gm):
     assert b.soft_guide == "eager"
     b.score_and_grad()
     assert b._guides_pending() == N
-    b[3].guide_j
-    assert b._guides_pending() == N - 1
+    b[3].guide_j   # interpair: its whole plan group (<= 8 lanes) from one shared fill
+    assert N - 8 <= b._guides_pending() < N
+    s = make(nwgrad.SeqPairBatchDouble, A, B, P, gm, "local", "striped")
+    s.score_and_grad()
+    s[3].guide_j   # own fills: that pair alone
+    assert s._guides_pending() == N - 1
+    assert list(s[3].guide_j) == list(b[3].guide_j)
     b.score_and_grad(keep_paths=True)      # stored paths need the Viterbi now
     assert b._guides_pending() == 0
     b.score_and_grad()

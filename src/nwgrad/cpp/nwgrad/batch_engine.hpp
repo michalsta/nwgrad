@@ -344,7 +344,7 @@ public:
     std::vector<int> guide_j(size_t i) {
         if (!path_valid(i))
             throw std::logic_error("nwgrad: alignment not computed; call align() first");
-        if (guide_pending(i)) resolve_guide_(i, solo_work_());
+        if (guide_pending(i)) resolve_caller_(i);
         const int* g = guide_ptr_(i);
         return {g, g + len_a(i) + 1};
     }
@@ -497,6 +497,7 @@ public:
                     "nwgrad: banded_grad() needs a guide path; run score_and_grad() first");
         prepare_paths_(keep_paths);
         tc_begin_full_();
+        resolve_groups_();
         if (s_.inter_fill && !keep_paths) banded_grad_inter_(bandwidth);
         else if (s_.sorted_schedule)      banded_grad_lpt_(bandwidth, keep_paths);
         else                           banded_grad_dynamic_(bandwidth, keep_paths);
@@ -536,6 +537,7 @@ public:
         if (!path_valid(i))
             throw std::logic_error("nwgrad: call align() or score_and_grad() before banded_align()");
         prepare_paths_(keep_path, /*all=*/false);
+        if (guide_pending(i)) resolve_caller_(i);
         run_banded_(i, solo_work_(), bandwidth, keep_path);
     }
     // The cached scores, in pair order.  Throws if any pair has none.
@@ -2042,6 +2044,97 @@ private:
         gparams_ = std::move(cur);
     }
 
+    // Deferred guides in bulk.  An eager soft call under fill "interpair" took its guides
+    // from the shared inter-pair fill, cheaper per cell than each pair's own fill (skynet
+    // sse4, one soft step with every guide used: 21-33 % more instructions resolving pair
+    // by pair, see AGENTS.md).  So a deferred guide is resolved with its whole plan group:
+    // one inter-pair fill under the snapshot, every kSnap-pending lane's guide from it --
+    // the eager call's fill and walk, so the eager guides, bit for bit.  Untracked batches
+    // with the shared fill on only (tracked lanes and own fills resolve per pair, which is
+    // what the eager call ran for them too).
+    bool group_resolve_ok_() const noexcept {
+        return s_.inter_fill && !tracked_ && gparams_ && grad_mode_ == GradMode::Soft;
+    }
+    uint32_t group_of_(size_t i) {
+        InterPlan& P = const_cast<InterPlan&>(ensure_plan_());
+        if (P.gid.size() != size()) {
+            P.gid.assign(size(), kNoGroup);
+            for (size_t t = 0; t < P.groups.size(); ++t)
+                for (size_t k = P.groups[t].first; k < P.groups[t].second; ++k)
+                    P.gid[P.elig[k]] = static_cast<uint32_t>(t);
+        }
+        return P.gid[i];
+    }
+    // Pair i's pending guide, on the calling thread: with its group when it has one.
+    void resolve_caller_(size_t i) {
+        const uint32_t t = (flags_[i] & kSnap) && group_resolve_ok_() ? group_of_(i) : kNoGroup;
+        if (t != kNoGroup && resolve_group_(t, solo_work_())) return;
+        resolve_guide_(i, solo_work_());
+    }
+    // Before a banded pass: every group with a kSnap-pending lane, in parallel (one worker
+    // a group, so each pair is written by one thread); the rest resolve per pair inside
+    // the pass as before.
+    void resolve_groups_() {
+        if (!group_resolve_ok_()) return;
+        bool any = false;
+        for (uint8_t f : flags_) any |= (f & kPending) && (f & kSnap);
+        if (!any) return;
+        ensure_plan_();
+        const size_t G = plan_.groups.size();
+        std::atomic<size_t> idx{0};
+        auto worker = [&]() {
+            WorkLease lease(*this);
+            for (size_t t; (t = idx.fetch_add(1, std::memory_order_relaxed)) < G; ) resolve_group_(t, *lease);
+        };
+        run_workers_(G, worker);
+    }
+    // Group t's kSnap-pending lanes from one inter-pair fill under gparams_; false (nothing
+    // done) when no lane is pending or the level does not share this fill.
+    bool resolve_group_(size_t t, Work& w) {
+        const auto& elig = plan_.elig;
+        const size_t s = plan_.groups[t].first, real = plan_.groups[t].second - s;
+        bool any = false;
+        for (size_t l = 0; l < real; ++l) {
+            const uint8_t f = flags_[elig[s + l]];
+            any |= (f & kPending) && (f & kSnap);
+        }
+        const LevelKernels& K = level_kernels(plan_.backend);
+        if (!any || !linear_fill_ok_(K)) return false;
+        const int W = inter_w_(K);
+        const OwnedParams& o = *gparams_;
+        std::vector<const unsigned char*> a(W), b(W);
+        std::vector<int> m(W), nb(W), bi(W), bj(W);
+        std::vector<T> best(W), blkT;
+        int M = 0, n = 0;
+        bool ragged = false;
+        for (int l = 0; l < W; ++l) {   // as score_and_grad_inter_: spare lanes repeat the last pair
+            const size_t i = elig[s + std::min<size_t>(l, real - 1)];
+            a[l] = codes_a(i).data(); b[l] = codes_b(i).data();
+            m[l] = static_cast<int>(len_a(i)); nb[l] = static_cast<int>(len_b(i));
+            M = std::max(M, m[l]); n = std::max(n, nb[l]);
+            ragged |= nb[l] != nb[0];
+        }
+        InterJobT<T> job{};
+        job.a = a.data(); job.m = m.data(); job.b = b.data(); job.n = n; job.M = M;
+        job.align_mode = (AM == AlignMode::Local) ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
+        if (ragged) job.nb = nb.data();
+        block_for_(job, blkT, o);
+        wire_inter_tables_(job, w.buf, static_cast<size_t>(M + 1) * (n + 1) * W);
+        job.best = best.data(); job.best_i = bi.data(); job.best_j = bj.data();
+        run_inter_fill_(K, job);
+        const size_t stride = ragged ? static_cast<size_t>(n) + 1 : 0;
+        for (size_t l = 0; l < real; ++l) {
+            const size_t i = elig[s + l];
+            if (!((flags_[i] & kPending) && (flags_[i] & kSnap))) continue;
+            w.full.set_kernel(kernel_);
+            problem_(w.full, i, o, 0, {});
+            w.full.adopt_interleaved(w.buf, W, static_cast<int>(l), best[l], bi[l], bj[l], stride);
+            guide_path_(i, w.full, w, false);   // (store_guide_ clears kPending | kSnap)
+            flags_[i] &= static_cast<uint8_t>(~kStored);
+        }
+        return true;
+    }
+
     // SeqPair::banded_grad_with_dp.
     void run_banded_(size_t i, Work& w, int bandwidth, bool keep) {
         resolve_guide_(i, w);
@@ -2282,10 +2375,11 @@ private:
     // cast_block_ + set_inter_params_ for the batch's params, except that a float32
     // tracked group reads their once-cast stack (OwnedParams) instead of casting K
     // matrices again.
-    void block_for_(InterJobT<T>& job, std::vector<T>& blkT) const {
-        const T* pp = params_->stack_or_null();
-        if (!pp) cast_block_(params_->p, blkT);
-        set_inter_params_(job, params_->p, blkT);
+    void block_for_(InterJobT<T>& job, std::vector<T>& blkT) const { block_for_(job, blkT, *params_); }
+    void block_for_(InterJobT<T>& job, std::vector<T>& blkT, const OwnedParams& o) const {
+        const T* pp = o.stack_or_null();
+        if (!pp) cast_block_(o.p, blkT);
+        set_inter_params_(job, o.p, blkT);
         if (pp) job.blk = pp;
     }
     static void wire_inter_tables_(InterJobT<T>& job, DpBuffer& buf, size_t sz) {
@@ -2376,7 +2470,9 @@ private:
         int backend = -1;                               // every group's vector backend
         std::vector<size_t> elig, other;
         std::vector<std::pair<size_t, size_t>> groups;   // [start, end) into elig
+        std::vector<uint32_t> gid;   // pair -> its group (kNoGroup: other); built on demand
     };
+    static constexpr uint32_t kNoGroup = ~0u;
     // Two plans: plan_ for the fills that keep tables (score_and_grad_inter_, the band
     // groups), plan_rows_ for score_only_ (no byte budget: its kernel keeps rows).  Both
     // only differ for grad_mode None; plan_rows_ stays empty otherwise.
