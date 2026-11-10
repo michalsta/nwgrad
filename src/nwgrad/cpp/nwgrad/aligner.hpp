@@ -1853,7 +1853,7 @@ private:
         : AM == AlignMode::Global ? TracebackMode::Hirschberg
                                   : TracebackMode::Pointers;
     // Local `auto` takes the one-pass Grid inside the pointer budget too (run_tb_), every
-    // type; int16 from kLocalGridMinRowsI16 rows (local_grid_min_rows).
+    // type; int16 from a floor per level (local_grid_min_rows).
     static constexpr bool kLocalGridAuto = true;
     static constexpr TracebackMode kDefaultTb =
         (GM == GapModel::Affine && AB == AlignBand::Full)
@@ -2020,7 +2020,7 @@ private:
         // float32 L1000 0.65, L3000 0.51 (6 threads 0.66 / 0.47), int32 0.57 / 0.42 (0.60 /
         // 0.41), int64 0.51 / 0.41, memory lower; skynet sse4 see AGENTS.md ("Grid at integer
         // T").  The floor is hb_cutoff (grid_ok_: m > hb_cutoff, Pointers below), as for
-        // Global.  int16 from kLocalGridMinRowsI16 rows (local_grid_min_rows).
+        // Global.  int16 from a floor per level (local_grid_min_rows).
         if constexpr (GM == GapModel::Affine && AB == AlignBand::Full && AM == AlignMode::Local &&
                       kLocalGridAuto)
             if (tb_auto_ && (tb_ == TracebackMode::Grid || tb_ == TracebackMode::HirschbergPmax) &&
@@ -2913,16 +2913,29 @@ private:
     // Affine ...)`, and linear has no Grid (an explicit "grid" runs Pointers), so a linear
     // int16 Local pair never reads this floor and keeps main's choice (the H table under
     // `auto`; spot NEON: it beats pointers and grid by 11-15 % up to L1000).  spot measured
-    // affine Grid winning from L700 (0.956-0.978; a tie at L500): a NEON floor near 700 is
-    // open, 1000 kept for every level until the fleet settles it.
-    static constexpr int kLocalGridMinRowsI16 = 1000;
+    // Per level (2026-11-11): AVX2 1000 (nighthaven, above); NEON 700 (spot M1: Grid / main's
+    // Pointers 0.956-0.978 at L700, a tie at L500); AVX-512 never (solace: int16 Grid at 32
+    // lanes is slow -- forced grid / pointers 1.70-1.85 at L700, the branch's auto 1.6-1.8x
+    // main's at L1000-L1500, DNA and protein, 1 and 8 threads; Pointers stays until the Grid
+    // base block changes); sse2 / sse4 1000 (the instruction counts above favour Grid from
+    // hb_cutoff, but no wall-clock below L1000: the conservative floor).
+    static constexpr int kLocalGridMinRowsI16Avx2 = 1000, kLocalGridMinRowsI16Neon = 700,
+                         kLocalGridMinRowsI16Sse = 1000, kLocalGridOff = std::numeric_limits<int>::max();
     static int local_grid_min_rows(int backend) noexcept {
         int r = 0;
 #if !(defined(__aarch64__) || defined(_M_ARM64))
         if (backend == static_cast<int>(SimdLevel::Avx512)) r = kLocalGridMinRows512;
 #endif
+        if constexpr (nw_is_int<T> && sizeof(T) == 2) {
+#if defined(__aarch64__) || defined(_M_ARM64)
+            r = std::max(r, kLocalGridMinRowsI16Neon);
+#else
+            r = backend == static_cast<int>(SimdLevel::Avx512) ? kLocalGridOff
+              : backend == static_cast<int>(SimdLevel::Avx2)   ? std::max(r, kLocalGridMinRowsI16Avx2)
+                                                               : std::max(r, kLocalGridMinRowsI16Sse);
+#endif
+        }
         (void)backend;
-        if constexpr (nw_is_int<T> && sizeof(T) == 2) r = std::max(r, kLocalGridMinRowsI16);
         return r;
     }
     static constexpr int kLinearStripedMinN512 =

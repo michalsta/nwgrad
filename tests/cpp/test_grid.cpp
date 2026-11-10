@@ -345,12 +345,19 @@ TEST_CASE("auto takes Grid for integer T where it splits", "[grid][traceback]") 
         if (simd) REQUIRE(l.alignment() == lp.alignment());
         Aligner<GapModel::Affine, AlignMode::Local, AlignBand::Full, int16_t> l16;
         run(l16, TracebackMode::Default, kern, A, B);
-        REQUIRE_FALSE(l16.ran_grid());   // int16 Local below kLocalGridMinRowsI16 (800 rows): Pointers
+        // int16 Local: Grid from a floor per level (local_grid_min_rows): NEON 700, AVX2 and
+        // sse 1000, AVX-512 never; 800 rows here, 1100 below
+#if defined(__aarch64__) || defined(_M_ARM64)
+        const bool g800 = simd, g1100 = simd;
+#else
+        const bool g800 = false, g1100 = simd && kern != static_cast<int>(SimdLevel::Avx512);
+#endif
+        REQUIRE(l16.ran_grid() == g800);
         {   // ... and from it, Grid: Pointers' result
             const std::string A2 = A + A.substr(0, 300), B2 = B + B.substr(0, 300);
             Aligner<GapModel::Affine, AlignMode::Local, AlignBand::Full, int16_t> m16, m16p;
             run(m16, TracebackMode::Default, kern, A2, B2); run(m16p, TracebackMode::Pointers, kern, A2, B2);
-            REQUIRE(m16.ran_grid() == simd);
+            REQUIRE(m16.ran_grid() == g1100);
             REQUIRE(m16.score() == m16p.score());
             REQUIRE(m16.alignment() == m16p.alignment());
         }
