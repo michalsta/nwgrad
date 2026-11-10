@@ -3353,7 +3353,18 @@ counts (wloczykij sse4, float32, 13 vs 1 passes, PYTHONHASHSEED=0, BLAS threads 
 score), local 0.998-1.001 except **Local linear hard 1.017-1.019, still open**: in its Pointers
 kernel.  Not the code store: written out explicitly (main's cvttps2dq + pshufb at SSSE3) the
 count was unchanged (two packs instead: +1-3 % on every linear fill), so store_codes is main's
-again; the `movd` seen in the profile is the packed 4-byte store.  Cause not found.  Overlap (all four) / global 0.85-0.99, a_end
+again; the `movd` seen in the profile is the packed 4-byte store.  **Found 2026-11-10:** the cause
+lay not in the store but in a thing that never ran -- the linear kernel's `pick_row`, a `[&]` lambda
+over `best_local` / `best_i` / `best_j`, built in every instantiation though only SGX ones call it.
+The closure takes those locals' addresses at gimplification, and the early passes saw them as memory
+before the dead closure was swept away; gcc then laid out `striped_linear_ptr_entry<float>` (the Local
+Pointers fill inlined into it) differently (3435 of ~3780 disassembly lines differed from main).  Now
+the pick is a struct (`SgPick1::row1`, kernels_linear_impl.inl) as the affine kernels' `SgPick`: the
+function's code is main's to the instruction, differing only in branch-alignment padding and the
+`ViterbiJob` offsets moved by `sg`.  Recount (13 vs 1 passes, release-wheel flags, -O3 -g1): new / main
+0.998-1.003 in every cell of global / local / glocal x affine / linear x hard / score, protein and DNA
+L300 / L1000, Local linear hard 0.999-1.000; A/A 0.997-1.002.  The lesson: no lambda that captures by
+reference in a kernel body, even an unused one.  Overlap (all four) / global 0.85-0.99, a_end
 0.99-1.04.
 
 **Tests** (`tests/Python/test_semiglobal.py`): a Python 3-state reference of the 4-flag
