@@ -218,6 +218,34 @@ static inline void striped_row_best(const T* cM, const T* cX, const T* cY, const
     btbl = (mm >= xx && mm >= yy) ? 0 : ((xx >= yy) ? 1 : 2);
 }
 
+// The semi-global end of a kernel run with runtime free ends (SGX: Glocal, SG < 0): the
+// candidates offered in row-major order, the first of the maxima winning (strict >), the
+// state by M > X > Y.  rows(ci, rM, rX, rY): row ci's candidates from its rows (slot 0 =
+// column 0, the striped columns from off): column n for a row < m (a free A end), row m
+// whole (a free B end; column 0, then the striped columns) or (m, n).  A struct, not lambdas
+// in the kernel, and declared only in the SGX instantiations (SgPickFor): the kernels of
+// the fixed ends (Global, Local, glocal's) stay main's code, whose register allocation the
+// lambdas had moved (Global Pointers +4 % instructions, wloczykij sse4, 2026-11-10).
+template <class T, bool Sat>
+struct SgPick {
+    int sg, m, n, seg; std::size_t off, coln; const T* pad;
+    T* best; int* bi; int* bj; int* bt; bool have = false;
+    void offer(int ci, int cj, T vm, T vx, T vy) noexcept {
+        const T v = std::max(std::max(vm, vx), vy);
+        if (have && !(v > *best)) return;
+        have = true; *best = v; *bi = ci; *bj = cj;
+        *bt = (vm >= vx && vm >= vy) ? 0 : ((vx >= vy) ? 1 : 2);
+    }
+    void row(int ci, const T* rM, const T* rX, const T* rY) noexcept {
+        if (ci < m) { if (sg & kSgFreeAEnd) offer(ci, n, rM[coln], rX[coln], rY[coln]); return; }
+        if (!(sg & kSgFreeBEnd)) { offer(m, n, rM[coln], rX[coln], rY[coln]); return; }
+        offer(m, 0, rM[0], rX[0], rY[0]);
+        if (seg > 0) striped_row_best<T, Sat>(rM + off, rX + off, rY + off, pad, seg, ci, *best, *bi, *bj, *bt);
+    }
+};
+struct SgNoPick { template <class... A> void row(A&&...) noexcept {} };
+template <bool SGX, class T, bool Sat> using SgPickFor = std::conditional_t<SGX, SgPick<T, Sat>, SgNoPick>;
+
 // pad[s*W + l] = 0 for a real column (l*seg + s + 1 <= n), -inf for padding.
 // The same mask into a row the caller owns (a spread_rows row: dp_buffer.hpp).
 template <class T, bool Sat = false>
@@ -813,7 +841,7 @@ static inline const T* striped_row_profile(T* prof, const T* blk, int nalpha, co
 // first of the maxima winning (column n's cell after each row i < m with a free A end, then
 // row m whole with a free B end, else (m, n)) -- one scalar read per row, the cell already
 // in the row's striped slots.
-template <class T, bool Local, bool Tr = false, bool Sat = false, bool Glocal = false, int SG = -1>
+template <class T, bool Local, bool Tr = false, bool Sat = false, bool Glocal = false, int SG = kSgGlocal>
 static void striped_affine_full(ViterbiJob<T>& job) {
     using vd = stdx::native_simd<T>;
     const int W = (int)vd::size();                       // native T-lane count for this level
@@ -873,9 +901,10 @@ static void striped_affine_full(ViterbiJob<T>& job) {
     T* ov = buf.sopenv.data();
 
     // The semi-global ends (Glocal only; see above).
-    const int sg = !Glocal ? 0 : (SG >= 0 ? SG : job.sg);   // SG: the ends fixed at compile time (glocal's), -1 runtime
-    const bool sg_ab = Glocal && (sg & kSgFreeABegin), sg_ae = Glocal && (sg & kSgFreeAEnd),
-               sg_bb = Glocal && (sg & kSgFreeBBegin), sg_be = Glocal && (sg & kSgFreeBEnd);
+    // SG: the ends fixed at compile time (kSgGlocal: glocal's, main's code); -1 runtime (SGX).
+    constexpr bool SGX = Glocal && SG < 0;
+    const int sg = !Glocal ? 0 : (SGX ? job.sg : SG);
+    const bool sg_ab = Glocal && (sg & kSgFreeABegin), sg_bb = Glocal && (sg & kSgFreeBBegin);
 
     // ── row 0, written striped straight into the tables (slot 0 = column 0) ──
     // This doubles as the previous row for i = 1 (read at buf.VM row 0 + off).  Global:
@@ -904,24 +933,13 @@ static void striped_affine_full(ViterbiJob<T>& job) {
 
     T best_local = 0; int best_i = 0, best_j = 0, best_tbl = 0;
     const T* pad = (Local || Glocal) ? striped_pad<Sat>(buf.spad, n, seg, W) : nullptr;
-    // Glocal: the end, offered cell by cell in row-major order (strict >, M > X > Y).
-    [[maybe_unused]] bool have = false;
-    [[maybe_unused]] auto offer = [&](int ci, int cj, T vm, T vx, T vy) {
-        const T v = std::max(std::max(vm, vx), vy);
-        if (have && !(v > best_local)) return;
-        have = true; best_local = v; best_i = ci; best_j = cj;
-        best_tbl = (vm >= vx && vm >= vy) ? 0 : ((vx >= vy) ? 1 : 2);
-    };
-    const std::size_t coln = (n == 0) ? 0 : off + scol(n);   // column n's slot in a row
-    // Row i's end candidates, the row's tables at slot 0 (column 0): column n (free A end,
-    // i < m), or row m.
-    [[maybe_unused]] auto offer_row = [&](int ci, const T* rM, const T* rX, const T* rY) {
-        if (ci < m) { if (sg_ae) offer(ci, n, rM[coln], rX[coln], rY[coln]); return; }
-        if (!sg_be) { offer(m, n, rM[coln], rX[coln], rY[coln]); return; }
-        offer(m, 0, rM[0], rX[0], rY[0]);   // column 0 first, then the striped columns
-        if (seg > 0) striped_row_best<T, Sat>(rM + off, rX + off, rY + off, pad, seg, ci, best_local, best_i, best_j, best_tbl);
-    };
-    if constexpr (Glocal) offer_row(0, buf.VM.data(), buf.VX.data(), buf.VY.data());   // row 0 (row m when m == 0)
+    if constexpr (Glocal && !SGX) { best_local = 0; best_i = 0; best_j = 0; best_tbl = 0; }   // m == 0: row 0, (0, 0)
+    [[maybe_unused]] SgPickFor<SGX, T, Sat> pick{};
+    if constexpr (SGX) {
+        pick = SgPick<T, Sat>{sg, m, n, seg, off, (n == 0) ? 0 : off + scol(n), pad,
+                              &best_local, &best_i, &best_j, &best_tbl};
+        pick.row(0, buf.VM.data(), buf.VX.data(), buf.VY.data());   // row 0 (row m when m == 0)
+    }
 
     for (int i = 1; i <= m; ++i) {
         if constexpr (Tr) {
@@ -1051,10 +1069,15 @@ static void striped_affine_full(ViterbiJob<T>& job) {
             if constexpr (Local)
                 striped_row_best<T, Sat>(cM, cX, cY, pad, seg, i, best_local, best_i, best_j, best_tbl);
         }
-        if constexpr (Glocal)
-            if (i == m || sg_ae) {   // the end: column n of rows < m, row m (column 0 first)
+        if constexpr (Glocal && !SGX)
+            if (i == m) {   // the end: column 0 first (M > X > Y), then the striped columns
+                best_local = std::max(nbM, nbX); best_i = m; best_j = 0; best_tbl = (nbM >= nbX) ? 0 : 1;
+                if (seg > 0) striped_row_best<T, Sat>(cM, cX, cY, pad, seg, i, best_local, best_i, best_j, best_tbl);
+            }
+        if constexpr (SGX)
+            if (i == m || (sg & kSgFreeAEnd)) {   // the end: column n of rows < m, row m
                 const std::size_t rb = (std::size_t)i * rowsz;
-                offer_row(i, buf.VM.data() + rb, buf.VX.data() + rb, buf.VY.data() + rb);
+                pick.row(i, buf.VM.data() + rb, buf.VX.data() + rb, buf.VY.data() + rb);
             }
         bM = nbM; bX = nbX; bY = K_NINF;
     }
@@ -1084,12 +1107,12 @@ template <class T, bool Sat>
 static void striped_full_entry_impl(ViterbiJob<T>& job) {
     const bool glocal = job.align_mode == 2;   // 0 Global, 1 Local, 2 Glocal
     if (job.tr.on()) {
-        if (glocal)              { if (job.sg == kSgGlocal) striped_affine_full<T, false, true, Sat, true, kSgGlocal>(job); else striped_affine_full<T, false, true, Sat, true, -1>(job); }
+        if (glocal)              { if (job.sg == kSgGlocal) striped_affine_full<T, false, true, Sat, true>(job); else striped_affine_full<T, false, true, Sat, true, -1>(job); }
         else if (job.align_mode) striped_affine_full<T, true, true, Sat>(job);
         else                     striped_affine_full<T, false, true, Sat>(job);
         return;
     }
-    if (glocal)              { if (job.sg == kSgGlocal) striped_affine_full<T, false, false, Sat, true, kSgGlocal>(job); else striped_affine_full<T, false, false, Sat, true, -1>(job); }
+    if (glocal)              { if (job.sg == kSgGlocal) striped_affine_full<T, false, false, Sat, true>(job); else striped_affine_full<T, false, false, Sat, true, -1>(job); }
     else if (job.align_mode) striped_affine_full<T, true, false, Sat>(job);
     else                     striped_affine_full<T, false, false, Sat>(job);
 }

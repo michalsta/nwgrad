@@ -90,7 +90,7 @@ static inline void striped_row_best1(const T* cH, const T* pad, int seg, int i,
 // Glocal (Local false): row 0 = 0 (a free start), column 0 Global's chain, no clamp, the
 // end the best cell of row m (column 0 first, then the striped columns, strict >) -- with
 // job.sg the other semi-global ends as striped_affine_full's (kernels_impl.inl).
-template <class T, bool Local, bool Ptr, bool Tr, bool Dense = false, bool Sat = false, bool Glocal = false>
+template <class T, bool Local, bool Ptr, bool Tr, bool Dense = false, bool Sat = false, bool Glocal = false, int SG = kSgGlocal>
 static void striped_linear_full(ViterbiJob<T>& job) {
     static_assert(!Dense || (Ptr && sizeof(T) >= 4), "dense codes: pointer fill, lanes >= 32 bits");
     using vd = stdx::native_simd<T>;
@@ -148,9 +148,10 @@ static void striped_linear_full(ViterbiJob<T>& job) {
     }
 
     // The semi-global ends (Glocal only).
-    const int sg = Glocal ? job.sg : 0;
-    const bool sg_ab = Glocal && (sg & kSgFreeABegin), sg_ae = Glocal && (sg & kSgFreeAEnd),
-               sg_bb = Glocal && (sg & kSgFreeBBegin), sg_be = Glocal && (sg & kSgFreeBEnd);
+    // SG: the ends fixed at compile time (kSgGlocal: glocal's, main's code); -1 runtime (SGX).
+    constexpr bool SGX = Glocal && SG < 0;
+    const int sg = !Glocal ? 0 : (SGX ? job.sg : SG);
+    const bool sg_ab = Glocal && (sg & kSgFreeABegin), sg_bb = Glocal && (sg & kSgFreeBBegin);
 
     // ── row 0 ──  H[0][0] = 0; H[0][j] = -(j * ge_a) (Global) or 0 (Local); pads NINF.
     pH[0] = static_cast<T>(0);
@@ -176,21 +177,26 @@ static void striped_linear_full(ViterbiJob<T>& job) {
     const vd vninf(K_NINF);
     T best_local = static_cast<T>(0); int best_i = 0, best_j = 0;
     const T* pad = (Local || Glocal) ? striped_pad_into<T, Sat>(rows + 2 * rs, n, seg, W) : nullptr;
-    // Glocal: the end, offered in row-major order (strict >), a row's cells from its H row
-    // (slot 0 = column 0), as striped_affine_full's.
-    [[maybe_unused]] bool have = false;
-    [[maybe_unused]] auto offer = [&](int ci, int cj, T v) {
-        if (have && !(v > best_local)) return;
-        have = true; best_local = v; best_i = ci; best_j = cj;
+    // Runtime ends (SGX): SgPick (kernels_impl.inl) over H alone (X = Y = -inf), so the
+    // fixed-end instantiations keep main's code.
+    [[maybe_unused]] SgPickFor<SGX, T, Sat> pick{};
+    [[maybe_unused]] int best_tbl = 0;
+    auto pick_row = [&](int ci, const T* rH) {
+        if constexpr (SGX) {
+            if (ci == m && (sg & kSgFreeBEnd)) {   // row m whole: column 0, then H's striped columns
+                pick.offer(m, 0, rH[0], K_NINF, K_NINF);
+                if (seg > 0) striped_row_best1<T, Sat>(rH + off, pad, seg, ci, best_local, best_i, best_j);
+            } else if (ci == m || (sg & kSgFreeAEnd)) {
+                pick.offer(ci, n, rH[pick.coln], K_NINF, K_NINF);
+            }
+        }
+        (void)ci; (void)rH;
     };
-    const std::size_t coln = (n == 0) ? 0 : off + scol(n);
-    [[maybe_unused]] auto offer_row = [&](int ci, const T* rH) {
-        if (ci < m) { if (sg_ae) offer(ci, n, rH[coln]); return; }
-        if (!sg_be) { offer(m, n, rH[coln]); return; }
-        offer(m, 0, rH[0]);   // column 0 first, then the striped columns
-        if (seg > 0) striped_row_best1<T, Sat>(rH + off, pad, seg, ci, best_local, best_i, best_j);
-    };
-    if constexpr (Glocal) offer_row(0, pH);   // row 0 (row m when m == 0)
+    if constexpr (SGX) {
+        pick = SgPick<T, Sat>{sg, m, n, seg, off, (n == 0) ? 0 : off + scol(n), pad,
+                              &best_local, &best_i, &best_j, &best_tbl};
+        pick_row(0, pH);   // row 0 (row m when m == 0)
+    }
 
     for (int i = 1; i <= m; ++i) {
         if constexpr (Tr) {
@@ -337,8 +343,12 @@ static void striped_linear_full(ViterbiJob<T>& job) {
             }   // groups
             if constexpr (Local) striped_row_best1<T, Sat>(cH + off, pad, seg, i, best_local, best_i, best_j);
         }
-        if constexpr (Glocal)
-            if (i == m || sg_ae) offer_row(i, cH);   // column n of rows < m, row m
+        if constexpr (Glocal && !SGX)
+            if (i == m) {   // the end: column 0 first, then the striped columns
+                best_local = cH[0]; best_i = m; best_j = 0;
+                if (seg > 0) striped_row_best1<T, Sat>(cH + off, pad, seg, i, best_local, best_i, best_j);
+            }
+        if constexpr (SGX) pick_row(i, cH);   // column n of rows < m, row m
 
         if constexpr (Ptr) std::swap(pH, cH);
         else { pH = cH; cH += hstride; }
@@ -373,12 +383,12 @@ template <class T, bool Sat>
 static void striped_linear_entry_impl(ViterbiJob<T>& job) {
     const bool glocal = job.align_mode == 2;   // 0 Global, 1 Local, 2 Glocal
     if (job.tr.on()) {
-        if (glocal)              striped_linear_full<T, false, false, true, false, Sat, true>(job);
+        if (glocal)              { if (job.sg == kSgGlocal) striped_linear_full<T, false, false, true, false, Sat, true>(job); else striped_linear_full<T, false, false, true, false, Sat, true, -1>(job); }
         else if (job.align_mode) striped_linear_full<T, true, false, true, false, Sat>(job);
         else                     striped_linear_full<T, false, false, true, false, Sat>(job);
         return;
     }
-    if (glocal)              striped_linear_full<T, false, false, false, false, Sat, true>(job);
+    if (glocal)              { if (job.sg == kSgGlocal) striped_linear_full<T, false, false, false, false, Sat, true>(job); else striped_linear_full<T, false, false, false, false, Sat, true, -1>(job); }
     else if (job.align_mode) striped_linear_full<T, true, false, false, false, Sat>(job);
     else                     striped_linear_full<T, false, false, false, false, Sat>(job);
 }
@@ -388,11 +398,11 @@ static void striped_linear_ptr_entry_impl(ViterbiJob<T>& job) {
     if constexpr (sizeof(T) >= 4) {
         if (job.dense) {
             if (job.tr.on()) {
-                if (glocal)              striped_linear_full<T, false, true, true, true, Sat, true>(job);
+                if (glocal)              { if (job.sg == kSgGlocal) striped_linear_full<T, false, true, true, true, Sat, true>(job); else striped_linear_full<T, false, true, true, true, Sat, true, -1>(job); }
                 else if (job.align_mode) striped_linear_full<T, true, true, true, true, Sat>(job);
                 else                     striped_linear_full<T, false, true, true, true, Sat>(job);
             } else {
-                if (glocal)              striped_linear_full<T, false, true, false, true, Sat, true>(job);
+                if (glocal)              { if (job.sg == kSgGlocal) striped_linear_full<T, false, true, false, true, Sat, true>(job); else striped_linear_full<T, false, true, false, true, Sat, true, -1>(job); }
                 else if (job.align_mode) striped_linear_full<T, true, true, false, true, Sat>(job);
                 else                     striped_linear_full<T, false, true, false, true, Sat>(job);
             }
@@ -401,12 +411,12 @@ static void striped_linear_ptr_entry_impl(ViterbiJob<T>& job) {
     }
     job.dense = 0;
     if (job.tr.on()) {
-        if (glocal)              striped_linear_full<T, false, true, true, false, Sat, true>(job);
+        if (glocal)              { if (job.sg == kSgGlocal) striped_linear_full<T, false, true, true, false, Sat, true>(job); else striped_linear_full<T, false, true, true, false, Sat, true, -1>(job); }
         else if (job.align_mode) striped_linear_full<T, true, true, true, false, Sat>(job);
         else                     striped_linear_full<T, false, true, true, false, Sat>(job);
         return;
     }
-    if (glocal)              striped_linear_full<T, false, true, false, false, Sat, true>(job);
+    if (glocal)              { if (job.sg == kSgGlocal) striped_linear_full<T, false, true, false, false, Sat, true>(job); else striped_linear_full<T, false, true, false, false, Sat, true, -1>(job); }
     else if (job.align_mode) striped_linear_full<T, true, true, false, false, Sat>(job);
     else                     striped_linear_full<T, false, true, false, false, Sat>(job);
 }
