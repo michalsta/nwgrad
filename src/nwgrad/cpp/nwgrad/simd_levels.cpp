@@ -40,10 +40,16 @@ void register_level_typed(SimdLevel l,
 
 template <class T>
 void register_level_sg(SimdLevel l, typename TypedKernels<T>::viterbi_fn linear_sg,
-                       typename TypedKernels<T>::viterbi_fn linear_ptr_sg) {
+                       typename TypedKernels<T>::viterbi_fn linear_ptr_sg,
+                       typename TypedKernels<T>::viterbi_fn viterbi_sg,
+                       typename TypedKernels<T>::viterbi_fn viterbi_ptr_sg,
+                       typename TypedKernels<T>::score_fn score_sg) {
     TypedKernels<T>& k = level_table()[(int)l].template of<T>();
-    k.linear_sg     = linear_sg;
-    k.linear_ptr_sg = linear_ptr_sg;
+    k.linear_sg      = linear_sg;
+    k.linear_ptr_sg  = linear_ptr_sg;
+    k.viterbi_sg     = viterbi_sg;
+    k.viterbi_ptr_sg = viterbi_ptr_sg;
+    k.score_sg       = score_sg;
 }
 
 template <class T>
@@ -67,7 +73,8 @@ void register_level_grid(SimdLevel l, typename TypedKernels<T>::grid_fn grid_fwd
         TypedKernels<T>::hb_fn, TypedKernels<T>::hb_fn, TypedKernels<T>::hbbase_fn, \
         TypedKernels<T>::hbscan_fn, TypedKernels<T>::score_fn); \
     template void register_level_sg<T>(SimdLevel, TypedKernels<T>::viterbi_fn, \
-        TypedKernels<T>::viterbi_fn); \
+        TypedKernels<T>::viterbi_fn, TypedKernels<T>::viterbi_fn, TypedKernels<T>::viterbi_fn, \
+        TypedKernels<T>::score_fn); \
     template void register_level_inter<T>(SimdLevel, TypedKernels<T>::inter_fn, \
         TypedKernels<T>::inter_fn, int); \
     template void register_level_grid<T>(SimdLevel, TypedKernels<T>::grid_fn);

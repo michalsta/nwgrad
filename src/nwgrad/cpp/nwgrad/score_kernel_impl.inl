@@ -1296,11 +1296,11 @@ static bool score_unroll2() noexcept {
     }();
     return on;
 }
-template <class T, bool Tr, bool Sat = false>
+template <class T, bool Tr, bool Sat = false, int SGE = kSgGlocal>
 static void score_entry_impl(ScoreJob<T>& job) {
     const bool glocal = job.local == 2;   // 0 Global, 1 Local, 2 Glocal (ScoreJob::local)
     if (job.variant == 1) {
-        if (glocal)         { if (job.sg == kSgGlocal) score_affine_striped<T, false, false, Tr, Sat, true>(job); else score_affine_striped<T, false, false, Tr, Sat, true, -1>(job); }
+        if (glocal)         score_affine_striped<T, false, false, Tr, Sat, true, SGE>(job);
         else if (job.local) score_affine_striped<T, true, false, Tr, Sat>(job);
         else                score_affine_striped<T, false, false, Tr, Sat>(job);
         return;
@@ -1320,7 +1320,7 @@ static void score_entry_impl(ScoreJob<T>& job) {
         pos_ext  = job.ge_a >= T(0) && job.ge_b >= T(0);
     }
     if (job.variant == 0 && job.linear) {   // linear gaps (go = 0): one row H
-        if (glocal) { if (job.sg == kSgGlocal) score_linear_striped<T, false, false, Tr, Sat, true>(job); else score_linear_striped<T, false, false, Tr, Sat, true, -1>(job); }
+        if (glocal) score_linear_striped<T, false, false, Tr, Sat, true, SGE>(job);
         else if (job.local) {
             if (pos_ext) score_linear_striped<T, true, true, Tr, Sat>(job);
             else         score_linear_striped<T, true, false, Tr, Sat>(job);
@@ -1331,7 +1331,7 @@ static void score_entry_impl(ScoreJob<T>& job) {
     }
     if (job.variant == 0 && pos_open) {
         if constexpr (std::is_floating_point_v<T>) {
-            if (glocal) { if (job.sg == kSgGlocal) score_affine_striped_pos_fp<T, false, false, Tr, true>(job); else score_affine_striped_pos_fp<T, false, false, Tr, true, -1>(job); }
+            if (glocal) score_affine_striped_pos_fp<T, false, false, Tr, true, SGE>(job);
             else if (job.local) {
                 if (pos_ext) score_affine_striped_pos_fp<T, true, true, Tr>(job);
                 else         score_affine_striped_pos_fp<T, true, false, Tr>(job);
@@ -1339,7 +1339,7 @@ static void score_entry_impl(ScoreJob<T>& job) {
                 score_affine_striped_pos_fp<T, false, false, Tr>(job);
             }
         } else if (score_unroll2()) {
-            if (glocal) { if (job.sg == kSgGlocal) score_affine_striped_pos<T, false, false, Tr, Sat, true, true>(job); else score_affine_striped_pos<T, false, false, Tr, Sat, true, true, -1>(job); }
+            if (glocal) score_affine_striped_pos<T, false, false, Tr, Sat, true, true, SGE>(job);
             else if (job.local) {
                 if (pos_ext) score_affine_striped_pos<T, true, true, Tr, Sat, true>(job);
                 else         score_affine_striped_pos<T, true, false, Tr, Sat, true>(job);
@@ -1347,7 +1347,7 @@ static void score_entry_impl(ScoreJob<T>& job) {
                 score_affine_striped_pos<T, false, false, Tr, Sat, true>(job);
             }
         } else {
-            if (glocal) { if (job.sg == kSgGlocal) score_affine_striped_pos<T, false, false, Tr, Sat, false, true>(job); else score_affine_striped_pos<T, false, false, Tr, Sat, false, true, -1>(job); }
+            if (glocal) score_affine_striped_pos<T, false, false, Tr, Sat, false, true, SGE>(job);
             else if (job.local) {
                 if (pos_ext) score_affine_striped_pos<T, true, true, Tr, Sat>(job);
                 else         score_affine_striped_pos<T, true, false, Tr, Sat>(job);
@@ -1357,7 +1357,7 @@ static void score_entry_impl(ScoreJob<T>& job) {
         }
         return;
     }
-    if (glocal)         { if (job.sg == kSgGlocal) score_affine_striped<T, false, true, Tr, Sat, true>(job); else score_affine_striped<T, false, true, Tr, Sat, true, -1>(job); }
+    if (glocal)         score_affine_striped<T, false, true, Tr, Sat, true, SGE>(job);
     else if (job.local) score_affine_striped<T, true, true, Tr, Sat>(job);
     else                score_affine_striped<T, false, true, Tr, Sat>(job);
 }
@@ -1372,4 +1372,17 @@ static void score_entry(ScoreJob<T>& job) {
     }
     if (job.tr.on()) score_entry_impl<T, true>(job);
     else             score_entry_impl<T, false>(job);
+}
+// The semi-global runtime ends: see striped_full_sg_entry (kernels_impl.inl).
+template <class T>
+static void score_sg_entry(ScoreJob<T>& job) {
+    if constexpr (nw_sat<T>) {
+        if (job.sat) {
+            if (job.tr.on()) score_entry_impl<T, true, true, -1>(job);
+            else             score_entry_impl<T, false, true, -1>(job);
+            return;
+        }
+    }
+    if (job.tr.on()) score_entry_impl<T, true, false, -1>(job);
+    else             score_entry_impl<T, false, false, -1>(job);
 }

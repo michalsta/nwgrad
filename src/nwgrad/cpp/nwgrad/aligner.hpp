@@ -943,7 +943,8 @@ struct Aligner {
         } else {
             const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
             if (backend != kBackendScalar) {
-                const auto fn = level_kernels(backend).template of<T>().score;
+                const auto& KTs = level_kernels(backend).template of<T>();
+                const auto fn = sg_is_glocal_() ? KTs.score : KTs.score_sg;   // semi-global runtime ends: the sg unit's
                 if (fn) {
                     ScoreJob<T> job{}; job.sat = sat_;
                     job.a = a_idx_.data(); job.m = m_;
@@ -2620,8 +2621,9 @@ private:
             // by the Scores traceback whatever tb_ says — the paths are identical.
             if (uses_rowwise_full()) { viterbi_affine_simd(buf, K); return; }
             // The striped Full kernel, this level's instantiation for T.
-            if (use_ptr && KT.viterbi_ptr) { run_dispatched_affine(buf, K, true);  return; }
-            if (KT.viterbi)                { run_dispatched_affine(buf, K, false); return; }
+            const bool sgk = !sg_is_glocal_();   // semi-global runtime ends: the sg unit's kernels
+            if (use_ptr && (sgk ? KT.viterbi_ptr_sg : KT.viterbi_ptr)) { run_dispatched_affine(buf, K, true);  return; }
+            if (sgk ? KT.viterbi_sg : KT.viterbi)                      { run_dispatched_affine(buf, K, false); return; }
             if (use_ptr) { viterbi_affine_ptr(buf); return; }   // level lacks the ptr kernel
         }
         // The row-wise banded kernel (every T); a level without it falls back to the
@@ -2650,7 +2652,8 @@ private:
         if (tr_) fill_track_job_(job.tr, true, static_cast<size_t>(n_) + 16);
         const TypedKernels<T>& KT = K.template of<T>();
         job.dense = (use_ptr && want_dense_()) ? 1 : 0;
-        if (use_ptr) KT.viterbi_ptr(job); else KT.viterbi(job);
+        if (!sg_is_glocal_()) { if (use_ptr) KT.viterbi_ptr_sg(job); else KT.viterbi_sg(job); }   // the sg unit's
+        else if (use_ptr) KT.viterbi_ptr(job); else KT.viterbi(job);
         pointers_ = use_ptr;   // Pointers leaves codes, not score tables
         dense_ = use_ptr && job.dense;
         // Adopt the layout the kernel produced (striped for the Full striped kernel).

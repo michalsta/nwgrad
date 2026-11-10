@@ -1103,16 +1103,16 @@ static void striped_affine_full(ViterbiJob<T>& job) {
 
 // The registered entry for a level, per precision: dispatch Full by mode.  GuideBanded
 // is not handled here (the caller routes it to the row-wise kernel).
-template <class T, bool Sat>
+template <class T, bool Sat, int SGE = kSgGlocal>
 static void striped_full_entry_impl(ViterbiJob<T>& job) {
     const bool glocal = job.align_mode == 2;   // 0 Global, 1 Local, 2 Glocal
     if (job.tr.on()) {
-        if (glocal)              { if (job.sg == kSgGlocal) striped_affine_full<T, false, true, Sat, true>(job); else striped_affine_full<T, false, true, Sat, true, -1>(job); }
+        if (glocal)              striped_affine_full<T, false, true, Sat, true, SGE>(job);
         else if (job.align_mode) striped_affine_full<T, true, true, Sat>(job);
         else                     striped_affine_full<T, false, true, Sat>(job);
         return;
     }
-    if (glocal)              { if (job.sg == kSgGlocal) striped_affine_full<T, false, false, Sat, true>(job); else striped_affine_full<T, false, false, Sat, true, -1>(job); }
+    if (glocal)              striped_affine_full<T, false, false, Sat, true, SGE>(job);
     else if (job.align_mode) striped_affine_full<T, true, false, Sat>(job);
     else                     striped_affine_full<T, false, false, Sat>(job);
 }
@@ -1121,4 +1121,12 @@ template <class T>
 static void striped_full_entry(ViterbiJob<T>& job) {
     if constexpr (nw_sat<T>) { if (job.sat) { striped_full_entry_impl<T, true>(job); return; } }
     striped_full_entry_impl<T, false>(job);
+}
+// The semi-global runtime ends (job.sg != kSgGlocal; Glocal only): the SG = -1 kernels,
+// instantiated only in the level's sg unit (level_<name>_sg.cpp, NWGRAD_LEVEL_SG_TU): beside
+// the fixed-end kernels they moved gcc's inlining in this unit (level_common.inc).
+template <class T>
+static void striped_full_sg_entry(ViterbiJob<T>& job) {
+    if constexpr (nw_sat<T>) { if (job.sat) { striped_full_entry_impl<T, true, -1>(job); return; } }
+    striped_full_entry_impl<T, false, -1>(job);
 }
