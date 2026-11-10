@@ -494,6 +494,7 @@ struct SoftPairJobT {
     const F* P;
     F oa, ea, ob, eb;               // linear: ea, eb only
     int local, full, bi, bj;        // bi/bj: Global border rows/cols
+    int sg = kSgGlocal;             // local 2: the semi-global free ends (kSgFree*)
     const int *jlo, *jhi, *jlo0, *jhi0, *slo, *shi;   // m+1 each
     size_t stride;                  // n+1
     F *FM, *FX, *FY;                // forward tables (linear: FM only)

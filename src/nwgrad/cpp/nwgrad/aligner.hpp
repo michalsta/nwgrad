@@ -5361,9 +5361,7 @@ private:
         soft_counts_ready_ = false;
 
         soft_f32_used_ = false;
-        // Semi-global ends other than glocal's: the log path (the scaled kernels seed and
-        // sum glocal's ends only), whatever soft_impl asks.
-        if (soft_impl_ != SoftImpl::Log && sg_is_glocal_()) {
+        if (soft_impl_ != SoftImpl::Log) {
             bool ok = false;
             // float32 pairs: the float32 scaled pass first; a pair whose weights or lost-mass
             // bound do not fit float32 (a step score past ~88 nats, or very low T) reruns
@@ -5732,6 +5730,7 @@ private:
         J.a = a_idx_.data(); J.b = b_idx_.data();
         J.P = tr_ ? sc.qp.data() : build_profile<SF>(buf, w);
         J.local = (AM == AlignMode::Local) ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
+        J.sg = sg_;
         J.full = (AB == AlignBand::Full) ? 1 : 0;
         J.bi = border_rows(); J.bj = border_cols();
         J.jlo = bl; J.jhi = bl + mm; J.jlo0 = bl + 2 * mm; J.jhi0 = bl + 3 * mm;

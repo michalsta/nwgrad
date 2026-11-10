@@ -3292,6 +3292,56 @@ best of 5).** glocal / global:
   the scans' Glocal branches (`HbScanJob::glocal`, a runtime int) cost nothing measurable
   against Local's: no template split needed.
 
+### Semi-global free ends (branch `proto/semiglobal`, 2026-11-07)
+
+**What.** `AlignMode::Glocal` is now the whole semi-global family: a runtime word `sg_`
+(`Aligner::set_free_ends`, `BatchSettings::free_ends`, `kSgFree*` in `simd_levels.hpp`) says
+which flanks are free -- A's begin / end, B's begin / end.  `kSgGlocal` (B's two) is the
+default, so every existing glocal caller runs what it ran; 0 is Global's DP; all four is
+`mode="overlap"`.  Python: `mode="semiglobal", free_ends=(a_begin, a_end, b_begin, b_end)`
+(booleans, or the names of the free ones), `mode="overlap"`, `.free_ends`, the
+`semiglobal_*` convenience functions (`__init__.py`).  The Global and Local template
+instantiations are untouched (every new test is `if constexpr (Glocal)`-guarded or a runtime
+word read only there).
+
+**The DP.** Free B begin: row 0 M = 0, no Y chain (glocal's); else Global's row 0.  Free A
+begin: column 0 M = 0, X = -inf (Local's border), else Global's chain.  Ends: row m whole
+(free B end) or (m, n); column n of rows 0..m-1 (free A end).  Border cells are ends too
+((m, 0) as glocal's; (0, n)), so a dovetail with nothing in common scores 0.  The tie rule:
+**the first candidate in row-major order holding the maximum (strict >), the state by
+M > X > Y** -- glocal's (first column of row m) and Local's, one rule.  `SgEnd::offer` in
+the aligner, the `offer` / `offer_row` lambdas in the striped kernels (column n's slot read
+after each row's lazy-F, one scalar read per row; row m by `striped_row_best`).  The walks
+stop at row 0 under a free B begin (as before) and at column 0 under a free A begin; a
+charged border emits Global's forced gap run.  Gradients follow from the walk.  Soft (log
+path): the same borders, Z = the sum over the end cells (`sg_for_end_cells_`), the backward
+seeded there; gap targets from `gap_min_j_()` / `gap_min_i_()` (the old kGapTargetMin
+constants, now per problem: a free A begin drops column 0's vertical moves, a charged row 0
+adds its horizontal ones).  Scaled soft (`soft_kernel_impl.inl`, `SoftPairJobT::sg`): a
+free A begin seeds column 0 with Local's 2^-S[i-1] (one cell, not every cell), each row's
+end mass goes to `rowsum` (`sp_row_ends`: column n's cell for a row < m, row m's sum or
+cell) and Z sums them as Local's per-row sums; the backward adds 2^-T at column n of
+every row < m (Local's `init`, one cell); `kmin` / `kmin0` from the flags.  Glocal's ends
+take the old code exactly (`GX` false).
+
+**Where.** Scalar fills (`viterbi_affine_impl`, `viterbi_linear_impl`, both Pointers fills,
+the two score-only scalars); the striped Scores / Pointers / linear kernels; all five
+score-only kernels (the int linear one finishes a row's H one row late, so column n is
+completed there by hand: `max(U, max(P, cin) - ramp)` with the ramp summed in the lane's
+wrapping arithmetic).  **Gated** for ends other than glocal's: Grid and the Hirschberg modes
+(`run_tb_` returns Pointers: O(m*n) direction bytes), the row-wise fill
+(`uses_rowwise_full`), the inter-pair fills, hard and soft (`BatchEngine::inter_fill_()`),
+guide bands (`check_problem` throws).
+
+**Tests** (`tests/Python/test_semiglobal.py`): a Python 3-state reference of the 4-flag
+DP (scores and end cells under the tie rule, exact with integer-valued parameters), itself
+checked against Biopython's PairwiseAligner with zero end-gap scores (an independent
+statement of the semantics); every flag set x gap model x dtype (double, float32, int32,
+int16) x level against scalar_fallback, bit for bit (score, aligned strings, gradient);
+score-only == the Pointers fill; flags () == mode "global" and (b_begin, b_end) == "glocal"
+bit for bit; path consistency (the aligned strings score the score, start and end on legal
+cells, grad . params == score); batches (both fills) == single pairs.
+
 ### Python bindings (`py_exports.cpp`)
 
 nanobind module `nwgrad_ext`, re-exported from `src/nwgrad/__init__.py`. Exposes:

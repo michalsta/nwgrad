@@ -286,6 +286,31 @@ def test_soft_glocal_ends_unchanged(gmatrix):
         np.testing.assert_allclose(np.asarray(g1.to_dict()["matrix"]), np.asarray(g0.to_dict()["matrix"]), atol=1e-10)
 
 
+@pytest.mark.parametrize("gap_model", ["affine", "linear"])
+@pytest.mark.parametrize("cls", ["SeqPairDouble", "SeqPair"])
+def test_scaled_soft_matches_log(gmatrix, gap_model, cls):
+    # the scaled kernels (double, and float32 for a float32 pair) against the log path
+    C = getattr(nwgrad, cls)
+    aff = gap_model == "affine"
+    p = _params(gmatrix, 1.5 if aff else 0.0, 0.7, 2.0 if aff else 0.0, 0.4)
+    rng = random.Random(73)
+    tol = 1e-10 if cls == "SeqPairDouble" else 2e-4
+    cases = [(_rand(rng, 0, 30), _rand(rng, 0, 60)) for _ in range(8)] + [("ACG", ""), ("", "AC"), ("", "")]
+    for flags in FLAGS:
+        for a, b in cases:
+            r = {}
+            for impl in ("log", "scaled"):
+                sp = C(a, b, p, gap_model=gap_model, mode="semiglobal", free_ends=flags, grad_mode="soft")
+                sp.soft_impl = impl
+                lz, g = sp.score_and_grad()
+                d = g.to_dict()
+                r[impl] = (lz, np.asarray(d["matrix"]), np.array([d[k] for k in
+                           ("gap_open_a", "gap_extend_a", "gap_open_b", "gap_extend_b")]))
+            assert r["scaled"][0] == pytest.approx(r["log"][0], rel=tol, abs=tol), (flags, a, b)
+            np.testing.assert_allclose(r["scaled"][1], r["log"][1], rtol=tol, atol=tol * 10)
+            np.testing.assert_allclose(r["scaled"][2], r["log"][2], rtol=tol, atol=tol * 10)
+
+
 @pytest.mark.parametrize("traceback", ["auto", "grid", "hirschberg", "hirschberg_pmax"])
 def test_other_tracebacks_run_pointers(gmatrix, traceback):
     p = _params(gmatrix, 2.0, 0.7, 1.5, 0.5)
