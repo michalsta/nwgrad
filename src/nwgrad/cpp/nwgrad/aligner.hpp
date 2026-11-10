@@ -1795,17 +1795,15 @@ private:
         // than Pointers and 2.1-5.5x than pmax (skynet sse4, AGENTS.md "Grid traceback").
         // Within the budget Pointers stays; a tracked pair or the scalar backend keeps pmax.
         // The batch planners ask hb_splits of pmax, true either way, so such pairs run their
-        // own fill in both cases.  NOT int16 Global / Glocal: at 32 int16 lanes (AVX-512,
-        // solace) pmax beat Grid on L1000-class protein pairs, `auto` 1.09-1.24x slower
-        // with Grid (DNA L3000 0.53x faster; nighthaven AVX2 int16 Global L1000 0.84-0.91x),
-        // so they keep pmax, as on main; traceback="grid" stays available for them.  int16
-        // Local takes Grid (above the budget, where pmax's two endpoint scans are the cost).
-        if constexpr (GM == GapModel::Affine && AB == AlignBand::Full && nw_is_int<T> &&
-                      !(sizeof(T) == 2 && AM != AlignMode::Local))
+        // own fill in both cases.  int16 Global / Glocal take Grid from int16_grid_min_rows
+        // (below): hb_cutoff except on AVX-512.  int16 Local takes Grid (above the budget,
+        // where pmax's two endpoint scans are the cost).
+        if constexpr (GM == GapModel::Affine && AB == AlignBand::Full && nw_is_int<T>)
             if (tb_auto_ && tb_ == TracebackMode::HirschbergPmax &&
                 hb_splits(tb_, kAutoPointerCells, hb_cutoff_, m_, n_)) {
                 const int be = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
-                if (be != kBackendScalar && grid_ok_(level_kernels(be))) return TracebackMode::Grid;
+                if (be != kBackendScalar && m_ >= int16_grid_min_rows(be) && grid_ok_(level_kernels(be)))
+                    return TracebackMode::Grid;
             }
         return tb_;
     }
@@ -2652,6 +2650,23 @@ private:
     static int local_grid_min_rows(int backend) noexcept {
 #if !(defined(__aarch64__) || defined(_M_ARM64))
         if (backend == static_cast<int>(SimdLevel::Avx512)) return kLocalGridMinRows512;
+#endif
+        (void)backend;
+        return 0;
+    }
+    // int16 Global / Glocal `auto` (run_tb_): the rows from which a splitting pair runs Grid
+    // instead of hirschberg_pmax, beyond hb_splits' m > hb_cutoff.  Until 2026-11-10 they kept
+    // pmax everywhere, for AVX-512 (solace, 32 int16 lanes), where Grid made `auto` 1.09-1.24x
+    // slower at L1000 protein (DNA L3000 0.53x).  Every other level loses with pmax: spot (M1,
+    // NEON, 1 thread) grid / pmax DNA L1000 0.912, protein L1000 0.870, DNA L3000 0.492
+    // (results/spot.md "Round 2"); nighthaven AVX2 L1000 0.84-0.91; skynet-class sse4 see
+    // AGENTS.md "int16 Global auto takes Grid".  So hb_cutoff there, and AVX-512 from 2048
+    // rows, between its L1000 loss and its L3000 win.  Local: 0 (Grid past the budget, as before).
+    static constexpr int kInt16GridMinRows512 =
+        (std::is_same_v<T, int16_t> && AM != AlignMode::Local) ? 2048 : 0;
+    static int int16_grid_min_rows(int backend) noexcept {
+#if !(defined(__aarch64__) || defined(_M_ARM64))
+        if (backend == static_cast<int>(SimdLevel::Avx512)) return kInt16GridMinRows512;
 #endif
         (void)backend;
         return 0;

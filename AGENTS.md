@@ -1359,14 +1359,29 @@ really takes (`test_tracked_long_global_float32_pairs_run_their_own_fill`).  fuz
 - **`auto`** (`run_tb_`): integer `auto` stays `hirschberg_pmax` (kDefaultTb) and a pair that
   SPLITS (`hb_splits`: past hb_cutoff and, where the type has one, past the pointer budget —
   Local and Global int64 2^25; Global int32 and Glocal have none) runs Grid where
-  grid_ok_ — except int16 Global / Glocal, which keep pmax: on solace (AVX-512, 32 int16
-  lanes) Grid made int16 Global `auto` 1.09-1.24x SLOWER at L1000 protein (DNA L3000 0.53x;
-  nighthaven AVX2 0.84-0.91x), and the merge rule is no regression on any host.  This is the floating rule's integer half: floating T resolves to Grid and runs
+  grid_ok_ — int16 Global / Glocal included since 2026-11-10 (below: "int16 Global auto takes
+  Grid"); until then they kept pmax because on solace (AVX-512, 32 int16 lanes) Grid made int16
+  Global `auto` 1.09-1.24x SLOWER at L1000 protein (DNA L3000 0.53x; nighthaven AVX2
+  0.84-0.91x), and the merge rule is no regression on any host.  This is the floating rule's integer half: floating T resolves to Grid and runs
   Pointers within Local's budget; integer T resolves to pmax and runs Grid past it — the
   same Pointers-within / Grid-beyond split in both.  Within the budget Pointers stays;
   tracked pairs / the scalar backend keep pmax; the planners ask hb_splits of pmax, true
   either way, so these pairs keep their own fill.  Scores are unchanged (pmax is exact for
   integers); paths become Pointers' wherever Hirschberg broke a tie differently.
+- **int16 Global auto takes Grid (branch `proto/gate-fixes`, 2026-11-10).** pmax was never
+  the best int16 Global traceback off AVX-512. spot (M1, NEON, 1 thread, time): grid / auto
+  (pmax) DNA L1000 0.912, protein L1000 0.870, DNA L3000 0.492 (Pointers 0.915 / 0.857 / 0.910).
+  wloczykij sse4, `instructions:u`, 1 thread, A/A 1.000: Global grid / auto DNA L600 / 1000 /
+  2000 / 3000 0.71 / 0.72 / 0.68 / 0.43, protein L600-2000 0.65-0.69; Glocal (pmax there is
+  ~2x Pointers) DNA 0.36 / 0.36 / 0.34 / 0.22, protein 0.35 / 0.35 / 0.33; Grid beats Pointers
+  in every cell (0.47-0.85). So int16 Global and Glocal `auto` runs Grid past hb_cutoff
+  (`int16_grid_min_rows`), except AVX-512, from 2048 rows (between solace's L1000 loss and
+  L3000 win). Scores unchanged (pmax is exact for integers). PR #45 (`proto/grid-base-simd`)
+  makes int16 Grid cheaper still.
+  **Release note: int16 Global / Glocal `traceback="auto"` paths may change at ties** (past
+  512 rows; AVX-512 past 2048): they are now Grid's, i.e. `traceback="pointers"`' path, not
+  hirschberg_pmax's. Scores are identical. Seen in the sse4 sweep: Global DNA L600 and L3000,
+  Glocal DNA L600 / L1000 / L3000 cigars differ from main's; protein L600-2000 unchanged.
 - **Local, one pass** (same branch): with every gap parameter >= 0 and a top level above the
   base size, the top level's forward finds the end cell itself (`GridFwdJob::find_best`, a
   `Best` instantiation: per lane the largest M and its first segment, as the Pointers
@@ -1390,7 +1405,7 @@ really takes (`test_tracked_long_global_float32_pairs_run_their_own_fill`).  fuz
   | 3000 | f32 Local | 3.65 / 26.2 | 3.65 / 26.2 (Pointers) | **1.92 / 13.4** | 4.50 / 28.9 | 3.75 / 26.2 |
   | 3000 | f32 / f64 Global | 2.02 / 12.05, 2.93 / 17.1 | 2.04 / 12.06, 2.97 / 16.8 | 1.98, 2.96 | 2.01, 3.17 | 3.59, 6.19 |
 
-  int32 Global `auto` 1.7-2.3x faster than main's (pmax); int16 Global keeps pmax.  Local within the 2^25 budget:
+  int32 Global `auto` 1.7-2.3x faster than main's (pmax); int16 Global kept pmax (until 2026-11-10).  Local within the 2^25 budget:
   `auto` stays Pointers on both sides (with one pass Grid would win 1.7-2.2x there on sse4;
   the budget was set against the two-pass form and is left to a fleet re-measure).  Above
   it (6300 x 6050, before the merge): int32 `auto` 1.94 ns/cell against pmax's 8.61.
