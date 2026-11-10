@@ -50,7 +50,7 @@ def _run(t, gm, mode, grad, level, forms, nb=(28, 36), seed=0):
     out = []
     gates = {g: None for g in _tuning.GATES if g not in ("soft_f32_min_cells", "linear_striped_min_n")}
     for fill, kern, prof in forms(level):
-        with _tuning.override(**gates, inter_profile_bytes=prof):
+        with _tuning.override(**{**gates, "inter_profile_bytes": prof}):
             b = CLS[t](A, B, p, gap_model=gm, mode=mode, grad_mode=grad, n_threads=2,
                        kernel=kern, traceback="pointers")
             b.fill = fill
@@ -122,7 +122,7 @@ def test_profile_banded(t, band, level):
     gates = {g: None for g in _tuning.GATES if g not in ("soft_f32_min_cells", "linear_striped_min_n")}
     out = []
     for fill, kern, prof in _three(level):
-        with _tuning.override(**gates, inter_profile_bytes=prof):
+        with _tuning.override(**{**gates, "inter_profile_bytes": prof}):
             b = CLS[t](2, gap_model="affine", mode="global", grad_mode="hard")
             b.fill = fill
             r = b.align(A, B, p, band, list(guides[0]), list(guides[1]), kern)
