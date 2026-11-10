@@ -676,7 +676,9 @@ static inline void striped_profile_index(unsigned char* idx, const unsigned char
 // AVX2 (nighthaven, perf, 2026-10-30).
 // int32 / float32, up to 32 symbols: the same with four byte planes, interleaved by two
 // rounds of unpacks (x86) or one vst4 (NEON, whose vld4 also splits the row into its
-// planes).  ~1.6 instructions per slot at 16 slots per iteration (sse4) against ~4.
+// planes).  The whole build (24 rows, the slot index and the padding included) fell from
+// 17.9k to 9.9k instructions at L100 and 53.1k to 25.0k at L300 (sse4, wloczykij,
+// 2026-11-10); protein score-only int32 / float32 -2.5-3 % of all instructions at L100.
 // AVX-512 (F + BW + VL, the level's flags): whole-element two-table permutes, a word /
 // dword / qword index zero-extended from the slot's byte -- vpermt2w (64 symbols at
 // once), vpermt2d (32), vpermt2q (16; two and a blend on bit 4 for up to 32) -- and a
@@ -917,6 +919,7 @@ static inline void striped_profile_row_idx(T* dst, const T* row, const unsigned 
 }
 // The padding slots (columns n+1..seg*W, fewer than W) of `nrow` consecutive rows: each
 // slot's position is computed once, not once per row (a division and a modulo each).
+// int16, whose rows were already shuffles: the build 7.8k -> 7.1k instructions at L100.
 template <class T>
 static inline void striped_profile_pad(T* prof, int nrow, int n, int seg, int W) {
     const std::size_t sw = (std::size_t)seg * W;
