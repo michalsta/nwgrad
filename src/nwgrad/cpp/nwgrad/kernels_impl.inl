@@ -813,7 +813,7 @@ static inline const T* striped_row_profile(T* prof, const T* blk, int nalpha, co
 // first of the maxima winning (column n's cell after each row i < m with a free A end, then
 // row m whole with a free B end, else (m, n)) -- one scalar read per row, the cell already
 // in the row's striped slots.
-template <class T, bool Local, bool Tr = false, bool Sat = false, bool Glocal = false>
+template <class T, bool Local, bool Tr = false, bool Sat = false, bool Glocal = false, int SG = -1>
 static void striped_affine_full(ViterbiJob<T>& job) {
     using vd = stdx::native_simd<T>;
     const int W = (int)vd::size();                       // native T-lane count for this level
@@ -873,7 +873,7 @@ static void striped_affine_full(ViterbiJob<T>& job) {
     T* ov = buf.sopenv.data();
 
     // The semi-global ends (Glocal only; see above).
-    const int sg = Glocal ? job.sg : 0;
+    const int sg = !Glocal ? 0 : (SG >= 0 ? SG : job.sg);   // SG: the ends fixed at compile time (glocal's), -1 runtime
     const bool sg_ab = Glocal && (sg & kSgFreeABegin), sg_ae = Glocal && (sg & kSgFreeAEnd),
                sg_bb = Glocal && (sg & kSgFreeBBegin), sg_be = Glocal && (sg & kSgFreeBEnd);
 
@@ -1084,12 +1084,12 @@ template <class T, bool Sat>
 static void striped_full_entry_impl(ViterbiJob<T>& job) {
     const bool glocal = job.align_mode == 2;   // 0 Global, 1 Local, 2 Glocal
     if (job.tr.on()) {
-        if (glocal)              striped_affine_full<T, false, true, Sat, true>(job);
+        if (glocal)              { if (job.sg == kSgGlocal) striped_affine_full<T, false, true, Sat, true, kSgGlocal>(job); else striped_affine_full<T, false, true, Sat, true, -1>(job); }
         else if (job.align_mode) striped_affine_full<T, true, true, Sat>(job);
         else                     striped_affine_full<T, false, true, Sat>(job);
         return;
     }
-    if (glocal)              striped_affine_full<T, false, false, Sat, true>(job);
+    if (glocal)              { if (job.sg == kSgGlocal) striped_affine_full<T, false, false, Sat, true, kSgGlocal>(job); else striped_affine_full<T, false, false, Sat, true, -1>(job); }
     else if (job.align_mode) striped_affine_full<T, true, false, Sat>(job);
     else                     striped_affine_full<T, false, false, Sat>(job);
 }

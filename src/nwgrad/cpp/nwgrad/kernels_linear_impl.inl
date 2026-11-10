@@ -90,7 +90,7 @@ static inline void striped_row_best1(const T* cH, const T* pad, int seg, int i,
 // Glocal (Local false): row 0 = 0 (a free start), column 0 Global's chain, no clamp, the
 // end the best cell of row m (column 0 first, then the striped columns, strict >) -- with
 // job.sg the other semi-global ends as striped_affine_full's (kernels_impl.inl).
-template <class T, bool Local, bool Ptr, bool Tr, bool Dense = false, bool Sat = false, bool Glocal = false>
+template <class T, bool Local, bool Ptr, bool Tr, bool Dense = false, bool Sat = false, bool Glocal = false, int SG = -1>
 static void striped_linear_full(ViterbiJob<T>& job) {
     static_assert(!Dense || (Ptr && sizeof(T) >= 4), "dense codes: pointer fill, lanes >= 32 bits");
     using vd = stdx::native_simd<T>;
@@ -148,7 +148,7 @@ static void striped_linear_full(ViterbiJob<T>& job) {
     }
 
     // The semi-global ends (Glocal only).
-    const int sg = Glocal ? job.sg : 0;
+    const int sg = !Glocal ? 0 : (SG >= 0 ? SG : job.sg);   // SG: the ends fixed at compile time (glocal's), -1 runtime
     const bool sg_ab = Glocal && (sg & kSgFreeABegin), sg_ae = Glocal && (sg & kSgFreeAEnd),
                sg_bb = Glocal && (sg & kSgFreeBBegin), sg_be = Glocal && (sg & kSgFreeBEnd);
 
@@ -373,12 +373,12 @@ template <class T, bool Sat>
 static void striped_linear_entry_impl(ViterbiJob<T>& job) {
     const bool glocal = job.align_mode == 2;   // 0 Global, 1 Local, 2 Glocal
     if (job.tr.on()) {
-        if (glocal)              striped_linear_full<T, false, false, true, false, Sat, true>(job);
+        if (glocal)              { if (job.sg == kSgGlocal) striped_linear_full<T, false, false, true, false, Sat, true, kSgGlocal>(job); else striped_linear_full<T, false, false, true, false, Sat, true, -1>(job); }
         else if (job.align_mode) striped_linear_full<T, true, false, true, false, Sat>(job);
         else                     striped_linear_full<T, false, false, true, false, Sat>(job);
         return;
     }
-    if (glocal)              striped_linear_full<T, false, false, false, false, Sat, true>(job);
+    if (glocal)              { if (job.sg == kSgGlocal) striped_linear_full<T, false, false, false, false, Sat, true, kSgGlocal>(job); else striped_linear_full<T, false, false, false, false, Sat, true, -1>(job); }
     else if (job.align_mode) striped_linear_full<T, true, false, false, false, Sat>(job);
     else                     striped_linear_full<T, false, false, false, false, Sat>(job);
 }
@@ -388,11 +388,11 @@ static void striped_linear_ptr_entry_impl(ViterbiJob<T>& job) {
     if constexpr (sizeof(T) >= 4) {
         if (job.dense) {
             if (job.tr.on()) {
-                if (glocal)              striped_linear_full<T, false, true, true, true, Sat, true>(job);
+                if (glocal)              { if (job.sg == kSgGlocal) striped_linear_full<T, false, true, true, true, Sat, true, kSgGlocal>(job); else striped_linear_full<T, false, true, true, true, Sat, true, -1>(job); }
                 else if (job.align_mode) striped_linear_full<T, true, true, true, true, Sat>(job);
                 else                     striped_linear_full<T, false, true, true, true, Sat>(job);
             } else {
-                if (glocal)              striped_linear_full<T, false, true, false, true, Sat, true>(job);
+                if (glocal)              { if (job.sg == kSgGlocal) striped_linear_full<T, false, true, false, true, Sat, true, kSgGlocal>(job); else striped_linear_full<T, false, true, false, true, Sat, true, -1>(job); }
                 else if (job.align_mode) striped_linear_full<T, true, true, false, true, Sat>(job);
                 else                     striped_linear_full<T, false, true, false, true, Sat>(job);
             }
@@ -401,12 +401,12 @@ static void striped_linear_ptr_entry_impl(ViterbiJob<T>& job) {
     }
     job.dense = 0;
     if (job.tr.on()) {
-        if (glocal)              striped_linear_full<T, false, true, true, false, Sat, true>(job);
+        if (glocal)              { if (job.sg == kSgGlocal) striped_linear_full<T, false, true, true, false, Sat, true, kSgGlocal>(job); else striped_linear_full<T, false, true, true, false, Sat, true, -1>(job); }
         else if (job.align_mode) striped_linear_full<T, true, true, true, false, Sat>(job);
         else                     striped_linear_full<T, false, true, true, false, Sat>(job);
         return;
     }
-    if (glocal)              striped_linear_full<T, false, true, false, false, Sat, true>(job);
+    if (glocal)              { if (job.sg == kSgGlocal) striped_linear_full<T, false, true, false, false, Sat, true, kSgGlocal>(job); else striped_linear_full<T, false, true, false, false, Sat, true, -1>(job); }
     else if (job.align_mode) striped_linear_full<T, true, true, false, false, Sat>(job);
     else                     striped_linear_full<T, false, true, false, false, Sat>(job);
 }

@@ -134,7 +134,7 @@ template <class T, class Vec>
     return spread_rows<T>(block, len, nrows, stride);
 }
 
-template <class T, bool Local, bool Tr = false, bool Dense = false, bool Sat = false, bool Glocal = false>
+template <class T, bool Local, bool Tr = false, bool Dense = false, bool Sat = false, bool Glocal = false, int SG = -1>
 static void striped_affine_full_ptr(ViterbiJob<T>& job) {
     static_assert(!Dense || sizeof(T) >= 4, "dense codes: lanes >= 32 bits");
     using vd = stdx::native_simd<T>;
@@ -184,7 +184,7 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
     T* cM = rows;          T* cX = rows + rs;     T* cY = rows + 2 * rs;
 
     // The semi-global ends (Glocal only; see striped_affine_full).
-    const int sg = Glocal ? job.sg : 0;
+    const int sg = !Glocal ? 0 : (SG >= 0 ? SG : job.sg);   // SG: the ends fixed at compile time (glocal's), -1 runtime
     const bool sg_ab = Glocal && (sg & kSgFreeABegin), sg_ae = Glocal && (sg & kSgFreeAEnd),
                sg_bb = Glocal && (sg & kSgFreeBBegin), sg_be = Glocal && (sg & kSgFreeBEnd);
 
@@ -614,11 +614,11 @@ static void striped_full_ptr_entry_impl(ViterbiJob<T>& job) {
     if constexpr (sizeof(T) >= 4) {
         if (job.dense) {
             if (job.tr.on()) {
-                if (glocal)              striped_affine_full_ptr<T, false, true, true, Sat, true>(job);
+                if (glocal)              { if (job.sg == kSgGlocal) striped_affine_full_ptr<T, false, true, true, Sat, true, kSgGlocal>(job); else striped_affine_full_ptr<T, false, true, true, Sat, true, -1>(job); }
                 else if (job.align_mode) striped_affine_full_ptr<T, true, true, true, Sat>(job);
                 else                     striped_affine_full_ptr<T, false, true, true, Sat>(job);
             } else {
-                if (glocal)              striped_affine_full_ptr<T, false, false, true, Sat, true>(job);
+                if (glocal)              { if (job.sg == kSgGlocal) striped_affine_full_ptr<T, false, false, true, Sat, true, kSgGlocal>(job); else striped_affine_full_ptr<T, false, false, true, Sat, true, -1>(job); }
                 else if (job.align_mode) striped_affine_full_ptr<T, true, false, true, Sat>(job);
                 else                     striped_affine_full_ptr<T, false, false, true, Sat>(job);
             }
@@ -627,12 +627,12 @@ static void striped_full_ptr_entry_impl(ViterbiJob<T>& job) {
     }
     job.dense = 0;
     if (job.tr.on()) {
-        if (glocal)              striped_affine_full_ptr<T, false, true, false, Sat, true>(job);
+        if (glocal)              { if (job.sg == kSgGlocal) striped_affine_full_ptr<T, false, true, false, Sat, true, kSgGlocal>(job); else striped_affine_full_ptr<T, false, true, false, Sat, true, -1>(job); }
         else if (job.align_mode) striped_affine_full_ptr<T, true, true, false, Sat>(job);
         else                     striped_affine_full_ptr<T, false, true, false, Sat>(job);
         return;
     }
-    if (glocal)              striped_affine_full_ptr<T, false, false, false, Sat, true>(job);
+    if (glocal)              { if (job.sg == kSgGlocal) striped_affine_full_ptr<T, false, false, false, Sat, true, kSgGlocal>(job); else striped_affine_full_ptr<T, false, false, false, Sat, true, -1>(job); }
     else if (job.align_mode) striped_affine_full_ptr<T, true, false, false, Sat>(job);
     else                     striped_affine_full_ptr<T, false, false, false, Sat>(job);
 }
