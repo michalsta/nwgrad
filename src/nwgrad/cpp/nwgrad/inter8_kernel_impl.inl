@@ -158,8 +158,11 @@ struct Inter8Common {
             if constexpr (kByteShuffle) {
                 for (int c = 0; c < np; ++c) P.p[c] = iv8_shuf(colt[c], ai);
             } else {
-                for (int c = 0; c < np; ++c)
-                    for (int l = 0; l < I8W; ++l) P.p[c][l] = colt[c][ai[l] & 15];
+                for (int c = 0; c < np; ++c) {   // a whole local, then stored (lane stores into
+                    iv8 v{};                       // P.p[c] read as maybe-uninitialized to gcc)
+                    for (int l = 0; l < I8W; ++l) v[l] = colt[c][ai[l] & 15];
+                    P.p[c] = v;
+                }
             }
         }
     }
