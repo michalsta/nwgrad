@@ -2214,6 +2214,7 @@ private:
         job.go_a = static_cast<T>(P.gap_open_a); job.ge_a = static_cast<T>(P.gap_extend_a);
         job.go_b = static_cast<T>(P.gap_open_b); job.ge_b = static_cast<T>(P.gap_extend_b);
         job.linear = GM == GapModel::Linear ? 1 : 0;
+        job.prof_max = inter_profile_max();
     }
     // cast_block_ + set_inter_params_ for the batch's params, except that a float32
     // tracked group reads their once-cast stack (OwnedParams) instead of casting K
