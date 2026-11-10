@@ -68,16 +68,6 @@ template <class T, int W>
         const __m256i b = _mm256_packus_epi16((__m256i)static_cast<__v16hi>(code), (__m256i)static_cast<__v16hi>(code));
         const __m256i p = _mm256_permute4x64_epi64(b, 0x08);
         _mm_storeu_si128((__m128i*)dst, _mm256_castsi256_si128(p)); return;
-    } else if constexpr (std::is_same_v<T, float> && W == 8) {
-        const __m256i d = _mm256_cvttps_epi32((__m256)static_cast<__v8sf>(code));
-        const __m256i w = _mm256_packus_epi32(d, d);
-        const __m256i p = _mm256_permute4x64_epi64(w, 0x08);
-        const __m128i b = _mm_packus_epi16(_mm256_castsi256_si128(p), _mm256_castsi256_si128(p));
-        _mm_storel_epi64((__m128i*)dst, b); return;
-    } else if constexpr (std::is_same_v<T, double> && W == 4) {
-        const __m128i d = _mm256_cvttpd_epi32((__m256d)static_cast<__v4df>(code));
-        const __m128i b = _mm_packus_epi16(_mm_packs_epi32(d, d), _mm_packs_epi32(d, d));
-        std::memcpy(dst, &b, 4); return;
     } else
 #elif defined(__SSE2__)
     if constexpr (std::is_same_v<T, int64_t> && W == 2) {
@@ -91,18 +81,18 @@ template <class T, int W>
     } else if constexpr (std::is_same_v<T, int16_t> && W == 8) {
         const __m128i b = _mm_packus_epi16((__m128i)static_cast<__v8hi>(code), (__m128i)static_cast<__v8hi>(code));
         _mm_storel_epi64((__m128i*)dst, b); return;
+#if defined(__SSSE3__)
     } else if constexpr (std::is_same_v<T, float> && W == 4) {
-        // Floating codes: an explicit truncating convert and two packs.  Through std::simd's
-        // cast, gcc chose the packing per unit (inlining-dependent): with the semi-global
-        // kernels added to the level it stored the Local linear codes lane by lane, +5 % on
-        // that kernel (wloczykij sse4, 2026-11-11).
+        // Floating codes at sse4: the truncating convert and one byte shuffle, written out --
+        // the form gcc reached for std::simd's cast on main.  Left to the cast, gcc chose the
+        // packing per unit (inlining-dependent): with the semi-global kernels added to the
+        // level it packed the Local linear codes otherwise, +5 % on that kernel; two packs
+        // instead of the shuffle cost the linear fills 1-3 % (wloczykij, 2026-11-11).
         const __m128i d = _mm_cvttps_epi32((__m128)static_cast<__v4sf>(code));
-        const __m128i b = _mm_packus_epi16(_mm_packs_epi32(d, d), _mm_packs_epi32(d, d));
-        std::memcpy(dst, &b, 4); return;
-    } else if constexpr (std::is_same_v<T, double> && W == 2) {
-        const __m128i d = _mm_cvttpd_epi32((__m128d)static_cast<__v2df>(code));
-        const __m128i b = _mm_packus_epi16(_mm_packs_epi32(d, d), _mm_packs_epi32(d, d));
-        std::memcpy(dst, &b, 2); return;
+        const __m128i b = _mm_shuffle_epi8(d, _mm_setr_epi8(0, 4, 8, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1));
+        const int v = _mm_cvtsi128_si32(b);
+        std::memcpy(dst, &v, 4); return;
+#endif
     } else
 #endif
     stdx::static_simd_cast<bvec>(code).copy_to(dst, stdx::element_aligned);
