@@ -922,9 +922,15 @@ wloczykij sse4 (= skynet's core), differential instructions per pair, BLOSUM62 1
 affine, 1 thread, gates off, new / main (A/A 0.99-1.01): L100 int16 score 0.53, path 0.55,
 Local hard 0.61; int32 score 0.64, path 0.68; float32 score 0.65, path 0.70; L300 int16
 path 0.44. sse2: 0.51-0.77, the same order. miRNA and DNA L100 (not on this path) 0.99-1.03
-(A/A 1.00-1.03). The profile build is not separately measured (the release build is
-stripped); by count it is ~(letters used + 1) x n x W copies a group, ~6k instructions a
-pair at protein L100 int16, ~9 % of the new fill. AVX2 / AVX-512 / NEON compile and are
+(A/A 1.00-1.03); miRNA int16 re-run with 2000 pairs, 6 rounds, arms alternated: score
+new / main 0.99 (medians 4604 / 4642 instructions a pair, rounds spread +-1.5 %), path 1.00.
+Profile build cost (RelWithDebInfo `-O3 -g1`, perf record of instructions:u, L100, share of
+build / (fill + row_profile + build)): int16 path 25 %, int32 path 17 %, float32 path 15 %,
+float32 score 10 % -- about the proposal's (letters / m), the 24 BLOSUM62 letters all used.
+Long B (instructions a pair, profile with no cap / gather): L1000 float32 path 0.59, L3000
+float32 score 0.54 (its profile, ~1.2 MB, is past the 1 MiB cap, which therefore gathers
+there by default). The cap is a cache guess that instruction counts cannot settle: it needs
+a cycles crossover on a timing host (nighthaven / solace). AVX2 / AVX-512 / NEON compile and are
 untested at runtime (at W = 16 / 32 the interleaves cross 128-bit halves: gcc's lowering
 there is unexamined).
 
