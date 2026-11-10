@@ -3351,8 +3351,9 @@ entries); the fixed-end kernels are main's code (`SgPick` holds the runtime end 
 counts (wloczykij sse4, float32, 13 vs 1 passes, PYTHONHASHSEED=0, BLAS threads 1; A/A
 0.999-1.003): new / main global 0.999-1.003, glocal 0.998-1.003 (affine and linear, hard and
 score), local 0.998-1.001 except **Local linear hard 1.017-1.019, still open**: in its Pointers
-kernel the direction codes are stored lane by lane (`movd`) where main packs them (`pshufb`), a
-codegen decision of the main unit; cause not found.  Overlap (all four) / global 0.85-0.99, a_end
+kernel.  Not the code store: written out explicitly (main's cvttps2dq + pshufb at SSSE3) the
+count was unchanged (two packs instead: +1-3 % on every linear fill), so store_codes is main's
+again; the `movd` seen in the profile is the packed 4-byte store.  Cause not found.  Overlap (all four) / global 0.85-0.99, a_end
 0.99-1.04.
 
 **Tests** (`tests/Python/test_semiglobal.py`): a Python 3-state reference of the 4-flag
