@@ -236,6 +236,13 @@ inline bool threads_share_cores(int n_threads) noexcept {
 // - Thread-locals in the kernels (inter_kernel's scratch vectors, the batch's Touched)
 //   now live as long as the worker: their capacity is kept between calls, as the
 //   calling thread's always was.
+// - Address space (not memory): glibc gives each long-lived thread its own malloc arena,
+//   a 64 MB PROT_NONE reservation, so a pool of 63 workers holds 63 of them (~4 GB of
+//   VmSize; spawn-per-call reused ~31, since short threads hand arenas on).  RSS is the
+//   same (+3 MB).  It only matters under an address-space limit (ulimit -v / RLIMIT_AS):
+//   wloczykij, 64 cores, n_threads = 0 then 64 OpenBLAS threads: VmSize 7.6 GB pool vs
+//   4.3 GB spawn, which tipped an 8 GB RLIMIT_AS.  There, MALLOC_ARENA_MAX or
+//   NWGRAD_THREAD_POOL=0.
 // - Switch: NWGRAD_THREAD_POOL=0 (read once, at the first multi-threaded call) or
 //   nwgrad._tuning.set_thread_pool(False) restores spawn-per-call, for A/B.  n_threads = 1
 //   never touches the pool.
