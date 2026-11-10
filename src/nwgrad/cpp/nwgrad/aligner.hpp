@@ -4327,6 +4327,7 @@ private:
     static constexpr int  kGridBaseMinSeg = 2;
     long long grid_base_cells_ = kGridBase;     // set_grid_base (tests: small blocks)
     long grid_striped_blocks_ = 0;
+    int grid_base_w_ = 0;                       // the striped block's W, once known (per problem)
     int grid_base_min_seg_ = grid_base_min_seg_env_();   // -1: scalar always
     // NWGRAD_GRID_BASE: unset = the switch above, "scalar" = the scalar block always,
     // "striped" = the striped block at any width (one segment up) -- for measuring.
@@ -4381,6 +4382,7 @@ private:
         grid_end_ = n_;
         grid_pick_end_ = AM == AlignMode::Glocal;   // the end column comes from row m
         grid_stop_ = false;
+        grid_base_w_ = 0;
         grid_find_best_ = false; grid_empty_ = false; grid_end_i_ = -1;
         if constexpr (AM == AlignMode::Local) {
             // Every gap parameter >= 0 and a top level above the base size: the top level's
@@ -4516,6 +4518,12 @@ private:
                             const GridLine& top, const GridLine& left, int& i, int& j, int& st) {
         const auto fn = K.template of<T>().grid_base;
         if (!fn || grid_base_min_seg_ < 0) return false;
+        // Declined widths skip the call: at L3000 most base blocks are a few columns wide
+        // (the second level's lines), one segment at int16, and need no job built.  W comes
+        // from the problem's first call (grid_base_w_, reset per problem: the level may
+        // change).  No row gate: striped from 1 / 4 / 8 / 16 rows measured within 1 % at
+        // L3000 and 4-6 % worse from 16 rows at L1000 (wloczykij sse4, instructions).
+        if (grid_base_w_ > 0 && (c1 - c0 + grid_base_w_ - 1) / grid_base_w_ < grid_base_min_seg_) return false;
         GridBaseJob<T> J{};
         J.a = a_idx_.data(); J.b = b_idx_.data(); J.blk = blkT_; J.nalpha = nalpha_;
         J.go_a = static_cast<T>(params_->gap_open_a); J.ge_a = static_cast<T>(params_->gap_extend_a);
@@ -4529,6 +4537,7 @@ private:
         J.min_seg = grid_base_min_seg_;
         if (st < 0) J.last = &buf.glast3;   // the end cell's row (Glocal: its column too)
         fn(J);
+        grid_base_w_ = J.W;
         if (!J.done) return false;
         ++grid_striped_blocks_;
         const int W = J.W, seg = J.seg;
