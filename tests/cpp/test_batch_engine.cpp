@@ -233,6 +233,11 @@ void run_case(unsigned seed, const Cfg& c) {
     AlignParams plain(alpha), weighted(alpha);
     std::vector<double> weights(N);
     for (auto& w : weights) w = std::uniform_real_distribution<double>(-2, 2)(rng);
+    // Pending state first: resolving one deferred guide resolves its inter-pair group.
+    for (size_t i = 0; i < N; ++i) {
+        const bool deferred = soft && c.soft_guide == 0 && soft_guide_defer();
+        REQUIRE(eng.guide_pending(i) == (c.gd == GradMode::None || (soft && c.soft_guide == 1) || deferred));
+    }
     for (size_t i = 0; i < N; ++i) {
         INFO("full pair " << i);
         REQUIRE(eng.score_valid(i)); REQUIRE(eng.path_valid(i)); REQUIRE_FALSE(eng.path_stored(i));
@@ -242,8 +247,6 @@ void run_case(unsigned seed, const Cfg& c) {
         // p1, the params scored.  Its odd pairs stay pending past set_params(p2) below,
         // and banded_grad must band around p1's guide all the same.
         const bool deferred = soft && c.soft_guide == 0 && soft_guide_defer();
-        const bool pending = c.gd == GradMode::None || (soft && c.soft_guide == 1) || deferred;
-        REQUIRE(eng.guide_pending(i) == pending);
         if (!(soft && c.soft_guide == 1) && !(deferred && i % 2)) {
             const auto actual_guide = eng.guide_j(i);
             if (soft && c.soft_guide == 2) {
