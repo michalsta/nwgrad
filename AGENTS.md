@@ -3341,7 +3341,11 @@ linear 0.98-1.04** -- the runtime flags in the Glocal instantiation (per-row sel
 offers, the general end code) cost glocal ~3 % affine; a constexpr glocal instantiation
 would buy it back (not done).  The other ends / new global: overlap (all four) 0.85-0.97
 (cheaper: no Y chain in row 0, no X chain in column 0), a_end 0.98-1.05, a_begin+b_end
-0.98-1.05, none 0.98-1.04.
+0.98-1.05, none 0.98-1.04.  **After** a compile-time glocal copy of the striped Scores / Pointers
+kernels (`SG` template, ec5640e / follow-ups; tried and reverted for the linear and score-only
+kernels: it moved Local linear hard +2 % through the unit's inlining, and did not move the score
+kernels): glocal affine hard 1.000-1.015, global 0.987-1.014, local 0.978-1.011 (A/A 0.99-1.03);
+**open: glocal score-only still +1-3 % (affine 1.002-1.028, linear up to 1.028)**.
 
 **Tests** (`tests/Python/test_semiglobal.py`): a Python 3-state reference of the 4-flag
 DP (scores and end cells under the tie rule, exact with integer-valued parameters), itself
