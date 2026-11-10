@@ -46,10 +46,6 @@ template <class T, int W>
         _mm_storeu_si128((__m128i*)dst, _mm512_cvtepi32_epi8((__m512i)static_cast<__v16si>(code))); return;
     } else if constexpr (std::is_same_v<T, int16_t> && W == 32) {
         _mm256_storeu_si256((__m256i*)dst, _mm512_cvtepi16_epi8((__m512i)static_cast<__v32hi>(code))); return;
-    } else if constexpr (std::is_same_v<T, float> && W == 16) {
-        _mm_storeu_si128((__m128i*)dst, _mm512_cvtepi32_epi8(_mm512_cvttps_epi32((__m512)static_cast<__v16sf>(code)))); return;
-    } else if constexpr (std::is_same_v<T, double> && W == 8) {
-        _mm_storel_epi64((__m128i*)dst, _mm512_cvtepi64_epi8(_mm512_cvttpd_epi64((__m512d)static_cast<__v8df>(code)))); return;
     } else
 #elif defined(__AVX2__)
     if constexpr (std::is_same_v<T, int64_t> && W == 4) {
@@ -81,18 +77,6 @@ template <class T, int W>
     } else if constexpr (std::is_same_v<T, int16_t> && W == 8) {
         const __m128i b = _mm_packus_epi16((__m128i)static_cast<__v8hi>(code), (__m128i)static_cast<__v8hi>(code));
         _mm_storel_epi64((__m128i*)dst, b); return;
-#if defined(__SSSE3__)
-    } else if constexpr (std::is_same_v<T, float> && W == 4) {
-        // Floating codes at sse4: the truncating convert and one byte shuffle, written out --
-        // the form gcc reached for std::simd's cast on main.  Left to the cast, gcc chose the
-        // packing per unit (inlining-dependent): with the semi-global kernels added to the
-        // level it packed the Local linear codes otherwise, +5 % on that kernel; two packs
-        // instead of the shuffle cost the linear fills 1-3 % (wloczykij, 2026-11-11).
-        const __m128i d = _mm_cvttps_epi32((__m128)static_cast<__v4sf>(code));
-        const __m128i b = _mm_shuffle_epi8(d, _mm_setr_epi8(0, 4, 8, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1));
-        const int v = _mm_cvtsi128_si32(b);
-        std::memcpy(dst, &v, 4); return;
-#endif
     } else
 #endif
     stdx::static_simd_cast<bvec>(code).copy_to(dst, stdx::element_aligned);
