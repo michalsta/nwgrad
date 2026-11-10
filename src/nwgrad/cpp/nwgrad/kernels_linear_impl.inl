@@ -81,6 +81,21 @@ static inline void striped_row_best1(const T* cH, const T* pad, int seg, int i,
     best = rmax; bi = i; bj = l * seg + s + 1;
 }
 
+// SgPick (kernels_impl.inl) over H alone (X = Y = -inf): row ci's end candidates.
+template <class T, bool Sat>
+struct SgPick1 : SgPick<T, Sat> {
+    void row1(int ci, const T* rH, T ninf) noexcept {
+        if (ci == this->m && (this->sg & kSgFreeBEnd)) {   // row m whole: column 0, then H's striped columns
+            this->offer(this->m, 0, rH[0], ninf, ninf);
+            if (this->seg > 0) striped_row_best1<T, Sat>(rH + this->off, this->pad, this->seg, ci,
+                                                         *this->best, *this->bi, *this->bj);
+        } else if (ci == this->m || (this->sg & kSgFreeAEnd)) {
+            this->offer(ci, this->n, rH[this->coln], ninf, ninf);
+        }
+    }
+};
+template <bool SGX, class T, bool Sat> using SgPick1For = std::conditional_t<SGX, SgPick1<T, Sat>, SgNoPick>;
+
 // Ptr: record direction bytes (TracebackMode::Pointers) on rolling rows; else the H table.
 // Tr: a tracked problem (job.tr): each row's extends, border and profile row from the
 // track arrays, in the same expressions, so equal sets give the untracked table.
@@ -179,23 +194,16 @@ static void striped_linear_full(ViterbiJob<T>& job) {
     const T* pad = (Local || Glocal) ? striped_pad_into<T, Sat>(rows + 2 * rs, n, seg, W) : nullptr;
     // Runtime ends (SGX): SgPick (kernels_impl.inl) over H alone (X = Y = -inf), so the
     // fixed-end instantiations keep main's code.
-    [[maybe_unused]] SgPickFor<SGX, T, Sat> pick{};
+    // No lambda here: an unused [&] closure over best_local / best_i / best_j, even in the
+    // fixed-end instantiations that never call it, moved gcc's code for Local linear
+    // Pointers (+5 % instructions in the kernel, +1.8 % on the path; wloczykij sse4,
+    // 2026-11-10), as the affine kernels' lambdas had (see SgPick).
+    [[maybe_unused]] SgPick1For<SGX, T, Sat> pick{};
     [[maybe_unused]] int best_tbl = 0;
-    auto pick_row = [&](int ci, const T* rH) {
-        if constexpr (SGX) {
-            if (ci == m && (sg & kSgFreeBEnd)) {   // row m whole: column 0, then H's striped columns
-                pick.offer(m, 0, rH[0], K_NINF, K_NINF);
-                if (seg > 0) striped_row_best1<T, Sat>(rH + off, pad, seg, ci, best_local, best_i, best_j);
-            } else if (ci == m || (sg & kSgFreeAEnd)) {
-                pick.offer(ci, n, rH[pick.coln], K_NINF, K_NINF);
-            }
-        }
-        (void)ci; (void)rH;
-    };
     if constexpr (SGX) {
-        pick = SgPick<T, Sat>{sg, m, n, seg, off, (n == 0) ? 0 : off + scol(n), pad,
-                              &best_local, &best_i, &best_j, &best_tbl};
-        pick_row(0, pH);   // row 0 (row m when m == 0)
+        pick = SgPick1<T, Sat>{{sg, m, n, seg, off, (n == 0) ? 0 : off + scol(n), pad,
+                                &best_local, &best_i, &best_j, &best_tbl}};
+        pick.row1(0, pH, K_NINF);   // row 0 (row m when m == 0)
     }
 
     for (int i = 1; i <= m; ++i) {
@@ -348,7 +356,7 @@ static void striped_linear_full(ViterbiJob<T>& job) {
                 best_local = cH[0]; best_i = m; best_j = 0;
                 if (seg > 0) striped_row_best1<T, Sat>(cH + off, pad, seg, i, best_local, best_i, best_j);
             }
-        if constexpr (SGX) pick_row(i, cH);   // column n of rows < m, row m
+        if constexpr (SGX) pick.row1(i, cH, K_NINF);   // column n of rows < m, row m
 
         if constexpr (Ptr) std::swap(pH, cH);
         else { pH = cH; cH += hstride; }
