@@ -1132,7 +1132,8 @@ scalar_fallback / sse2 / sse4, the Python suite (5505), `tools/fuzz_ab.py` main 
 seeds, 0 differ) and an int16/int32/int64/float32/double x Global/Local/Glocal x level x fill A/B
 of linear score-only batches against main (400 seeds, 36000 batches, every score's bytes equal).
 Two mutations (lazy-F one round; the lane carry-in dropped) fail 3 of the 5 `[score]` cases.
-`NWGRAD_SCORE_LINEAR=affine` runs the old route (an A/B switch in one binary).
+`NWGRAD_SCORE_LINEAR=affine` runs the old route (an A/B switch in one binary; `onerow` the new
+one at every length, past the gate below).
 Measured (skynet sse4, 1 thread, `fill="striped"` batches, `perf stat instructions:u` differenced
 between 1 and 4 repetitions, so per cell of the kernel; protein BLOSUM62 0/4, DNA +2/-4 0/2, 20 %
 mutated homologues; new / old instructions, A/A of the new arm 1.00 on every row):
@@ -1150,6 +1151,21 @@ inner loop at sse4 is 32 instructions per two segments (16 a vector cell, 4 a ce
 vector cell for the D/X form. First tried: the integer form with pass 2 kept (the D/X kernel's
 shape, three rows): only 0.92-0.93 of the old instructions; dropping pass 2 gave the rest. NEON,
 AVX2 and AVX-512 compile, untested at runtime (skynet cannot run them).
+
+**Linear score-only gate (branch `proto/gate-fixes`, 2026-11-10).** 56f4d3e sent every linear
+score-only call to the one-row kernel, ungated, and on the M1 it loses in three windows (spot,
+1 thread, affine-route / one-row time, results/spot.md "Round 2"): int16 Global at B 81-104
+(11-13 segments of 8 lanes; L100 DNA / protein 0.940 / 0.945, L70 and L150 win 1.2-1.3x),
+double at short B (Global L50 0.92 / 0.99, L70 0.89 / 0.96; Local L50 0.91 / 0.95; miRNA 22 x
+50 0.92), float32 Local DNA L100 0.940 (protein 1.00). `Aligner::linear_score_one_row`
+routes those B lengths (`kLinScoreAffineNeon`: int16 Global / Glocal n 81-104, float32 Local
+n 81-104, double Global / Glocal n < 80, Local n < 60) through the zero-open affine kernel on
+AArch64; bit-identical either way. x86 stays one-row everywhere: wloczykij sse4,
+`instructions:u` affine-route / one-row, 1 thread, BLAS pinned, A/A 0.997-1.002, L50-L300
+DNA and protein, Global and Local: int16 1.31-1.81, float32 1.29-1.69 (DNA Global and the
+miRNA cells 1.00: the shared fill takes them), double 1.43-1.72, miRNA double 1.51 / 1.59 --
+no window at all, so the M1's is microarchitectural. AVX2 / AVX-512 timing pending
+(nighthaven, solace). `NWGRAD_SCORE_LINEAR` = `affine` / `onerow` forces either route.
 
 ### Grid traceback: `traceback="grid"` (branch `cc/grid-traceback`, 2026-10-26)
 

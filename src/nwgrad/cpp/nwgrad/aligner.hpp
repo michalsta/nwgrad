@@ -940,7 +940,7 @@ struct Aligner {
                     job.ge_b = static_cast<T>(params_->gap_extend_b);
                     job.local = AM == AlignMode::Local ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
                     job.variant = score_variant_env();
-                    job.linear = lin && score_linear_env();
+                    job.linear = lin && linear_score_one_row(backend, n_);
                     job.buf = &buf;
                     if (tr_) fill_track_job_(job.tr, true, static_cast<size_t>(n_) + 16, lin);
                     fn(job);
@@ -4579,14 +4579,47 @@ private:
         return v;
     }
 
-    // NWGRAD_SCORE_LINEAR=affine: linear gaps through the affine D/X kernel with zero opens
-    // (the form before score_linear_striped; for measuring it in one binary).
-    static bool score_linear_env() {
-        static const bool on = [] {
+    // NWGRAD_SCORE_LINEAR: unset = the per-level gate (linear_score_one_row), "affine" =
+    // always the affine D/X kernel with zero opens (the form before score_linear_striped),
+    // "onerow" = always score_linear_striped -- for measuring both in one binary.
+    // 0 / 1 / 2 = gate / affine / onerow.
+    static int score_linear_env() {
+        static const int v = [] {
             const char* e = std::getenv("NWGRAD_SCORE_LINEAR");
-            return !(e && std::string_view(e) == "affine");
+            if (!e) return 0;
+            const std::string_view s(e);
+            return s == "affine" ? 1 : s == "onerow" ? 2 : 0;
         }();
-        return on;
+        return v;
+    }
+    // Linear score-only: the B lengths [lo, hi] at which the zero-open affine kernel beats
+    // the one-row kernel (score_linear_striped) on a level; elsewhere one-row.  Both give the
+    // same score bit for bit, so this moves speed only.  NEON (spot, M1, 1 thread, 2026-11-10,
+    // results/spot.md "Round 2", affine-route time / one-row time, 20 %-mutated L x L pairs
+    // and miRNA 22 x 50, control 0.995-1.019):
+    // - int16 Global, n 81-104 (11-13 segments of 8 lanes): L100 DNA / protein 0.940 / 0.945;
+    //   L70 1.21-1.23 and L150 1.32-1.34 win, as int16 Local does at every length.
+    // - double Global n < 80: L50 0.921 / 0.987, L70 0.891 / 0.963, miRNA 22 x 50 0.92;
+    //   L100 1.07-1.09.  double Local n < 60: L50 0.912 / 0.946, miRNA 0.92; L70 1.08-1.09.
+    // - float32 Local n 81-104: L100 DNA 0.940 / protein 1.00 (L70 DNA 0.984 / protein 1.04
+    //   and L150 1.07-1.09 stay one-row).  float32 Global is flat (1.00-1.04).
+    // Glocal takes Global's windows (unmeasured).  x86: one-row at every length; see
+    // AGENTS.md "Linear score-only gate" for the sse4 counts (AVX2 / AVX-512 pending).
+    struct NSpan { int lo, hi; };
+    static constexpr NSpan kLinScoreAffineNeon =
+        std::is_same_v<T, int16_t> ? (AM == AlignMode::Local ? NSpan{1, 0} : NSpan{81, 104})
+        : std::is_same_v<T, float> ? (AM == AlignMode::Local ? NSpan{81, 104} : NSpan{1, 0})
+        : std::is_same_v<T, double> ? (AM == AlignMode::Local ? NSpan{0, 59} : NSpan{0, 79})
+                                    : NSpan{1, 0};
+    static bool linear_score_one_row(int backend, int n) noexcept {
+        if (const int e = score_linear_env()) return e == 2;
+        (void)backend;
+#if defined(__aarch64__) || defined(_M_ARM64)
+        return !(n >= kLinScoreAffineNeon.lo && n <= kLinScoreAffineNeon.hi);
+#else
+        (void)n;
+        return true;
+#endif
     }
 
     double score_affine_scalar(DpBuffer& buf) const {
