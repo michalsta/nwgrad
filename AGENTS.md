@@ -3047,6 +3047,9 @@ B = default, A'/A 0.97-1.04): the overflowing cells now cost 1.01-1.03 (protein 
 rel affine 1.02 / linear 1.02, DNA L300 Local rel 1.01, protein L1000 linear Local rand
 1.02), the gains hold (DNA L300 Local rand 0.33, int32 DNA L100 Local rel 0.80, miRNA Local
 affine 0.78 / linear 0.82), miRNA Global 1.01 (not tried).
+With the predictor in place of the back-off (wloczykij, A'/A 0.99-1.01): protein L100 Local
+rel affine 1.00 / linear 0.99, DNA L300 Local rel 1.00 (A' 1.007), protein L1000 linear
+Local rand 1.01 (A' 1.00); DNA L300 Local rand 0.33, miRNA Local affine 0.79.
 
 ### The soft path: scaled probability space (2026-10-05)
 
