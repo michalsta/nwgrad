@@ -752,6 +752,17 @@ inline constexpr bool kSoftCkptByDefault = false;
 // from 22 x 80 for double and int32 on AVX2 (the own kernel's single profile row wins once
 // B is long), and in Local mode sooner than in Global, so they are per mode; the shared
 // linear fill of int64 loses at SSE and NEON at every length.
+// float32 Global over up to 8 letters had NO cap on SSE, AVX2 and NEON: the sweep that set it
+// ran 22 x L pairs (to 22 x 200), and every long pair-sized score-only call then took the
+// shared fill.  On the M1 (spot, 2026-11-10, 1 thread, DNA L x L) striped / default time was
+// linear 0.62 / 0.59 / 0.38 at L1000 / 2000 / 3000, affine 0.78 / 0.68 / 0.64.  sse4
+// (wloczykij, instructions:u, striped / shared): linear L100 1.08, L150 1.00, L200 0.95,
+// L500 0.85, L1000-3000 0.82-0.80; affine L500 1.06, L700 1.00, L1000 0.99, L2000 0.91,
+// L3000 0.89; short A keeps the shared fill (22 x 200-3000 striped 1.19-1.52, 40 x 3000
+// linear 1.03 / affine 1.21).  Caps: SSE 10^6 cells (L1000 on, where both gap models stop
+// losing in instructions); NEON 250000 (L500 on; the M1's gap is 1.3-2.6x where sse4 counts
+// 1.0-1.2x, so its crossover sits earlier -- L300-700 unmeasured there).  AVX2 pending
+// nighthaven; AVX-512 keeps its measured 40000000.
 // One thread, alphabets of up to 8 letters (2026-11-04): the integers' small one-thread
 // budgets above come from protein, whose shared fill gathers; DNA's mask-blend fill wins
 // alone through L400 on AVX2 (15 MB of affine tables; L600, 34 MB, loses) and L300 on
@@ -804,7 +815,7 @@ struct GateLevelCaps {
 };
 inline constexpr uint32_t kGateNoCap = 0xFFFFFFFFu;
 //                                          score_aff  score_lin  lin_gather  group_kb  group_kb_1   small_loc  small_glob   lin_small  score_aff_g score_lin_g  score_aff_1 score_aff_g1
-inline constexpr GateLevelCaps kGateCapsSse    { {       6600,     1700,      20000,     3072,      12288,       1900, kGateNoCap, kGateNoCap,       6600,       3800,       6600,       6600 },   // float32
+inline constexpr GateLevelCaps kGateCapsSse    { {       6600,     1700,      20000,     3072,      12288,       1900,    1000000, kGateNoCap,       6600,       3800,       6600,       6600 },   // float32
                                                  {          0,        0,       8000,     3072,      12288,          0,       1200, kGateNoCap,          0,          0,       1700,       1700 },   // double
                                                  {          0,     1700,       4000,     1024,       1024,       1900,       1900, kGateNoCap,          0,       1700,          0,          0 },   // int16
                                                  {          0,     3800, kGateNoCap,     3072,      12288,       1200,        800, kGateNoCap,          0,       1700,       1700,       1700 },   // int32 (its own linear fill is slow at W=4: shared to L400)
@@ -825,7 +836,7 @@ inline constexpr GateLevelCaps kGateCapsAvx512 { {     520000,    31000,      33
                                                  {       1700,     3800,       6600,     1500,       2048,       4700, kGateNoCap, kGateNoCap,       1700,       3800,       1700,       1700 },
                                                  3072, 8192, 20000,
                                                  { 7000, 10000, 1000, 7000 }, { 5000, 5000, 0, 0 }, 16384 };
-inline constexpr GateLevelCaps kGateCapsNeon   { {      10300,     1700,       8000,     5120,      12288,       2800, kGateNoCap, kGateNoCap,      14700,      10300,      10300,      14700 },
+inline constexpr GateLevelCaps kGateCapsNeon   { {      10300,     1700,       8000,     5120,      12288,       2800,     250000, kGateNoCap,      14700,      10300,      10300,      14700 },
                                                  {          0,        0,       3000,     3072,      12288,        800,       1900, kGateNoCap,          0,          0,          0,          0 },
                                                  {       1700,     1700,       8000,     3072,       1400,       4700,       4700, kGateNoCap,       1700,       1700,       1700,       1700 },
                                                  {       1700,     1700,       8000,     4608,       6144,       4700,       4700, kGateNoCap,       1700,       1700,       1700,       1700 },

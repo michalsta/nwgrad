@@ -2740,6 +2740,18 @@ slower than the better arm, up to 2.65x. What the data said, gate by gate:
   gather caps stay one value per gap model. And the shared LINEAR hard fill of int64 over
   small alphabets loses at SSE (sse4 1.06-1.2, sse2 2-2.5x) and on the M1 (1.15-1.34):
   `linear_small` = 0 there, no cap elsewhere.
+- **float32 Global over small alphabets had no cap** (`score_small_global` = kGateNoCap on
+  SSE, AVX2 and NEON; fixed on branch `proto/gate-fixes`, 2026-11-10): the sweep above ran 22 x L
+  pairs only, so every long DNA float32 Global score-only call took the shared fill
+  (`fill="interpair"`'s speed). The M1 (spot, 1 thread, L x L): striped / default time linear
+  0.62 / 0.59 / 0.38 at L1000 / 2000 / 3000, affine 0.78 / 0.68 / 0.64; 7c69934's inter-lookup
+  made that fill erratic at L >= 2000 (L3000 linear 1.52x 9845e77). sse4 (wloczykij,
+  `instructions:u`, striped / shared, A/A 0.999-1.003): linear L100 1.08, L150 1.00, L200 0.95,
+  L500 0.85, L1000-3000 0.82-0.80; affine L500 1.06, L700 1.00, L1000 0.99, L2000 0.91, L3000
+  0.89; short A stays shared (22 x 200-3000 linear 1.19-1.33, affine 1.39-1.52; 40 x 3000 1.03 /
+  1.21; 100 x 1000 linear 0.91, affine 1.15). Caps now: SSE 10^6 cells (L1000 on), NEON 250000
+  (L500 on; the M1's gap is far larger than sse4's instruction gap, so its crossover is earlier;
+  L300-700 there unmeasured). AVX2 pending nighthaven; AVX-512 keeps its measured 4 x 10^7.
 - **The linear hard gather caps (`inter_linear_*_gather_cells`, `inter_global_linear_*`).**
   The integer caps (15000 / 6000 cells) were too high: int16 and int32 cross at L60-80
   (4000 cells) on every x86 level, int64 at L40-60 on AVX2 (2500; solace's avx2 run has
