@@ -3040,6 +3040,11 @@ int32 narrowed (A: int32 -> int16, B: int32 -> int8): DNA L100 L rel 0.80, DNA L
 L 0.83.  Read: int8 halves the instructions where the Local score stays below 127; an
 overflowing pair costs its int8 run (1.06-2.0x), and Global / Glocal lose outright (lazy-F
 across every lane, every row).  Hence the default: Local only, with the back-off.
+With the default (wloczykij, the same sse4 core, instructions per pair, A = NWGRAD_INT8=0,
+B = default, A'/A 0.97-1.04): the overflowing cells now cost 1.01-1.03 (protein L100 Local
+rel affine 1.02 / linear 1.02, DNA L300 Local rel 1.01, protein L1000 linear Local rand
+1.02), the gains hold (DNA L300 Local rand 0.33, int32 DNA L100 Local rel 0.80, miRNA Local
+affine 0.78 / linear 0.82), miRNA Global 1.01 (not tried).
 
 ### The soft path: scaled probability space (2026-10-05)
 
