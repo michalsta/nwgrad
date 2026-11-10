@@ -3333,6 +3333,16 @@ wrapping arithmetic).  **Gated** for ends other than glocal's: Grid and the Hirs
 (`uses_rowwise_full`), the inter-pair fills, hard and soft (`BatchEngine::inter_fill_()`),
 guide bands (`check_problem` throws).
 
+**Measured** (wloczykij, sse4, float32, own striped fill, traceback pointers, 1 thread;
+`instructions:u` of 3 passes, protein BLOSUM62 11/1 and DNA +2/-4 4/2, L100 / 300 / 1000;
+A/A control base vs base 0.97-1.03, one outlier cell 0.66).  new / main: global 0.990-1.018
+and local 0.994-1.012, i.e. unchanged; **glocal affine +1.4-3.6 % (hard and score-only),
+linear 0.98-1.04** -- the runtime flags in the Glocal instantiation (per-row selects and
+offers, the general end code) cost glocal ~3 % affine; a constexpr glocal instantiation
+would buy it back (not done).  The other ends / new global: overlap (all four) 0.85-0.97
+(cheaper: no Y chain in row 0, no X chain in column 0), a_end 0.98-1.05, a_begin+b_end
+0.98-1.05, none 0.98-1.04.
+
 **Tests** (`tests/Python/test_semiglobal.py`): a Python 3-state reference of the 4-flag
 DP (scores and end cells under the tie rule, exact with integer-valued parameters), itself
 checked against Biopython's PairwiseAligner with zero end-gap scores (an independent
