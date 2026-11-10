@@ -46,6 +46,10 @@ template <class T, int W>
         _mm_storeu_si128((__m128i*)dst, _mm512_cvtepi32_epi8((__m512i)static_cast<__v16si>(code))); return;
     } else if constexpr (std::is_same_v<T, int16_t> && W == 32) {
         _mm256_storeu_si256((__m256i*)dst, _mm512_cvtepi16_epi8((__m512i)static_cast<__v32hi>(code))); return;
+    } else if constexpr (std::is_same_v<T, float> && W == 16) {
+        _mm_storeu_si128((__m128i*)dst, _mm512_cvtepi32_epi8(_mm512_cvttps_epi32((__m512)static_cast<__v16sf>(code)))); return;
+    } else if constexpr (std::is_same_v<T, double> && W == 8) {
+        _mm_storel_epi64((__m128i*)dst, _mm512_cvtepi64_epi8(_mm512_cvttpd_epi64((__m512d)static_cast<__v8df>(code)))); return;
     } else
 #elif defined(__AVX2__)
     if constexpr (std::is_same_v<T, int64_t> && W == 4) {
@@ -64,6 +68,16 @@ template <class T, int W>
         const __m256i b = _mm256_packus_epi16((__m256i)static_cast<__v16hi>(code), (__m256i)static_cast<__v16hi>(code));
         const __m256i p = _mm256_permute4x64_epi64(b, 0x08);
         _mm_storeu_si128((__m128i*)dst, _mm256_castsi256_si128(p)); return;
+    } else if constexpr (std::is_same_v<T, float> && W == 8) {
+        const __m256i d = _mm256_cvttps_epi32((__m256)static_cast<__v8sf>(code));
+        const __m256i w = _mm256_packus_epi32(d, d);
+        const __m256i p = _mm256_permute4x64_epi64(w, 0x08);
+        const __m128i b = _mm_packus_epi16(_mm256_castsi256_si128(p), _mm256_castsi256_si128(p));
+        _mm_storel_epi64((__m128i*)dst, b); return;
+    } else if constexpr (std::is_same_v<T, double> && W == 4) {
+        const __m128i d = _mm256_cvttpd_epi32((__m256d)static_cast<__v4df>(code));
+        const __m128i b = _mm_packus_epi16(_mm_packs_epi32(d, d), _mm_packs_epi32(d, d));
+        std::memcpy(dst, &b, 4); return;
     } else
 #elif defined(__SSE2__)
     if constexpr (std::is_same_v<T, int64_t> && W == 2) {
@@ -77,6 +91,18 @@ template <class T, int W>
     } else if constexpr (std::is_same_v<T, int16_t> && W == 8) {
         const __m128i b = _mm_packus_epi16((__m128i)static_cast<__v8hi>(code), (__m128i)static_cast<__v8hi>(code));
         _mm_storel_epi64((__m128i*)dst, b); return;
+    } else if constexpr (std::is_same_v<T, float> && W == 4) {
+        // Floating codes: an explicit truncating convert and two packs.  Through std::simd's
+        // cast, gcc chose the packing per unit (inlining-dependent): with the semi-global
+        // kernels added to the level it stored the Local linear codes lane by lane, +5 % on
+        // that kernel (wloczykij sse4, 2026-11-11).
+        const __m128i d = _mm_cvttps_epi32((__m128)static_cast<__v4sf>(code));
+        const __m128i b = _mm_packus_epi16(_mm_packs_epi32(d, d), _mm_packs_epi32(d, d));
+        std::memcpy(dst, &b, 4); return;
+    } else if constexpr (std::is_same_v<T, double> && W == 2) {
+        const __m128i d = _mm_cvttpd_epi32((__m128d)static_cast<__v2df>(code));
+        const __m128i b = _mm_packus_epi16(_mm_packs_epi32(d, d), _mm_packs_epi32(d, d));
+        std::memcpy(dst, &b, 2); return;
     } else
 #endif
     stdx::static_simd_cast<bvec>(code).copy_to(dst, stdx::element_aligned);
