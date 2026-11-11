@@ -2948,7 +2948,11 @@ private:
     // lanes is slow -- forced grid / pointers 1.70-1.85 at L700, the branch's auto 1.6-1.8x
     // main's at L1000-L1500, DNA and protein, 1 and 8 threads; Pointers stays until the Grid
     // base block changes); sse2 / sse4 1000 (the instruction counts above favour Grid from
-    // hb_cutoff, but no wall-clock below L1000: the conservative floor).
+    // hb_cutoff, but no wall-clock below L1000: the conservative floor).  AVX2 disagrees across
+    // cores: solace forced to AVX2 (Tiger Lake, 16 lanes) had Grid 1.08-1.19x Pointers at
+    // L1000-L1500, 1 thread, where nighthaven (Alder Lake, the primary target) had Grid 3-9 %
+    // faster at 1 and 6 threads; a level constant cannot tell them apart and a Tiger Lake runs
+    // the AVX-512 level anyway, so AVX2 follows nighthaven.
     static constexpr int kLocalGridMinRowsI16Avx2 = 1000, kLocalGridMinRowsI16Neon = 700,
                          kLocalGridMinRowsI16Sse = 1000, kLocalGridOff = std::numeric_limits<int>::max();
     static int local_grid_min_rows(int backend) noexcept {
