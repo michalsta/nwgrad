@@ -46,7 +46,8 @@ pairs and batches) run the narrowest lanes that are provably exact:
 An int8 run that overflows is wasted work (a Local run stops at the row where it reaches
 127), so a thread tries the int8 tier only when its previous Local problem of the same
 type scored below 127 (the wide kernel's score tells exactly whether int8 would have held). Switches, process-wide: `NWGRAD_INT8`
-or `_tuning.set_gate("score_int8", v)`: 0 off, 1 Local with back-off (default), 2 every
+or `_tuning.set_gate("score_int8", v)`: 0 off, 1 Local with the predictor (the default on x86; AArch64 defaults to 0, where the
+int8 kernel measured slower than int16 even on pairs that fit), 2 every
 mode and every problem; `NWGRAD_INT_NARROW=0` turns off all narrowing, the int8 tier included.
 Results never change, only speed. The batch's shared inter-pair score kernel (short pairs)
 has no int8 form; those pairs run at their own type.

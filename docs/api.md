@@ -529,7 +529,7 @@ float64 one, bit for bit. See [Precision](tuning.md#integer-types).
 | `_int8` / `*Int8` | score-only: int8 where provably exact, else int16; paths and gradients: int16 | integers within ±127 (`ValueError` otherwise) | as int16 |
 
 The int8 names are int16 with the parameter range checked up front: score-only work
-runs the int8 kernel first (Local, by default) and re-runs at int16 whenever it cannot prove its result (a
+runs the int8 kernel first (Local by default on x86; off by default on AArch64) and re-runs at int16 whenever it cannot prove its result (a
 Local score reaching 127; Global / Glocal see [Precision](tuning.md#integer-types)), so
 the score is the int16 one either way; paths, guides and hard gradients are computed at
 int16 (there is no int8 traceback). They take the same arguments as the int16 names,

@@ -3004,7 +3004,9 @@ so a saturated value never leaks and the score is the int16 / int32 integer bit 
   passes the test, every other V <= S <= max.
 - **Preconditions** (else int16 directly): params within +-127, gaps >= 0, go + ge <= 127
   per side, m, n >= 1.
-- **Gate** `score_int8` / `NWGRAD_INT8`: 0 off, 1 Local only with a per-thread predictor
+- **Gate** `score_int8` / `NWGRAD_INT8`: 0 off (the AArch64 default: spot, M1, lost on every
+  cell but DNA L1000 unrelated affine, unrelated DNA L100 1.26-1.35, protein L300 1.41-1.75),
+  1 (the x86 default) Local only with a per-thread predictor
   (try int8 only if the previous Local problem of this type, on this thread, scored < 127 --
   the wide kernel's score answers it exactly; it replaced a geometric back-off, skip 1, 3,
   ... 63 after an overflow, which left the overflowing cells at 1.01-1.03), 2 every mode,
@@ -3022,7 +3024,8 @@ so a saturated value never leaks and the score is the int16 / int32 integer bit 
   int8 run of a group after one where over half the lanes failed.  Preconditions: untracked,
   <= 8 letters, the int8 parameter limits above, both lengths <= 127 (int8 lane compares);
   groups under int16's score caps.  Gate `inter_score_int8` / `NWGRAD_INTER_INT8`: 0 off,
-  1 (default) and 2 every mode.  wloczykij sse4, miRNA 22 x 50, instructions per pair on /
+  1 (the x86 default; 0 is the AArch64 default, untimed there and the per-pair int8 kernel
+  lost on spot) and 2 every mode.  wloczykij sse4, miRNA 22 x 50, instructions per pair on /
   off (A/A 0.91-1.07): int16 0.47-0.61, int32 0.22-0.28 in every mode and gap model;
   all-overflowing cells 0.99-1.015 with the predictor (1.22-1.51 without).
 - **The small-alphabet score cap** (`inter_score_ok`, `score_small_local` / `_global`) has

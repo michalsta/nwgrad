@@ -2860,7 +2860,9 @@ private:
     // Global / Local / Glocal 0.51-0.53 / 0.47-0.49 / 0.48-0.54, linear 0.48-0.61; int32
     // 0.22-0.28.  Where every lane overflows (Local match 8; Global unrelated, go 10 /
     // ge 3), the predictor keeps it at 0.99-1.015 (1.22-1.51 without one).
-    static constexpr bool kInter8Default = true;
+    // AArch64: off, as the per-pair int8 tier (kScoreInt8Default): that kernel lost to int16 on
+    // spot (M1) and this one is untimed there.
+    static constexpr bool kInter8Default = kInterScoreInt8Default;
     // plan8_ for this call (rebuilt when PL or the length bound changed), or nullptr.
     const Inter8Plan* ensure_plan8_(const InterPlan& PL, Inter8Call& c) {
         if (!inter8_call_(PL, c)) return nullptr;

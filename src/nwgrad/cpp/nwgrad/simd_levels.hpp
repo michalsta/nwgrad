@@ -703,11 +703,23 @@ inline bool soft_double_ftz() noexcept {
 // target (22 x 50, the case short enough for their G <= 126 precondition) ran 2.2x the
 // int16 instructions (skynet sse4, 2026-11-07).  NWGRAD_INT_NARROW=0 turns it off too
 // (every narrowing).  The gate wins over the environment.
+// The default (neither the gate nor NWGRAD_INT8 set): 1 on x86; 0 on AArch64, where the int8
+// kernel lost to int16 even on pairs that fit (spot, M1, 44a8679, Local score-only, best of
+// 5, controls 0.995-1.002: unrelated DNA L100 1.26 / 1.35 affine / linear, L300 1.11 / 1.70,
+// protein L300 1.41 / 1.75; only DNA L1000 affine 0.91).
+#if defined(__aarch64__) || defined(_M_ARM64)
+inline constexpr int kScoreInt8Default = 0;
+inline constexpr bool kInterScoreInt8Default = false;   // the batch's inter-pair int8 tier (untimed there)
+#else
+inline constexpr int kScoreInt8Default = 1;
+inline constexpr bool kInterScoreInt8Default = true;
+#endif
 inline int score_int8_mode() noexcept {
     const int64_t o = gate_override(Gate::ScoreInt8);
     if (o >= 0) return o >= 2 ? 2 : static_cast<int>(o);
     static const int64_t v = env_nonneg_int("NWGRAD_INT8");
-    return v < 0 ? 1 : v >= 2 ? 2 : static_cast<int>(v);
+    if (v >= 0) return v >= 2 ? 2 : static_cast<int>(v);
+    return kScoreInt8Default;
 }
 // Counters of the int8 tier (problems run, of which overflowed), for the tests; counted
 // only while switched on (score8_count_on()), so a production run pays one relaxed load.
