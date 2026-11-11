@@ -3004,7 +3004,9 @@ so a saturated value never leaks and the score is the int16 / int32 integer bit 
   passes the test, every other V <= S <= max.
 - **Preconditions** (else int16 directly): params within +-127, gaps >= 0, go + ge <= 127
   per side, m, n >= 1.
-- **Gate** `score_int8` / `NWGRAD_INT8`: 0 off, 1 Local only with a per-thread predictor
+- **Gate** `score_int8` / `NWGRAD_INT8`: 0 off (the AArch64 default: spot, M1, lost on every
+  cell but DNA L1000 unrelated affine, unrelated DNA L100 1.26-1.35, protein L300 1.41-1.75),
+  1 (the x86 default) Local only with a per-thread predictor
   (try int8 only if the previous Local problem of this type, on this thread, scored < 127 --
   the wide kernel's score answers it exactly; it replaced a geometric back-off, skip 1, 3,
   ... 63 after an overflow, which left the overflowing cells at 1.01-1.03), 2 every mode,

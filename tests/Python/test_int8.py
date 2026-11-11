@@ -8,6 +8,8 @@ and problems straddling both overflow tests (a Local score of 127; Global / Gloc
 score > G - 128 and G <= 126).  The tier's counters (_score8_stats) show it really ran and
 really overflowed, so neither branch passes vacuously.
 """
+import platform
+
 import numpy as np
 import pytest
 
@@ -17,6 +19,8 @@ from nwgrad import nwgrad_ext as E
 
 DNA = "ACGT"
 MODES = ["global", "local", "glocal"]
+# The tier's default: on for Local on x86, off on AArch64 (simd_levels.hpp, kScoreInt8Default).
+DEFAULT_ON = platform.machine().lower() not in ("aarch64", "arm64")
 SCORE_FN = {("linear", "global"): "nw_score", ("linear", "local"): "sw_score",
             ("linear", "glocal"): "glocal_score", ("affine", "global"): "nw_score_affine",
             ("affine", "local"): "sw_score_affine", ("affine", "glocal"): "glocal_score_affine"}
@@ -147,7 +151,7 @@ def test_narrow_off_disables_the_tier():
     code = ("import nwgrad, numpy as np; from nwgrad import nwgrad_ext as E; E._score8_stats(True, True);"
             "p = nwgrad.AlignParams(nwgrad.SubstMatrix(np.where(np.eye(4, dtype=bool), 2.0, -1.0), alphabet='ACGT'), 2.0, 1.0, 2.0, 1.0);"
             "s = nwgrad.sw_score_int32('ACGTAC', 'ACGTTC', p); print(int(s), E._score8_stats()[0])")
-    for env, runs in (({"NWGRAD_INT_NARROW": "0"}, 0), ({"NWGRAD_INT8": "0"}, 0), ({}, 1)):
+    for env, runs in (({"NWGRAD_INT_NARROW": "0"}, 0), ({"NWGRAD_INT8": "0"}, 0), ({}, int(DEFAULT_ON))):
         e = dict(os.environ, **env)
         out = subprocess.run([sys.executable, "-c", code], env=e, capture_output=True, text=True, check=True).stdout.split()
         if nwgrad.get_isa_level() != "scalar_fallback":
@@ -191,6 +195,8 @@ def test_int8_pairs_and_batches():
 
 
 def test_default_mode_is_local_with_a_predictor():
+    if not DEFAULT_ON:
+        pytest.skip("the int8 tier is off by default on AArch64")
     m = np.where(np.eye(4, dtype=bool), 2.0, -2.0)
     p = nwgrad.AlignParams(nwgrad.SubstMatrix(m, alphabet=DNA), 2.0, 1.0, 2.0, 1.0)
     a = "ACGTTGCA" * 4
