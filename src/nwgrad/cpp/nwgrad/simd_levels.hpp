@@ -392,12 +392,17 @@ struct HbBaseJob {
 // bit-identical to the scalar float fill.
 // Alphabets over 8 letters (the gather lookup, inter_kernel_impl.inl): the cap on the bytes
 // of the per-lane query profile a group builds once (InterCommon::build_profile), past
-// which the rows are gathered lane-cell by lane-cell as before.  Unmeasured as a
-// crossover: the profile is W x (letters used) x n values (BLOSUM62 L100 int16 at W = 8:
-// ~32 KB), read W contiguous rows a DP row; the cap keeps it within an L2 (1 MiB: about
-// L1300 at int16 W = 8 on 20 letters).  The `inter_profile_bytes` gate overrides it (0:
-// always gather; off: no cap).  A new switch for a new code path, not a fill gate retuned.
-inline constexpr int64_t kInterProfileMaxBytes = int64_t(1) << 20;
+// which the rows are gathered lane-cell by lane-cell as before.  By default NONE: nothing
+// measured favours the gather.  nighthaven (AVX2), protein, A = 40 against long B, always-
+// profile vs the first 1 MiB cap: never slower; 1 thread float32 path B = 2000 / 3000 ~21 %
+// faster (where 1 MiB gathered), the gather at B = 1500 1.13-1.14x the profile; score-only,
+// int16 path, B = 6000 and every 6-thread cell: no effect (2026-11-11).  wloczykij sse4,
+// instructions, profile / gather: L1000 float32 path 0.59, L3000 float32 score 0.54.
+// Memory needs no cap either: the profile is (letters used <= M + 1) x n x W values, below
+// the group's own three (M + 1) x (n + 1) x W tables.  solace (AVX-512, W = 16 / 32) is
+// unmeasured.  The `inter_profile_bytes` gate sets a cap for A/B runs (0: always gather).
+// A new switch for a new code path, not a fill gate retuned.
+inline constexpr int64_t kInterProfileMaxBytes = INT64_MAX;
 template <class T>
 struct InterJobT {
     const unsigned char* const* a;   // W pointers to A's codes
@@ -429,7 +434,7 @@ struct InterJobT {
     // The go_*/ge_* scalars above are then unused.  ra/crow are not read: no profile here.
     const TrackJob<T>* tr = nullptr;
     // Untracked alphabets over 8 letters: build the per-lane profile when its bytes are
-    // <= prof_max (kInterProfileMaxBytes above; 0: never).
+    // <= prof_max (kInterProfileMaxBytes above: no cap by default; 0: never).
     int64_t prof_max = kInterProfileMaxBytes;
 };
 using InterJob = InterJobT<double>;

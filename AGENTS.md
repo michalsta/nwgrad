@@ -916,8 +916,8 @@ row, `row_profile` loads the W lanes' rows W columns at a time and transposes th
 `srow` (`ivtranspose`: log2 W rounds of interleaves, punpckl/h at SSE). The column loops
 are unchanged; values are loaded, never computed, so it is bit-identical
 (`test_interpair_profile.py`: own fill / profile / gather at every level and lane type,
-ragged and short B, banded, the cap). Cap: `kInterProfileMaxBytes` (1 MiB, unmeasured as
-a crossover), gate `inter_profile_bytes` (0 = the gather). Tracked lanes keep the gather.
+ragged and short B, banded, the cap). Cap: `kInterProfileMaxBytes`, none by default since
+2026-11-11 (first 1 MiB; see below), gate `inter_profile_bytes` (0 = the gather). Tracked lanes keep the gather.
 wloczykij sse4 (= skynet's core), differential instructions per pair, BLOSUM62 11/1
 affine, 1 thread, gates off, new / main (A/A 0.99-1.01): L100 int16 score 0.53, path 0.55,
 Local hard 0.61; int32 score 0.64, path 0.68; float32 score 0.65, path 0.70; L300 int16
@@ -930,7 +930,11 @@ float32 score 10 % -- about the proposal's (letters / m), the 24 BLOSUM62 letter
 Long B (instructions a pair, profile with no cap / gather): L1000 float32 path 0.59, L3000
 float32 score 0.54 (its profile, ~1.2 MB, is past the 1 MiB cap, which therefore gathers
 there by default). The cap is a cache guess that instruction counts cannot settle: it needs
-a cycles crossover on a timing host (nighthaven / solace). AVX2 / AVX-512 / NEON compile and are
+a cycles crossover on a timing host (nighthaven / solace).
+nighthaven (AVX2, 2026-11-11), protein A = 40 vs long B, always-profile vs the 1 MiB default:
+never slower; 1 thread float32 path B = 2000 / 3000 ~21 % faster, the gather at B = 1500
+1.13-1.14x; score-only, int16 path, B = 6000 and all 6-thread cells: no effect. So the cap
+is gone by default (the gate still sets one for A/B). solace (AVX-512) unmeasured. AVX2 / AVX-512 / NEON compile and are
 untested at runtime (at W = 16 / 32 the interleaves cross 128-bit halves: gcc's lowering
 there is unexamined).
 

@@ -1489,7 +1489,7 @@ NB_MODULE(nwgrad_ext, m) {
             {"soft_ckpt_rows", int64_t(0)},   // (auto: _tuning.defaults() says so)
             {"soft_ckpt_min_bytes", int64_t(kSoftCkptMinBytes)},
             {"soft_double_ftz", int64_t(1)},
-            {"inter_profile_bytes", kInterProfileMaxBytes}};
+            {"inter_profile_bytes", int64_t(0)}};   // no cap (kInterProfileMaxBytes)
     });
 
     m.def(
