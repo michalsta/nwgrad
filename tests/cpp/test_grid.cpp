@@ -329,8 +329,13 @@ TEST_CASE("auto takes Grid for integer T where it splits", "[grid][traceback]") 
         REQUIRE(c.ran_grid() == simd);
         if (simd) REQUIRE(c.alignment() == cp.alignment());
         // int16 Global / Glocal (2026-11-10): Grid past hb_cutoff, except AVX-512, where they
-        // keep hirschberg_pmax below 2048 rows (it beat Grid at 32 lanes on L1000 protein)
-        const bool g16grid = simd && !is_avx512(kern);
+        // keep hirschberg_pmax below 2048 rows (it beat Grid at 32 lanes on L1000 protein),
+        // and AVX2 Global below 1000 rows (DNA L600 on nighthaven); these pairs have 800
+        const bool c16grid = simd && !is_avx512(kern);
+        bool g16grid = c16grid;
+#if !(defined(__aarch64__) || defined(_M_ARM64))
+        if (kern == static_cast<int>(SimdLevel::Avx2)) g16grid = false;
+#endif
         Aligner<GapModel::Affine, AlignMode::Global, AlignBand::Full, int16_t> g16, g16p;
         run(g16, TracebackMode::Default, kern, A, B); run(g16p, TracebackMode::Pointers, kern, A, B);
         REQUIRE(g16.ran_grid() == g16grid);
@@ -338,8 +343,8 @@ TEST_CASE("auto takes Grid for integer T where it splits", "[grid][traceback]") 
         if (g16grid) REQUIRE(g16.alignment() == g16p.alignment());
         Aligner<GapModel::Affine, AlignMode::Glocal, AlignBand::Full, int16_t> c16, c16p;
         run(c16, TracebackMode::Default, kern, A, B); run(c16p, TracebackMode::Pointers, kern, A, B);
-        REQUIRE(c16.ran_grid() == g16grid);
-        if (g16grid) REQUIRE(c16.alignment() == c16p.alignment());
+        REQUIRE(c16.ran_grid() == c16grid);
+        if (c16grid) REQUIRE(c16.alignment() == c16p.alignment());
         Aligner<GapModel::Affine, AlignMode::Local, AlignBand::Full, int32_t> l, lp;
         run(l, TracebackMode::Default, kern, A, B); run(lp, TracebackMode::Pointers, kern, A, B);
         REQUIRE(l.ran_grid() == simd);   // Local: the one-pass Grid inside the budget too

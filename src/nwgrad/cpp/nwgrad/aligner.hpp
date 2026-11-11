@@ -2677,11 +2677,18 @@ private:
     // (results/spot.md "Round 2"); nighthaven AVX2 L1000 0.84-0.91; skynet-class sse4 see
     // AGENTS.md "int16 Global auto takes Grid".  So hb_cutoff there, and AVX-512 from 2048
     // rows, between its L1000 loss and its L3000 win.  Local: 0 (Grid past the budget, as before).
+    // AVX2, Global only: from 1000 rows.  nighthaven (2026-11-10, PR #55) grid / pmax DNA L600
+    // 1.013 at 1 thread, 1.038 at 6 (Grid's scalar base case: 0.300 vs pmax's 0.295 ns/cell),
+    // protein L600 0.83-0.85, L1000 up wins; Glocal wins everywhere (0.25-0.56), so it keeps
+    // hb_cutoff.  PR #45's striped Grid base case should let this floor drop to hb_cutoff.
     static constexpr int kInt16GridMinRows512 =
         (std::is_same_v<T, int16_t> && AM != AlignMode::Local) ? 2048 : 0;
+    static constexpr int kInt16GridMinRowsAvx2 =
+        (std::is_same_v<T, int16_t> && AM == AlignMode::Global) ? 1000 : 0;
     static int int16_grid_min_rows(int backend) noexcept {
 #if !(defined(__aarch64__) || defined(_M_ARM64))
         if (backend == static_cast<int>(SimdLevel::Avx512)) return kInt16GridMinRows512;
+        if (backend == static_cast<int>(SimdLevel::Avx2))   return kInt16GridMinRowsAvx2;
 #endif
         (void)backend;
         return 0;
