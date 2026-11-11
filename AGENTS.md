@@ -2769,9 +2769,12 @@ slower than the better arm, up to 2.65x. What the data said, gate by gate:
   `instructions:u`, striped / shared, A/A 0.999-1.003): linear L100 1.08, L150 1.00, L200 0.95,
   L500 0.85, L1000-3000 0.82-0.80; affine L500 1.06, L700 1.00, L1000 0.99, L2000 0.91, L3000
   0.89; short A stays shared (22 x 200-3000 linear 1.19-1.33, affine 1.39-1.52; 40 x 3000 1.03 /
-  1.21; 100 x 1000 linear 0.91, affine 1.15). Caps now: SSE 10^6 cells (L1000 on), NEON 250000
-  (L500 on; the M1's gap is far larger than sse4's instruction gap, so its crossover is earlier;
-  L300-700 there unmeasured). AVX2 pending nighthaven; AVX-512 keeps its measured 4 x 10^7.
+  1.21; 100 x 1000 linear 0.91, affine 1.15). nighthaven AVX2 (time): linear L300 1.07, L500
+  0.90, L1000 0.78, L2000-3000 0.56-0.75, 100 x 3000 0.78; affine the shared fill wins almost
+  everywhere (striped 1.08-1.50 at L300-700, 1.12-1.40 at L2000-3000; L1000 alone 0.92-0.97).
+  spot with the cap: L300 1.000, L500 linear 0.755 / affine 0.925. So the cap is per gap model
+  (`f32_small_global_lin` for linear, `score_small_global` affine): SSE 200000 / 10^6 cells,
+  AVX2 200000 / none, NEON 250000 / 250000, AVX-512 4 x 10^7 / 4 x 10^7.
 - **The linear hard gather caps (`inter_linear_*_gather_cells`, `inter_global_linear_*`).**
   The integer caps (15000 / 6000 cells) were too high: int16 and int32 cross at L60-80
   (4000 cells) on every x86 level, int64 at L40-60 on AVX2 (2500; solace's avx2 run has
