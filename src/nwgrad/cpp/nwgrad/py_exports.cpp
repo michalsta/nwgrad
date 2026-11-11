@@ -1053,8 +1053,7 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             "     under the params score_and_grad() ran with, even after set_params().\n"
             "     Computed on first use (guide_j, banded_align, banded_grad) from a\n"
             "     snapshot of those params, so a call that never asks for it pays\n"
-            "     nothing for it -- unless the previous step read most guides, then\n"
-            "     in the call; the same guide, bit for bit, either way.\n"
+            "     nothing for it; the same guide, bit for bit.\n"
             "  \"lazy\": it does not; the guide is computed on first use (guide_j,\n"
             "     banded_align, banded_grad) under the params CURRENT THEN — after\n"
             "     set_params() it follows the new params.\n"
@@ -1497,7 +1496,7 @@ NB_MODULE(nwgrad_ext, m) {
             {"soft_ckpt_rows", int64_t(0)},   // (auto: _tuning.defaults() says so)
             {"soft_ckpt_min_bytes", int64_t(kSoftCkptMinBytes)},
             {"soft_double_ftz", int64_t(1)},
-            {"soft_guide_defer", int64_t(1)}};
+            {"soft_guide_defer", int64_t(2)}};
     });
 
     m.def(

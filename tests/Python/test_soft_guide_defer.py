@@ -26,7 +26,7 @@ CLASSES = {"double": nwgrad.SeqPairBatchDouble, "float32": nwgrad.SeqPairBatch}
 
 @pytest.fixture(autouse=True)
 def _reset():
-    # Pure deferral (2) for the semantic tests; the adaptive default (1) has its own test.
+    # Always defer (2, the default) pinned for the semantic tests; adaptive (1) has its own test.
     _tuning.reset_gates()
     _tuning.set_gate("soft_guide_defer", 2)
     yield
@@ -387,8 +387,8 @@ def test_exception_keeps_unfinished_guides():
 
 
 @pytest.mark.parametrize("fill", ["striped", "interpair"])
-def test_adaptive_default(fill):
-    """The default (gate 1): a step defers its guides unless at least half of them were
+def test_adaptive(fill):
+    """Gate 1, adaptive: a step defers its guides unless at least half of them were
     read since the previous soft call; then it fills them in the call, as eager always
     did.  The guides and outputs are the same either way."""
     rng = np.random.default_rng(53)
@@ -424,3 +424,18 @@ def test_adaptive_default(fill):
         b[i].guide_j
     b.score_and_grad()
     assert b._guides_pending() == N
+
+
+def test_default_always_defers():
+    """The default (no override: gate 2) defers every step, read or not."""
+    _tuning.reset_gates()
+    assert _tuning.defaults()["soft_guide_defer"] == 2
+    rng = np.random.default_rng(59)
+    P = dna_params(rng, "affine")
+    A, B = pairs(rng, "dna", 20)
+    b = make(nwgrad.SeqPairBatchDouble, A, B, P, "affine", "local", "interpair")
+    for _ in range(3):
+        b.score_and_grad()
+        assert b._guides_pending() == len(A)
+        guides(b)
+        assert b._guides_pending() == 0

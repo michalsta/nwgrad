@@ -1219,7 +1219,7 @@ private:
     // guide is the eager one, bit for bit, computed on first use (guide_j, banded_grad,
     // banded_align); a call that never asks for it skips the hard fill, 24-26 % of a
     // double soft step's instructions on skynet (AGENTS.md, "The soft path").
-    // Adaptive (the gate's default 1): `read` -- at least half the batch's guides were read
+    // Adaptive (gate 1, an option; the default 2 always defers): `read` -- at least half the batch's guides were read
     // (guide_j, banded_grad) since its previous full soft call -- runs the Viterbi in the
     // call: deferring and then resolving every guide cost +0.4-0.7 instructions per cell
     // over the in-call fill on miRNA (the per-group setup paid twice), so a loop that

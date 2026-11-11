@@ -243,7 +243,7 @@ void run_case(unsigned seed, const Cfg& c) {
         REQUIRE(eng.score_valid(i)); REQUIRE(eng.path_valid(i)); REQUIRE_FALSE(eng.path_stored(i));
         REQUIRE(eng.grad_valid(i) == (c.gd != GradMode::None));
         check_number(expected[i].score, eng.score(i), soft, 1e-10 * soft_scale<T>);
-        // "eager" defers its guide too (soft_guide_defer, on by default): pending under
+        // "eager" defers its guide too (soft_guide_defer, on by default; a fresh engine defers under 1 too): pending under
         // p1, the params scored.  Its odd pairs stay pending past set_params(p2) below,
         // and banded_grad must band around p1's guide all the same.
         const bool deferred = soft && c.soft_guide == 0 && soft_guide_defer();

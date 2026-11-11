@@ -2921,7 +2921,7 @@ functions:
   float32 Global 64.4 / 48.4 | 64.6 / 64.6, Local 67.3 / 49.0 | 67.5 / 67.5.
   So -24 to -30 % when unused, +0 to +0.7 % when used (miRNA: the per-group setup).
   "lazy" used: 125.7 (miRNA double Global), 110.3 (protein double Global) -- per pair.
-  Hence the ADAPTIVE default (gate 1, 2026-11-10): a soft call fills its guides in the
+  Gate 1, ADAPTIVE (the default 2026-11-10, an option since 2026-11-11): a soft call fills its guides in the
   call, as eager did, when at least half the batch's guides were read (`guide_j`,
   `banded_grad`; `guide_reads_`) since its previous soft call, and defers them otherwise;
   gate 2 always defers, 0 never. The first step of a loop defers and decides the next.
@@ -2932,6 +2932,13 @@ functions:
   (91.37), 95.97 vs 95.96 (95.96); float32 64.60 vs 64.61 (64.60), 67.52 vs 67.52 (67.52):
   all within the A/A spread. Unused: as "deferred" above (72.87, 73.24, 44.76, 45.35,
   67.56, 67.64, 48.36, 49.02).
+  The DEFAULT is gate 2, always defer (2026-11-11), on wall clock: nighthaven (AVX2),
+  a rotated soft training loop (miRNA and protein L300, double/float32, Global/Local, 1
+  and 6 threads), branch / main: guides read every step, gate 0 0.989-1.009, 1
+  0.989-1.008, 2 0.986-1.009; never read, 1 and 2 0.68-0.79; read every other step, 1
+  0.984-1.017 (miRNA double Global 1.014/1.017, controls ~1.004), 2 0.87-0.94. The +0.6 %
+  instructions of deferring with guides read does not show in time, and adaptive loses
+  the alternating loop (it fills in the call for a step whose guides go unread).
   Tests: `test_soft_guide_defer.py`. `"lazy"` — it does not, and the guide
   is computed on first use (`guide_j`, `banded_align`, `banded_grad`) under the params
   CURRENT THEN. Deliberately opt-in: `score_and_grad(); set_params(params + lr*g); banded_grad()`
