@@ -196,6 +196,7 @@ static inline double lse3(double a, double b, double c) noexcept {
 // DpBuffer (the DP table storage) now lives in its own header so the leveled kernel
 // TUs can include it without the whole Aligner.
 #include "dp_buffer.hpp"
+#include "parallel.hpp"   // nw_concurrent_workers
 
 // Runtime per-ISA-level dispatch table for the leveled affine kernels.
 #include "simd_levels.hpp"
@@ -1135,6 +1136,10 @@ struct Aligner {
     // (solace, int16 Local pointers / grid 0.57-0.73 at L1000-L1500, 1 and 8 threads; L1450
     // is 2^21 cells) -- above it the int32 run stays (unmeasured: NEEDS THE FLEET).
     static constexpr std::size_t kNarrowI16PtrCells512 = std::size_t(1) << 21;
+    // The call's narrowed int16 one-byte code tables, all workers together, that may replace
+    // a wide fill's dense codes (see narrow_viterbi_): 16 MiB.  NEEDS THE FLEET (one host
+    // pair calibrated it).
+    static constexpr std::size_t kNarrowCodeBytes = std::size_t(16) << 20;
     // 0: the Pointers class; 1: a splitting Hirschberg mode (run_tb_()); -1: this run
     // throws (an explicit Hirschberg mode with a negative penalty).  run_viterbi's dispatch.
     int path_class_() const {
@@ -1202,14 +1207,19 @@ struct Aligner {
                 }
 #endif
                 // int16 never writes the dense codes: where this type's fill would (a code
-                // fill past dense_gate_), the narrowed one-byte table is the bigger one and
-                // multi-threaded runs hit the memory wall (solace AVX-512, DNA L2000 linear
-                // Global int32 path: 0.54 at 1 thread, 1.65-1.71 at 8).  Not narrowed there.
+                // fill past dense_gate_), the narrowed one-byte table is the bigger one, and it
+                // loses once the call's concurrent tables pass the shared cache -- so it is not
+                // narrowed when workers x cells one-byte codes exceed kNarrowCodeBytes.  Measured
+                // (int32 linear Global path, narrowed / int32 with its dense codes): nighthaven
+                // AVX2 (18 MB L3) 1 thread wins to L3000 (0.31-0.55; 9 MB), 6 threads L2000 loses
+                // 1.11-1.15 (24 MB); solace AVX-512 (24 MB L3) 1 thread L2000 0.54 (4 MB), 8
+                // threads L2000 1.65-1.71 (32 MB).  16 MiB sits between the last win and the
+                // first loss on both.
                 if (cls == 0 && !runs_grid(na) && want_dense_()) {
                     const bool wide_codes = GM == GapModel::Linear ? linear_ptr_fill() : !runs_grid(*this);
-                    if (wide_codes) return false;
+                    const std::size_t workers = static_cast<std::size_t>(std::max(1, nw_concurrent_workers));
+                    if (wide_codes && workers * cells > kNarrowCodeBytes) return false;
                 }
-                (void)cells;
             }
             na.ensure_viterbi_ptruf(sc.buf);
             na.run_viterbi(sc.buf);

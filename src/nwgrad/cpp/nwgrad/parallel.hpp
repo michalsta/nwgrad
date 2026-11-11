@@ -194,6 +194,11 @@ inline bool threads_share_cores(int n_threads) noexcept {
 // items and may throw in turn.  Only the first exception is kept, and any
 // results the workers produced must be treated as incomplete once one is
 // rethrown.
+// The workers of the call the calling thread is running in (run_workers_guarded sets it for
+// the duration of each worker; 1 outside any): how many DP fills run concurrently, for the
+// fills that size a memory budget by it (Aligner::narrow_viterbi_).
+inline thread_local int nw_concurrent_workers = 1;
+
 template<typename Worker>
 inline void run_workers_guarded(int n_threads, Worker&& worker) {
     if (n_threads < 1) n_threads = 1;
@@ -202,6 +207,9 @@ inline void run_workers_guarded(int n_threads, Worker&& worker) {
     std::exception_ptr first_err;
 
     auto guarded = [&]() noexcept {
+        const int outer = nw_concurrent_workers;
+        nw_concurrent_workers = n_threads;
+        struct Restore { int v; ~Restore() { nw_concurrent_workers = v; } } restore{outer};
         try {
             worker();
         } catch (...) {
