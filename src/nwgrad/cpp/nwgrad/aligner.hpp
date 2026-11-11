@@ -1618,6 +1618,18 @@ private:
     // linear Pointers fill is the scalar one (linear_kernel_pays) while the grid forward runs
     // 2 or 4 lanes without a packed 64-bit max -- traceback="grid" stays available for it.
     static constexpr bool kLinearGridAuto = !(nw_is_int<T> && sizeof(T) == 8);
+    // Per level: int16 not on NEON.  spot (M1, PR #49, 2026-11-11): int16 linear Global path
+    // `auto` at L1000 read 1.039 (protein) / 1.011 (DNA) against main's, controls ~1.00 --
+    // main's H table beat both Grid and Pointers there, where every other type won 0.34-0.60
+    // from L1000.  No NEON int16 data past L1000 yet, so it keeps the old routing for now; x86
+    // keeps Grid (sse4 protein L1000: Grid 4.31 instructions a cell against the H table's 5.09).
+    static bool linear_grid_auto_level(int backend) noexcept {
+#if defined(__aarch64__) || defined(_M_ARM64)
+        if constexpr (nw_is_int<T> && sizeof(T) == 2) return false;   // NEON: the only simd level here
+#endif
+        (void)backend;
+        return true;
+    }
     // NWGRAD_LINEAR_GRID=0: linear `auto` never takes Grid (the Pointers / H fills as before;
     // an A/B switch in one binary, for measuring).
     static bool linear_grid_env() {
@@ -1807,7 +1819,8 @@ private:
         if constexpr (GM == GapModel::Linear && AB == AlignBand::Full && kLinearGridAuto)
             if (tb_auto_ && tb_ == TracebackMode::Pointers && linear_grid_env()) {
                 const int be = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
-                if (be != kBackendScalar && grid_ok_(level_kernels(be))) return TracebackMode::Grid;
+                if (be != kBackendScalar && linear_grid_auto_level(be) && grid_ok_(level_kernels(be)))
+                    return TracebackMode::Grid;
             }
         if constexpr (GM == GapModel::Affine && AB == AlignBand::Full && std::is_floating_point_v<T>)
             if (tb_ == TracebackMode::Grid && tb_auto_) {
