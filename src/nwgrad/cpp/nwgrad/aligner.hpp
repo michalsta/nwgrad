@@ -1828,12 +1828,27 @@ private:
     // wins 1.6x up to L=350 (1 MB), ties at L=500 (2 MB), loses 2.4x at 700 and 3.5x
     // at 1000.  Same path either way, so this is a speed choice only.
     static constexpr size_t kLinearHTableBytes = size_t(2) << 20;
+    // AVX-512, int16 Local: 768 KiB (L ~620).  solace (Tiger Lake, 1.25 MiB L2), branch
+    // narrow-paths 7939230 whose linear fill is main's, Pointers / auto (H) time, DNA and
+    // protein, 1 / 8 threads: L500 (0.5 MB of H) 1.03-1.19, H wins; L700 (1 MB) 0.98 / 0.88;
+    // L1000 (2 MB) 0.60-0.72; from L1200 auto already runs Pointers (0.98-1.02).  AVX2 on
+    // the same host keeps H to L1000 (Pointers / H 1.00-1.07), NEON too (spot: main's auto
+    // 11-15 % ahead up to L1000), so they keep 2 MiB.  Global / Glocal unmeasured: 2 MiB.
+    static constexpr size_t kLinearHTableBytes512 =
+        (std::is_same_v<T, int16_t> && AM == AlignMode::Local) ? size_t(768) << 10 : kLinearHTableBytes;
+    size_t linear_h_table_bytes() const noexcept {
+#if !(defined(__aarch64__) || defined(_M_ARM64))
+        const int be = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
+        if (be == static_cast<int>(SimdLevel::Avx512)) return kLinearHTableBytes512;
+#endif
+        return kLinearHTableBytes;
+    }
     bool linear_ptr_fill() const noexcept {
         if constexpr (GM != GapModel::Linear || AB != AlignBand::Full) return false;
         else {
             if (is_hirschberg(tb_) || tb_ == TracebackMode::Grid) return true;
             if (tb_ != TracebackMode::Pointers) return false;
-            return !tb_auto_ || sz_ * sizeof(T) > kLinearHTableBytes;
+            return !tb_auto_ || sz_ * sizeof(T) > linear_h_table_bytes();
         }
     }
 

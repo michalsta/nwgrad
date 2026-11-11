@@ -1466,7 +1466,12 @@ really takes (`test_tracked_long_global_float32_pairs_run_their_own_fill`).  fuz
   under `auto` (which resolves to pointers for linear) a pair whose H table is ≤ 2 MiB
   keeps H. Measured (nighthaven, double Global, 12 threads): H 1.6× faster up to L=350,
   tie at 500, pointers 2.4× at 700 and 3.5× at 1000; `auto` tracks the faster one on both
-  sides. Explicit `pointers` always records bytes.
+  sides. Explicit `pointers` always records bytes. **AVX-512 int16 Local: 768 KiB**
+  (`kLinearHTableBytes512`, branch `proto/gate-fixes`, 2026-11-10): solace (Tiger Lake, 1.25
+  MiB L2), Pointers / H time, DNA and protein, 1 / 8 threads: L500 1.03-1.19 (H wins), L700
+  0.98 / 0.88, L1000 0.60-0.72; AVX2 on the same host keeps H to L1000 (1.00-1.07) and spot's
+  NEON too, so both keep 2 MiB; int16 Global / Glocal and the other types unmeasured there.
+  Same path either way (Pointers and H break ties alike).
 - **Linear Hirschberg** (`viterbi_linear_hirschberg`, `lhb_solve` / `lhb_sweep` / `lhb_base`):
   no gap state crosses a row cut, so the join is a plain argmax of forward + reverse
   scores. Local uses the affine path's endpoint reduction (clamped forward scan,
