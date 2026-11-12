@@ -3011,6 +3011,12 @@ so a saturated value never leaks and the score is the int16 / int32 integer bit 
   the wide kernel's score answers it exactly; it replaced a geometric back-off, skip 1, 3,
   ... 63 after an overflow, which left the overflowing cells at 1.01-1.03), 2 every mode,
   every problem (tests).  `NWGRAD_INT_NARROW=0` turns it off with the other narrowing.
+- **Minimum row** `score_int8_min_segs` (gate 1 only): none at 16 lanes, 32 segments at 32
+  and 64 lanes.  nighthaven AVX2 (87356da, Local score, tier on / off) lost on SHORT rows of
+  pairs that fit int8 -- protein unrelated L100 1.70 / L300 1.33, DNA related L100 1.66 /
+  L300 1.06 (6 threads the same) -- and gained from L1000 (32 segments: 0.45-1.00; L3000
+  0.11-0.36).  At 4-10 segments lazy-F carries across 32 lane boundaries per row and the
+  per-row costs dominate; skynet SSE4 at L100 (7 segments of 16) already gained.
 - **Python**: `*_int8` names / `SeqPairInt8` / `SeqPairBatchInt8` (`nwgrad/_int8.py`) are the
   int16 ones with the parameter range checked (ValueError past +-127); paths and gradients
   run at int16 (fallback, the same integers).

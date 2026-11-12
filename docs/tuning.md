@@ -147,6 +147,11 @@ batch._inter_plan()               # [pairs in shared groups, pairs on their own 
 An `int` is the threshold, `None` turns the gate off, and `"default"` removes the
 override. A batch regroups on its next call after any change.
 
+`score_int8_min_segs` is the int8 tier's minimum row length in int8 segments (length of
+`seq_b` / lanes, rounded up): 0 at 16 lanes (SSE, NEON), 32 at 32 and 64 lanes (AVX2,
+AVX-512), where short rows ran slower in int8 than in int16 (nighthaven: L100 1.66-1.70,
+L300 1.06-1.33 on pairs that fit; L1000 0.45-1.00). An override applies at every level.
+
 `score_int8` is a mode, not a threshold: 0 never runs the int8 score kernel, 1 (the
 default) runs it first for Local integer score-only calls unless the thread's previous one
 overflowed, 2 for every mode and problem ([Integer types](#integer-types)); `NWGRAD_INT8`
