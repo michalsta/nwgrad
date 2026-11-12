@@ -186,12 +186,20 @@ endif()
 # placement alone does to a timing.  Its TU goes first on the link line.
 set(NWGRAD_PLACEMENT_SHIFT "" CACHE STRING
     "Experiment: shift all extension code by this many bytes (empty = off)")
-set(NWGRAD_PLACEMENT_SHIFT_AT "front" CACHE STRING "Experiment: where the shift pad goes (front | text)")
+set(NWGRAD_PLACEMENT_SHIFT_AT "front" CACHE STRING "Experiment: where the shift pad goes (front | text | mid)")
 set(NWGRAD_PLACEMENT_SOURCES "")
 if (NOT NWGRAD_PLACEMENT_SHIFT STREQUAL "")
     set(NWGRAD_PLACEMENT_SOURCES src/nwgrad/cpp/nwgrad/placement_shift.cpp)
     set_source_files_properties(src/nwgrad/cpp/nwgrad/placement_shift.cpp PROPERTIES
-        COMPILE_DEFINITIONS "NWGRAD_PLACEMENT_SHIFT=${NWGRAD_PLACEMENT_SHIFT};$<$<STREQUAL:${NWGRAD_PLACEMENT_SHIFT_AT},text>:NWGRAD_PLACEMENT_SHIFT_TEXT>")
+        COMPILE_DEFINITIONS "NWGRAD_PLACEMENT_SHIFT=${NWGRAD_PLACEMENT_SHIFT};$<$<NOT:$<STREQUAL:${NWGRAD_PLACEMENT_SHIFT_AT},front>>:NWGRAD_PLACEMENT_SHIFT_TEXT>")
+endif()
+
+# AT=mid links the pad between the bindings and the level units instead ("a level unit
+# linked earlier grew by N": the kernels move against the bindings' code, not with it).
+set(NWGRAD_PLACEMENT_SOURCES_MID "")
+if (NWGRAD_PLACEMENT_SHIFT_AT STREQUAL "mid")
+    set(NWGRAD_PLACEMENT_SOURCES_MID ${NWGRAD_PLACEMENT_SOURCES})
+    set(NWGRAD_PLACEMENT_SOURCES "")
 endif()
 
 nanobind_add_module(nwgrad_ext
@@ -199,6 +207,7 @@ nanobind_add_module(nwgrad_ext
     ${NWGRAD_PLACEMENT_SOURCES}
     src/nwgrad/cpp/nwgrad/py_exports.cpp
     src/nwgrad/cpp/nwgrad/logistic/py_logistic.cpp
+    ${NWGRAD_PLACEMENT_SOURCES_MID}
     ${NWGRAD_LEVEL_SOURCES})
 if (DEFINED NWGRAD_JCC_GNU_OPTS)
     target_compile_options(nwgrad_ext PRIVATE "$<$<CXX_COMPILER_ID:GNU>:${NWGRAD_JCC_GNU_OPTS}>")
