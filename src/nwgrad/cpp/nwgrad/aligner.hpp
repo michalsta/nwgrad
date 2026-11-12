@@ -2688,13 +2688,14 @@ private:
     // AVX-512 (solace, Tiger Lake, 1 thread, 2026-11-11, PR #55 against main's pmax `auto`):
     // Global, forced Grid (scalar base case) DNA / protein L1000 1.24 / 1.09, L1500 1.05 /
     // 0.92, L2048 1.08 / 0.96 (2048-row `auto` 1.091 / 0.972: a DNA loss), L3000 DNA 0.52 --
-    // so Global from 3000 rows (L2500 unmeasured).  Glocal, forced Grid L1000 0.59 / 0.53,
-    // L1500 0.54 / 0.49, L2048 0.55 / 0.50 -- from 1000 rows (below unmeasured).  PR #45's
-    // striped base case moves the Global crossover to ~L1500 (0.55 / 0.54 there).
+    // L2500 DNA 0.551 (2026-11-12) -- so Global from 2500 rows.  Glocal, forced Grid L700 / L800
+    // 0.53-0.60 (auto there was still main's), L1000 0.59 / 0.53, L1500 0.54 / 0.49, L2048
+    // 0.55 / 0.50 -- from 700 rows (L500 / L600 unmeasured).  PR #45's striped base case
+    // moves the Global crossover to ~L1500 (0.55 / 0.54 there).
     static constexpr int kInt16GridMinRows512 =
         !std::is_same_v<T, int16_t> ? 0
-        : AM == AlignMode::Global   ? 3000
-        : AM == AlignMode::Glocal   ? 1000 : 0;
+        : AM == AlignMode::Global   ? 2500
+        : AM == AlignMode::Glocal   ? 700 : 0;
     static constexpr int kInt16GridMinRowsAvx2 =
         (std::is_same_v<T, int16_t> && AM == AlignMode::Global) ? 1000 : 0;
     static int int16_grid_min_rows(int backend) noexcept {

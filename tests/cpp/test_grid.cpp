@@ -303,7 +303,7 @@ TEST_CASE("auto takes Grid for integer T where it splits", "[grid][traceback]") 
     // run_tb_ (2026-11-05): integer `auto` is hirschberg_pmax; a pair that splits (past
     // hb_cutoff = 512 rows; Global int32 and Glocal have no pointer budget, Global int64 has
     // 2^25) runs Grid on a simd level, Pointers within the budget; int16 Global / Glocal too
-    // (AVX-512 Global from 3000 rows, Glocal from 1000); Local (not int16) takes Grid past hb_cutoff at every size.
+    // (AVX-512 Global from 2500 rows, Glocal from 700); Local (not int16) takes Grid past hb_cutoff at every size.
     std::mt19937 rng(20261110);
     const AlignParams p = random_int_params(rng, 0);
     auto run = [&](auto& al, TracebackMode tb, int kern, const std::string& a, const std::string& b) {
@@ -329,10 +329,11 @@ TEST_CASE("auto takes Grid for integer T where it splits", "[grid][traceback]") 
         REQUIRE(c.ran_grid() == simd);
         if (simd) REQUIRE(c.alignment() == cp.alignment());
         // int16 Global / Glocal (2026-11-10): Grid past hb_cutoff, except AVX-512, where they
-        // keep hirschberg_pmax below 3000 / 1000 rows (Global / Glocal; it beat Grid at 32 lanes),
-        // and AVX2 Global below 1000 rows (DNA L600 on nighthaven); these pairs have 800
-        const bool c16grid = simd && !is_avx512(kern);
-        bool g16grid = c16grid;
+        // keep hirschberg_pmax below 2500 / 700 rows (Global / Glocal; it beat Grid at 32 lanes),
+        // and AVX2 Global below 1000 rows (DNA L600 on nighthaven); these pairs have 800, so
+        // Glocal takes Grid on every simd level and Global on none of AVX2 / AVX-512
+        const bool c16grid = simd;
+        bool g16grid = simd && !is_avx512(kern);
 #if !(defined(__aarch64__) || defined(_M_ARM64))
         if (kern == static_cast<int>(SimdLevel::Avx2)) g16grid = false;
 #endif

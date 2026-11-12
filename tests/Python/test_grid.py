@@ -145,10 +145,10 @@ def test_batch_grid_equals_pointers_integer_types(tname, mode, pi):
 def test_auto_integer_takes_grid_where_it_split(tname, mode):
     # integer pairs past hb_cutoff that `auto` splits (hirschberg_pmax; Global int16 / int32
     # and Glocal have no pointer budget): Grid, i.e. Pointers' result and ties.  int16
-    # Global / Glocal on AVX-512 take Grid from 3000 / 1000 rows only, Global on AVX2 from 1000
+    # Global / Glocal on AVX-512 take Grid from 2500 / 700 rows only, Global on AVX2 from 1000
     # (int16_grid_min_rows).
     if tname == "int16" and mode != "local" and nwgrad.simd_isa() == "avx512":
-        pytest.skip("int16 Global / Glocal take Grid from 3000 / 1000 rows on AVX-512")
+        pytest.skip("int16 Global / Glocal take Grid from 2500 / 700 rows on AVX-512")
     if tname == "int16" and mode == "global" and nwgrad.simd_isa() == "avx2":
         pytest.skip("int16 Global takes Grid from 1000 rows on AVX2")
     A, B = related_pairs(6, 200, 400, seed=3)
