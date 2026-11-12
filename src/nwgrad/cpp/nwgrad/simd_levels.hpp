@@ -626,7 +626,7 @@ enum class Gate : int {
     InterGroupBytes, InterSoftBytes, InterScoreGatherCells,
     InterLinearIntGatherCells, InterLinearF32GatherCells, InterLinearF64GatherCells,
     InterGlobalLinearIntCells, InterGlobalLinearF32Cells, LinearStripedMinN, SoftF32MinCells,
-    InterMinFill, SoftCkptRows, SoftCkptMinBytes, SoftDoubleFtz, ScoreInt8, Count_
+    InterMinFill, SoftCkptRows, SoftCkptMinBytes, SoftDoubleFtz, ScoreInt8, ScoreInt8MinSegs, Count_
 };
 inline constexpr const char* kGateNames[] = {
     "inter_group_bytes", "inter_soft_bytes", "inter_score_gather_cells",
@@ -634,7 +634,7 @@ inline constexpr const char* kGateNames[] = {
     "inter_linear_f64_gather_cells", "inter_global_linear_int_cells",
     "inter_global_linear_f32_cells", "linear_striped_min_n", "soft_f32_min_cells",
     "inter_min_fill", "soft_ckpt_rows", "soft_ckpt_min_bytes",
-    "soft_double_ftz", "score_int8"};
+    "soft_double_ftz", "score_int8", "score_int8_min_segs"};
 static_assert(sizeof(kGateNames) / sizeof(kGateNames[0]) == static_cast<size_t>(Gate::Count_));
 inline constexpr int64_t kGateUnset = -1;
 inline constexpr int64_t kGateOff = INT64_MAX;
@@ -717,6 +717,28 @@ inline int score_int8_mode() noexcept {
     static const int64_t v = env_nonneg_int("NWGRAD_INT8");
     if (v >= 0) return v >= 2 ? 2 : static_cast<int>(v);
     return kScoreInt8Default;
+}
+// The int8 tier's minimum row length in int8 segments (ceil(n / lanes)), by lane count:
+// none at 16 lanes, 32 segments at 32 and 64 lanes.  At 32 lanes a short row is a few
+// segments, so lazy-F's carries across 32 lane boundaries and the per-row costs outweigh
+// the doubled width: nighthaven (AVX2) Local score, pairs that fit int8, tier on / off,
+// L100 (4 segments) protein unrelated 1.70, DNA related 1.66; L300 (10) 1.33 / 1.06;
+// L1000 (32) 0.64 / 1.00, DNA unrelated 0.45; L3000 0.36.  At 16 lanes (SSE4, skynet,
+// instructions) L100 (7 segments) already gained: DNA related 0.81, unrelated 0.48,
+// protein unrelated 0.97.  AVX-512 untimed: the AVX2 rule.  score_int8_min_segs overrides
+// it at every level.
+inline int score_int8_min_segs(int lanes) noexcept {
+    const int64_t o = gate_override(Gate::ScoreInt8MinSegs);
+    if (o >= 0) return o > (1 << 20) ? (1 << 20) : static_cast<int>(o);
+    return lanes >= 32 ? 32 : 0;
+}
+// The int8 kernel's lane count at a level (score8_kernel_impl.inl: native_simd<int8_t>).
+inline int score_int8_lanes(int level) noexcept {
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64)
+    return level == static_cast<int>(SimdLevel::Avx512) ? 64 : level == static_cast<int>(SimdLevel::Avx2) ? 32 : 16;
+#else
+    (void)level; return 16;
+#endif
 }
 // Counters of the int8 tier (problems run, of which overflowed), for the tests; counted
 // only while switched on (score8_count_on()), so a production run pays one relaxed load.

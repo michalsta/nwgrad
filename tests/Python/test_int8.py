@@ -148,7 +148,8 @@ def test_negative_gaps_and_tracks_skip_the_tier():
 
 def test_narrow_off_disables_the_tier():
     import os, subprocess, sys
-    code = ("import nwgrad, numpy as np; from nwgrad import nwgrad_ext as E; E._score8_stats(True, True);"
+    code = ("import nwgrad, numpy as np; from nwgrad import nwgrad_ext as E, _tuning; E._score8_stats(True, True);"
+            "_tuning.set_gate('score_int8_min_segs', 0);"
             "p = nwgrad.AlignParams(nwgrad.SubstMatrix(np.where(np.eye(4, dtype=bool), 2.0, -1.0), alphabet='ACGT'), 2.0, 1.0, 2.0, 1.0);"
             "s = nwgrad.sw_score_int32('ACGTAC', 'ACGTTC', p); print(int(s), E._score8_stats()[0])")
     for env, runs in (({"NWGRAD_INT_NARROW": "0"}, 0), ({"NWGRAD_INT8": "0"}, 0), ({}, int(DEFAULT_ON))):
@@ -197,6 +198,7 @@ def test_int8_pairs_and_batches():
 def test_default_mode_is_local_with_a_predictor():
     if not DEFAULT_ON:
         pytest.skip("the int8 tier is off by default on AArch64")
+    _tuning.set_gate("score_int8_min_segs", 0)   # short rows: below the 32 / 64-lane minimum
     m = np.where(np.eye(4, dtype=bool), 2.0, -2.0)
     p = nwgrad.AlignParams(nwgrad.SubstMatrix(m, alphabet=DNA), 2.0, 1.0, 2.0, 1.0)
     a = "ACGTTGCA" * 4
@@ -216,3 +218,18 @@ def test_default_mode_is_local_with_a_predictor():
         nwgrad.sw_score_int16(a, a, p, kernel=K)     # skipped (the last score was >= 127) ...
         nwgrad.sw_score_int16(a, a, p, kernel=K)     # ... and its score 64 re-arms int8
         assert E._score8_stats(True) == (1, 0)
+
+
+def test_min_segs_gate():
+    m = np.where(np.eye(4, dtype=bool), 2.0, -2.0)
+    p = nwgrad.AlignParams(nwgrad.SubstMatrix(m, alphabet=DNA), 2.0, 1.0, 2.0, 1.0)
+    a = "ACGTTGCA" * 4                                # 32 columns: 2 segments at 16 lanes
+    want = nwgrad.sw_score_double(a, a, p)
+    for segs, runs in ((3, 0), (2, 1), (0, 1)):
+        _tuning.set_gate("score_int8_min_segs", segs)
+        with _tuning.override(score_int8=2):          # (a success re-arms the predictor)
+            nwgrad.sw_score_int16(a, a, p, kernel="sse2")
+        E._score8_stats(True)
+        assert nwgrad.sw_score_int16(a, a, p, kernel="sse2") == want
+        if DEFAULT_ON and "sse2" in nwgrad.available_isa_levels():
+            assert E._score8_stats(True)[0] == runs, segs
