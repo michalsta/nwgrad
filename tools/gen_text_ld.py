@@ -14,6 +14,12 @@ matched and stays in .text.  A function matched by two groups goes to the first.
 TYPES = ["f", "d", "s", "i", "l"]                 # float, double, int16, int32, int64 (Itanium codes)
 LEVELS = ["avx2", "avx512", "sse4", "baseline", "neon"]
 UNITS = ["_inter", "", "_soft"]
+# Offset of a group's start within its page, where measured to matter.  The avx2 inter-pair float32
+# group (nighthaven, Alder Lake, the group shifted 0..3712 with everything else fixed, protein L100,
+# 1 / 6 threads): float32 Global hard 1.12 / 1.11 at 0 and 1.14 / 1.10 at 2048, against main; at
+# 3712: Global hard 1.017 / 1.004, Local path 1.009 / 0.995, Local hard 1.002, Global path 0.994,
+# protein L300 path 1.007-1.008 (results/nighthaven.md, "Placement").
+OFFSET = {("avx2", "_inter", "f"): 3712}
 
 out = []
 w = out.append
@@ -52,7 +58,8 @@ for lv in LEVELS:
         obj = f"*level_{lv}{u}.cpp.o"
         for t in TYPES:
             grp = "KEEP(*(.text.nwgrad_placement_shift_grp)) " if (lv, u, t) == ("avx2", "_inter", "f") else ""
-            w(f"    . = ALIGN(4096); {grp}{obj}(.text._Z*[a-z_]I{t}[LE]*)")
+            off = OFFSET.get((lv, u, t), 0)
+            w(f"    . = ALIGN(4096);{f' . += {off};' if off else ''} {grp}{obj}(.text._Z*[a-z_]I{t}[LE]*)")
         w(f"    . = ALIGN(4096); {obj}(.text._Z*)")
 w("""    . = ALIGN(4096);
   }

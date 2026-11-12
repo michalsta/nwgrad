@@ -51,7 +51,7 @@ SECTIONS
     . = ALIGN(4096); *py_exports.cpp.o(.text._Z*BatchEngineIlL8GapModel1EL9AlignMode2E* .text._Z*AlignerIL8GapModel1EL9AlignMode2EL9AlignBand?ElE*)
     . = ALIGN(4096); *py_exports.cpp.o(.text._ZNSt* .text._ZNKSt* .text._ZSt* .text._ZN9__gnu_cxx*)
     . = ALIGN(4096); KEEP(*(.text.nwgrad_placement_shift)) *py_exports.cpp.o(.text._Z*)
-    . = ALIGN(4096); KEEP(*(.text.nwgrad_placement_shift_grp)) *level_avx2_inter.cpp.o(.text._Z*[a-z_]If[LE]*)
+    . = ALIGN(4096); . += 3712; KEEP(*(.text.nwgrad_placement_shift_grp)) *level_avx2_inter.cpp.o(.text._Z*[a-z_]If[LE]*)
     . = ALIGN(4096); *level_avx2_inter.cpp.o(.text._Z*[a-z_]Id[LE]*)
     . = ALIGN(4096); *level_avx2_inter.cpp.o(.text._Z*[a-z_]Is[LE]*)
     . = ALIGN(4096); *level_avx2_inter.cpp.o(.text._Z*[a-z_]Ii[LE]*)
