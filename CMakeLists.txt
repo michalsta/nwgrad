@@ -202,6 +202,22 @@ nanobind_add_module(nwgrad_ext
 if (DEFINED NWGRAD_JCC_GNU_OPTS)
     target_compile_options(nwgrad_ext PRIVATE "$<$<CXX_COMPILER_ID:GNU>:${NWGRAD_JCC_GNU_OPTS}>")
 endif()
+# ── Code placement (ELF, GNU ld) ─────────────────────────────────────────────
+# Kernel timings depend on where the kernels land mod 4096 (front-end set aliasing;
+# nighthaven, see nwgrad_text.ld), and that used to be the size of everything linked
+# before them: a change in the bindings or in another level moved every kernel after it.
+# nwgrad_text.ld anchors each level unit on its own 4 KiB boundary ahead of .text.
+option(NWGRAD_KERNEL_LAYOUT "Page-anchor the per-ISA kernel units (GNU ld, ELF)" ON)
+if (NWGRAD_KERNEL_LAYOUT AND NOT APPLE AND NOT WIN32 AND NOT CMAKE_VERSION VERSION_LESS 3.18)
+    include(CheckLinkerFlag)
+    set(NWGRAD_TEXT_LD "${CMAKE_CURRENT_SOURCE_DIR}/src/nwgrad/cpp/nwgrad/nwgrad_text.ld")
+    check_linker_flag(CXX "-Wl,-T,${NWGRAD_TEXT_LD}" NWGRAD_TEXT_LD_OK)
+    if (NWGRAD_TEXT_LD_OK)
+        target_link_options(nwgrad_ext PRIVATE "-Wl,-T,${NWGRAD_TEXT_LD}")
+        set_property(TARGET nwgrad_ext APPEND PROPERTY LINK_DEPENDS "${NWGRAD_TEXT_LD}")
+    endif()
+endif()
+
 # clang's SLP vectorizer, in the TU that holds the scalar code (every Aligner fill,
 # traceback and walk; scalar_fallback; the linear Pointers fill at every level): it packs
 # pairs of independent scalar chains (the X and Y updates, the argmax operands) into
