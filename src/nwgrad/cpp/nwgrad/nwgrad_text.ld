@@ -9,7 +9,8 @@
    driver is the size of everything linked between them, so any unrelated change moved it.
 
    Here each group starts on a 4 KiB boundary: the batch engine + aligner code of one (scalar type,
-   gap model, mode), the rest of the bindings, and each level unit's kernels of one scalar type.  A
+   gap model, mode), the bindings' std:: instantiations (vector resize etc., called per pair), the
+   rest of the bindings, and each level unit's kernels of one scalar type.  A
    kernel's offset from its driver mod 4096 then depends only on the code in its own two groups.
    Cost: at most 4 KiB of padding per group (~120 groups, ~0.25 MB).  The experiment knob's pads
    (placement_shift.cpp) are placed first / at the start of the avx2 inter float32 group. */
@@ -48,6 +49,7 @@ SECTIONS
     . = ALIGN(4096); *py_exports.cpp.o(.text._Z*BatchEngineIlL8GapModel1EL9AlignMode0E* .text._Z*AlignerIL8GapModel1EL9AlignMode0EL9AlignBand?ElE*)
     . = ALIGN(4096); *py_exports.cpp.o(.text._Z*BatchEngineIlL8GapModel1EL9AlignMode1E* .text._Z*AlignerIL8GapModel1EL9AlignMode1EL9AlignBand?ElE*)
     . = ALIGN(4096); *py_exports.cpp.o(.text._Z*BatchEngineIlL8GapModel1EL9AlignMode2E* .text._Z*AlignerIL8GapModel1EL9AlignMode2EL9AlignBand?ElE*)
+    . = ALIGN(4096); *py_exports.cpp.o(.text._ZNSt* .text._ZNKSt* .text._ZSt* .text._ZN9__gnu_cxx*)
     . = ALIGN(4096); KEEP(*(.text.nwgrad_placement_shift)) *py_exports.cpp.o(.text._Z*)
     . = ALIGN(4096); KEEP(*(.text.nwgrad_placement_shift_grp)) *level_avx2_inter.cpp.o(.text._Z*[a-z_]If[LE]*)
     . = ALIGN(4096); *level_avx2_inter.cpp.o(.text._Z*[a-z_]Id[LE]*)

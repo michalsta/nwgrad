@@ -6,7 +6,7 @@
 Groups, each starting on a 4 KiB boundary, in this order:
   1. per scalar type T, gap model G, mode M: the batch engine and aligner code of (T, G, M) from
      py_exports.cpp (BatchEngine<T,G,M>, Aligner<G,M,*,T>, and everything instantiated for them);
-  2. the rest of py_exports.cpp;
+  2. py_exports.cpp's standard-library instantiations (std::vector etc.), then the rest of it;
   3. per per-ISA-level unit, per scalar type: that unit's kernels of type T; then the unit's rest.
 Matching is on -ffunction-sections names (.text._Z<mangled>); .text.unlikely.* (cold splits) is not
 matched and stays in .text.  A function matched by two groups goes to the first.
@@ -28,7 +28,8 @@ w("""/* Code layout for GNU ld (ELF), passed with -Wl,-T: see "Code placement" i
    driver is the size of everything linked between them, so any unrelated change moved it.
 
    Here each group starts on a 4 KiB boundary: the batch engine + aligner code of one (scalar type,
-   gap model, mode), the rest of the bindings, and each level unit's kernels of one scalar type.  A
+   gap model, mode), the bindings' std:: instantiations (vector resize etc., called per pair), the
+   rest of the bindings, and each level unit's kernels of one scalar type.  A
    kernel's offset from its driver mod 4096 then depends only on the code in its own two groups.
    Cost: at most 4 KiB of padding per group (~120 groups, ~0.25 MB).  The experiment knob's pads
    (placement_shift.cpp) are placed first / at the start of the avx2 inter float32 group. */
@@ -42,6 +43,9 @@ for t in TYPES:
         for m in "012":
             w(f"    . = ALIGN(4096); *py_exports.cpp.o(.text._Z*BatchEngineI{t}L8GapModel{g}EL9AlignMode{m}E* "
               f".text._Z*AlignerIL8GapModel{g}EL9AlignMode{m}EL9AlignBand?E{t}E*)")
+# the standard-library instantiations the engines call per pair (std::vector resize / assign / erase:
+# co-hot with the hard path's kernel on nighthaven), apart from the bindings, whose code changes most
+w("    . = ALIGN(4096); *py_exports.cpp.o(.text._ZNSt* .text._ZNKSt* .text._ZSt* .text._ZN9__gnu_cxx*)")
 w("    . = ALIGN(4096); KEEP(*(.text.nwgrad_placement_shift)) *py_exports.cpp.o(.text._Z*)")
 for lv in LEVELS:
     for u in UNITS:
