@@ -1440,7 +1440,7 @@ ties, guide, gradient).
   the largest U and its first segment (`Best`), which with ge_a >= 0 is linear Pointers' end
   cell (the leftmost max of a row is never a gap-in-A cell, and U <= H); a problem that is one
   base block scans it.  Local with a negative extend runs as Pointers (`grid_ok_`).
-- **`auto`** (`run_tb_`, `kLinearGridAuto`, all types but int64; not int16 on NEON, `linear_grid_auto_level`: spot read int16 Global L1000 `auto` 1.039 protein / 1.011 DNA vs main's H table, every other type 0.34-0.60): skynet-class sse4
+- **`auto`** (`run_tb_`, `kLinearGridAuto`, all types but int64; int16 from per-level floors, `linear_grid_min_rows`: sse2 / sse4 / AVX2 Global and Glocal 800 rows, Local 1000 -- nighthaven had Grid 1.15-1.33x main's H table at L600 and 1.07-1.12 Local at L800 -- AVX-512 off until solace data, NEON off (spot int16 Global L1000 1.039 protein / 1.011 DNA); int32 / float32 / double from hb_cutoff, 0.23-1.00 on nighthaven and 0.34-0.60 on spot): skynet-class sse4
   (wloczykij), instructions per cell, Global, 20 % mutated homologues, own fills, hard path:
 
   | | Grid | Pointers | old `auto` | score-only |

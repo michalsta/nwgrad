@@ -1618,17 +1618,30 @@ private:
     // linear Pointers fill is the scalar one (linear_kernel_pays) while the grid forward runs
     // 2 or 4 lanes without a packed 64-bit max -- traceback="grid" stays available for it.
     static constexpr bool kLinearGridAuto = !(nw_is_int<T> && sizeof(T) == 8);
-    // Per level: int16 not on NEON.  spot (M1, PR #49, 2026-11-11): int16 linear Global path
-    // `auto` at L1000 read 1.039 (protein) / 1.011 (DNA) against main's, controls ~1.00 --
-    // main's H table beat both Grid and Pointers there, where every other type won 0.34-0.60
-    // from L1000.  No NEON int16 data past L1000 yet, so it keeps the old routing for now; x86
-    // keeps Grid (sse4 protein L1000: Grid 4.31 instructions a cell against the H table's 5.09).
-    static bool linear_grid_auto_level(int backend) noexcept {
+    // Per level, int16 only: the rows from which linear `auto` takes Grid (beyond grid_ok_'s
+    // m > hb_cutoff); INT_MAX = never.  Below ~2 MiB (L ~1000 at int16) `auto` ran the H table,
+    // fast at 2 bytes a cell, and Grid only overtakes it later:
+    //  * AVX2 (nighthaven, PR #49 a009f6e, wall clock against main, controls 0.97-1.02): protein
+    //    L600 Global / Local / Glocal 1.27 / 1.33 / 1.19 at 1 thread, 1.25-1.32 at 6; DNA L600
+    //    1.15-1.26 at 6; Local L800 1.07-1.12 (DNA and protein, 1 and 6 threads); so Global /
+    //    Glocal from 800 rows, Local from 1000.
+    //  * sse2 / sse4: the same floors.  Instructions alone favour Grid from L600 (wloczykij sse4,
+    //    Grid / H table: Global protein 0.84 at L800, 0.82 at L1000; Local 0.83-0.84; DNA
+    //    0.74-0.82), but the H fill runs at a higher IPC there and AVX2's clock shows it.
+    //  * AVX-512: off until solace measures it.  NEON: off (spot, a009f6e: int16 Global L1000
+    //    `auto` 1.039 protein / 1.011 DNA against main's H table).
+    // Every other type: hb_cutoff (int32 / float32 / double 0.23-1.00 on nighthaven).
+    static int linear_grid_min_rows(int backend) noexcept {
+        if constexpr (!(nw_is_int<T> && sizeof(T) == 2)) { (void)backend; return 0; }
+        else {
 #if defined(__aarch64__) || defined(_M_ARM64)
-        if constexpr (nw_is_int<T> && sizeof(T) == 2) return false;   // NEON: the only simd level here
+            (void)backend;
+            return std::numeric_limits<int>::max();
+#else
+            if (backend == static_cast<int>(SimdLevel::Avx512)) return std::numeric_limits<int>::max();
+            return AM == AlignMode::Local ? 1000 : 800;
 #endif
-        (void)backend;
-        return true;
+        }
     }
     // NWGRAD_LINEAR_GRID=0: linear `auto` never takes Grid (the Pointers / H fills as before;
     // an A/B switch in one binary, for measuring).
@@ -1819,7 +1832,7 @@ private:
         if constexpr (GM == GapModel::Linear && AB == AlignBand::Full && kLinearGridAuto)
             if (tb_auto_ && tb_ == TracebackMode::Pointers && linear_grid_env()) {
                 const int be = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
-                if (be != kBackendScalar && linear_grid_auto_level(be) && grid_ok_(level_kernels(be)))
+                if (be != kBackendScalar && m_ >= linear_grid_min_rows(be) && grid_ok_(level_kernels(be)))
                     return TracebackMode::Grid;
             }
         if constexpr (GM == GapModel::Affine && AB == AlignBand::Full && std::is_floating_point_v<T>)
