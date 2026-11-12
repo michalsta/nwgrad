@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Generate the GNU ld code-layout fragments (see their headers and AGENTS.md "Code placement").
 
-    python tools/gen_text_ld.py units  > src/nwgrad/cpp/nwgrad/nwgrad_text.ld          (the default)
+    python tools/gen_text_ld.py units  > src/nwgrad/cpp/nwgrad/nwgrad_text.ld          (the default, x86-64)
+    python tools/gen_text_ld.py units-aarch64 > src/nwgrad/cpp/nwgrad/nwgrad_text_aarch64.ld
     python tools/gen_text_ld.py groups > src/nwgrad/cpp/nwgrad/nwgrad_text_groups.ld   (-DNWGRAD_KERNEL_LAYOUT=groups)
 
 units:  every translation unit's functions in their own block, the block starting at a FIXED offset within
@@ -23,9 +24,9 @@ import sys
 UNIT_OFFSET = [("py_exports", 0), ("level_baseline", 192), ("level_sse4", 3712), ("level_avx2", 640),
                ("level_avx512", 3584), ("level_baseline_soft", 1760), ("level_sse4_soft", 4032),
                ("level_avx2_soft", 2080), ("level_avx512_soft", 2048), ("level_baseline_inter", 2080),
-               ("level_sse4_inter", 160), ("level_avx2_inter", 2144), ("level_avx512_inter", 1376),
-               # AArch64 (no measured offsets: page-aligned)
-               ("level_neon", 0), ("level_neon_soft", 0), ("level_neon_inter", 0)]
+               ("level_sse4_inter", 160), ("level_avx2_inter", 2144), ("level_avx512_inter", 1376)]
+# AArch64 (its own script: a `. += N` for a unit that is not linked still pads).  No measured offsets.
+UNIT_OFFSET_AARCH64 = [("py_exports", 0), ("level_neon", 0), ("level_neon_soft", 0), ("level_neon_inter", 0)]
 
 TYPES = ["f", "d", "s", "i", "l"]                 # float, double, int16, int32, int64 (Itanium codes)
 LEVELS = ["avx2", "avx512", "sse4", "baseline", "neon"]
@@ -61,9 +62,9 @@ def at(off):
     return f" . += {off};" if off else ""
 
 
-def units():
-    out = [HEAD.format(mode="units", grpnote="")]
-    for u, off in UNIT_OFFSET:
+def units(table=UNIT_OFFSET, mode="units"):
+    out = [HEAD.format(mode=mode, grpnote="")]
+    for u, off in table:
         pat = ".text._Z* .text.Py*" if u == "py_exports" else ".text._Z*"
         knob = " KEEP(*(.text.nwgrad_placement_shift))" if u == "py_exports" else ""
         out.append(f"    . = ALIGN(4096);{at(off)}{knob} *{u}.cpp.o({pat})")
@@ -94,4 +95,5 @@ def groups():
 
 
 mode = sys.argv[1] if len(sys.argv) > 1 else "units"
-print("\n".join({"units": units, "groups": groups}[mode]()))
+print("\n".join({"units": units, "groups": groups,
+                 "units-aarch64": lambda: units(UNIT_OFFSET_AARCH64, "units-aarch64")}[mode]()))

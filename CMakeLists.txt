@@ -229,6 +229,8 @@ if (NWGRAD_KERNEL_LAYOUT MATCHES "^(units|groups)$" AND NOT APPLE AND NOT WIN32
     include(CheckLinkerFlag)
     if (NWGRAD_KERNEL_LAYOUT STREQUAL "groups")
         set(NWGRAD_TEXT_LD "${CMAKE_CURRENT_SOURCE_DIR}/src/nwgrad/cpp/nwgrad/nwgrad_text_groups.ld")
+    elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+        set(NWGRAD_TEXT_LD "${CMAKE_CURRENT_SOURCE_DIR}/src/nwgrad/cpp/nwgrad/nwgrad_text_aarch64.ld")
     else()
         set(NWGRAD_TEXT_LD "${CMAKE_CURRENT_SOURCE_DIR}/src/nwgrad/cpp/nwgrad/nwgrad_text.ld")
     endif()
