@@ -1837,9 +1837,16 @@ private:
     // protein, 1 / 8 threads: L500 (0.5 MB of H) 1.03-1.19, H wins; L700 (1 MB) 0.98 / 0.88;
     // L1000 (2 MB) 0.60-0.72; from L1200 auto already runs Pointers (0.98-1.02).  AVX2 on
     // the same host keeps H to L1000 (Pointers / H 1.00-1.07), NEON too (spot: main's auto
-    // 11-15 % ahead up to L1000), so they keep 2 MiB.  Global / Glocal unmeasured: 2 MiB.
+    // 11-15 % ahead up to L1000), so they keep 2 MiB.
+    // AVX-512, int16 Global: 1 MiB (L ~720).  solace (PR #49 053ebc0, whose linear fill is
+    // main's, 1 thread), Pointers / main's auto (H) time, DNA / protein: L600 (0.72 MB of H)
+    // 1.07 / 1.08, H wins; L800 (1.28 MB) 0.60 / 0.61; L1000 0.54 / 0.45; L1500 already
+    // Pointers.  L700 (0.99 MB) unmeasured: it keeps H, the side main is on.  Glocal: 2 MiB.
     static constexpr size_t kLinearHTableBytes512 =
-        (std::is_same_v<T, int16_t> && AM == AlignMode::Local) ? size_t(768) << 10 : kLinearHTableBytes;
+        !std::is_same_v<T, int16_t> ? kLinearHTableBytes
+        : AM == AlignMode::Local    ? size_t(768) << 10
+        : AM == AlignMode::Global   ? size_t(1) << 20
+                                    : kLinearHTableBytes;
     size_t linear_h_table_bytes() const noexcept {
 #if !(defined(__aarch64__) || defined(_M_ARM64))
         const int be = (backend_ == kBackendAuto) ? global_default_backend() : backend_;

@@ -1478,7 +1478,9 @@ really takes (`test_tracked_long_global_float32_pairs_run_their_own_fill`).  fuz
   (`kLinearHTableBytes512`, branch `proto/gate-fixes`, 2026-11-10): solace (Tiger Lake, 1.25
   MiB L2), Pointers / H time, DNA and protein, 1 / 8 threads: L500 1.03-1.19 (H wins), L700
   0.98 / 0.88, L1000 0.60-0.72; AVX2 on the same host keeps H to L1000 (1.00-1.07) and spot's
-  NEON too, so both keep 2 MiB; int16 Global / Glocal and the other types unmeasured there.
+  NEON too, so both keep 2 MiB. **AVX-512 int16 Global: 1 MiB** (solace, 1 thread, Pointers /
+  H: L600 1.07 / 1.08 DNA / protein, H wins; L800 0.60 / 0.61; L1000 0.54 / 0.45; L700
+  unmeasured, kept on H). int16 Glocal and the other types unmeasured there: 2 MiB.
   Same path either way (Pointers and H break ties alike).
 - **Linear Hirschberg** (`viterbi_linear_hirschberg`, `lhb_solve` / `lhb_sweep` / `lhb_base`):
   no gap state crosses a row cut, so the join is a plain argmax of forward + reverse
