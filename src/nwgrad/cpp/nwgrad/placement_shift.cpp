@@ -13,12 +13,16 @@
 // NWGRAD_PLACEMENT_SHIFT_AT=text (CMake) puts the pad in a plain .text.* section instead,
 // first among the ordinary functions: ahead of the bindings, but behind anything the
 // layout script (nwgrad_text.ld) places before .text -- i.e. "the bindings grew by N".
+// NWGRAD_PLACEMENT_SHIFT_AT=grp: a section the layout script places at the start of one kernel
+// group (avx2 inter-pair float32): "a kernel in the same group grew by N".
 // "R" (SHF_GNU_RETAIN, binutils >= 2.36) keeps the unreferenced section through
 // --gc-sections.  ELF only; on other object formats the knob is a no-op.
 #if defined(NWGRAD_PLACEMENT_SHIFT) && NWGRAD_PLACEMENT_SHIFT >= 0 && defined(__ELF__)
 #define NWGRAD_PS_STR2(x) #x
 #define NWGRAD_PS_STR(x) NWGRAD_PS_STR2(x)
-#if defined(NWGRAD_PLACEMENT_SHIFT_TEXT)
+#if defined(NWGRAD_PLACEMENT_SHIFT_GRP)
+#define NWGRAD_PS_SECTION ".text.nwgrad_placement_shift_grp"
+#elif defined(NWGRAD_PLACEMENT_SHIFT_TEXT)
 #define NWGRAD_PS_SECTION ".text.nwgrad_placement_shift"
 #else
 #define NWGRAD_PS_SECTION ".text.unlikely.nwgrad_placement_shift"
