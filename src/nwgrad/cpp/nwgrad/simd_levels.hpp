@@ -888,7 +888,7 @@ inline constexpr GateLevelCaps kGateCapsSse    { {       6600,     1700,      20
                                                  { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, 0 };
 inline constexpr GateLevelCaps kGateCapsAvx2   { {      31000,     3800,      20000,     3072,      12288,       4700, kGateNoCap, kGateNoCap,      31000,      10300,      31000,      31000 },
                                                  {       6600,     1700,      20000,     3072,      12288,       1900, kGateNoCap, kGateNoCap,       6600,       6600,       6600,       6600 },
-                                                 {       1700,     1700,       4000,     1024,        450,       4700,       4700, kGateNoCap,       1700,       1700,       1700,       1700 },
+                                                 {       1700,     1700,       4000,     1024,        450,      91000,      91000, kGateNoCap,       1700,       1700,       1700,       1700 },   // int16: small caps L300 (see kGateCapsSse4)
                                                  {       1700,     3800,       4000,     2560,       2048,       1900,       1900, kGateNoCap,       1700,       3800,       1700,       1700 },
                                                  {       3800,     1700,       2500,     3072,      12288,       2800,       1900, kGateNoCap,       3800,       1700,       3800,       3800 },
                                                  3072, 8192, 20000,
@@ -907,12 +907,36 @@ inline constexpr GateLevelCaps kGateCapsNeon   { {      10300,     1700,       8
                                                  {      14700,        0,          0,     4608,      12288,       2800, kGateNoCap,          0,      63100,          0,      14700,      63100 },
                                                  3072, 8192, 20000,
                                                  { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, 0 };
+// The small-alphabet score caps of int16 per level (score_small_local / _global), measured
+// with the inter-pair int8 tier in (proto/int8-inter; the int8 groups of int16 AND int32
+// batches take int16's caps), DNA related pairs, cap lifted / default:
+//   AVX2 (nighthaven, time, 1 and 6 threads): L100 0.13-0.48, L300 0.69-0.80 -> 91000 (L300;
+//     past it unmeasured).
+//   SSE4 (wloczykij, instructions, A/A 0.94-1.05): L60 0.29-0.43, L100 0.42-0.69, L150-L500
+//     affine 0.72-0.85, linear Global 0.77-0.94, linear Local 0.88 / 0.99 / 1.03 / 1.04 at
+//     L150 / 200 / 300 / 500 -> 41000 (L200) both modes.
+//   SSE2 (the same): L60 0.55-0.71; L100 Local 0.57-0.82 (int8), Global 0.98-1.06; L150 on
+//     loses in linear (1.10-1.55) -> Local 10500 (L100), Global 3800 (L60).
+// int32's own caps stay: its inter-pair kernel loses from L100 Global on (SSE4 1.33-2.10,
+// SSE2 2.5-4.5).  AVX-512 int16 has no cap; NEON keeps its own.
+inline constexpr GateLevelCaps kGateCapsSse4 = [] {
+    GateLevelCaps c = kGateCapsSse;
+    c.i16.score_small_local = 41000; c.i16.score_small_global = 41000;
+    return c;
+}();
+inline constexpr GateLevelCaps kGateCapsSse2 = [] {
+    GateLevelCaps c = kGateCapsSse;
+    c.i16.score_small_local = 10500; c.i16.score_small_global = 3800;
+    return c;
+}();
 inline const GateLevelCaps& gate_caps(int level) noexcept {
 #if defined(__aarch64__) || defined(_M_ARM64)
     (void)level; return kGateCapsNeon;
 #else
     switch (static_cast<SimdLevel>(level)) {
         case SimdLevel::Avx2:   return kGateCapsAvx2;
+        case SimdLevel::Sse4:   return kGateCapsSse4;
+        case SimdLevel::Baseline: return kGateCapsSse2;
         case SimdLevel::Avx512: return kGateCapsAvx512;
         default:                return kGateCapsSse;
     }
