@@ -1376,13 +1376,17 @@ really takes (`test_tracked_long_global_float32_pairs_run_their_own_fill`).  fuz
   2000 / 3000 0.71 / 0.72 / 0.68 / 0.43, protein L600-2000 0.65-0.69; Glocal (pmax there is
   ~2x Pointers) DNA 0.36 / 0.36 / 0.34 / 0.22, protein 0.35 / 0.35 / 0.33; Grid beats Pointers
   in every cell (0.47-0.85). So int16 Global and Glocal `auto` runs Grid past hb_cutoff
-  (`int16_grid_min_rows`), except AVX-512, from 2048 rows (between solace's L1000 loss and
-  L3000 win), and AVX2 Global from 1000 rows (nighthaven: DNA L600 grid / pmax 1.013 at 1
+  (`int16_grid_min_rows`), except AVX-512 -- Global from 3000 rows (solace, Grid with its
+  scalar base / pmax: DNA / protein L1000 1.24 / 1.09, L1500 1.05 / 0.92, L2048 1.08 / 0.96,
+  L3000 DNA 0.52), Glocal from 1000 (L1000-2048 0.49-0.59) -- and AVX2 Global from 1000 rows (nighthaven: DNA L600 grid / pmax 1.013 at 1
   thread, 1.038 at 6, on Grid's scalar base case; protein L600 0.83-0.85; Glocal 0.25-0.56
   everywhere, so it keeps hb_cutoff; PR #45's striped base should let the floor drop). Scores unchanged (pmax is exact for integers). PR #45 (`proto/grid-base-simd`)
   makes int16 Grid cheaper still.
+  **TODO (when PR #45's striped Grid base case and this gate are both on main):** drop the
+  AVX-512 int16 Global floor (`kInt16GridMinRows512`) from 3000 to ~1500 rows: with the
+  striped base, solace measured Grid / pmax L1500 0.55 / 0.54, L2048 0.48 / 0.45.
   **Release note: int16 Global / Glocal `traceback="auto"` paths may change at ties** (past
-  512 rows; AVX-512 past 2048, AVX2 Global past 1000): they are now Grid's, i.e. `traceback="pointers"`' path, not
+  512 rows; AVX-512 Global from 3000, Glocal from 1000; AVX2 Global from 1000): they are now Grid's, i.e. `traceback="pointers"`' path, not
   hirschberg_pmax's. Scores are identical. Seen in the sse4 sweep: Global DNA L600 and L3000,
   Glocal DNA L600 / L1000 / L3000 cigars differ from main's; protein L600-2000 unchanged.
 - **Local, one pass** (same branch): with every gap parameter >= 0 and a top level above the

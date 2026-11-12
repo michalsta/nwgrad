@@ -2679,14 +2679,22 @@ private:
     // slower at L1000 protein (DNA L3000 0.53x).  Every other level loses with pmax: spot (M1,
     // NEON, 1 thread) grid / pmax DNA L1000 0.912, protein L1000 0.870, DNA L3000 0.492
     // (results/spot.md "Round 2"); nighthaven AVX2 L1000 0.84-0.91; skynet-class sse4 see
-    // AGENTS.md "int16 Global auto takes Grid".  So hb_cutoff there, and AVX-512 from 2048
-    // rows, between its L1000 loss and its L3000 win.  Local: 0 (Grid past the budget, as before).
+    // AGENTS.md "int16 Global auto takes Grid".  So hb_cutoff there; AVX-512 below
+    // (kInt16GridMinRows512).  Local: 0 (Grid past the budget, as before).
     // AVX2, Global only: from 1000 rows.  nighthaven (2026-11-10, PR #55) grid / pmax DNA L600
     // 1.013 at 1 thread, 1.038 at 6 (Grid's scalar base case: 0.300 vs pmax's 0.295 ns/cell),
     // protein L600 0.83-0.85, L1000 up wins; Glocal wins everywhere (0.25-0.56), so it keeps
     // hb_cutoff.  PR #45's striped Grid base case should let this floor drop to hb_cutoff.
+    // AVX-512 (solace, Tiger Lake, 1 thread, 2026-11-11, PR #55 against main's pmax `auto`):
+    // Global, forced Grid (scalar base case) DNA / protein L1000 1.24 / 1.09, L1500 1.05 /
+    // 0.92, L2048 1.08 / 0.96 (2048-row `auto` 1.091 / 0.972: a DNA loss), L3000 DNA 0.52 --
+    // so Global from 3000 rows (L2500 unmeasured).  Glocal, forced Grid L1000 0.59 / 0.53,
+    // L1500 0.54 / 0.49, L2048 0.55 / 0.50 -- from 1000 rows (below unmeasured).  PR #45's
+    // striped base case moves the Global crossover to ~L1500 (0.55 / 0.54 there).
     static constexpr int kInt16GridMinRows512 =
-        (std::is_same_v<T, int16_t> && AM != AlignMode::Local) ? 2048 : 0;
+        !std::is_same_v<T, int16_t> ? 0
+        : AM == AlignMode::Global   ? 3000
+        : AM == AlignMode::Glocal   ? 1000 : 0;
     static constexpr int kInt16GridMinRowsAvx2 =
         (std::is_same_v<T, int16_t> && AM == AlignMode::Global) ? 1000 : 0;
     static int int16_grid_min_rows(int backend) noexcept {
