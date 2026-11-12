@@ -940,7 +940,11 @@ struct Aligner {
                     job.ge_b = static_cast<T>(params_->gap_extend_b);
                     job.local = AM == AlignMode::Local ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
                     job.variant = score_variant_env();
+#if defined(__aarch64__) || defined(_M_ARM64)
+                    job.linear = lin && linear_score_one_row(backend, n_, nalpha_);
+#else
                     job.linear = lin && linear_score_one_row(backend, n_);
+#endif
                     job.buf = &buf;
                     if (tr_) fill_track_job_(job.tr, true, static_cast<size_t>(n_) + 16, lin);
                     fn(job);
@@ -4638,8 +4642,13 @@ private:
     //   L70 1.21-1.23 and L150 1.32-1.34 win, as int16 Local does at every length.
     // - double Global n < 80: L50 0.921 / 0.987, L70 0.891 / 0.963, miRNA 22 x 50 0.92;
     //   L100 1.07-1.09.  double Local n < 60: L50 0.912 / 0.946, miRNA 0.92; L70 1.08-1.09.
-    // - float32 Local n 81-104: L100 DNA 0.940 / protein 1.00 (L70 DNA 0.984 / protein 1.04
-    //   and L150 1.07-1.09 stay one-row).  float32 Global is flat (1.00-1.04).
+    // - float32 Local n 81-104, alphabets of up to 8 letters only (kLinScoreAffineF32MaxAlpha,
+    //   the small-alphabet test of the fill gates): L100 DNA 0.940 (L70 DNA 0.984 and L150
+    //   1.07-1.09 stay one-row).  Protein keeps one-row: L70-L100 1.00-1.04 for one-row, and
+    //   routed (47fbe3c) protein float32 Local L90 lost 1.037 (control 1.000; spot,
+    //   results/spot.md "PR55 gate-fixes 47fbe3c").  float32 Global is flat (1.00-1.04).
+    //   The int16 and double windows won on protein as well (int16 L100 0.945; double
+    //   Global L50 / L70 0.987 / 0.963, Local L50 0.946): every alphabet.
     // Glocal takes Global's windows (unmeasured).  x86: one-row at every length; see
     // AGENTS.md "Linear score-only gate" for the sse4 counts (AVX2 / AVX-512 pending).
     struct NSpan { int lo, hi; };
@@ -4648,13 +4657,17 @@ private:
         : std::is_same_v<T, float> ? (AM == AlignMode::Local ? NSpan{81, 104} : NSpan{1, 0})
         : std::is_same_v<T, double> ? (AM == AlignMode::Local ? NSpan{0, 59} : NSpan{0, 79})
                                     : NSpan{1, 0};
-    static bool linear_score_one_row(int backend, int n) noexcept {
+    static constexpr size_t kLinScoreAffineF32MaxAlpha = 8;
+    // nalpha: passed on AArch64 only (the x86 call is unchanged, so are its objects).
+    static bool linear_score_one_row(int backend, int n, size_t nalpha = 0) noexcept {
         if (const int e = score_linear_env()) return e == 2;
         (void)backend;
 #if defined(__aarch64__) || defined(_M_ARM64)
+        if constexpr (std::is_same_v<T, float> && AM == AlignMode::Local)
+            if (nalpha > kLinScoreAffineF32MaxAlpha) return true;
         return !(n >= kLinScoreAffineNeon.lo && n <= kLinScoreAffineNeon.hi);
 #else
-        (void)n;
+        (void)n; (void)nalpha;
         return true;
 #endif
     }

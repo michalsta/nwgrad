@@ -1159,7 +1159,8 @@ score-only call to the one-row kernel, ungated, and on the M1 it loses in three 
 double at short B (Global L50 0.92 / 0.99, L70 0.89 / 0.96; Local L50 0.91 / 0.95; miRNA 22 x
 50 0.92), float32 Local DNA L100 0.940 (protein 1.00). `Aligner::linear_score_one_row`
 routes those B lengths (`kLinScoreAffineNeon`: int16 Global / Glocal n 81-104, float32 Local
-n 81-104, double Global / Glocal n < 80, Local n < 60) through the zero-open affine kernel on
+n 81-104 over alphabets of up to 8 letters only -- protein L90 lost 1.037 there on spot --,
+double Global / Glocal n < 80, Local n < 60) through the zero-open affine kernel on
 AArch64; bit-identical either way. x86 stays one-row everywhere: wloczykij sse4,
 `instructions:u` affine-route / one-row, 1 thread, BLAS pinned, A/A 0.997-1.002, L50-L300
 DNA and protein, Global and Local: int16 1.31-1.81, float32 1.29-1.69 (DNA Global and the
