@@ -186,11 +186,12 @@ endif()
 # placement alone does to a timing.  Its TU goes first on the link line.
 set(NWGRAD_PLACEMENT_SHIFT "" CACHE STRING
     "Experiment: shift all extension code by this many bytes (empty = off)")
+set(NWGRAD_PLACEMENT_SHIFT_AT "front" CACHE STRING "Experiment: where the shift pad goes (front | text)")
 set(NWGRAD_PLACEMENT_SOURCES "")
 if (NOT NWGRAD_PLACEMENT_SHIFT STREQUAL "")
     set(NWGRAD_PLACEMENT_SOURCES src/nwgrad/cpp/nwgrad/placement_shift.cpp)
     set_source_files_properties(src/nwgrad/cpp/nwgrad/placement_shift.cpp PROPERTIES
-        COMPILE_DEFINITIONS "NWGRAD_PLACEMENT_SHIFT=${NWGRAD_PLACEMENT_SHIFT}")
+        COMPILE_DEFINITIONS "NWGRAD_PLACEMENT_SHIFT=${NWGRAD_PLACEMENT_SHIFT};$<$<STREQUAL:${NWGRAD_PLACEMENT_SHIFT_AT},text>:NWGRAD_PLACEMENT_SHIFT_TEXT>")
 endif()
 
 nanobind_add_module(nwgrad_ext
