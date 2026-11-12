@@ -181,8 +181,21 @@ elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
         ${NWGRAD_LEVEL_DIR}/level_neon_inter.cpp)
 endif()
 
+# Placement experiment knob (off by default; see placement_shift.cpp): shifts all of the
+# extension's code by N bytes without changing an instruction, to measure what code
+# placement alone does to a timing.  Its TU goes first on the link line.
+set(NWGRAD_PLACEMENT_SHIFT "" CACHE STRING
+    "Experiment: shift all extension code by this many bytes (empty = off)")
+set(NWGRAD_PLACEMENT_SOURCES "")
+if (NOT NWGRAD_PLACEMENT_SHIFT STREQUAL "")
+    set(NWGRAD_PLACEMENT_SOURCES src/nwgrad/cpp/nwgrad/placement_shift.cpp)
+    set_source_files_properties(src/nwgrad/cpp/nwgrad/placement_shift.cpp PROPERTIES
+        COMPILE_DEFINITIONS "NWGRAD_PLACEMENT_SHIFT=${NWGRAD_PLACEMENT_SHIFT}")
+endif()
+
 nanobind_add_module(nwgrad_ext
     NB_STATIC NOMINSIZE
+    ${NWGRAD_PLACEMENT_SOURCES}
     src/nwgrad/cpp/nwgrad/py_exports.cpp
     src/nwgrad/cpp/nwgrad/logistic/py_logistic.cpp
     ${NWGRAD_LEVEL_SOURCES})
