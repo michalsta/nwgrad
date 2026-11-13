@@ -3390,7 +3390,19 @@ the inter-pair kernel against the engine code (pr-placement.md: up to 13 % on by
 Even the qemu block counts moved with it (a hot loop of the identical kernel split across a 4 KiB
 page in one link and not the other: -4.8 % host instructions, an artifact).  The glocal linear
 walks and the scalar fills now take glocal's ends at compile time (`SGR`, `sgt_*_<SGR>()`): the
-glocal walk is main's code but for register names.  Overlap (all four) / global 0.85-0.99, a_end
+glocal walk is main's code but for register names.  **5652ad2 on four layouts** (pads +0 / +1536 /
++3072 / +32 in py_exports): protein double 0.991-1.010 and DNA glocal 0.980-1.000 (placement, as
+above), miRNA glocal 1.003-1.015, but **protein L300 linear Local float32 path / hard 1.014-1.025 on
+all four**.  Its per-pair route (qemu block profile): `striped_linear_entry<float>` (the H-table
+fill, 46 % of the blocks), the profile build and the walk, each the same block count as main's.
+What still differed from main was data layout: `Aligner::sg_` sat beside `tb_auto_` (every later
+field +4: the walk's loads), and the `*_sg` kernel slots sat inside `TypedKernels` (the dispatch
+read `linear` at +40).  `sg_` is now Aligner's last member; the slots live in `SgTypedKernels`, at
+the end of `LevelKernels` (`sg_of<T>()`); `job.sg` is written for Glocal only.  The Local linear
+walk is now main's instruction for instruction (only a .rodata constant's address differs), and so
+is compute_viterbi but for the level table's stride and `ViterbiJob`'s default `sg` (one store a
+pair).  qemu instructions, batch, R6-R1: Local linear float32 protein L300 1.0003, local affine
+double 1.0001.  Overlap (all four) / global 0.85-0.99, a_end
 0.99-1.04.
 
 **Tests** (`tests/Python/test_semiglobal.py`): a Python 3-state reference of the 4-flag
