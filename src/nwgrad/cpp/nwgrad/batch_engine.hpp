@@ -2420,9 +2420,10 @@ private:
         InterPlan& dst = narrow ? (rows ? nplan_rows_ : nplan_) : (rows ? plan_rows_ : plan_);
         const int def_backend = global_default_backend();
         const unsigned epoch = gate_epoch();
-        const NwIntBound<T> ib = params_ ? params_->ib : NwIntBound<T>{};
+        // (floating T: never prepared, so the key compares constants; skipped at compile time)
+        const NwIntBound<T> ib = (nw_is_int<T> && params_) ? params_->ib : NwIntBound<T>{};
         if (dst.default_backend == def_backend && dst.hb_cutoff == s_.hb_cutoff &&
-            dst.gate_epoch == epoch && same_bound_(dst.ib, ib)) return dst;
+            dst.gate_epoch == epoch && (!nw_is_int<T> || same_bound_(dst.ib, ib))) return dst;
         const size_t N = size();
         InterPlan P;
         P.default_backend = def_backend; P.hb_cutoff = s_.hb_cutoff; P.gate_epoch = epoch; P.ib = ib;
@@ -2499,11 +2500,14 @@ private:
     // tables for score, path and gradient; the other pairs run their own fill.  One
     // atomic counter over all tasks.  (SeqPairBatch::score_and_grad_inter_.)
     void score_and_grad_inter_(bool keep) {
-        const InterPlan& PL = ensure_plan_(false, narrow_inter_on_());
+        // (a type never narrowed: plan_ and no narrow groups, NG a constant 0, so the worker
+        // below is main's -- nighthaven measured +1.2-1.5 % instructions on double linear
+        // Global miRNA path at 4 lanes with the narrow dispatch in the loop)
+        const InterPlan& PL = kNarrowInter ? ensure_plan_(false, narrow_inter_on_()) : ensure_plan_();
         const auto& elig = PL.elig;
         const auto& other = PL.other;
         const auto& groups = PL.groups;
-        const size_t NG = PL.ngroups.size();
+        const size_t NG = kNarrowInter ? PL.ngroups.size() : 0;
         const size_t G = groups.size(), tasks = NG + G + other.size();
         const bool soft = grad_mode_ == GradMode::Soft;
         // A lazy-guide soft group needs no Viterbi at all, nor a posterior-guide one.
@@ -2523,8 +2527,10 @@ private:
             while (true) {
                 size_t t = idx.fetch_add(1, std::memory_order_relaxed);
                 if (t >= tasks) break;
-                if (t < NG) { run_narrow_group_(PL, PL.ngroups[t].first, PL.ngroups[t].second, w, keep); continue; }
-                t -= NG;
+                if constexpr (kNarrowInter) {
+                    if (t < NG) { run_narrow_group_(PL, PL.ngroups[t].first, PL.ngroups[t].second, w, keep); continue; }
+                    t -= NG;
+                }
                 if (t >= G) { run_full_(other[t - G], w, keep); continue; }
                 // (not a structured binding: the soft pass's lambda captures s, and clang
                 // cannot capture a structured binding inside an OpenMP region)
@@ -2916,9 +2922,9 @@ private:
         gparams_ = params_;
         const size_t N = size();
         const bool inter = s_.inter_fill;
-        const InterPlan& PL = inter ? ensure_plan_(true, narrow_inter_on_()) : plan_;
+        const InterPlan& PL = inter ? (kNarrowInter ? ensure_plan_(true, narrow_inter_on_()) : ensure_plan_(true)) : plan_;
         const size_t G = inter ? PL.groups.size() : 0;
-        const size_t NG = inter ? PL.ngroups.size() : 0;
+        const size_t NG = (kNarrowInter && inter) ? PL.ngroups.size() : 0;
         const size_t tasks = inter ? NG + G + PL.other.size() : N;
         std::atomic<size_t> idx{0};
         auto worker = [&]() {
