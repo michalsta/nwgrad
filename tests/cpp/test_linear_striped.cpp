@@ -10,6 +10,7 @@
 //
 // run with NWGRAD_ISA=<level> (ctest does, per level) or let it loop every level.
 #include "catch.hpp"
+#include <optional>
 
 #include <cstdint>
 #include <string>
@@ -236,4 +237,60 @@ TEMPLATE_TEST_CASE("linear Hirschberg kernel equals the scalar linear Hirschberg
         any |= level_kernels(static_cast<int>(l)).template of<TestType>().lhb != nullptr;
     if (any) CHECK(kernel_calls >= cases / 10);
     else     CHECK(kernel_calls == 0);
+}
+
+// int16 in the SATURATING regime (past the quarter rule) with a negative extend: the opens
+// of the integer carry (int_pmax_carry) sit near lowest() and the ramp k * ge_a is negative,
+// so the carry must saturate too (it did not: plain adds, a signed wrap -- UBSan in CI,
+// linear Glocal at 32 lanes, -32744 + -2160).  Every level against the scalar fill, the
+// path fill, the H fill and score-only, Global / Glocal / Local.
+TEST_CASE("int16 striped linear kernels in the saturating regime with negative extends", "[linear][simd][integer]") {
+    Rng rng(0x5a7d11);
+    const Alphabet& alpha = Alphabet::get("ACGT");
+    std::vector<int> levels;
+    for (SimdLevel l : detect_available_levels()) levels.push_back(static_cast<int>(l));
+    if (levels.empty()) return;
+    int cases = 0, sat = 0, bad = 0;
+    for (int r = 0; r < 60; ++r) {
+        std::vector<double> m(16);
+        for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) m[i * 4 + j] = i == j ? rng.in(3, 12) : -rng.in(1, 12);
+        AlignParams p(SubstMatrix(m.data(), alpha, 1));
+        p.gap_ref(0, AlignParams::kOpenA) = 0; p.gap_ref(0, AlignParams::kOpenB) = 0;
+        p.gap_ref(0, AlignParams::kExtendA) = -rng.in(0, 2);
+        p.gap_ref(0, AlignParams::kExtendB) = rng.in(-1, 3);
+        const int la = rng.in(200, 700), lb = rng.in(200, 700);
+        const std::string A = random_seq(rng, alpha, la), B = random_seq(rng, alpha, lb);
+        const auto ea = alpha.encode(A), eb = alpha.encode(B);
+        auto one = [&](auto am_tag) {
+            constexpr AlignMode AM = decltype(am_tag)::value;
+            using Al = Aligner<GapModel::Linear, AM, AlignBand::Full, int16_t>;
+            std::optional<Result> refo;
+            try { refo.emplace(run_one<AM, int16_t>(ea, eb, p, {}, kBackendScalar, TracebackMode::Scores)); }
+            catch (const std::overflow_error&) { return; }   // past the saturating bound too
+            const Result& ref = *refo;
+            ++cases;
+            { Al probe; probe.set_problem(ea, eb, p); sat += probe.saturating() ? 1 : 0; }
+            for (int level : levels) {
+                const Result kH = run_one<AM, int16_t>(ea, eb, p, {}, level, TracebackMode::Scores);
+                const Result kP = run_one<AM, int16_t>(ea, eb, p, {}, level, TracebackMode::Pointers);
+                Al s; s.set_kernel(level); s.set_problem(ea, eb, p);
+                DpBufferT<int16_t> sb;
+                const double sc = s.compute_score(sb);
+                INFO("level " << level << " AM " << static_cast<int>(AM) << " |A|=" << la << " |B|=" << lb
+                     << " ge " << p.gap_extend_a << "/" << p.gap_extend_b);
+                CHECK(same(ref, kH));
+                CHECK(same(ref, kP));
+                CHECK(sc == ref.score);
+                bad += !(same(ref, kH) && same(ref, kP) && sc == ref.score);
+            }
+        };
+        switch (r % 3) {
+            case 0: one(std::integral_constant<AlignMode, AlignMode::Global>{}); break;
+            case 1: one(std::integral_constant<AlignMode, AlignMode::Glocal>{}); break;
+            default: one(std::integral_constant<AlignMode, AlignMode::Local>{}); break;
+        }
+    }
+    WARN(cases << " problems, " << sat << " in the saturating regime");
+    CHECK(sat > cases / 3);
+    CHECK(bad == 0);
 }

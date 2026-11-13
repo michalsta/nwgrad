@@ -860,6 +860,8 @@ struct Aligner {
     // Whether the retained Viterbi tables (or direction bytes) are in the striped layout
     // of a leveled kernel — i.e. one ran, not the scalar fill.  For tests' liveness checks.
     bool tables_striped() const noexcept { return tables_striped_; }
+    // Whether the current integer problem runs the saturating regime (nw_int_bound_check 1).
+    bool saturating() const noexcept { return sat_; }
     // The B length from which the linear Full fill takes the leveled striped kernel.
     // ... on `backend` (a level id): AVX-512's lanes move some crossovers later.
     static int linear_striped_min_n(int backend) noexcept {
