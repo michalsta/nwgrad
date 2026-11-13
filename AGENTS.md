@@ -2306,6 +2306,17 @@ round): NEON and AVX-512 are to be checked before merging.
   moves (DNA uses the inter-pair kernels, which build no profile).  The other types keep the
   scalar loop (float32 / int32 would need a 4-byte lookup: `vpermd` for <= 8 symbols,
   gathers otherwise; not done).
+  Later (branch `proto/profile-shuffle`, 2026-11-10): int32 / float32 rows over <= 32 symbols
+  as four byte planes (pshufb pairs + two rounds of unpacks; AVX2 the same 32 slots wide;
+  NEON vld4 / tbl2 / vst4), AVX-512 two-table permutes for every type (vpermt2w 64 symbols,
+  vpermt2d 32, vpermt2q 16 or two + a blend for 32, masked tails), the padding written once per
+  slot rather than per row.  int64 / double below AVX-512 stay scalar.  Build alone (sse4,
+  24 rows, instructions): int32 / float32 17.9k -> 9.9k (L100), 53.1k -> 25.0k (L300); int16
+  7.8k -> 7.1k.  Whole protein score-only runs (wloczykij, instructions, A/A 0.1 %): L100
+  int32 -3.0 %, float32 -2.5 %, int16 -0.4 %; L300 int32 -1.9 %, float32 -1.5 %, int16 0;
+  DNA and miRNA (inter-pair) within noise.  Identity: `test_profile_build.cpp` against the
+  definition (random bits, 1..70 symbols, lengths 1..300 and long, odd W, tracked rows) via the
+  per-level `profile_build` hook.  AVX2, AVX-512 and NEON untested at runtime as of writing.
 - **The Local row best over M alone, in registers** (`monly`, kernels_pointers_impl.inl).
   With non-negative gap parameters (every row, when tracked) the row's maximum is an M
   cell and so is the FIRST cell reaching it in column order (a gap cell never exceeds the

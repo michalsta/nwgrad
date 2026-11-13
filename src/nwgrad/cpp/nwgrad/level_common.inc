@@ -111,6 +111,7 @@ struct NwgradLevelRegistrar {
                                 &NWGRAD_LVL_NAME::hb_scan_entry<T>,           // Hirschberg local endpoint scan
                                 &NWGRAD_LVL_NAME::score_entry<T>);            // score only
         register_level_grid<T>(NWGRAD_LVL_ENUM, NWGRAD_LVL_NAME::grid_fwd_ptr<T>());
+        register_level_profile<T>(NWGRAD_LVL_ENUM, &NWGRAD_LVL_NAME::profile_build_entry<T>);
     }
     template <class T>
     static void inter() {

@@ -1033,6 +1033,10 @@ struct TypedKernels {
     int                inter_w = 0;                  // the inter-pair lane count (pairs per call)
     using grid_fn = void (*)(GridFwdJob<T>&);
     grid_fn            grid_fwd = nullptr;           // TracebackMode::Grid's forward pass
+    // Test hook: the level's striped profile build (kernels_impl.inl, profile_build_entry).
+    using profile_fn = void (*)(T*, const T*, int, const unsigned char*, int, int, int,
+                                const uint32_t*, int);
+    profile_fn         profile_build = nullptr;
 };
 
 struct LevelKernels {
@@ -1121,6 +1125,10 @@ void register_level_inter(SimdLevel l, typename TypedKernels<T>::inter_fn inter_
 template <class T>
 NWGRAD_BASELINE_ONLY
 void register_level_grid(SimdLevel l, typename TypedKernels<T>::grid_fn grid_fwd);
+// The profile-build test hook.
+template <class T>
+NWGRAD_BASELINE_ONLY
+void register_level_profile(SimdLevel l, typename TypedKernels<T>::profile_fn profile_build);
 
 NWGRAD_BASELINE_ONLY
 void register_level_common(SimdLevel l, int row_block);
