@@ -1838,14 +1838,14 @@ private:
     // L1000 (2 MB) 0.60-0.72; from L1200 auto already runs Pointers (0.98-1.02).  AVX2 on
     // the same host keeps H to L1000 (Pointers / H 1.00-1.07), NEON too (spot: main's auto
     // 11-15 % ahead up to L1000), so they keep 2 MiB.
-    // AVX-512, int16 Global: 1 MiB (L ~720).  solace (PR #49 053ebc0, whose linear fill is
+    // AVX-512, int16 Global: 864 KiB (L ~665).  solace (PR #49 053ebc0, whose linear fill is
     // main's, 1 thread), Pointers / main's auto (H) time, DNA / protein: L600 (0.72 MB of H)
-    // 1.07 / 1.08, H wins; L800 (1.28 MB) 0.60 / 0.61; L1000 0.54 / 0.45; L1500 already
-    // Pointers.  L700 (0.99 MB) unmeasured: it keeps H, the side main is on.  Glocal: 2 MiB.
+    // 1.07-1.13, H wins; L700 (0.99 MB) 0.905-0.933 (H itself 0.975-1.01 of main); L800
+    // (1.28 MB) 0.60 / 0.61; L1000 0.54 / 0.45; L1500 already Pointers.  Glocal: 2 MiB.
     static constexpr size_t kLinearHTableBytes512 =
         !std::is_same_v<T, int16_t> ? kLinearHTableBytes
         : AM == AlignMode::Local    ? size_t(768) << 10
-        : AM == AlignMode::Global   ? size_t(1) << 20
+        : AM == AlignMode::Global   ? size_t(864) << 10
                                     : kLinearHTableBytes;
     size_t linear_h_table_bytes() const noexcept {
 #if !(defined(__aarch64__) || defined(_M_ARM64))
@@ -2697,12 +2697,13 @@ private:
     // 0.92, L2048 1.08 / 0.96 (2048-row `auto` 1.091 / 0.972: a DNA loss), L3000 DNA 0.52 --
     // L2500 DNA 0.551 (2026-11-12) -- so Global from 2500 rows.  Glocal, forced Grid L700 / L800
     // 0.53-0.60 (auto there was still main's), L1000 0.59 / 0.53, L1500 0.54 / 0.49, L2048
-    // 0.55 / 0.50 -- from 700 rows (L500 / L600 unmeasured).  PR #45's striped base case
+    // 0.55 / 0.50, L600 0.52-0.71 (2026-11-13; L400 / L500 neutral, 0.99-1.01) -- from 600
+    // rows.  PR #45's striped base case
     // moves the Global crossover to ~L1500 (0.55 / 0.54 there).
     static constexpr int kInt16GridMinRows512 =
         !std::is_same_v<T, int16_t> ? 0
         : AM == AlignMode::Global   ? 2500
-        : AM == AlignMode::Glocal   ? 700 : 0;
+        : AM == AlignMode::Glocal   ? 600 : 0;
     static constexpr int kInt16GridMinRowsAvx2 =
         (std::is_same_v<T, int16_t> && AM == AlignMode::Global) ? 1000 : 0;
     static int int16_grid_min_rows(int backend) noexcept {

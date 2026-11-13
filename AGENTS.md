@@ -1378,8 +1378,8 @@ really takes (`test_tracked_long_global_float32_pairs_run_their_own_fill`).  fuz
   in every cell (0.47-0.85). So int16 Global and Glocal `auto` runs Grid past hb_cutoff
   (`int16_grid_min_rows`), except AVX-512 -- Global from 2500 rows (solace, Grid with its
   scalar base / pmax: DNA / protein L1000 1.24 / 1.09, L1500 1.05 / 0.92, L2048 0.96-1.08,
-  L2500 DNA 0.551, L3000 DNA 0.52), Glocal from 700 (L700-L2048 0.49-0.60; L500 / L600
-  unmeasured, hb_cutoff if they win) -- and AVX2 Global from 1000 rows (nighthaven: DNA L600 grid / pmax 1.013 at 1
+  L2500 DNA 0.551, L3000 DNA 0.52), Glocal from 600 (L600 0.52-0.71, L700-L2048 0.49-0.60;
+  L400 / L500 neutral, 0.99-1.01) -- and AVX2 Global from 1000 rows (nighthaven: DNA L600 grid / pmax 1.013 at 1
   thread, 1.038 at 6, on Grid's scalar base case; protein L600 0.83-0.85; Glocal 0.25-0.56
   everywhere, so it keeps hb_cutoff; PR #45's striped base should let the floor drop). Scores unchanged (pmax is exact for integers). PR #45 (`proto/grid-base-simd`)
   makes int16 Grid cheaper still.
@@ -1387,7 +1387,7 @@ really takes (`test_tracked_long_global_float32_pairs_run_their_own_fill`).  fuz
   AVX-512 int16 Global floor (`kInt16GridMinRows512`) from 2500 to ~1500 rows: with the
   striped base, solace measured Grid / pmax L1500 0.55 / 0.54, L2048 0.48 / 0.45.
   **Release note: int16 Global / Glocal `traceback="auto"` paths may change at ties** (past
-  512 rows; AVX-512 Global from 2500, Glocal from 700; AVX2 Global from 1000): they are now Grid's, i.e. `traceback="pointers"`' path, not
+  512 rows; AVX-512 Global from 2500, Glocal from 600; AVX2 Global from 1000): they are now Grid's, i.e. `traceback="pointers"`' path, not
   hirschberg_pmax's. Scores are identical. Seen in the sse4 sweep: Global DNA L600 and L3000,
   Glocal DNA L600 / L1000 / L3000 cigars differ from main's; protein L600-2000 unchanged.
 - **Local, one pass** (same branch): with every gap parameter >= 0 and a top level above the
@@ -1478,9 +1478,9 @@ really takes (`test_tracked_long_global_float32_pairs_run_their_own_fill`).  fuz
   (`kLinearHTableBytes512`, branch `proto/gate-fixes`, 2026-11-10): solace (Tiger Lake, 1.25
   MiB L2), Pointers / H time, DNA and protein, 1 / 8 threads: L500 1.03-1.19 (H wins), L700
   0.98 / 0.88, L1000 0.60-0.72; AVX2 on the same host keeps H to L1000 (1.00-1.07) and spot's
-  NEON too, so both keep 2 MiB. **AVX-512 int16 Global: 1 MiB** (solace, 1 thread, Pointers /
-  H: L600 1.07 / 1.08 DNA / protein, H wins; L800 0.60 / 0.61; L1000 0.54 / 0.45; L700
-  unmeasured, kept on H). int16 Glocal and the other types unmeasured there: 2 MiB.
+  NEON too, so both keep 2 MiB. **AVX-512 int16 Global: 864 KiB, ~L665** (solace, 1 thread,
+  Pointers / H: L600 1.07-1.13, H wins; L700 0.905-0.933; L800 0.60 / 0.61; L1000 0.54 /
+  0.45). int16 Glocal and the other types unmeasured there: 2 MiB.
   Same path either way (Pointers and H break ties alike).
 - **Linear Hirschberg** (`viterbi_linear_hirschberg`, `lhb_solve` / `lhb_sweep` / `lhb_base`):
   no gap state crosses a row cut, so the join is a plain argmax of forward + reverse
