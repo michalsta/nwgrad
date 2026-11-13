@@ -193,7 +193,6 @@ struct ViterbiJob {
     const T* blk; int nalpha;               // substitution block, row-major nalpha×nalpha
     T go_a, ge_a, go_b, ge_b;               // gap penalties (in the Viterbi precision)
     int   align_mode;                       // 0 = Global, 1 = Local, 2 = Glocal
-    int   sg = kSgGlocal;                   // align_mode 2: the free ends (kSgFree*)
     int   align_band;                       // 0 = Full,   1 = GuideBanded
     int   band;                             // half-width (band>0)
     const int* guide_j; int guide_len;      // guide path for GuideBanded (may be null)
@@ -213,6 +212,9 @@ struct ViterbiJob {
     // 0.75 B/cell affine).  Out: 1 if the kernel wrote them, 0 if it wrote one byte a cell
     // (it clears the request it cannot honour: int16 lanes).
     int dense = 0;
+    // align_mode 2: the free ends (kSgFree*).  Last, so every member before it keeps main's
+    // offset: inserted beside align_mode it moved the code of kernels that never read it.
+    int sg = kSgGlocal;
 };
 
 // The dense direction codes' geometry, shared by the kernels and the walks.  Per DP row:
@@ -255,12 +257,12 @@ struct ScoreJob {
     const T* blk; int nalpha;
     T go_a, ge_a, go_b, ge_b;
     int local;                              // 0 = Global, 1 = Local, 2 = Glocal (AlignMode)
-    int sg = kSgGlocal;                     // local 2: the free ends (kSgFree*)
     int variant;                            // 0 auto, 1 two-pass, 2 fused three-state (measuring)
     int linear = 0;                         // 1: linear gaps (go_a = go_b = 0), the one-row kernel
     DpBufferT<T>* buf;
     T score;                                // out
     TrackJob<T> tr;                         // tracked rows (tr.on()), else untracked
+    int sg = kSgGlocal;                     // local 2: the free ends (kSgFree*); last, as ViterbiJob's
 };
 
 // ── Grid forward pass (TracebackMode::Grid) ──────────────────────────────────
