@@ -140,11 +140,17 @@ def test_batch_grid_equals_pointers_integer_types(tname, mode, pi):
     _same(_run(cls, A, B, p, "grid", mode, 2), _run(cls, A, B, p, "pointers", mode, 2))
 
 
-@pytest.mark.parametrize("tname", ["int32", "int64"])   # int16 Global / Glocal keep pmax
+@pytest.mark.parametrize("tname", ["int16", "int32", "int64"])
 @pytest.mark.parametrize("mode", ["global", "local", "glocal"])
 def test_auto_integer_takes_grid_where_it_split(tname, mode):
     # integer pairs past hb_cutoff that `auto` splits (hirschberg_pmax; Global int16 / int32
-    # and Glocal have no pointer budget): Grid, i.e. Pointers' result and ties
+    # and Glocal have no pointer budget): Grid, i.e. Pointers' result and ties.  int16
+    # Global / Glocal on AVX-512 take Grid from 2500 / 600 rows only, Global on AVX2 from 1000
+    # (int16_grid_min_rows).
+    if tname == "int16" and mode != "local" and nwgrad.simd_isa() == "avx512":
+        pytest.skip("int16 Global / Glocal take Grid from 2500 / 600 rows on AVX-512")
+    if tname == "int16" and mode == "global" and nwgrad.simd_isa() == "avx2":
+        pytest.skip("int16 Global takes Grid from 1000 rows on AVX2")
     A, B = related_pairs(6, 200, 400, seed=3)
     cls, p = BATCHES[tname], PARAMS[0]
     _same(_run(cls, A, B, p, "auto", mode, 2, cutoff=64), _run(cls, A, B, p, "pointers", mode, 2, cutoff=64))

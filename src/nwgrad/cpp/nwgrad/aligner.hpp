@@ -951,7 +951,11 @@ struct Aligner {
                     job.ge_b = static_cast<T>(params_->gap_extend_b);
                     job.local = AM == AlignMode::Local ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
                     job.variant = score_variant_env();
-                    job.linear = lin && score_linear_env();
+#if defined(__aarch64__) || defined(_M_ARM64)
+                    job.linear = lin && linear_score_one_row(backend, n_, nalpha_);
+#else
+                    job.linear = lin && linear_score_one_row(backend, n_);
+#endif
                     job.buf = &buf;
                     if (tr_) fill_track_job_(job.tr, true, static_cast<size_t>(n_) + 16, lin);
                     fn(job);
@@ -1884,17 +1888,15 @@ private:
         // than Pointers and 2.1-5.5x than pmax (skynet sse4, AGENTS.md "Grid traceback").
         // Within the budget Pointers stays; a tracked pair or the scalar backend keeps pmax.
         // The batch planners ask hb_splits of pmax, true either way, so such pairs run their
-        // own fill in both cases.  NOT int16 Global / Glocal: at 32 int16 lanes (AVX-512,
-        // solace) pmax beat Grid on L1000-class protein pairs, `auto` 1.09-1.24x slower
-        // with Grid (DNA L3000 0.53x faster; nighthaven AVX2 int16 Global L1000 0.84-0.91x),
-        // so they keep pmax, as on main; traceback="grid" stays available for them.  int16
-        // Local takes Grid (above the budget, where pmax's two endpoint scans are the cost).
-        if constexpr (GM == GapModel::Affine && AB == AlignBand::Full && nw_is_int<T> &&
-                      !(sizeof(T) == 2 && AM != AlignMode::Local))
+        // own fill in both cases.  int16 Global / Glocal take Grid from int16_grid_min_rows
+        // (below): hb_cutoff except on AVX-512.  int16 Local takes Grid (above the budget,
+        // where pmax's two endpoint scans are the cost).
+        if constexpr (GM == GapModel::Affine && AB == AlignBand::Full && nw_is_int<T>)
             if (tb_auto_ && tb_ == TracebackMode::HirschbergPmax &&
                 hb_splits(tb_, kAutoPointerCells, hb_cutoff_, m_, n_)) {
                 const int be = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
-                if (be != kBackendScalar && grid_ok_(level_kernels(be))) return TracebackMode::Grid;
+                if (be != kBackendScalar && m_ >= int16_grid_min_rows(be) && grid_ok_(level_kernels(be)))
+                    return TracebackMode::Grid;
             }
         return tb_;
     }
@@ -1919,12 +1921,51 @@ private:
     // wins 1.6x up to L=350 (1 MB), ties at L=500 (2 MB), loses 2.4x at 700 and 3.5x
     // at 1000.  Same path either way, so this is a speed choice only.
     static constexpr size_t kLinearHTableBytes = size_t(2) << 20;
+    // AVX-512, int16 Local: 1 MiB (L ~720).  solace (Tiger Lake, 1.25 MiB L2), branch
+    // narrow-paths 7939230 whose linear fill is main's, Pointers / auto (H) time, DNA and
+    // protein, 1 / 8 threads: L500 (0.5 MB of H) 1.03-1.19, H wins; L700 (0.99 MB) 0.98 /
+    // 0.88; L1000 (2 MB) 0.60-0.72; from L1200 auto already runs Pointers (0.98-1.02).  A
+    // 768 KiB cap sent L700 to Pointers and lost there (PR #55 phase 3: DNA L700 1T 1.074-
+    // 1.080, instructions 1.085), so L700 stays on H; L800 (1.28 MB) and up take Pointers.
+    // AVX2 on the same host keeps H to L1000 (Pointers / H 1.00-1.07), NEON too (spot:
+    // main's auto 11-15 % ahead up to L1000), so they keep 2 MiB.
+    // AVX-512, int16 Global: 864 KiB (L ~665).  solace (PR #49 053ebc0, whose linear fill is
+    // main's, 1 thread), Pointers / main's auto (H) time, DNA / protein: L600 (0.72 MB of H)
+    // 1.07-1.13, H wins; L700 (0.99 MB) 0.905-0.933 (H itself 0.975-1.01 of main); L800
+    // (1.28 MB) 0.60 / 0.61; L1000 0.54 / 0.45; L1500 already Pointers.  Glocal: 2 MiB.
+    static constexpr size_t kLinearHTableBytes512 =
+        !std::is_same_v<T, int16_t> ? kLinearHTableBytes
+        : AM == AlignMode::Local    ? size_t(1) << 20
+        : AM == AlignMode::Global   ? size_t(864) << 10
+                                    : kLinearHTableBytes;
+    // Whether an `auto` pair's H table is past its level's cap.  The level is looked up only
+    // for a table between the AVX-512 cap and the common one (int16 Local / Global past
+    // 864 KiB-1 MiB); every other pair -- the short ones above all -- pays one compare, as on
+    // main (PR #55 phase 3: resolving the level for every pair cost short linear int16 paths
+    // +0.7-0.9 % instructions).
+    // The AVX-512 test lives out of line (noinline, cold): inlined, it made gcc outline
+    // compute_viterbi and the traceback's subT() in the int16 linear instantiations, +0.3-0.8 %
+    // instructions on short paths (sse4 counts).
+    [[gnu::noinline, gnu::cold]] bool linear_h_table_avx512_() const noexcept {
+#if !(defined(__aarch64__) || defined(_M_ARM64))
+        const int be = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
+        return be == static_cast<int>(SimdLevel::Avx512);
+#else
+        return false;
+#endif
+    }
+    bool linear_h_table_exceeds(size_t bytes) const noexcept {
+        if (bytes > kLinearHTableBytes) return true;
+        if constexpr (kLinearHTableBytes512 < kLinearHTableBytes)
+            if (bytes > kLinearHTableBytes512) [[unlikely]] return linear_h_table_avx512_();
+        return false;
+    }
     bool linear_ptr_fill() const noexcept {
         if constexpr (GM != GapModel::Linear || AB != AlignBand::Full) return false;
         else {
             if (is_hirschberg(tb_) || tb_ == TracebackMode::Grid) return true;
             if (tb_ != TracebackMode::Pointers) return false;
-            return !tb_auto_ || sz_ * sizeof(T) > kLinearHTableBytes;
+            return !tb_auto_ || linear_h_table_exceeds(sz_ * sizeof(T));
         }
     }
 
@@ -2741,6 +2782,40 @@ private:
     static int local_grid_min_rows(int backend) noexcept {
 #if !(defined(__aarch64__) || defined(_M_ARM64))
         if (backend == static_cast<int>(SimdLevel::Avx512)) return kLocalGridMinRows512;
+#endif
+        (void)backend;
+        return 0;
+    }
+    // int16 Global / Glocal `auto` (run_tb_): the rows from which a splitting pair runs Grid
+    // instead of hirschberg_pmax, beyond hb_splits' m > hb_cutoff.  Until 2026-11-10 they kept
+    // pmax everywhere, for AVX-512 (solace, 32 int16 lanes), where Grid made `auto` 1.09-1.24x
+    // slower at L1000 protein (DNA L3000 0.53x).  Every other level loses with pmax: spot (M1,
+    // NEON, 1 thread) grid / pmax DNA L1000 0.912, protein L1000 0.870, DNA L3000 0.492
+    // (results/spot.md "Round 2"); nighthaven AVX2 L1000 0.84-0.91; skynet-class sse4 see
+    // AGENTS.md "int16 Global auto takes Grid".  So hb_cutoff there; AVX-512 below
+    // (kInt16GridMinRows512).  Local: 0 (Grid past the budget, as before).
+    // AVX2, Global only: from 1000 rows.  nighthaven (2026-11-10, PR #55) grid / pmax DNA L600
+    // 1.013 at 1 thread, 1.038 at 6 (Grid's scalar base case: 0.300 vs pmax's 0.295 ns/cell),
+    // protein L600 0.83-0.85, L1000 up wins; Glocal wins everywhere (0.25-0.56), so it keeps
+    // hb_cutoff.  PR #45's striped Grid base case should let this floor drop to hb_cutoff.
+    // AVX-512 (solace, Tiger Lake, 1 thread, 2026-11-11, PR #55 against main's pmax `auto`):
+    // Global, forced Grid (scalar base case) DNA / protein L1000 1.24 / 1.09, L1500 1.05 /
+    // 0.92, L2048 1.08 / 0.96 (2048-row `auto` 1.091 / 0.972: a DNA loss), L3000 DNA 0.52 --
+    // L2500 DNA 0.551 (2026-11-12) -- so Global from 2500 rows.  Glocal, forced Grid L700 / L800
+    // 0.53-0.60 (auto there was still main's), L1000 0.59 / 0.53, L1500 0.54 / 0.49, L2048
+    // 0.55 / 0.50, L600 0.52-0.71 (2026-11-13; L400 / L500 neutral, 0.99-1.01) -- from 600
+    // rows.  PR #45's striped base case
+    // moves the Global crossover to ~L1500 (0.55 / 0.54 there).
+    static constexpr int kInt16GridMinRows512 =
+        !std::is_same_v<T, int16_t> ? 0
+        : AM == AlignMode::Global   ? 2500
+        : AM == AlignMode::Glocal   ? 600 : 0;
+    static constexpr int kInt16GridMinRowsAvx2 =
+        (std::is_same_v<T, int16_t> && AM == AlignMode::Global) ? 1000 : 0;
+    static int int16_grid_min_rows(int backend) noexcept {
+#if !(defined(__aarch64__) || defined(_M_ARM64))
+        if (backend == static_cast<int>(SimdLevel::Avx512)) return kInt16GridMinRows512;
+        if (backend == static_cast<int>(SimdLevel::Avx2))   return kInt16GridMinRowsAvx2;
 #endif
         (void)backend;
         return 0;
@@ -4668,14 +4743,56 @@ private:
         return v;
     }
 
-    // NWGRAD_SCORE_LINEAR=affine: linear gaps through the affine D/X kernel with zero opens
-    // (the form before score_linear_striped; for measuring it in one binary).
-    static bool score_linear_env() {
-        static const bool on = [] {
+    // NWGRAD_SCORE_LINEAR: unset = the per-level gate (linear_score_one_row), "affine" =
+    // always the affine D/X kernel with zero opens (the form before score_linear_striped),
+    // "onerow" = always score_linear_striped -- for measuring both in one binary.
+    // 0 / 1 / 2 = gate / affine / onerow.
+    static int score_linear_env() {
+        static const int v = [] {
             const char* e = std::getenv("NWGRAD_SCORE_LINEAR");
-            return !(e && std::string_view(e) == "affine");
+            if (!e) return 0;
+            const std::string_view s(e);
+            return s == "affine" ? 1 : s == "onerow" ? 2 : 0;
         }();
-        return on;
+        return v;
+    }
+    // Linear score-only: the B lengths [lo, hi] at which the zero-open affine kernel beats
+    // the one-row kernel (score_linear_striped) on a level; elsewhere one-row.  Both give the
+    // same score bit for bit, so this moves speed only.  NEON (spot, M1, 1 thread, 2026-11-10,
+    // results/spot.md "Round 2", affine-route time / one-row time, 20 %-mutated L x L pairs
+    // and miRNA 22 x 50, control 0.995-1.019):
+    // - int16 Global, n 81-104 (11-13 segments of 8 lanes): L100 DNA / protein 0.940 / 0.945;
+    //   L70 1.21-1.23 and L150 1.32-1.34 win, as int16 Local does at every length.
+    // - double Global n < 80: L50 0.921 / 0.987, L70 0.891 / 0.963, miRNA 22 x 50 0.92;
+    //   L100 1.07-1.09.  double Local n < 60: L50 0.912 / 0.946, miRNA 0.92; L70 1.08-1.09.
+    // - float32 Local n 81-104, alphabets of up to 8 letters only (kLinScoreAffineF32MaxAlpha,
+    //   the small-alphabet test of the fill gates): L100 DNA 0.940 (L70 DNA 0.984 and L150
+    //   1.07-1.09 stay one-row).  Protein keeps one-row: L70-L100 1.00-1.04 for one-row, and
+    //   routed (47fbe3c) protein float32 Local L90 lost 1.037 (control 1.000; spot,
+    //   results/spot.md "PR55 gate-fixes 47fbe3c").  float32 Global is flat (1.00-1.04).
+    //   The int16 and double windows won on protein as well (int16 L100 0.945; double
+    //   Global L50 / L70 0.987 / 0.963, Local L50 0.946): every alphabet.
+    // Glocal takes Global's windows (unmeasured).  x86: one-row at every length; see
+    // AGENTS.md "Linear score-only gate" for the sse4 counts (AVX2 / AVX-512 pending).
+    struct NSpan { int lo, hi; };
+    static constexpr NSpan kLinScoreAffineNeon =
+        std::is_same_v<T, int16_t> ? (AM == AlignMode::Local ? NSpan{1, 0} : NSpan{81, 104})
+        : std::is_same_v<T, float> ? (AM == AlignMode::Local ? NSpan{81, 104} : NSpan{1, 0})
+        : std::is_same_v<T, double> ? (AM == AlignMode::Local ? NSpan{0, 59} : NSpan{0, 79})
+                                    : NSpan{1, 0};
+    static constexpr size_t kLinScoreAffineF32MaxAlpha = 8;
+    // nalpha: passed on AArch64 only (the x86 call is unchanged, so are its objects).
+    static bool linear_score_one_row(int backend, int n, size_t nalpha = 0) noexcept {
+        if (const int e = score_linear_env()) return e == 2;
+        (void)backend;
+#if defined(__aarch64__) || defined(_M_ARM64)
+        if constexpr (std::is_same_v<T, float> && AM == AlignMode::Local)
+            if (nalpha > kLinScoreAffineF32MaxAlpha) return true;
+        return !(n >= kLinScoreAffineNeon.lo && n <= kLinScoreAffineNeon.hi);
+#else
+        (void)n; (void)nalpha;
+        return true;
+#endif
     }
 
     double score_affine_scalar(DpBuffer& buf) const {

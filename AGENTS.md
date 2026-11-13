@@ -1145,7 +1145,8 @@ scalar_fallback / sse2 / sse4, the Python suite (5505), `tools/fuzz_ab.py` main 
 seeds, 0 differ) and an int16/int32/int64/float32/double x Global/Local/Glocal x level x fill A/B
 of linear score-only batches against main (400 seeds, 36000 batches, every score's bytes equal).
 Two mutations (lazy-F one round; the lane carry-in dropped) fail 3 of the 5 `[score]` cases.
-`NWGRAD_SCORE_LINEAR=affine` runs the old route (an A/B switch in one binary).
+`NWGRAD_SCORE_LINEAR=affine` runs the old route (an A/B switch in one binary; `onerow` the new
+one at every length, past the gate below).
 Measured (skynet sse4, 1 thread, `fill="striped"` batches, `perf stat instructions:u` differenced
 between 1 and 4 repetitions, so per cell of the kernel; protein BLOSUM62 0/4, DNA +2/-4 0/2, 20 %
 mutated homologues; new / old instructions, A/A of the new arm 1.00 on every row):
@@ -1163,6 +1164,22 @@ inner loop at sse4 is 32 instructions per two segments (16 a vector cell, 4 a ce
 vector cell for the D/X form. First tried: the integer form with pass 2 kept (the D/X kernel's
 shape, three rows): only 0.92-0.93 of the old instructions; dropping pass 2 gave the rest. NEON,
 AVX2 and AVX-512 compile, untested at runtime (skynet cannot run them).
+
+**Linear score-only gate (branch `proto/gate-fixes`, 2026-11-10).** 56f4d3e sent every linear
+score-only call to the one-row kernel, ungated, and on the M1 it loses in three windows (spot,
+1 thread, affine-route / one-row time, results/spot.md "Round 2"): int16 Global at B 81-104
+(11-13 segments of 8 lanes; L100 DNA / protein 0.940 / 0.945, L70 and L150 win 1.2-1.3x),
+double at short B (Global L50 0.92 / 0.99, L70 0.89 / 0.96; Local L50 0.91 / 0.95; miRNA 22 x
+50 0.92), float32 Local DNA L100 0.940 (protein 1.00). `Aligner::linear_score_one_row`
+routes those B lengths (`kLinScoreAffineNeon`: int16 Global / Glocal n 81-104, float32 Local
+n 81-104 over alphabets of up to 8 letters only -- protein L90 lost 1.037 there on spot --,
+double Global / Glocal n < 80, Local n < 60) through the zero-open affine kernel on
+AArch64; bit-identical either way. x86 stays one-row everywhere: wloczykij sse4,
+`instructions:u` affine-route / one-row, 1 thread, BLAS pinned, A/A 0.997-1.002, L50-L300
+DNA and protein, Global and Local: int16 1.31-1.81, float32 1.29-1.69 (DNA Global and the
+miRNA cells 1.00: the shared fill takes them), double 1.43-1.72, miRNA double 1.51 / 1.59 --
+no window at all, so the M1's is microarchitectural. AVX2 / AVX-512 timing pending
+(nighthaven, solace). `NWGRAD_SCORE_LINEAR` = `affine` / `onerow` forces either route.
 
 ### Grid traceback: `traceback="grid"` (branch `cc/grid-traceback`, 2026-10-26)
 
@@ -1356,14 +1373,36 @@ really takes (`test_tracked_long_global_float32_pairs_run_their_own_fill`).  fuz
 - **`auto`** (`run_tb_`): integer `auto` stays `hirschberg_pmax` (kDefaultTb) and a pair that
   SPLITS (`hb_splits`: past hb_cutoff and, where the type has one, past the pointer budget —
   Local and Global int64 2^25; Global int32 and Glocal have none) runs Grid where
-  grid_ok_ — except int16 Global / Glocal, which keep pmax: on solace (AVX-512, 32 int16
-  lanes) Grid made int16 Global `auto` 1.09-1.24x SLOWER at L1000 protein (DNA L3000 0.53x;
-  nighthaven AVX2 0.84-0.91x), and the merge rule is no regression on any host.  This is the floating rule's integer half: floating T resolves to Grid and runs
+  grid_ok_ — int16 Global / Glocal included since 2026-11-10 (below: "int16 Global auto takes
+  Grid"); until then they kept pmax because on solace (AVX-512, 32 int16 lanes) Grid made int16
+  Global `auto` 1.09-1.24x SLOWER at L1000 protein (DNA L3000 0.53x; nighthaven AVX2
+  0.84-0.91x), and the merge rule is no regression on any host.  This is the floating rule's integer half: floating T resolves to Grid and runs
   Pointers within Local's budget; integer T resolves to pmax and runs Grid past it — the
   same Pointers-within / Grid-beyond split in both.  Within the budget Pointers stays;
   tracked pairs / the scalar backend keep pmax; the planners ask hb_splits of pmax, true
   either way, so these pairs keep their own fill.  Scores are unchanged (pmax is exact for
   integers); paths become Pointers' wherever Hirschberg broke a tie differently.
+- **int16 Global auto takes Grid (branch `proto/gate-fixes`, 2026-11-10).** pmax was never
+  the best int16 Global traceback off AVX-512. spot (M1, NEON, 1 thread, time): grid / auto
+  (pmax) DNA L1000 0.912, protein L1000 0.870, DNA L3000 0.492 (Pointers 0.915 / 0.857 / 0.910).
+  wloczykij sse4, `instructions:u`, 1 thread, A/A 1.000: Global grid / auto DNA L600 / 1000 /
+  2000 / 3000 0.71 / 0.72 / 0.68 / 0.43, protein L600-2000 0.65-0.69; Glocal (pmax there is
+  ~2x Pointers) DNA 0.36 / 0.36 / 0.34 / 0.22, protein 0.35 / 0.35 / 0.33; Grid beats Pointers
+  in every cell (0.47-0.85). So int16 Global and Glocal `auto` runs Grid past hb_cutoff
+  (`int16_grid_min_rows`), except AVX-512 -- Global from 2500 rows (solace, Grid with its
+  scalar base / pmax: DNA / protein L1000 1.24 / 1.09, L1500 1.05 / 0.92, L2048 0.96-1.08,
+  L2500 DNA 0.551, L3000 DNA 0.52), Glocal from 600 (L600 0.52-0.71, L700-L2048 0.49-0.60;
+  L400 / L500 neutral, 0.99-1.01) -- and AVX2 Global from 1000 rows (nighthaven: DNA L600 grid / pmax 1.013 at 1
+  thread, 1.038 at 6, on Grid's scalar base case; protein L600 0.83-0.85; Glocal 0.25-0.56
+  everywhere, so it keeps hb_cutoff; PR #45's striped base should let the floor drop). Scores unchanged (pmax is exact for integers). PR #45 (`proto/grid-base-simd`)
+  makes int16 Grid cheaper still.
+  **TODO (when PR #45's striped Grid base case and this gate are both on main):** drop the
+  AVX-512 int16 Global floor (`kInt16GridMinRows512`) from 2500 to ~1500 rows: with the
+  striped base, solace measured Grid / pmax L1500 0.55 / 0.54, L2048 0.48 / 0.45.
+  **Release note: int16 Global / Glocal `traceback="auto"` paths may change at ties** (past
+  512 rows; AVX-512 Global from 2500, Glocal from 600; AVX2 Global from 1000): they are now Grid's, i.e. `traceback="pointers"`' path, not
+  hirschberg_pmax's. Scores are identical. Seen in the sse4 sweep: Global DNA L600 and L3000,
+  Glocal DNA L600 / L1000 / L3000 cigars differ from main's; protein L600-2000 unchanged.
 - **Local, one pass** (same branch): with every gap parameter >= 0 and a top level above the
   base size, the top level's forward finds the end cell itself (`GridFwdJob::find_best`, a
   `Best` instantiation: per lane the largest M and its first segment, as the Pointers
@@ -1387,7 +1426,7 @@ really takes (`test_tracked_long_global_float32_pairs_run_their_own_fill`).  fuz
   | 3000 | f32 Local | 3.65 / 26.2 | 3.65 / 26.2 (Pointers) | **1.92 / 13.4** | 4.50 / 28.9 | 3.75 / 26.2 |
   | 3000 | f32 / f64 Global | 2.02 / 12.05, 2.93 / 17.1 | 2.04 / 12.06, 2.97 / 16.8 | 1.98, 2.96 | 2.01, 3.17 | 3.59, 6.19 |
 
-  int32 Global `auto` 1.7-2.3x faster than main's (pmax); int16 Global keeps pmax.  Local within the 2^25 budget:
+  int32 Global `auto` 1.7-2.3x faster than main's (pmax); int16 Global kept pmax (until 2026-11-10).  Local within the 2^25 budget:
   `auto` stays Pointers on both sides (with one pass Grid would win 1.7-2.2x there on sse4;
   the budget was set against the two-pass form and is left to a fleet re-measure).  Above
   it (6300 x 6050, before the merge): int32 `auto` 1.94 ns/cell against pmax's 8.61.
@@ -1448,7 +1487,18 @@ really takes (`test_tracked_long_global_float32_pairs_run_their_own_fill`).  fuz
   under `auto` (which resolves to pointers for linear) a pair whose H table is ≤ 2 MiB
   keeps H. Measured (nighthaven, double Global, 12 threads): H 1.6× faster up to L=350,
   tie at 500, pointers 2.4× at 700 and 3.5× at 1000; `auto` tracks the faster one on both
-  sides. Explicit `pointers` always records bytes.
+  sides. Explicit `pointers` always records bytes. **AVX-512 int16 Local: 1 MiB**
+  (`kLinearHTableBytes512`, branch `proto/gate-fixes`, 2026-11-10/13): solace (Tiger Lake, 1.25
+  MiB L2), Pointers / H time, DNA and protein, 1 / 8 threads: L500 1.03-1.19 (H wins), L700
+  0.98 / 0.88, L1000 0.60-0.72; a first cap of 768 KiB sent L700 to Pointers and lost there
+  (phase 3: DNA L700 1T 1.074-1.080), so L700 stays on H and L800 up takes Pointers.
+  The level is resolved only for a table between the AVX-512 cap and 2 MiB
+  (`linear_h_table_exceeds`): resolving it for every pair cost short linear int16 paths
+  0.7-0.9 % instructions; AVX2 on the same host keeps H to L1000 (1.00-1.07) and spot's
+  NEON too, so both keep 2 MiB. **AVX-512 int16 Global: 864 KiB, ~L665** (solace, 1 thread,
+  Pointers / H: L600 1.07-1.13, H wins; L700 0.905-0.933; L800 0.60 / 0.61; L1000 0.54 /
+  0.45). int16 Glocal and the other types unmeasured there: 2 MiB.
+  Same path either way (Pointers and H break ties alike).
 - **Linear Hirschberg** (`viterbi_linear_hirschberg`, `lhb_solve` / `lhb_sweep` / `lhb_base`):
   no gap state crosses a row cut, so the join is a plain argmax of forward + reverse
   scores. Local uses the affine path's endpoint reduction (clamped forward scan,
@@ -2737,6 +2787,21 @@ slower than the better arm, up to 2.65x. What the data said, gate by gate:
   gather caps stay one value per gap model. And the shared LINEAR hard fill of int64 over
   small alphabets loses at SSE (sse4 1.06-1.2, sse2 2-2.5x) and on the M1 (1.15-1.34):
   `linear_small` = 0 there, no cap elsewhere.
+- **float32 Global over small alphabets had no cap** (`score_small_global` = kGateNoCap on
+  SSE, AVX2 and NEON; fixed on branch `proto/gate-fixes`, 2026-11-10): the sweep above ran 22 x L
+  pairs only, so every long DNA float32 Global score-only call took the shared fill
+  (`fill="interpair"`'s speed). The M1 (spot, 1 thread, L x L): striped / default time linear
+  0.62 / 0.59 / 0.38 at L1000 / 2000 / 3000, affine 0.78 / 0.68 / 0.64; 7c69934's inter-lookup
+  made that fill erratic at L >= 2000 (L3000 linear 1.52x 9845e77). sse4 (wloczykij,
+  `instructions:u`, striped / shared, A/A 0.999-1.003): linear L100 1.08, L150 1.00, L200 0.95,
+  L500 0.85, L1000-3000 0.82-0.80; affine L500 1.06, L700 1.00, L1000 0.99, L2000 0.91, L3000
+  0.89; short A stays shared (22 x 200-3000 linear 1.19-1.33, affine 1.39-1.52; 40 x 3000 1.03 /
+  1.21; 100 x 1000 linear 0.91, affine 1.15). nighthaven AVX2 (time): linear L300 1.07, L500
+  0.90, L1000 0.78, L2000-3000 0.56-0.75, 100 x 3000 0.78; affine the shared fill wins almost
+  everywhere (striped 1.08-1.50 at L300-700, 1.12-1.40 at L2000-3000; L1000 alone 0.92-0.97).
+  spot with the cap: L300 1.000, L500 linear 0.755 / affine 0.925. So the cap is per gap model
+  (`f32_small_global_lin` for linear, `score_small_global` affine): SSE 200000 / 10^6 cells,
+  AVX2 200000 / none, NEON 250000 / 250000, AVX-512 4 x 10^7 / 4 x 10^7.
 - **The linear hard gather caps (`inter_linear_*_gather_cells`, `inter_global_linear_*`).**
   The integer caps (15000 / 6000 cells) were too high: int16 and int32 cross at L60-80
   (4000 cells) on every x86 level, int64 at L40-60 on AVX2 (2500; solace's avx2 run has
