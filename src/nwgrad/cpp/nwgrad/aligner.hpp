@@ -2953,8 +2953,9 @@ private:
     // Affine ...)`, and linear has no Grid (an explicit "grid" runs Pointers), so a linear
     // int16 Local pair never reads this floor and keeps main's choice (the H table under
     // `auto`; spot NEON: it beats pointers and grid by 11-15 % up to L1000).  spot measured
-    // Per level (2026-11-11): AVX2 1000 (nighthaven, above); NEON 700 (spot M1: Grid / main's
-    // Pointers 0.956-0.978 at L700, a tie at L500); AVX-512 never (solace: int16 Grid at 32
+    // Per level (2026-11-11): AVX2 1000 (nighthaven, above); NEON 600 (spot M1: Grid / main's
+    // Pointers 0.956-0.978 at L700, 0.946-0.977 at L700-L1000 with the floor at 700, a floor
+    // of 600 a further 1.4-3.5 %, a tie at L500); AVX-512 never (solace: int16 Grid at 32
     // lanes is slow -- forced grid / pointers 1.70-1.85 at L700, the branch's auto 1.6-1.8x
     // main's at L1000-L1500, DNA and protein, 1 and 8 threads; Pointers stays until the Grid
     // base block changes); sse2 / sse4 1000 (the instruction counts above favour Grid from
@@ -2963,7 +2964,7 @@ private:
     // L1000-L1500, 1 thread, where nighthaven (Alder Lake, the primary target) had Grid 3-9 %
     // faster at 1 and 6 threads; a level constant cannot tell them apart and a Tiger Lake runs
     // the AVX-512 level anyway, so AVX2 follows nighthaven.
-    static constexpr int kLocalGridMinRowsI16Avx2 = 1000, kLocalGridMinRowsI16Neon = 700,
+    static constexpr int kLocalGridMinRowsI16Avx2 = 1000, kLocalGridMinRowsI16Neon = 600,
                          kLocalGridMinRowsI16Sse = 1000, kLocalGridOff = std::numeric_limits<int>::max();
     static int local_grid_min_rows(int backend) noexcept {
         int r = 0;

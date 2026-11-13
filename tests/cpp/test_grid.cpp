@@ -345,7 +345,7 @@ TEST_CASE("auto takes Grid for integer T where it splits", "[grid][traceback]") 
         if (simd) REQUIRE(l.alignment() == lp.alignment());
         Aligner<GapModel::Affine, AlignMode::Local, AlignBand::Full, int16_t> l16;
         run(l16, TracebackMode::Default, kern, A, B);
-        // int16 Local: Grid from a floor per level (local_grid_min_rows): NEON 700, AVX2 and
+        // int16 Local: Grid from a floor per level (local_grid_min_rows): NEON 600, AVX2 and
         // sse 1000, AVX-512 never; 800 rows here, 1100 below
 #if defined(__aarch64__) || defined(_M_ARM64)
         const bool g800 = simd, g1100 = simd;
