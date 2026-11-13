@@ -26,7 +26,7 @@ CLASSES = {"double": nwgrad.SeqPairBatchDouble, "float32": nwgrad.SeqPairBatch}
 
 @pytest.fixture(autouse=True)
 def _reset():
-    # Always defer (2, the default) pinned for the semantic tests; adaptive (1) has its own test.
+    # Always defer (2) pinned for the semantic tests; the adaptive default (1) has its own test.
     _tuning.reset_gates()
     _tuning.set_gate("soft_guide_defer", 2)
     yield
@@ -391,54 +391,64 @@ def test_exception_keeps_unfinished_guides():
 
 
 @pytest.mark.parametrize("fill", ["striped", "interpair"])
-def test_adaptive(fill):
-    """Gate 1, adaptive: a step defers its guides unless at least half of them were
-    read since the previous soft call; then it fills them in the call, as eager always
-    did.  The guides and outputs are the same either way."""
+@pytest.mark.parametrize("threads", [1, 4])
+def test_adaptive_default(fill, threads):
+    """The default (gate 1): a step defers its guides unless they were read (at least
+    half of them) after each of the last two soft calls; one unread step drops back to
+    deferring.  Every step read: eager from the third step on; never read: always
+    deferred; read every other step: always deferred.  Guides and outputs are the eager
+    ones in every step."""
+    _tuning.reset_gates()
+    assert _tuning.defaults()["soft_guide_defer"] == 1
     rng = np.random.default_rng(53)
-    P0, P1 = dna_params(rng, "affine"), dna_params(rng, "affine")
+    Ps = [dna_params(rng, "affine") for _ in range(8)]
     A, B = pairs(rng, "dna", 30)
     N = len(A)
-    _tuning.set_gate("soft_guide_defer", 0)
-    e = make(nwgrad.SeqPairBatchDouble, A, B, P0, "affine", "local", fill)
-    e.score_and_grad()
-    want0, wout0 = guides(e), outputs(e)
-    e.set_params(P1)
-    e.score_and_grad()
-    want1 = guides(e)
-    _tuning.set_gate("soft_guide_defer", 1)
-    b = make(nwgrad.SeqPairBatchDouble, A, B, P0, "affine", "local", fill)
-    b.score_and_grad()
-    assert b._guides_pending() == N              # nothing read yet: deferred
-    assert guides(b) == want0                    # every guide read
-    b.score_and_grad()
-    assert b._guides_pending() == 0              # read last step: filled in the call
-    for x, y in zip(outputs(b), wout0):
-        np.testing.assert_array_equal(x, y)
-    b.set_params(P1)
-    b.score_and_grad()                           # nothing read since: deferred again
-    assert b._guides_pending() == N
-    b.banded_grad(3)                             # a banded pass reads every guide
-    b.score_and_grad()
-    assert b._guides_pending() == 0
-    assert guides(b) == want1
-    b.score_and_grad()                           # (all read: in the call; counts reset)
-    assert b._guides_pending() == 0
-    for i in range(N // 2 - 1):                  # fewer than half read: deferred
-        b[i].guide_j
-    b.score_and_grad()
-    assert b._guides_pending() == N
+
+    def ref():
+        _tuning.set_gate("soft_guide_defer", 0)
+        e = make(nwgrad.SeqPairBatchDouble, A, B, Ps[0], "affine", "local", fill, threads=threads)
+        out = []
+        for P in Ps:
+            e.set_params(P)
+            e.score_and_grad()
+            out.append((guides(e), outputs(e)))
+        _tuning.reset_gates()
+        return out
+
+    want = ref()
+    for pattern, expect in (
+            ("every", [N, N] + [0] * 6),
+            ("never", [N] * 8),
+            ("alternate", [N] * 8),
+            ("every,then-skip", [N, N, 0, 0, N, N, 0, 0])):
+        b = make(nwgrad.SeqPairBatchDouble, A, B, Ps[0], "affine", "local", fill, threads=threads)
+        for k, P in enumerate(Ps):
+            b.set_params(P)
+            b.score_and_grad()
+            assert b._guides_pending() == expect[k], (pattern, k)
+            for x, y in zip(outputs(b), want[k][1]):
+                np.testing.assert_array_equal(x, y)
+            read = {"every": True, "never": False, "alternate": k % 2 == 0,
+                    "every,then-skip": k not in (3,)}[pattern]
+            if read:
+                assert guides(b) == want[k][0], (pattern, k)
+    # banded_grad counts as reading every guide.
+    b = make(nwgrad.SeqPairBatchDouble, A, B, Ps[0], "affine", "local", fill, threads=threads)
+    for k in range(3):
+        b.score_and_grad()
+        assert b._guides_pending() == (0 if k == 2 else N)
+        b.banded_grad(3)
 
 
-def test_default_always_defers():
-    """The default (no override: gate 2) defers every step, read or not."""
-    _tuning.reset_gates()
-    assert _tuning.defaults()["soft_guide_defer"] == 2
+def test_gate_two_always_defers():
+    """Gate 2 defers every step, read or not."""
+    _tuning.set_gate("soft_guide_defer", 2)
     rng = np.random.default_rng(59)
     P = dna_params(rng, "affine")
     A, B = pairs(rng, "dna", 20)
     b = make(nwgrad.SeqPairBatchDouble, A, B, P, "affine", "local", "interpair")
-    for _ in range(3):
+    for _ in range(4):
         b.score_and_grad()
         assert b._guides_pending() == len(A)
         guides(b)

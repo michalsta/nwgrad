@@ -462,8 +462,9 @@ public:
         prepare_paths_(keep_paths);
         ++full_calls_;   // guides may have moved: the banded grouping is stale
         tc_begin_full_();
-        call_pend_ = soft_pend_(keep_paths, guide_reads_ * 2 >= N);
+        read_streak_ = guide_reads_ * 2 >= N ? read_streak_ + 1 : 0;
         guide_reads_ = 0;
+        call_pend_ = soft_pend_(keep_paths, read_streak_ >= kReadStreak);
         const bool none = grad_mode_ == GradMode::None && !keep_paths;
         // Every pair this call finishes defers its guide under the params scored now
         // (score_only_ does the same).  A pair the call does not finish (it threw)
@@ -1219,20 +1220,26 @@ private:
     // guide is the eager one, bit for bit, computed on first use (guide_j, banded_grad,
     // banded_align); a call that never asks for it skips the hard fill, 24-26 % of a
     // double soft step's instructions on skynet (AGENTS.md, "The soft path").
-    // Adaptive (gate 1, an option; the default 2 always defers): `read` -- at least half the batch's guides were read
-    // (guide_j, banded_grad) since its previous full soft call -- runs the Viterbi in the
-    // call: deferring and then resolving every guide cost +0.4-0.7 instructions per cell
-    // over the in-call fill on miRNA (the per-group setup paid twice), so a loop that
-    // reads its guides keeps eager's cost and a loop that does not keeps the saving.  The
-    // first step of a loop decides nothing: it defers, and its reads set the next step.
+    // Adaptive (gate 1, the default): `read` -- the batch's guides were read (at least half
+    // of them: guide_j, banded_grad) after each of the last kReadStreak full soft calls --
+    // runs the Viterbi in the call, as eager did; any step whose guides go unread drops
+    // back to deferring.  Why: resolving deferred guides after the call is a second
+    // parallel pass over the batch, 4-9 % slower per step than the in-call fill when every
+    // guide is read (solace AVX-512, 8 threads, 79b72ad), while deferring wins 21-30 % when
+    // none is.  A streak of 2, not 1: with 1 (the gate-1 rule until 2026-11-13) a loop
+    // reading its guides every OTHER step filled them in the call exactly on the steps
+    // that did not read them (nighthaven: 0.98-1.02 of main, against 0.87-0.94 deferring).
     uint8_t soft_pend_(bool keep, bool read) const noexcept {
         if (grad_mode_ != GradMode::Soft || keep || s_.soft_guide_posterior) return 0;
         if (s_.soft_guide_lazy) return kPending;
         const int d = soft_guide_defer();
         return d == 2 || (d == 1 && !read) ? static_cast<uint8_t>(kPending | kSnap) : uint8_t(0);
     }
-    // Guide reads since the last full soft call (soft_pend_'s `read`); the calling thread only.
+    // Guide reads since the last full soft call, and how many consecutive full soft calls
+    // had theirs read (soft_pend_'s `read`); the calling thread only.
     size_t guide_reads_ = 0;
+    int read_streak_ = 0;
+    static constexpr int kReadStreak = 2;
     int kernel_ = kBackendAuto;
     std::vector<double>  grad_;             // pair i: gstride() doubles (matrix, 4 gaps); untracked
     // ── Tracks ──

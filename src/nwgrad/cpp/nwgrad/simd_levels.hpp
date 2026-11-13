@@ -673,21 +673,19 @@ inline bool soft_double_ftz() noexcept {
     return v != 0;   // unset (-1): the default, on
 }
 // soft_guide "eager"'s guide Viterbi: soft_guide_defer / NWGRAD_SOFT_GUIDE_DEFER.
-// 2 (DEFAULT, 2026-11-11): always defer it to first use, under the params the soft call
-// scored (BatchEngine::soft_pend_); 1: adaptive -- defer unless at least half the batch's
-// guides were read since its previous soft call; 0: never (the Viterbi inside the soft
-// call, as before: the A/B switch).  Results never change.  Why 2: timed on nighthaven
-// (AVX2, rotated soft training loop, miRNA and protein L300, double/float32, Global/Local,
-// 1 and 6 threads; branch / main): guides read every step, 0 0.989-1.009, 1 0.989-1.008,
-// 2 0.986-1.009; never read, 1 and 2 0.68-0.79; read every other step, 1 0.984-1.017, 2
-// 0.87-0.94.  Deferring's +0.6 % instructions with guides read (skynet sse4, miRNA)
-// does not show in time; adaptive loses the alternating loop.  The gate wins over the
-// environment.
+// 1 (DEFAULT, 2026-11-13): adaptive -- defer it to first use, under the params the soft
+// call scored (BatchEngine::soft_pend_), unless the guides were read after each of the
+// last two soft calls (then fill them in the call, as before); 2: always defer; 0: never
+// (the Viterbi inside the soft call: the A/B switch).  Results never change.  History:
+// 2 was the default 2026-11-11..13, until solace (AVX-512, 8 threads) showed the
+// deferred guides' separate resolve pass 4-9 % slower than main with every guide read;
+// the earlier gate 1 (a streak of one step) lost the read-every-other-step loop.  The
+// gate wins over the environment.
 inline int soft_guide_defer() noexcept {
     const int64_t o = gate_override(Gate::SoftGuideDefer);
     if (o >= 0) return o >= 2 ? 2 : static_cast<int>(o);
     static const int64_t v = env_nonneg_int("NWGRAD_SOFT_GUIDE_DEFER");
-    return v < 0 ? 2 : (v >= 2 ? 2 : static_cast<int>(v));   // unset (-1): the default, always
+    return v < 0 ? 1 : (v >= 2 ? 2 : static_cast<int>(v));   // unset (-1): the default, adaptive
 }
 inline bool soft_ckpt_env_check() noexcept {
     static const bool v = [] { const char* e = std::getenv("NWGRAD_SOFT_CKPT_CHECK"); return e && *e && std::strcmp(e, "0") != 0; }();
