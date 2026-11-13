@@ -752,6 +752,21 @@ inline constexpr bool kSoftCkptByDefault = false;
 // from 22 x 80 for double and int32 on AVX2 (the own kernel's single profile row wins once
 // B is long), and in Local mode sooner than in Global, so they are per mode; the shared
 // linear fill of int64 loses at SSE and NEON at every length.
+// float32 Global over up to 8 letters had NO cap on SSE, AVX2 and NEON: the sweep that set it
+// ran 22 x L pairs (to 22 x 200), and every long pair-sized score-only call then took the
+// shared fill.  On the M1 (spot, 2026-11-10, 1 thread, DNA L x L) striped / default time was
+// linear 0.62 / 0.59 / 0.38 at L1000 / 2000 / 3000, affine 0.78 / 0.68 / 0.64.  sse4
+// (wloczykij, instructions:u, striped / shared): linear L100 1.08, L150 1.00, L200 0.95,
+// L500 0.85, L1000-3000 0.82-0.80; affine L500 1.06, L700 1.00, L1000 0.99, L2000 0.91,
+// L3000 0.89; short A keeps the shared fill (22 x 200-3000 striped 1.19-1.52, 40 x 3000
+// linear 1.03 / affine 1.21).  nighthaven (AVX2, time): linear L300 1.07, L500 0.90, L1000
+// 0.78, L2000-3000 0.56-0.75, 22 x 3000 1.015, 100 x 3000 0.78; affine the shared fill wins
+// almost everywhere (L300-700 striped 1.08-1.50, L2000-3000 1.12-1.40, 22 / 100 x 3000
+// 1.9-2.2; L1000 alone 0.92-0.97).  spot after the cap (time): L300 1.000, L500 linear 0.755
+// / affine 0.925, 100 x 3000 0.576 / 0.846.  So per gap model (linear: f32_small_global_lin):
+// SSE linear 200000 cells (L500 on) / affine 10^6 (L1000 on, where its counts stop losing);
+// AVX2 linear 200000 / affine none; NEON 250000 for both (L500 on); AVX-512 its measured
+// 40000000 for both.
 // One thread, alphabets of up to 8 letters (2026-11-04): the integers' small one-thread
 // budgets above come from protein, whose shared fill gathers; DNA's mask-blend fill wins
 // alone through L400 on AVX2 (15 MB of affine tables; L600, 34 MB, loses) and L300 on
@@ -794,6 +809,9 @@ struct GateLevelCaps {
     SoftF32Caps f32soft_big, f32soft_small;   // float32 soft pass from: alphabets over 8 / up to 8
     uint32_t group_small_kb_1;             // hard shared fill, alphabets <= 8, n_threads == 1: KiB
                                            // floor under the type's group_kb_1 (0 = none)
+    uint32_t f32_small_global_lin;         // float32 score-only shared kernel, alphabets <= 8,
+                                           // Global, LINEAR gaps: cells (f32.score_small_global
+                                           // is the affine cap)
     template <class T> const GateTypeCaps& of() const noexcept {
         if constexpr (std::is_same_v<T, float>)        return f32;
         else if constexpr (std::is_same_v<T, double>)  return f64;
@@ -804,34 +822,34 @@ struct GateLevelCaps {
 };
 inline constexpr uint32_t kGateNoCap = 0xFFFFFFFFu;
 //                                          score_aff  score_lin  lin_gather  group_kb  group_kb_1   small_loc  small_glob   lin_small  score_aff_g score_lin_g  score_aff_1 score_aff_g1
-inline constexpr GateLevelCaps kGateCapsSse    { {       6600,     1700,      20000,     3072,      12288,       1900, kGateNoCap, kGateNoCap,       6600,       3800,       6600,       6600 },   // float32
+inline constexpr GateLevelCaps kGateCapsSse    { {       6600,     1700,      20000,     3072,      12288,       1900,    1000000, kGateNoCap,       6600,       3800,       6600,       6600 },   // float32
                                                  {          0,        0,       8000,     3072,      12288,          0,       1200, kGateNoCap,          0,          0,       1700,       1700 },   // double
                                                  {          0,     1700,       4000,     1024,       1024,       1900,       1900, kGateNoCap,          0,       1700,          0,          0 },   // int16
                                                  {          0,     3800, kGateNoCap,     3072,      12288,       1200,        800, kGateNoCap,          0,       1700,       1700,       1700 },   // int32 (its own linear fill is slow at W=4: shared to L400)
                                                  {          0,     1700,          0,     3072,      12288,          0,          0,          0,          0,       1700,       3800,       3800 },   // int64
                                                  3072, 8192, 33000,
-                                                 { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, 0 };
+                                                 { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, 0, 200000 };
 inline constexpr GateLevelCaps kGateCapsAvx2   { {      31000,     3800,      20000,     3072,      12288,       4700, kGateNoCap, kGateNoCap,      31000,      10300,      31000,      31000 },
                                                  {       6600,     1700,      20000,     3072,      12288,       1900, kGateNoCap, kGateNoCap,       6600,       6600,       6600,       6600 },
                                                  {       1700,     1700,       4000,     1024,        450,       4700,       4700, kGateNoCap,       1700,       1700,       1700,       1700 },
                                                  {       1700,     3800,       4000,     2560,       2048,       1900,       1900, kGateNoCap,       1700,       3800,       1700,       1700 },
                                                  {       3800,     1700,       2500,     3072,      12288,       2800,       1900, kGateNoCap,       3800,       1700,       3800,       3800 },
                                                  3072, 8192, 20000,
-                                                 { 1000, 2000, 0, 5000 }, { 0, 0, 0, 0 }, 16384 };
+                                                 { 1000, 2000, 0, 5000 }, { 0, 0, 0, 0 }, 16384, 200000 };
 inline constexpr GateLevelCaps kGateCapsAvx512 { {     520000,    31000,      33000,     3072,      18432,   30000000,   40000000, kGateNoCap,     520000,      31000,     520000,     520000 },
                                                  {     160000,    14700,      33000,     3072,      18432,   16000000,   31000000, kGateNoCap,     160000,      23000,     160000,     160000 },
                                                  {       1700,     1700,       4000,     1024,       1024, kGateNoCap, kGateNoCap, kGateNoCap,       1700,       1700,       1700,       1700 },
                                                  {       2600,     3800,       4000,     1024,       1024, kGateNoCap, kGateNoCap, kGateNoCap,       2600,       3800,       2600,       2600 },
                                                  {       1700,     3800,       6600,     1500,       2048,       4700, kGateNoCap, kGateNoCap,       1700,       3800,       1700,       1700 },
                                                  3072, 8192, 20000,
-                                                 { 7000, 10000, 1000, 7000 }, { 5000, 5000, 0, 0 }, 16384 };
-inline constexpr GateLevelCaps kGateCapsNeon   { {      10300,     1700,       8000,     5120,      12288,       2800, kGateNoCap, kGateNoCap,      14700,      10300,      10300,      14700 },
+                                                 { 7000, 10000, 1000, 7000 }, { 5000, 5000, 0, 0 }, 16384, 40000000 };
+inline constexpr GateLevelCaps kGateCapsNeon   { {      10300,     1700,       8000,     5120,      12288,       2800,     250000, kGateNoCap,      14700,      10300,      10300,      14700 },
                                                  {          0,        0,       3000,     3072,      12288,        800,       1900, kGateNoCap,          0,          0,          0,          0 },
                                                  {       1700,     1700,       8000,     3072,       1400,       4700,       4700, kGateNoCap,       1700,       1700,       1700,       1700 },
                                                  {       1700,     1700,       8000,     4608,       6144,       4700,       4700, kGateNoCap,       1700,       1700,       1700,       1700 },
                                                  {      14700,        0,          0,     4608,      12288,       2800, kGateNoCap,          0,      63100,          0,      14700,      63100 },
                                                  3072, 8192, 20000,
-                                                 { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, 0 };
+                                                 { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, 0, 250000 };
 inline const GateLevelCaps& gate_caps(int level) noexcept {
 #if defined(__aarch64__) || defined(_M_ARM64)
     (void)level; return kGateCapsNeon;
@@ -886,7 +904,10 @@ inline bool inter_score_ok(size_t nalpha, int M, int n, bool affine, bool local,
     const GateTypeCaps& c = gate_caps(level).of<T>();
     const uint32_t aff = local ? (single ? c.score_affine_1 : c.score_affine)
                                : (single ? c.score_affine_g1 : c.score_affine_g);
-    const size_t cap = nalpha <= 8 ? size_t(local ? c.score_small_local : c.score_small_global)
+    const uint32_t small = local ? c.score_small_local
+                         : (std::is_same_v<T, float> && !affine) ? gate_caps(level).f32_small_global_lin
+                                                                 : c.score_small_global;
+    const size_t cap = nalpha <= 8 ? size_t(small)
                                    : gate_cap(Gate::InterScoreGatherCells,
                                               affine ? aff : (local ? c.score_linear : c.score_linear_g));
     return static_cast<size_t>(M + 1) * static_cast<size_t>(n + 1) <= cap;
