@@ -2702,8 +2702,16 @@ private:
             // groups (an average halved per group, over the lanes that failed or, run at T,
             // would have failed the int8 test -- exact from the T scores) is above the
             // break-even of the level's lane count (inter8_max_fail_).  A group whose lanes
-            // cannot overflow at all (inter8_safe_) runs int8 regardless.
-            double fail8 = 0.0;
+            // cannot overflow at all (inter8_safe_) runs int8 regardless.  The estimate is
+            // the batch's, shared by the workers and kept across calls (inter8_fail_q_):
+            // per worker and per call, every worker of every call paid one blind int8 group,
+            // which at 64 lanes (solace, 8 threads) cost 1.11-1.13 on related DNA L100 Local.
+            auto fail8 = [this] { return std::atomic_ref<int>(inter8_fail_q_).load(std::memory_order_relaxed) * (1.0 / kFailQ); };
+            auto note8 = [this](size_t fails, size_t real) {
+                std::atomic_ref<int> q(inter8_fail_q_);
+                const int f = static_cast<int>(static_cast<double>(fails) / static_cast<double>(real) * kFailQ + 0.5);
+                q.store((q.load(std::memory_order_relaxed) + f) / 2, std::memory_order_relaxed);   // races only blur it
+            };
             auto own = [&](size_t i) {
                 flags_[i] &= static_cast<uint8_t>(~kStored);
                 set_problem_(w.full, i);
@@ -2764,14 +2772,14 @@ private:
                     const size_t W = static_cast<size_t>(inter_w_(*Kp));
                     const size_t* ids8 = P8->elig8.data() + s;
                     const bool safe = inter8_safe_(ids8, e - s, c8);
-                    if (!safe && fail8 > max_fail) {   // predicted to overflow: the T kernel, W at a time
+                    if (!safe && fail8() > max_fail) {   // predicted to overflow: the T kernel, W at a time
                         for (size_t k = s; k < e; k += W) run16(P8->elig8, k, std::min(W, e - k));
-                        fail8 = 0.5 * fail8 + 0.5 * static_cast<double>(inter8_fails_(ids8, e - s, c8)) / static_cast<double>(e - s);
+                        note8(inter8_fails_(ids8, e - s, c8), e - s);
                         continue;
                     }
                     const size_t before = spill.size();
                     run8_(ids8, e - s, c8, *Kp, spill, own);
-                    if (!safe) fail8 = 0.5 * fail8 + 0.5 * static_cast<double>(spill.size() - before) / static_cast<double>(e - s);
+                    if (!safe) note8(spill.size() - before, e - s);
                     while (spill.size() >= W) {   // a full group of re-runs
                         run16(spill, spill.size() - W, W);
                         spill.resize(spill.size() - W);
@@ -2816,6 +2824,10 @@ private:
         std::vector<std::pair<size_t, size_t>> groups8, groups16;
     };
     Inter8Plan plan8_;
+    // The int8 predictor's fail fraction (score_only_), in 1/kFailQ, shared by the workers
+    // through std::atomic_ref (a plain int: the engine is moved, an atomic member cannot be).
+    static constexpr int kFailQ = 1 << 12;
+    int inter8_fail_q_ = 0;
     static int inter8_mode_() noexcept {
         const int64_t o = gate_override(Gate::InterScoreInt8);
         if (o >= 0) return o >= 2 ? 2 : static_cast<int>(o);
