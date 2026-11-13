@@ -2939,6 +2939,19 @@ functions:
   0.984-1.017 (miRNA double Global 1.014/1.017, controls ~1.004), 2 0.87-0.94. The +0.6 %
   instructions of deferring with guides read does not show in time, and adaptive loses
   the alternating loop (it fills in the call for a step whose guides go unread).
+  2026-11-13: the first read of a snapshot guide resolves the WHOLE batch's on n_threads
+  (`resolve_all_snap_`: groups, then the other pairs on workers): Python reading
+  `b[i].guide_j` pair by pair had resolved them one at a time on the caller, 1.6-2.5x
+  main's step at 8 threads (solace AVX-512, wloczykij). That pass is still a second
+  sweep over the batch after the call, 4-9 % over main with every guide read at 8 threads
+  (solace), so the DEFAULT is gate 1 again with a STREAK rule: fill in the call when the
+  guides were read (half or more, `guide_j` / `banded_grad`) after each of the last TWO
+  soft calls (`read_streak_`, `kReadStreak`), defer otherwise; one unread step drops back.
+  Timed with `results/tools/soft_steps_ab.py` (use none / all / alt = every other step),
+  cudak (idle; Westmere sse4), new / main, controls main2/main in brackets:
+  1 thread: none 0.70-0.76, all 0.997-1.002 (0.997-1.003), alt 0.84-0.88;
+  8 threads (7 rounds): none 0.69-0.80, all 0.93-1.02 (0.99-1.24), alt 0.81-1.00
+  (0.96-1.25); gate 2 (always defer) at 8 threads, all: 1.01-1.29.
   Tests: `test_soft_guide_defer.py`. `"lazy"` — it does not, and the guide
   is computed on first use (`guide_j`, `banded_align`, `banded_grad`) under the params
   CURRENT THEN. Deliberately opt-in: `score_and_grad(); set_params(params + lr*g); banded_grad()`
