@@ -1180,7 +1180,7 @@ prototyped in `tools/gridgrad/` and integrated as `TracebackMode::Grid`:
   base-block tie-break fails it), `tests/Python/test_grid.py` (SeqPairBatch / SeqPair).
 - **Scope:** affine Full, untracked, opens >= 0 (the D/X form), a simd level with the kernel,
   m > `hb_cutoff`; Global, Local and Glocal (2026-11-05, "Grid for Glocal and Local" below),
-  every scalar type (integer T 2026-11-05, "Grid at integer T" below).  Everything else — linear, tracks, negative
+  every scalar type (integer T 2026-11-05, "Grid at integer T" below), linear gaps (2026-11-10, "Grid for linear gaps" below).  Everything else — tracks, negative
   opens, `scalar_fallback`, short pairs — runs AS Pointers, which is the same result by
   definition, so no fallback can change an answer.
 - **Tuning:** `kGridK` = 32 lines per dimension per level, `kGridMin` = 8, `kGridBase` = 64 x 64
@@ -1415,6 +1415,50 @@ really takes (`test_tracked_long_global_float32_pairs_run_their_own_fill`).  fuz
 - Tests: `tests/cpp/test_grid.cpp` (every mode at int16 / int32 / int64, int16 in both
   regimes, every backend here, `ran_grid()` per type; integer `auto` routing),
   `tests/Python/test_grid.py` (every mode x integer type through the batch, `auto`).
+
+**Grid for linear gaps (branch `proto/grid-linear`, 2026-11-10).**  `traceback="grid"` and
+linear `auto` past hb_cutoff now run Grid for linear gaps (before: AS Pointers), in all three
+modes and every scalar type; bit-identical to the linear Pointers fill (score bits, path,
+ties, guide, gradient).
+- **Forward:** `grid_linear_fwd_impl` (grid_kernel_impl.inl, `GridFwdJob::linear`; the same
+  registered `grid_fwd` pointer) runs `score_linear_striped`'s recurrence over the rectangle --
+  floating T (and int64 below 4 lanes) the two-segment carry on H plus lazy-F, integer T from 4
+  lanes the fused prefix-max form (rows U and P in place, H formed when the next row reads it;
+  a saved line's H formed the same way after its row).  One state: a saved row is w+1 values,
+  a column set (h+1) x W.  The rectangle's left column enters as H(i, c0) (the carry's Y there
+  is H(i, c0) - ge_a) and, a row down, as the diagonal.
+- **Walk:** `viterbi_linear_grid` reuses `grid_solve` (`kGridStates` 1); the base block
+  `grid_base_linear` fills VALUES only, in `viterbi_linear_ptr`'s two passes, and the walk
+  re-derives each code on the path by the fill's expressions (0 diagonal, 1 up where u > d, 2
+  left where left - ge_a > max(d, u), Local 3 where the clamped value is <= 0).  Its own
+  buffer `DpBuffer::gbH`: sharing `gbM` broke the affine block, which grows gbM..gdY together
+  keyed on gbM's size (a linear run then an affine one on one buffer: store to null,
+  `test_buffer_reuse`, caught by CI's ASan job).  Scalar, not striped: at kGridK = 32 the blocks
+  are ~R x 31 columns, below the striped linear kernel's crossover (kLinearStripedMinN 40-96).
+- **Ends:** Global (m, n); Glocal the first column holding row m's max (the top level's last
+  row, `GridFwdJob::last`, or the base block); Local in one pass: the forward tracks per lane
+  the largest U and its first segment (`Best`), which with ge_a >= 0 is linear Pointers' end
+  cell (the leftmost max of a row is never a gap-in-A cell, and U <= H); a problem that is one
+  base block scans it.  Local with a negative extend runs as Pointers (`grid_ok_`).
+- **`auto`** (`run_tb_`, `kLinearGridAuto`, all types but int64; int16 from per-level floors, `linear_grid_min_rows`: sse2 / sse4 / AVX2 Global and Glocal 800 rows, Local 1500 -- nighthaven had Grid 1.15-1.33x main's H table at L600, 1.07-1.12 Local at L800, and Local L1200 1.025 at 6 threads (20 % fewer instructions) -- AVX-512 off until solace data, NEON off (spot int16 Global L1000 1.039 protein / 1.011 DNA); int32 / float32 / double from hb_cutoff, 0.23-1.00 on nighthaven and 0.34-0.60 on spot): skynet-class sse4
+  (wloczykij), instructions per cell, Global, 20 % mutated homologues, own fills, hard path:
+
+  | | Grid | Pointers | old `auto` | score-only |
+  |---|---|---|---|---|
+  | protein L1000 int32 / float32 | 5.68 / 5.47 | 13.8 / 11.3 | 13.8 / 11.3 | 4.48 / 4.24 |
+  | protein L1000 int16 | 4.31 | 6.90 | 5.09 (H) | 2.65 |
+  | protein L3000 int32 / float32 | 4.91 / 4.54 | 13.6 / 10.8 | 13.6 / 10.8 | 4.32 / 3.87 |
+  | DNA L1000 int16 / int32 / float32 | 3.99 / 5.69 / 5.20 | 6.70 / 13.7 / 10.7 | 5.21 (H) / 13.7 / 10.9 | 2.61 / 4.23 / 4.02 |
+  | DNA L3000 int16 / int32 / float32 | 2.87 / 4.77 / 4.34 | 6.55 / 13.6 / 10.7 | 6.61 / 13.6 / 10.7 | 2.50 / 4.27 / 3.80 |
+  | protein L1000 Local int32 / Glocal float32 | 8.31 / 5.46 | 18.0 / 10.9 | 17.8 / 11.0 | 5.34 / 4.16 |
+
+  2.0-2.9x fewer instructions than Pointers, 1.1-1.35x the score kernel (Local 1.56x: the
+  end tracking).  A/A (Pointers twice) 0.98-1.02.  Protein int16 L3000 is refused (bound).
+  Wall-clock not measured (shared hosts); NWGRAD_LINEAR_GRID=0 restores the old `auto` in one
+  binary for the fleet pass.  AVX2 / AVX-512 / NEON compile; untested at runtime here.
+- Tests: `test_grid.cpp` `[linear]` (every mode x type x backend, ties, 0.1 / 0 / negative
+  extends, int16 both regimes, one-column / narrow / short sequences, cutoff 1, `auto`
+  routing), `test_grid.py` (batch, every type and mode, grid and auto).
 
 ### Linear gaps: Pointers and Hirschberg (2026-10-05)
 

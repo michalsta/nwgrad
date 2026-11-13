@@ -93,10 +93,11 @@ enum class AlignBand { Full,   GuideBanded };
 //              (viterbi_affine_grid).  O(k (m + n)) memory and ~1x the cell work
 //              (the re-filled blocks are ~2/k of the cells per level).  Bit-identical to
 //              Pointers because every re-filled cell is computed from the full fill's
-//              exact values by the same expressions.  Implemented for affine Global Full,
-//              untracked, floating T, opens >= 0, on a simd level with the kernel, and
-//              pairs longer than hb_cutoff; everything else runs AS Pointers (the same
-//              result by definition, so no fallback can change an answer).
+//              exact values by the same expressions.  Implemented for Full, untracked,
+//              every mode and scalar type, on a simd level with the kernel, and pairs
+//              longer than hb_cutoff: affine with opens >= 0, linear (viterbi_linear_grid,
+//              2026-11-07; Local with extends >= 0); everything else runs AS Pointers (the
+//              same result by definition, so no fallback can change an answer).
 enum class TracebackMode { Scores, Pointers, Hirschberg, HirschbergPmax, Grid, Default };
 
 // How compute_forward_back() evaluates log Z and the expected counts.
@@ -1542,6 +1543,7 @@ private:
     bool grid_find_best_ = false;    // Local Grid: the top level's forward finds the end cell
     bool grid_empty_ = false;        // Local Grid: nothing above 0 (the empty alignment)
     int  grid_end_i_ = -1;           // Local Grid, one pass: the end row the forward found
+    bool grid_base_best_ = false;    // linear Local Grid, the whole problem one block: it finds the end
     // Local Hirschberg only: the 0-based cell where the recovered local path STARTS.
     // hops_ is a path within the sub-rectangle A[hb_start_i_..ie) x B[hb_start_j_..je),
     // so every consumer replays it from this origin rather than (0, 0).  For Global (and
@@ -1606,6 +1608,53 @@ private:
     // Local `auto` takes the one-pass Grid inside the pointer budget too (run_tb_): every
     // type but int16, which tied Pointers there (nighthaven 0.98 at L1000).
     static constexpr bool kLocalGridAuto = !(nw_is_int<T> && sizeof(T) == 2);
+    // Linear Full `auto` takes Grid past hb_cutoff (run_tb_, grid_ok_; 2026-11-10), where it
+    // ran Pointers (or the H table up to 2 MiB).  Instructions per cell, sse4 (wloczykij),
+    // Global, 20 % mutated homologues, own fills, hard path; Grid / Pointers / old `auto` /
+    // score-only: protein L1000 int32 5.68 / 13.8 / 13.8 / 4.48, float32 5.47 / 11.3 / 11.3 /
+    // 4.24; L3000 int32 4.91 / 13.6, float32 4.54 / 10.8; DNA L1000 int16 3.99 / 6.70 / 5.21
+    // (H) / 2.61, L3000 2.87 / 6.55; Local int32 L1000 8.31 / 18.0; Glocal float32 5.46 /
+    // 10.9 (A/A Pointers 0.98-1.02).  int64 is left out: not measured, and below 8 lanes its
+    // linear Pointers fill is the scalar one (linear_kernel_pays) while the grid forward runs
+    // 2 or 4 lanes without a packed 64-bit max -- traceback="grid" stays available for it.
+    static constexpr bool kLinearGridAuto = !(nw_is_int<T> && sizeof(T) == 8);
+    // Per level, int16 only: the rows from which linear `auto` takes Grid (beyond grid_ok_'s
+    // m > hb_cutoff); INT_MAX = never.  Below ~2 MiB (L ~1000 at int16) `auto` ran the H table,
+    // fast at 2 bytes a cell, and Grid only overtakes it later:
+    //  * AVX2 (nighthaven, PR #49 a009f6e, wall clock against main, controls 0.97-1.02): protein
+    //    L600 Global / Local / Glocal 1.27 / 1.33 / 1.19 at 1 thread, 1.25-1.32 at 6; DNA L600
+    //    1.15-1.26 at 6; Local L800 1.07-1.12 (DNA and protein, 1 and 6 threads); so Global /
+    //    Glocal from 800 rows.  Local from 1500: at 1000 / 1200 rows Grid ran ~20 % fewer
+    //    instructions but protein L1200 Local read 1.025 / 1.024 at 6 threads (control 1.001,
+    //    PR #49 e498fa2) -- more memory traffic per pair with 6 workers -- so the conservative
+    //    floor, pending nighthaven's L1000-1500 re-check at 1 and 6 threads.
+    //  * sse2 / sse4: the same floors.  Instructions alone favour Grid from L600 (wloczykij sse4,
+    //    Grid / H table: Global protein 0.84 at L800, 0.82 at L1000; Local 0.83-0.84; DNA
+    //    0.74-0.82), but the H fill runs at a higher IPC there and AVX2's clock shows it.
+    //  * AVX-512: off until solace measures it.  NEON: off (spot, a009f6e: int16 Global L1000
+    //    `auto` 1.039 protein / 1.011 DNA against main's H table).
+    // Every other type: hb_cutoff (int32 / float32 / double 0.23-1.00 on nighthaven).
+    static int linear_grid_min_rows(int backend) noexcept {
+        if constexpr (!(nw_is_int<T> && sizeof(T) == 2)) { (void)backend; return 0; }
+        else {
+#if defined(__aarch64__) || defined(_M_ARM64)
+            (void)backend;
+            return std::numeric_limits<int>::max();
+#else
+            if (backend == static_cast<int>(SimdLevel::Avx512)) return std::numeric_limits<int>::max();
+            return AM == AlignMode::Local ? 1500 : 800;
+#endif
+        }
+    }
+    // NWGRAD_LINEAR_GRID=0: linear `auto` never takes Grid (the Pointers / H fills as before;
+    // an A/B switch in one binary, for measuring).
+    static bool linear_grid_env() {
+        static const bool on = [] {
+            const char* e = std::getenv("NWGRAD_LINEAR_GRID");
+            return !(e && e[0] == '0');
+        }();
+        return on;
+    }
     static constexpr TracebackMode kDefaultTb =
         (GM == GapModel::Affine && AB == AlignBand::Full)
             ? (nw_is_int<T> ? TracebackMode::HirschbergPmax : TracebackMode::Grid)
@@ -1780,6 +1829,15 @@ private:
                 if (be != kBackendScalar && m_ >= local_grid_min_rows(be) && grid_ok_(level_kernels(be)))
                     return TracebackMode::Grid;
             }
+        // Linear `auto` (Pointers, kDefaultTb) takes Grid where it applies (grid_ok_: untracked,
+        // a simd level, m > hb_cutoff; Local with both extends >= 0) and kLinearGridAuto
+        // allows it -- the same result; see kLinearGridAuto for the measurements.
+        if constexpr (GM == GapModel::Linear && AB == AlignBand::Full && kLinearGridAuto)
+            if (tb_auto_ && tb_ == TracebackMode::Pointers && linear_grid_env()) {
+                const int be = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
+                if (be != kBackendScalar && m_ >= linear_grid_min_rows(be) && grid_ok_(level_kernels(be)))
+                    return TracebackMode::Grid;
+            }
         if constexpr (GM == GapModel::Affine && AB == AlignBand::Full && std::is_floating_point_v<T>)
             if (tb_ == TracebackMode::Grid && tb_auto_) {
                 if constexpr (AM == AlignMode::Local)
@@ -1841,8 +1899,8 @@ private:
 
     void ensure_viterbi_ptruf(DpBuffer& buf) const {
         if constexpr (GM == GapModel::Linear) {
-            // The pointer / Hirschberg fills keep no H (they allocate their own).
-            if (linear_ptr_fill()) return;
+            // The pointer / Hirschberg / Grid fills keep no H (they allocate their own).
+            if (linear_ptr_fill() || run_tb_() == TracebackMode::Grid) return;
             if (buf.H.size() < sz_) buf.H.resize(sz_);
         } else {
             // Pointers mode never touches VM/VX/VY — it keeps two rolling rows and byte
@@ -2536,6 +2594,11 @@ private:
             const bool lin_ptr = linear_ptr_fill();
             if constexpr (AB == AlignBand::Full) {
                 const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
+                // Grid: where it applies (grid_ok_), else the Pointers fill below -- the same result.
+                if (tb_ == TracebackMode::Grid && backend != kBackendScalar && grid_ok_(level_kernels(backend))) {
+                    viterbi_linear_grid(buf, level_kernels(backend));
+                    return;
+                }
                 if (backend != kBackendScalar && n_ >= linear_striped_min_n(backend)) {
                     const LevelKernels& K = level_kernels(backend);
                     const TypedKernels<T>& KT = K.template of<T>();
@@ -4319,6 +4382,8 @@ private:
     static constexpr long long kGridBase = 64 * 64;   // long long: `long` is 32-bit on Windows (LLP64)
     static constexpr int  kGridMin = 8;      // rows / columns per block, at least
     static constexpr int  kGridDepth = 64;   // recursion levels (never reached: ~log_k(m))
+    // values a saved cell holds: M, X, Y (affine); H (linear, viterbi_linear_grid)
+    static constexpr std::size_t kGridStates = GM == GapModel::Linear ? 1 : 3;
 
     struct GridLine {                        // value(s, idx) = p[s*ss + idx*es]
         const T* p; std::size_t ss, es;
@@ -4332,6 +4397,14 @@ private:
 
     bool grid_ok_(const LevelKernels& K) const noexcept {
         if (!K.template of<T>().grid_fwd || tr_ || m_ <= hb_cutoff_ || n_ == 0) return false;
+        if constexpr (GM == GapModel::Linear) {
+            // Linear (viterbi_linear_grid): no opens.  Local needs both extends >= 0 (NaN:
+            // false), the one-pass end cell's condition (grid_linear_fwd_impl); a Local run
+            // with a gaining gap is degenerate, and runs as Pointers.
+            if constexpr (AM == AlignMode::Local)
+                return static_cast<T>(params_->gap_extend_a) >= T(0) && static_cast<T>(params_->gap_extend_b) >= T(0);
+            return true;
+        }
         return static_cast<T>(params_->gap_open_a) >= T(0) && static_cast<T>(params_->gap_open_b) >= T(0);
     }
 
@@ -4427,7 +4500,8 @@ private:
                     const GridLine& left, int depth, int& i, int& j, int& st) {
         const int r1 = i, c1 = j, h = r1 - r0, w = c1 - c0;
         if (!grid_splits_(h, w) || depth + 1 >= kGridDepth) {
-            grid_base(buf, r0, r1, c0, c1, top, left, i, j, st);
+            if constexpr (GM == GapModel::Linear) grid_base_linear(buf, r0, r1, c0, c1, top, left, i, j, st);
+            else                                  grid_base(buf, r0, r1, c0, c1, top, left, i, j, st);
             return;
         }
         auto& L = buf.glv[static_cast<std::size_t>(depth)];
@@ -4445,6 +4519,8 @@ private:
         J.local = AM == AlignMode::Local ? 1 : 0;
         J.sat = sat_;
         J.find_best = grid_find_best_ ? 1 : 0;
+        J.linear = GM == GapModel::Linear ? 1 : 0;
+        if constexpr (GM == GapModel::Linear) { J.go_a = T(0); J.go_b = T(0); }
         K.template of<T>().grid_fwd(J);
         const int W = J.W, q = J.q;
         if (grid_find_best_) {   // Local, top level, one pass: the walk starts at the best cell
@@ -4454,7 +4530,8 @@ private:
         }
         if (grid_pick_end_) {   // glocal_end_rows_'s rule: the first column holding row m's best
             const T* lr = buf.glast.data();
-            int bj = c0; T best = std::max({left(0, h), left(1, h), left(2, h)});
+            int bj = c0;
+            T best = GM == GapModel::Linear ? left(0, h) : std::max({left(0, h), left(1, h), left(2, h)});
             for (int jj = 1; jj <= w; ++jj) if (lr[jj] > best) { best = lr[jj]; bj = c0 + jj; }
             j = bj; grid_end_ = bj; grid_pick_end_ = false;
         }
@@ -4470,11 +4547,11 @@ private:
             const int bc0 = it->first, tl = it->second;
             const GridLine ctop = br0 == r0
                 ? top.shifted(bc0 - c0)
-                : GridLine{L.rows.data() + static_cast<std::size_t>((br0 - r0) / R - 1) * 3 * static_cast<std::size_t>(w + 1),
+                : GridLine{L.rows.data() + static_cast<std::size_t>((br0 - r0) / R - 1) * kGridStates * static_cast<std::size_t>(w + 1),
                            static_cast<std::size_t>(w + 1), 1}.shifted(bc0 - c0);
             const GridLine cleft = tl < 0
                 ? left.shifted(br0 - r0)
-                : GridLine{L.cols.data() + static_cast<std::size_t>(tl / W) * 3 * static_cast<std::size_t>(h + 1) * W + static_cast<std::size_t>(tl % W),
+                : GridLine{L.cols.data() + static_cast<std::size_t>(tl / W) * kGridStates * static_cast<std::size_t>(h + 1) * W + static_cast<std::size_t>(tl % W),
                            static_cast<std::size_t>(h + 1) * W, static_cast<std::size_t>(W)}.shifted(br0 - r0);
             grid_solve(buf, K, br0, bc0, ctop, cleft, depth + 1, i, j, st);
         }
@@ -4543,6 +4620,134 @@ private:
             if (st == 0)      { st = dM[k]; --i; --j; }
             else if (st == 1) { st = dX[k]; --i; }
             else              { st = dY[k]; --j; }
+        }
+    }
+
+    // ── TracebackMode::Grid for linear gaps (2026-11-07) ──
+    //
+    // The affine Grid's recursion (grid_solve) over one state: the forward pass is the
+    // dedicated linear score kernel's recurrence (grid_linear_fwd_impl, GridFwdJob::linear),
+    // the lines hold H, and a base block re-fills linear Pointers' codes from them
+    // (grid_base_linear).  Linear Pointers' result -- score bits, path, ties, guide, gradient --
+    // because every re-filled cell is the full fill's value by the same expressions, so it
+    // gets the same code.  The path goes to hops_ (hirschberg_ / grid_ set), so every consumer
+    // replays it: the gradient by hard_grad_linear_hb (the same counts), the guide by
+    // guide_j_grid_ (Pointers' convention: the column where the path leaves each row).
+    // Ends: Global (m, n); Glocal the first column holding row m's max of H, from the top
+    // level's last row (or the base block, when the problem is one); Local the forward's best
+    // cell (both extends >= 0, grid_ok_; or the base block's scan), linear Pointers' rule.
+    void viterbi_linear_grid(DpBuffer& buf, const LevelKernels& K) {
+        const T ge_a = static_cast<T>(params_->gap_extend_a), ge_b = static_cast<T>(params_->gap_extend_b);
+        // the borders as the linear Pointers fills leave row 0 and column 0 (striped_linear_full,
+        // viterbi_linear_ptr): Global -j*ge_a / -i*ge_b; Local 0 on both; Glocal row 0 = 0
+        const std::size_t n1 = static_cast<std::size_t>(n_) + 1, m1 = static_cast<std::size_t>(m_) + 1;
+        buf.gtop.resize(n1); buf.gleft.resize(m1);
+        constexpr bool gl = AM == AlignMode::Glocal, lc = AM == AlignMode::Local;
+        for (std::size_t j = 0; j < n1; ++j)
+            buf.gtop[j] = (j == 0 || gl || lc) ? T(0) : -static_cast<T>(j) * ge_a;
+        for (std::size_t i = 0; i < m1; ++i)
+            buf.gleft[i] = (i == 0 || lc) ? T(0) : -static_cast<T>(i) * ge_b;
+        if (buf.glv.size() < static_cast<std::size_t>(kGridDepth)) buf.glv.resize(kGridDepth);
+        hops_.clear();
+        hops_.reserve(static_cast<std::size_t>(m_ + n_));
+        int i = m_, j = n_, st = -1;   // st < 0: the score not yet read (the first base block reads it)
+        grid_end_ = n_;
+        grid_pick_end_ = gl;
+        grid_stop_ = false;
+        grid_empty_ = false; grid_end_i_ = -1;
+        grid_find_best_ = lc && grid_splits_(m_, n_);   // the top level's forward finds the end
+        grid_base_best_ = lc && !grid_find_best_;      // else the one base block scans for it
+        grid_solve(buf, K, 0, 0, GridLine{buf.gtop.data(), 0, 1}, GridLine{buf.gleft.data(), 0, 1},
+                   0, i, j, st);
+        best_tbl_ = TBTable::M;
+        if constexpr (lc) {
+            if (grid_empty_) {   // nothing above 0: the empty alignment
+                hops_.clear();
+                viterbi_score_ = static_cast<T>(0);
+                best_i_ = 0; best_j_ = 0;
+                hb_start_i_ = 0; hb_start_j_ = 0;
+                hirschberg_ = true; grid_ = true;
+                return;
+            }
+        }
+        if (st < 0) viterbi_score_ = buf.gleft[static_cast<std::size_t>(m_)];   // Glocal ending in column 0
+        hb_start_i_ = 0; hb_start_j_ = 0;
+        if constexpr (lc) { hb_start_i_ = i; hb_start_j_ = j; }   // the start cell (a code 3, or a border)
+        else {
+            if constexpr (gl) { if (i == 0) hb_start_j_ = j; }   // row 0: a free start
+            else for (; i == 0 && j > 0; --j) hops_.push_back(2);
+            for (; j == 0 && i > 0; --i) hops_.push_back(1);
+        }
+        std::reverse(hops_.begin(), hops_.end());
+        best_i_ = lc ? grid_end_i_ : m_; best_j_ = grid_end_;
+        hirschberg_ = true;
+        grid_ = true;
+    }
+
+    // The linear base block: linear Pointers' values (viterbi_linear_ptr's expressions) over
+    // [r0, r1] x [c0, c1] from its borders, then the walk from (i, j) until the top row or the
+    // left column (Local: or a start).  The fill keeps values only, in viterbi_linear_ptr's
+    // two passes (the carry-free max(diag + s, up - ge_b) vectorizes across the row; only
+    // max(t, left - ge_a) is serial); the walk re-derives each code on the path from the same
+    // values by the same expressions -- 0 diagonal, 1 up where u > d strictly, 2 left where
+    // left - ge_a strictly exceeds max(d, u), Local 3 where the clamped value is <= 0 -- so
+    // it reads linear Pointers' codes without the fill storing any.  Scalar: at kGridK = 32 the
+    // blocks are ~R x 31 columns (L1000: 32 x 31), below the striped linear kernel's
+    // crossover (kLinearStripedMinN: 40-96 columns), so a striped sub-rectangle fill
+    // (lhb_striped has that interface: borders in, codes out) would not pay here.
+    void grid_base_linear(DpBuffer& buf, int r0, int r1, int c0, int c1, const GridLine& top,
+                          const GridLine& left, int& i, int& j, int& st) {
+        const T ge_a = static_cast<T>(params_->gap_extend_a), ge_b = static_cast<T>(params_->gap_extend_b);
+        const std::size_t bw = static_cast<std::size_t>(c1 - c0) + 1, sz = (static_cast<std::size_t>(r1 - r0) + 1) * bw;
+        if (buf.gbH.size() < sz) buf.gbH.resize(sz);
+        T* const bH = buf.gbH.data();
+        auto at = [&](int ii, int jj) {
+            return static_cast<std::size_t>(ii - r0) * bw + static_cast<std::size_t>(jj - c0);
+        };
+        constexpr bool lc = AM == AlignMode::Local;
+        const unsigned char* const bc = b_idx_.data() + c0;   // column c0 + c reads bc[c - 1]
+        const int w = c1 - c0;
+        for (int c = 0; c <= w; ++c) bH[c] = top(0, c);
+        for (int ii = r0 + 1; ii <= r1; ++ii) {
+            T* __restrict cv = bH + at(ii, c0);
+            const T* __restrict pv = cv - bw;
+            const T* __restrict prow = blkT_ + static_cast<std::size_t>(a_idx_[static_cast<std::size_t>(ii) - 1]) * nalpha_;
+            cv[0] = left(0, ii - r0);
+            for (int c = 1; c <= w; ++c)
+                cv[c] = std::max(nw_add<T>(pv[c - 1], prow[bc[c - 1]]), nw_sub<T>(pv[c], ge_b));
+            T lf = cv[0];
+            for (int c = 1; c <= w; ++c) {
+                T v = std::max(cv[c], nw_sub<T>(lf, ge_a));
+                if constexpr (lc) v = std::max(v, static_cast<T>(0));
+                cv[c] = v; lf = v;
+            }
+        }
+        if (grid_pick_end_) {   // Glocal, the whole problem one block: row m's first best column
+            int bj = c0; T best = bH[at(i, c0)];
+            for (int jj = c0 + 1; jj <= c1; ++jj) if (bH[at(i, jj)] > best) { best = bH[at(i, jj)]; bj = jj; }
+            j = bj; grid_end_ = bj; grid_pick_end_ = false;
+        }
+        if (grid_base_best_) {   // Local, the whole problem one block: the best cell, rows then columns, strict >
+            grid_base_best_ = false;
+            T best = static_cast<T>(0); int bi = 0, bj = 0;
+            for (int ii = r0 + 1; ii <= r1; ++ii)
+                for (int jj = c0 + 1; jj <= c1; ++jj)
+                    if (bH[at(ii, jj)] > best) { best = bH[at(ii, jj)]; bi = ii; bj = jj; }
+            if (!(best > static_cast<T>(0))) { grid_empty_ = true; grid_stop_ = true; return; }
+            i = bi; j = bj; grid_end_ = bj; grid_end_i_ = bi;
+        }
+        if (st < 0) { viterbi_score_ = bH[at(i, j)]; st = 0; }   // the end cell's value, as the fill's
+        while (i > r0 && j > c0) {
+            const std::size_t k = at(i, j);
+            if constexpr (lc) if (bH[k] <= static_cast<T>(0)) { grid_stop_ = true; break; }   // a start (code 3)
+            const T d0 = nw_add<T>(bH[k - bw - 1], subTu(i, j));
+            const T u = nw_sub<T>(bH[k - bw], ge_b);
+            const T l = nw_sub<T>(bH[k - 1], ge_a);
+            const unsigned char c = std::max(d0, u) < l ? 2 : static_cast<unsigned char>(d0 < u);
+            hops_.push_back(c);
+            if (c == 0)      { --i; --j; }
+            else if (c == 1) --i;
+            else             --j;
         }
     }
 

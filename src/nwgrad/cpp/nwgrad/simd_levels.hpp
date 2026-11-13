@@ -276,6 +276,9 @@ struct GridFwdJob {
     int local = 0;                          // Local: M clamped at 0 (the walk stops at a start)
     int find_best = 0;                      // Local, top level: the best M cell (strict >, row then column order)
     T best = T(0); int best_i = 0, best_j = 0;   // out (find_best)
+    // Linear gaps: one state, H (grid_linear_fwd_impl): top / left give H alone (s = 0),
+    // rows hold (w+1) values a saved row, cols (h+1) x W a set, last row r1's H
+    int linear = 0;
 };
 
 // ── Hirschberg linear-space sweep ─────────────────────────────────────────────
