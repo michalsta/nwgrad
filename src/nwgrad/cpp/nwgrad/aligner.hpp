@@ -1093,7 +1093,7 @@ struct Aligner {
             if (!fn || m_ < 1 || n_ < 1 || !ib_.prepared()) return 0;
             if (mode == 1) {   // the row length the level's lanes need (score_int8_min_segs)
                 const int W = score_int8_lanes(backend);
-                if ((n_ + W - 1) / W < score_int8_min_segs(W)) return 0;
+                if ((n_ + W - 1) / W < score_int8_min_segs(W, GM == GapModel::Linear, nalpha_)) return 0;
             }
             if (ib_.smax_pos > T(127) || ib_.smax_neg > T(127)) return 0;
             const bool lin = GM == GapModel::Linear;

@@ -1499,7 +1499,7 @@ NB_MODULE(nwgrad_ext, m) {
             {"soft_ckpt_min_bytes", int64_t(kSoftCkptMinBytes)},
             {"soft_double_ftz", int64_t(1)},
             {"score_int8", int64_t(kScoreInt8Default)},
-            {"score_int8_min_segs", int64_t(score_int8_min_segs(score_int8_lanes(be < 0 ? 0 : be)))}};
+            {"score_int8_min_segs", int64_t(score_int8_min_segs(score_int8_lanes(be < 0 ? 0 : be), false, 4))}};
     });
 
     m.def(

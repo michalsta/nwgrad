@@ -3016,7 +3016,12 @@ so a saturated value never leaks and the score is the int16 / int32 integer bit 
   pairs that fit int8 -- protein unrelated L100 1.70 / L300 1.33, DNA related L100 1.66 /
   L300 1.06 (6 threads the same) -- and gained from L1000 (32 segments: 0.45-1.00; L3000
   0.11-0.36).  At 4-10 segments lazy-F carries across 32 lane boundaries per row and the
-  per-row costs dominate; skynet SSE4 at L100 (7 segments of 16) already gained.
+  per-row costs dominate; skynet SSE4 at L100 (7 segments of 16) already gained.  At 64
+  lanes (solace AVX-512, 87356da) 16 segments (L1000) gained for affine and DNA (DNA 0.45-
+  0.55, protein affine 0.74) but not protein linear (1.02-1.06, control 1.02), L300 (5)
+  lost 1.30-1.84, L2048 gained everywhere (DNA 0.38-0.40, protein affine 0.56, int32 0.15-
+  0.33): 16 segments there, 32 for linear over > 8 letters.  AVX2 keeps 32 pending
+  nighthaven's re-timing.
 - **Python**: `*_int8` names / `SeqPairInt8` / `SeqPairBatchInt8` (`nwgrad/_int8.py`) are the
   int16 ones with the parameter range checked (ValueError past +-127); paths and gradients
   run at int16 (fallback, the same integers).
