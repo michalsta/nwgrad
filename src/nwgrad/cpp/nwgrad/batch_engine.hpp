@@ -2913,12 +2913,13 @@ private:
     // int8 group costs r of the T kernel and each failed lane re-runs at about k: break-even
     // at f = (1 - r) / k.  SSE4 (16 lanes; wloczykij instructions, related DNA L100 Local,
     // the fail fraction swept by mutation): r = 0.44-0.45, f 0.07 / 0.28 / 0.39 / 0.97 read
-    // 0.48-0.53 / 0.73 / 0.93 / 1.01-1.03 (k ~ 1.0-1.2): break-even ~0.45 -> 0.3.  At 64
-    // lanes (solace AVX-512) the tier's own gain is smaller (unrelated DNA L100 int16 0.89),
-    // and related DNA L100 Local read 1.12-1.15 with the old 1/2 -> 0.08.  32 lanes (AVX2)
-    // unswept -> 0.2, between.
+    // 0.48-0.53 / 0.73 / 0.93 / 1.01-1.03 (k ~ 1.0-1.2): break-even ~0.45 -> 0.4 (0.3 gave
+    // up the gain at f 0.28-0.39: 0.84 / 1.02).  At 64 lanes (solace AVX-512) the tier's own
+    // gain is smaller (unrelated DNA L100 int16 0.89), and related DNA L100 Local read
+    // 1.12-1.15 with the old 1/2 -> 0.08.  32 lanes (AVX2, nighthaven): no loss seen under
+    // 1/2, unswept -> 0.3.
     static double inter8_max_fail_(int w8) noexcept {
-        return w8 <= 16 ? 0.3 : w8 <= 32 ? 0.2 : 0.08;
+        return w8 <= 16 ? 0.4 : w8 <= 32 ? 0.3 : 0.08;
     }
     // Local: no lane of the group can reach 127 (smax_pos * min(m, n) < 127), so its int8
     // run cannot fail -- miRNA x site at match 2 (44) never consults the predictor.
