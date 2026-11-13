@@ -1742,9 +1742,11 @@ private:
         DpBuffer buf;
         FullAl full;
         BandAl band;
-        DpBufferT<NI> nbuf;   // narrow inter-pair groups: their tables, and the lane's aligner
-        NarrowAl nfull;
-        NarrowLanes nl;
+        // narrow inter-pair groups: their tables, the lane's aligner and lanes (an empty
+        // member for the types never narrowed: no aligner or buffer to build per Work)
+        struct NarrowWork { DpBufferT<NI> nbuf; NarrowAl nfull; NarrowLanes nl; };
+        struct NoNarrowWork {};
+        [[no_unique_address]] std::conditional_t<kNarrowInter, NarrowWork, NoNarrowWork> nw;
         AlignParams g;
         std::vector<int> gj;
         std::vector<FullAl> lanes;           // tracked inter-pair: one aligner per lane
@@ -2825,37 +2827,37 @@ private:
         if constexpr (kNarrowInter) {
             const LevelKernels& K = level_kernels(PL.nbackend);
             const int W = K.template of<NI>().inter_w;
-            NarrowLanes& L = w.nl;
+            NarrowLanes& L = w.nw.nl;
             InterJobT<NI> job;
             narrow_job_(PL, s, e, W, L, job);
             const size_t sz = static_cast<size_t>(L.M + 1) * (L.n + 1) * W;
             if constexpr (GM == GapModel::Linear) {
-                if (w.nbuf.H.size() < sz) w.nbuf.H.resize(sz);
-                job.VM = w.nbuf.H.data();
+                if (w.nw.nbuf.H.size() < sz) w.nw.nbuf.H.resize(sz);
+                job.VM = w.nw.nbuf.H.data();
             } else {
-                for (auto* v : {&w.nbuf.VM, &w.nbuf.VX, &w.nbuf.VY}) if (v->size() < sz) v->resize(sz);
-                job.VM = w.nbuf.VM.data(); job.VX = w.nbuf.VX.data(); job.VY = w.nbuf.VY.data();
+                for (auto* v : {&w.nw.nbuf.VM, &w.nw.nbuf.VX, &w.nw.nbuf.VY}) if (v->size() < sz) v->resize(sz);
+                job.VM = w.nw.nbuf.VM.data(); job.VX = w.nw.nbuf.VX.data(); job.VY = w.nw.nbuf.VY.data();
             }
             job.best = L.best.data(); job.best_i = L.bi.data(); job.best_j = L.bj.data();
             K.template of<NI>().inter_fill(job);
             const size_t gstride = L.ragged ? static_cast<size_t>(L.n) + 1 : 0;
-            NarrowAl& al = w.nfull;
+            NarrowAl& al = w.nw.nfull;
             for (size_t l = 0; l < e - s; ++l) {
                 const size_t i = PL.nelig[s + l];
                 flags_[i] &= static_cast<uint8_t>(~(kScore | kGrad | kStored));
                 al.set_problem(codes_a(i), codes_b(i), params_->p, 0, {}, {}, {},
                                params_->nstack.data(), nullptr, &params_->nib);
-                al.adopt_interleaved(w.nbuf, W, static_cast<int>(l), L.best[l], L.bi[l], L.bj[l], gstride);
+                al.adopt_interleaved(w.nw.nbuf, W, static_cast<int>(l), L.best[l], L.bi[l], L.bj[l], gstride);
                 score_[i] = al.score();
                 if (grad_mode_ == GradMode::Hard) {
                     with_path_(i, al, keep, [&](auto&& mv) {
                         w.g.zero();
-                        al.hard_grad_and_guide(w.nbuf, w.g, w.gj, mv);
+                        al.hard_grad_and_guide(w.nw.nbuf, w.g, w.gj, mv);
                         store_grad_(i, w.g);
                         store_guide_(i, w.gj);
                     });
                 } else {
-                    with_path_(i, al, keep, [&](auto&& mv) { al.path_and_guide(w.nbuf, mv, w.gj); });
+                    with_path_(i, al, keep, [&](auto&& mv) { al.path_and_guide(w.nw.nbuf, mv, w.gj); });
                     store_guide_(i, w.gj);
                 }
                 finish_(i, false, false);
@@ -2873,7 +2875,7 @@ private:
             const TypedKernels<NI>& KN = K.template of<NI>();
             if (!KN.inter_score) return false;
             const int W = KN.inter_w;
-            NarrowLanes& L = w.nl;
+            NarrowLanes& L = w.nw.nl;
             InterJobT<NI> job;
             narrow_job_(PL, s, e, W, L, job);
             if (!inter_score_ok<NI>(alpha_->size(), L.M, L.n, GM == GapModel::Affine, AM == AlignMode::Local,
@@ -2881,11 +2883,11 @@ private:
                 return false;
             const size_t sz = static_cast<size_t>(L.n + 1) * W;
             if constexpr (GM == GapModel::Linear) {
-                if (w.nbuf.H.size() < sz) w.nbuf.H.resize(sz);
-                job.VM = w.nbuf.H.data();
+                if (w.nw.nbuf.H.size() < sz) w.nw.nbuf.H.resize(sz);
+                job.VM = w.nw.nbuf.H.data();
             } else {
-                for (auto* v : {&w.nbuf.VM, &w.nbuf.VX, &w.nbuf.VY}) if (v->size() < sz) v->resize(sz);
-                job.VM = w.nbuf.VM.data(); job.VX = w.nbuf.VX.data(); job.VY = w.nbuf.VY.data();
+                for (auto* v : {&w.nw.nbuf.VM, &w.nw.nbuf.VX, &w.nw.nbuf.VY}) if (v->size() < sz) v->resize(sz);
+                job.VM = w.nw.nbuf.VM.data(); job.VX = w.nw.nbuf.VX.data(); job.VY = w.nw.nbuf.VY.data();
             }
             job.best = L.best.data();
             KN.inter_score(job);
