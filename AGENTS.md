@@ -1474,10 +1474,14 @@ really takes (`test_tracked_long_global_float32_pairs_run_their_own_fill`).  fuz
   under `auto` (which resolves to pointers for linear) a pair whose H table is ≤ 2 MiB
   keeps H. Measured (nighthaven, double Global, 12 threads): H 1.6× faster up to L=350,
   tie at 500, pointers 2.4× at 700 and 3.5× at 1000; `auto` tracks the faster one on both
-  sides. Explicit `pointers` always records bytes. **AVX-512 int16 Local: 768 KiB**
-  (`kLinearHTableBytes512`, branch `proto/gate-fixes`, 2026-11-10): solace (Tiger Lake, 1.25
+  sides. Explicit `pointers` always records bytes. **AVX-512 int16 Local: 1 MiB**
+  (`kLinearHTableBytes512`, branch `proto/gate-fixes`, 2026-11-10/13): solace (Tiger Lake, 1.25
   MiB L2), Pointers / H time, DNA and protein, 1 / 8 threads: L500 1.03-1.19 (H wins), L700
-  0.98 / 0.88, L1000 0.60-0.72; AVX2 on the same host keeps H to L1000 (1.00-1.07) and spot's
+  0.98 / 0.88, L1000 0.60-0.72; a first cap of 768 KiB sent L700 to Pointers and lost there
+  (phase 3: DNA L700 1T 1.074-1.080), so L700 stays on H and L800 up takes Pointers.
+  The level is resolved only for a table between the AVX-512 cap and 2 MiB
+  (`linear_h_table_exceeds`): resolving it for every pair cost short linear int16 paths
+  0.7-0.9 % instructions; AVX2 on the same host keeps H to L1000 (1.00-1.07) and spot's
   NEON too, so both keep 2 MiB. **AVX-512 int16 Global: 864 KiB, ~L665** (solace, 1 thread,
   Pointers / H: L600 1.07-1.13, H wins; L700 0.905-0.933; L800 0.60 / 0.61; L1000 0.54 /
   0.45). int16 Glocal and the other types unmeasured there: 2 MiB.

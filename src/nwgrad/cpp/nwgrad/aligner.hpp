@@ -1832,34 +1832,51 @@ private:
     // wins 1.6x up to L=350 (1 MB), ties at L=500 (2 MB), loses 2.4x at 700 and 3.5x
     // at 1000.  Same path either way, so this is a speed choice only.
     static constexpr size_t kLinearHTableBytes = size_t(2) << 20;
-    // AVX-512, int16 Local: 768 KiB (L ~620).  solace (Tiger Lake, 1.25 MiB L2), branch
+    // AVX-512, int16 Local: 1 MiB (L ~720).  solace (Tiger Lake, 1.25 MiB L2), branch
     // narrow-paths 7939230 whose linear fill is main's, Pointers / auto (H) time, DNA and
-    // protein, 1 / 8 threads: L500 (0.5 MB of H) 1.03-1.19, H wins; L700 (1 MB) 0.98 / 0.88;
-    // L1000 (2 MB) 0.60-0.72; from L1200 auto already runs Pointers (0.98-1.02).  AVX2 on
-    // the same host keeps H to L1000 (Pointers / H 1.00-1.07), NEON too (spot: main's auto
-    // 11-15 % ahead up to L1000), so they keep 2 MiB.
+    // protein, 1 / 8 threads: L500 (0.5 MB of H) 1.03-1.19, H wins; L700 (0.99 MB) 0.98 /
+    // 0.88; L1000 (2 MB) 0.60-0.72; from L1200 auto already runs Pointers (0.98-1.02).  A
+    // 768 KiB cap sent L700 to Pointers and lost there (PR #55 phase 3: DNA L700 1T 1.074-
+    // 1.080, instructions 1.085), so L700 stays on H; L800 (1.28 MB) and up take Pointers.
+    // AVX2 on the same host keeps H to L1000 (Pointers / H 1.00-1.07), NEON too (spot:
+    // main's auto 11-15 % ahead up to L1000), so they keep 2 MiB.
     // AVX-512, int16 Global: 864 KiB (L ~665).  solace (PR #49 053ebc0, whose linear fill is
     // main's, 1 thread), Pointers / main's auto (H) time, DNA / protein: L600 (0.72 MB of H)
     // 1.07-1.13, H wins; L700 (0.99 MB) 0.905-0.933 (H itself 0.975-1.01 of main); L800
     // (1.28 MB) 0.60 / 0.61; L1000 0.54 / 0.45; L1500 already Pointers.  Glocal: 2 MiB.
     static constexpr size_t kLinearHTableBytes512 =
         !std::is_same_v<T, int16_t> ? kLinearHTableBytes
-        : AM == AlignMode::Local    ? size_t(768) << 10
+        : AM == AlignMode::Local    ? size_t(1) << 20
         : AM == AlignMode::Global   ? size_t(864) << 10
                                     : kLinearHTableBytes;
-    size_t linear_h_table_bytes() const noexcept {
+    // Whether an `auto` pair's H table is past its level's cap.  The level is looked up only
+    // for a table between the AVX-512 cap and the common one (int16 Local / Global past
+    // 864 KiB-1 MiB); every other pair -- the short ones above all -- pays one compare, as on
+    // main (PR #55 phase 3: resolving the level for every pair cost short linear int16 paths
+    // +0.7-0.9 % instructions).
+    // The AVX-512 test lives out of line (noinline, cold): inlined, it made gcc outline
+    // compute_viterbi and the traceback's subT() in the int16 linear instantiations, +0.3-0.8 %
+    // instructions on short paths (sse4 counts).
+    [[gnu::noinline, gnu::cold]] bool linear_h_table_avx512_() const noexcept {
 #if !(defined(__aarch64__) || defined(_M_ARM64))
         const int be = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
-        if (be == static_cast<int>(SimdLevel::Avx512)) return kLinearHTableBytes512;
+        return be == static_cast<int>(SimdLevel::Avx512);
+#else
+        return false;
 #endif
-        return kLinearHTableBytes;
+    }
+    bool linear_h_table_exceeds(size_t bytes) const noexcept {
+        if (bytes > kLinearHTableBytes) return true;
+        if constexpr (kLinearHTableBytes512 < kLinearHTableBytes)
+            if (bytes > kLinearHTableBytes512) [[unlikely]] return linear_h_table_avx512_();
+        return false;
     }
     bool linear_ptr_fill() const noexcept {
         if constexpr (GM != GapModel::Linear || AB != AlignBand::Full) return false;
         else {
             if (is_hirschberg(tb_) || tb_ == TracebackMode::Grid) return true;
             if (tb_ != TracebackMode::Pointers) return false;
-            return !tb_auto_ || sz_ * sizeof(T) > linear_h_table_bytes();
+            return !tb_auto_ || linear_h_table_exceeds(sz_ * sizeof(T));
         }
     }
 
