@@ -1035,11 +1035,6 @@ struct TypedKernels {
     viterbi_fn         viterbi_ptr = nullptr;        // TracebackMode::Pointers
     viterbi_fn         linear = nullptr;             // striped LINEAR Full, H table (kernels_linear_impl.inl)
     viterbi_fn         linear_ptr = nullptr;         // ... recording direction bytes
-    // The semi-global runtime ends (job.sg != kSgGlocal), from the level's sg unit:
-    viterbi_fn         linear_sg = nullptr;          // linear, H table
-    viterbi_fn         linear_ptr_sg = nullptr;      // ... recording direction bytes
-    viterbi_fn         viterbi_sg = nullptr;         // affine Full, Scores
-    viterbi_fn         viterbi_ptr_sg = nullptr;     // ... Pointers
     using lhb_fn = void (*)(LhbJob<T>&);
     lhb_fn             lhb = nullptr;                // linear Hirschberg sweeps / base / scans
     banded_row_fn_t<T> banded_row_global = nullptr;  // row-wise banded whole-row kernels
@@ -1052,12 +1047,24 @@ struct TypedKernels {
     hbbase_fn          hb_base = nullptr;            // Hirschberg base case (records directions)
     hbscan_fn          hb_scan = nullptr;            // Hirschberg local endpoint scan
     score_fn           score = nullptr;              // score only (rolling rows)
-    score_fn           score_sg = nullptr;           // score only, semi-global runtime ends
     inter_fn           inter_fill = nullptr;         // inter-pair Full fill, W pairs per call
     inter_fn           inter_score = nullptr;        // inter-pair score only (Full)
     int                inter_w = 0;                  // the inter-pair lane count (pairs per call)
     using grid_fn = void (*)(GridFwdJob<T>&);
     grid_fn            grid_fwd = nullptr;           // TracebackMode::Grid's forward pass
+};
+
+// The semi-global runtime ends (job.sg != kSgGlocal), from the level's sg unit.  Not in
+// TypedKernels: there they moved every later slot (and the per-type tables) against main,
+// and the Global / Local / glocal dispatch reads those slots on every pair.  Kept at the
+// end of LevelKernels instead (sg_of<T>()).
+template <class T>
+struct SgTypedKernels {
+    typename TypedKernels<T>::viterbi_fn linear_sg = nullptr;       // linear, H table
+    typename TypedKernels<T>::viterbi_fn linear_ptr_sg = nullptr;   // ... recording direction bytes
+    typename TypedKernels<T>::viterbi_fn viterbi_sg = nullptr;      // affine Full, Scores
+    typename TypedKernels<T>::viterbi_fn viterbi_ptr_sg = nullptr;  // ... Pointers
+    typename TypedKernels<T>::score_fn   score_sg = nullptr;        // score only
 };
 
 struct LevelKernels {
@@ -1090,6 +1097,21 @@ struct LevelKernels {
     }
     template <class T> TypedKernels<T>& of() noexcept {
         return const_cast<TypedKernels<T>&>(static_cast<const LevelKernels*>(this)->of<T>());
+    }
+    SgTypedKernels<double>  sg_d;   // last: see SgTypedKernels
+    SgTypedKernels<float>   sg_f;
+    SgTypedKernels<int16_t> sg_i16;
+    SgTypedKernels<int32_t> sg_i32;
+    SgTypedKernels<int64_t> sg_i64;
+    template <class T> const SgTypedKernels<T>& sg_of() const {
+        if constexpr (std::is_same_v<T, double>)        return sg_d;
+        else if constexpr (std::is_same_v<T, float>)    return sg_f;
+        else if constexpr (std::is_same_v<T, int16_t>)  return sg_i16;
+        else if constexpr (std::is_same_v<T, int32_t>)  return sg_i32;
+        else { static_assert(std::is_same_v<T, int64_t>, "unsupported scalar type"); return sg_i64; }
+    }
+    template <class T> SgTypedKernels<T>& sg_of() {
+        return const_cast<SgTypedKernels<T>&>(static_cast<const LevelKernels*>(this)->sg_of<T>());
     }
 };
 

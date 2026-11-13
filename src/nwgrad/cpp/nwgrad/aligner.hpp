@@ -943,8 +943,10 @@ struct Aligner {
         } else {
             const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
             if (backend != kBackendScalar) {
-                const auto& KTs = level_kernels(backend).template of<T>();
-                const auto fn = sg_is_glocal_() ? KTs.score : KTs.score_sg;   // semi-global runtime ends: the sg unit's
+                const LevelKernels& KL = level_kernels(backend);
+                auto fn = KL.template of<T>().score;
+                if constexpr (AM == AlignMode::Glocal)   // semi-global runtime ends: the sg unit's
+                    if (!sg_is_glocal_()) fn = KL.template sg_of<T>().score_sg;
                 if (fn) {
                     ScoreJob<T> job{}; job.sat = sat_;
                     job.a = a_idx_.data(); job.m = m_;
@@ -956,7 +958,7 @@ struct Aligner {
                     job.go_b = lin ? T(0) : static_cast<T>(params_->gap_open_b);
                     job.ge_b = static_cast<T>(params_->gap_extend_b);
                     job.local = AM == AlignMode::Local ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
-                    job.sg = sg_;
+                    if constexpr (AM == AlignMode::Glocal) job.sg = sg_;
                     job.variant = score_variant_env();
                     job.linear = lin && score_linear_env();
                     job.buf = &buf;
@@ -2596,8 +2598,8 @@ private:
                     const TypedKernels<T>& KT = K.template of<T>();
                     // semi-global runtime ends: the level's sg fills (their own unit)
                     const bool sgk = !sg_is_glocal_();
-                    if (lin_ptr ? (sgk ? KT.linear_ptr_sg : KT.linear_ptr) != nullptr
-                                : (sgk ? KT.linear_sg : KT.linear) != nullptr) {
+                    if (lin_ptr ? (sgk ? K.template sg_of<T>().linear_ptr_sg : KT.linear_ptr) != nullptr
+                                : (sgk ? K.template sg_of<T>().linear_sg : KT.linear) != nullptr) {
                         run_dispatched_linear(buf, K, lin_ptr);
                         return;
                     }
@@ -2634,8 +2636,8 @@ private:
             if (uses_rowwise_full()) { viterbi_affine_simd(buf, K); return; }
             // The striped Full kernel, this level's instantiation for T.
             const bool sgk = !sg_is_glocal_();   // semi-global runtime ends: the sg unit's kernels
-            if (use_ptr && (sgk ? KT.viterbi_ptr_sg : KT.viterbi_ptr)) { run_dispatched_affine(buf, K, true);  return; }
-            if (sgk ? KT.viterbi_sg : KT.viterbi)                      { run_dispatched_affine(buf, K, false); return; }
+            if (use_ptr && (sgk ? K.template sg_of<T>().viterbi_ptr_sg : KT.viterbi_ptr)) { run_dispatched_affine(buf, K, true);  return; }
+            if (sgk ? K.template sg_of<T>().viterbi_sg : KT.viterbi)                      { run_dispatched_affine(buf, K, false); return; }
             if (use_ptr) { viterbi_affine_ptr(buf); return; }   // level lacks the ptr kernel
         }
         // The row-wise banded kernel (every T); a level without it falls back to the
@@ -2657,15 +2659,21 @@ private:
         job.go_a = static_cast<T>(params_->gap_open_a);   job.ge_a = static_cast<T>(params_->gap_extend_a);
         job.go_b = static_cast<T>(params_->gap_open_b);   job.ge_b = static_cast<T>(params_->gap_extend_b);
         job.align_mode = (AM == AlignMode::Local) ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
-        job.sg = sg_;
+        if constexpr (AM == AlignMode::Glocal) job.sg = sg_;
         job.align_band = 0; job.band = 0;
         job.guide_j = nullptr; job.guide_len = 0;
         job.buf = &buf;
         if (tr_) fill_track_job_(job.tr, true, static_cast<size_t>(n_) + 16);
         const TypedKernels<T>& KT = K.template of<T>();
         job.dense = (use_ptr && want_dense_()) ? 1 : 0;
-        if (!sg_is_glocal_()) { if (use_ptr) KT.viterbi_ptr_sg(job); else KT.viterbi_sg(job); }   // the sg unit's
-        else if (use_ptr) KT.viterbi_ptr(job); else KT.viterbi(job);
+        if constexpr (AM == AlignMode::Glocal) {
+            if (!sg_is_glocal_()) {   // the sg unit's
+                const SgTypedKernels<T>& KS = K.template sg_of<T>();
+                if (use_ptr) KS.viterbi_ptr_sg(job); else KS.viterbi_sg(job);
+            } else if (use_ptr) KT.viterbi_ptr(job); else KT.viterbi(job);
+        } else {
+            if (use_ptr) KT.viterbi_ptr(job); else KT.viterbi(job);
+        }
         pointers_ = use_ptr;   // Pointers leaves codes, not score tables
         dense_ = use_ptr && job.dense;
         // Adopt the layout the kernel produced (striped for the Full striped kernel).
@@ -2733,15 +2741,21 @@ private:
         job.go_a = static_cast<T>(0); job.ge_a = static_cast<T>(params_->gap_extend_a);
         job.go_b = static_cast<T>(0); job.ge_b = static_cast<T>(params_->gap_extend_b);
         job.align_mode = (AM == AlignMode::Local) ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
-        job.sg = sg_;
+        if constexpr (AM == AlignMode::Glocal) job.sg = sg_;
         job.align_band = 0; job.band = 0;
         job.guide_j = nullptr; job.guide_len = 0;
         job.buf = &buf;
         if (tr_) fill_track_job_(job.tr, true, static_cast<size_t>(n_) + 16, true);
         const TypedKernels<T>& KT = K.template of<T>();
         job.dense = (use_ptr && want_dense_()) ? 1 : 0;
-        if (!sg_is_glocal_()) { if (use_ptr) KT.linear_ptr_sg(job); else KT.linear_sg(job); }
-        else if (use_ptr) KT.linear_ptr(job); else KT.linear(job);
+        if constexpr (AM == AlignMode::Glocal) {
+            if (!sg_is_glocal_()) {   // the sg unit's
+                const SgTypedKernels<T>& KS = K.template sg_of<T>();
+                if (use_ptr) KS.linear_ptr_sg(job); else KS.linear_sg(job);
+            } else if (use_ptr) KT.linear_ptr(job); else KT.linear(job);
+        } else {
+            if (use_ptr) KT.linear_ptr(job); else KT.linear(job);
+        }
         pointers_ = use_ptr;
         dense_ = use_ptr && job.dense;
         if (job.table_layout == 1) {

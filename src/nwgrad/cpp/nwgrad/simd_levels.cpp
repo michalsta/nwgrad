@@ -44,7 +44,7 @@ void register_level_sg(SimdLevel l, typename TypedKernels<T>::viterbi_fn linear_
                        typename TypedKernels<T>::viterbi_fn viterbi_sg,
                        typename TypedKernels<T>::viterbi_fn viterbi_ptr_sg,
                        typename TypedKernels<T>::score_fn score_sg) {
-    TypedKernels<T>& k = level_table()[(int)l].template of<T>();
+    SgTypedKernels<T>& k = level_table()[(int)l].template sg_of<T>();
     k.linear_sg      = linear_sg;
     k.linear_ptr_sg  = linear_ptr_sg;
     k.viterbi_sg     = viterbi_sg;
