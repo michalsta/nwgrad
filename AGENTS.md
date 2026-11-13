@@ -3377,7 +3377,20 @@ instantiations only (fixed ends: `static_assert` glocal's), and `sg` sits last i
 `striped_linear_ptr_entry` (every T), `striped_full_ptr_entry` and the Hirschberg / grid kernels
 are main's instruction for instruction on NEON (341 identical, 25 differ in register names only);
 what differs is the score-only kernels (31, small: operand order, one spill) and a few affine
-Scores fills.  On x86 sse4 the same: 597 identical, the rest score-only kernels and one int64 Pointers fill.  Overlap (all four) / global 0.85-0.99, a_end
+Scores fills.  On x86 sse4 the same: 597 identical, the rest score-only kernels and one int64 Pointers fill.
+**Spot on f65cdfd** then read protein affine double path / hard 1.17-1.19 (Global, Local, Glocal; DNA,
+float32, score-only 1.000).  I followed it with a static aarch64 driver of the batch engine under
+qemu, logging every translated block: the cell runs the inter-pair fill
+(`lvl_neon_inter::inter_fill_affine<double>` + `row_gather`, ~40 % of the blocks), and
+`level_neon_inter.o` is byte-identical to main's (606 / 606 functions); the hard walk in the bindings
+is main's but for the `Aligner` member offsets (+4, `sg_`).  x86 sse4 instructions on the same cell:
+1.000 (Python, 13 vs 1 passes).  So the code that runs is main's; what moved is where it sits: ld64
+(macOS) has no `nwgrad_text.ld`, so every byte the branch adds to py_exports or the level units moves
+the inter-pair kernel against the engine code (pr-placement.md: up to 13 % on byte-identical kernels).
+Even the qemu block counts moved with it (a hot loop of the identical kernel split across a 4 KiB
+page in one link and not the other: -4.8 % host instructions, an artifact).  The glocal linear
+walks and the scalar fills now take glocal's ends at compile time (`SGR`, `sgt_*_<SGR>()`): the
+glocal walk is main's code but for register names.  Overlap (all four) / global 0.85-0.99, a_end
 0.99-1.04.
 
 **Tests** (`tests/Python/test_semiglobal.py`): a Python 3-state reference of the 4-flag
