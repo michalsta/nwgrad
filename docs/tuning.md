@@ -148,9 +148,12 @@ An `int` is the threshold, `None` turns the gate off, and `"default"` removes th
 override. A batch regroups on its next call after any change.
 
 `score_int8_min_segs` is the int8 tier's minimum row length in int8 segments (length of
-`seq_b` / lanes, rounded up): 0 at 16 lanes (SSE, NEON), 32 at 32 and 64 lanes (AVX2,
-AVX-512), where short rows ran slower in int8 than in int16 (nighthaven: L100 1.66-1.70,
-L300 1.06-1.33 on pairs that fit; L1000 0.45-1.00). An override applies at every level.
+`seq_b` / lanes, rounded up): 0 at 16 lanes (SSE, NEON); 32 at 32 lanes (AVX2), where
+short rows ran slower in int8 than in int16 (nighthaven: L100 1.66-1.70, L300 1.06-1.33 on
+pairs that fit; L1000 0.45-1.00); at 64 lanes (AVX-512) 16, or 32 for linear gaps over
+more than 8 letters (solace: L1000 DNA 0.45-0.55 and protein affine 0.74 at 16 segments,
+protein linear 1.02-1.06; L300 1.30-1.84). An override applies at every level; the default
+shown by `_tuning.defaults()` is the affine one.
 
 `score_int8` is a mode, not a threshold: 0 never runs the int8 score kernel, 1 (the
 default) runs it first for Local integer score-only calls unless the thread's previous one

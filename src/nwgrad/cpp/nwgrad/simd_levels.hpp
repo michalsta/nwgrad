@@ -728,11 +728,16 @@ inline int score_int8_mode() noexcept {
 // L100 (4 segments) protein unrelated 1.70, DNA related 1.66; L300 (10) 1.33 / 1.06;
 // L1000 (32) 0.64 / 1.00, DNA unrelated 0.45; L3000 0.36.  At 16 lanes (SSE4, skynet,
 // instructions) L100 (7 segments) already gained: DNA related 0.81, unrelated 0.48,
-// protein unrelated 0.97.  AVX-512 untimed: the AVX2 rule.  score_int8_min_segs overrides
-// it at every level.
-inline int score_int8_min_segs(int lanes) noexcept {
+// protein unrelated 0.97.  At 64 lanes (AVX-512, solace, Local score int16, tier on / off,
+// 87356da) 16 segments (L1000) already gained for affine and for <= 8 letters -- DNA
+// 0.45-0.55, protein affine 0.74 -- but not protein linear (1.02-1.06, control 1.02); 5
+// segments (L300) lost 1.30-1.84; from 32 (L2048) every cell gained (DNA 0.38-0.40,
+// protein affine 0.56, int32 0.15-0.33).  So 16 there, except linear over > 8 letters: 32.
+// score_int8_min_segs overrides it at every level.
+inline int score_int8_min_segs(int lanes, bool linear, int nalpha) noexcept {
     const int64_t o = gate_override(Gate::ScoreInt8MinSegs);
     if (o >= 0) return o > (1 << 20) ? (1 << 20) : static_cast<int>(o);
+    if (lanes >= 64) return (linear && nalpha > 8) ? 32 : 16;
     return lanes >= 32 ? 32 : 0;
 }
 // The int8 kernel's lane count at a level (score8_kernel_impl.inl: native_simd<int8_t>).
