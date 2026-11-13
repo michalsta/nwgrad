@@ -1630,8 +1630,6 @@ private:
             : TracebackMode::Pointers;
     TracebackMode tb_ = kDefaultTb;
     bool          tb_auto_ = true;   // tb_ came from "auto" (see linear_ptr_fill)
-    // Glocal: the free ends (kSgFree*, simd_levels.hpp); the other modes ignore it.
-    int           sg_ = kSgGlocal;
     int    striped_seg_    = 0;
     int    striped_w_      = 1;
     size_t striped_rs_     = 0;   // a striped row's stride (>= (seg+1)*W: a kernel may pad it)
@@ -3968,6 +3966,11 @@ private:
     std::vector<uint32_t> lhb_rows_;
     std::vector<T> lhb_ga_, lhb_gb_, lhb_r0_, lhb_c0_;
     int lhb_runs_ = 0;   // kernel calls, for the tests' liveness check
+    // Glocal: the free ends (kSgFree*, simd_levels.hpp); the other modes ignore it.  The
+    // last member, so every other one keeps main's offset (beside tb_auto_ it moved the
+    // fields the walks and fills read by 4 bytes; protein L300 linear Local float32 path
+    // read 1.014-1.025 on M1 on four code layouts, 2026-11-13).
+    int sg_ = kSgGlocal;
     LhbJob<T> lhb_job_(DpBuffer& buf, int ncols, int nrows) {
         LhbJob<T> job{}; job.sat = sat_;
         job.b = lhb_b_.data(); job.n = ncols;
