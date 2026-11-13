@@ -2067,21 +2067,36 @@ private:
     bool group_resolve_ok_() const noexcept {
         return s_.inter_fill && !tracked_ && gparams_ && grad_mode_ == GradMode::Soft;
     }
-    uint32_t group_of_(size_t i) {
-        InterPlan& P = const_cast<InterPlan&>(ensure_plan_());
-        if (P.gid.size() != size()) {
-            P.gid.assign(size(), kNoGroup);
-            for (size_t t = 0; t < P.groups.size(); ++t)
-                for (size_t k = P.groups[t].first; k < P.groups[t].second; ++k)
-                    P.gid[P.elig[k]] = static_cast<uint32_t>(t);
-        }
-        return P.gid[i];
-    }
-    // Pair i's pending guide, on the calling thread: with its group when it has one.
+    // Pair i's pending guide, on the calling thread.  A snapshot guide resolves EVERY
+    // kSnap-pending guide of the batch at once, in parallel (resolve_all_snap_): a caller
+    // reading guide_j pair by pair (Python) otherwise computed them one at a time on its
+    // own thread, while main's eager call had filled them on n_threads -- solace AVX-512,
+    // 8 threads, every guide read after each step: 1.6-2.2x main's time per step.  Any
+    // one read thus pays for the batch's guides (what the eager call always paid); a step
+    // whose guides are never read still pays nothing.  A lazy guide (no kSnap) follows
+    // the params current at its own first use, so it stays per pair.
     void resolve_caller_(size_t i) {
-        const uint32_t t = (flags_[i] & kSnap) && group_resolve_ok_() ? group_of_(i) : kNoGroup;
-        if (t != kNoGroup && resolve_group_(t, solo_work_())) return;
+        if (flags_[i] & kSnap) {
+            resolve_all_snap_();
+            if (!guide_pending(i)) return;
+        }
         resolve_guide_(i, solo_work_());
+    }
+    // Every kSnap-pending guide: the inter-pair groups (resolve_groups_), then the rest
+    // per pair, each on one worker (dynamic, as score_and_grad's own fills).
+    void resolve_all_snap_() {
+        resolve_groups_();
+        std::vector<size_t> rest;
+        for (size_t i = 0; i < size(); ++i)
+            if ((flags_[i] & kPending) && (flags_[i] & kSnap)) rest.push_back(i);
+        if (rest.empty()) return;
+        std::atomic<size_t> idx{0};
+        auto worker = [&]() {
+            WorkLease lease(*this);
+            for (size_t k; (k = idx.fetch_add(1, std::memory_order_relaxed)) < rest.size(); )
+                resolve_guide_(rest[k], *lease);
+        };
+        run_workers_(rest.size(), worker);
     }
     // Before a banded pass: every group with a kSnap-pending lane, in parallel (one worker
     // a group, so each pair is written by one thread); the rest resolve per pair inside
@@ -2482,9 +2497,7 @@ private:
         int backend = -1;                               // every group's vector backend
         std::vector<size_t> elig, other;
         std::vector<std::pair<size_t, size_t>> groups;   // [start, end) into elig
-        std::vector<uint32_t> gid;   // pair -> its group (kNoGroup: other); built on demand
     };
-    static constexpr uint32_t kNoGroup = ~0u;
     // Two plans: plan_ for the fills that keep tables (score_and_grad_inter_, the band
     // groups), plan_rows_ for score_only_ (no byte budget: its kernel keeps rows).  Both
     // only differ for grad_mode None; plan_rows_ stays empty otherwise.

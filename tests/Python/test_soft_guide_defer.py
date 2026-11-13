@@ -125,13 +125,17 @@ def test_pending_only_when_unasked(gm):
     assert b.soft_guide == "eager"
     b.score_and_grad()
     assert b._guides_pending() == N
-    b[3].guide_j   # interpair: its whole plan group (<= 8 lanes) from one shared fill
-    assert N - 8 <= b._guides_pending() < N
+    b[3].guide_j   # one read resolves every snapshot guide of the batch, in parallel
+    assert b._guides_pending() == 0
     s = make(nwgrad.SeqPairBatchDouble, A, B, P, gm, "local", "striped")
     s.score_and_grad()
-    s[3].guide_j   # own fills: that pair alone
-    assert s._guides_pending() == N - 1
+    s[3].guide_j   # own fills too
+    assert s._guides_pending() == 0
     assert list(s[3].guide_j) == list(b[3].guide_j)
+    s.soft_guide = "lazy"   # a lazy guide follows the params at its own first use: per pair
+    s.score_and_grad()
+    s[3].guide_j
+    assert s._guides_pending() == N - 1
     b.score_and_grad(keep_paths=True)      # stored paths need the Viterbi now
     assert b._guides_pending() == 0
     b.score_and_grad()
@@ -439,3 +443,36 @@ def test_default_always_defers():
         assert b._guides_pending() == len(A)
         guides(b)
         assert b._guides_pending() == 0
+
+
+@pytest.mark.parametrize("fill", ["striped", "rowwise", "interpair"])
+@pytest.mark.parametrize("threads", [1, 4, 8])
+@pytest.mark.parametrize("cname", list(CLASSES))
+def test_per_pair_reads_resolve_batch(fill, threads, cname):
+    """A caller reading guide_j pair by pair after a deferred step (the first read
+    resolves the batch's guides on its n_threads): the eager guides and outputs, at every
+    thread count, over several steps with set_params between them."""
+    rng = np.random.default_rng(61 + threads)
+    Ps = [prot_params(rng, "affine") for _ in range(3)]
+    A, B = pairs(rng, "protein", 60)
+    cls = CLASSES[cname]
+
+    def loop(defer):
+        _tuning.set_gate("soft_guide_defer", defer)
+        b = make(cls, A, B, Ps[0], "affine", "global", fill, threads=threads)
+        out = []
+        for P in Ps:
+            b.set_params(P)
+            b.score_and_grad()
+            if defer:
+                assert b._guides_pending() == len(A)
+            g = [list(b[i].guide_j) for i in range(len(A))]
+            assert b._guides_pending() == 0
+            out.append((g, outputs(b)))
+        return out
+
+    e, d = loop(0), loop(2)
+    for (ge, oe), (gd, od) in zip(e, d):
+        assert gd == ge
+        for x, y in zip(oe, od):
+            np.testing.assert_array_equal(x, y)
