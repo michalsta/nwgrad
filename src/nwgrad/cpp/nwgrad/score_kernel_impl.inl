@@ -38,6 +38,11 @@
 // Glocal with no columns (n == 0): column 0 is column n, so the ends are (m, 0) and, with a
 // free A end, every (i, 0) above it; (i, 0) is 0 at i == 0 or with a free A begin, else
 // Global's border -(go_b + i*ge_b) (the fill's VX there).  go_b / ge_b: the job's, untracked.
+// Instantiated by the runtime-ends kernels only (SG < 0, the sg unit): referenced from the
+// fixed-end ones too, this helper and the column-n index (coln) computed in every kernel
+// moved gcc's code for the whole level unit on AArch64 (score, Pointers, Hirschberg and
+// grid kernels alike, untouched ones included; aarch64 gcc 16.2.1, 2026-11-13), and with
+// it Local linear float32 and the glocal linear path +2-3 % on M1.
 template <class T, bool Tr>
 static T sg_score_col0_only(const ScoreJob<T>& job, T go_b, T ge_b) {
     const int m = job.m, sg = job.sg;
@@ -70,7 +75,7 @@ static void score_affine_striped(ScoreJob<T>& job) {
         // No columns: Global ends in one gap run down column 0 (or is empty); Local is 0.
         // The fill's (m, 0) cell: VM = -inf (0 at m == 0), VX = -(go_b + m*ge_b), VY = -inf.
         if constexpr (Local) job.score = T(0);
-        else if constexpr (Glocal) job.score = sg_score_col0_only<T, Tr>(job, go_b, ge_b);
+        else if constexpr (Glocal && SG < 0) job.score = sg_score_col0_only<T, Tr>(job, go_b, ge_b);   // glocal's (SG fixed): Global's line below
         else if constexpr (Tr) job.score = (m == 0) ? T(0) : tr.bx0[m];
         else job.score = (m == 0) ? T(0) : static_cast<T>(-(go_b + static_cast<T>(m) * ge_b));
         return;
@@ -78,10 +83,11 @@ static void score_affine_striped(ScoreJob<T>& job) {
     // The semi-global ends (Glocal: job.sg, simd_levels.hpp).  A score needs no position:
     // the maximum over row m (free B end) or (m, n), and over column n (free A end).
     constexpr bool SGX = Glocal && SG < 0;   // SG: kSgGlocal glocal's ends (main's code), -1 runtime
+    static_assert(SG < 0 || SG == kSgGlocal, "fixed ends: glocal's only (coln, the n == 0 score)");
     const int sg = !Glocal ? 0 : (SGX ? job.sg : SG);
     const bool sg_ab = Glocal && (sg & kSgFreeABegin), sg_ae = Glocal && (sg & kSgFreeAEnd),
                sg_bb = Glocal && (sg & kSgFreeBBegin), sg_be = Glocal && (sg & kSgFreeBEnd);
-    const std::size_t coln = (std::size_t)((n - 1) % ((n + W - 1) / W)) * W + (std::size_t)((n - 1) / ((n + W - 1) / W));
+    const std::size_t coln = !SGX ? 0 : (std::size_t)((n - 1) % ((n + W - 1) / W)) * W + (std::size_t)((n - 1) / ((n + W - 1) / W));
 
     const int seg = (n + W - 1) / W;
     const std::size_t sw = (std::size_t)seg * W;
@@ -118,7 +124,7 @@ static void score_affine_striped(ScoreJob<T>& job) {
             }
         }
     // Glocal, a free A end: the best of column n over rows 0..m-1 (row m at the end)
-    T colbest = (sg_ae && m > 0) ? std::max({pM[coln], pX[coln], pY[coln]}) : NINF;
+    T colbest = (Glocal && sg_ae && m > 0) ? std::max({pM[coln], pX[coln], pY[coln]}) : NINF;
 
     vd vgo_a(go_a), vge_a(ge_a), vgo_b(go_b), vge_b(ge_b);
     vd vgoe_a = vgo_a + vge_a, vgoe_b = vgo_b + vge_b;   // open_pen (integer T)
@@ -288,7 +294,7 @@ static void score_affine_striped(ScoreJob<T>& job) {
             if (!changed) break;
         }
 
-        if (sg_ae && i < m) colbest = std::max(colbest, std::max({cM[coln], cX[coln], cY[coln]}));
+        if (Glocal && sg_ae && i < m) colbest = std::max(colbest, std::max({cM[coln], cX[coln], cY[coln]}));
         std::swap(pM, cM); std::swap(pX, cX); std::swap(pY, cY);
         bM = nbM; bX = nbX; bY = NINF;
     }
@@ -377,7 +383,7 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
 
     if (n == 0) {
         if constexpr (Local) job.score = T(0);
-        else if constexpr (Glocal) job.score = sg_score_col0_only<T, Tr>(job, go_b, ge_b);
+        else if constexpr (Glocal && SG < 0) job.score = sg_score_col0_only<T, Tr>(job, go_b, ge_b);   // glocal's (SG fixed): Global's line below
         else if constexpr (Tr) job.score = (m == 0) ? T(0) : tr.bx0[m];
         else job.score = (m == 0) ? T(0) : static_cast<T>(-(go_b + static_cast<T>(m) * ge_b));
         return;
@@ -404,10 +410,11 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
 
     // The semi-global ends (Glocal: job.sg; see score_affine_striped).
     constexpr bool SGX = Glocal && SG < 0;   // SG: kSgGlocal glocal's ends (main's code), -1 runtime
+    static_assert(SG < 0 || SG == kSgGlocal, "fixed ends: glocal's only (coln, the n == 0 score)");
     const int sg = !Glocal ? 0 : (SGX ? job.sg : SG);
     const bool sg_ab = Glocal && (sg & kSgFreeABegin), sg_ae = Glocal && (sg & kSgFreeAEnd),
                sg_bb = Glocal && (sg & kSgFreeBBegin), sg_be = Glocal && (sg & kSgFreeBEnd);
-    const std::size_t coln = (std::size_t)((n - 1) % seg) * W + (std::size_t)((n - 1) / seg);
+    const std::size_t coln = !SGX ? 0 : (std::size_t)((n - 1) % seg) * W + (std::size_t)((n - 1) / seg);
     // row 0: D = max(M, X, Y) of the three-state row 0, X = -inf; padding -inf
     for (std::size_t k = 0; k < sw; ++k) { pD[k] = NINF; pX[k] = NINF; }
     for (int l = 0; l < W; ++l)
@@ -419,7 +426,7 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
                 else                pD[k] = -(go_a + j * ge_a);
             }
         }
-    T colbest = (sg_ae && m > 0) ? pD[coln] : NINF;   // Glocal, a free A end: column n, rows < m
+    T colbest = (Glocal && sg_ae && m > 0) ? pD[coln] : NINF;   // Glocal, a free A end: column n, rows < m
 
     vd vgo_a(go_a), vge_a(ge_a), vgo_b(go_b), vge_b(ge_b);
     vd vgoe_a = vgo_a + vge_a, vgoe_b = vgo_b + vge_b;   // open_pen (integer T)
@@ -616,7 +623,7 @@ static void score_affine_striped_pos(ScoreJob<T>& job) {
             if (!changed) break;
         }
 
-        if (sg_ae && i < m) colbest = std::max(colbest, cD[coln]);
+        if (Glocal && sg_ae && i < m) colbest = std::max(colbest, cD[coln]);
         std::swap(pD, cD); std::swap(pX, cX);
         bD = nbD;
     }
@@ -678,7 +685,7 @@ static void score_affine_striped_pos_fp(ScoreJob<T>& job) {
 
     if (n == 0) {
         if constexpr (Local) job.score = T(0);
-        else if constexpr (Glocal) job.score = sg_score_col0_only<T, Tr>(job, go_b, ge_b);
+        else if constexpr (Glocal && SG < 0) job.score = sg_score_col0_only<T, Tr>(job, go_b, ge_b);   // glocal's (SG fixed): Global's line below
         else if constexpr (Tr) job.score = (m == 0) ? T(0) : tr.bx0[m];
         else job.score = (m == 0) ? T(0) : static_cast<T>(-(go_b + static_cast<T>(m) * ge_b));
         return;
@@ -705,10 +712,11 @@ static void score_affine_striped_pos_fp(ScoreJob<T>& job) {
 
     // The semi-global ends (Glocal: job.sg; see score_affine_striped).
     constexpr bool SGX = Glocal && SG < 0;   // SG: kSgGlocal glocal's ends (main's code), -1 runtime
+    static_assert(SG < 0 || SG == kSgGlocal, "fixed ends: glocal's only (coln, the n == 0 score)");
     const int sg = !Glocal ? 0 : (SGX ? job.sg : SG);
     const bool sg_ab = Glocal && (sg & kSgFreeABegin), sg_ae = Glocal && (sg & kSgFreeAEnd),
                sg_bb = Glocal && (sg & kSgFreeBBegin), sg_be = Glocal && (sg & kSgFreeBEnd);
-    const std::size_t coln = (std::size_t)((n - 1) % seg) * W + (std::size_t)((n - 1) / seg);
+    const std::size_t coln = !SGX ? 0 : (std::size_t)((n - 1) % seg) * W + (std::size_t)((n - 1) / seg);
     // row 0 (three-state: Global M = X = -inf, Y = -(go + j*ge); Local M = 0); padding -inf
     for (std::size_t k = 0; k < sw; ++k) { pA[k] = NINF; pX[k] = NINF; pY[k] = NINF; }
     for (int l = 0; l < W; ++l)
@@ -720,7 +728,7 @@ static void score_affine_striped_pos_fp(ScoreJob<T>& job) {
                 else                pY[k] = -(go_a + j * ge_a);
             }
         }
-    T colbest = (sg_ae && m > 0) ? std::max(pA[coln], pY[coln]) : NINF;   // Glocal, a free A end
+    T colbest = (Glocal && sg_ae && m > 0) ? std::max(pA[coln], pY[coln]) : NINF;   // Glocal, a free A end
 
     vd vgo_a(go_a), vge_a(ge_a), vgo_b(go_b), vge_b(ge_b);
     const vd vzero(static_cast<T>(0)), vninf(NINF);
@@ -825,7 +833,7 @@ static void score_affine_striped_pos_fp(ScoreJob<T>& job) {
             if (!changed) break;
         }
 
-        if (sg_ae && i < m) colbest = std::max(colbest, std::max(cA[coln], cY[coln]));
+        if (Glocal && sg_ae && i < m) colbest = std::max(colbest, std::max(cA[coln], cY[coln]));
         std::swap(pA, cA); std::swap(pX, cX); std::swap(pY, cY);
         bD = nbD;
     }
@@ -924,7 +932,7 @@ static void score_linear_striped_int(ScoreJob<T>& job) {
 
     if (n == 0) {
         if constexpr (Local) job.score = T(0);
-        else if constexpr (Glocal) job.score = sg_score_col0_only<T, Tr>(job, go_b, ge_b);
+        else if constexpr (Glocal && SG < 0) job.score = sg_score_col0_only<T, Tr>(job, go_b, ge_b);   // glocal's (SG fixed): Global's line below
         else if constexpr (Tr) job.score = (m == 0) ? T(0) : tr.bx0[m];
         else job.score = (m == 0) ? T(0) : static_cast<T>(-(go_b + static_cast<T>(m) * ge_b));
         return;
@@ -945,10 +953,11 @@ static void score_linear_striped_int(ScoreJob<T>& job) {
 
     // The semi-global ends (Glocal: job.sg; see score_affine_striped).
     constexpr bool SGX = Glocal && SG < 0;   // SG: kSgGlocal glocal's ends (main's code), -1 runtime
+    static_assert(SG < 0 || SG == kSgGlocal, "fixed ends: glocal's only (coln, the n == 0 score)");
     const int sg = !Glocal ? 0 : (SGX ? job.sg : SG);
     const bool sg_ab = Glocal && (sg & kSgFreeABegin), sg_ae = Glocal && (sg & kSgFreeAEnd),
                sg_bb = Glocal && (sg & kSgFreeBBegin), sg_be = Glocal && (sg & kSgFreeBEnd);
-    const std::size_t coln = (std::size_t)((n - 1) % seg) * W + (std::size_t)((n - 1) / seg);
+    const std::size_t coln = !SGX ? 0 : (std::size_t)((n - 1) % seg) * W + (std::size_t)((n - 1) / seg);
     // row 0 as U: Global -(go_a + j*ge_a), Local / Glocal 0; padding -inf; P -inf
     for (std::size_t k = 0; k < sw; ++k) { rU[k] = NINF; rP[k] = NINF; }
     for (int l = 0; l < W; ++l)
@@ -960,7 +969,7 @@ static void score_linear_striped_int(ScoreJob<T>& job) {
                 else                rU[k] = -(go_a + j * ge_a);
             }
         }
-    T colbest = (sg_ae && m > 0) ? rU[coln] : NINF;   // Glocal, a free A end: column n, rows < m
+    T colbest = (Glocal && sg_ae && m > 0) ? rU[coln] : NINF;   // Glocal, a free A end: column n, rows < m
 
     vd vge_a(ge_a), vge_b(ge_b);
     const vd vzero(static_cast<T>(0)), vninf(NINF);
@@ -976,7 +985,8 @@ static void score_linear_striped_int(ScoreJob<T>& job) {
             vge_a = vd(ge_a); vge_b = vd(ge_b);
         }
         T nbH;   // column 0: the D/X kernel's max(M, X) there (its Y is -inf), go_b = 0
-        if (Local || sg_ab) nbH = T(0);   // a semi-global free A begin: Local's
+        if constexpr (Local) nbH = T(0);
+        else if (sg_ab) nbH = T(0);       // a semi-global free A begin: Local's
         else if constexpr (Tr) nbH = std::max(NINF, tr.bx0[i]);
         else nbH = std::max(NINF, static_cast<T>(-(go_b + i * ge_b)));
         const T nbOpen = nw_sub(nw_sub(nbH, go_a), ge_a);   // open_pen with go = 0
@@ -1048,7 +1058,7 @@ static void score_linear_striped_int(ScoreJob<T>& job) {
         // Glocal, a free A end: row i's H at column n, completed as the next row's pass (or
         // the last-row pass below) completes it: max(U, max(P, carry-in) - ramp), the ramp
         // fBase + s*ge_a summed in the lane's wrapping arithmetic (as prq's +=).
-        if (sg_ae && i < m) {
+        if (Glocal && sg_ae && i < m) {
             const int sn = (n - 1) % seg, ln = (n - 1) / seg;
             T rq = static_cast<T>(fBase[ln]);
             for (int q = 0; q < sn; ++q) rq = static_cast<T>(rq + ge_a);
@@ -1112,7 +1122,7 @@ static void score_linear_striped_fp(ScoreJob<T>& job) {
 
     if (n == 0) {
         if constexpr (Local) job.score = T(0);
-        else if constexpr (Glocal) job.score = sg_score_col0_only<T, Tr>(job, go_b, ge_b);
+        else if constexpr (Glocal && SG < 0) job.score = sg_score_col0_only<T, Tr>(job, go_b, ge_b);   // glocal's (SG fixed): Global's line below
         else if constexpr (Tr) job.score = (m == 0) ? T(0) : tr.bx0[m];
         else job.score = (m == 0) ? T(0) : static_cast<T>(-(go_b + static_cast<T>(m) * ge_b));
         return;
@@ -1136,10 +1146,11 @@ static void score_linear_striped_fp(ScoreJob<T>& job) {
 
     // The semi-global ends (Glocal: job.sg; see score_affine_striped).
     constexpr bool SGX = Glocal && SG < 0;   // SG: kSgGlocal glocal's ends (main's code), -1 runtime
+    static_assert(SG < 0 || SG == kSgGlocal, "fixed ends: glocal's only (coln, the n == 0 score)");
     const int sg = !Glocal ? 0 : (SGX ? job.sg : SG);
     const bool sg_ab = Glocal && (sg & kSgFreeABegin), sg_ae = Glocal && (sg & kSgFreeAEnd),
                sg_bb = Glocal && (sg & kSgFreeBBegin), sg_be = Glocal && (sg & kSgFreeBEnd);
-    const std::size_t coln = (std::size_t)((n - 1) % seg) * W + (std::size_t)((n - 1) / seg);
+    const std::size_t coln = !SGX ? 0 : (std::size_t)((n - 1) % seg) * W + (std::size_t)((n - 1) / seg);
     // row 0: Global -(go_a + j*ge_a) (the D/X kernel's D), Local / Glocal 0; padding -inf
     for (std::size_t k = 0; k < sw; ++k) pH[k] = NINF;
     for (int l = 0; l < W; ++l)
@@ -1151,7 +1162,7 @@ static void score_linear_striped_fp(ScoreJob<T>& job) {
                 else                pH[k] = -(go_a + j * ge_a);
             }
         }
-    T colbest = (sg_ae && m > 0) ? pH[coln] : NINF;   // Glocal, a free A end: column n, rows < m
+    T colbest = (Glocal && sg_ae && m > 0) ? pH[coln] : NINF;   // Glocal, a free A end: column n, rows < m
 
     vd vge_a(ge_a), vge_b(ge_b);
     const vd vzero(static_cast<T>(0)), vninf(NINF);
@@ -1175,7 +1186,8 @@ static void score_linear_striped_fp(ScoreJob<T>& job) {
         }
         // column 0: the D/X kernel's max(M, X) there (its Y is -inf), with go_b = 0
         T nbH;
-        if (Local || sg_ab) nbH = T(0);   // a semi-global free A begin: Local's
+        if constexpr (Local) nbH = T(0);
+        else if (sg_ab) nbH = T(0);       // a semi-global free A begin: Local's
         else if constexpr (Tr) nbH = std::max(NINF, tr.bx0[i]);
         else nbH = std::max(NINF, static_cast<T>(-(go_b + i * ge_b)));
         const T* sub = striped_row_profile<T, Tr>(buf.sprof.data(), job.blk, nalpha, a, b, n, seg, W, i, tr);
@@ -1240,7 +1252,7 @@ static void score_linear_striped_fp(ScoreJob<T>& job) {
             if (!changed) break;
         }
 
-        if (sg_ae && i < m) colbest = std::max(colbest, cH[coln]);
+        if (Glocal && sg_ae && i < m) colbest = std::max(colbest, cH[coln]);
         std::swap(pH, cH);
         bH = nbH;
     }
