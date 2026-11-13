@@ -606,7 +606,7 @@ enum class Gate : int {
     InterGroupBytes, InterSoftBytes, InterScoreGatherCells,
     InterLinearIntGatherCells, InterLinearF32GatherCells, InterLinearF64GatherCells,
     InterGlobalLinearIntCells, InterGlobalLinearF32Cells, LinearStripedMinN, SoftF32MinCells,
-    InterMinFill, SoftCkptRows, SoftCkptMinBytes, SoftDoubleFtz, Count_
+    InterMinFill, SoftCkptRows, SoftCkptMinBytes, SoftDoubleFtz, SoftGuideDefer, Count_
 };
 inline constexpr const char* kGateNames[] = {
     "inter_group_bytes", "inter_soft_bytes", "inter_score_gather_cells",
@@ -614,7 +614,7 @@ inline constexpr const char* kGateNames[] = {
     "inter_linear_f64_gather_cells", "inter_global_linear_int_cells",
     "inter_global_linear_f32_cells", "linear_striped_min_n", "soft_f32_min_cells",
     "inter_min_fill", "soft_ckpt_rows", "soft_ckpt_min_bytes",
-    "soft_double_ftz"};
+    "soft_double_ftz", "soft_guide_defer"};
 static_assert(sizeof(kGateNames) / sizeof(kGateNames[0]) == static_cast<size_t>(Gate::Count_));
 inline constexpr int64_t kGateUnset = -1;
 inline constexpr int64_t kGateOff = INT64_MAX;
@@ -671,6 +671,21 @@ inline bool soft_double_ftz() noexcept {
     if (o >= 0) return o != 0;
     static const int64_t v = env_nonneg_int("NWGRAD_SOFT_DOUBLE_FTZ");
     return v != 0;   // unset (-1): the default, on
+}
+// soft_guide "eager"'s guide Viterbi: soft_guide_defer / NWGRAD_SOFT_GUIDE_DEFER.
+// 1 (DEFAULT, 2026-11-13): adaptive -- defer it to first use, under the params the soft
+// call scored (BatchEngine::soft_pend_), unless the guides were read after each of the
+// last two soft calls (then fill them in the call, as before); 2: always defer; 0: never
+// (the Viterbi inside the soft call: the A/B switch).  Results never change.  History:
+// 2 was the default 2026-11-11..13, until solace (AVX-512, 8 threads) showed the
+// deferred guides' separate resolve pass 4-9 % slower than main with every guide read;
+// the earlier gate 1 (a streak of one step) lost the read-every-other-step loop.  The
+// gate wins over the environment.
+inline int soft_guide_defer() noexcept {
+    const int64_t o = gate_override(Gate::SoftGuideDefer);
+    if (o >= 0) return o >= 2 ? 2 : static_cast<int>(o);
+    static const int64_t v = env_nonneg_int("NWGRAD_SOFT_GUIDE_DEFER");
+    return v < 0 ? 1 : (v >= 2 ? 2 : static_cast<int>(v));   // unset (-1): the default, adaptive
 }
 inline bool soft_ckpt_env_check() noexcept {
     static const bool v = [] { const char* e = std::getenv("NWGRAD_SOFT_CKPT_CHECK"); return e && *e && std::strcmp(e, "0") != 0; }();

@@ -957,6 +957,9 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
              "the plan of a grad_mode \"none\" call without keep_paths (no byte budget:\n"
              "its score kernel keeps rows); else the plan of a call that keeps tables.  The\n"
              "score-only gather gate acts per group inside the call and is not reflected.")
+        .def("_guides_pending", &SPB::guides_pending,
+             "UNSTABLE (tests): how many pairs' guides are pending, to be computed on\n"
+             "first use (soft_guide \"eager\" and \"lazy\", grad_mode \"none\").")
         .def_prop_ro(
             "alphabet",
             [](const SPB& self) { return self.alphabet().symbols(); },
@@ -1046,7 +1049,12 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             },
             "When soft pairs compute their guide path (the Viterbi alignment that\n"
             "banded_grad()/banded_align() band around).\n"
-            "  \"eager\" (default): score_and_grad() runs the guide Viterbi, as always.\n"
+            "  \"eager\" (default): the guide of the params scored: the Viterbi path\n"
+            "     under the params score_and_grad() ran with, even after set_params().\n"
+            "     Computed on first use (guide_j, banded_align, banded_grad) from a\n"
+            "     snapshot of those params, so a call that never asks for it pays\n"
+            "     nothing for it -- unless the guides were read after each of the last\n"
+            "     two steps, then in the call; the same guide, bit for bit, either way.\n"
             "  \"lazy\": it does not; the guide is computed on first use (guide_j,\n"
             "     banded_align, banded_grad) under the params CURRENT THEN — after\n"
             "     set_params() it follows the new params.\n"
@@ -1488,7 +1496,8 @@ NB_MODULE(nwgrad_ext, m) {
             {"inter_min_fill", int64_t(kInterMinFillPct)},
             {"soft_ckpt_rows", int64_t(0)},   // (auto: _tuning.defaults() says so)
             {"soft_ckpt_min_bytes", int64_t(kSoftCkptMinBytes)},
-            {"soft_double_ftz", int64_t(1)}};
+            {"soft_double_ftz", int64_t(1)},
+            {"soft_guide_defer", int64_t(1)}};
     });
 
     m.def(
