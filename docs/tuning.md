@@ -25,6 +25,33 @@ The two precisions also have different traceback defaults (next section), so a
 float32 result and a float64 result are not bit-comparable even where the
 arithmetic would agree.
 
+### Integer types
+
+`_int16` / `_int32` / `_int64` (and `_int8`; table in the [API reference](api.md#scalar-types))
+run the DP in integers: integral parameters only, every result equal to float64's bit
+for bit, no soft path. Their **score-only** calls (the `*_score*` functions, `grad_mode="none"`
+pairs and batches) run the narrowest lanes that are provably exact:
+
+- **int8** (16 lanes at SSE / NEON, 32 at AVX2, 64 at AVX-512), when every substitution
+  score is within ±127 and every gap parameter is ≥ 0 with open + extend ≤ 127 per side.
+  The kernel saturates and proves its own result afterwards: Local is exact unless its
+  maximum reached 127; Global / Glocal need G = min(len_a, len_b) · (largest substitution
+  score) ≤ 126 up front and a score above G − 128 afterwards. Anything else re-runs below.
+  In practice: Local pairs whose best score stays under 127 (unrelated or weakly related
+  pairs, miRNA sites, DNA with small scores). By default **Local only**: Global / Glocal
+  qualify only for short pairs (DNA match 2: up to 63 residues on the shorter side), and
+  there the int8 kernel measured slower than int16 (miRNA × target 2.2× the instructions).
+- **int16** for an int32 problem whose bound fits it, int32 for an int64 one ("narrowing").
+
+An int8 run that overflows is wasted work (a Local run stops at the row where it reaches
+127), so a thread tries the int8 tier only when its previous Local problem of the same
+type scored below 127 (the wide kernel's score tells exactly whether int8 would have held). Switches, process-wide: `NWGRAD_INT8`
+or `_tuning.set_gate("score_int8", v)`: 0 off, 1 Local with the predictor (the default on x86; AArch64 defaults to 0, where the
+int8 kernel measured slower than int16 even on pairs that fit), 2 every
+mode and every problem; `NWGRAD_INT_NARROW=0` turns off all narrowing, the int8 tier included.
+Results never change, only speed. The batch's shared inter-pair score kernel (short pairs)
+has no int8 form; those pairs run at their own type.
+
 ## Traceback modes
 
 `SeqPair` and `SeqPairBatch` take `traceback=`, fixed at construction. It decides
@@ -119,6 +146,19 @@ batch._inter_plan()               # [pairs in shared groups, pairs on their own 
 
 An `int` is the threshold, `None` turns the gate off, and `"default"` removes the
 override. A batch regroups on its next call after any change.
+
+`score_int8_min_segs` is the int8 tier's minimum row length in int8 segments (length of
+`seq_b` / lanes, rounded up): 0 at 16 lanes (SSE, NEON); 32 at 32 lanes (AVX2), where
+short rows ran slower in int8 than in int16 (nighthaven: L100 1.66-1.70, L300 1.06-1.33 on
+pairs that fit; L1000 0.45-1.00); at 64 lanes (AVX-512) 16, or 32 for linear gaps over
+more than 8 letters (solace: L1000 DNA 0.45-0.55 and protein affine 0.74 at 16 segments,
+protein linear 1.02-1.06; L300 1.30-1.84). An override applies at every level; the default
+shown by `_tuning.defaults()` is the affine one.
+
+`score_int8` is a mode, not a threshold: 0 never runs the int8 score kernel, 1 (the
+default) runs it first for Local integer score-only calls unless the thread's previous one
+overflowed, 2 for every mode and problem ([Integer types](#integer-types)); `NWGRAD_INT8`
+is its environment fallback.
 
 ## Performance notes
 

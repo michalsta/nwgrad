@@ -69,6 +69,9 @@ namespace NWGRAD_LVL_NAME {
 #include "inter_kernel_impl.inl"  // inter-pair affine Full fill (uses KW)
 #include "score_kernel_impl.inl"  // score only: rolling rows, no table
 #include "grid_kernel_impl.inl"   // TracebackMode::Grid's forward pass (score recurrence + grid lines)
+#if !defined(NWGRAD_LEVEL_INTER_TU) && !defined(NWGRAD_LEVEL_SOFT_TU)
+#include "score8_kernel_impl.inl" // score only in saturating int8 lanes (the typed unit only)
+#endif
 // The inter-pair hard kernels likewise (level_<name>_inter.cpp defines NWGRAD_LEVEL_INTER_TU):
 // with the lookup form a template parameter (inter_kernel_impl.inl, Lv) their instances
 // tripled, and in this unit gcc then inlined less into the striped kernels beside them
@@ -140,7 +143,7 @@ struct NwgradLevelRegistrar {
         typed<int16_t>();
         typed<int32_t>();
         typed<int64_t>();
-        register_level_common(NWGRAD_LVL_ENUM, NWGRAD_LVL_NAME::ROW_BLOCK);
+        register_level_common(NWGRAD_LVL_ENUM, NWGRAD_LVL_NAME::ROW_BLOCK, &NWGRAD_LVL_NAME::score8_entry);
 #endif
     }
 };

@@ -68,8 +68,9 @@ NWGRAD_INSTANTIATE_REGISTER(int32_t)
 NWGRAD_INSTANTIATE_REGISTER(int64_t)
 #undef NWGRAD_INSTANTIATE_REGISTER
 
-void register_level_common(SimdLevel l, int row_block) {
+void register_level_common(SimdLevel l, int row_block, score8_fn score_i8) {
     LevelKernels& k = level_table()[(int)l];
+    k.score_i8  = score_i8;
     k.level     = static_cast<int>(l);
     k.row_block = row_block;
 }

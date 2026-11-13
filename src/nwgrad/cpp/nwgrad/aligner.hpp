@@ -332,6 +332,13 @@ namespace nwgrad_soft_base {
 #include "soft_kernel_impl.inl"
 }
 
+// Integer score-only at half the lane width (Aligner::narrow_score_): -1 = the
+// NWGRAD_INT_NARROW env (default on), 0 / 1 forced (the tests check both).
+inline std::atomic<int>& int_narrow_mode() noexcept {
+    static std::atomic<int> m{-1};
+    return m;
+}
+
 // ── Aligner ───────────────────────────────────────────────────────────────────
 //
 // Pipeline API (call in order):
@@ -926,7 +933,34 @@ struct Aligner {
             return viterbi_score_;
         } else {
             const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
+            if constexpr (nw_is_int<T>) {
+                if (backend != kBackendScalar && !tr_ && int_narrow_env()) {
+                    double r;
+                    const int e = score_i8_(backend, r);
+                    if (e > 0) return r;
+                    if (e < 0) {   // Local, predicted or found to overflow: note the wide score
+                        r = score_wide_(buf, backend);
+                        score8_tl().last_over = r >= 127.0;
+                        return r;
+                    }
+                }
+            }
+            return score_wide_(buf, backend);
+        }
+    }
+    // compute_score past the int8 tier: the half-width narrowing, the type's own kernel,
+    // the scalar fill.
+    double score_wide_(DpBuffer& buf, int backend) {
+        if constexpr (AB == AlignBand::GuideBanded) {
+            (void)backend;
+            compute_viterbi(buf);
+            return viterbi_score_;
+        } else {
             if (backend != kBackendScalar) {
+                if constexpr (std::is_same_v<T, std::int32_t> || std::is_same_v<T, std::int64_t>) {
+                    double r;
+                    if (!tr_ && int_narrow_env() && narrow_score_(backend, r)) return r;
+                }
                 const auto fn = level_kernels(backend).template of<T>().score;
                 if (fn) {
                     ScoreJob<T> job{}; job.sat = sat_;
@@ -955,6 +989,158 @@ struct Aligner {
         check_problem();
         check_own_buf_allocated();
         return compute_score(own_buf_);
+    }
+
+    // ── Score-only at half the lane width (int32 -> int16, int64 -> int32) ──────
+    // An integer problem whose params and a-priori bound fit the narrower type runs that
+    // type's score kernel: twice the lanes, half the rows' bytes.  Exact: the narrower
+    // type's own bound (nw_int_bound_check, the quarter rule or int16's saturating
+    // regime) promises every reachable value is formed exactly and no sentinel-derived
+    // value wins a max, so the score is the same integer and the same double.  Needs
+    // every parameter within the narrow cap, which step_max <= nw_int_cap<N> implies
+    // (step_max >= every |s| and every |go| + |ge|).  Untracked problems only (a
+    // tracked one's per-row gaps would need the whole stack and set casts).  The
+    // narrow type's buffer is per thread (the rows grow to the longest B seen; the
+    // block's cast copy is redone per problem: nalpha^2 casts).
+    // NWGRAD_INT_NARROW=0 turns it off (the A/B switch); int_narrow_mode() is the
+    // tests' switch (-1 = the env / default on).
+    static bool int_narrow_env() {
+        const int m = int_narrow_mode().load(std::memory_order_relaxed);
+        if (m >= 0) return m != 0;
+        static const bool on = [] {
+            const char* e = std::getenv("NWGRAD_INT_NARROW");
+            return !(e && e[0] == '0');
+        }();
+        return on;
+    }
+    bool narrow_score_(int backend, double& out) {
+        if constexpr (std::is_same_v<T, std::int32_t> || std::is_same_v<T, std::int64_t>) {
+            using N = std::conditional_t<std::is_same_v<T, std::int32_t>, std::int16_t, std::int32_t>;
+            if (!ib_.prepared() || ib_.step_max > static_cast<T>(nw_int_cap<N>)) return false;
+#if defined(__aarch64__) || defined(_M_ARM64)
+            // AArch64, int32 -> int16, linear Global: not at 11-13 int16 segments a row
+            // (n 81-104, 8 lanes).  spot (M1, 1 thread, DNA score-only, narrowed / int32):
+            // L70 0.81, L80 0.98, L90 1.10, L100 1.04, L110 0.99, L125 0.90, L150 0.60.  Main's
+            // int16 linear kernel itself runs ~32 ns a row at L100 against ~26 at L150 there
+            // (main's int16 batch shows it too); the code has no switch at these lengths, so
+            // this is an empirical window, not a fix of its cause.  Exact either way (the
+            // narrowed and the int32 kernel give the same score); Local and affine never lost.
+            if constexpr (std::is_same_v<N, std::int16_t> && GM == GapModel::Linear && AM == AlignMode::Global) {
+                constexpr int kSkipSegLo = 11, kSkipSegHi = 13;
+                const int seg16 = (n_ + 7) / 8;
+                if (seg16 >= kSkipSegLo && seg16 <= kSkipSegHi) return false;
+            }
+#endif
+            NwIntBound<N> nb;
+            nb.step_max = static_cast<N>(ib_.step_max);
+            nb.smax_pos = static_cast<N>(ib_.smax_pos); nb.smax_neg = static_cast<N>(ib_.smax_neg);
+            nb.gain = static_cast<N>(ib_.gain); nb.goneg = static_cast<N>(ib_.goneg);
+            nb.goa_pos = static_cast<N>(ib_.goa_pos); nb.gob_pos = static_cast<N>(ib_.gob_pos);
+            nb.gea_pos = static_cast<N>(ib_.gea_pos); nb.geb_pos = static_cast<N>(ib_.geb_pos);
+            const int why = nw_int_bound_check<N, AM == AlignMode::Local, false>(nb, m_, n_);
+            if (why < 0) return false;
+            const auto fn = level_kernels(backend).template of<N>().score;
+            if (!fn) return false;
+            struct Scratch { DpBufferT<N> buf; std::vector<N> blk; };
+            static thread_local Scratch sc;
+            const std::size_t nn = static_cast<std::size_t>(nalpha_) * nalpha_;
+            sc.blk.resize(nn);
+            for (std::size_t k = 0; k < nn; ++k) sc.blk[k] = static_cast<N>(blkT_[k]);
+            ScoreJob<N> job{}; job.sat = why == 1;
+            job.a = a_idx_.data(); job.m = m_;
+            job.b = b_idx_.data(); job.n = n_;
+            job.blk = sc.blk.data(); job.nalpha = nalpha_;
+            const bool lin = GM == GapModel::Linear;
+            job.go_a = lin ? N(0) : static_cast<N>(params_->gap_open_a);
+            job.ge_a = static_cast<N>(params_->gap_extend_a);
+            job.go_b = lin ? N(0) : static_cast<N>(params_->gap_open_b);
+            job.ge_b = static_cast<N>(params_->gap_extend_b);
+            job.local = AM == AlignMode::Local ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
+            job.variant = score_variant_env();
+            job.linear = lin && score_linear_env();
+            job.buf = &sc.buf;
+            fn(job);
+            out = static_cast<double>(job.score);
+            return true;
+        } else {
+            (void)backend; (void)out;
+            return false;
+        }
+    }
+
+    // ── Score-only in int8 lanes (any integer T; score8_kernel_impl.inl) ─────────
+    // Tried first, before the half-width narrowing: four times int32's lanes.  The kernel
+    // proves its own result (see the file's head): Local exact unless its maximum reached
+    // 127, Global / Glocal exact when the score clears G - 128 with G = min(m, n) *
+    // smax_pos <= 126 -- the a-priori part, checked here.  On `overflow` this returns
+    // false and the caller runs the wider kernel, so the score is always the integer the
+    // int16 / int32 kernels give.  Preconditions (else false, nothing run): untracked,
+    // m, n >= 1, gap parameters >= 0 with go + ge <= 127 per side (the kernel subtracts
+    // only, and opens in one saturating step), every substitution within [-127, 127].
+    // Per-thread scratch: the int8 block (cast per problem) and the kernel's rows.
+    // Per thread and problem type: the int8 run's scratch, and whether the last Local
+    // problem's score reached 127 (score8 predictor, below).
+    struct Score8Tl { std::vector<int8_t> blk, rows; bool last_over = false; };
+    static Score8Tl& score8_tl() { static thread_local Score8Tl t; return t; }
+    // 1: the int8 score in `out`; 0: not run (the tier off, the problem not eligible, or
+    // gate 2's overflow); -1: Local at gate 1, predicted to overflow or overflowed -- the
+    // caller notes the wide score for the predictor.
+    int score_i8_(int backend, double& out) {
+        if constexpr (nw_is_int<T>) {
+            const int mode = score_int8_mode();
+            if (mode == 0 || (mode == 1 && AM != AlignMode::Local)) return 0;
+            const auto fn = level_kernels(backend).score_i8;
+            if (!fn || m_ < 1 || n_ < 1 || !ib_.prepared()) return 0;
+            if (mode == 1) {   // the row length the level's lanes need (score_int8_min_segs)
+                const int W = score_int8_lanes(backend);
+                if ((n_ + W - 1) / W < score_int8_min_segs(W, GM == GapModel::Linear, nalpha_)) return 0;
+            }
+            if (ib_.smax_pos > T(127) || ib_.smax_neg > T(127)) return 0;
+            const bool lin = GM == GapModel::Linear;
+            const long long goa = lin ? 0 : static_cast<long long>(params_->gap_open_a);
+            const long long gob = lin ? 0 : static_cast<long long>(params_->gap_open_b);
+            const long long gea = static_cast<long long>(params_->gap_extend_a);
+            const long long geb = static_cast<long long>(params_->gap_extend_b);
+            if (goa < 0 || gob < 0 || gea < 0 || geb < 0 || goa + gea > 127 || gob + geb > 127) return 0;
+            const long long gain = static_cast<long long>(std::min(m_, n_)) * static_cast<long long>(ib_.smax_pos);
+            if (AM != AlignMode::Local && gain > 126) return 0;
+            // Predictor: a Local run that overflows is wasted (up to the row that reached
+            // 127), and related pairs overflow in runs -- protein L100 30 %-mutated Local
+            // cost 2.0x the int16 instructions trying every pair (skynet sse4); a geometric
+            // back-off (skip 1, 3, ... 63 after an overflow) still left 1.01-1.03.  The
+            // wide kernel's score says exactly whether int8 would have held (Local: score
+            // < 127), so the thread tries int8 only when its previous Local problem of this
+            // type scored below 127: an all-overflowing batch pays one wasted run per
+            // thread, an i.i.d. mix p(1-p) of its pairs.
+            Score8Tl& sc = score8_tl();
+            if (mode == 1 && sc.last_over) return -1;
+            const std::size_t nn = static_cast<std::size_t>(nalpha_) * nalpha_;
+            sc.blk.resize(nn);
+            for (std::size_t k = 0; k < nn; ++k) sc.blk[k] = static_cast<int8_t>(blkT_[k]);
+            Score8Job job{};
+            job.a = a_idx_.data(); job.m = m_;
+            job.b = b_idx_.data(); job.n = n_;
+            job.blk = sc.blk.data(); job.nalpha = nalpha_;
+            job.go_a = static_cast<int8_t>(goa); job.ge_a = static_cast<int8_t>(gea);
+            job.go_b = static_cast<int8_t>(gob); job.ge_b = static_cast<int8_t>(geb);
+            job.local = AM == AlignMode::Local ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
+            job.linear = lin ? 1 : 0;
+            job.gain = static_cast<int>(std::min<long long>(gain, 126));
+            job.scratch = &sc.rows;
+            fn(job);
+            Score8Stats& st = score8_stats();
+            if (st.on.load(std::memory_order_relaxed)) {
+                st.runs.fetch_add(1, std::memory_order_relaxed);
+                if (job.overflow) st.overflows.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (job.overflow) return mode == 2 ? 0 : -1;   // gate 2: every problem tried
+            sc.last_over = false;
+            out = static_cast<double>(job.score);
+            return 1;
+        } else {
+            (void)backend; (void)out;
+            return 0;
+        }
     }
 
     // soft_guide="posterior": the next forward-backward also records, per row of A, the
