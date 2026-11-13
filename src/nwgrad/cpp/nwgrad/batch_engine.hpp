@@ -2698,12 +2698,12 @@ private:
             std::vector<int> m, nb;
             std::vector<T> best, blkT;
             std::vector<size_t> spill;   // int8 lanes that may have saturated: re-run at T
-            // Predictor: skip the int8 run of a group when over half the previous group's
-            // lanes failed (or, run at T, would have failed) the int8 test -- exact from the
-            // T scores, as the striped tier's.  An all-overflowing call then wastes one
-            // int8 group per worker: miRNA Global with go 10 / ge 3, every lane re-run,
-            // cost 1.51x the int16 instructions without it (wloczykij sse4).
-            bool skip8 = false;
+            // Predictor: skip the int8 run of a group while the fail fraction of the recent
+            // groups (an average halved per group, over the lanes that failed or, run at T,
+            // would have failed the int8 test -- exact from the T scores) is above the
+            // break-even of the level's lane count (inter8_max_fail_).  A group whose lanes
+            // cannot overflow at all (inter8_safe_) runs int8 regardless.
+            double fail8 = 0.0;
             auto own = [&](size_t i) {
                 flags_[i] &= static_cast<uint8_t>(~kStored);
                 set_problem_(w.full, i);
@@ -2711,6 +2711,7 @@ private:
                 finish_(i, false, true);
             };
             const LevelKernels* Kp = inter ? &level_kernels(PL.backend) : nullptr;
+            const double max_fail = Kp && P8 ? inter8_max_fail_(Kp->inter_w8) : 0.0;
             // One group of `real` pairs vec[s0 .. s0 + real) on the T score kernel.
             auto run16 = [&](const std::vector<size_t>& vec, size_t s0, size_t real) {
                 const size_t* ids = vec.data() + s0;
@@ -2761,14 +2762,16 @@ private:
                 if (t < G8) {
                     const auto [s, e] = P8->groups8[t];
                     const size_t W = static_cast<size_t>(inter_w_(*Kp));
-                    if (skip8) {   // predicted to overflow: the T kernel directly, W at a time
+                    const size_t* ids8 = P8->elig8.data() + s;
+                    const bool safe = inter8_safe_(ids8, e - s, c8);
+                    if (!safe && fail8 > max_fail) {   // predicted to overflow: the T kernel, W at a time
                         for (size_t k = s; k < e; k += W) run16(P8->elig8, k, std::min(W, e - k));
-                        skip8 = inter8_fails_(P8->elig8.data() + s, e - s, c8) * 2 > e - s;
+                        fail8 = 0.5 * fail8 + 0.5 * static_cast<double>(inter8_fails_(ids8, e - s, c8)) / static_cast<double>(e - s);
                         continue;
                     }
                     const size_t before = spill.size();
-                    run8_(P8->elig8.data() + s, e - s, c8, *Kp, spill, own);
-                    skip8 = (spill.size() - before) * 2 > e - s;
+                    run8_(ids8, e - s, c8, *Kp, spill, own);
+                    if (!safe) fail8 = 0.5 * fail8 + 0.5 * static_cast<double>(spill.size() - before) / static_cast<double>(e - s);
                     while (spill.size() >= W) {   // a full group of re-runs
                         run16(spill, spill.size() - W, W);
                         spill.resize(spill.size() - W);
@@ -2905,6 +2908,25 @@ private:
         group(k16, static_cast<size_t>(inter_w_(K)), P.elig16, P.groups16, [&](const Key& k) { P.other.push_back(k.i); });
         P.other.insert(P.other.end(), PL.other.begin(), PL.other.end());
         return &P;
+    }
+    // The fail fraction above which a group skips its int8 run, per int8 lane count.  An
+    // int8 group costs r of the T kernel and each failed lane re-runs at about k: break-even
+    // at f = (1 - r) / k.  SSE4 (16 lanes; wloczykij instructions, related DNA L100 Local,
+    // the fail fraction swept by mutation): r = 0.44-0.45, f 0.07 / 0.28 / 0.39 / 0.97 read
+    // 0.48-0.53 / 0.73 / 0.93 / 1.01-1.03 (k ~ 1.0-1.2): break-even ~0.45 -> 0.3.  At 64
+    // lanes (solace AVX-512) the tier's own gain is smaller (unrelated DNA L100 int16 0.89),
+    // and related DNA L100 Local read 1.12-1.15 with the old 1/2 -> 0.08.  32 lanes (AVX2)
+    // unswept -> 0.2, between.
+    static double inter8_max_fail_(int w8) noexcept {
+        return w8 <= 16 ? 0.3 : w8 <= 32 ? 0.2 : 0.08;
+    }
+    // Local: no lane of the group can reach 127 (smax_pos * min(m, n) < 127), so its int8
+    // run cannot fail -- miRNA x site at match 2 (44) never consults the predictor.
+    bool inter8_safe_(const size_t* ids, size_t real, const Inter8Call& c) const {
+        if (AM != AlignMode::Local) return false;
+        for (size_t l = 0; l < real; ++l)
+            if (static_cast<long long>(std::min(len_a(ids[l]), len_b(ids[l]))) * c.smax_pos >= 127) return false;
+        return true;
     }
     // How many of ids[0..real), already scored at T, the int8 test would have refused:
     // Local a score >= 127, Global / Glocal a score <= G - 128 (exact both ways: see
