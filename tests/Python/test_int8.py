@@ -233,3 +233,31 @@ def test_min_segs_gate():
         assert nwgrad.sw_score_int16(a, a, p, kernel="sse2") == want
         if DEFAULT_ON and "sse2" in nwgrad.available_isa_levels():
             assert E._score8_stats(True)[0] == runs, segs
+
+
+def test_shared_groups_of_long_rows_take_the_int8_tier():
+    # A score-only group the per-pair int8 tier would take (rows of >= 16 int8 segments)
+    # leaves the shared inter-pair route for its own fills; forced shared here (protein, the
+    # gather cap off), at 16 lanes.  Scores equal the tier-off run either way.
+    if not DEFAULT_ON or "sse2" not in nwgrad.available_isa_levels():
+        pytest.skip("needs the int8 tier at a 16-lane level")
+    from nwgrad.matrices import BLOSUM62
+    p = nwgrad.AlignParams(BLOSUM62, 11.0, 1.0, 11.0, 1.0)
+    rng = np.random.default_rng(5)
+    aa = list("ARNDCQEGHILKMFPSTWYV")
+    for L, want_runs in ((300, True), (200, False)):   # 19 / 13 segments of 16
+        A = ["".join(rng.choice(aa, L)) for _ in range(16)]
+        B = ["".join(rng.choice(aa, L)) for _ in range(16)]
+        got = {}
+        for gate in (0, 1):
+            _tuning.reset_gates()
+            _tuning.set_gate("inter_score_gather_cells", None)
+            _tuning.set_gate("score_int8", gate)
+            b = nwgrad.SeqPairBatchInt32(A, B, p, mode="local", grad_mode="none", n_threads=1, kernel="sse2")
+            with _tuning.override(score_int8=2):          # re-arm this thread's predictor
+                nwgrad.sw_score_int32("ARND", "ARND", p, kernel="sse2")
+            E._score8_stats(True)
+            b.score_and_grad()
+            got[gate] = (list(b.scores()), E._score8_stats(True)[0])
+        assert got[0][0] == got[1][0]
+        assert got[0][1] == 0 and (got[1][1] == 16) == want_runs, (L, got[1][1])
