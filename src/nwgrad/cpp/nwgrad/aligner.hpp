@@ -1624,7 +1624,10 @@ private:
     //  * AVX2 (nighthaven, PR #49 a009f6e, wall clock against main, controls 0.97-1.02): protein
     //    L600 Global / Local / Glocal 1.27 / 1.33 / 1.19 at 1 thread, 1.25-1.32 at 6; DNA L600
     //    1.15-1.26 at 6; Local L800 1.07-1.12 (DNA and protein, 1 and 6 threads); so Global /
-    //    Glocal from 800 rows, Local from 1000.
+    //    Glocal from 800 rows.  Local from 1500: at 1000 / 1200 rows Grid ran ~20 % fewer
+    //    instructions but protein L1200 Local read 1.025 / 1.024 at 6 threads (control 1.001,
+    //    PR #49 e498fa2) -- more memory traffic per pair with 6 workers -- so the conservative
+    //    floor, pending nighthaven's L1000-1500 re-check at 1 and 6 threads.
     //  * sse2 / sse4: the same floors.  Instructions alone favour Grid from L600 (wloczykij sse4,
     //    Grid / H table: Global protein 0.84 at L800, 0.82 at L1000; Local 0.83-0.84; DNA
     //    0.74-0.82), but the H fill runs at a higher IPC there and AVX2's clock shows it.
@@ -1639,7 +1642,7 @@ private:
             return std::numeric_limits<int>::max();
 #else
             if (backend == static_cast<int>(SimdLevel::Avx512)) return std::numeric_limits<int>::max();
-            return AM == AlignMode::Local ? 1000 : 800;
+            return AM == AlignMode::Local ? 1500 : 800;
 #endif
         }
     }

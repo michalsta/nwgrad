@@ -497,7 +497,7 @@ TEST_CASE("auto takes Grid for linear gaps past hb_cutoff", "[grid][traceback][l
         REQUIRE(l.score() == lp.score());
         REQUIRE(l.alignment() == lp.alignment());
         // int16: per-level floors (linear_grid_min_rows): x86 below AVX-512 Global from 800 rows,
-        // Local from 1000; A has 800 rows
+        // Local from 1500; A has 800 rows
         Aligner<GapModel::Linear, AlignMode::Global, AlignBand::Full, int16_t> g16, g16s;
         Aligner<GapModel::Linear, AlignMode::Local, AlignBand::Full, int16_t> l16;
         run(g16, TracebackMode::Default, kern, A, B);
