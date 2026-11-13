@@ -58,3 +58,48 @@ from . import matrices
 from importlib.metadata import version as _version
 __version__ = _version("nwgrad")
 del _version
+
+
+# ── Semi-global alignment ─────────────────────────────────────────────────────
+# mode="semiglobal" with free_ends: which flanks are free (their residues left unaligned at
+# no cost), as four booleans (a_begin, a_end, b_begin, b_end) or the names of the free ones,
+# e.g. free_ends=("a_begin", "b_end").  "overlap" frees all four, "glocal" is (b_begin,
+# b_end), "global" none.  The convenience functions below take free_ends directly (default:
+# all four, "overlap").
+
+def _sg_pair(cls, seq_a, seq_b, params, free_ends, gap_model, kernel, grad_mode):
+    if free_ends is None:
+        free_ends = (True, True, True, True)
+    return cls(seq_a, seq_b, params, gap_model=gap_model, mode="semiglobal", grad_mode=grad_mode,
+               kernel=kernel, free_ends=free_ends)
+
+
+def semiglobal_score(seq_a, seq_b, params, free_ends=None, *, gap_model="affine", kernel="auto"):
+    """Semi-global alignment score (float32 Viterbi); free_ends as SeqPairBatch's
+    (default: all four free, "overlap")."""
+    return _sg_pair(SeqPair, seq_a, seq_b, params, free_ends, gap_model, kernel, "none").align()
+
+
+def semiglobal_grad(seq_a, seq_b, params, free_ends=None, *, gap_model="affine", kernel="auto"):
+    """(score, AlignParams hard gradient) of the semi-global alignment (float32)."""
+    return _sg_pair(SeqPair, seq_a, seq_b, params, free_ends, gap_model, kernel, "hard").score_and_grad()
+
+
+def semiglobal_soft_grad(seq_a, seq_b, params, free_ends=None, *, gap_model="affine"):
+    """(log Z, AlignParams soft gradient) over the semi-global ensemble."""
+    return _sg_pair(SeqPair, seq_a, seq_b, params, free_ends, gap_model, "auto", "soft").score_and_grad()
+
+
+def semiglobal_score_double(seq_a, seq_b, params, free_ends=None, *, gap_model="affine", kernel="auto"):
+    """semiglobal_score at double precision."""
+    return _sg_pair(SeqPairDouble, seq_a, seq_b, params, free_ends, gap_model, kernel, "none").align()
+
+
+def semiglobal_grad_double(seq_a, seq_b, params, free_ends=None, *, gap_model="affine", kernel="auto"):
+    """semiglobal_grad at double precision."""
+    return _sg_pair(SeqPairDouble, seq_a, seq_b, params, free_ends, gap_model, kernel, "hard").score_and_grad()
+
+
+def semiglobal_soft_grad_double(seq_a, seq_b, params, free_ends=None, *, gap_model="affine"):
+    """semiglobal_soft_grad at double precision (the soft path is double either way)."""
+    return _sg_pair(SeqPairDouble, seq_a, seq_b, params, free_ends, gap_model, "auto", "soft").score_and_grad()

@@ -112,6 +112,19 @@ struct NwgradLevelRegistrar {
                                 &NWGRAD_LVL_NAME::score_entry<T>);            // score only
         register_level_grid<T>(NWGRAD_LVL_ENUM, NWGRAD_LVL_NAME::grid_fwd_ptr<T>());
     }
+    // The semi-global kernels with runtime ends (SG = -1: linear, affine Scores / Pointers,
+    // score only): their own unit, as the inter-pair kernels, because instantiated beside
+    // the fixed-end kernels they moved gcc's inlining there (Local linear Pointers +5 % in
+    // the kernel, +1.8 % on the path; glocal affine +3 %; wloczykij sse4, 2026-11-10).
+    template <class T>
+    static void sg() {
+        register_level_sg<T>(NWGRAD_LVL_ENUM,
+                             NWGRAD_LVL_NAME::linear_kernel_pays<T>() ? &NWGRAD_LVL_NAME::striped_linear_sg_entry<T> : nullptr,
+                             NWGRAD_LVL_NAME::linear_kernel_pays<T>() ? &NWGRAD_LVL_NAME::striped_linear_ptr_sg_entry<T> : nullptr,
+                             &NWGRAD_LVL_NAME::striped_full_sg_entry<T>,
+                             &NWGRAD_LVL_NAME::striped_full_ptr_sg_entry<T>,
+                             &NWGRAD_LVL_NAME::score_sg_entry<T>);
+    }
     template <class T>
     static void inter() {
         register_level_inter<T>(NWGRAD_LVL_ENUM,
@@ -120,7 +133,13 @@ struct NwgradLevelRegistrar {
                                 NWGRAD_LVL_NAME::IVT<T>::W);
     }
     NwgradLevelRegistrar() {
-#if defined(NWGRAD_LEVEL_INTER_TU)
+#if defined(NWGRAD_LEVEL_SG_TU)
+        sg<double>();
+        sg<float>();
+        sg<int16_t>();
+        sg<int32_t>();
+        sg<int64_t>();
+#elif defined(NWGRAD_LEVEL_INTER_TU)
         inter<double>();
         inter<float>();
         inter<int16_t>();

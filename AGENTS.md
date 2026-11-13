@@ -3292,6 +3292,116 @@ best of 5).** glocal / global:
   the scans' Glocal branches (`HbScanJob::glocal`, a runtime int) cost nothing measurable
   against Local's: no template split needed.
 
+### Semi-global free ends (branch `proto/semiglobal`, 2026-11-07)
+
+**What.** `AlignMode::Glocal` is now the whole semi-global family: a runtime word `sg_`
+(`Aligner::set_free_ends`, `BatchSettings::free_ends`, `kSgFree*` in `simd_levels.hpp`) says
+which flanks are free -- A's begin / end, B's begin / end.  `kSgGlocal` (B's two) is the
+default, so every existing glocal caller runs what it ran; 0 is Global's DP; all four is
+`mode="overlap"`.  Python: `mode="semiglobal", free_ends=(a_begin, a_end, b_begin, b_end)`
+(booleans, or the names of the free ones), `mode="overlap"`, `.free_ends`, the
+`semiglobal_*` convenience functions (`__init__.py`).  The Global and Local template
+instantiations are untouched (every new test is `if constexpr (Glocal)`-guarded or a runtime
+word read only there).
+
+**The DP.** Free B begin: row 0 M = 0, no Y chain (glocal's); else Global's row 0.  Free A
+begin: column 0 M = 0, X = -inf (Local's border), else Global's chain.  Ends: row m whole
+(free B end) or (m, n); column n of rows 0..m-1 (free A end).  Border cells are ends too
+((m, 0) as glocal's; (0, n)), so a dovetail with nothing in common scores 0.  The tie rule:
+**the first candidate in row-major order holding the maximum (strict >), the state by
+M > X > Y** -- glocal's (first column of row m) and Local's, one rule.  `SgEnd::offer` in
+the aligner, the `offer` / `offer_row` lambdas in the striped kernels (column n's slot read
+after each row's lazy-F, one scalar read per row; row m by `striped_row_best`).  The walks
+stop at row 0 under a free B begin (as before) and at column 0 under a free A begin; a
+charged border emits Global's forced gap run.  Gradients follow from the walk.  Soft (log
+path): the same borders, Z = the sum over the end cells (`sg_for_end_cells_`), the backward
+seeded there; gap targets from `gap_min_j_()` / `gap_min_i_()` (the old kGapTargetMin
+constants, now per problem: a free A begin drops column 0's vertical moves, a charged row 0
+adds its horizontal ones).  Scaled soft (`soft_kernel_impl.inl`, `SoftPairJobT::sg`): a
+free A begin seeds column 0 with Local's 2^-S[i-1] (one cell, not every cell), each row's
+end mass goes to `rowsum` (`sp_row_ends`: column n's cell for a row < m, row m's sum or
+cell) and Z sums them as Local's per-row sums; the backward adds 2^-T at column n of
+every row < m (Local's `init`, one cell); `kmin` / `kmin0` from the flags.  Glocal's ends
+take the old code exactly (`GX` false).
+
+**Where.** Scalar fills (`viterbi_affine_impl`, `viterbi_linear_impl`, both Pointers fills,
+the two score-only scalars); the striped Scores / Pointers / linear kernels; all five
+score-only kernels (the int linear one finishes a row's H one row late, so column n is
+completed there by hand: `max(U, max(P, cin) - ramp)` with the ramp summed in the lane's
+wrapping arithmetic).  **Gated** for ends other than glocal's: Grid and the Hirschberg modes
+(`run_tb_` returns Pointers: O(m*n) direction bytes), the row-wise fill
+(`uses_rowwise_full`), the inter-pair fills, hard and soft (`BatchEngine::inter_fill_()`),
+guide bands (`check_problem` throws).
+
+**Measured** (wloczykij, sse4, float32, own striped fill, traceback pointers, 1 thread;
+`instructions:u` of 3 passes, protein BLOSUM62 11/1 and DNA +2/-4 4/2, L100 / 300 / 1000;
+A/A control base vs base 0.97-1.03, one outlier cell 0.66).  new / main: global 0.990-1.018
+and local 0.994-1.012, i.e. unchanged; **glocal affine +1.4-3.6 % (hard and score-only),
+linear 0.98-1.04** -- the runtime flags in the Glocal instantiation (per-row selects and
+offers, the general end code) cost glocal ~3 % affine; a constexpr glocal instantiation
+would buy it back (not done).  The other ends / new global: overlap (all four) 0.85-0.97
+(cheaper: no Y chain in row 0, no X chain in column 0), a_end 0.98-1.05, a_begin+b_end
+0.98-1.05, none 0.98-1.04.  **After** a compile-time glocal copy of the striped Scores / Pointers
+kernels (`SG` template, ec5640e / follow-ups; tried and reverted for the linear and score-only
+kernels: it moved Local linear hard +2 % through the unit's inlining, and did not move the score
+kernels): glocal affine hard 1.000-1.015, global 0.987-1.014, local 0.978-1.011 (A/A 0.99-1.03);
+**open: glocal score-only still +1-3 % (affine 1.002-1.028, linear up to 1.028)**. **Resolved 2026-11-10/11:** the kernels with runtime ends (SG = -1) are instantiated only in a
+unit of their own per level (`level_<name>_sg.cpp`, `NWGRAD_LEVEL_SG_TU`, registered as `*_sg` table
+entries); the fixed-end kernels are main's code (`SgPick` holds the runtime end logic).  Precise
+counts (wloczykij sse4, float32, 13 vs 1 passes, PYTHONHASHSEED=0, BLAS threads 1; A/A
+0.999-1.003): new / main global 0.999-1.003, glocal 0.998-1.003 (affine and linear, hard and
+score), local 0.998-1.001 except **Local linear hard 1.017-1.019, still open**: in its Pointers
+kernel.  Not the code store: written out explicitly (main's cvttps2dq + pshufb at SSSE3) the
+count was unchanged (two packs instead: +1-3 % on every linear fill), so store_codes is main's
+again; the `movd` seen in the profile is the packed 4-byte store.  **Found 2026-11-10:** the cause
+lay not in the store but in a thing that never ran -- the linear kernel's `pick_row`, a `[&]` lambda
+over `best_local` / `best_i` / `best_j`, built in every instantiation though only SGX ones call it.
+The closure takes those locals' addresses at gimplification, and the early passes saw them as memory
+before the dead closure was swept away; gcc then laid out `striped_linear_ptr_entry<float>` (the Local
+Pointers fill inlined into it) differently (3435 of ~3780 disassembly lines differed from main).  Now
+the pick is a struct (`SgPick1::row1`, kernels_linear_impl.inl) as the affine kernels' `SgPick`: the
+function's code is main's to the instruction, differing only in branch-alignment padding and the
+`ViterbiJob` offsets moved by `sg`.  Recount (13 vs 1 passes, release-wheel flags, -O3 -g1): new / main
+0.998-1.003 in every cell of global / local / glocal x affine / linear x hard / score, protein and DNA
+L300 / L1000, Local linear hard 0.999-1.000; A/A 0.997-1.002.  The lesson: no lambda that captures by
+reference in a kernel body, even an unused one.  **On NEON it was not enough** (spot M1, 15f23a4:
+Local linear float32 path / hard 1.018-1.020, glocal linear path miRNA 1.017-1.025, DNA L100
+1.013-1.032).  I cross-compiled the level units (aarch64 gcc 16.2.1, -O3, release-wheel flags) and
+compared them function by function with main: 300 of ~400 functions in `level_neon.o` differed
+structurally, untouched Hirschberg and grid kernels among them.  Bisected by file, the whole
+disturbance came from score_kernel_impl.inl: the fixed-end Glocal kernels called
+`sg_score_col0_only` (a new function with a `[&]` lambda) for n == 0, and every kernel computed the
+column-n index `coln` (two divisions) whether it used it or not.  Both are now in the runtime-ends
+instantiations only (fixed ends: `static_assert` glocal's), and `sg` sits last in `ViterbiJob` /
+`ScoreJob`, so the other members keep main's offsets.  Result: `striped_linear_entry` /
+`striped_linear_ptr_entry` (every T), `striped_full_ptr_entry` and the Hirschberg / grid kernels
+are main's instruction for instruction on NEON (341 identical, 25 differ in register names only);
+what differs is the score-only kernels (31, small: operand order, one spill) and a few affine
+Scores fills.  On x86 sse4 the same: 597 identical, the rest score-only kernels and one int64 Pointers fill.
+**Spot on f65cdfd** then read protein affine double path / hard 1.17-1.19 (Global, Local, Glocal; DNA,
+float32, score-only 1.000).  I followed it with a static aarch64 driver of the batch engine under
+qemu, logging every translated block: the cell runs the inter-pair fill
+(`lvl_neon_inter::inter_fill_affine<double>` + `row_gather`, ~40 % of the blocks), and
+`level_neon_inter.o` is byte-identical to main's (606 / 606 functions); the hard walk in the bindings
+is main's but for the `Aligner` member offsets (+4, `sg_`).  x86 sse4 instructions on the same cell:
+1.000 (Python, 13 vs 1 passes).  So the code that runs is main's; what moved is where it sits: ld64
+(macOS) has no `nwgrad_text.ld`, so every byte the branch adds to py_exports or the level units moves
+the inter-pair kernel against the engine code (pr-placement.md: up to 13 % on byte-identical kernels).
+Even the qemu block counts moved with it (a hot loop of the identical kernel split across a 4 KiB
+page in one link and not the other: -4.8 % host instructions, an artifact).  The glocal linear
+walks and the scalar fills now take glocal's ends at compile time (`SGR`, `sgt_*_<SGR>()`): the
+glocal walk is main's code but for register names.  Overlap (all four) / global 0.85-0.99, a_end
+0.99-1.04.
+
+**Tests** (`tests/Python/test_semiglobal.py`): a Python 3-state reference of the 4-flag
+DP (scores and end cells under the tie rule, exact with integer-valued parameters), itself
+checked against Biopython's PairwiseAligner with zero end-gap scores (an independent
+statement of the semantics); every flag set x gap model x dtype (double, float32, int32,
+int16) x level against scalar_fallback, bit for bit (score, aligned strings, gradient);
+score-only == the Pointers fill; flags () == mode "global" and (b_begin, b_end) == "glocal"
+bit for bit; path consistency (the aligned strings score the score, start and end on legal
+cells, grad . params == score); batches (both fills) == single pairs.
+
 ### Python bindings (`py_exports.cpp`)
 
 nanobind module `nwgrad_ext`, re-exported from `src/nwgrad/__init__.py`. Exposes:

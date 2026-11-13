@@ -110,10 +110,10 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
         ${NWGRAD_LEVEL_DIR}/level_avx2_soft.cpp
         ${NWGRAD_LEVEL_DIR}/level_avx512_soft.cpp
         # the inter-pair hard kernels of each level, their own TU (NWGRAD_LEVEL_INTER_TU)
-        ${NWGRAD_LEVEL_DIR}/level_baseline_inter.cpp
-        ${NWGRAD_LEVEL_DIR}/level_sse4_inter.cpp
-        ${NWGRAD_LEVEL_DIR}/level_avx2_inter.cpp
-        ${NWGRAD_LEVEL_DIR}/level_avx512_inter.cpp)
+        ${NWGRAD_LEVEL_DIR}/level_baseline_inter.cpp ${NWGRAD_LEVEL_DIR}/level_baseline_sg.cpp
+        ${NWGRAD_LEVEL_DIR}/level_sse4_inter.cpp ${NWGRAD_LEVEL_DIR}/level_sse4_sg.cpp
+        ${NWGRAD_LEVEL_DIR}/level_avx2_inter.cpp ${NWGRAD_LEVEL_DIR}/level_avx2_sg.cpp
+        ${NWGRAD_LEVEL_DIR}/level_avx512_inter.cpp ${NWGRAD_LEVEL_DIR}/level_avx512_sg.cpp)
     # baseline is the x86-64 default (SSE2); the other levels get their flags per-file.
     # sse4 is the x86-64-v2 feature set (SSE4.2 + POPCNT), spelled as -m flags like the
     # others so no -march/-mtune change rides along.
@@ -129,9 +129,9 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
     # and 1 the same.  On cudak (Westmere; not a target) NOPs cost up to 1.15x, the cap at 2
     # less: baseline worst 1.05, sse4 1.14 in one arm, 10 of 60 above 1.03.
     set(NWGRAD_PAD_CAP_OPTS "$<$<CXX_COMPILER_ID:GNU>:-Wa,-malign-branch-prefix-size=2>")
-    set_source_files_properties(${NWGRAD_LEVEL_DIR}/level_baseline.cpp ${NWGRAD_LEVEL_DIR}/level_baseline_soft.cpp ${NWGRAD_LEVEL_DIR}/level_baseline_inter.cpp PROPERTIES
+    set_source_files_properties(${NWGRAD_LEVEL_DIR}/level_baseline.cpp ${NWGRAD_LEVEL_DIR}/level_baseline_soft.cpp ${NWGRAD_LEVEL_DIR}/level_baseline_inter.cpp ${NWGRAD_LEVEL_DIR}/level_baseline_sg.cpp PROPERTIES
         COMPILE_OPTIONS "${NWGRAD_PAD_CAP_OPTS}")
-    set_source_files_properties(${NWGRAD_LEVEL_DIR}/level_sse4.cpp ${NWGRAD_LEVEL_DIR}/level_sse4_soft.cpp ${NWGRAD_LEVEL_DIR}/level_sse4_inter.cpp PROPERTIES
+    set_source_files_properties(${NWGRAD_LEVEL_DIR}/level_sse4.cpp ${NWGRAD_LEVEL_DIR}/level_sse4_soft.cpp ${NWGRAD_LEVEL_DIR}/level_sse4_inter.cpp ${NWGRAD_LEVEL_DIR}/level_sse4_sg.cpp PROPERTIES
         COMPILE_OPTIONS "-msse4.2;-mpopcnt;${NWGRAD_PAD_CAP_OPTS}")
     # The avx2 and avx512 levels are the ones Skylake-derived cores run (6th-10th gen Core,
     # Skylake-SP/Cascade Lake Xeons), whose JCC-erratum microcode keeps any jump that crosses
@@ -154,9 +154,9 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
     set(NWGRAD_JCC_GNU_OPTS
         "-Wa,-mbranches-within-32B-boundaries;-falign-functions=32;-falign-loops=1;-falign-jumps=1;-falign-labels=1")
     set(NWGRAD_JCC_CLANG_OPTS "$<$<CXX_COMPILER_ID:Clang,AppleClang>:-mbranches-within-32B-boundaries>")
-    set_source_files_properties(${NWGRAD_LEVEL_DIR}/level_avx2.cpp ${NWGRAD_LEVEL_DIR}/level_avx2_soft.cpp ${NWGRAD_LEVEL_DIR}/level_avx2_inter.cpp PROPERTIES
+    set_source_files_properties(${NWGRAD_LEVEL_DIR}/level_avx2.cpp ${NWGRAD_LEVEL_DIR}/level_avx2_soft.cpp ${NWGRAD_LEVEL_DIR}/level_avx2_inter.cpp ${NWGRAD_LEVEL_DIR}/level_avx2_sg.cpp PROPERTIES
         COMPILE_OPTIONS "-mavx2;-mfma;${NWGRAD_JCC_CLANG_OPTS}")
-    set_source_files_properties(${NWGRAD_LEVEL_DIR}/level_avx512.cpp ${NWGRAD_LEVEL_DIR}/level_avx512_soft.cpp ${NWGRAD_LEVEL_DIR}/level_avx512_inter.cpp PROPERTIES
+    set_source_files_properties(${NWGRAD_LEVEL_DIR}/level_avx512.cpp ${NWGRAD_LEVEL_DIR}/level_avx512_soft.cpp ${NWGRAD_LEVEL_DIR}/level_avx512_inter.cpp ${NWGRAD_LEVEL_DIR}/level_avx512_sg.cpp PROPERTIES
         COMPILE_OPTIONS "-mavx512f;-mavx512dq;-mavx512vl;-mavx512bw;${NWGRAD_JCC_CLANG_OPTS}")
     # MinGW: the Win64 ABI only guarantees a 16-byte-aligned stack, and older gcc spilled
     # 32- and 64-byte vectors there with ALIGNED moves (vmovapd / vmovdqa64; GCC PR 54412)
@@ -178,7 +178,7 @@ elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
         ${NWGRAD_LEVEL_DIR}/simd_levels.cpp
         ${NWGRAD_LEVEL_DIR}/level_neon.cpp
         ${NWGRAD_LEVEL_DIR}/level_neon_soft.cpp
-        ${NWGRAD_LEVEL_DIR}/level_neon_inter.cpp)
+        ${NWGRAD_LEVEL_DIR}/level_neon_inter.cpp ${NWGRAD_LEVEL_DIR}/level_neon_sg.cpp)
 endif()
 
 nanobind_add_module(nwgrad_ext

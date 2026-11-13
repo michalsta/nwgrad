@@ -81,6 +81,21 @@ static inline void striped_row_best1(const T* cH, const T* pad, int seg, int i,
     best = rmax; bi = i; bj = l * seg + s + 1;
 }
 
+// SgPick (kernels_impl.inl) over H alone (X = Y = -inf): row ci's end candidates.
+template <class T, bool Sat>
+struct SgPick1 : SgPick<T, Sat> {
+    void row1(int ci, const T* rH, T ninf) noexcept {
+        if (ci == this->m && (this->sg & kSgFreeBEnd)) {   // row m whole: column 0, then H's striped columns
+            this->offer(this->m, 0, rH[0], ninf, ninf);
+            if (this->seg > 0) striped_row_best1<T, Sat>(rH + this->off, this->pad, this->seg, ci,
+                                                         *this->best, *this->bi, *this->bj);
+        } else if (ci == this->m || (this->sg & kSgFreeAEnd)) {
+            this->offer(ci, this->n, rH[this->coln], ninf, ninf);
+        }
+    }
+};
+template <bool SGX, class T, bool Sat> using SgPick1For = std::conditional_t<SGX, SgPick1<T, Sat>, SgNoPick>;
+
 // Ptr: record direction bytes (TracebackMode::Pointers) on rolling rows; else the H table.
 // Tr: a tracked problem (job.tr): each row's extends, border and profile row from the
 // track arrays, in the same expressions, so equal sets give the untracked table.
@@ -88,8 +103,9 @@ static inline void striped_row_best1(const T* cH, const T* pad, int seg, int i,
 // simd_levels.hpp: 0.25 B/cell), for the memory-bound regime -- each lane accumulates its
 // 2-bit codes by Horner over a group of four segments and stores one byte per lane a group.
 // Glocal (Local false): row 0 = 0 (a free start), column 0 Global's chain, no clamp, the
-// end the best cell of row m (column 0 first, then the striped columns, strict >).
-template <class T, bool Local, bool Ptr, bool Tr, bool Dense = false, bool Sat = false, bool Glocal = false>
+// end the best cell of row m (column 0 first, then the striped columns, strict >) -- with
+// job.sg the other semi-global ends as striped_affine_full's (kernels_impl.inl).
+template <class T, bool Local, bool Ptr, bool Tr, bool Dense = false, bool Sat = false, bool Glocal = false, int SG = kSgGlocal>
 static void striped_linear_full(ViterbiJob<T>& job) {
     static_assert(!Dense || (Ptr && sizeof(T) >= 4), "dense codes: pointer fill, lanes >= 32 bits");
     using vd = stdx::native_simd<T>;
@@ -146,13 +162,19 @@ static void striped_linear_full(ViterbiJob<T>& job) {
         pH = buf.H.data(); cH = pH + hstride;
     }
 
+    // The semi-global ends (Glocal only).
+    // SG: the ends fixed at compile time (kSgGlocal: glocal's, main's code); -1 runtime (SGX).
+    constexpr bool SGX = Glocal && SG < 0;
+    const int sg = !Glocal ? 0 : (SGX ? job.sg : SG);
+    const bool sg_ab = Glocal && (sg & kSgFreeABegin), sg_bb = Glocal && (sg & kSgFreeBBegin);
+
     // ── row 0 ──  H[0][0] = 0; H[0][j] = -(j * ge_a) (Global) or 0 (Local); pads NINF.
     pH[0] = static_cast<T>(0);
     for (int l = 0; l < W; ++l)
         for (int s = 0; s < seg; ++s) {
             const int j = l * seg + s + 1;
             const std::size_t k = off + (std::size_t)s * W + l;
-            if (j <= n) pH[k] = (Local || Glocal) ? static_cast<T>(0) : -static_cast<T>(j) * ge_a;
+            if (j <= n) pH[k] = (Local || sg_bb) ? static_cast<T>(0) : -static_cast<T>(j) * ge_a;
             else        pH[k] = K_NINF;
         }
     if constexpr (Ptr) {
@@ -170,6 +192,19 @@ static void striped_linear_full(ViterbiJob<T>& job) {
     const vd vninf(K_NINF);
     T best_local = static_cast<T>(0); int best_i = 0, best_j = 0;
     const T* pad = (Local || Glocal) ? striped_pad_into<T, Sat>(rows + 2 * rs, n, seg, W) : nullptr;
+    // Runtime ends (SGX): SgPick (kernels_impl.inl) over H alone (X = Y = -inf), so the
+    // fixed-end instantiations keep main's code.
+    // No lambda here: an unused [&] closure over best_local / best_i / best_j, even in the
+    // fixed-end instantiations that never call it, moved gcc's code for Local linear
+    // Pointers (+5 % instructions in the kernel, +1.8 % on the path; wloczykij sse4,
+    // 2026-11-10), as the affine kernels' lambdas had (see SgPick).
+    [[maybe_unused]] SgPick1For<SGX, T, Sat> pick{};
+    [[maybe_unused]] int best_tbl = 0;
+    if constexpr (SGX) {
+        pick = SgPick1<T, Sat>{{sg, m, n, seg, off, (n == 0) ? 0 : off + scol(n), pad,
+                                &best_local, &best_i, &best_j, &best_tbl}};
+        pick.row1(0, pH, K_NINF);   // row 0 (row m when m == 0)
+    }
 
     for (int i = 1; i <= m; ++i) {
         if constexpr (Tr) {
@@ -178,8 +213,8 @@ static void striped_linear_full(ViterbiJob<T>& job) {
         }
         // column 0 of this row, and the previous row's (the diagonal into column 1)
         T nb;
-        if constexpr (Tr) nb = Local ? static_cast<T>(0) : tr.bx0[i];
-        else              nb = Local ? static_cast<T>(0) : -static_cast<T>(i) * ge_b;
+        if constexpr (Tr) nb = (Local || sg_ab) ? static_cast<T>(0) : tr.bx0[i];
+        else              nb = (Local || sg_ab) ? static_cast<T>(0) : -static_cast<T>(i) * ge_b;
         const T bprev = pH[0];
         cH[0] = nb;
         const T nbOpen = nw_sub(nb, ge_a);                     // the open into column 1
@@ -316,11 +351,12 @@ static void striped_linear_full(ViterbiJob<T>& job) {
             }   // groups
             if constexpr (Local) striped_row_best1<T, Sat>(cH + off, pad, seg, i, best_local, best_i, best_j);
         }
-        if constexpr (Glocal)
+        if constexpr (Glocal && !SGX)
             if (i == m) {   // the end: column 0 first, then the striped columns
                 best_local = cH[0]; best_i = m; best_j = 0;
                 if (seg > 0) striped_row_best1<T, Sat>(cH + off, pad, seg, i, best_local, best_i, best_j);
             }
+        if constexpr (SGX) pick.row1(i, cH, K_NINF);   // column n of rows < m, row m
 
         if constexpr (Ptr) std::swap(pH, cH);
         else { pH = cH; cH += hstride; }
@@ -598,4 +634,37 @@ template <class T>
 static void lhb_striped(LhbJob<T>& job) {
     if constexpr (nw_sat<T>) { if (job.sat) { lhb_striped_impl<T, true>(job); return; } }
     lhb_striped_impl<T, false>(job);
+}
+
+// The semi-global runtime-ends fills (job.sg != kSgGlocal; Glocal only), registered from a
+// unit of their own (level_<name>_sg.cpp, NWGRAD_LEVEL_SG_TU): see level_common.inc.
+template <class T, bool Sat>
+static void striped_linear_sg_entry_impl(ViterbiJob<T>& job, bool ptr) {
+    const bool tr = job.tr.on();
+    if (ptr) {
+        if constexpr (sizeof(T) >= 4) {
+            if (job.dense) {
+                if (tr) striped_linear_full<T, false, true, true, true, Sat, true, -1>(job);
+                else    striped_linear_full<T, false, true, false, true, Sat, true, -1>(job);
+                return;
+            }
+        } else {
+            job.dense = 0;
+        }
+        if (tr) striped_linear_full<T, false, true, true, false, Sat, true, -1>(job);
+        else    striped_linear_full<T, false, true, false, false, Sat, true, -1>(job);
+        return;
+    }
+    if (tr) striped_linear_full<T, false, false, true, false, Sat, true, -1>(job);
+    else    striped_linear_full<T, false, false, false, false, Sat, true, -1>(job);
+}
+template <class T>
+static void striped_linear_sg_entry(ViterbiJob<T>& job) {
+    if constexpr (nw_sat<T>) { if (job.sat) { striped_linear_sg_entry_impl<T, true>(job, false); return; } }
+    striped_linear_sg_entry_impl<T, false>(job, false);
+}
+template <class T>
+static void striped_linear_ptr_sg_entry(ViterbiJob<T>& job) {
+    if constexpr (nw_sat<T>) { if (job.sat) { striped_linear_sg_entry_impl<T, true>(job, true); return; } }
+    striped_linear_sg_entry_impl<T, false>(job, true);
 }

@@ -118,7 +118,9 @@ template <class V>
 // carry; each lane accumulates a plane's codes over four segments by Horner and stores one
 // byte per lane a group.  The codes are the same choices; only where their bits go differs.
 // Glocal: as striped_affine_full's (row 0 M = 0, the best of row m; row 0's codes are
-// never read: the walk stops at row 0).
+// never read: the walk stops at row 0), and its other semi-global ends (job.sg) the same
+// way: a charged row 0 keeps Global's values and codes (written for every mode), a free
+// column 0 is Local's border (its code never read: the walk stops there).
 // The kernel's per-call setup, out of line: whether gcc inlines the vector growth and
 // spread_rows' allocation paths depends on the unit's size (its inlining budget), and when
 // the inter-pair kernels moved to a unit of their own (level_<lv>_inter.cpp) it began to,
@@ -132,7 +134,7 @@ template <class T, class Vec>
     return spread_rows<T>(block, len, nrows, stride);
 }
 
-template <class T, bool Local, bool Tr = false, bool Dense = false, bool Sat = false, bool Glocal = false>
+template <class T, bool Local, bool Tr = false, bool Dense = false, bool Sat = false, bool Glocal = false, int SG = kSgGlocal>
 static void striped_affine_full_ptr(ViterbiJob<T>& job) {
     static_assert(!Dense || sizeof(T) >= 4, "dense codes: lanes >= 32 bits");
     using vd = stdx::native_simd<T>;
@@ -181,6 +183,12 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
     T* pM = rows + 3 * rs; T* pX = rows + 4 * rs; T* pY = rows + 5 * rs;
     T* cM = rows;          T* cX = rows + rs;     T* cY = rows + 2 * rs;
 
+    // The semi-global ends (Glocal only; see striped_affine_full).
+    // SG: the ends fixed at compile time (kSgGlocal: glocal's, main's code); -1 runtime (SGX).
+    constexpr bool SGX = Glocal && SG < 0;
+    const int sg = !Glocal ? 0 : (SGX ? job.sg : SG);
+    const bool sg_ab = Glocal && (sg & kSgFreeABegin), sg_bb = Glocal && (sg & kSgFreeBBegin);
+
     // ── row 0: scores into the rolling "previous" row, codes into the tables ──
     {
         pM[0] = 0; pX[0] = K_NINF; pY[0] = K_NINF;
@@ -201,8 +209,8 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                 const int j = l * seg + s + 1;
                 const std::size_t k = (std::size_t)s * W + l;
                 if (j <= n) {
-                    if constexpr (Local || Glocal) pM[off + k] = 0;
-                    else                           pY[off + k] = -(go_a + j * ge_a);
+                    if (Local || sg_bb) pM[off + k] = 0;
+                    else                pY[off + k] = -(go_a + j * ge_a);
                     // row 0 is a start (M 3, X 0); Y: (0,1) opens from M, the rest extend
                     if constexpr (!Dense) d0[off + k] = (j <= 1) ? 3 : 3 | 2 << 4;
                 } else {
@@ -221,6 +229,12 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
     T bM = 0, bX = K_NINF, bY = K_NINF;
     T best_local = 0; int best_i = 0, best_j = 0, best_tbl = 0;
     const T* pad = (Local || Glocal) ? striped_pad_into<T, Sat>(rows + 10 * rs, n, seg, W) : nullptr;
+    [[maybe_unused]] SgPickFor<SGX, T, Sat> pick{};   // runtime ends (kernels_impl.inl)
+    if constexpr (SGX) {
+        pick = SgPick<T, Sat>{sg, m, n, seg, off, (n == 0) ? 0 : off + scol(n), pad,
+                              &best_local, &best_i, &best_j, &best_tbl};
+        pick.row(0, pM, pX, pY);   // row 0 (row m when m == 0)
+    }
     // Local with non-negative gap parameters (every row, when tracked): the row's best
     // cell is an M cell, and the FIRST cell reaching the row's maximum (column order) is
     // an M cell too -- a gap cell never exceeds the cell it extends from (X from the cell
@@ -251,10 +265,10 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
             go_a = tr.go_a[i]; ge_a = tr.ge_a[i]; go_b = tr.go_b[i]; ge_b = tr.ge_b[i];
             vgo_a = vd(go_a); vge_a = vd(ge_a); vgo_b = vd(go_b); vge_b = vd(ge_b);
         }
-        const T nbM = Local ? T(0) : K_NINF;
+        const T nbM = (Local || sg_ab) ? T(0) : K_NINF;   // a semi-global free A begin: Local's
         T nbX;
-        if constexpr (Tr) nbX = Local ? K_NINF : tr.bx0[i];
-        else              nbX = Local ? K_NINF : -(go_b + i * ge_b);
+        if constexpr (Tr) nbX = (Local || sg_ab) ? K_NINF : tr.bx0[i];
+        else              nbX = (Local || sg_ab) ? K_NINF : -(go_b + i * ge_b);
         const T nbOpen = nw_sub(nw_sub(std::max(nbM, nbX), go_a), ge_a);
         const T nbOpenK = (nw_sub(nw_sub(nbM, go_a), ge_a) >= nw_sub(nw_sub(nbX, go_a), ge_a)) ? T(0) : T(Dense ? 1 : 16);   // Y's open codes
         const T* sub = striped_row_profile<T, Tr>(buf.sprof.data(), blk, nalpha, a, b, n, seg, W, i, tr);
@@ -562,12 +576,14 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
                 }
             }
         }
-        if constexpr (Glocal)
+        if constexpr (Glocal && !SGX)
             if (i == m) {   // the end: column 0 first (M > X > Y), then the striped columns
                 best_local = std::max(nbM, nbX); best_i = m; best_j = 0; best_tbl = (nbM >= nbX) ? 0 : 1;
                 if (seg > 0) striped_row_best<T, Sat>(cM + off, cX + off, cY + off, pad, seg, i,
                                                  best_local, best_i, best_j, best_tbl);
             }
+        if constexpr (SGX)
+            if (i == m || (sg & kSgFreeAEnd)) pick.row(i, cM, cX, cY);   // column n of rows < m, row m
         bM = nbM; bX = nbX; bY = K_NINF;
         std::swap(pM, cM); std::swap(pX, cX); std::swap(pY, cY);
     }
@@ -587,17 +603,17 @@ static void striped_affine_full_ptr(ViterbiJob<T>& job) {
     job.width = W;
 }
 
-template <class T, bool Sat>
+template <class T, bool Sat, int SGE = kSgGlocal>
 static void striped_full_ptr_entry_impl(ViterbiJob<T>& job) {
     const bool glocal = job.align_mode == 2;   // 0 Global, 1 Local, 2 Glocal
     if constexpr (sizeof(T) >= 4) {
         if (job.dense) {
             if (job.tr.on()) {
-                if (glocal)              striped_affine_full_ptr<T, false, true, true, Sat, true>(job);
+                if (glocal)              striped_affine_full_ptr<T, false, true, true, Sat, true, SGE>(job);
                 else if (job.align_mode) striped_affine_full_ptr<T, true, true, true, Sat>(job);
                 else                     striped_affine_full_ptr<T, false, true, true, Sat>(job);
             } else {
-                if (glocal)              striped_affine_full_ptr<T, false, false, true, Sat, true>(job);
+                if (glocal)              striped_affine_full_ptr<T, false, false, true, Sat, true, SGE>(job);
                 else if (job.align_mode) striped_affine_full_ptr<T, true, false, true, Sat>(job);
                 else                     striped_affine_full_ptr<T, false, false, true, Sat>(job);
             }
@@ -606,12 +622,12 @@ static void striped_full_ptr_entry_impl(ViterbiJob<T>& job) {
     }
     job.dense = 0;
     if (job.tr.on()) {
-        if (glocal)              striped_affine_full_ptr<T, false, true, false, Sat, true>(job);
+        if (glocal)              striped_affine_full_ptr<T, false, true, false, Sat, true, SGE>(job);
         else if (job.align_mode) striped_affine_full_ptr<T, true, true, false, Sat>(job);
         else                     striped_affine_full_ptr<T, false, true, false, Sat>(job);
         return;
     }
-    if (glocal)              striped_affine_full_ptr<T, false, false, false, Sat, true>(job);
+    if (glocal)              striped_affine_full_ptr<T, false, false, false, Sat, true, SGE>(job);
     else if (job.align_mode) striped_affine_full_ptr<T, true, false, false, Sat>(job);
     else                     striped_affine_full_ptr<T, false, false, false, Sat>(job);
 }
@@ -619,4 +635,10 @@ template <class T>
 static void striped_full_ptr_entry(ViterbiJob<T>& job) {
     if constexpr (nw_sat<T>) { if (job.sat) { striped_full_ptr_entry_impl<T, true>(job); return; } }
     striped_full_ptr_entry_impl<T, false>(job);
+}
+// The semi-global runtime ends: see striped_full_sg_entry (kernels_impl.inl).
+template <class T>
+static void striped_full_ptr_sg_entry(ViterbiJob<T>& job) {
+    if constexpr (nw_sat<T>) { if (job.sat) { striped_full_ptr_entry_impl<T, true, -1>(job); return; } }
+    striped_full_ptr_entry_impl<T, false, -1>(job);
 }

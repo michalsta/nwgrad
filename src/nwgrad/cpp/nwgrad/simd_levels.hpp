@@ -166,6 +166,20 @@ struct TrackJob {
     bool on() const noexcept { return go_a != nullptr; }
 };
 
+// ── Semi-global free ends (AlignMode::Glocal's runtime refinement) ────────────
+// The Glocal template mode is the whole semi-global family: four runtime flags say which
+// flanks are free (unaligned residues, not gap moves).  A = the rows (i), B = the columns
+// (j).  kSgFreeABegin: column 0 a free start (M = 0, no X chain down it); kSgFreeAEnd: every
+// cell of column n an end; kSgFreeBBegin: row 0 a free start (M = 0, no Y chain along it);
+// kSgFreeBEnd: every cell of row m an end.  "glocal" (A within B) is kSgGlocal; no flag is
+// Global's DP exactly.  The end cell, among equal maxima: the FIRST candidate in row-major
+// order (i ascending, then j), the state by M > X > Y -- glocal's rule (the first column of
+// row m) and Local's, extended.  Every job struct defaults to kSgGlocal, so a caller that
+// predates the flags runs glocal.
+inline constexpr int kSgFreeABegin = 1, kSgFreeAEnd = 2, kSgFreeBBegin = 4, kSgFreeBEnd = 8;
+inline constexpr int kSgGlocal = kSgFreeBBegin | kSgFreeBEnd;
+inline constexpr int kSgAll = 15;
+
 // Everything a forward pass needs, and everything it produces — no std::simd, no
 // Aligner: the only currency that crosses a level boundary.  Templated on the Viterbi
 // precision T (double or float32): the substitution block, gap penalties and DP buffer
@@ -198,6 +212,9 @@ struct ViterbiJob {
     // 0.75 B/cell affine).  Out: 1 if the kernel wrote them, 0 if it wrote one byte a cell
     // (it clears the request it cannot honour: int16 lanes).
     int dense = 0;
+    // align_mode 2: the free ends (kSgFree*).  Last, so every member before it keeps main's
+    // offset: inserted beside align_mode it moved the code of kernels that never read it.
+    int sg = kSgGlocal;
 };
 
 // The dense direction codes' geometry, shared by the kernels and the walks.  Per DP row:
@@ -245,6 +262,7 @@ struct ScoreJob {
     DpBufferT<T>* buf;
     T score;                                // out
     TrackJob<T> tr;                         // tracked rows (tr.on()), else untracked
+    int sg = kSgGlocal;                     // local 2: the free ends (kSgFree*); last, as ViterbiJob's
 };
 
 // ── Grid forward pass (TracebackMode::Grid) ──────────────────────────────────
@@ -478,6 +496,7 @@ struct SoftPairJobT {
     const F* P;
     F oa, ea, ob, eb;               // linear: ea, eb only
     int local, full, bi, bj;        // bi/bj: Global border rows/cols
+    int sg = kSgGlocal;             // local 2: the semi-global free ends (kSgFree*)
     const int *jlo, *jhi, *jlo0, *jhi0, *slo, *shi;   // m+1 each
     size_t stride;                  // n+1
     F *FM, *FX, *FY;                // forward tables (linear: FM only)
@@ -1016,6 +1035,11 @@ struct TypedKernels {
     viterbi_fn         viterbi_ptr = nullptr;        // TracebackMode::Pointers
     viterbi_fn         linear = nullptr;             // striped LINEAR Full, H table (kernels_linear_impl.inl)
     viterbi_fn         linear_ptr = nullptr;         // ... recording direction bytes
+    // The semi-global runtime ends (job.sg != kSgGlocal), from the level's sg unit:
+    viterbi_fn         linear_sg = nullptr;          // linear, H table
+    viterbi_fn         linear_ptr_sg = nullptr;      // ... recording direction bytes
+    viterbi_fn         viterbi_sg = nullptr;         // affine Full, Scores
+    viterbi_fn         viterbi_ptr_sg = nullptr;     // ... Pointers
     using lhb_fn = void (*)(LhbJob<T>&);
     lhb_fn             lhb = nullptr;                // linear Hirschberg sweeps / base / scans
     banded_row_fn_t<T> banded_row_global = nullptr;  // row-wise banded whole-row kernels
@@ -1028,6 +1052,7 @@ struct TypedKernels {
     hbbase_fn          hb_base = nullptr;            // Hirschberg base case (records directions)
     hbscan_fn          hb_scan = nullptr;            // Hirschberg local endpoint scan
     score_fn           score = nullptr;              // score only (rolling rows)
+    score_fn           score_sg = nullptr;           // score only, semi-global runtime ends
     inter_fn           inter_fill = nullptr;         // inter-pair Full fill, W pairs per call
     inter_fn           inter_score = nullptr;        // inter-pair score only (Full)
     int                inter_w = 0;                  // the inter-pair lane count (pairs per call)
@@ -1112,6 +1137,13 @@ void register_level_typed(SimdLevel l,
                           typename TypedKernels<T>::score_fn score);
 // The inter-pair hard kernels, from the level's inter TU (level_<name>_inter.cpp; see
 // level_common.inc).
+template <class T>
+NWGRAD_BASELINE_ONLY
+void register_level_sg(SimdLevel l, typename TypedKernels<T>::viterbi_fn linear_sg,
+                       typename TypedKernels<T>::viterbi_fn linear_ptr_sg,
+                       typename TypedKernels<T>::viterbi_fn viterbi_sg,
+                       typename TypedKernels<T>::viterbi_fn viterbi_ptr_sg,
+                       typename TypedKernels<T>::score_fn score_sg);
 template <class T>
 NWGRAD_BASELINE_ONLY
 void register_level_inter(SimdLevel l, typename TypedKernels<T>::inter_fn inter_fill,

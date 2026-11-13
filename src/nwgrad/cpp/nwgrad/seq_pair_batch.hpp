@@ -101,6 +101,9 @@ public:
     // ── Batch operations  ──────────────────
 
     void set_params(const AlignParams& p) { visit([&](auto& e) { e.set_params(p); }); }
+    // The semi-global free ends (kSgFree* bits; mode glocal only, kSgGlocal its default).
+    void set_free_ends(int f) { visit([&](auto& e) { e.set_free_ends(f); }); }
+    int free_ends() const { return visit([](const auto& e) { return e.free_ends(); }); }
     double score_and_grad(bool keep_paths = false) {
         return visit([&](auto& e) { return e.score_and_grad(keep_paths); });
     }
@@ -284,6 +287,8 @@ public:
     int kernel() const { return ce([](const auto& x) { return x.kernel(); }); }
     GapModel gap_model() const { return b_->gap_model(); }
     AlignMode align_mode() const { return b_->align_mode(); }
+    int free_ends() const { return b_->free_ends(); }
+    void set_free_ends(int f) { standalone_("free_ends"); own_->set_free_ends(f); }
     GradMode grad_mode() const { return b_->grad_mode(); }
     TracebackMode traceback() const { return b_->traceback_resolved(); }
     const Alphabet& alphabet() const { return b_->alphabet(); }
