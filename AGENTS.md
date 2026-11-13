@@ -3041,7 +3041,7 @@ so a saturated value never leaks and the score is the int16 / int32 integer bit 
   off, DNA L100 int16 / int32 inter-pair is 0.50 Global / 0.52 Local; int16 inter-pair /
   own fill at DNA L100 Global 0.69 (instructions; the caps came from timings, untouched).
   Since then int16's caps are per level (`kGateCapsSse2` / `kGateCapsSse4`, AVX2's row):
-  AVX2 L300, SSE4 L200, SSE2 L100 Local / L60 Global, from nighthaven timings and wloczykij
+  AVX2 L1000, SSE4 L200, SSE2 L100 Local / L60 Global, from nighthaven timings and wloczykij
   instruction counts (simd_levels.hpp has the numbers); int32's, AVX-512 and NEON unchanged.
 - **ISA**: sse2 / sse4 run here (A/B fuzz, C++ [int8] case, test_int8.py at every level);
   avx2, avx512 and neon (gcc and clang, aarch64 cross) compile only.

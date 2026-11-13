@@ -888,7 +888,7 @@ inline constexpr GateLevelCaps kGateCapsSse    { {       6600,     1700,      20
                                                  { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, 0 };
 inline constexpr GateLevelCaps kGateCapsAvx2   { {      31000,     3800,      20000,     3072,      12288,       4700, kGateNoCap, kGateNoCap,      31000,      10300,      31000,      31000 },
                                                  {       6600,     1700,      20000,     3072,      12288,       1900, kGateNoCap, kGateNoCap,       6600,       6600,       6600,       6600 },
-                                                 {       1700,     1700,       4000,     1024,        450,      91000,      91000, kGateNoCap,       1700,       1700,       1700,       1700 },   // int16: small caps L300 (see kGateCapsSse4)
+                                                 {       1700,     1700,       4000,     1024,        450,    1003000,    1003000, kGateNoCap,       1700,       1700,       1700,       1700 },   // int16: small caps L1000 (see kGateCapsSse4)
                                                  {       1700,     3800,       4000,     2560,       2048,       1900,       1900, kGateNoCap,       1700,       3800,       1700,       1700 },
                                                  {       3800,     1700,       2500,     3072,      12288,       2800,       1900, kGateNoCap,       3800,       1700,       3800,       3800 },
                                                  3072, 8192, 20000,
@@ -910,8 +910,9 @@ inline constexpr GateLevelCaps kGateCapsNeon   { {      10300,     1700,       8
 // The small-alphabet score caps of int16 per level (score_small_local / _global), measured
 // with the inter-pair int8 tier in (proto/int8-inter; the int8 groups of int16 AND int32
 // batches take int16's caps), DNA related pairs, cap lifted / default:
-//   AVX2 (nighthaven, time, 1 and 6 threads): L100 0.13-0.48, L300 0.69-0.80 -> 91000 (L300;
-//     past it unmeasured).
+//   AVX2 (nighthaven, time, 1 and 6 threads): L100 0.13-0.48, L300 0.69-0.80, L500 0.70-0.89,
+//     L1000 affine 1.00 / linear 0.87-0.91 -> 1003000 (L1000; affine is at par there, so
+//     not removed: past it unmeasured on AVX2).
 //   SSE4 (wloczykij, instructions, A/A 0.94-1.05): L60 0.29-0.43, L100 0.42-0.69, L150-L500
 //     affine 0.72-0.85, linear Global 0.77-0.94, linear Local 0.88 / 0.99 / 1.03 / 1.04 at
 //     L150 / 200 / 300 / 500 -> 41000 (L200) both modes.
