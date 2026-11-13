@@ -2680,8 +2680,16 @@ private:
         const size_t N = size();
         const bool inter = s_.inter_fill;
         const InterPlan& PL = inter ? ensure_plan_(true) : plan_;
-        const size_t G = inter ? PL.groups.size() : 0;
-        const size_t tasks = inter ? G + PL.other.size() : N;
+        // The int8 groups (inter8_kernel_impl.inl) when the call qualifies: then the plan is
+        // plan8_'s split of PL, else PL itself.
+        Inter8Call c8;
+        const Inter8Plan* P8 = inter ? ensure_plan8_(PL, c8) : nullptr;
+        const std::vector<size_t>& elig = P8 ? P8->elig16 : PL.elig;
+        const std::vector<size_t>& other = P8 ? P8->other : PL.other;
+        const auto& groups = P8 ? P8->groups16 : PL.groups;
+        const size_t G8 = P8 ? P8->groups8.size() : 0;
+        const size_t G = inter ? groups.size() : 0;
+        const size_t tasks = inter ? G8 + G + other.size() : N;
         std::atomic<size_t> idx{0};
         auto worker = [&]() {
             WorkLease lease(*this);
@@ -2689,21 +2697,36 @@ private:
             std::vector<const unsigned char*> a, b;
             std::vector<int> m, nb;
             std::vector<T> best, blkT;
+            std::vector<size_t> spill;   // int8 lanes that may have saturated: re-run at T
+            // Predictor: skip the int8 run of a group while the fail fraction of the recent
+            // groups (an average halved per group, over the lanes that failed or, run at T,
+            // would have failed the int8 test -- exact from the T scores) is above the
+            // break-even of the level's lane count (inter8_max_fail_).  A group whose lanes
+            // cannot overflow at all (inter8_safe_) runs int8 regardless.  The estimate is
+            // the batch's, shared by the workers and kept across calls (inter8_fail_q_):
+            // per worker and per call, every worker of every call paid one blind int8 group,
+            // which at 64 lanes (solace, 8 threads) cost 1.11-1.13 on related DNA L100 Local.
+            auto fail8 = [this] { return std::atomic_ref<int>(inter8_fail_q_).load(std::memory_order_relaxed) * (1.0 / kFailQ); };
+            auto note8 = [this](size_t fails, size_t real) {
+                std::atomic_ref<int> q(inter8_fail_q_);
+                const int f = static_cast<int>(static_cast<double>(fails) / static_cast<double>(real) * kFailQ + 0.5);
+                q.store((q.load(std::memory_order_relaxed) + f) / 2, std::memory_order_relaxed);   // races only blur it
+            };
             auto own = [&](size_t i) {
                 flags_[i] &= static_cast<uint8_t>(~kStored);
                 set_problem_(w.full, i);
                 score_[i] = w.full.compute_score(w.buf);
                 finish_(i, false, true);
             };
-            for (size_t t; (t = idx.fetch_add(1, std::memory_order_relaxed)) < tasks; ) {
-                if (!inter) { own(t); continue; }
-                if (t >= G) { own(PL.other[t - G]); continue; }
-                const auto [s, e] = PL.groups[t];
-                const size_t real = e - s;
-                const LevelKernels& K = level_kernels(PL.backend);
+            const LevelKernels* Kp = inter ? &level_kernels(PL.backend) : nullptr;
+            const double max_fail = Kp && P8 ? inter8_max_fail_(Kp->inter_w8) : 0.0;
+            // One group of `real` pairs vec[s0 .. s0 + real) on the T score kernel.
+            auto run16 = [&](const std::vector<size_t>& vec, size_t s0, size_t real) {
+                const size_t* ids = vec.data() + s0;
+                const LevelKernels& K = *Kp;
                 if (!has_inter_score_(K) || !linear_fill_ok_(K)) {
-                    for (size_t l = 0; l < real; ++l) own(PL.elig[s + l]);
-                    continue;
+                    for (size_t l = 0; l < real; ++l) own(ids[l]);
+                    return;
                 }
                 const int W = inter_w_(K);
                 a.assign(W, nullptr); b.assign(W, nullptr); m.assign(W, 0); nb.assign(W, 0);
@@ -2711,7 +2734,7 @@ private:
                 int M = 0, n = 0;
                 bool ragged = false;
                 for (int l = 0; l < W; ++l) {
-                    const size_t i = PL.elig[s + std::min<size_t>(l, real - 1)];
+                    const size_t i = ids[std::min<size_t>(l, real - 1)];
                     a[l] = codes_a(i).data(); b[l] = codes_b(i).data();
                     m[l] = static_cast<int>(len_a(i));
                     nb[l] = static_cast<int>(len_b(i));
@@ -2719,16 +2742,19 @@ private:
                     n = std::max(n, nb[l]);
                     ragged |= nb[l] != nb[0];
                 }
-                if (!inter_score_ok<T>(alpha_->size(), M, n, GM == GapModel::Affine, AM == AlignMode::Local, s_.n_threads == 1, PL.backend)) {   // short pairs only
-                    for (size_t l = 0; l < real; ++l) own(PL.elig[s + l]);
-                    continue;
+                // (int8_own_: a group of long rows the per-pair int8 tier would take; the
+                // int8 groups' pairs, <= 127 columns, are never that long)
+                if (!inter_score_ok<T>(alpha_->size(), M, n, GM == GapModel::Affine, AM == AlignMode::Local, s_.n_threads == 1, PL.backend) ||
+                    int8_own_(PL.backend, nb.data(), static_cast<int>(real), w.full)) {   // short pairs only
+                    for (size_t l = 0; l < real; ++l) own(ids[l]);
+                    return;
                 }
                 InterJobT<T> job{};
                 job.a = a.data(); job.m = m.data(); job.b = b.data(); job.n = n; job.M = M;
                 job.align_mode = (AM == AlignMode::Local) ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
                 if (ragged) job.nb = nb.data();
                 if (tracked_) {
-                    tracked_lanes_(w, w.lanes, W, real, PL.elig, s);
+                    tracked_lanes_(w, w.lanes, W, real, vec, s0);
                     job.tr = w.tjobs.data();
                 }
                 block_for_(job, blkT);
@@ -2736,14 +2762,280 @@ private:
                 job.best = best.data();
                 run_inter_score_(K, job);
                 for (size_t l = 0; l < real; ++l) {
-                    const size_t i = PL.elig[s + l];
+                    const size_t i = ids[l];
                     flags_[i] &= static_cast<uint8_t>(~kStored);
                     score_[i] = static_cast<double>(best[l]);
                     finish_(i, false, true);
                 }
+            };
+            for (size_t t; (t = idx.fetch_add(1, std::memory_order_relaxed)) < tasks; ) {
+                if (!inter) { own(t); continue; }
+                if (t < G8) {
+                    const auto [s, e] = P8->groups8[t];
+                    const size_t W = static_cast<size_t>(inter_w_(*Kp));
+                    const size_t* ids8 = P8->elig8.data() + s;
+                    const bool safe = inter8_safe_(ids8, e - s, c8);
+                    if (!safe && fail8() > max_fail) {   // predicted to overflow: the T kernel, W at a time
+                        for (size_t k = s; k < e; k += W) run16(P8->elig8, k, std::min(W, e - k));
+                        note8(inter8_fails_(ids8, e - s, c8), e - s);
+                        continue;
+                    }
+                    const size_t before = spill.size();
+                    run8_(ids8, e - s, c8, *Kp, spill, own);
+                    if (!safe) note8(spill.size() - before, e - s);
+                    while (spill.size() >= W) {   // a full group of re-runs
+                        run16(spill, spill.size() - W, W);
+                        spill.resize(spill.size() - W);
+                    }
+                    continue;
+                }
+                if (t >= G8 + G) { own(other[t - G8 - G]); continue; }
+                const auto [s, e] = groups[t - G8];
+                run16(elig, s, e - s);
+            }
+            // The last re-runs: a group if it fills one (inter_group_filled), else their own fills.
+            if (!spill.empty()) {
+                if (inter_group_filled(spill.size(), static_cast<size_t>(inter_w_(*Kp)))) run16(spill, 0, spill.size());
+                else for (size_t i : spill) own(i);
             }
         };
         run_workers_(tasks, worker);
+    }
+
+    // ── The inter-pair int8 score tier (inter8_kernel_impl.inl) ──────────────────
+    // A score-only call of an integer batch first runs its short pairs in groups of
+    // inter_w8 int8 lanes (twice int16's, four times int32's), proving each lane's score as
+    // the striped int8 tier does (score8_kernel_impl.inl): Local exact below 127, Global /
+    // Glocal exact above G - 128 with G = min(m, n) * smax_pos <= 126 required up front.
+    // A lane that fails runs again at T, in a group of the T kernel's width once a worker
+    // has gathered enough of them (else its own fill), so every score is the T kernel's
+    // integer.  Preconditions (else the call runs as before): an integer T, untracked, at
+    // most 8 letters, every substitution within [-127, 127], gaps >= 0 with go + ge <= 127
+    // per side, the level's kernel present; per pair: both lengths <= 127 (the kernel's
+    // lane compares are int8) and, Global / Glocal, the gain bound.  Gate inter_score_int8.
+    struct Inter8Call {
+        std::vector<int8_t> blk;
+        int8_t go_a = 0, ge_a = 0, go_b = 0, ge_b = 0;
+        int smax_pos = 0;
+        int lmin = 0;   // the largest min(m, n) a pair may have (Global / Glocal gain bound)
+    };
+    struct Inter8Plan {
+        const InterPlan* base = nullptr;   // the plan it splits, and that plan's identity
+        int base_backend = -1000, base_hb = -1; unsigned base_epoch = ~0u;
+        int lmin = -1;
+        std::vector<size_t> elig8, elig16, other;
+        std::vector<std::pair<size_t, size_t>> groups8, groups16;
+    };
+    Inter8Plan plan8_;
+    // The int8 predictor's fail fraction (score_only_), in 1/kFailQ, shared by the workers
+    // through std::atomic_ref (a plain int: the engine is moved, an atomic member cannot be).
+    static constexpr int kFailQ = 1 << 12;
+    int inter8_fail_q_ = 0;
+    static int inter8_mode_() noexcept {
+        const int64_t o = gate_override(Gate::InterScoreInt8);
+        if (o >= 0) return o >= 2 ? 2 : static_cast<int>(o);
+        static const int64_t v = env_nonneg_int("NWGRAD_INTER_INT8");
+        return v < 0 ? 1 : v >= 2 ? 2 : static_cast<int>(v);
+    }
+    // The call's int8 parameters, or false (the tier does not apply).
+    bool inter8_call_(const InterPlan& PL, Inter8Call& c) const {
+        if constexpr (!nw_is_int<T>) { (void)PL; (void)c; return false; }
+        else {
+            const int mode = inter8_mode_();
+            if (mode == 0 || (mode == 1 && !kInter8Default)) return false;
+            if (PL.backend < 0 || tracked_ || grad_mode_ != GradMode::None || alpha_->size() > 8) return false;
+            const LevelKernels& K = level_kernels(PL.backend);
+            if (!K.inter_score_i8 || !has_inter_score_(K) || !linear_fill_ok_(K)) return false;
+            const AlignParams& P = params_->p;
+            if (P.num_sets() != 1) return false;
+            auto i8 = [](double v, int lo, int hi, int& out) {
+                if (!(v >= lo && v <= hi) || v != std::floor(v)) return false;
+                out = static_cast<int>(v); return true;
+            };
+            const size_t nn = static_cast<size_t>(P.matrix.size()) * P.matrix.size();
+            c.blk.resize(nn);
+            int smax = 0;
+            for (size_t k = 0; k < nn; ++k) {
+                int v;
+                if (!i8(P.matrix.data()[k], -127, 127, v)) return false;
+                c.blk[k] = static_cast<int8_t>(v);
+                smax = std::max(smax, v);
+            }
+            constexpr bool lin = GM == GapModel::Linear;
+            int goa = 0, gob = 0, gea, geb;
+            if (!lin && (!i8(P.gap_open_a, 0, 127, goa) || !i8(P.gap_open_b, 0, 127, gob))) return false;
+            if (!i8(P.gap_extend_a, 0, 127, gea) || !i8(P.gap_extend_b, 0, 127, geb)) return false;
+            if (goa + gea > 127 || gob + geb > 127) return false;
+            c.go_a = static_cast<int8_t>(goa); c.ge_a = static_cast<int8_t>(gea);
+            c.go_b = static_cast<int8_t>(gob); c.ge_b = static_cast<int8_t>(geb);
+            c.smax_pos = smax;
+            c.lmin = (AM == AlignMode::Local || smax == 0) ? 127 : std::min(127, 126 / smax);
+            return true;
+        }
+    }
+    // Gate value 1 (the default): on in every mode.  Instructions per pair, tier on / off,
+    // miRNA 22 x 50 score only, wloczykij sse4, 1 thread (A/A 0.91-1.07): int16 affine
+    // Global / Local / Glocal 0.51-0.53 / 0.47-0.49 / 0.48-0.54, linear 0.48-0.61; int32
+    // 0.22-0.28.  Where every lane overflows (Local match 8; Global unrelated, go 10 /
+    // ge 3), the predictor keeps it at 0.99-1.015 (1.22-1.51 without one).
+    // AArch64: off, as the per-pair int8 tier (kScoreInt8Default): that kernel lost to int16 on
+    // spot (M1) and this one is untimed there.
+    static constexpr bool kInter8Default = kInterScoreInt8Default;
+    // plan8_ for this call (rebuilt when PL or the length bound changed), or nullptr.
+    const Inter8Plan* ensure_plan8_(const InterPlan& PL, Inter8Call& c) {
+        if (!inter8_call_(PL, c)) return nullptr;
+        Inter8Plan& P = plan8_;
+        if (P.base == &PL && P.base_backend == PL.default_backend && P.base_hb == PL.hb_cutoff &&
+            P.base_epoch == PL.gate_epoch && P.lmin == c.lmin) return &P;
+        P = Inter8Plan{};
+        P.base = &PL; P.base_backend = PL.default_backend; P.base_hb = PL.hb_cutoff;
+        P.base_epoch = PL.gate_epoch; P.lmin = c.lmin;
+        const LevelKernels& K = level_kernels(PL.backend);
+        struct Key { size_t len_b, len_a, i; };
+        std::vector<Key> k8, k16;
+        for (size_t i : PL.elig) {
+            const size_t la = len_a(i), lb = len_b(i);
+            if (std::max(la, lb) <= 127 && std::min(la, lb) <= static_cast<size_t>(c.lmin)) k8.push_back({lb, la, i});
+            else k16.push_back({lb, la, i});
+        }
+        auto by_len = [](const Key& x, const Key& y) {
+            if (x.len_b != y.len_b) return x.len_b < y.len_b;
+            if (x.len_a != y.len_a) return x.len_a < y.len_a;
+            return x.i < y.i;
+        };
+        // ensure_plan_'s grouping: len B runs cut every W and where ragged_ok() fails.
+        auto group = [&](std::vector<Key>& keys, size_t W, std::vector<size_t>& elig,
+                         std::vector<std::pair<size_t, size_t>>& groups, auto&& reject) {
+            std::sort(keys.begin(), keys.end(), by_len);
+            for (size_t s = 0; s < keys.size();) {
+                size_t e = s + 1;
+                while (e < keys.size() && e - s < W && ragged_ok(keys[s].len_b, keys[e].len_b)) ++e;
+                if (inter_group_filled(e - s, W)) {
+                    groups.emplace_back(elig.size(), elig.size() + (e - s));
+                    for (size_t k = s; k < e; ++k) elig.push_back(keys[k].i);
+                } else {
+                    for (size_t k = s; k < e; ++k) reject(keys[k]);
+                }
+                s = e;
+            }
+        };
+        group(k8, static_cast<size_t>(K.inter_w8), P.elig8, P.groups8, [&](const Key& k) { k16.push_back(k); });
+        group(k16, static_cast<size_t>(inter_w_(K)), P.elig16, P.groups16, [&](const Key& k) { P.other.push_back(k.i); });
+        P.other.insert(P.other.end(), PL.other.begin(), PL.other.end());
+        return &P;
+    }
+    // The fail fraction above which a group skips its int8 run, per int8 lane count.  An
+    // int8 group costs r of the T kernel and each failed lane re-runs at about k: break-even
+    // at f = (1 - r) / k.  SSE4 (16 lanes; wloczykij instructions, related DNA L100 Local,
+    // the fail fraction swept by mutation): r = 0.44-0.45, f 0.07 / 0.28 / 0.39 / 0.97 read
+    // 0.48-0.53 / 0.73 / 0.93 / 1.01-1.03 (k ~ 1.0-1.2): break-even ~0.45 -> 0.4 (0.3 gave
+    // up the gain at f 0.28-0.39: 0.84 / 1.02).  At 64 lanes (solace AVX-512) the tier's own
+    // gain is smaller (unrelated DNA L100 int16 0.89), and related DNA L100 Local read
+    // 1.12-1.15 with the old 1/2 -> 0.08.  32 lanes (AVX2, nighthaven): no loss seen under
+    // 1/2, unswept -> 0.3.
+    static double inter8_max_fail_(int w8) noexcept {
+        return w8 <= 16 ? 0.4 : w8 <= 32 ? 0.3 : 0.08;
+    }
+    // Local: no lane of the group can reach 127 (smax_pos * min(m, n) < 127), so its int8
+    // run cannot fail -- miRNA x site at match 2 (44) never consults the predictor.
+    bool inter8_safe_(const size_t* ids, size_t real, const Inter8Call& c) const {
+        if (AM != AlignMode::Local) return false;
+        for (size_t l = 0; l < real; ++l)
+            if (static_cast<long long>(std::min(len_a(ids[l]), len_b(ids[l]))) * c.smax_pos >= 127) return false;
+        return true;
+    }
+    // How many of ids[0..real), already scored at T, the int8 test would have refused:
+    // Local a score >= 127, Global / Glocal a score <= G - 128 (exact both ways: see
+    // inter8_kernel_impl.inl's head).
+    size_t inter8_fails_(const size_t* ids, size_t real, const Inter8Call& c) const {
+        size_t f = 0;
+        for (size_t l = 0; l < real; ++l) {
+            const size_t i = ids[l];
+            const double v = score_[i];
+            const long long g = static_cast<long long>(std::min(len_a(i), len_b(i))) * c.smax_pos;
+            f += AM == AlignMode::Local ? v >= 127.0 : v <= static_cast<double>(g - 128);
+        }
+        return f;
+    }
+    // One int8 group: ids[0..real); proven lanes scored, the rest appended to `spill`.
+    template <class Own>
+    void run8_(const size_t* ids, size_t real, const Inter8Call& c, const LevelKernels& K,
+               std::vector<size_t>& spill, Own&& own) {
+        struct alignas(64) Blk { int8_t v[64]; };
+        static thread_local std::vector<Blk> rows;
+        static thread_local std::vector<const unsigned char*> a, b;
+        static thread_local std::vector<int> m, nb;
+        static thread_local std::vector<int8_t> best;
+        const int W = K.inter_w8;
+        a.assign(W, nullptr); b.assign(W, nullptr); m.assign(W, 0); nb.assign(W, 0); best.assign(W, 0);
+        int M = 0, n = 0;
+        bool ragged = false;
+        for (int l = 0; l < W; ++l) {
+            const size_t i = ids[std::min<size_t>(l, real - 1)];
+            a[l] = codes_a(i).data(); b[l] = codes_b(i).data();
+            m[l] = static_cast<int>(len_a(i));
+            nb[l] = static_cast<int>(len_b(i));
+            M = std::max(M, m[l]);
+            n = std::max(n, nb[l]);
+            ragged |= nb[l] != nb[0];
+        }
+        // the T kernel's own short-pair gate, at int16's caps (the int8 kernel's are unmeasured)
+        if (!inter_score_ok<int16_t>(alpha_->size(), M, n, GM == GapModel::Affine, AM == AlignMode::Local, s_.n_threads == 1, K.level)) {
+            for (size_t l = 0; l < real; ++l) own(ids[l]);
+            return;
+        }
+        InterJobT<int8_t> job{};
+        job.a = a.data(); job.m = m.data(); job.b = b.data(); job.n = n; job.M = M;
+        job.align_mode = (AM == AlignMode::Local) ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
+        job.linear = GM == GapModel::Linear ? 1 : 0;
+        if (ragged) job.nb = nb.data();
+        job.blk = c.blk.data(); job.nalpha = static_cast<int>(alpha_->size());
+        job.go_a = c.go_a; job.ge_a = c.ge_a; job.go_b = c.go_b; job.ge_b = c.ge_b;
+        const size_t row = (static_cast<size_t>(n + 1) * W + sizeof(Blk) - 1) / sizeof(Blk);
+        if (rows.size() < 2 * row) rows.resize(2 * row);
+        job.VM = rows[0].v; job.VX = rows[row].v;
+        job.best = best.data();
+        K.inter_score_i8(job);
+        for (size_t l = 0; l < real; ++l) {
+            const size_t i = ids[l];
+            const int v = best[l];
+            const int g = std::min(m[l], nb[l]) * c.smax_pos;
+            if (AM == AlignMode::Local ? v >= 127 : v <= g - 128) { spill.push_back(i); continue; }
+            flags_[i] &= static_cast<uint8_t>(~kStored);
+            score_[i] = static_cast<double>(v);
+            finish_(i, false, true);
+        }
+    }
+
+    // A score-only group the per-pair int8 tier (Aligner::score_i8_) would take instead: its
+    // own fills then.  The shared kernel holds one pair per lane of T; the int8 striped
+    // kernel 16-64 cells of one pair, so for long rows it wins: solace (AVX-512) DNA L1000
+    // Local int32, 48 unrelated pairs, the shared route (small alphabets have no cell cap
+    // there) read 1.01 of main while fill="striped" (own fills, int8) read 0.37-0.40.  Only
+    // where the tier would run (gate 1, Local, untracked, the params within its
+    // preconditions, the thread's predictor not expecting an overflow) and every pair's row
+    // is at least max(16, score_int8_min_segs) int8 segments: shorter groups stay shared
+    // (they are what the shared kernel is for, and an int8 form of it is a separate tier).
+    template <class Al>
+    bool int8_own_(int backend, const int* nb, int real, const Al&) const {
+        if constexpr (!nw_is_int<T> || AM != AlignMode::Local) {
+            (void)backend; (void)nb; (void)real; return false;
+        } else {
+            if (tracked_ || backend < 0 || !Al::int_narrow_env() || score_int8_mode() != 1) return false;
+            if (!level_kernels(backend).score_i8 || Al::score8_tl().last_over) return false;
+            const NwIntBound<T>& ib = params_->ib;
+            if (!ib.prepared() || ib.smax_pos > T(127) || ib.smax_neg > T(127)) return false;
+            const AlignParams& p = params_->p;
+            const bool lin = GM == GapModel::Linear;
+            const double goa = lin ? 0.0 : p.gap_open_a, gob = lin ? 0.0 : p.gap_open_b;
+            if (!(goa >= 0 && gob >= 0 && p.gap_extend_a >= 0 && p.gap_extend_b >= 0 &&
+                  goa + p.gap_extend_a <= 127 && gob + p.gap_extend_b <= 127)) return false;
+            const int W = score_int8_lanes(backend);
+            const int segs = std::max(16, score_int8_min_segs(W, lin, static_cast<int>(alpha_->size())));
+            for (int l = 0; l < real; ++l)
+                if ((nb[l] + W - 1) / W < segs) return false;
+            return true;
+        }
     }
 
     void score_and_grad_dynamic_(bool keep) {
