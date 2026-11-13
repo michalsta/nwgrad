@@ -2742,16 +2742,12 @@ private:
                     n = std::max(n, nb[l]);
                     ragged |= nb[l] != nb[0];
                 }
-<<<<<<< HEAD
-                if (!inter_score_ok<T>(alpha_->size(), M, n, GM == GapModel::Affine, AM == AlignMode::Local, s_.n_threads == 1, PL.backend)) {   // short pairs only
-                    for (size_t l = 0; l < real; ++l) own(ids[l]);
-                    return;
-=======
+                // (int8_own_: a group of long rows the per-pair int8 tier would take; the
+                // int8 groups' pairs, <= 127 columns, are never that long)
                 if (!inter_score_ok<T>(alpha_->size(), M, n, GM == GapModel::Affine, AM == AlignMode::Local, s_.n_threads == 1, PL.backend) ||
                     int8_own_(PL.backend, nb.data(), static_cast<int>(real), w.full)) {   // short pairs only
-                    for (size_t l = 0; l < real; ++l) own(PL.elig[s + l]);
-                    continue;
->>>>>>> origin/proto/int8
+                    for (size_t l = 0; l < real; ++l) own(ids[l]);
+                    return;
                 }
                 InterJobT<T> job{};
                 job.a = a.data(); job.m = m.data(); job.b = b.data(); job.n = n; job.M = M;
@@ -2806,7 +2802,6 @@ private:
         run_workers_(tasks, worker);
     }
 
-<<<<<<< HEAD
     // ── The inter-pair int8 score tier (inter8_kernel_impl.inl) ──────────────────
     // A score-only call of an integer batch first runs its short pairs in groups of
     // inter_w8 int8 lanes (twice int16's, four times int32's), proving each lane's score as
@@ -3011,7 +3006,7 @@ private:
             finish_(i, false, true);
         }
     }
-=======
+
     // A score-only group the per-pair int8 tier (Aligner::score_i8_) would take instead: its
     // own fills then.  The shared kernel holds one pair per lane of T; the int8 striped
     // kernel 16-64 cells of one pair, so for long rows it wins: solace (AVX-512) DNA L1000
@@ -3042,7 +3037,6 @@ private:
             return true;
         }
     }
->>>>>>> origin/proto/int8
 
     void score_and_grad_dynamic_(bool keep) {
         const size_t N = size();
