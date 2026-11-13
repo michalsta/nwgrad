@@ -399,3 +399,27 @@ Tracks landed on branch `tracks` (2026-10-11; see AGENTS.md, "Tracks").  Deferre
   sensitive).  12 threads: 1.01.
 - **Tracked Hirschberg builds each row's profile as it sweeps** (no shared profile): one
   gather per cell.  A compact profile per block would help when rows share sets.
+
+## Persistent worker pool (PR #47, branch `proto/thread-pool`): held back (2026-11-10)
+
+Multi-threaded calls run on a process-wide pool of persistent workers instead of
+spawning and joining threads per call (`run_workers_guarded`, `parallel.hpp`). Tested
+(full suite, ThreadSanitizer on a micro-test, fork, nested and concurrent calls,
+bit-identical to spawn) but held back by the owner; return to it much later.
+
+Measured on wloczykij (sse4, instruction counts; no wall clock yet): miRNA int16 hard,
+16 pairs at 4-16 threads: kernel instructions 15k vs 55k, CPU 80 vs 180-210 us, but
+user instructions +6 % (the caller's wait spin); 256 pairs at 16 threads: kernel 186k
+vs 1155k, CPU 1146 vs 2007 us; 4000 pairs: no difference.
+
+Open before it can go in:
+- Address space: each long-lived worker keeps a glibc malloc arena (a 64 MB virtual
+  reservation) and its 8 MB stack. 63 workers + numpy's threads took the process from
+  4.3 to 7.6 GB of virtual memory (RSS +3 MB). Harmless without a limit, but under
+  `ulimit -v` / RLIMIT_AS (some HPC schedulers) allocations fail. Options: document
+  (`NWGRAD_THREAD_POOL=0`, `MALLOC_ARENA_MAX`), smaller worker stacks, or skip the
+  pool when an address-space limit is set. `mallopt` from a library is not an option
+  (it changes malloc for the whole process).
+- The +6 % user instructions on small calls: measure wall clock on nighthaven,
+  solace and spot (pool vs `NWGRAD_THREAD_POOL=0` vs main) before deciding.
+- Windows: no fork handler; the path is untested at runtime there.
