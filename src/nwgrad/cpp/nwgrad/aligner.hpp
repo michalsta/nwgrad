@@ -713,6 +713,10 @@ struct Aligner {
     // Whether the last Viterbi run took the Grid traceback (tests: Grid falls back to
     // Pointers silently where it does not apply, with the same result).
     bool ran_grid() const noexcept { return grid_; }
+    // Tests: Grid's base-block size (cells; blocks above it are gridded again) and its fill
+    // (min_seg: the striped block from that many segments, 1 = always, -1 = the scalar block).
+    void set_grid_base(long long cells, int min_seg) noexcept { grid_base_cells_ = cells; grid_base_min_seg_ = min_seg; }
+    long grid_striped_blocks() const noexcept { return grid_striped_blocks_; }   // striped base blocks run, ever
     // Rows per block at which the Hirschberg recursion stops splitting and solves
     // outright — see hb_cutoff_.  Unlike set_traceback this is safe to change between
     // runs: it alters how the DP divides, not what it retains.  It is a THREE-way knob
@@ -4319,6 +4323,23 @@ private:
     static constexpr long long kGridBase = 64 * 64;   // long long: `long` is 32-bit on Windows (LLP64)
     static constexpr int  kGridMin = 8;      // rows / columns per block, at least
     static constexpr int  kGridDepth = 64;   // recursion levels (never reached: ~log_k(m))
+    // The striped base block from this many segments of W lanes (fewer: the scalar block).
+    static constexpr int  kGridBaseMinSeg = 2;
+    long long grid_base_cells_ = kGridBase;     // set_grid_base (tests: small blocks)
+    long grid_striped_blocks_ = 0;
+    int grid_base_w_ = 0;                       // the striped block's W, once known (per problem)
+    int grid_base_min_seg_ = grid_base_min_seg_env_();   // -1: scalar always
+    // NWGRAD_GRID_BASE: unset = the switch above, "scalar" = the scalar block always,
+    // "striped" = the striped block at any width (one segment up) -- for measuring.
+    static int grid_base_min_seg_env_() {
+        static const int v = [] {
+            const char* e = std::getenv("NWGRAD_GRID_BASE");
+            if (!e) return kGridBaseMinSeg;
+            const std::string_view s(e);
+            return s == "scalar" ? -1 : s == "striped" ? 1 : kGridBaseMinSeg;
+        }();
+        return v;
+    }
 
     struct GridLine {                        // value(s, idx) = p[s*ss + idx*es]
         const T* p; std::size_t ss, es;
@@ -4361,6 +4382,7 @@ private:
         grid_end_ = n_;
         grid_pick_end_ = AM == AlignMode::Glocal;   // the end column comes from row m
         grid_stop_ = false;
+        grid_base_w_ = 0;
         grid_find_best_ = false; grid_empty_ = false; grid_end_i_ = -1;
         if constexpr (AM == AlignMode::Local) {
             // Every gap parameter >= 0 and a top level above the base size: the top level's
@@ -4418,16 +4440,16 @@ private:
         grid_ = true;
     }
 
-    // A rectangle of h x w cells runs the grid kernel (else the scalar base block).
-    static bool grid_splits_(int h, int w) noexcept {
-        return !(static_cast<long long>(h) * w <= kGridBase || h < 2 * kGridMin || w < 2 * kGridMin);
+    // A rectangle of h x w cells runs the grid kernel (else the base block).
+    bool grid_splits_(int h, int w) const noexcept {
+        return !(static_cast<long long>(h) * w <= grid_base_cells_ || h < 2 * kGridMin || w < 2 * kGridMin);
     }
 
     void grid_solve(DpBuffer& buf, const LevelKernels& K, int r0, int c0, const GridLine& top,
                     const GridLine& left, int depth, int& i, int& j, int& st) {
         const int r1 = i, c1 = j, h = r1 - r0, w = c1 - c0;
         if (!grid_splits_(h, w) || depth + 1 >= kGridDepth) {
-            grid_base(buf, r0, r1, c0, c1, top, left, i, j, st);
+            grid_base(buf, K, r0, r1, c0, c1, top, left, i, j, st);
             return;
         }
         auto& L = buf.glv[static_cast<std::size_t>(depth)];
@@ -4480,10 +4502,82 @@ private:
         }
     }
 
-    // The base block: viterbi_affine_ptr's fill over [r0, r1] x [c0, c1] from its borders,
-    // then the walk from (i, j) until the top row or the left column.
-    void grid_base(DpBuffer& buf, int r0, int r1, int c0, int c1, const GridLine& top,
-                   const GridLine& left, int& i, int& j, int& st) {
+    // The base block: the Pointers fill over [r0, r1] x [c0, c1] from its borders, then the
+    // walk from (i, j) until the top row or the left column.  The leveled striped fill
+    // (grid_base_striped, grid_kernel_impl.inl) from kGridBaseMinSeg segments, else the
+    // scalar one below (viterbi_affine_ptr's expressions; also the reference the striped
+    // fill is tested against).  A linear Grid would add its own pair here, one state.
+    void grid_base(DpBuffer& buf, const LevelKernels& K, int r0, int r1, int c0, int c1,
+                   const GridLine& top, const GridLine& left, int& i, int& j, int& st) {
+        if (grid_base_striped_(buf, K, r0, r1, c0, c1, top, left, i, j, st)) return;
+        grid_base_scalar_(buf, r0, r1, c0, c1, top, left, i, j, st);
+    }
+
+    // The striped block (GridBaseJob); false when it declines (narrow, or no kernel).
+    bool grid_base_striped_(DpBuffer& buf, const LevelKernels& K, int r0, int r1, int c0, int c1,
+                            const GridLine& top, const GridLine& left, int& i, int& j, int& st) {
+        const auto fn = K.template of<T>().grid_base;
+        if (!fn || grid_base_min_seg_ < 0) return false;
+        // Declined widths skip the call: at L3000 most base blocks are a few columns wide
+        // (the second level's lines), one segment at int16, and need no job built.  W comes
+        // from the problem's first call (grid_base_w_, reset per problem: the level may
+        // change).  No row gate: striped from 1 / 4 / 8 / 16 rows measured within 1 % at
+        // L3000 and 4-6 % worse from 16 rows at L1000 (wloczykij sse4, instructions).
+        if (grid_base_w_ > 0 && (c1 - c0 + grid_base_w_ - 1) / grid_base_w_ < grid_base_min_seg_) return false;
+        GridBaseJob<T> J{};
+        J.a = a_idx_.data(); J.b = b_idx_.data(); J.blk = blkT_; J.nalpha = nalpha_;
+        J.go_a = static_cast<T>(params_->gap_open_a); J.ge_a = static_cast<T>(params_->gap_extend_a);
+        J.go_b = static_cast<T>(params_->gap_open_b); J.ge_b = static_cast<T>(params_->gap_extend_b);
+        J.r0 = r0; J.r1 = r1; J.c0 = c0; J.c1 = c1;
+        J.top = top.p; J.top_ss = top.ss; J.top_es = top.es;
+        J.left = left.p; J.left_ss = left.ss; J.left_es = left.es;
+        J.buf = &buf;
+        J.local = AM == AlignMode::Local ? 1 : 0;
+        J.sat = sat_;
+        J.min_seg = grid_base_min_seg_;
+        if (st < 0) J.last = &buf.glast3;   // the end cell's row (Glocal: its column too)
+        fn(J);
+        grid_base_w_ = J.W;
+        if (!J.done) return false;
+        ++grid_striped_blocks_;
+        const int W = J.W, seg = J.seg;
+        const std::size_t sw = static_cast<std::size_t>(seg) * static_cast<std::size_t>(W);
+        if (st < 0) {
+            const std::size_t w1 = static_cast<std::size_t>(c1 - c0) + 1;
+            const T* lr = buf.glast3.data();
+            if (grid_pick_end_) {   // Glocal, the whole problem one block: row m's first best column
+                int bj = c0; T best = std::max({lr[0], lr[w1], lr[2 * w1]});
+                for (int jj = c0 + 1; jj <= c1; ++jj) {
+                    const std::size_t c = static_cast<std::size_t>(jj - c0);
+                    const T v = std::max({lr[c], lr[w1 + c], lr[2 * w1 + c]});
+                    if (v > best) { best = v; bj = jj; }
+                }
+                j = bj; grid_end_ = bj; grid_pick_end_ = false;
+            }
+            // the end cell (m, n): its argmax and the score, as viterbi_affine_ptr
+            const std::size_t c = static_cast<std::size_t>(j - c0);
+            const T vm = lr[c], vx = lr[w1 + c], vy = lr[2 * w1 + c];
+            viterbi_score_ = std::max({vm, vx, vy});
+            st = (vm >= vx && vm >= vy) ? 0 : (vx >= vy ? 1 : 2);
+            best_tbl_ = st == 0 ? TBTable::M : (st == 1 ? TBTable::X : TBTable::Y);
+        }
+        const unsigned char* D = buf.gD.data();
+        while (i > r0 && j > c0) {
+            const int c = j - c0 - 1;
+            const unsigned char code = D[static_cast<std::size_t>(i - r0 - 1) * sw
+                                         + static_cast<std::size_t>(c % seg) * W + static_cast<std::size_t>(c / seg)];
+            if (AM == AlignMode::Local && st == 0 && (code & 3) == 3) { grid_stop_ = true; break; }   // a start
+            hops_.push_back(static_cast<unsigned char>(st));
+            if (st == 0)      { st = code & 3; --i; --j; }
+            else if (st == 1) { st = (code >> 2) & 3; --i; }
+            else              { st = (code >> 4) & 3; --j; }
+        }
+        return true;
+    }
+
+    // The scalar block: viterbi_affine_ptr's fill and pick.
+    void grid_base_scalar_(DpBuffer& buf, int r0, int r1, int c0, int c1, const GridLine& top,
+                           const GridLine& left, int& i, int& j, int& st) {
         const T go_a = static_cast<T>(params_->gap_open_a), ge_a = static_cast<T>(params_->gap_extend_a);
         const T go_b = static_cast<T>(params_->gap_open_b), ge_b = static_cast<T>(params_->gap_extend_b);
         const std::size_t bw = static_cast<std::size_t>(c1 - c0) + 1, sz = (static_cast<std::size_t>(r1 - r0) + 1) * bw;

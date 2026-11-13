@@ -1416,6 +1416,49 @@ really takes (`test_tracked_long_global_float32_pairs_run_their_own_fill`).  fuz
   regimes, every backend here, `ran_grid()` per type; integer `auto` routing),
   `tests/Python/test_grid.py` (every mode x integer type through the batch, `auto`).
 
+**Grid's base block, striped (branch `proto/grid-base-simd`, 2026-11-10).**  `grid_base`
+re-filled every base rectangle with the scalar Pointers fill (a loop-carried Y, three code
+arrays, ~27 instructions a cell): at int16 L1000 it cost about as much as the whole forward.
+Now `grid_base_striped` (grid_kernel_impl.inl, leveled; `TypedKernels::grid_base`,
+`GridBaseJob`) runs `striped_affine_full_ptr`'s recurrence over the rectangle, as
+`hb_base_striped` does for Hirschberg, with Grid's borders: row r0 from the top line, column
+c0 of each row from the left line -- its M / X / Y the next row's diagonal shift-in, its open
+(with its code) and its Y - ge_a (the extension seed: `int_pmax_carry`'s bY, the floating
+carry's lane-0 prev) entering Y's carry.  Packed striped codes in `buf.gD`; the walk reads
+them; `last` (row r1, three states) gives the end cell's argmax and Glocal's end column.
+Every type (float32 / double / int16 both regimes / int32 / int64), every mode, every level.
+- **Switch:** `kGridBaseMinSeg` = 2 segments (narrower blocks keep the scalar fill, which stays
+  the reference; once W is known the call is skipped).  `NWGRAD_GRID_BASE=scalar|striped`
+  forces either (measuring); `Aligner::set_grid_base(cells, min_seg)` sets the block size and
+  fill (tests).  A linear Grid would add its own pair beside it (one state).
+- **Exact:** same expressions, picks and association as the Pointers kernel, so each code is
+  Pointers'.  `test_grid.cpp` "striped base block ... at block edges": blocks of 1..4096 cells,
+  B of 1 column to a few vectors, the end cell in the first / last block, striped forced and
+  scalar forced, every type x mode; plus int16 saturating.  wloczykij (scalar, sse2, sse4): the
+  C++ suite 209 cases pass, `[grid]` at NWGRAD_GRID_FUZZ=200 11.3 M assertions pass,
+  test_grid.py 47 passed at each level.  AVX2 / AVX-512 / NEON compile (CI), untested at runtime.
+- **Measured** (wloczykij sse4, instructions per cell by differencing rep counts, hard path,
+  1 thread, `traceback="grid"`; scalar fill -> striped, A/A of the striped arm in brackets):
+
+  | | protein L1000 | DNA L1000 | protein L3000 | DNA L3000 |
+  |---|---|---|---|---|
+  | int16 Global | 8.74 -> 6.26 (6.28) | 8.52 -> 5.94 (5.95) | out of int16 range | 5.03 -> 5.16 (5.16)* |
+  | int16 Local | 10.05 -> 7.56 (7.57) | 9.79 -> 7.22 (7.17) | out of range | 6.34 -> 6.42 (6.30) |
+  | int32 Global | 12.39 -> 10.64 (10.73) | 12.08 -> 10.38 (10.36) | 9.48 -> 9.42 (9.38) | 9.45 -> 9.30 (9.32) |
+  | int32 Local | 14.91 -> 13.04 (13.03) | 14.60 -> 12.60 (12.74) | 11.88 -> 11.76 (11.76) | 11.65 -> 11.63 (11.58) |
+  | float32 Global | 14.59 -> 13.64 (13.64) | 11.58 -> 10.46 (10.55) | 12.30 -> 12.35 (12.32) | 8.53 -> 8.53 (8.58) |
+  | float32 Local | 16.42 -> 15.37 (15.40) | 12.92 -> 11.67 (11.67) | 14.00 -> 13.82 (13.92) | 10.48 -> 10.38 (10.28) |
+
+  L1000: int16 0.72-0.75x, int32 0.86-0.87x, float32 0.90-0.94x of the scalar-base run
+  (the review's estimate: 8.8 -> ~6.2).  L3000: the base is ~3 % of the run, a wash (+-1 %).
+  (*) the scalar arm at DNA int16 L3000 Global was unstable (5.03, then two negative
+  differences); the striped arm repeated at 5.16-5.17.
+- **int16 Global gate (not changed; the owner's):** sse4, the same harness, instr/cell
+  `hirschberg_pmax` / Pointers / Grid-scalar-base / Grid-striped: protein L1000 12.83 / 11.22 /
+  8.74 / 6.26, DNA L1000 11.97 / 11.14 / 8.52 / 5.94, DNA L3000 11.83 / 10.85 / 5.03 / 5.16.
+  Grid now needs ~0.5x pmax's instructions (was ~0.7x).  `run_tb_` keeps int16 Global / Glocal
+  on pmax because Grid lost at 32 lanes (solace); that comparison must be re-run there.
+
 ### Linear gaps: Pointers and Hirschberg (2026-10-05)
 
 - **`traceback="pointers"` for linear** (`viterbi_linear_ptr`): one direction byte per
