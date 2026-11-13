@@ -2182,20 +2182,22 @@ private:
     // fill's max chose it, so both give the same walk, ties included.
     template <class Emit>
     void walk_linear(const DpBuffer& buf, Emit&& emit) const {
+        if constexpr (AM == AlignMode::Glocal)
+            if (!sg_is_glocal_()) { if (tr_) walk_linear_impl<true, true>(buf, emit); else walk_linear_impl<false, true>(buf, emit); return; }   // the other ends: runtime flags (SGR)
         if (tr_) walk_linear_impl<true>(buf, emit);
         else     walk_linear_impl<false>(buf, emit);
     }
     // Tr: read each row's extend (row_ge_b) rather than one hoisted value — a template
     // parameter, so the untracked walk is the code it always was.
-    template <bool Tr, class Emit>
+    template <bool Tr, bool SGR = false, class Emit>
     void walk_linear_impl(const DpBuffer& buf, Emit& emit) const {
         int i = (AM == AlignMode::Global) ? m_ : best_i_;
         int j = (AM == AlignMode::Global) ? n_ : best_j_;
         while (true) {
             if (i == 0 && j == 0) break;
             if constexpr (AM == AlignMode::Glocal) {   // the semi-global free starts
-                if (i == 0 && sg_bb_()) break;          // row 0 (glocal's)
-                if (j == 0 && sg_ab_()) break;          // column 0
+                if (i == 0 && sgt_bb_<SGR>()) break;          // row 0 (glocal's)
+                if (j == 0 && sgt_ab_<SGR>()) break;          // column 0
             }
             int k;
             if (pointers_) {
@@ -2305,7 +2307,19 @@ private:
     // "A"*22 vs "C"*87 at band<=32).  At a border only one move is legal; forcing it is
     // what a well-formed DP would have chosen anyway.
     template <class Emit>
+    void walk_affine_sgr_(const DpBuffer& buf, Emit& emit) const {
+        if (tr_) {
+            if (pointers_) walk_affine_impl<true, true, true>(buf, emit);
+            else           walk_affine_impl<false, true, true>(buf, emit);
+        } else {
+            if (pointers_) walk_affine_impl<true, false, true>(buf, emit);
+            else           walk_affine_impl<false, false, true>(buf, emit);
+        }
+    }
+    template <class Emit>
     void walk_affine(const DpBuffer& buf, Emit&& emit) const {
+        if constexpr (AM == AlignMode::Glocal)
+            if (!sg_is_glocal_()) { walk_affine_sgr_(buf, emit); return; }   // the other ends: runtime flags (SGR)
         if (tr_) {
             if (pointers_) walk_affine_impl<true, true>(buf, emit);
             else           walk_affine_impl<false, true>(buf, emit);
@@ -2317,7 +2331,7 @@ private:
 
     // Tr: each move reads the penalties of its own row (a gap in B the row it enters, a
     // gap in A the row it lies in); otherwise the four are hoisted, as they always were.
-    template <bool Ptr, bool Tr, class Emit>
+    template <bool Ptr, bool Tr, bool SGR = false, class Emit>
     void walk_affine_impl(const DpBuffer& buf, Emit& emit) const {
         auto from_code = [](unsigned char c) {
             return c == 1 ? TBTable::X : (c == 2 ? TBTable::Y : TBTable::M);
@@ -2346,12 +2360,12 @@ private:
                 }
             } else {
                 if (i == 0) {
-                    if constexpr (AM == AlignMode::Glocal) if (sg_bb_()) break;   // row 0: a free start
+                    if constexpr (AM == AlignMode::Glocal) if (sgt_bb_<SGR>()) break;   // row 0: a free start
                     for (; j > 0; --j) emit(TBTable::Y, 0, j, j == 1);
                     break;
                 }
                 if (j == 0) {
-                    if constexpr (AM == AlignMode::Glocal) if (sg_ab_()) break;   // column 0: a free start
+                    if constexpr (AM == AlignMode::Glocal) if (sgt_ab_<SGR>()) break;   // column 0: a free start
                     for (; i > 0; --i) emit(TBTable::X, i, 0, i == 1);
                     break;
                 }
@@ -2773,11 +2787,13 @@ private:
     // to "gap in A", and the returned path was not the one scored (-18.7 vs -7.9).
     // At T=double every cast here is the identity: results are unchanged bit for bit.
     void viterbi_linear(DpBuffer& buf) {
+        if constexpr (AM == AlignMode::Glocal)
+            if (!sg_is_glocal_()) { sat_dispatch_([&]<bool Tr, bool Sat>() { viterbi_linear_impl<Tr, Sat, true>(buf); }); return; }   // the other ends: runtime flags (SGR)
         sat_dispatch_([&]<bool Tr, bool Sat>() { viterbi_linear_impl<Tr, Sat>(buf); });
     }
     // Tr: each row's penalties and substitution row from the track arrays (the same
     // expressions with the row's values, so equal sets reproduce the untracked fill).
-    template <bool Tr, bool Sat>
+    template <bool Tr, bool Sat, bool SGR = false>
     void viterbi_linear_impl(DpBuffer& buf) {
         banded_fill(buf.H);
 
@@ -2794,13 +2810,13 @@ private:
                     for (int j = 1; j <= bj; ++j) at(buf.H, 0, j) = -static_cast<T>(j) * static_cast<T>(params_->gap_extend_a);
             }
             if constexpr (AM == AlignMode::Glocal) {
-                if (sg_bb_()) {   // row 0: a free start at any column
+                if (sgt_bb_<SGR>()) {   // row 0: a free start at any column
                     for (int j = 0; j <= n_; ++j) at(buf.H, 0, j) = 0.0;
                 } else {          // Global's chain along row 0
                     for (int j = 1; j <= bj; ++j)
                         at(buf.H, 0, j) = -static_cast<T>(j) * (Tr ? tgea_[0] : static_cast<T>(params_->gap_extend_a));
                 }
-                if (sg_ab_())     // column 0: a free start at any row
+                if (sgt_ab_<SGR>())     // column 0: a free start at any row
                     for (int i = 1; i <= m_; ++i) at(buf.H, i, 0) = 0.0;
             }
         } else {
@@ -2879,9 +2895,11 @@ private:
     // equality — so both pick the first largest.  Local: stop where the clamped value is
     // <= 0 (the H walk's stop test); borders stop (Local), go up / left (Global).
     void viterbi_linear_ptr(DpBuffer& buf) {
+        if constexpr (AM == AlignMode::Glocal)
+            if (!sg_is_glocal_()) { sat_dispatch_([&]<bool Tr, bool Sat>() { viterbi_linear_ptr_impl<Tr, Sat, true>(buf); }); return; }   // the other ends: runtime flags (SGR)
         sat_dispatch_([&]<bool Tr, bool Sat>() { viterbi_linear_ptr_impl<Tr, Sat>(buf); });
     }
-    template <bool Tr, bool Sat>
+    template <bool Tr, bool Sat, bool SGR = false>
     void viterbi_linear_ptr_impl(DpBuffer& buf) {
         const size_t st = stride_;
         const size_t dsz = static_cast<size_t>(m_ + 1) * st;
@@ -2894,16 +2912,16 @@ private:
         if constexpr (Tr) ge_a = tgea_[0];
         constexpr bool local = AM == AlignMode::Local;
         // row 0 a free start (Local, Glocal with a free B begin)
-        const bool free0 = AM == AlignMode::Local || (AM == AlignMode::Glocal && sg_bb_());
-        const bool free_col0 = AM == AlignMode::Glocal && sg_ab_();   // column 0 a free start
-        const bool sg_general = AM == AlignMode::Glocal && !sg_is_glocal_();
+        const bool free0 = AM == AlignMode::Local || (AM == AlignMode::Glocal && sgt_bb_<SGR>());
+        const bool free_col0 = AM == AlignMode::Glocal && sgt_ab_<SGR>();   // column 0 a free start
+        const bool sg_general = AM == AlignMode::Glocal && SGR;
         prev[0] = static_cast<T>(0); D[0] = 3;
         for (int j = 1; j <= n_; ++j) {
             prev[j] = free0 ? static_cast<T>(0) : -static_cast<T>(j) * ge_a;
             D[j] = free0 ? 3 : 2;
         }
         SgEnd sge;
-        if (sg_general && sg_ae_() && m_ > 0) sge.offer(0, n_, prev[n_], NINF(), NINF());
+        if (sg_general && sgt_ae_<SGR>() && m_ > 0) sge.offer(0, n_, prev[n_], NINF(), NINF());
         int bi = 0, bj = 0;   // locals: best_i_/best_j_ are members (see below)
         const int n = n_;     // ditto: a member bound is reloaded after every byte store
         T best_local = T(0);
@@ -2976,7 +2994,7 @@ private:
                 left = v;
             }
             if constexpr (local) bi = hit ? i : bi;   // hit stays 0 on the plain form
-            if (sg_general && sg_ae_() && i < m_) sge.offer(i, n_, cur[n_], NINF(), NINF());
+            if (sg_general && sgt_ae_<SGR>() && i < m_) sge.offer(i, n_, cur[n_], NINF(), NINF());
             std::swap(prev, cur);
         }
         best_i_ = bi; best_j_ = bj;
@@ -2984,7 +3002,7 @@ private:
             if (!sg_general) glocal_end_row_(prev);
             else {
                 const T ninf = NINF();
-                if (sg_be_()) { for (int j = 0; j <= n_; ++j) sge.offer(m_, j, prev[j], ninf, ninf); }
+                if (sgt_be_<SGR>()) { for (int j = 0; j <= n_; ++j) sge.offer(m_, j, prev[j], ninf, ninf); }
                 else          sge.offer(m_, n_, prev[n_], ninf, ninf);
                 sg_take_(sge);
             }
@@ -3077,9 +3095,11 @@ private:
     // walks column 0 and row 0 (X at (1,0) resolves to M, at (i>1,0) to X), and
     // those cells are border-initialised, never visited by the main loop.
     void viterbi_affine_ptr(DpBuffer& buf) {
+        if constexpr (AM == AlignMode::Glocal)
+            if (!sg_is_glocal_()) { sat_dispatch_([&]<bool Tr, bool Sat>() { viterbi_affine_ptr_impl<Tr, Sat, true>(buf); }); return; }   // the other ends: runtime flags (SGR)
         sat_dispatch_([&]<bool Tr, bool Sat>() { viterbi_affine_ptr_impl<Tr, Sat>(buf); });
     }
-    template <bool Tr, bool Sat>
+    template <bool Tr, bool Sat, bool SGR = false>
     void viterbi_affine_ptr_impl(DpBuffer& buf) {
         T go_a = static_cast<T>(params_->gap_open_a);
         T ge_a = static_cast<T>(params_->gap_extend_a);
@@ -3109,7 +3129,7 @@ private:
 
         // ── row 0 ────────────────────────────────────────────────────────────
         // Glocal with row 0 charged (the semi-global ends without a free B begin): Global's row.
-        const bool free_row0 = AM == AlignMode::Local || (AM == AlignMode::Glocal && sg_bb_());
+        const bool free_row0 = AM == AlignMode::Local || (AM == AlignMode::Glocal && sgt_bb_<SGR>());
         for (std::size_t j = 0; j <= static_cast<std::size_t>(n_); ++j) {
             if (free_row0) { pM[j] = 0; pX[j] = NINF(); pY[j] = NINF(); }
             else {
@@ -3122,10 +3142,10 @@ private:
             D[j] = (j <= 1 || free_row0) ? 3 : 3 | 2 << 4;
         }
         // Semi-global: column 0 a free start (A's prefix free); column n's cells ends.
-        const bool free_col0 = AM == AlignMode::Glocal && sg_ab_();
-        const bool sg_general = AM == AlignMode::Glocal && !sg_is_glocal_();
+        const bool free_col0 = AM == AlignMode::Glocal && sgt_ab_<SGR>();
+        const bool sg_general = AM == AlignMode::Glocal && SGR;
         SgEnd sge;
-        if (sg_general && sg_ae_() && m_ > 0) sge.offer(0, n_, pM[n_], pX[n_], pY[n_]);
+        if (sg_general && sgt_ae_<SGR>() && m_ > 0) sge.offer(0, n_, pM[n_], pX[n_], pY[n_]);
 
         best_i_ = 0; best_j_ = 0; best_tbl_ = TBTable::M;
         T best_local = static_cast<T>(0);
@@ -3177,7 +3197,7 @@ private:
             if constexpr (AM == AlignMode::Local)
                 if (rowmax > best_local) local_row_best_(cM, cX, cY, 1, rowmax, i, best_local);
             if constexpr (AM == AlignMode::Glocal)
-                if (sg_general && sg_ae_() && i < m_) sge.offer(i, n_, cM[n_], cX[n_], cY[n_]);
+                if (sg_general && sgt_ae_<SGR>() && i < m_) sge.offer(i, n_, cM[n_], cX[n_], cY[n_]);
             std::swap(pM, cM); std::swap(pX, cX); std::swap(pY, cY);
         }
 
@@ -4675,9 +4695,11 @@ private:
     }
 
     double score_affine_scalar(DpBuffer& buf) const {
+        if constexpr (AM == AlignMode::Glocal)
+            if (!sg_is_glocal_()) { return sat_dispatch_([&]<bool Tr, bool Sat>() { return score_affine_scalar_impl<Tr, Sat, true>(buf); }); }   // the other ends: runtime flags (SGR)
         return sat_dispatch_([&]<bool Tr, bool Sat>() { return score_affine_scalar_impl<Tr, Sat>(buf); });
     }
-    template <bool Tr, bool Sat>
+    template <bool Tr, bool Sat, bool SGR = false>
     double score_affine_scalar_impl(DpBuffer& buf) const {
         T go_a = static_cast<T>(params_->gap_open_a);
         T ge_a = static_cast<T>(params_->gap_extend_a);
@@ -4692,9 +4714,9 @@ private:
         constexpr bool local = AM == AlignMode::Local;
         const T ninf = NINF();
         // row 0 a free start: Local, Glocal with a free B begin (sg_bb_)
-        const bool free0 = AM == AlignMode::Local || (AM == AlignMode::Glocal && sg_bb_());
-        const bool free_col0 = AM == AlignMode::Glocal && sg_ab_();
-        const bool col_end = AM == AlignMode::Glocal && sg_ae_();
+        const bool free0 = AM == AlignMode::Local || (AM == AlignMode::Glocal && sgt_bb_<SGR>());
+        const bool free_col0 = AM == AlignMode::Glocal && sgt_ab_<SGR>();
+        const bool col_end = AM == AlignMode::Glocal && sgt_ae_<SGR>();
         pM[0] = static_cast<T>(0); pX[0] = ninf; pY[0] = ninf;
         for (int j = 1; j <= n_; ++j) {
             pM[j] = free0 ? static_cast<T>(0) : ninf;
@@ -4744,16 +4766,18 @@ private:
         if constexpr (local) return static_cast<double>(best);
         else if constexpr (AM == AlignMode::Glocal) {   // the ends: row m (free B end) or (m, n), column n
             T b = std::max({pM[n_], pX[n_], pY[n_]});
-            if (sg_be_()) for (int j = 0; j < n_; ++j) b = std::max(b, std::max({pM[j], pX[j], pY[j]}));
+            if (sgt_be_<SGR>()) for (int j = 0; j < n_; ++j) b = std::max(b, std::max({pM[j], pX[j], pY[j]}));
             return static_cast<double>(std::max(b, colbest));
         }
         else return static_cast<double>(std::max({pM[n_], pX[n_], pY[n_]}));
     }
 
     double score_linear_scalar(DpBuffer& buf) const {
+        if constexpr (AM == AlignMode::Glocal)
+            if (!sg_is_glocal_()) { return sat_dispatch_([&]<bool Tr, bool Sat>() { return score_linear_scalar_impl<Tr, Sat, true>(buf); }); }   // the other ends: runtime flags (SGR)
         return sat_dispatch_([&]<bool Tr, bool Sat>() { return score_linear_scalar_impl<Tr, Sat>(buf); });
     }
-    template <bool Tr, bool Sat>
+    template <bool Tr, bool Sat, bool SGR = false>
     double score_linear_scalar_impl(DpBuffer& buf) const {
         T ge_a = static_cast<T>(params_->gap_extend_a);
         T ge_b = static_cast<T>(params_->gap_extend_b);
@@ -4763,9 +4787,9 @@ private:
         if (buf.qM.size() < w) buf.qM.resize(w);
         T* prev = buf.qM.data(); T* cur = buf.rM.data();
         constexpr bool local = AM == AlignMode::Local;
-        const bool free0 = AM == AlignMode::Local || (AM == AlignMode::Glocal && sg_bb_());
-        const bool free_col0 = AM == AlignMode::Glocal && sg_ab_();
-        const bool col_end = AM == AlignMode::Glocal && sg_ae_();
+        const bool free0 = AM == AlignMode::Local || (AM == AlignMode::Glocal && sgt_bb_<SGR>());
+        const bool free_col0 = AM == AlignMode::Glocal && sgt_ab_<SGR>();
+        const bool col_end = AM == AlignMode::Glocal && sgt_ae_<SGR>();
         prev[0] = static_cast<T>(0);
         for (int j = 1; j <= n_; ++j) prev[j] = free0 ? static_cast<T>(0) : -static_cast<T>(j) * ge_a;
         T colbest = col_end && m_ > 0 ? prev[n_] : NINF();   // semi-global: column n, rows < m
@@ -4806,7 +4830,7 @@ private:
         }
         if constexpr (AM == AlignMode::Glocal) {   // the ends: row m (free B end) or (m, n), column n
             T b = prev[n_];
-            if (sg_be_()) for (int j = 0; j < n_; ++j) b = std::max(b, prev[j]);
+            if (sgt_be_<SGR>()) for (int j = 0; j < n_; ++j) b = std::max(b, prev[j]);
             return static_cast<double>(std::max(b, colbest));
         }
         return local ? best : static_cast<double>(prev[n_]);
@@ -4831,9 +4855,11 @@ private:
     }
 
     void viterbi_affine(DpBuffer& buf) {
+        if constexpr (AM == AlignMode::Glocal)
+            if (!sg_is_glocal_()) { sat_dispatch_([&]<bool Tr, bool Sat>() { viterbi_affine_impl<Tr, Sat, true>(buf); }); return; }   // the other ends: runtime flags (SGR)
         sat_dispatch_([&]<bool Tr, bool Sat>() { viterbi_affine_impl<Tr, Sat>(buf); });
     }
-    template <bool Tr, bool Sat>
+    template <bool Tr, bool Sat, bool SGR = false>
     void viterbi_affine_impl(DpBuffer& buf) {
         band_fill(buf.VM, NINF());
         band_fill(buf.VX, NINF());
@@ -4866,14 +4892,14 @@ private:
                     at(buf.VY, 0, j) = -(go_a + static_cast<T>(j) * ge_a);
             }
             if constexpr (AM == AlignMode::Glocal) {
-                if (sg_bb_()) {   // row 0: a free start at any column
+                if (sgt_bb_<SGR>()) {   // row 0: a free start at any column
                     for (int j = 0; j <= n_; ++j) at(buf.VM, 0, j) = static_cast<T>(0);
                 } else {          // Global's Y chain along row 0
                     for (int j = 1; j <= bj; ++j)
                         at(buf.VY, 0, j) = Tr ? -(tgoa_[0] + static_cast<T>(j) * tgea_[0])
                                               : -(go_a + static_cast<T>(j) * ge_a);
                 }
-                if (sg_ab_())     // column 0: a free start at any row, no X chain
+                if (sgt_ab_<SGR>())     // column 0: a free start at any row, no X chain
                     for (int i = 1; i <= m_; ++i) { at(buf.VM, i, 0) = static_cast<T>(0); at(buf.VX, i, 0) = NINF(); }
             }
         } else {
@@ -4990,6 +5016,13 @@ private:
     bool sg_bb_() const noexcept { return AM == AlignMode::Glocal && (sg_ & kSgFreeBBegin); }
     bool sg_be_() const noexcept { return AM == AlignMode::Glocal && (sg_ & kSgFreeBEnd); }
     bool sg_is_glocal_() const noexcept { return AM != AlignMode::Glocal || sg_ == kSgGlocal; }
+    // The ends as the fills and walks read them: SGR (runtime ends, other than glocal's) the
+    // flags, else glocal's fixed at compile time.  The flags read at every step / row cost
+    // the glocal linear path 2-3 % on NEON (M1: miRNA, DNA L100) against main's constants.
+    template <bool SGR> bool sgt_ab_() const noexcept { if constexpr (SGR) return sg_ab_(); else return false; }
+    template <bool SGR> bool sgt_ae_() const noexcept { if constexpr (SGR) return sg_ae_(); else return false; }
+    template <bool SGR> bool sgt_bb_() const noexcept { if constexpr (SGR) return sg_bb_(); else return AM == AlignMode::Glocal; }
+    template <bool SGR> bool sgt_be_() const noexcept { if constexpr (SGR) return sg_be_(); else return AM == AlignMode::Glocal; }
     struct SgEnd {
         T best{}; int i = -1, j = 0; TBTable t = TBTable::M;
         void offer(int ci, int cj, T vm, T vx, T vy) noexcept {
