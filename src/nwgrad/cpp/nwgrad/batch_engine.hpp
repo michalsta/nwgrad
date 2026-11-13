@@ -1908,8 +1908,14 @@ private:
         if (gj.size() != len_a(i) + 1)
             throw std::logic_error("nwgrad: internal: guide of the wrong length");
         std::copy(gj.begin(), gj.end(), guide_ptr_(i));
-        flags_[i] &= static_cast<uint8_t>(~(kPending | kSnap));   // a stored guide is current
     }
+    // A soft pair's guide was just stored in the call and its forward-backward may still
+    // throw: drop a pending state left by an earlier call first, or settle_unfinished_
+    // would overwrite the new guide with the old snapshot's.  Only on the soft branches:
+    // in store_guide_ (every hard and path pair) this one byte store moved gcc's inlining
+    // of the traceback walk in score_and_grad_inter_'s worker, +1.7 % instructions on
+    // miRNA int32 affine Local paths (skynet-class sse4; solace AVX-512 +1.5-4.7 %).
+    void guide_current_(size_t i) noexcept { flags_[i] &= static_cast<uint8_t>(~(kPending | kSnap)); }
     // The stored path's writer: the walk's moves (last first, see NoMoves) as run-length
     // ops, written backward from `w`.  Why not the gapped strings: the path used to be
     // rendered by aligned() into two std::strings (a second traceback walk, a push_back
@@ -1983,6 +1989,7 @@ private:
         al.compute_viterbi(w.buf);
         guide_path_(i, al, w, keep);
         if (grad_mode_ == GradMode::Soft) {
+            guide_current_(i);
             fwdbwd_(i, al, w.buf);
             score_[i] = al.log_z();
         } else {
@@ -2163,8 +2170,10 @@ private:
             w.full.set_kernel(kernel_);
             problem_(w.full, i, o, 0, {});
             w.full.adopt_interleaved(w.buf, W, static_cast<int>(l), best[l], bi[l], bj[l], stride);
-            guide_path_(i, w.full, w, false);   // (store_guide_ clears kPending | kSnap)
-            flags_[i] &= static_cast<uint8_t>(~kStored);
+            // (guide_j_from_viterbi, as resolve_guide_: no new call site of the walk the
+            // hard path inlines)
+            store_guide_(i, w.full.guide_j_from_viterbi(w.buf));
+            flags_[i] &= static_cast<uint8_t>(~(kPending | kSnap | kStored));
         }
         return true;
     }
@@ -2228,6 +2237,7 @@ private:
             if (grad_mode_ == GradMode::Soft && soft) {
                 apply_soft_lane_(i, *soft);
             } else if (grad_mode_ == GradMode::Soft) {
+                guide_current_(i);
                 fwdbwd_(i, al, w.buf);
                 score_[i] = al.log_z();
                 grad_with_buf_(i, al, w);
