@@ -3364,7 +3364,20 @@ function's code is main's to the instruction, differing only in branch-alignment
 `ViterbiJob` offsets moved by `sg`.  Recount (13 vs 1 passes, release-wheel flags, -O3 -g1): new / main
 0.998-1.003 in every cell of global / local / glocal x affine / linear x hard / score, protein and DNA
 L300 / L1000, Local linear hard 0.999-1.000; A/A 0.997-1.002.  The lesson: no lambda that captures by
-reference in a kernel body, even an unused one.  Overlap (all four) / global 0.85-0.99, a_end
+reference in a kernel body, even an unused one.  **On NEON it was not enough** (spot M1, 15f23a4:
+Local linear float32 path / hard 1.018-1.020, glocal linear path miRNA 1.017-1.025, DNA L100
+1.013-1.032).  I cross-compiled the level units (aarch64 gcc 16.2.1, -O3, release-wheel flags) and
+compared them function by function with main: 300 of ~400 functions in `level_neon.o` differed
+structurally, untouched Hirschberg and grid kernels among them.  Bisected by file, the whole
+disturbance came from score_kernel_impl.inl: the fixed-end Glocal kernels called
+`sg_score_col0_only` (a new function with a `[&]` lambda) for n == 0, and every kernel computed the
+column-n index `coln` (two divisions) whether it used it or not.  Both are now in the runtime-ends
+instantiations only (fixed ends: `static_assert` glocal's), and `sg` sits last in `ViterbiJob` /
+`ScoreJob`, so the other members keep main's offsets.  Result: `striped_linear_entry` /
+`striped_linear_ptr_entry` (every T), `striped_full_ptr_entry` and the Hirschberg / grid kernels
+are main's instruction for instruction on NEON (341 identical, 25 differ in register names only);
+what differs is the score-only kernels (31, small: operand order, one spill) and a few affine
+Scores fills.  On x86 sse4 the same: 597 identical, the rest score-only kernels and one int64 Pointers fill.  Overlap (all four) / global 0.85-0.99, a_end
 0.99-1.04.
 
 **Tests** (`tests/Python/test_semiglobal.py`): a Python 3-state reference of the 4-flag
