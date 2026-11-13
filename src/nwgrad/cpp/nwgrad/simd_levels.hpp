@@ -390,6 +390,19 @@ struct HbBaseJob {
 // Templated on the precision T (double or float32); at float32 W is twice the double
 // lane count (LevelKernels::inter_w_f) and every value, border and comparison is in T,
 // bit-identical to the scalar float fill.
+// Alphabets over 8 letters (the gather lookup, inter_kernel_impl.inl): the cap on the bytes
+// of the per-lane query profile a group builds once (InterCommon::build_profile), past
+// which the rows are gathered lane-cell by lane-cell as before.  By default NONE: nothing
+// measured favours the gather.  nighthaven (AVX2), protein, A = 40 against long B, always-
+// profile vs the first 1 MiB cap: never slower; 1 thread float32 path B = 2000 / 3000 ~21 %
+// faster (where 1 MiB gathered), the gather at B = 1500 1.13-1.14x the profile; score-only,
+// int16 path, B = 6000 and every 6-thread cell: no effect (2026-11-11).  wloczykij sse4,
+// instructions, profile / gather: L1000 float32 path 0.59, L3000 float32 score 0.54.
+// Memory needs no cap either: the profile is (letters used <= M + 1) x n x W values, below
+// the group's own three (M + 1) x (n + 1) x W tables.  solace (AVX-512, W = 16 / 32) is
+// unmeasured.  The `inter_profile_bytes` gate sets a cap for A/B runs (0: always gather).
+// A new switch for a new code path, not a fill gate retuned.
+inline constexpr int64_t kInterProfileMaxBytes = INT64_MAX;
 template <class T>
 struct InterJobT {
     const unsigned char* const* a;   // W pointers to A's codes
@@ -420,6 +433,9 @@ struct InterJobT {
     // its own (rs into `blk`, which is then the stacked block; the four gap arrays; bx0).
     // The go_*/ge_* scalars above are then unused.  ra/crow are not read: no profile here.
     const TrackJob<T>* tr = nullptr;
+    // Untracked alphabets over 8 letters: build the per-lane profile when its bytes are
+    // <= prof_max (kInterProfileMaxBytes above: no cap by default; 0: never).
+    int64_t prof_max = kInterProfileMaxBytes;
 };
 using InterJob = InterJobT<double>;
 
@@ -606,7 +622,7 @@ enum class Gate : int {
     InterGroupBytes, InterSoftBytes, InterScoreGatherCells,
     InterLinearIntGatherCells, InterLinearF32GatherCells, InterLinearF64GatherCells,
     InterGlobalLinearIntCells, InterGlobalLinearF32Cells, LinearStripedMinN, SoftF32MinCells,
-    InterMinFill, SoftCkptRows, SoftCkptMinBytes, SoftDoubleFtz, Count_
+    InterMinFill, SoftCkptRows, SoftCkptMinBytes, SoftDoubleFtz, InterProfileBytes, Count_
 };
 inline constexpr const char* kGateNames[] = {
     "inter_group_bytes", "inter_soft_bytes", "inter_score_gather_cells",
@@ -614,7 +630,7 @@ inline constexpr const char* kGateNames[] = {
     "inter_linear_f64_gather_cells", "inter_global_linear_int_cells",
     "inter_global_linear_f32_cells", "linear_striped_min_n", "soft_f32_min_cells",
     "inter_min_fill", "soft_ckpt_rows", "soft_ckpt_min_bytes",
-    "soft_double_ftz"};
+    "soft_double_ftz", "inter_profile_bytes"};
 static_assert(sizeof(kGateNames) / sizeof(kGateNames[0]) == static_cast<size_t>(Gate::Count_));
 inline constexpr int64_t kGateUnset = -1;
 inline constexpr int64_t kGateOff = INT64_MAX;
@@ -671,6 +687,12 @@ inline bool soft_double_ftz() noexcept {
     if (o >= 0) return o != 0;
     static const int64_t v = env_nonneg_int("NWGRAD_SOFT_DOUBLE_FTZ");
     return v != 0;   // unset (-1): the default, on
+}
+// The per-lane profile's byte cap (kInterProfileMaxBytes, InterJobT::prof_max) with its
+// override: kGateOff (None) = no cap, 0 = always the gather.
+inline int64_t inter_profile_max() noexcept {
+    const int64_t o = gate_override(Gate::InterProfileBytes);
+    return o < 0 ? kInterProfileMaxBytes : o;
 }
 inline bool soft_ckpt_env_check() noexcept {
     static const bool v = [] { const char* e = std::getenv("NWGRAD_SOFT_CKPT_CHECK"); return e && *e && std::strcmp(e, "0") != 0; }();
