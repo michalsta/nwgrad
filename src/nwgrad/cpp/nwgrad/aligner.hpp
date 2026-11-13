@@ -1002,7 +1002,8 @@ struct Aligner {
             // (main's int16 batch shows it too); the code has no switch at these lengths, so
             // this is an empirical window, not a fix of its cause.  Exact either way (the
             // narrowed and the int32 kernel give the same score); Local and affine never lost.
-            if constexpr (std::is_same_v<N, std::int16_t> && GM == GapModel::Linear && AM == AlignMode::Global) {
+            // Glocal too: spot DNA L100 linear Glocal int32 score-only 1.041-1.047 narrowed.
+            if constexpr (std::is_same_v<N, std::int16_t> && GM == GapModel::Linear && AM != AlignMode::Local) {
                 constexpr int kSkipSegLo = 11, kSkipSegHi = 13;
                 const int seg16 = (n_ + 7) / 8;
                 if (seg16 >= kSkipSegLo && seg16 <= kSkipSegHi) return false;
