@@ -351,3 +351,260 @@ static void grid_fwd_entry(GridFwdJob<T>& J) {
 // The registered pointer: every scalar type (the integers since 2026-11-05).
 template <class T>
 constexpr typename TypedKernels<T>::grid_fn grid_fwd_ptr() { return &grid_fwd_entry<T>; }
+
+// ── The base block: the striped Pointers fill over a sub-rectangle ────────────────
+//
+// Aligner::grid_base re-fills each base rectangle (up to kGridBase cells) and walks its
+// codes.  Its scalar fill has a loop-carried Y and three code arrays: ~27 instructions a
+// cell, as much as the whole forward pass at int16 L1000 (the base was 45 % of an int16
+// Grid run there, perf).  This is striped_affine_full_ptr (kernels_pointers_impl.inl)
+// restricted to the rectangle, as hb_base_striped is for Hirschberg, with Grid's borders:
+//   * row r0 comes from the top line (three states per column), not row 0's closed form;
+//   * column c0 of row i comes from the left line: its M / X / Y are the diagonal operand
+//     of row i+1's first cell (shifted into lane 0, as the full kernel's bM / bX / bY),
+//     its open (max(M, X) - go_a) - ge_a enters Y's carry with its code (M wins ties),
+//     and its Y enters as Y(i, c0) - ge_a, the extension the scalar pick weighs.  (The
+//     full kernel's column 0 has Y = -inf, so it passes the sentinel there.)
+// Local's clamp (code 3) is the full kernel's.  Every other expression, comparison and
+// association is the full kernel's, so each re-filled cell has the full fill's value and
+// code -- the same argument as hb_base_striped and the Pointers kernel themselves (the
+// scalar block in aligner.hpp stays the reference, and the tests compare both to
+// Pointers).  Glocal's end column and the end cell's argmax read `last`.
+template <class T, bool Local, bool Sat>
+static void grid_base_striped(GridBaseJob<T>& J) {
+    using vd = stdx::native_simd<T>;
+    constexpr int W = (int)vd::size();
+    constexpr bool kOpenRows = nw_is_int<T> && W >= 4;   // see striped_affine_full_ptr
+    const T NINF = nw_ninf_s<T, Sat>;
+    const int h = J.r1 - J.r0, w = J.c1 - J.c0, nalpha = J.nalpha;
+    const int seg = (w + W - 1) / W;
+    J.W = W; J.seg = seg;
+    if (w <= 0 || h <= 0 || seg < J.min_seg) { J.done = 0; return; }
+    J.done = 1;
+    const std::size_t sw = (std::size_t)seg * W;
+    const T go_a = J.go_a, ge_a = J.ge_a, go_b = J.go_b, ge_b = J.ge_b;
+    DpBufferT<T>& buf = *J.buf;
+    auto top  = [&](int s, int jj) { return J.top[(std::size_t)s * J.top_ss + (std::size_t)jj * J.top_es]; };
+    auto left = [&](int s, int ii) { return J.left[(std::size_t)s * J.left_ss + (std::size_t)ii * J.left_es]; };
+
+    if (buf.gD.size() < (std::size_t)h * sw) buf.gD.resize((std::size_t)h * sw);
+    unsigned char* const D = buf.gD.data();
+    // six rolling rows, ov | ok | Q (integer T), the y-code and M+X-code scratch
+    std::size_t rs; T* const rows = spread_rows<T>(buf.prows, sw, 11, rs);
+    T* pM = rows + 3 * rs; T* pX = rows + 4 * rs; T* pY = rows + 5 * rs;   // row i-1
+    T* cM = rows;          T* cX = rows + rs;     T* cY = rows + 2 * rs;   // row i
+    T* ov = rows + 6 * rs;
+    T* ok = rows + 7 * rs;
+    T* qb = rows + 8 * rs;
+    T* yc = rows + 9 * rs;
+    T* mx = rows + 10 * rs;
+
+    // the profile rows of the letters this block meets, built on first use from the
+    // block's striped column symbols (one gather a slot; int16 by byte shuffles)
+    if (buf.gidx.size() < sw) buf.gidx.resize(sw);
+    striped_profile_index(buf.gidx.data(), J.b + J.c0, w, seg, W);
+    if (buf.gprof.size() < (std::size_t)nalpha * sw) buf.gprof.resize((std::size_t)nalpha * sw);
+    buf.gbuilt.assign((std::size_t)nalpha, 0);
+
+    // row r0 from the top line, striped; padding -inf
+    for (int l = 0; l < W; ++l)
+        for (int s = 0; s < seg; ++s) {
+            const int c = l * seg + s + 1;
+            const std::size_t k = (std::size_t)s * W + l;
+            if (c <= w) { pM[k] = top(0, c); pX[k] = top(1, c); pY[k] = top(2, c); }
+            else        { pM[k] = NINF; pX[k] = NINF; pY[k] = NINF; }
+        }
+    T bM = top(0, 0), bX = top(1, 0), bY = top(2, 0);   // column c0 of the row above
+
+    const vd vgo_a(go_a), vge_a(ge_a), vgo_b(go_b), vge_b(ge_b);
+    const vd vzero(T(0)), vone(T(1)), vtwo(T(2)), vthree(T(3));
+    const vd vfour(T(4)), veight(T(8)), vsixteen(T(16)), vthirtytwo(T(32));
+
+    for (int ii = 1; ii <= h; ++ii) {
+        const unsigned char ai = J.a[J.r0 + ii - 1];
+        T* const sub = buf.gprof.data() + (std::size_t)ai * sw;
+        if (!buf.gbuilt[ai]) {
+            buf.gbuilt[ai] = 1;
+            striped_profile_row_idx(sub, J.blk + (std::size_t)ai * nalpha, buf.gidx.data(), w, seg, W, nalpha);
+        }
+        unsigned char* const dP = D + (std::size_t)(ii - 1) * sw;
+        const T lM = left(0, ii), lX = left(1, ii), lY = left(2, ii);
+        const T nbOpen = nw_sub(nw_sub(std::max(lM, lX), go_a), ge_a);
+        const T nbOpenK = (nw_sub(nw_sub(lM, go_a), ge_a) >= nw_sub(nw_sub(lX, go_a), ge_a)) ? T(0) : T(16);
+
+        // the diagonal predecessors, rotated in registers (striped_affine_full_ptr)
+        vd dgM, dgX, dgY;
+        {
+            vd lMv, lXv, lYv;
+            lMv.copy_from(pM + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+            lXv.copy_from(pX + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+            lYv.copy_from(pY + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+            dgM = lane_shift_in(lMv, bM);
+            dgX = lane_shift_in(lXv, bX);
+            dgY = lane_shift_in(lYv, bY);
+        }
+        for (int s = 0; s < seg; ++s) {
+            vd sb; sb.copy_from(sub + (std::size_t)s * W, stdx::element_aligned);
+            const vd mx3 = stdx::max(stdx::max(dgM, dgX), dgY);
+            vd vmv = vadd<Sat>(mx3, sb);
+            vd km = vtwo;
+#if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
+            if constexpr (sizeof(T) == 8) {
+                km = avx512d_blend(avx512d_ge(dgX, dgY), km, vone);
+                km = avx512d_blend(avx512d_eq(mx3, dgM), km, vzero);
+            } else {
+                km = pick_code_mx(mx3, dgM, dgX, dgY, vzero, vone, vtwo);
+            }
+#else
+            km = pick_code_mx(mx3, dgM, dgX, dgY, vzero, vone, vtwo);
+#endif
+            if constexpr (Local) {
+                vmv = stdx::max(vmv, vzero);
+#if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
+                if constexpr (sizeof(T) == 8) {
+                    km = avx512d_blend(avx512d_ge(vzero, vmv), km, vthree);
+                } else if constexpr (nw_is_int<T>) {
+                    stdx::where(vmv == vzero, km) = vthree;
+                } else {
+                    stdx::where(vmv <= vzero, km) = vthree;
+                }
+#else
+                if constexpr (nw_is_int<T>) stdx::where(vmv == vzero, km) = vthree;   // clamped >= 0
+                else                        stdx::where(vmv <= vzero, km) = vthree;   // the walk stops here
+#endif
+            }
+            vmv.copy_to(cM + (std::size_t)s * W, stdx::element_aligned);
+
+            vd uM, uX, uY;
+            uM.copy_from(pM + (std::size_t)s * W, stdx::element_aligned);
+            uX.copy_from(pX + (std::size_t)s * W, stdx::element_aligned);
+            uY.copy_from(pY + (std::size_t)s * W, stdx::element_aligned);
+            dgM = uM; dgX = uX; dgY = uY;   // the next segment's diagonal
+            const vd ax = vsub<Sat>(vsub<Sat>(uM, vgo_b), vge_b), bx = vsub<Sat>(uX, vge_b), cx = vsub<Sat>(vsub<Sat>(uY, vgo_b), vge_b);
+            vd vxv = stdx::max(stdx::max(ax, bx), cx);
+            vd kx = veight;                     // X's code, shifted: 0 / 4 / 8
+#if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
+            if constexpr (sizeof(T) == 8) {
+                kx = avx512d_blend(avx512d_ge(bx, cx), kx, vfour);
+                kx = avx512d_blend(avx512d_eq(vxv, ax), kx, vzero);
+            } else {
+                kx = pick_code_mx(vxv, ax, bx, cx, vzero, vfour, veight);
+            }
+#else
+            kx = pick_code_mx(vxv, ax, bx, cx, vzero, vfour, veight);
+#endif
+            vxv.copy_to(cX + (std::size_t)s * W, stdx::element_aligned);
+            (km + kx).copy_to(mx + (std::size_t)s * W, stdx::element_aligned);
+            if constexpr (kOpenRows) {   // the open on the ROUNDED candidates (see the full kernel)
+                const vd om = vsub<Sat>(vsub<Sat>(vmv, vgo_a), vge_a), ox = vsub<Sat>(vsub<Sat>(vxv, vgo_a), vge_a);
+                stdx::max(om, ox).copy_to(ov + (std::size_t)s * W, stdx::element_aligned);
+                vd okv = vsixteen;
+#if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
+                if constexpr (sizeof(T) == 8) okv = avx512d_blend(avx512d_ge(om, ox), okv, vzero);
+                else                          okv = sel_ge(om, ox, vsixteen, vzero);
+#else
+                okv = sel_ge(om, ox, vsixteen, vzero);
+#endif
+                okv.copy_to(ok + (std::size_t)s * W, stdx::element_aligned);
+            }
+        }
+
+        // ── Y's carry, codes tracked: column c0's Y enters as the extension seed ──
+        if constexpr (kOpenRows) {
+            int_pmax_carry<T, W, false, 32, Sat>(ov, ok, nbOpen, nbOpenK, lY, ge_a, seg, cY, yc, qb);
+        } else {
+            auto open_from = [&](int q, vd& O, vd& OK) __attribute__((always_inline)) {
+                vd vm, vx;
+                vm.copy_from(cM + (std::size_t)q * W, stdx::element_aligned);
+                vx.copy_from(cX + (std::size_t)q * W, stdx::element_aligned);
+                const vd om = vsub<Sat>(vsub<Sat>(vm, vgo_a), vge_a), ox = vsub<Sat>(vsub<Sat>(vx, vgo_a), vge_a);
+                O = stdx::max(om, ox);
+                OK = vsixteen;
+#if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
+                if constexpr (sizeof(T) == 8) OK = avx512d_blend(avx512d_ge(om, ox), OK, vzero);
+                else                          OK = sel_ge(om, ox, vsixteen, vzero);
+#else
+                OK = sel_ge(om, ox, vsixteen, vzero);
+#endif
+            };
+            vd prev([&](int q) { return q == 0 ? lY : NINF; });
+            vd OKs[2];
+            prev = carry_pass<Sat>(seg, prev, vge_a,
+                [&](int s) NWGRAD_ALWAYS_INLINE_LAMBDA {
+                    const int q = s == 0 ? seg - 1 : s - 1;
+                    vd O, OK;
+                    open_from(q, O, OK);
+                    OKs[s & 1] = s == 0 ? lane_shift_in(OK, nbOpenK) : OK;
+                    return s == 0 ? lane_shift_in(O, nbOpen) : O;
+                },
+                [&](int s, const vd& O, const vd& ext, const vd& v) NWGRAD_ALWAYS_INLINE_LAMBDA {
+                    vd ky = vthirtytwo;                       // extension
+#if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
+                    if constexpr (sizeof(T) == 8) ky = avx512d_blend(avx512d_ge(O, ext), ky, OKs[s & 1]);
+                    else                          ky = sel_ge(O, ext, vthirtytwo, OKs[s & 1]);
+#else
+                    ky = sel_ge(O, ext, vthirtytwo, OKs[s & 1]);   // open: M or X, ties go to open
+#endif
+                    v.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
+                    ky.copy_to(yc + (std::size_t)s * W, stdx::element_aligned);
+                });
+            // lazy-F across the lanes (lane 0's column-c0 seed is in the carry already: the
+            // sentinel here, as the full kernel's)
+            for (int r = 0; r < W; ++r) {
+                vd last; last.copy_from(cY + (std::size_t)(seg - 1) * W, stdx::element_aligned);
+                vd F = vsub<Sat>(lane_shift_in(last, NINF), vge_a);
+                bool changed = false;
+                for (int s = 0; s < seg; ++s) {
+                    vd v; v.copy_from(cY + (std::size_t)s * W, stdx::element_aligned);
+#if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
+                    if constexpr (sizeof(T) == 8) { if (!avx512d_any_gt(F, v)) break; }
+                    else { if (!stdx::any_of(F > v)) break; }
+#else
+                    if (!stdx::any_of(F > v)) break;
+#endif
+                    vd k; k.copy_from(yc + (std::size_t)s * W, stdx::element_aligned);
+#if defined(__clang__) && defined(__AVX512F__) && !defined(NWGRAD_STD_SIMD_AVX512_MASK_OK)
+                    if constexpr (sizeof(T) == 8) k = avx512d_blend(avx512d_gt(F, v), k, vthirtytwo);
+                    else                          stdx::where(F > v, k) = vthirtytwo;
+#else
+                    stdx::where(F > v, k) = vthirtytwo;   // a raised cell is an extension
+#endif
+                    k.copy_to(yc + (std::size_t)s * W, stdx::element_aligned);
+                    v = stdx::max(v, F);
+                    v.copy_to(cY + (std::size_t)s * W, stdx::element_aligned);
+                    F = lazy_f_next<Sat>(F, v, vge_a);
+                    changed = true;
+                }
+                if (!changed) break;
+            }
+        }
+        for (int s = 0; s < seg; ++s) {   // M | X << 2 | Y << 4
+            vd k, kmx;
+            k.copy_from(yc + (std::size_t)s * W, stdx::element_aligned);
+            kmx.copy_from(mx + (std::size_t)s * W, stdx::element_aligned);
+            store_codes<T, W>(kmx + k, dP + (std::size_t)s * W);
+        }
+        bM = lM; bX = lX; bY = lY;
+        std::swap(pM, cM); std::swap(pX, cX); std::swap(pY, cY);
+    }
+    if (J.last) {   // row r1 (p* after the last swap), dense, column c0 from the left line
+        J.last->resize(3 * ((std::size_t)w + 1));
+        T* const lr = J.last->data();
+        const std::size_t w1 = (std::size_t)w + 1;
+        lr[0] = left(0, h); lr[w1] = left(1, h); lr[2 * w1] = left(2, h);
+        for (int c = 1; c <= w; ++c) {
+            const std::size_t k = (std::size_t)((c - 1) % seg) * W + (c - 1) / seg;
+            lr[c] = pM[k]; lr[w1 + c] = pX[k]; lr[2 * w1 + c] = pY[k];
+        }
+    }
+}
+
+template <class T>
+static void grid_base_entry(GridBaseJob<T>& J) {
+    if constexpr (nw_sat<T>)
+        if (J.sat) {
+            if (J.local) grid_base_striped<T, true, true>(J); else grid_base_striped<T, false, true>(J);
+            return;
+        }
+    if (J.local) grid_base_striped<T, true, false>(J); else grid_base_striped<T, false, false>(J);
+}
