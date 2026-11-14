@@ -253,6 +253,9 @@ struct DpBufferT {
     std::vector<unsigned char> gbuilt;   // profile rows built for the current rectangle
     GVec gbM, gbX, gbY;
     GBVec gdM, gdX, gdY;
+    GBVec gD;                  // the striped base block's packed codes (GridBaseJob)
+    GVec glast3;               // its last row, three states (the end cell's argmax, Glocal's pick)
+    std::vector<unsigned char> gidx;   // its striped column symbols (striped_profile_index)
 
     // Scaled soft path (SoftImpl::Scaled), in its soft type SF — float for a float32
     // pair (soft_float_t), double otherwise, and double again when a float32 pair's range
@@ -304,9 +307,10 @@ struct DpBufferT {
         clrB(hbD); clrB(hops);
         glv.clear(); glv.shrink_to_fit();
         clrT(grows); clrT(gprof);
-        for (GVec* v : {&gtop, &gleft, &glast, &gbM, &gbX, &gbY}) { v->clear(); v->shrink_to_fit(); }
-        for (GBVec* v : {&gdM, &gdX, &gdY}) { v->clear(); v->shrink_to_fit(); }
+        for (GVec* v : {&gtop, &gleft, &glast, &gbM, &gbX, &gbY, &glast3}) { v->clear(); v->shrink_to_fit(); }
+        for (GBVec* v : {&gdM, &gdX, &gdY, &gD}) { v->clear(); v->shrink_to_fit(); }
         gbuilt.clear(); gbuilt.shrink_to_fit();
+        gidx.clear(); gidx.shrink_to_fit();
         sd.clear(); sf.clear();
         sexp.clear(); sexp.shrink_to_fit();
     }

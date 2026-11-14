@@ -48,8 +48,10 @@ void register_level_inter(SimdLevel l, typename TypedKernels<T>::inter_fn inter_
 }
 
 template <class T>
-void register_level_grid(SimdLevel l, typename TypedKernels<T>::grid_fn grid_fwd) {
+void register_level_grid(SimdLevel l, typename TypedKernels<T>::grid_fn grid_fwd,
+                         typename TypedKernels<T>::gridbase_fn grid_base) {
     level_table()[(int)l].template of<T>().grid_fwd = grid_fwd;
+    level_table()[(int)l].template of<T>().grid_base = grid_base;
 }
 
 template <class T>
@@ -65,7 +67,7 @@ void register_level_profile(SimdLevel l, typename TypedKernels<T>::profile_fn pr
         TypedKernels<T>::hbscan_fn, TypedKernels<T>::score_fn); \
     template void register_level_inter<T>(SimdLevel, TypedKernels<T>::inter_fn, \
         TypedKernels<T>::inter_fn, int); \
-    template void register_level_grid<T>(SimdLevel, TypedKernels<T>::grid_fn); \
+    template void register_level_grid<T>(SimdLevel, TypedKernels<T>::grid_fn, TypedKernels<T>::gridbase_fn); \
     template void register_level_profile<T>(SimdLevel, TypedKernels<T>::profile_fn);
 NWGRAD_INSTANTIATE_REGISTER(double)
 NWGRAD_INSTANTIATE_REGISTER(float)

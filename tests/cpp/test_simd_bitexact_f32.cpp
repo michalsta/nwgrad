@@ -121,6 +121,12 @@ TEST_CASE("f32 striped kernel is actually dispatched (not a scalar fallback)", "
     // scalar fill.  Prove it does not: the level's float striped entry is registered, and
     // a Simd run over a length that is not a multiple of the vector width leaves the table
     // in the padded striped layout (buffer larger than the row-major (m+1)(n+1)).
+    // Under NWGRAD_ISA=scalar_fallback `auto` IS the scalar fill, so there is nothing to
+    // prove (Catch2 v2 has no SKIP: return with a note).
+    if (global_default_backend() == kBackendScalar) {
+        WARN("scalar backend forced (NWGRAD_ISA): striped dispatch not checked");
+        return;
+    }
     REQUIRE(level_kernels(best_simd_backend()).f.viterbi != nullptr);
 
     AlignParams p = int_params(11.0, 1.0, 11.0, 1.0);

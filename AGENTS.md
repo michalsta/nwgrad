@@ -891,6 +891,19 @@ matrices, 4 and 6 letters, ragged B):
    table row `always_inline`. After the split, protein L100 (gather) path / hard, skynet
    sse4, instructions vs main: 0.970-1.004; DNA L300 path 0.47-0.998. Aimed at W = 32 (int16
    AVX-512); at W <= 8 it measured 0-2 %.
+6. `inter_fill_affine` is pinned to a page boundary (`aligned(4096)` + `noinline`, every
+   instance; 2026-11-06).  Its row loop's front-end delivery (LSD vs DSB) depends on the
+   function's address mod 4096, and that address is otherwise the size of everything linked
+   before the inter unit: proto/int-score-rows grew the score kernels in the level units and
+   moved it, byte-identical, from 3328 to 3200 mod 4096.  nighthaven, float32 affine Local
+   path, protein L300, 1 thread, placement swept: mod 4096 = 0 1.001, 256 / 512 / 1024 /
+   2048 1.00-1.007, 128 1.014, 768 1.037, 3328 1.010, 3200 1.063 (front-end bubbles track
+   it).  Splitting the score kernels into their own unit and pinning setup helpers
+   `noinline` was tried first and not adopted: it left 56-72 functions per level still
+   depending on the unit's contents and moved the inter unit again.  Regression runs
+   should include an int16 affine Global score-only cell at L180-L220 (a 12-14 segment AVX2
+   band that showed 1.04-1.07 before the int16 >= 16-lane gate) and the protein L300 float32
+   affine Local path cell at 1 thread: both moved on layout alone.
 Measured on skynet (sse4, perf stat, differential instructions per pair, 1 thread,
 affine Global unless noted, gates off; A/A 0.986-1.009): miRNA 22x50 int16 score 0.587, hard
 0.800; int32 hard 0.737; float32 score 0.646, hard 0.809, Local hard 0.768; int16 Local score
@@ -905,6 +918,38 @@ a v3 host. AVX2 / AVX-512 / NEON compile (gcc, clang syntax; NEON gcc cross) and
 untested at runtime. Not done: 5-8 letters as two shuffles + a blend (the global 8a + b
 table is 64 entries, four shuffles: no gain over the 7-blend tree at W = 8), protein by
 `vpermi2b` (needs VBMI, which the avx512 level does not enable, and a runtime check).
+
+**Protein: a per-lane query profile instead of the lane-cell gather (branch
+`proto/inter-profile`, 2026-11-10).** Alphabets over 8 letters (`Lv = kLvGather`, untracked)
+no longer gather each row lane-cell by lane-cell (`row_gather`: a load, an indexed load and
+a lane store per lane-cell, 46 % of a protein L100 int16 path fill at sse4). Per group,
+`InterCommon::build_profile` writes each lane's profile rows `score(c, b_l[j])` for the
+letters its A uses (and letter 0, read past a shorter A), padded to whole W-blocks; per
+row, `row_profile` loads the W lanes' rows W columns at a time and transposes them into
+`srow` (`ivtranspose`: log2 W rounds of interleaves, punpckl/h at SSE). The column loops
+are unchanged; values are loaded, never computed, so it is bit-identical
+(`test_interpair_profile.py`: own fill / profile / gather at every level and lane type,
+ragged and short B, banded, the cap). Cap: `kInterProfileMaxBytes`, none by default since
+2026-11-11 (first 1 MiB; see below), gate `inter_profile_bytes` (0 = the gather). Tracked lanes keep the gather.
+wloczykij sse4 (= skynet's core), differential instructions per pair, BLOSUM62 11/1
+affine, 1 thread, gates off, new / main (A/A 0.99-1.01): L100 int16 score 0.53, path 0.55,
+Local hard 0.61; int32 score 0.64, path 0.68; float32 score 0.65, path 0.70; L300 int16
+path 0.44. sse2: 0.51-0.77, the same order. miRNA and DNA L100 (not on this path) 0.99-1.03
+(A/A 1.00-1.03); miRNA int16 re-run with 2000 pairs, 6 rounds, arms alternated: score
+new / main 0.99 (medians 4604 / 4642 instructions a pair, rounds spread +-1.5 %), path 1.00.
+Profile build cost (RelWithDebInfo `-O3 -g1`, perf record of instructions:u, L100, share of
+build / (fill + row_profile + build)): int16 path 25 %, int32 path 17 %, float32 path 15 %,
+float32 score 10 % -- about the proposal's (letters / m), the 24 BLOSUM62 letters all used.
+Long B (instructions a pair, profile with no cap / gather): L1000 float32 path 0.59, L3000
+float32 score 0.54 (its profile, ~1.2 MB, is past the 1 MiB cap, which therefore gathers
+there by default). The cap is a cache guess that instruction counts cannot settle: it needs
+a cycles crossover on a timing host (nighthaven / solace).
+nighthaven (AVX2, 2026-11-11), protein A = 40 vs long B, always-profile vs the 1 MiB default:
+never slower; 1 thread float32 path B = 2000 / 3000 ~21 % faster, the gather at B = 1500
+1.13-1.14x; score-only, int16 path, B = 6000 and all 6-thread cells: no effect. So the cap
+is gone by default (the gate still sets one for A/B). solace (AVX-512) unmeasured. AVX2 / AVX-512 / NEON compile and are
+untested at runtime (at W = 16 / 32 the interleaves cross 128-bit halves: gcc's lowering
+there is unexamined).
 
 ### Score only: `compute_score` and the inter-pair score kernel (2026-10-08)
 
@@ -1132,7 +1177,8 @@ scalar_fallback / sse2 / sse4, the Python suite (5505), `tools/fuzz_ab.py` main 
 seeds, 0 differ) and an int16/int32/int64/float32/double x Global/Local/Glocal x level x fill A/B
 of linear score-only batches against main (400 seeds, 36000 batches, every score's bytes equal).
 Two mutations (lazy-F one round; the lane carry-in dropped) fail 3 of the 5 `[score]` cases.
-`NWGRAD_SCORE_LINEAR=affine` runs the old route (an A/B switch in one binary).
+`NWGRAD_SCORE_LINEAR=affine` runs the old route (an A/B switch in one binary; `onerow` the new
+one at every length, past the gate below).
 Measured (skynet sse4, 1 thread, `fill="striped"` batches, `perf stat instructions:u` differenced
 between 1 and 4 repetitions, so per cell of the kernel; protein BLOSUM62 0/4, DNA +2/-4 0/2, 20 %
 mutated homologues; new / old instructions, A/A of the new arm 1.00 on every row):
@@ -1150,6 +1196,22 @@ inner loop at sse4 is 32 instructions per two segments (16 a vector cell, 4 a ce
 vector cell for the D/X form. First tried: the integer form with pass 2 kept (the D/X kernel's
 shape, three rows): only 0.92-0.93 of the old instructions; dropping pass 2 gave the rest. NEON,
 AVX2 and AVX-512 compile, untested at runtime (skynet cannot run them).
+
+**Linear score-only gate (branch `proto/gate-fixes`, 2026-11-10).** 56f4d3e sent every linear
+score-only call to the one-row kernel, ungated, and on the M1 it loses in three windows (spot,
+1 thread, affine-route / one-row time, results/spot.md "Round 2"): int16 Global at B 81-104
+(11-13 segments of 8 lanes; L100 DNA / protein 0.940 / 0.945, L70 and L150 win 1.2-1.3x),
+double at short B (Global L50 0.92 / 0.99, L70 0.89 / 0.96; Local L50 0.91 / 0.95; miRNA 22 x
+50 0.92), float32 Local DNA L100 0.940 (protein 1.00). `Aligner::linear_score_one_row`
+routes those B lengths (`kLinScoreAffineNeon`: int16 Global / Glocal n 81-104, float32 Local
+n 81-104 over alphabets of up to 8 letters only -- protein L90 lost 1.037 there on spot --,
+double Global / Glocal n < 80, Local n < 60) through the zero-open affine kernel on
+AArch64; bit-identical either way. x86 stays one-row everywhere: wloczykij sse4,
+`instructions:u` affine-route / one-row, 1 thread, BLAS pinned, A/A 0.997-1.002, L50-L300
+DNA and protein, Global and Local: int16 1.31-1.81, float32 1.29-1.69 (DNA Global and the
+miRNA cells 1.00: the shared fill takes them), double 1.43-1.72, miRNA double 1.51 / 1.59 --
+no window at all, so the M1's is microarchitectural. AVX2 / AVX-512 timing pending
+(nighthaven, solace). `NWGRAD_SCORE_LINEAR` = `affine` / `onerow` forces either route.
 
 ### Grid traceback: `traceback="grid"` (branch `cc/grid-traceback`, 2026-10-26)
 
@@ -1343,14 +1405,36 @@ really takes (`test_tracked_long_global_float32_pairs_run_their_own_fill`).  fuz
 - **`auto`** (`run_tb_`): integer `auto` stays `hirschberg_pmax` (kDefaultTb) and a pair that
   SPLITS (`hb_splits`: past hb_cutoff and, where the type has one, past the pointer budget —
   Local and Global int64 2^25; Global int32 and Glocal have none) runs Grid where
-  grid_ok_ — except int16 Global / Glocal, which keep pmax: on solace (AVX-512, 32 int16
-  lanes) Grid made int16 Global `auto` 1.09-1.24x SLOWER at L1000 protein (DNA L3000 0.53x;
-  nighthaven AVX2 0.84-0.91x), and the merge rule is no regression on any host.  This is the floating rule's integer half: floating T resolves to Grid and runs
+  grid_ok_ — int16 Global / Glocal included since 2026-11-10 (below: "int16 Global auto takes
+  Grid"); until then they kept pmax because on solace (AVX-512, 32 int16 lanes) Grid made int16
+  Global `auto` 1.09-1.24x SLOWER at L1000 protein (DNA L3000 0.53x; nighthaven AVX2
+  0.84-0.91x), and the merge rule is no regression on any host.  This is the floating rule's integer half: floating T resolves to Grid and runs
   Pointers within Local's budget; integer T resolves to pmax and runs Grid past it — the
   same Pointers-within / Grid-beyond split in both.  Within the budget Pointers stays;
   tracked pairs / the scalar backend keep pmax; the planners ask hb_splits of pmax, true
   either way, so these pairs keep their own fill.  Scores are unchanged (pmax is exact for
   integers); paths become Pointers' wherever Hirschberg broke a tie differently.
+- **int16 Global auto takes Grid (branch `proto/gate-fixes`, 2026-11-10).** pmax was never
+  the best int16 Global traceback off AVX-512. spot (M1, NEON, 1 thread, time): grid / auto
+  (pmax) DNA L1000 0.912, protein L1000 0.870, DNA L3000 0.492 (Pointers 0.915 / 0.857 / 0.910).
+  wloczykij sse4, `instructions:u`, 1 thread, A/A 1.000: Global grid / auto DNA L600 / 1000 /
+  2000 / 3000 0.71 / 0.72 / 0.68 / 0.43, protein L600-2000 0.65-0.69; Glocal (pmax there is
+  ~2x Pointers) DNA 0.36 / 0.36 / 0.34 / 0.22, protein 0.35 / 0.35 / 0.33; Grid beats Pointers
+  in every cell (0.47-0.85). So int16 Global and Glocal `auto` runs Grid past hb_cutoff
+  (`int16_grid_min_rows`), except AVX-512 -- Global from 2500 rows (solace, Grid with its
+  scalar base / pmax: DNA / protein L1000 1.24 / 1.09, L1500 1.05 / 0.92, L2048 0.96-1.08,
+  L2500 DNA 0.551, L3000 DNA 0.52), Glocal from 600 (L600 0.52-0.71, L700-L2048 0.49-0.60;
+  L400 / L500 neutral, 0.99-1.01) -- and AVX2 Global from 1000 rows (nighthaven: DNA L600 grid / pmax 1.013 at 1
+  thread, 1.038 at 6, on Grid's scalar base case; protein L600 0.83-0.85; Glocal 0.25-0.56
+  everywhere, so it keeps hb_cutoff; PR #45's striped base should let the floor drop). Scores unchanged (pmax is exact for integers). PR #45 (`proto/grid-base-simd`)
+  makes int16 Grid cheaper still.
+  **TODO (when PR #45's striped Grid base case and this gate are both on main):** drop the
+  AVX-512 int16 Global floor (`kInt16GridMinRows512`) from 2500 to ~1500 rows: with the
+  striped base, solace measured Grid / pmax L1500 0.55 / 0.54, L2048 0.48 / 0.45.
+  **Release note: int16 Global / Glocal `traceback="auto"` paths may change at ties** (past
+  512 rows; AVX-512 Global from 2500, Glocal from 600; AVX2 Global from 1000): they are now Grid's, i.e. `traceback="pointers"`' path, not
+  hirschberg_pmax's. Scores are identical. Seen in the sse4 sweep: Global DNA L600 and L3000,
+  Glocal DNA L600 / L1000 / L3000 cigars differ from main's; protein L600-2000 unchanged.
 - **Local, one pass** (same branch): with every gap parameter >= 0 and a top level above the
   base size, the top level's forward finds the end cell itself (`GridFwdJob::find_best`, a
   `Best` instantiation: per lane the largest M and its first segment, as the Pointers
@@ -1374,7 +1458,7 @@ really takes (`test_tracked_long_global_float32_pairs_run_their_own_fill`).  fuz
   | 3000 | f32 Local | 3.65 / 26.2 | 3.65 / 26.2 (Pointers) | **1.92 / 13.4** | 4.50 / 28.9 | 3.75 / 26.2 |
   | 3000 | f32 / f64 Global | 2.02 / 12.05, 2.93 / 17.1 | 2.04 / 12.06, 2.97 / 16.8 | 1.98, 2.96 | 2.01, 3.17 | 3.59, 6.19 |
 
-  int32 Global `auto` 1.7-2.3x faster than main's (pmax); int16 Global keeps pmax.  Local within the 2^25 budget:
+  int32 Global `auto` 1.7-2.3x faster than main's (pmax); int16 Global kept pmax (until 2026-11-10).  Local within the 2^25 budget:
   `auto` stays Pointers on both sides (with one pass Grid would win 1.7-2.2x there on sse4;
   the budget was set against the two-pass form and is left to a fleet re-measure).  Above
   it (6300 x 6050, before the merge): int32 `auto` 1.94 ns/cell against pmax's 8.61.
@@ -1416,6 +1500,49 @@ really takes (`test_tracked_long_global_float32_pairs_run_their_own_fill`).  fuz
   regimes, every backend here, `ran_grid()` per type; integer `auto` routing),
   `tests/Python/test_grid.py` (every mode x integer type through the batch, `auto`).
 
+**Grid's base block, striped (branch `proto/grid-base-simd`, 2026-11-10).**  `grid_base`
+re-filled every base rectangle with the scalar Pointers fill (a loop-carried Y, three code
+arrays, ~27 instructions a cell): at int16 L1000 it cost about as much as the whole forward.
+Now `grid_base_striped` (grid_kernel_impl.inl, leveled; `TypedKernels::grid_base`,
+`GridBaseJob`) runs `striped_affine_full_ptr`'s recurrence over the rectangle, as
+`hb_base_striped` does for Hirschberg, with Grid's borders: row r0 from the top line, column
+c0 of each row from the left line -- its M / X / Y the next row's diagonal shift-in, its open
+(with its code) and its Y - ge_a (the extension seed: `int_pmax_carry`'s bY, the floating
+carry's lane-0 prev) entering Y's carry.  Packed striped codes in `buf.gD`; the walk reads
+them; `last` (row r1, three states) gives the end cell's argmax and Glocal's end column.
+Every type (float32 / double / int16 both regimes / int32 / int64), every mode, every level.
+- **Switch:** `kGridBaseMinSeg` = 2 segments (narrower blocks keep the scalar fill, which stays
+  the reference; once W is known the call is skipped).  `NWGRAD_GRID_BASE=scalar|striped`
+  forces either (measuring); `Aligner::set_grid_base(cells, min_seg)` sets the block size and
+  fill (tests).  A linear Grid would add its own pair beside it (one state).
+- **Exact:** same expressions, picks and association as the Pointers kernel, so each code is
+  Pointers'.  `test_grid.cpp` "striped base block ... at block edges": blocks of 1..4096 cells,
+  B of 1 column to a few vectors, the end cell in the first / last block, striped forced and
+  scalar forced, every type x mode; plus int16 saturating.  wloczykij (scalar, sse2, sse4): the
+  C++ suite 209 cases pass, `[grid]` at NWGRAD_GRID_FUZZ=200 11.3 M assertions pass,
+  test_grid.py 47 passed at each level.  AVX2 / AVX-512 / NEON compile (CI), untested at runtime.
+- **Measured** (wloczykij sse4, instructions per cell by differencing rep counts, hard path,
+  1 thread, `traceback="grid"`; scalar fill -> striped, A/A of the striped arm in brackets):
+
+  | | protein L1000 | DNA L1000 | protein L3000 | DNA L3000 |
+  |---|---|---|---|---|
+  | int16 Global | 8.74 -> 6.26 (6.28) | 8.52 -> 5.94 (5.95) | out of int16 range | 5.03 -> 5.16 (5.16)* |
+  | int16 Local | 10.05 -> 7.56 (7.57) | 9.79 -> 7.22 (7.17) | out of range | 6.34 -> 6.42 (6.30) |
+  | int32 Global | 12.39 -> 10.64 (10.73) | 12.08 -> 10.38 (10.36) | 9.48 -> 9.42 (9.38) | 9.45 -> 9.30 (9.32) |
+  | int32 Local | 14.91 -> 13.04 (13.03) | 14.60 -> 12.60 (12.74) | 11.88 -> 11.76 (11.76) | 11.65 -> 11.63 (11.58) |
+  | float32 Global | 14.59 -> 13.64 (13.64) | 11.58 -> 10.46 (10.55) | 12.30 -> 12.35 (12.32) | 8.53 -> 8.53 (8.58) |
+  | float32 Local | 16.42 -> 15.37 (15.40) | 12.92 -> 11.67 (11.67) | 14.00 -> 13.82 (13.92) | 10.48 -> 10.38 (10.28) |
+
+  L1000: int16 0.72-0.75x, int32 0.86-0.87x, float32 0.90-0.94x of the scalar-base run
+  (the review's estimate: 8.8 -> ~6.2).  L3000: the base is ~3 % of the run, a wash (+-1 %).
+  (*) the scalar arm at DNA int16 L3000 Global was unstable (5.03, then two negative
+  differences); the striped arm repeated at 5.16-5.17.
+- **int16 Global gate (not changed; the owner's):** sse4, the same harness, instr/cell
+  `hirschberg_pmax` / Pointers / Grid-scalar-base / Grid-striped: protein L1000 12.83 / 11.22 /
+  8.74 / 6.26, DNA L1000 11.97 / 11.14 / 8.52 / 5.94, DNA L3000 11.83 / 10.85 / 5.03 / 5.16.
+  Grid now needs ~0.5x pmax's instructions (was ~0.7x).  `run_tb_` keeps int16 Global / Glocal
+  on pmax because Grid lost at 32 lanes (solace); that comparison must be re-run there.
+
 ### Linear gaps: Pointers and Hirschberg (2026-10-05)
 
 - **`traceback="pointers"` for linear** (`viterbi_linear_ptr`): one direction byte per
@@ -1435,7 +1562,18 @@ really takes (`test_tracked_long_global_float32_pairs_run_their_own_fill`).  fuz
   under `auto` (which resolves to pointers for linear) a pair whose H table is ≤ 2 MiB
   keeps H. Measured (nighthaven, double Global, 12 threads): H 1.6× faster up to L=350,
   tie at 500, pointers 2.4× at 700 and 3.5× at 1000; `auto` tracks the faster one on both
-  sides. Explicit `pointers` always records bytes.
+  sides. Explicit `pointers` always records bytes. **AVX-512 int16 Local: 1 MiB**
+  (`kLinearHTableBytes512`, branch `proto/gate-fixes`, 2026-11-10/13): solace (Tiger Lake, 1.25
+  MiB L2), Pointers / H time, DNA and protein, 1 / 8 threads: L500 1.03-1.19 (H wins), L700
+  0.98 / 0.88, L1000 0.60-0.72; a first cap of 768 KiB sent L700 to Pointers and lost there
+  (phase 3: DNA L700 1T 1.074-1.080), so L700 stays on H and L800 up takes Pointers.
+  The level is resolved only for a table between the AVX-512 cap and 2 MiB
+  (`linear_h_table_exceeds`): resolving it for every pair cost short linear int16 paths
+  0.7-0.9 % instructions; AVX2 on the same host keeps H to L1000 (1.00-1.07) and spot's
+  NEON too, so both keep 2 MiB. **AVX-512 int16 Global: 864 KiB, ~L665** (solace, 1 thread,
+  Pointers / H: L600 1.07-1.13, H wins; L700 0.905-0.933; L800 0.60 / 0.61; L1000 0.54 /
+  0.45). int16 Glocal and the other types unmeasured there: 2 MiB.
+  Same path either way (Pointers and H break ties alike).
 - **Linear Hirschberg** (`viterbi_linear_hirschberg`, `lhb_solve` / `lhb_sweep` / `lhb_base`):
   no gap state crosses a row cut, so the join is a plain argmax of forward + reverse
   scores. Local uses the affine path's endpoint reduction (clamped forward scan,
@@ -2735,6 +2873,21 @@ slower than the better arm, up to 2.65x. What the data said, gate by gate:
   gather caps stay one value per gap model. And the shared LINEAR hard fill of int64 over
   small alphabets loses at SSE (sse4 1.06-1.2, sse2 2-2.5x) and on the M1 (1.15-1.34):
   `linear_small` = 0 there, no cap elsewhere.
+- **float32 Global over small alphabets had no cap** (`score_small_global` = kGateNoCap on
+  SSE, AVX2 and NEON; fixed on branch `proto/gate-fixes`, 2026-11-10): the sweep above ran 22 x L
+  pairs only, so every long DNA float32 Global score-only call took the shared fill
+  (`fill="interpair"`'s speed). The M1 (spot, 1 thread, L x L): striped / default time linear
+  0.62 / 0.59 / 0.38 at L1000 / 2000 / 3000, affine 0.78 / 0.68 / 0.64; 7c69934's inter-lookup
+  made that fill erratic at L >= 2000 (L3000 linear 1.52x 9845e77). sse4 (wloczykij,
+  `instructions:u`, striped / shared, A/A 0.999-1.003): linear L100 1.08, L150 1.00, L200 0.95,
+  L500 0.85, L1000-3000 0.82-0.80; affine L500 1.06, L700 1.00, L1000 0.99, L2000 0.91, L3000
+  0.89; short A stays shared (22 x 200-3000 linear 1.19-1.33, affine 1.39-1.52; 40 x 3000 1.03 /
+  1.21; 100 x 1000 linear 0.91, affine 1.15). nighthaven AVX2 (time): linear L300 1.07, L500
+  0.90, L1000 0.78, L2000-3000 0.56-0.75, 100 x 3000 0.78; affine the shared fill wins almost
+  everywhere (striped 1.08-1.50 at L300-700, 1.12-1.40 at L2000-3000; L1000 alone 0.92-0.97).
+  spot with the cap: L300 1.000, L500 linear 0.755 / affine 0.925. So the cap is per gap model
+  (`f32_small_global_lin` for linear, `score_small_global` affine): SSE 200000 / 10^6 cells,
+  AVX2 200000 / none, NEON 250000 / 250000, AVX-512 4 x 10^7 / 4 x 10^7.
 - **The linear hard gather caps (`inter_linear_*_gather_cells`, `inter_global_linear_*`).**
   The integer caps (15000 / 6000 cells) were too high: int16 and int32 cross at L60-80
   (4000 cells) on every x86 level, int64 at L40-60 on AVX2 (2500; solace's avx2 run has
@@ -2874,6 +3027,186 @@ of 3-5, score-only protein L200 / L1000, 1 thread unless noted; control arms 0.9
   either way (0.89-0.97). So the hand unroll is a marginal, bit-identical win on x86 and
   the residual gap is clang's scheduling of the whole kernel, not the unroll count; not
   closable this way.
+
+### Score-only integer kernel: four rows, the Local mask, half-width lanes (branch `proto/int-score-rows`, 2026-11-05)
+
+Review proposal 5 (the D/X integer kernel, `score_affine_striped_pos`, against parasail's
+scan).  Four changes, all bit-identical in the score (the [score] fuzz at 20000, now with an
+integer arm; `tests/cpp/test_integer.cpp`; an integer A/B fuzz of base vs branch, 1800
+batches at sse4 and at sse2, 0 differ):
+- **No Y row.**  Pass 1 no longer stores the running prefix; it keeps it in a register for
+  the lanes' totals only.  Pass 2 re-forms Y from the D row as pass 1 stored it (max(M, X),
+  read before it is overwritten), with the carry-in known.  Rolling rows 5 -> 4 (working set
+  with the profile row 6 -> 5, Local 7 -> 6 or 5, below).  The first form re-formed the
+  PREFIX (max(P, open + ramp) - ramp): +2.5 instructions a vector cell, yet 0.80-0.93x at
+  L >= 1000 on skynet (fewer stores and loads past the 16 KB L1D).  Then pass 2 as the
+  serial step y(s) = max(y(s-1) - ge, open(s-1)) (the ramp cancels): -3 instructions but
+  1.02-1.08x SLOWER (sub + max on the chain, 2-cycle latencies on Piledriver); unrolled by
+  two, -5, still mixed.  Kept: two segments per dependent step, y(s+1) = max(max(open(s),
+  open(s-1) - ge), y(s-1) - 2ge), the off-chain max `carry_pin`ned (now with integer
+  vectors).  Exactness: plain regime, nothing wraps under the quarter rule, so the integer
+  identities are exact; saturating int16 with ge >= 0, bottom clamps commute; with ge < 0
+  only sentinel-derived values differ (the prefix form lifts a clamped open by the ramp),
+  which stay below every reachable value -- the rows are not bit-identical there, the score
+  is (see the comment at the pass).
+- **Local mask.**  Padding slots (l*seg + s + 1 > n) live in segments s >= n - (W-1)*seg
+  only; the passes take the mask from there (templated trips, no per-segment branch).  With
+  MOnly (all gap parameters >= 0) no mask at all, integer T too: a padding M is max(D(i-1,
+  j-1) + 0, 0) and no D exceeds the best M at or before it (the W < 4 form always ran it so).
+  -2 instructions a vector cell in Local.
+- **Half-width lanes** (`Aligner::narrow_score_`, aligner.hpp): an untracked int32 problem
+  whose step_max fits int16's cap and which passes `nw_int_bound_check<int16_t>` (plain or
+  saturating regime) runs the int16 score kernel; int64 -> int32 likewise.  Per-thread
+  scratch (buffer + the block cast per problem).  `NWGRAD_INT_NARROW=0` (and
+  `int_narrow_mode()` for the tests) turns it off.  BLOSUM62 11/1 fits int16 to ~L2300, so
+  L3000 and DNA L10000 (2/-4, 4/2) stay int32.  The inter-pair score kernels are untouched.
+
+Measured (skynet sse4, Piledriver, 16 KB L1D; one process per arm, alternated, 4 rounds;
+instructions per VECTOR cell from `perf stat` (two rep counts differenced), ns/cell best of
+4; striped fill, 30 %-mutated pairs, BLOSUM62 11/1, DNA 2/-4 4/2; B/A against main, the
+control arm A'/A 0.93-1.04, the host loaded):
+
+| config | main instr | +rows | +mask | +2-step | +narrow | ns/cell main | all / main |
+|---|---|---|---|---|---|---|---|
+| int32 protein L300 G / L | 34.5 / 38.9 | 37.0 / 41.8 | 37.0 / 39.8 | 33.9 / 36.8 | 18.1 / 19.5 | 1.16 / 1.15 | 0.44 / 0.48 |
+| int32 protein L1000 G / L | 32.1 / 36.5 | 34.6 / 39.5 | 34.5 / 37.5 | 31.5 / 34.4 | 15.4 / 17.1 | 1.24 / 1.39 | 0.39 / 0.36 |
+| int32 protein L2000 G / L | 31.5 / 36.0 | 34.0 / 39.0 | 34.0 / 37.0 | 31.0 / 34.0 | 15.0 / 16.8 | 1.36 / 1.46 | 0.38 / 0.36 |
+| int32 protein L3000 G / L | 31.4 / 35.9 | 33.9 / 38.9 | 33.9 / 36.9 | 30.8 / 33.8 | (refused) | 1.37 / 1.37 | 0.80 / 0.85 |
+| int32 DNA L1000 G / L | 31.5 / 36.0 | 34.0 / 39.0 | 34.0 / 37.0 | 31.0 / 33.9 | 15.3 / 17.0 | 1.24 / 1.38 | 0.38 / 0.35 |
+| int32 DNA L10000 G / L | 31.1 / 35.6 | 33.6 / 38.6 | 33.6 / 36.6 | 30.6 / 33.6 | (refused) | 1.47 / 1.42 | 0.72 / 0.80 |
+| int16 protein L300 G / L | 35.7 / 40.5 | 38.8 / 43.5 | 39.4 / 42.2 | 36.1 / 38.9 | -- | 0.54 / 0.60 | 0.94 / 0.89 |
+| int16 protein L1000 G / L | 31.9 / 36.7 | 33.3 / 38.2 | 33.3 / 36.2 | 30.8 / 34.2 | -- | 0.57 / 0.61 | 0.85 / 0.83 |
+| int16 protein L2000 G / L | 31.2 / 36.2 | 32.8 / 37.6 | 32.7 / 35.7 | 30.1 / 33.5 | -- | 0.64 / 0.69 | 0.81 / 0.80 |
+| int16 DNA L1000 G / L | 31.6 / 36.6 | 33.1 / 38.0 | 33.1 / 36.1 | 30.5 / 34.0 | -- | 0.56 / 0.57 | 0.85 / 0.83 |
+
+Per change, ns B/A: rows (the recomputed-prefix form) 0.75-0.93 at L >= 1000, 0.92-1.07 at
+L300; mask (Local) 0.86-0.96 on top; two-step pass 2 0.89-1.05 against the recomputed
+prefix (mostly 0.94-0.97); narrow int32 0.36-0.48 where the bound allows.  On this host every
+int32 length here but L300 is past the L1 (16 KB: six 4-byte rows cross at ~L680, five at
+~L820; int16 at twice that), so the row change pays as traffic, not as a cliff crossed.
+Expected elsewhere (not measured): 48 KB L1D, int32 Global's working set crosses at ~L2000
+before, ~L2450 after; int32 problems narrowed to int16 cross at ~L4900, beyond the int16
+bound.  Instruction count is still ~31 a vector cell in Global (parasail scan ~22): pass 1
+is ~19.5 of them (sse4 disassembly: three loads, two stores, the cell, the opens, the
+running prefix), pass 2 ~8 plus the loop; what remains is the cell, not the carry.  AVX2 / AVX-512 / NEON compiled, not run.
+
+**Gated after the fleet run (2026-11-06).**  The fleet (branch / main, score-only, bit-
+identical everywhere) confirmed the long-cell gains on v3 (nighthaven, oldsolace: int32
+0.53-0.60 narrowed, 0.75-0.93 not; int64 0.25-0.40; int16 DNA L3000 0.61-0.71) and AVX-512
+for int32 / int64 (solace 0.40-0.92 / 0.23-0.74), but found three losses, all in the
+re-formed pass 2 (a dependent chain where the stored prefix's pass 2 has none) and the
+segment-limited mask:
+- v3 int16 short pairs, L100-L200 (7-13 segments of 16 lanes): 1.02-1.04.  skynet sse4 showed
+  it at L100 (13 segments of 8): Global 1.02-1.07, instructions equal.  Now up to 16 segments
+  a row (`kStoredPrefixSeg`) the stored-prefix form runs (template flag SQ: pass 1 stores the
+  prefix, main's pass 2): skynet sse4 int16, against main `15c734d`, control 0.99-1.01: L100
+  0.95-0.98, L200 0.90-0.91, L300 0.91, L1000 0.82-0.83 (and int32 narrowed 0.35-0.69).
+- solace AVX-512 int16 Global 1.02-1.11 (worst DNA L3000), cycles +3-12 % at +1-1.5 %
+  instructions: the chain's latency at 32 lanes.  int16 at >= 32 lanes runs main's forms.
+- spot M1 NEON: int16 1.05-1.33, int32 not narrowed 1.10-1.21, short int16 1.18-1.27.
+  AArch64 runs main's forms for every type (`kMainForm`, score_kernel_impl.inl).
+Narrowing (c) stays on everywhere (spot narrowed int32 0.51-0.68).
+**Second fleet round (2d0a158).**  solace AVX-512: int16 instruction-equal to main, int32 0.35-
+0.81.  spot NEON: int16 at parity or better (affine Global L100 0.82-0.86), int32 narrowed
+0.48-0.51.  nighthaven AVX2 int16 affine LOST from L200: L200 1.06-1.09 (13 segments of 16, the
+stored-prefix form, main's operations), L300-L3000 1.05-1.11, at 0.88-0.99 of main's
+instructions (cycles +7-15 %); L100 0.93-0.97 and int32 / int64 held.  So:
+- int16 at >= 16 lanes on x86 runs main's forms too (`kMainForm`): only sse2 / sse4 int16
+  (8 lanes, not a target) keeps the re-formed pass 2 and the segment-limited mask.
+- On x86 the entry calls main's form (SQ) directly (`kMainDirect`): through the SQ = false
+  form gcc inlined it into that function (no SQ symbol in the object), and that combined
+  body is what lost at L200 with main's operations.  Called directly it is its own function,
+  inlined into the entry as on main.  Narrowed int32 on AVX2 now runs main's int16 kernel
+  (the branch's lost 1.05-1.06 at L1000), so its 0.59-0.61 should hold or improve.
+- So the int16 >= 16-lane path on x86 is `kMainForm` + `kMainDirect` into the original
+  stored-prefix instantiation, called at each site directly (an always-inline wrapper made
+  gcc inline a different set of forms into the avx2 int16 entry).  A verbatim copy of main's
+  kernel (`score_affine_striped_pos_main`, `kMainCopy`) serves AArch64 int32 only: there
+  main's form reached through the re-formed kernel compiled its once-per-row code
+  differently (a spill and reloads; Global rolled 654 vs 591 instructions), ~9 ns a row
+  over main on spot (int32 Global NARROW=0 L1000 1.020, L2500 1.010, L3000 1.008, L4000
+  1.005; Local 1.000), and the copy fixed it (spot clean on 80f04b9).  On x86 the copy did
+  not pay: AVX-512 int16 ran 27-322 fewer instructions a pair yet 1-2 % slower at protein
+  L200-L300 (solace), and AVX2 int16 Global L150 stayed at 1.011-1.016 (nighthaven).
+  AArch64 int16 keeps the combined body, which measured faster than main there (L100 affine
+  Global 0.82-0.86).  The score entries are page-aligned (`score_entry`, one per type and
+  level), as `inter_fill_affine` is.
+- Open: nighthaven AVX2 int16 affine Global score-only L130-L170 +0.4-1.2 % at equal
+  instructions (codegen of the entry's per-row code; not removed by any of the above).
+- spot linear Global DNA, narrowed / int32: L70 0.81, L80 0.98, L90 1.10, L100 1.04, L110
+  0.99, L125 0.90, L150 0.60 (Local, affine, protein never lost).  The int16 linear kernel
+  (main's) runs ~32 ns a row at L100 and ~26 at L150 on the M1, so a longer row costs less,
+  and its path has no switch at these lengths (batch: inter-pair up to 4700 cells, i.e.
+  below L68; then compute_score -> narrow_score_ -> score_linear_striped_int, the same loop
+  at every length).  Cause not found from the code.  AArch64 skips narrowing for linear
+  Global at 11-13 int16 segments (n 81-104), an empirical window: both kernels give the
+  same score.
+Not re-measured after this round: everything above (nighthaven int16, the spot window).
+
+### Narrowing for paths and inter-pair groups (branch `proto/narrow-paths`, 2026-11-10)
+
+Review r2 proposal 1: the half-width lanes of `narrow_score_` extended to every
+path-producing fill.  Bit-identical by the same argument (under the narrower type's bound
+every reachable value is the wide fill's integer, so every comparison, code, walk step, tie,
+guide and gradient count is too); the outputs are converted back (score widened, codes and
+held paths type-free).
+- **Own fill** (`Aligner::narrow_viterbi_`, aligner.hpp): an untracked Full int32 / int64
+  problem that passes `nw_int_bound_check<N>` (plain or int16's saturating regime) runs its
+  Viterbi fill as a per-thread `Aligner<..., N>`; the wide aligner adopts the direction codes
+  (swapped into the caller's buffer, with the layout and dense flag the narrow kernel chose)
+  or the held path (Grid / Hirschberg `hops_`), the end cell and state, and the score.  The
+  narrow run must take an algorithm of the same class (`path_class_`): Pointers / Grid /
+  unsplit Hirschberg (one result) or the same splitting Hirschberg mode.  `auto` resolves per
+  type, so where the narrow type's own choice leaves the class it is told: Grid (int16 Global
+  `auto` is pmax, a different tie-break) or the wide aligner's Hirschberg mode.  Linear runs
+  the code fill (explicit Pointers) where `auto` keeps the H table.  int64 fitting int16
+  narrows twice (chained).  Not narrowed: tracked, banded, scalar backend, Scores / rowwise
+  tables, empty sides.
+- **Inter-pair** (`BatchEngine`, "Inter-pair groups at the narrower type"): the pairs passing
+  the narrower type's QUARTER rule (the inter-pair kernels have no saturating regime) form
+  groups at NI's width under NI's own gates (`inter_pair_fits` / `inter_linear_cap` /
+  `inter_score_ok` at NI); each lane is adopted by `Work::nfull` (an `Aligner<NI>`) and walked
+  for gradient, guide and path; score-only groups run NI's inter score kernel.  Separate plans
+  (`nplan_`, `nplan_rows_`); the band groups keep `plan_`.  Untracked, hard / none only.
+  The plans are now also keyed on the params' bound facts (`same_bound_`): set_params() could
+  move a pair across a bound (a latent hole for int16's saturating regime, whose pairs must
+  not join a group).
+- Switches: `NWGRAD_INT_NARROW=0` turns off all narrowing; `NWGRAD_INT_NARROW_PATHS` = `0`
+  (score-only narrowing only), `own`, `inter` (one of the two), unset = both
+  (`int_narrow_paths()`; `int_narrow_paths_mode()` for the tests; `IntNarrowOff` scoped in the
+  routing tests, which check a type's own kernels).  An int8 tier (score-only) would extend
+  `nw_int_narrower` for `narrow_score_` only: the path / inter kernels stop at int16.
+- Tests: `[narrow]` in test_integer.cpp (on / off, 700 problems per type, every gap model,
+  mode, traceback, cutoff 8 / 24 / 512, every level here, params from step ~12 to ~1500);
+  `results/tools/int_path_ab.py` (on / off over whole batches at sse4 / sse2 / scalar_fallback,
+  mixed fitting / non-fitting pairs, every output incl. banded and set_params).
+- Not done: the streaming align (`align_stream`) inter fills.  Given up on the narrowed
+  problems: the dense codes (int16 never writes them) and int16 Local's `auto` Grid (it runs
+  Pointers); measure on AVX2 / NEON at L >= 2000.
+
+Measured (wloczykij, Piledriver sse4, user instructions per cell, two rep counts differenced,
+A = `NWGRAD_INT_NARROW=0`, A' = A again, B = on; 1 thread; BLOSUM62 11/1 or 0/4, DNA 2/-4 4/2):
+
+| config | A | A' | B | B/A |
+|---|---|---|---|---|
+| int64 protein L1000 affine Global path (Pointers -> int16 Grid, chained) | 49.99 | 49.97 | 8.79 | 0.18 |
+| int64 protein L1000 linear Global path | 30.11 | 30.12 | 6.74 | 0.22 |
+| int64 DNA L1000 linear Global path | 30.11 | 30.10 | 6.74 | 0.22 |
+| int32 protein L1000 affine Global path, auto (Grid) | 12.31 | 12.30 | 8.79 | 0.71 |
+| int32 protein L1000 affine Global path, grid | 12.30 | 12.30 | 8.81 | 0.72 |
+| int32 protein L1000 linear Global path | 13.83 | 13.87 | 6.70 | 0.48 |
+| int32 protein L1000 affine Local path | 14.89 | 14.90 | 13.10 | 0.88 |
+| int32 miRNA 22x50 score (256 pairs, interpair) | 12.36 | 11.77 | 4.19 | 0.34 |
+| int32 miRNA path | 12.19 | 12.62 | 8.09 | 0.66 |
+| int32 miRNA hard | 12.32 | 12.31 | 8.26 | 0.67 |
+| int32 DNA L100 path (64 pairs, interpair) | 9.29 | 9.28 | 5.17 | 0.56 |
+| int64 DNA L100 path | 24.94 | 25.05 | 9.18 | 0.37 |
+| int32 protein L100 path | 16.02 | 15.98 | 12.78 | 0.80 |
+| int64 protein L100 path | 31.78 | 31.70 | 16.09 | 0.51 |
+| int64 DNA L100 linear Global path | 16.45 | 16.44 | 4.95 | 0.30 |
+
+The narrowed numbers are the int16 batch's own (review: miRNA int16 score 4.19, path 8.18;
+int16 Grid 8.79).  Instruction counts only; AVX2 / AVX-512 / NEON compiled, not run.
 
 ### The soft path: scaled probability space (2026-10-05)
 

@@ -196,6 +196,7 @@ static inline double lse3(double a, double b, double c) noexcept {
 // DpBuffer (the DP table storage) now lives in its own header so the leveled kernel
 // TUs can include it without the whole Aligner.
 #include "dp_buffer.hpp"
+#include "parallel.hpp"   // nw_concurrent_workers
 
 // Runtime per-ISA-level dispatch table for the leveled affine kernels.
 #include "simd_levels.hpp"
@@ -330,6 +331,76 @@ inline int nw_int_bound_check(const NwIntBound<T>& ib, int m, int n) noexcept {
 // with their -march; see soft_kernel_impl.inl.
 namespace nwgrad_soft_base {
 #include "soft_kernel_impl.inl"
+}
+
+// Integer score-only at half the lane width (Aligner::narrow_score_): -1 = the
+// NWGRAD_INT_NARROW env (default on), 0 / 1 forced (the tests check both).
+inline std::atomic<int>& int_narrow_mode() noexcept {
+    static std::atomic<int> m{-1};
+    return m;
+}
+// ... and its sub-switch for everything beyond the own score-only fill, a mask:
+// kIntNarrowOwnPath (an Aligner's Viterbi fill, which every path, guide and hard gradient
+// reads: Pointers, Grid, Hirschberg / pmax, the linear fills) and kIntNarrowInter (the
+// batch's inter-pair fills, hard and score-only).  -1 = the NWGRAD_INT_NARROW_PATHS env:
+// unset or "1" both, "0" neither, "own" / "inter" one of them.  NWGRAD_INT_NARROW=0
+// turns all of it off as well.
+inline constexpr int kIntNarrowOwnPath = 1, kIntNarrowInter = 2;
+inline std::atomic<int>& int_narrow_paths_mode() noexcept {
+    static std::atomic<int> m{-1};
+    return m;
+}
+// Scoped: every narrowing off (the tests that check which kernel or traceback a type's
+// own fill ran -- the dense codes, the striped layout, ran_grid -- not results).
+struct IntNarrowOff {
+    int m0 = int_narrow_mode().exchange(0), p0 = int_narrow_paths_mode().exchange(0);
+    ~IntNarrowOff() { int_narrow_mode().store(m0); int_narrow_paths_mode().store(p0); }
+    IntNarrowOff() = default;
+    IntNarrowOff(const IntNarrowOff&) = delete;
+    IntNarrowOff& operator=(const IntNarrowOff&) = delete;
+};
+// Viterbi fills this thread ran narrowed (narrow_viterbi_ adoptions; a chained int64 ->
+// int16 run counts twice): the tests' liveness check, a plain per-thread counter.
+inline thread_local unsigned long nw_narrow_path_runs = 0;
+inline int int_narrow_paths() noexcept {
+    const int m = int_narrow_paths_mode().load(std::memory_order_relaxed);
+    if (m >= 0) return m;
+    static const int env = [] {
+        const char* e = std::getenv("NWGRAD_INT_NARROW_PATHS");
+        if (!e || !*e) return kIntNarrowOwnPath | kIntNarrowInter;
+        const std::string_view v(e);
+        if (v == "0") return 0;
+        if (v == "own") return kIntNarrowOwnPath;
+        if (v == "inter") return kIntNarrowInter;
+        return kIntNarrowOwnPath | kIntNarrowInter;
+    }();
+    return env;
+}
+
+// The next narrower lane type an integer problem may run in when its bound allows:
+// int32 -> int16, int64 -> int32 (void: none).  One tier per step; a problem two tiers
+// down (int64 fitting int16) gets there by chaining (the narrow aligner narrows again).
+// The path fills, Grid, Hirschberg and the inter-pair kernels exist for int16 / int32 /
+// int64 only, so a tier below int16 (int8, score-only kernels) would be added for the
+// score path alone (Aligner::narrow_score_), not here.
+template <class T> struct nw_int_narrower { using type = void; };
+template <> struct nw_int_narrower<std::int32_t> { using type = std::int16_t; };
+template <> struct nw_int_narrower<std::int64_t> { using type = std::int32_t; };
+template <class T> using nw_int_narrower_t = typename nw_int_narrower<T>::type;
+
+// T's bound facts in the narrower N, when they fit it: every fact is bounded by step_max
+// (step_max >= every |s|, every |go| + |ge|, and so every positive part, the gain and
+// |negative open|), so step_max <= nw_int_cap<N> is the whole condition -- and with it
+// every parameter is within N's cap, as nw_int_checked<N> would require.
+template <class N, class T>
+inline bool nw_int_bound_narrow(const NwIntBound<T>& ib, NwIntBound<N>& nb) noexcept {
+    if (!ib.prepared() || ib.step_max > static_cast<T>(nw_int_cap<N>)) return false;
+    nb.step_max = static_cast<N>(ib.step_max);
+    nb.smax_pos = static_cast<N>(ib.smax_pos); nb.smax_neg = static_cast<N>(ib.smax_neg);
+    nb.gain = static_cast<N>(ib.gain); nb.goneg = static_cast<N>(ib.goneg);
+    nb.goa_pos = static_cast<N>(ib.goa_pos); nb.gob_pos = static_cast<N>(ib.gob_pos);
+    nb.gea_pos = static_cast<N>(ib.gea_pos); nb.geb_pos = static_cast<N>(ib.geb_pos);
+    return true;
 }
 
 // ── Aligner ───────────────────────────────────────────────────────────────────
@@ -713,6 +784,10 @@ struct Aligner {
     // Whether the last Viterbi run took the Grid traceback (tests: Grid falls back to
     // Pointers silently where it does not apply, with the same result).
     bool ran_grid() const noexcept { return grid_; }
+    // Tests: Grid's base-block size (cells; blocks above it are gridded again) and its fill
+    // (min_seg: the striped block from that many segments, 1 = always, -1 = the scalar block).
+    void set_grid_base(long long cells, int min_seg) noexcept { grid_base_cells_ = cells; grid_base_min_seg_ = min_seg; }
+    long grid_striped_blocks() const noexcept { return grid_striped_blocks_; }   // striped base blocks run, ever
     // Rows per block at which the Hirschberg recursion stops splitting and solves
     // outright — see hb_cutoff_.  Unlike set_traceback this is safe to change between
     // runs: it alters how the DP divides, not what it retains.  It is a THREE-way knob
@@ -789,6 +864,8 @@ struct Aligner {
     // Whether the retained Viterbi tables (or direction bytes) are in the striped layout
     // of a leveled kernel — i.e. one ran, not the scalar fill.  For tests' liveness checks.
     bool tables_striped() const noexcept { return tables_striped_; }
+    // Whether the current integer problem runs the saturating regime (nw_int_bound_check 1).
+    bool saturating() const noexcept { return sat_; }
     // The B length from which the linear Full fill takes the leveled striped kernel.
     // ... on `backend` (a level id): AVX-512's lanes move some crossovers later.
     static int linear_striped_min_n(int backend) noexcept {
@@ -927,6 +1004,10 @@ struct Aligner {
         } else {
             const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
             if (backend != kBackendScalar) {
+                if constexpr (std::is_same_v<T, std::int32_t> || std::is_same_v<T, std::int64_t>) {
+                    double r;
+                    if (!tr_ && int_narrow_env() && narrow_score_(backend, r)) return r;
+                }
                 const auto fn = level_kernels(backend).template of<T>().score;
                 if (fn) {
                     ScoreJob<T> job{}; job.sat = sat_;
@@ -940,7 +1021,11 @@ struct Aligner {
                     job.ge_b = static_cast<T>(params_->gap_extend_b);
                     job.local = AM == AlignMode::Local ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
                     job.variant = score_variant_env();
-                    job.linear = lin && score_linear_env();
+#if defined(__aarch64__) || defined(_M_ARM64)
+                    job.linear = lin && linear_score_one_row(backend, n_, nalpha_);
+#else
+                    job.linear = lin && linear_score_one_row(backend, n_);
+#endif
                     job.buf = &buf;
                     if (tr_) fill_track_job_(job.tr, true, static_cast<size_t>(n_) + 16, lin);
                     fn(job);
@@ -955,6 +1040,221 @@ struct Aligner {
         check_problem();
         check_own_buf_allocated();
         return compute_score(own_buf_);
+    }
+
+    // ── Score-only at half the lane width (int32 -> int16, int64 -> int32) ──────
+    // An integer problem whose params and a-priori bound fit the narrower type runs that
+    // type's score kernel: twice the lanes, half the rows' bytes.  Exact: the narrower
+    // type's own bound (nw_int_bound_check, the quarter rule or int16's saturating
+    // regime) promises every reachable value is formed exactly and no sentinel-derived
+    // value wins a max, so the score is the same integer and the same double.  Needs
+    // every parameter within the narrow cap, which step_max <= nw_int_cap<N> implies
+    // (step_max >= every |s| and every |go| + |ge|).  Untracked problems only (a
+    // tracked one's per-row gaps would need the whole stack and set casts).  The
+    // narrow type's buffer is per thread (the rows grow to the longest B seen; the
+    // block's cast copy is redone per problem: nalpha^2 casts).
+    // NWGRAD_INT_NARROW=0 turns it off (the A/B switch); int_narrow_mode() is the
+    // tests' switch (-1 = the env / default on).
+    static bool int_narrow_env() {
+        const int m = int_narrow_mode().load(std::memory_order_relaxed);
+        if (m >= 0) return m != 0;
+        static const bool on = [] {
+            const char* e = std::getenv("NWGRAD_INT_NARROW");
+            return !(e && e[0] == '0');
+        }();
+        return on;
+    }
+    bool narrow_score_(int backend, double& out) {
+        if constexpr (std::is_same_v<T, std::int32_t> || std::is_same_v<T, std::int64_t>) {
+            using N = nw_int_narrower_t<T>;
+            NwIntBound<N> nb;
+            if (!nw_int_bound_narrow(ib_, nb)) return false;
+#if defined(__aarch64__) || defined(_M_ARM64)
+            // AArch64, int32 -> int16, linear Global: not at 11-13 int16 segments a row
+            // (n 81-104, 8 lanes).  spot (M1, 1 thread, DNA score-only, narrowed / int32):
+            // L70 0.81, L80 0.98, L90 1.10, L100 1.04, L110 0.99, L125 0.90, L150 0.60.  Main's
+            // int16 linear kernel itself runs ~32 ns a row at L100 against ~26 at L150 there
+            // (main's int16 batch shows it too); the code has no switch at these lengths, so
+            // this is an empirical window, not a fix of its cause.  Exact either way (the
+            // narrowed and the int32 kernel give the same score); Local and affine never lost.
+            // Glocal too: spot DNA L100 linear Glocal int32 score-only 1.041-1.047 narrowed.
+            if constexpr (std::is_same_v<N, std::int16_t> && GM == GapModel::Linear && AM != AlignMode::Local) {
+                constexpr int kSkipSegLo = 11, kSkipSegHi = 13;
+                const int seg16 = (n_ + 7) / 8;
+                if (seg16 >= kSkipSegLo && seg16 <= kSkipSegHi) return false;
+            }
+#endif
+            const int why = nw_int_bound_check<N, AM == AlignMode::Local, false>(nb, m_, n_);
+            if (why < 0) return false;
+            const auto fn = level_kernels(backend).template of<N>().score;
+            if (!fn) return false;
+            struct Scratch { DpBufferT<N> buf; std::vector<N> blk; };
+            static thread_local Scratch sc;
+            const std::size_t nn = static_cast<std::size_t>(nalpha_) * nalpha_;
+            sc.blk.resize(nn);
+            for (std::size_t k = 0; k < nn; ++k) sc.blk[k] = static_cast<N>(blkT_[k]);
+            ScoreJob<N> job{}; job.sat = why == 1;
+            job.a = a_idx_.data(); job.m = m_;
+            job.b = b_idx_.data(); job.n = n_;
+            job.blk = sc.blk.data(); job.nalpha = nalpha_;
+            const bool lin = GM == GapModel::Linear;
+            job.go_a = lin ? N(0) : static_cast<N>(params_->gap_open_a);
+            job.ge_a = static_cast<N>(params_->gap_extend_a);
+            job.go_b = lin ? N(0) : static_cast<N>(params_->gap_open_b);
+            job.ge_b = static_cast<N>(params_->gap_extend_b);
+            job.local = AM == AlignMode::Local ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
+            job.variant = score_variant_env();
+            job.linear = lin && score_linear_env();
+            job.buf = &sc.buf;
+            fn(job);
+            out = static_cast<double>(job.score);
+            return true;
+        } else {
+            (void)backend; (void)out;
+            return false;
+        }
+    }
+
+    // ── The Viterbi fill at half the lane width (int32 -> int16, int64 -> int32) ──────
+    // The path-producing counterpart of narrow_score_: an untracked Full integer problem
+    // whose params fit the narrower type N and which passes N's own bound (the quarter
+    // rule, or int16's saturating regime) runs its Viterbi fill as an Aligner<..., N> --
+    // twice the lanes, half the bytes a row -- and this aligner adopts the result.  Exact:
+    // under N's bound every reachable DP value of the narrow fill is the wide fill's, as
+    // an integer, and no sentinel-derived value wins a max; every direction code and every
+    // walk step comes from comparisons of those values in the same order, so the score,
+    // the path, its ties, the guide and the hard gradient are the wide fill's.
+    //   What is adopted: Pointers' direction codes (one byte or the dense 2-bit fields;
+    //   type-free, swapped into `buf`, with the layout the narrow kernel chose), or the
+    //   held path (Grid, Hirschberg: hops_ and its start), the end cell and state, and the
+    //   score, widened.  Every consumer then walks or replays exactly what it would have.
+    //   The narrow run must take an algorithm of the same CLASS as this one's (path_class_):
+    //   the Pointers class (Pointers, Grid, an unsplit Hirschberg pair -- one result,
+    //   ties included) or the same splitting Hirschberg mode (a different tie-break).
+    //   `auto` resolves per type (pointer budgets, int16's pmax), so where the narrow
+    //   type's own choice leaves the class it is told which mode to run: Grid (Pointers'
+    //   result; where Grid does not apply it runs Pointers) or this aligner's Hirschberg
+    //   mode.  Linear runs the direction-code fill (explicit Pointers) where `auto` would
+    //   keep the H table: H is T-typed, codes are not; the same path either way.
+    // Not narrowed: tracked problems (per-row gaps), banded ones, the scalar backend
+    // (the same scalar loop at either width), Scores / rowwise tables (kept for reading),
+    // empty sides.  int64 fitting int16 narrows twice (the int32 aligner narrows again).
+    // The narrow aligner and its buffer are per thread (the code table moves into `buf`
+    // and the replaced one is kept for the next problem).  NWGRAD_INT_NARROW=0 or
+    // NWGRAD_INT_NARROW_PATHS=0 / =inter turn it off (int_narrow_paths()).
+    template <GapModel, AlignMode, AlignBand, class> friend struct Aligner;
+    // AVX-512, a narrowed int16 run that would take Grid takes Pointers up to this many cells
+    // (solace, int16 Local pointers / grid 0.57-0.73 at L1000-L1500, 1 and 8 threads; L1450
+    // is 2^21 cells) -- above it the int32 run stays (unmeasured: NEEDS THE FLEET).
+    static constexpr std::size_t kNarrowI16PtrCells512 = std::size_t(1) << 21;
+    // The call's narrowed int16 one-byte code tables, all workers together, that may replace
+    // a wide fill's dense codes (see narrow_viterbi_): 16 MiB.  NEEDS THE FLEET (one host
+    // pair calibrated it).
+    static constexpr std::size_t kNarrowCodeBytes = std::size_t(16) << 20;
+    // 0: the Pointers class; 1: a splitting Hirschberg mode (run_tb_()); -1: this run
+    // throws (an explicit Hirschberg mode with a negative penalty).  run_viterbi's dispatch.
+    int path_class_() const {
+        const TracebackMode rt = run_tb_();
+        if (is_hirschberg(rt) && hb_splits(rt, tb_auto_ ? kAutoPointerCells : 0, hb_cutoff_, m_, n_)) {
+            if (!hb_penalties_ok_()) return tb_auto_ ? 0 : -1;
+            return 1;
+        }
+        return 0;
+    }
+    bool narrow_viterbi_(DpBuffer& buf) {
+        if constexpr (AB == AlignBand::Full && (std::is_same_v<T, std::int32_t> || std::is_same_v<T, std::int64_t>)) {
+            using N = nw_int_narrower_t<T>;
+            if (tr_ || m_ == 0 || n_ == 0 || rowwise_full_ || !int_narrow_env() ||
+                !(int_narrow_paths() & kIntNarrowOwnPath)) return false;
+            if (!tb_auto_ && tb_ == TracebackMode::Scores) return false;
+            const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
+            if (backend == kBackendScalar) return false;
+            NwIntBound<N> nb;
+            if (!nw_int_bound_narrow(ib_, nb)) return false;
+            if (nw_int_bound_check<N, AM == AlignMode::Local, false>(nb, m_, n_) < 0) return false;
+            const int cls = path_class_();
+            if (cls < 0) return false;
+            struct Scratch { Aligner<GM, AM, AlignBand::Full, N> al; DpBufferT<N> buf; std::vector<N> blk; };
+            static thread_local Scratch sc;
+            const std::size_t nn = static_cast<std::size_t>(nalpha_) * nalpha_;
+            sc.blk.resize(nn);
+            for (std::size_t k = 0; k < nn; ++k) sc.blk[k] = static_cast<N>(blkT_[k]);
+            auto& na = sc.al;
+            na.backend_ = backend_;
+            na.hb_cutoff_ = hb_cutoff_;
+            na.dense_mode_ = dense_mode_;
+            na.rowwise_full_ = false;
+            na.tb_ = tb_; na.tb_auto_ = tb_auto_;
+            na.set_problem(a_idx_, b_idx_, *params_, 0, {}, {}, {}, sc.blk.data(), nullptr, &nb);
+            // Where this type's `auto` takes Grid, the narrow run takes Grid too (an explicit
+            // request), whatever its own `auto` would: int16 Local `auto` keeps Pointers
+            // within the pointer budget, and an int32 Local path narrowed onto it lost
+            // (nighthaven AVX2, DNA L3000: 1.07 at 1 thread, 1.43 and 3.3x the RSS at 6;
+            // explicit Grid there 0.39).  Elsewhere the narrow type's own choice stands
+            // (int64 Global within its budget runs Pointers, narrowed int32 Grid).
+            if (cls == 0 && tb_auto_ && run_tb_() == TracebackMode::Grid && grid_ok_(level_kernels(backend)))
+                na.set_traceback(TracebackMode::Grid);
+            if (na.path_class_() != cls) {
+                if (cls == 0) na.set_traceback(GM == GapModel::Affine ? TracebackMode::Grid : TracebackMode::Pointers);
+                else          na.set_traceback(run_tb_());
+                if (na.path_class_() != cls) return false;
+            }
+            if constexpr (GM == GapModel::Linear)
+                if (cls == 0 && !na.linear_ptr_fill()) na.set_traceback(TracebackMode::Pointers);
+            if constexpr (sizeof(N) == 2) {
+                const LevelKernels& K = level_kernels(backend);
+                const std::size_t cells = (static_cast<std::size_t>(m_) + 1) * (static_cast<std::size_t>(n_) + 1);
+                auto runs_grid = [&](const auto& al) {
+                    return GM == GapModel::Affine && al.run_tb_() == TracebackMode::Grid && al.grid_ok_(K);
+                };
+#if !(defined(__aarch64__) || defined(_M_ARM64))
+                // AVX-512: int16 Grid at 32 lanes is slow (solace: narrowed int16 Grid / int32
+                // Grid 1.05-1.08 at L1000, int16 grid / pointers 1.6-1.85 at L700-L1500), so the
+                // narrowed run takes int16 Pointers (the same result) within kNarrowI16PtrCells512
+                // and is not narrowed above it.
+                if (cls == 0 && backend == static_cast<int>(SimdLevel::Avx512) && runs_grid(na)) {
+                    if (cells > kNarrowI16PtrCells512) return false;
+                    na.set_traceback(TracebackMode::Pointers);
+                }
+#endif
+                // int16 never writes the dense codes: where this type's fill would (a code
+                // fill past dense_gate_), the narrowed one-byte table is the bigger one, and it
+                // loses once the call's concurrent tables pass the shared cache -- so it is not
+                // narrowed when workers x cells one-byte codes exceed kNarrowCodeBytes.  Measured
+                // (int32 linear Global path, narrowed / int32 with its dense codes): nighthaven
+                // AVX2 (18 MB L3) 1 thread wins to L3000 (0.31-0.55; 9 MB), 6 threads L2000 loses
+                // 1.11-1.15 (24 MB); solace AVX-512 (24 MB L3) 1 thread L2000 0.54 (4 MB), 8
+                // threads L2000 1.65-1.71 (32 MB).  16 MiB sits between the last win and the
+                // first loss on both.
+                if (cls == 0 && !runs_grid(na) && want_dense_()) {
+                    const bool wide_codes = GM == GapModel::Linear ? linear_ptr_fill() : !runs_grid(*this);
+                    const std::size_t workers = static_cast<std::size_t>(std::max(1, nw_concurrent_workers));
+                    if (wide_codes && workers * cells > kNarrowCodeBytes) return false;
+                }
+            }
+            na.ensure_viterbi_ptruf(sc.buf);
+            na.run_viterbi(sc.buf);
+            // Every Pointers-class fill above leaves codes or a held path, never T-typed
+            // tables; anything else would not be adoptable (this aligner then runs its own).
+            if (!na.pointers_ && !na.hirschberg_) return false;
+            viterbi_score_ = static_cast<T>(na.viterbi_score_);
+            best_i_ = na.best_i_; best_j_ = na.best_j_;
+            best_tbl_ = static_cast<TBTable>(static_cast<int>(na.best_tbl_));   // (one enum per instantiation)
+            pointers_ = na.pointers_; dense_ = na.dense_;
+            tables_striped_ = na.tables_striped_;
+            striped_seg_ = na.striped_seg_; striped_w_ = na.striped_w_; striped_rs_ = na.striped_rs_;
+            inter_w_ = 0;
+            hirschberg_ = na.hirschberg_; grid_ = na.grid_;
+            grid_end_ = na.grid_end_; grid_end_i_ = na.grid_end_i_; grid_empty_ = na.grid_empty_;
+            hb_start_i_ = na.hb_start_i_; hb_start_j_ = na.hb_start_j_;
+            hops_.swap(na.hops_);
+            if (pointers_) std::swap(buf.DM, sc.buf.DM);
+            ++nw_narrow_path_runs;
+            return true;
+        } else {
+            (void)buf;
+            return false;
+        }
     }
 
     // soft_guide="posterior": the next forward-backward also records, per row of A, the
@@ -1603,9 +1903,9 @@ private:
         std::is_same_v<T, float> ? TracebackMode::HirschbergPmax
         : AM == AlignMode::Global ? TracebackMode::Hirschberg
                                   : TracebackMode::Pointers;
-    // Local `auto` takes the one-pass Grid inside the pointer budget too (run_tb_): every
-    // type but int16, which tied Pointers there (nighthaven 0.98 at L1000).
-    static constexpr bool kLocalGridAuto = !(nw_is_int<T> && sizeof(T) == 2);
+    // Local `auto` takes the one-pass Grid inside the pointer budget too (run_tb_), every
+    // type; int16 from a floor per level (local_grid_min_rows).
+    static constexpr bool kLocalGridAuto = true;
     static constexpr TracebackMode kDefaultTb =
         (GM == GapModel::Affine && AB == AlignBand::Full)
             ? (nw_is_int<T> ? TracebackMode::HirschbergPmax : TracebackMode::Grid)
@@ -1771,7 +2071,7 @@ private:
         // float32 L1000 0.65, L3000 0.51 (6 threads 0.66 / 0.47), int32 0.57 / 0.42 (0.60 /
         // 0.41), int64 0.51 / 0.41, memory lower; skynet sse4 see AGENTS.md ("Grid at integer
         // T").  The floor is hb_cutoff (grid_ok_: m > hb_cutoff, Pointers below), as for
-        // Global.  int16 excluded (kLocalGridAuto): a tie on nighthaven (0.98 at L1000).
+        // Global.  int16 from a floor per level (local_grid_min_rows).
         if constexpr (GM == GapModel::Affine && AB == AlignBand::Full && AM == AlignMode::Local &&
                       kLocalGridAuto)
             if (tb_auto_ && (tb_ == TracebackMode::Grid || tb_ == TracebackMode::HirschbergPmax) &&
@@ -1795,17 +2095,15 @@ private:
         // than Pointers and 2.1-5.5x than pmax (skynet sse4, AGENTS.md "Grid traceback").
         // Within the budget Pointers stays; a tracked pair or the scalar backend keeps pmax.
         // The batch planners ask hb_splits of pmax, true either way, so such pairs run their
-        // own fill in both cases.  NOT int16 Global / Glocal: at 32 int16 lanes (AVX-512,
-        // solace) pmax beat Grid on L1000-class protein pairs, `auto` 1.09-1.24x slower
-        // with Grid (DNA L3000 0.53x faster; nighthaven AVX2 int16 Global L1000 0.84-0.91x),
-        // so they keep pmax, as on main; traceback="grid" stays available for them.  int16
-        // Local takes Grid (above the budget, where pmax's two endpoint scans are the cost).
-        if constexpr (GM == GapModel::Affine && AB == AlignBand::Full && nw_is_int<T> &&
-                      !(sizeof(T) == 2 && AM != AlignMode::Local))
+        // own fill in both cases.  int16 Global / Glocal take Grid from int16_grid_min_rows
+        // (below): hb_cutoff except on AVX-512.  int16 Local takes Grid (above the budget,
+        // where pmax's two endpoint scans are the cost).
+        if constexpr (GM == GapModel::Affine && AB == AlignBand::Full && nw_is_int<T>)
             if (tb_auto_ && tb_ == TracebackMode::HirschbergPmax &&
                 hb_splits(tb_, kAutoPointerCells, hb_cutoff_, m_, n_)) {
                 const int be = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
-                if (be != kBackendScalar && grid_ok_(level_kernels(be))) return TracebackMode::Grid;
+                if (be != kBackendScalar && m_ >= int16_grid_min_rows(be) && grid_ok_(level_kernels(be)))
+                    return TracebackMode::Grid;
             }
         return tb_;
     }
@@ -1830,12 +2128,51 @@ private:
     // wins 1.6x up to L=350 (1 MB), ties at L=500 (2 MB), loses 2.4x at 700 and 3.5x
     // at 1000.  Same path either way, so this is a speed choice only.
     static constexpr size_t kLinearHTableBytes = size_t(2) << 20;
+    // AVX-512, int16 Local: 1 MiB (L ~720).  solace (Tiger Lake, 1.25 MiB L2), branch
+    // narrow-paths 7939230 whose linear fill is main's, Pointers / auto (H) time, DNA and
+    // protein, 1 / 8 threads: L500 (0.5 MB of H) 1.03-1.19, H wins; L700 (0.99 MB) 0.98 /
+    // 0.88; L1000 (2 MB) 0.60-0.72; from L1200 auto already runs Pointers (0.98-1.02).  A
+    // 768 KiB cap sent L700 to Pointers and lost there (PR #55 phase 3: DNA L700 1T 1.074-
+    // 1.080, instructions 1.085), so L700 stays on H; L800 (1.28 MB) and up take Pointers.
+    // AVX2 on the same host keeps H to L1000 (Pointers / H 1.00-1.07), NEON too (spot:
+    // main's auto 11-15 % ahead up to L1000), so they keep 2 MiB.
+    // AVX-512, int16 Global: 864 KiB (L ~665).  solace (PR #49 053ebc0, whose linear fill is
+    // main's, 1 thread), Pointers / main's auto (H) time, DNA / protein: L600 (0.72 MB of H)
+    // 1.07-1.13, H wins; L700 (0.99 MB) 0.905-0.933 (H itself 0.975-1.01 of main); L800
+    // (1.28 MB) 0.60 / 0.61; L1000 0.54 / 0.45; L1500 already Pointers.  Glocal: 2 MiB.
+    static constexpr size_t kLinearHTableBytes512 =
+        !std::is_same_v<T, int16_t> ? kLinearHTableBytes
+        : AM == AlignMode::Local    ? size_t(1) << 20
+        : AM == AlignMode::Global   ? size_t(864) << 10
+                                    : kLinearHTableBytes;
+    // Whether an `auto` pair's H table is past its level's cap.  The level is looked up only
+    // for a table between the AVX-512 cap and the common one (int16 Local / Global past
+    // 864 KiB-1 MiB); every other pair -- the short ones above all -- pays one compare, as on
+    // main (PR #55 phase 3: resolving the level for every pair cost short linear int16 paths
+    // +0.7-0.9 % instructions).
+    // The AVX-512 test lives out of line (noinline, cold): inlined, it made gcc outline
+    // compute_viterbi and the traceback's subT() in the int16 linear instantiations, +0.3-0.8 %
+    // instructions on short paths (sse4 counts).
+    [[gnu::noinline, gnu::cold]] bool linear_h_table_avx512_() const noexcept {
+#if !(defined(__aarch64__) || defined(_M_ARM64))
+        const int be = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
+        return be == static_cast<int>(SimdLevel::Avx512);
+#else
+        return false;
+#endif
+    }
+    bool linear_h_table_exceeds(size_t bytes) const noexcept {
+        if (bytes > kLinearHTableBytes) return true;
+        if constexpr (kLinearHTableBytes512 < kLinearHTableBytes)
+            if (bytes > kLinearHTableBytes512) [[unlikely]] return linear_h_table_avx512_();
+        return false;
+    }
     bool linear_ptr_fill() const noexcept {
         if constexpr (GM != GapModel::Linear || AB != AlignBand::Full) return false;
         else {
             if (is_hirschberg(tb_) || tb_ == TracebackMode::Grid) return true;
             if (tb_ != TracebackMode::Pointers) return false;
-            return !tb_auto_ || sz_ * sizeof(T) > kLinearHTableBytes;
+            return !tb_auto_ || linear_h_table_exceeds(sz_ * sizeof(T));
         }
     }
 
@@ -2459,6 +2796,7 @@ private:
     // vectorize linear ACROSS pairs instead — SeqPairBatch fill="interpair", one pair per
     // lane, bit-identical — which sidesteps the chain.)
     void run_viterbi(DpBuffer& buf) {
+        if (narrow_viterbi_(buf)) return;   // an integer problem the narrower type holds
         // `auto` resolved to Grid where Grid does not apply: this run takes the previous
         // default (kGridFallbackTb) — its memory bound — and tb_ is restored after it.
         struct TbRestore {
@@ -2649,9 +2987,80 @@ private:
     // AVX-512 int32 / int64 0.45-0.87 and double 0.57-0.84 there, nighthaven AVX2 float32
     // L1000 0.65.  Below the floor a budgeted pair runs Pointers, as on main.
     static constexpr int kLocalGridMinRows512 = std::is_same_v<T, float> ? 2048 : 0;
+    // int16, every level: from 1000 rows (was: never inside the budget, a tie at L1000 on
+    // nighthaven before round 1).  Re-measured 2026-11-10, DNA Local path: nighthaven AVX2
+    // auto (Pointers) / grid 1 thread 1.32 L2000, 2.75 L3000, 2.25 L4000, Grid 2.7-3x at 6
+    // threads from L3000 (Pointers' code table grows with m * n); wloczykij sse4 user
+    // instructions per cell, pointers / grid: DNA L1000 12.99 / 9.91, L2000 12.80 / 9.31,
+    // L3000 12.76 / 6.31, protein L1000 13.06 / 10.09, L2000 12.83 / 9.45; below the floor DNA
+    // L600 13.87 / 9.93, L800 13.24 / 9.91 -- fewer instructions from hb_cutoff on, but
+    // Pointers' table is in cache there and instructions do not show it (nighthaven measured
+    // the tie at L1000 before round 1).  1000 is the conservative floor; NEEDS THE FLEET
+    // (L500-L1500, AVX2 / AVX-512 / NEON, 1 and 6 threads) to settle it, possibly lower.
+    // Affine only, at compile time: run_tb_'s Local Grid clause is `if constexpr (GM ==
+    // Affine ...)`, and linear has no Grid (an explicit "grid" runs Pointers), so a linear
+    // int16 Local pair never reads this floor and keeps main's choice (the H table under
+    // `auto`; spot NEON: it beats pointers and grid by 11-15 % up to L1000).  spot measured
+    // Per level (2026-11-11): AVX2 1000 (nighthaven, above); NEON 600 (spot M1: Grid / main's
+    // Pointers 0.956-0.978 at L700, 0.946-0.977 at L700-L1000 with the floor at 700, a floor
+    // of 600 a further 1.4-3.5 %, a tie at L500); AVX-512 never (solace: int16 Grid at 32
+    // lanes is slow -- forced grid / pointers 1.70-1.85 at L700, the branch's auto 1.6-1.8x
+    // main's at L1000-L1500, DNA and protein, 1 and 8 threads; Pointers stays until the Grid
+    // base block changes); sse2 / sse4 1000 (the instruction counts above favour Grid from
+    // hb_cutoff, but no wall-clock below L1000: the conservative floor).  AVX2 disagrees across
+    // cores: solace forced to AVX2 (Tiger Lake, 16 lanes) had Grid 1.08-1.19x Pointers at
+    // L1000-L1500, 1 thread, where nighthaven (Alder Lake, the primary target) had Grid 3-9 %
+    // faster at 1 and 6 threads; a level constant cannot tell them apart and a Tiger Lake runs
+    // the AVX-512 level anyway, so AVX2 follows nighthaven.
+    static constexpr int kLocalGridMinRowsI16Avx2 = 1000, kLocalGridMinRowsI16Neon = 600,
+                         kLocalGridMinRowsI16Sse = 1000, kLocalGridOff = std::numeric_limits<int>::max();
     static int local_grid_min_rows(int backend) noexcept {
+        int r = 0;
 #if !(defined(__aarch64__) || defined(_M_ARM64))
-        if (backend == static_cast<int>(SimdLevel::Avx512)) return kLocalGridMinRows512;
+        if (backend == static_cast<int>(SimdLevel::Avx512)) r = kLocalGridMinRows512;
+#endif
+        if constexpr (nw_is_int<T> && sizeof(T) == 2) {
+#if defined(__aarch64__) || defined(_M_ARM64)
+            r = std::max(r, kLocalGridMinRowsI16Neon);
+#else
+            r = backend == static_cast<int>(SimdLevel::Avx512) ? kLocalGridOff
+              : backend == static_cast<int>(SimdLevel::Avx2)   ? std::max(r, kLocalGridMinRowsI16Avx2)
+                                                               : std::max(r, kLocalGridMinRowsI16Sse);
+#endif
+        }
+        (void)backend;
+        return r;
+    }
+    // int16 Global / Glocal `auto` (run_tb_): the rows from which a splitting pair runs Grid
+    // instead of hirschberg_pmax, beyond hb_splits' m > hb_cutoff.  Until 2026-11-10 they kept
+    // pmax everywhere, for AVX-512 (solace, 32 int16 lanes), where Grid made `auto` 1.09-1.24x
+    // slower at L1000 protein (DNA L3000 0.53x).  Every other level loses with pmax: spot (M1,
+    // NEON, 1 thread) grid / pmax DNA L1000 0.912, protein L1000 0.870, DNA L3000 0.492
+    // (results/spot.md "Round 2"); nighthaven AVX2 L1000 0.84-0.91; skynet-class sse4 see
+    // AGENTS.md "int16 Global auto takes Grid".  So hb_cutoff there; AVX-512 below
+    // (kInt16GridMinRows512).  Local: 0 (Grid past the budget, as before).
+    // AVX2, Global only: from 1000 rows.  nighthaven (2026-11-10, PR #55) grid / pmax DNA L600
+    // 1.013 at 1 thread, 1.038 at 6 (Grid's scalar base case: 0.300 vs pmax's 0.295 ns/cell),
+    // protein L600 0.83-0.85, L1000 up wins; Glocal wins everywhere (0.25-0.56), so it keeps
+    // hb_cutoff.  PR #45's striped Grid base case should let this floor drop to hb_cutoff.
+    // AVX-512 (solace, Tiger Lake, 1 thread, 2026-11-11, PR #55 against main's pmax `auto`):
+    // Global, forced Grid (scalar base case) DNA / protein L1000 1.24 / 1.09, L1500 1.05 /
+    // 0.92, L2048 1.08 / 0.96 (2048-row `auto` 1.091 / 0.972: a DNA loss), L3000 DNA 0.52 --
+    // L2500 DNA 0.551 (2026-11-12) -- so Global from 2500 rows.  Glocal, forced Grid L700 / L800
+    // 0.53-0.60 (auto there was still main's), L1000 0.59 / 0.53, L1500 0.54 / 0.49, L2048
+    // 0.55 / 0.50, L600 0.52-0.71 (2026-11-13; L400 / L500 neutral, 0.99-1.01) -- from 600
+    // rows.  PR #45's striped base case
+    // moves the Global crossover to ~L1500 (0.55 / 0.54 there).
+    static constexpr int kInt16GridMinRows512 =
+        !std::is_same_v<T, int16_t> ? 0
+        : AM == AlignMode::Global   ? 2500
+        : AM == AlignMode::Glocal   ? 600 : 0;
+    static constexpr int kInt16GridMinRowsAvx2 =
+        (std::is_same_v<T, int16_t> && AM == AlignMode::Global) ? 1000 : 0;
+    static int int16_grid_min_rows(int backend) noexcept {
+#if !(defined(__aarch64__) || defined(_M_ARM64))
+        if (backend == static_cast<int>(SimdLevel::Avx512)) return kInt16GridMinRows512;
+        if (backend == static_cast<int>(SimdLevel::Avx2))   return kInt16GridMinRowsAvx2;
 #endif
         (void)backend;
         return 0;
@@ -4319,6 +4728,23 @@ private:
     static constexpr long long kGridBase = 64 * 64;   // long long: `long` is 32-bit on Windows (LLP64)
     static constexpr int  kGridMin = 8;      // rows / columns per block, at least
     static constexpr int  kGridDepth = 64;   // recursion levels (never reached: ~log_k(m))
+    // The striped base block from this many segments of W lanes (fewer: the scalar block).
+    static constexpr int  kGridBaseMinSeg = 2;
+    long long grid_base_cells_ = kGridBase;     // set_grid_base (tests: small blocks)
+    long grid_striped_blocks_ = 0;
+    int grid_base_w_ = 0;                       // the striped block's W, once known (per problem)
+    int grid_base_min_seg_ = grid_base_min_seg_env_();   // -1: scalar always
+    // NWGRAD_GRID_BASE: unset = the switch above, "scalar" = the scalar block always,
+    // "striped" = the striped block at any width (one segment up) -- for measuring.
+    static int grid_base_min_seg_env_() {
+        static const int v = [] {
+            const char* e = std::getenv("NWGRAD_GRID_BASE");
+            if (!e) return kGridBaseMinSeg;
+            const std::string_view s(e);
+            return s == "scalar" ? -1 : s == "striped" ? 1 : kGridBaseMinSeg;
+        }();
+        return v;
+    }
 
     struct GridLine {                        // value(s, idx) = p[s*ss + idx*es]
         const T* p; std::size_t ss, es;
@@ -4361,6 +4787,7 @@ private:
         grid_end_ = n_;
         grid_pick_end_ = AM == AlignMode::Glocal;   // the end column comes from row m
         grid_stop_ = false;
+        grid_base_w_ = 0;
         grid_find_best_ = false; grid_empty_ = false; grid_end_i_ = -1;
         if constexpr (AM == AlignMode::Local) {
             // Every gap parameter >= 0 and a top level above the base size: the top level's
@@ -4418,16 +4845,16 @@ private:
         grid_ = true;
     }
 
-    // A rectangle of h x w cells runs the grid kernel (else the scalar base block).
-    static bool grid_splits_(int h, int w) noexcept {
-        return !(static_cast<long long>(h) * w <= kGridBase || h < 2 * kGridMin || w < 2 * kGridMin);
+    // A rectangle of h x w cells runs the grid kernel (else the base block).
+    bool grid_splits_(int h, int w) const noexcept {
+        return !(static_cast<long long>(h) * w <= grid_base_cells_ || h < 2 * kGridMin || w < 2 * kGridMin);
     }
 
     void grid_solve(DpBuffer& buf, const LevelKernels& K, int r0, int c0, const GridLine& top,
                     const GridLine& left, int depth, int& i, int& j, int& st) {
         const int r1 = i, c1 = j, h = r1 - r0, w = c1 - c0;
         if (!grid_splits_(h, w) || depth + 1 >= kGridDepth) {
-            grid_base(buf, r0, r1, c0, c1, top, left, i, j, st);
+            grid_base(buf, K, r0, r1, c0, c1, top, left, i, j, st);
             return;
         }
         auto& L = buf.glv[static_cast<std::size_t>(depth)];
@@ -4480,10 +4907,82 @@ private:
         }
     }
 
-    // The base block: viterbi_affine_ptr's fill over [r0, r1] x [c0, c1] from its borders,
-    // then the walk from (i, j) until the top row or the left column.
-    void grid_base(DpBuffer& buf, int r0, int r1, int c0, int c1, const GridLine& top,
-                   const GridLine& left, int& i, int& j, int& st) {
+    // The base block: the Pointers fill over [r0, r1] x [c0, c1] from its borders, then the
+    // walk from (i, j) until the top row or the left column.  The leveled striped fill
+    // (grid_base_striped, grid_kernel_impl.inl) from kGridBaseMinSeg segments, else the
+    // scalar one below (viterbi_affine_ptr's expressions; also the reference the striped
+    // fill is tested against).  A linear Grid would add its own pair here, one state.
+    void grid_base(DpBuffer& buf, const LevelKernels& K, int r0, int r1, int c0, int c1,
+                   const GridLine& top, const GridLine& left, int& i, int& j, int& st) {
+        if (grid_base_striped_(buf, K, r0, r1, c0, c1, top, left, i, j, st)) return;
+        grid_base_scalar_(buf, r0, r1, c0, c1, top, left, i, j, st);
+    }
+
+    // The striped block (GridBaseJob); false when it declines (narrow, or no kernel).
+    bool grid_base_striped_(DpBuffer& buf, const LevelKernels& K, int r0, int r1, int c0, int c1,
+                            const GridLine& top, const GridLine& left, int& i, int& j, int& st) {
+        const auto fn = K.template of<T>().grid_base;
+        if (!fn || grid_base_min_seg_ < 0) return false;
+        // Declined widths skip the call: at L3000 most base blocks are a few columns wide
+        // (the second level's lines), one segment at int16, and need no job built.  W comes
+        // from the problem's first call (grid_base_w_, reset per problem: the level may
+        // change).  No row gate: striped from 1 / 4 / 8 / 16 rows measured within 1 % at
+        // L3000 and 4-6 % worse from 16 rows at L1000 (wloczykij sse4, instructions).
+        if (grid_base_w_ > 0 && (c1 - c0 + grid_base_w_ - 1) / grid_base_w_ < grid_base_min_seg_) return false;
+        GridBaseJob<T> J{};
+        J.a = a_idx_.data(); J.b = b_idx_.data(); J.blk = blkT_; J.nalpha = nalpha_;
+        J.go_a = static_cast<T>(params_->gap_open_a); J.ge_a = static_cast<T>(params_->gap_extend_a);
+        J.go_b = static_cast<T>(params_->gap_open_b); J.ge_b = static_cast<T>(params_->gap_extend_b);
+        J.r0 = r0; J.r1 = r1; J.c0 = c0; J.c1 = c1;
+        J.top = top.p; J.top_ss = top.ss; J.top_es = top.es;
+        J.left = left.p; J.left_ss = left.ss; J.left_es = left.es;
+        J.buf = &buf;
+        J.local = AM == AlignMode::Local ? 1 : 0;
+        J.sat = sat_;
+        J.min_seg = grid_base_min_seg_;
+        if (st < 0) J.last = &buf.glast3;   // the end cell's row (Glocal: its column too)
+        fn(J);
+        grid_base_w_ = J.W;
+        if (!J.done) return false;
+        ++grid_striped_blocks_;
+        const int W = J.W, seg = J.seg;
+        const std::size_t sw = static_cast<std::size_t>(seg) * static_cast<std::size_t>(W);
+        if (st < 0) {
+            const std::size_t w1 = static_cast<std::size_t>(c1 - c0) + 1;
+            const T* lr = buf.glast3.data();
+            if (grid_pick_end_) {   // Glocal, the whole problem one block: row m's first best column
+                int bj = c0; T best = std::max({lr[0], lr[w1], lr[2 * w1]});
+                for (int jj = c0 + 1; jj <= c1; ++jj) {
+                    const std::size_t c = static_cast<std::size_t>(jj - c0);
+                    const T v = std::max({lr[c], lr[w1 + c], lr[2 * w1 + c]});
+                    if (v > best) { best = v; bj = jj; }
+                }
+                j = bj; grid_end_ = bj; grid_pick_end_ = false;
+            }
+            // the end cell (m, n): its argmax and the score, as viterbi_affine_ptr
+            const std::size_t c = static_cast<std::size_t>(j - c0);
+            const T vm = lr[c], vx = lr[w1 + c], vy = lr[2 * w1 + c];
+            viterbi_score_ = std::max({vm, vx, vy});
+            st = (vm >= vx && vm >= vy) ? 0 : (vx >= vy ? 1 : 2);
+            best_tbl_ = st == 0 ? TBTable::M : (st == 1 ? TBTable::X : TBTable::Y);
+        }
+        const unsigned char* D = buf.gD.data();
+        while (i > r0 && j > c0) {
+            const int c = j - c0 - 1;
+            const unsigned char code = D[static_cast<std::size_t>(i - r0 - 1) * sw
+                                         + static_cast<std::size_t>(c % seg) * W + static_cast<std::size_t>(c / seg)];
+            if (AM == AlignMode::Local && st == 0 && (code & 3) == 3) { grid_stop_ = true; break; }   // a start
+            hops_.push_back(static_cast<unsigned char>(st));
+            if (st == 0)      { st = code & 3; --i; --j; }
+            else if (st == 1) { st = (code >> 2) & 3; --i; }
+            else              { st = (code >> 4) & 3; --j; }
+        }
+        return true;
+    }
+
+    // The scalar block: viterbi_affine_ptr's fill and pick.
+    void grid_base_scalar_(DpBuffer& buf, int r0, int r1, int c0, int c1, const GridLine& top,
+                           const GridLine& left, int& i, int& j, int& st) {
         const T go_a = static_cast<T>(params_->gap_open_a), ge_a = static_cast<T>(params_->gap_extend_a);
         const T go_b = static_cast<T>(params_->gap_open_b), ge_b = static_cast<T>(params_->gap_extend_b);
         const std::size_t bw = static_cast<std::size_t>(c1 - c0) + 1, sz = (static_cast<std::size_t>(r1 - r0) + 1) * bw;
@@ -4579,14 +5078,56 @@ private:
         return v;
     }
 
-    // NWGRAD_SCORE_LINEAR=affine: linear gaps through the affine D/X kernel with zero opens
-    // (the form before score_linear_striped; for measuring it in one binary).
-    static bool score_linear_env() {
-        static const bool on = [] {
+    // NWGRAD_SCORE_LINEAR: unset = the per-level gate (linear_score_one_row), "affine" =
+    // always the affine D/X kernel with zero opens (the form before score_linear_striped),
+    // "onerow" = always score_linear_striped -- for measuring both in one binary.
+    // 0 / 1 / 2 = gate / affine / onerow.
+    static int score_linear_env() {
+        static const int v = [] {
             const char* e = std::getenv("NWGRAD_SCORE_LINEAR");
-            return !(e && std::string_view(e) == "affine");
+            if (!e) return 0;
+            const std::string_view s(e);
+            return s == "affine" ? 1 : s == "onerow" ? 2 : 0;
         }();
-        return on;
+        return v;
+    }
+    // Linear score-only: the B lengths [lo, hi] at which the zero-open affine kernel beats
+    // the one-row kernel (score_linear_striped) on a level; elsewhere one-row.  Both give the
+    // same score bit for bit, so this moves speed only.  NEON (spot, M1, 1 thread, 2026-11-10,
+    // results/spot.md "Round 2", affine-route time / one-row time, 20 %-mutated L x L pairs
+    // and miRNA 22 x 50, control 0.995-1.019):
+    // - int16 Global, n 81-104 (11-13 segments of 8 lanes): L100 DNA / protein 0.940 / 0.945;
+    //   L70 1.21-1.23 and L150 1.32-1.34 win, as int16 Local does at every length.
+    // - double Global n < 80: L50 0.921 / 0.987, L70 0.891 / 0.963, miRNA 22 x 50 0.92;
+    //   L100 1.07-1.09.  double Local n < 60: L50 0.912 / 0.946, miRNA 0.92; L70 1.08-1.09.
+    // - float32 Local n 81-104, alphabets of up to 8 letters only (kLinScoreAffineF32MaxAlpha,
+    //   the small-alphabet test of the fill gates): L100 DNA 0.940 (L70 DNA 0.984 and L150
+    //   1.07-1.09 stay one-row).  Protein keeps one-row: L70-L100 1.00-1.04 for one-row, and
+    //   routed (47fbe3c) protein float32 Local L90 lost 1.037 (control 1.000; spot,
+    //   results/spot.md "PR55 gate-fixes 47fbe3c").  float32 Global is flat (1.00-1.04).
+    //   The int16 and double windows won on protein as well (int16 L100 0.945; double
+    //   Global L50 / L70 0.987 / 0.963, Local L50 0.946): every alphabet.
+    // Glocal takes Global's windows (unmeasured).  x86: one-row at every length; see
+    // AGENTS.md "Linear score-only gate" for the sse4 counts (AVX2 / AVX-512 pending).
+    struct NSpan { int lo, hi; };
+    static constexpr NSpan kLinScoreAffineNeon =
+        std::is_same_v<T, int16_t> ? (AM == AlignMode::Local ? NSpan{1, 0} : NSpan{81, 104})
+        : std::is_same_v<T, float> ? (AM == AlignMode::Local ? NSpan{81, 104} : NSpan{1, 0})
+        : std::is_same_v<T, double> ? (AM == AlignMode::Local ? NSpan{0, 59} : NSpan{0, 79})
+                                    : NSpan{1, 0};
+    static constexpr size_t kLinScoreAffineF32MaxAlpha = 8;
+    // nalpha: passed on AArch64 only (the x86 call is unchanged, so are its objects).
+    static bool linear_score_one_row(int backend, int n, size_t nalpha = 0) noexcept {
+        if (const int e = score_linear_env()) return e == 2;
+        (void)backend;
+#if defined(__aarch64__) || defined(_M_ARM64)
+        if constexpr (std::is_same_v<T, float> && AM == AlignMode::Local)
+            if (nalpha > kLinScoreAffineF32MaxAlpha) return true;
+        return !(n >= kLinScoreAffineNeon.lo && n <= kLinScoreAffineNeon.hi);
+#else
+        (void)n; (void)nalpha;
+        return true;
+#endif
     }
 
     double score_affine_scalar(DpBuffer& buf) const {
