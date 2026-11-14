@@ -163,3 +163,43 @@ def test_old_and_new_grouping_identical(t, grad, mode, gm, level):
                     np.testing.assert_allclose(y, x, rtol=tol, atol=tol * np.abs(x).max())
             else:
                 assert x == y
+
+
+@pytest.mark.parametrize("level", LEVELS)
+@pytest.mark.parametrize("mode", ["local", "global"])
+def test_score_only_plan_keeps_the_gated_groups(mode, level):
+    """Score only: a group past inter_score_ok's cell cap runs its pairs' own fills.  The
+    regrouping must not move pairs from there to the shared kernel: every old group past
+    the cap is kept as it was, and the rest are regrouped among themselves."""
+    from nwgrad.matrices import BLOSUM62
+    rng = np.random.default_rng(7)
+    aa = list("ACDEFGHIKLMNPQRSTVWY")
+    n = 400
+    A = ["".join(rng.choice(aa, int(k))) for k in rng.integers(20, 120, n)]
+    B = ["".join(rng.choice(aa, int(k))) for k in rng.integers(20, 120, n)]
+    b = nwgrad.SeqPairBatch(A, B, nwgrad.AlignParams(BLOSUM62, 11.0, 1.0, 11.0, 1.0), mode=mode,
+                            grad_mode="none", n_threads=1, kernel=level)
+    la, lb = [len(x) for x in A], [len(x) for x in B]
+    cells = lambda g: (max(la[i] for i in g) + 1) * (max(lb[i] for i in g) + 1)
+    with _tuning.override(inter_group_tiles=1):
+        old = b._inter_groups(score_only=True)
+    if not old:
+        pytest.skip("no shared groups at this level")
+    cap = sorted(cells(g) for g in old)[len(old) // 2]          # half the old groups pass
+    with _tuning.override(inter_score_gather_cells=cap):
+        new = b._inter_groups(score_only=True)
+        assert b._inter_plan(score_only=True)[:2] == [sum(map(len, old)), n - sum(map(len, old))]
+    failing = [g for g in old if cells(g) > cap]
+    passing = {i for g in old if cells(g) <= cap for i in g}
+    for g in failing:
+        assert g in new
+    regrouped = [g for g in new if set(g) <= passing]
+    assert sorted(i for g in regrouped for i in g) == sorted(passing)
+    assert len(failing) + len(regrouped) == len(new)
+    assert regrouped != [g for g in old if cells(g) <= cap]   # the passing pairs did regroup
+    out = []
+    for gate in (1, "default"):
+        with _tuning.override(inter_group_tiles=gate, inter_score_gather_cells=cap):
+            b.score_and_grad(keep_paths=False)
+            out.append(np.asarray(b.scores()).tobytes())
+    assert out[0] == out[1]

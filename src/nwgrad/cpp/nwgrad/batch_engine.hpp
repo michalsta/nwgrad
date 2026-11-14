@@ -2391,7 +2391,32 @@ private:
         // of mostly padding lanes runs its pairs' own fills (inter_group_filled).
         P.elig.reserve(keys.size());
         const size_t W = static_cast<size_t>(inter_w_(K));
-        inter_cut_groups(keys, W, inter_group_tiles(keys.size(), W),
+        const size_t tile = inter_group_tiles(keys.size(), W);
+        // Score only (rows): score_only_ sends a group past inter_score_ok's cell cap to its
+        // pairs' own fills, a cap tuned on the old groups.  Tighter groups pass it more often:
+        // protein float32 Local score-only (U[50,300] lengths) moved 13 % -> 29 % of the
+        // cells onto the shared gather kernel on AVX2 and lost there (nighthaven, 2026-11-13:
+        // 1.038x time, 1.11x instructions at 1 thread; 1.029x / 1.08x at 6).  So the pairs
+        // whose OLD group fails the cap keep that group (score_only_ runs their own fills, as
+        // before), and only the pairs it shared are regrouped: none moves from its own fill
+        // to the shared one, and the plan's counts are unchanged.
+        if (rows && tile > 1 && has_inter_score_(K) && linear_fill_ok_(K)) {
+            std::vector<Key> old = keys, keep;
+            keep.reserve(keys.size());
+            inter_cut_groups(old, W, 1, [](const Key& k) { return k.len_a; }, [](const Key& k) { return k.len_b; },
+                             [&](size_t g, size_t e, bool filled) {
+                                 size_t M = 0, n = 0;
+                                 for (size_t k = g; k < e; ++k) { M = std::max(M, old[k].len_a); n = std::max(n, old[k].len_b); }
+                                 const bool shared = filled &&
+                                     inter_score_ok<T>(alpha_->size(), static_cast<int>(M), static_cast<int>(n), GM == GapModel::Affine,
+                                                       AM == AlignMode::Local, s_.n_threads == 1, P.backend);
+                                 if (shared) { keep.insert(keep.end(), old.begin() + g, old.begin() + e); return; }
+                                 if (filled) P.groups.emplace_back(P.elig.size(), P.elig.size() + (e - g));
+                                 for (size_t k = g; k < e; ++k) (filled ? P.elig : P.other).push_back(old[k].i);
+                             });
+            keys.swap(keep);   // still in (len B, len A, index) order
+        }
+        inter_cut_groups(keys, W, tile,
                          [](const Key& k) { return k.len_a; }, [](const Key& k) { return k.len_b; },
                          [&](size_t g, size_t e, bool filled) {
                              if (filled) P.groups.emplace_back(P.elig.size(), P.elig.size() + (e - g));
