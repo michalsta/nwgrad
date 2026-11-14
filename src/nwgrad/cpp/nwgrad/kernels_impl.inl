@@ -563,6 +563,16 @@ static inline V carry_pin(V v) {
     } else if constexpr (std::is_same_v<T, double> && B == 64) {
         __m512d r = static_cast<__m512d>(v); __asm__("" : "+v"(r)); return V(r);
 #  endif
+    } else if constexpr (std::is_integral_v<T> && B == 16) {   // the integer score kernel's pass 2
+        __m128i r = static_cast<__m128i>(v); __asm__("" : "+v"(r)); return V(r);
+#  if defined(__AVX__)
+    } else if constexpr (std::is_integral_v<T> && B == 32) {
+        __m256i r = static_cast<__m256i>(v); __asm__("" : "+v"(r)); return V(r);
+#  endif
+#  if defined(__AVX512F__)
+    } else if constexpr (std::is_integral_v<T> && B == 64) {
+        __m512i r = static_cast<__m512i>(v); __asm__("" : "+v"(r)); return V(r);
+#  endif
     }
 #elif defined(__GNUC__) && !defined(__clang__) && defined(__aarch64__)
     // gcc does the same on AArch64: without the pin the two-segment carry compiled to
