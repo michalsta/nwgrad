@@ -105,6 +105,34 @@ struct BatchSettings {
     }
 };
 
+// The inter-pair groups of `keys` (sorted by len B, then len A, then index): tiles of up
+// to `tile` groups within the ragged len-B window of the tile's shortest, each tile
+// stable-sorted by (len A, len B) and cut every W; emit(s, e, filled) per group, a range
+// of the reordered keys.  tile = 1 is the grouping before 2026-11-10 exactly.  A tile
+// that the ragged window ends on a partial group too empty to share gives that tail back
+// to the next tile.  Both planners (ensure_plan_, stream_inter_) cut through this one
+// function: the soft results' last bits follow the group, and the batch and the stream
+// must keep agreeing (test_batch_constructor, test_tracks_batch).
+template<class Key, class LenA, class LenB, class Emit>
+void inter_cut_groups(std::vector<Key>& keys, size_t W, size_t tile, LenA la, LenB lb, Emit emit) {
+    const size_t tmax = tile > SIZE_MAX / W ? SIZE_MAX : tile * W;
+    for (size_t s = 0; s < keys.size();) {
+        size_t t = s + 1;
+        while (t < keys.size() && t - s < tmax && lb(keys[t]) * 4 <= lb(keys[s]) * 5 + 16) ++t;   // ragged_ok
+        if (tile > 1 && t < keys.size() && t - s > W && !inter_group_filled((t - s) % W, W))
+            t = s + (t - s) / W * W;
+        if (tile > 1)
+            std::stable_sort(keys.begin() + s, keys.begin() + t, [&](const Key& x, const Key& y) {
+                return la(x) != la(y) ? la(x) < la(y) : lb(x) < lb(y);
+            });
+        for (size_t g = s; g < t; g += W) {
+            const size_t e = std::min(t, g + W);
+            emit(g, e, inter_group_filled(e - g, W));
+        }
+        s = t;
+    }
+}
+
 template<class T, GapModel GM, AlignMode AM>
 class BatchEngine {
 public:
@@ -853,7 +881,7 @@ private:
             return -1;
         return backend;
     }
-    // Problems grouped W at a time, sorted by len B then len A (counting sorts: each call
+    // Problems sorted by len B then len A, then grouped as the batch plan (inter_cut_groups; counting sorts: each call
     // brings new problems, nothing is cached).  The rest run their own path in the same
     // pass: empty sequences, and Full pairs the traceback would split (Hirschberg past
     // the cutoff).  A guided band-0 call is GuideBanded and stays so.
@@ -907,15 +935,13 @@ private:
         csort([&](size_t i) { return problems[i].seq_a.size(); }, maxa);
         csort([&](size_t i) { return problems[i].seq_b.size(); }, maxb);
         std::vector<std::pair<size_t, size_t>> groups;
-        for (size_t s = 0; s < elig.size();) {
-            const size_t lb = problems[elig[s]].seq_b.size();
-            size_t e = s + 1;
-            while (e < elig.size() && e - s < static_cast<size_t>(W) &&
-                   problems[elig[e]].seq_b.size() * 4 <= lb * 5 + 16) ++e;
-            if (inter_group_filled(e - s, static_cast<size_t>(W))) groups.emplace_back(s, e);
-            else other.insert(other.end(), elig.begin() + s, elig.begin() + e);   // mostly padding
-            s = e;
-        }
+        inter_cut_groups(elig, static_cast<size_t>(W), inter_group_tiles(elig.size(), static_cast<size_t>(W)),
+                         [&](size_t i) { return problems[i].seq_a.size(); },
+                         [&](size_t i) { return problems[i].seq_b.size(); },
+                         [&](size_t g, size_t e, bool filled) {
+                             if (filled) groups.emplace_back(g, e);
+                             else other.insert(other.end(), elig.begin() + g, elig.begin() + e);   // mostly padding
+                         });
         // Tracked lanes (per-lane rows into the kernels): params with sets, or any track.
         const bool trk = params.num_sets() > 1 || st.any();
         std::atomic<size_t> idx{0};
@@ -2305,6 +2331,14 @@ public:
         const InterPlan& P = ensure_plan_(score_only && grad_mode_ == GradMode::None);
         return {P.elig.size(), P.other.size(), P.groups.size()};
     }
+    // The plan's groups as pair indices, in group order (nwgrad._tuning, tests).
+    std::vector<std::vector<size_t>> inter_plan_groups(bool score_only = false) {
+        const InterPlan& P = ensure_plan_(score_only && grad_mode_ == GradMode::None);
+        std::vector<std::vector<size_t>> g;
+        g.reserve(P.groups.size());
+        for (auto [s, e] : P.groups) g.emplace_back(P.elig.begin() + s, P.elig.begin() + e);
+        return g;
+    }
 private:
     struct InterPlan {
         int default_backend = -1000, hb_cutoff = -1;   // what it was built for
@@ -2321,8 +2355,9 @@ private:
     // Built once and reused until the default ISA changes, the Hirschberg cutoff moves or
     // a fill gate is overridden (nwgrad._tuning):
     // re-sorting 2.5M pairs every training iteration was ~0.9 s of serial work per call.
-    // Groups: len B runs of len-A-sorted pairs, cut every W and wherever len B outgrows
-    // the group's shortest past ragged_ok().
+    // Groups: see the tiles below (default) -- or, with inter_group_tiles = 1, len B runs
+    // of len-A-sorted pairs, cut every W and wherever len B outgrows the group's shortest
+    // past ragged_ok().
     const InterPlan& ensure_plan_(bool rows = false) {
         InterPlan& dst = rows ? plan_rows_ : plan_;
         const int def_backend = global_default_backend();
@@ -2352,20 +2387,44 @@ private:
             if (x.len_a != y.len_a) return x.len_a < y.len_a;
             return x.i < y.i;
         });
-        // A group of mostly padding lanes runs its pairs' own fills (inter_group_filled).
+        // Tiles of groups (inter_cut_groups; inter_group_tiles, simd_levels.hpp).  A group
+        // of mostly padding lanes runs its pairs' own fills (inter_group_filled).
         P.elig.reserve(keys.size());
         const size_t W = static_cast<size_t>(inter_w_(K));
-        for (size_t s = 0; s < keys.size();) {
-            size_t e = s + 1;
-            while (e < keys.size() && e - s < W && ragged_ok(keys[s].len_b, keys[e].len_b)) ++e;
-            if (inter_group_filled(e - s, W)) {
-                P.groups.emplace_back(P.elig.size(), P.elig.size() + (e - s));
-                for (size_t k = s; k < e; ++k) P.elig.push_back(keys[k].i);
-            } else {
-                for (size_t k = s; k < e; ++k) P.other.push_back(keys[k].i);
-            }
-            s = e;
+        const size_t tile = inter_group_tiles(keys.size(), W);
+        // Score only (rows): score_only_ sends a group past inter_score_ok's cell cap to its
+        // pairs' own fills, a cap tuned on the old groups.  Tighter groups pass it more often:
+        // protein float32 Local score-only (U[50,300] lengths) moved 13 % -> 29 % of the
+        // cells onto the shared gather kernel on AVX2 and lost there (nighthaven, 2026-11-13:
+        // 1.038x time, 1.11x instructions at 1 thread; 1.029x / 1.08x at 6).  So the pairs
+        // whose OLD group fails the cap keep that group (score_only_ runs their own fills, as
+        // before), and only the pairs it shared are regrouped: none moves from its own fill
+        // to the shared one.  (The other way, a regrouped tile's tail too short for
+        // inter_group_filled runs its own fills, as in every regrouped plan: 2 of 400 pairs
+        // at 8 lanes in test_score_only_plan_keeps_the_gated_groups; nighthaven 2026-11-14,
+        // mixprot float32 score-only 0.92-0.95x of main's time with the fix.)
+        if (rows && tile > 1 && has_inter_score_(K) && linear_fill_ok_(K)) {
+            std::vector<Key> old = keys, keep;
+            keep.reserve(keys.size());
+            inter_cut_groups(old, W, 1, [](const Key& k) { return k.len_a; }, [](const Key& k) { return k.len_b; },
+                             [&](size_t g, size_t e, bool filled) {
+                                 size_t M = 0, n = 0;
+                                 for (size_t k = g; k < e; ++k) { M = std::max(M, old[k].len_a); n = std::max(n, old[k].len_b); }
+                                 const bool shared = filled &&
+                                     inter_score_ok<T>(alpha_->size(), static_cast<int>(M), static_cast<int>(n), GM == GapModel::Affine,
+                                                       AM == AlignMode::Local, s_.n_threads == 1, P.backend);
+                                 if (shared) { keep.insert(keep.end(), old.begin() + g, old.begin() + e); return; }
+                                 if (filled) P.groups.emplace_back(P.elig.size(), P.elig.size() + (e - g));
+                                 for (size_t k = g; k < e; ++k) (filled ? P.elig : P.other).push_back(old[k].i);
+                             });
+            keys.swap(keep);   // still in (len B, len A, index) order
         }
+        inter_cut_groups(keys, W, tile,
+                         [](const Key& k) { return k.len_a; }, [](const Key& k) { return k.len_b; },
+                         [&](size_t g, size_t e, bool filled) {
+                             if (filled) P.groups.emplace_back(P.elig.size(), P.elig.size() + (e - g));
+                             for (size_t k = g; k < e; ++k) (filled ? P.elig : P.other).push_back(keys[k].i);
+                         });
         dst = std::move(P);
         return dst;
     }

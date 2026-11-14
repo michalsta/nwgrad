@@ -20,6 +20,7 @@
 // feature of the built extension, where CMake compiles the level TUs with flags.
 
 #include <algorithm>
+#include <cmath>
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
@@ -606,7 +607,7 @@ enum class Gate : int {
     InterGroupBytes, InterSoftBytes, InterScoreGatherCells,
     InterLinearIntGatherCells, InterLinearF32GatherCells, InterLinearF64GatherCells,
     InterGlobalLinearIntCells, InterGlobalLinearF32Cells, LinearStripedMinN, SoftF32MinCells,
-    InterMinFill, SoftCkptRows, SoftCkptMinBytes, SoftDoubleFtz, Count_
+    InterMinFill, SoftCkptRows, SoftCkptMinBytes, SoftDoubleFtz, InterGroupTiles, Count_
 };
 inline constexpr const char* kGateNames[] = {
     "inter_group_bytes", "inter_soft_bytes", "inter_score_gather_cells",
@@ -614,7 +615,7 @@ inline constexpr const char* kGateNames[] = {
     "inter_linear_f64_gather_cells", "inter_global_linear_int_cells",
     "inter_global_linear_f32_cells", "linear_striped_min_n", "soft_f32_min_cells",
     "inter_min_fill", "soft_ckpt_rows", "soft_ckpt_min_bytes",
-    "soft_double_ftz"};
+    "soft_double_ftz", "inter_group_tiles"};
 static_assert(sizeof(kGateNames) / sizeof(kGateNames[0]) == static_cast<size_t>(Gate::Count_));
 inline constexpr int64_t kGateUnset = -1;
 inline constexpr int64_t kGateOff = INT64_MAX;
@@ -894,6 +895,29 @@ inline bool inter_group_filled(size_t real, size_t W) noexcept {
     const size_t pct = o < 0 ? kInterMinFillPct
                      : o == kGateOff ? 0 : static_cast<size_t>(std::min<int64_t>(o, 100));
     return real * 100 >= W * pct;
+}
+// Inter-pair grouping (BatchEngine::ensure_plan_).  A group computes W x max(len A) x
+// max(len B) cells, so the pairs of a group should agree in BOTH lengths.  Sorting by
+// (len B, len A) and cutting every W gives groups of one len B but, when the lengths are
+// independent (all-vs-all, family screens), a third of the len-A range each: lane
+// utilisation 0.89 / 0.81 / 0.69 at W = 8 / 16 / 32 on U[50,300] x U[50,300] (simulated;
+// solace AVX-512 measured time per useful cell 1.42-1.47x of a uniform batch at W = 32,
+// 1.22-1.27x at W = 16, time following computed cells to 0-2 %).  So the sorted pairs are
+// cut into TILES of k groups (k*W pairs, and within ragged_ok of the tile's shortest B),
+// and each tile is re-sorted by (len A, len B) before its groups are cut: a tile spans
+// ~k*W/N of the len-B range, a group ~1/k of the tile's len-A range, balanced at
+// k = sqrt(N / W) (simulated 0.98 / 0.97 / 0.95; correlated lengths and miRNA-like batches
+// 0.97-1.00, never below the old grouping by more than noise; small batches N = 300-2000
+// gain too).  Fill and ragged rules are unchanged, and each lane's result does not depend
+// on its group, so the regrouping changes speed only (bit-identical results, output order
+// unchanged).  Override (inter_group_tiles): k; 0 or 1 = the old (len B, len A) grouping
+// (one group per tile), for A/B; off = one tile per ragged window.
+inline size_t inter_group_tiles(size_t n_elig, size_t W) noexcept {
+    const int64_t o = gate_override(Gate::InterGroupTiles);
+    if (o == kGateOff) return SIZE_MAX / (W ? W : 1);
+    if (o >= 0) return o < 1 ? 1 : static_cast<size_t>(std::min<int64_t>(o, int64_t(SIZE_MAX / (W ? W : 1))));
+    const double k = std::sqrt(static_cast<double>(n_elig) / static_cast<double>(W ? W : 1));
+    return k < 1.5 ? 1 : static_cast<size_t>(k + 0.5);
 }
 // Score only: the shared score kernel pays only for short pairs -- over 8 letters it
 // gathers (the InterScoreGatherCells override applies), up to 8 it blends on masks and
