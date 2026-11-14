@@ -340,7 +340,7 @@ inline constexpr bool kMainForm =
 // prefix instantiation) gcc inlined it into that function, and the combined body is
 // the one nighthaven measured: its L200 cells run the stored-prefix form with main's
 // operations, yet 6-9 % slower at 12 % fewer instructions -- the generated code, not the
-// work.  The entry runs main's kernel itself (score_affine_striped_pos_main, below).  On
+// work.  Where kMainCopy, main's kernel itself (score_affine_striped_pos_main).  On
 // AArch64 int32 only: the combined body measured FASTER than main for int16 there (spot
 // int16 affine Global L100 0.82-0.86), so int16 keeps it, while int32 Global paid ~9 ns a
 // row in it (spot, 2026-11-07: L1000 1.020 .. L4000 1.005, Local 1.000).
@@ -1577,13 +1577,39 @@ static bool score_unroll2() noexcept {
     }();
     return on;
 }
-// The integer positive-open kernel the entry runs: main's verbatim where kMainDirect,
-// else the re-formed one (its stored-prefix form up to kStoredPrefixSeg segments).
+// kMainCopy: the kMainDirect targets that run main's kernel verbatim
+// (score_affine_striped_pos_main): AArch64 int32 only (spot: its row code then compiles as
+// main's).  On x86 kMainDirect calls the stored-prefix instantiation, main's form: the copy
+// at 32 lanes (AVX-512) ran 27-322 fewer instructions a pair yet 1-2 % slower at protein
+// L200-L300 (solace, 2026-11-07), and at 16 lanes (AVX2) it did not remove nighthaven's
+// int16 Global L130-L170 residual.
+template <class T>
+inline constexpr bool kMainCopy =
+#if defined(__aarch64__)
+    kMainDirect<T>;
+#else
+    false;
+#endif
+// The integer positive-open kernel the entry runs: main's verbatim (kMainCopy), main's
+// form as the stored-prefix instantiation (other kMainDirect targets), else the re-formed
+// kernel (its stored-prefix form up to kStoredPrefixSeg segments).  On x86 spelled out at
+// each call: through an always-inline wrapper gcc inlined a different set of forms into the
+// avx2 int16 entry than with the direct calls (the objects are 2413307's this way).  On
+// AArch64 through the wrapper, which is how the int32 direct call was measured (spot).
+#if defined(__aarch64__) || defined(_M_ARM64)
 template <class T, bool Local, bool MOnly, bool Tr, bool Sat, bool U2, bool Glocal>
 [[gnu::always_inline]] static inline void score_pos_int(ScoreJob<T>& job) {
-    if constexpr (kMainDirect<T>) score_affine_striped_pos_main<T, Local, MOnly, Tr, Sat, U2, Glocal>(job);
-    else                          score_affine_striped_pos<T, Local, MOnly, Tr, Sat, U2, Glocal>(job);
+    if constexpr (kMainCopy<T>) score_affine_striped_pos_main<T, Local, MOnly, Tr, Sat, U2, Glocal>(job);
+    else                        score_affine_striped_pos<T, Local, MOnly, Tr, Sat, U2, Glocal, kMainDirect<T>>(job);
 }
+#  define NWGRAD_SCORE_POS_INT(...) score_pos_int<__VA_ARGS__>(job)
+#else
+#  define NWGRAD_SCORE_POS_INT(...)                                                      \
+    do {                                                                                  \
+        if constexpr (kMainCopy<T>) score_affine_striped_pos_main<__VA_ARGS__>(job);      \
+        else score_affine_striped_pos<__VA_ARGS__, kMainDirect<T>>(job);                  \
+    } while (0)
+#endif
 template <class T, bool Tr, bool Sat = false>
 static void score_entry_impl(ScoreJob<T>& job) {
     const bool glocal = job.local == 2;   // 0 Global, 1 Local, 2 Glocal (ScoreJob::local)
@@ -1627,20 +1653,20 @@ static void score_entry_impl(ScoreJob<T>& job) {
                 score_affine_striped_pos_fp<T, false, false, Tr>(job);
             }
         } else if (score_unroll2()) {
-            if (glocal) score_pos_int<T, false, false, Tr, Sat, true, true>(job);
+            if (glocal) NWGRAD_SCORE_POS_INT(T, false, false, Tr, Sat, true, true);
             else if (job.local) {
-                if (pos_ext) score_pos_int<T, true, true, Tr, Sat, true, false>(job);
-                else         score_pos_int<T, true, false, Tr, Sat, true, false>(job);
+                if (pos_ext) NWGRAD_SCORE_POS_INT(T, true, true, Tr, Sat, true, false);
+                else         NWGRAD_SCORE_POS_INT(T, true, false, Tr, Sat, true, false);
             } else {
-                score_pos_int<T, false, false, Tr, Sat, true, false>(job);
+                NWGRAD_SCORE_POS_INT(T, false, false, Tr, Sat, true, false);
             }
         } else {
-            if (glocal) score_pos_int<T, false, false, Tr, Sat, false, true>(job);
+            if (glocal) NWGRAD_SCORE_POS_INT(T, false, false, Tr, Sat, false, true);
             else if (job.local) {
-                if (pos_ext) score_pos_int<T, true, true, Tr, Sat, false, false>(job);
-                else         score_pos_int<T, true, false, Tr, Sat, false, false>(job);
+                if (pos_ext) NWGRAD_SCORE_POS_INT(T, true, true, Tr, Sat, false, false);
+                else         NWGRAD_SCORE_POS_INT(T, true, false, Tr, Sat, false, false);
             } else {
-                score_pos_int<T, false, false, Tr, Sat, false, false>(job);
+                NWGRAD_SCORE_POS_INT(T, false, false, Tr, Sat, false, false);
             }
         }
         return;
