@@ -2399,7 +2399,10 @@ private:
         // 1.038x time, 1.11x instructions at 1 thread; 1.029x / 1.08x at 6).  So the pairs
         // whose OLD group fails the cap keep that group (score_only_ runs their own fills, as
         // before), and only the pairs it shared are regrouped: none moves from its own fill
-        // to the shared one, and the plan's counts are unchanged.
+        // to the shared one.  (The other way, a regrouped tile's tail too short for
+        // inter_group_filled runs its own fills, as in every regrouped plan: 2 of 400 pairs
+        // at 8 lanes in test_score_only_plan_keeps_the_gated_groups; nighthaven 2026-11-14,
+        // mixprot float32 score-only 0.92-0.95x of main's time with the fix.)
         if (rows && tile > 1 && has_inter_score_(K) && linear_fill_ok_(K)) {
             std::vector<Key> old = keys, keep;
             keep.reserve(keys.size());

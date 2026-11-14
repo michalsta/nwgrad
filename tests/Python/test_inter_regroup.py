@@ -167,7 +167,8 @@ def test_old_and_new_grouping_identical(t, grad, mode, gm, level):
 
 @pytest.mark.parametrize("level", LEVELS)
 @pytest.mark.parametrize("mode", ["local", "global"])
-def test_score_only_plan_keeps_the_gated_groups(mode, level):
+@pytest.mark.parametrize("t", ["float32", "int16"])   # (int16: 8 lanes from sse4 on)
+def test_score_only_plan_keeps_the_gated_groups(t, mode, level):
     """Score only: a group past inter_score_ok's cell cap runs its pairs' own fills.  The
     regrouping must not move pairs from there to the shared kernel: every old group past
     the cap is kept as it was, and the rest are regrouped among themselves."""
@@ -177,7 +178,7 @@ def test_score_only_plan_keeps_the_gated_groups(mode, level):
     n = 400
     A = ["".join(rng.choice(aa, int(k))) for k in rng.integers(20, 120, n)]
     B = ["".join(rng.choice(aa, int(k))) for k in rng.integers(20, 120, n)]
-    b = nwgrad.SeqPairBatch(A, B, nwgrad.AlignParams(BLOSUM62, 11.0, 1.0, 11.0, 1.0), mode=mode,
+    b = CLS[t](A, B, nwgrad.AlignParams(BLOSUM62, 11.0, 1.0, 11.0, 1.0), mode=mode,
                             grad_mode="none", n_threads=1, kernel=level)
     la, lb = [len(x) for x in A], [len(x) for x in B]
     cells = lambda g: (max(la[i] for i in g) + 1) * (max(lb[i] for i in g) + 1)
@@ -188,14 +189,21 @@ def test_score_only_plan_keeps_the_gated_groups(mode, level):
     cap = sorted(cells(g) for g in old)[len(old) // 2]          # half the old groups pass
     with _tuning.override(inter_score_gather_cells=cap):
         new = b._inter_groups(score_only=True)
-        assert b._inter_plan(score_only=True)[:2] == [sum(map(len, old)), n - sum(map(len, old))]
+        elig, other, ngroups = b._inter_plan(score_only=True)
+    W = 1 << (max(map(len, old)) - 1).bit_length()
     failing = [g for g in old if cells(g) > cap]
     passing = {i for g in old if cells(g) <= cap for i in g}
-    for g in failing:
+    for g in failing:                     # kept whole: their pairs run their own fills, as on main
         assert g in new
-    regrouped = [g for g in new if set(g) <= passing]
-    assert sorted(i for g in regrouped for i in g) == sorted(passing)
-    assert len(failing) + len(regrouped) == len(new)
+    regrouped = [g for g in new if g not in failing]
+    shared = [i for g in regrouped for i in g]
+    assert set(shared) <= passing         # no pair joins the shared kernel that main kept off it
+    assert elig + other == n and ngroups == len(new) == len(failing) + len(regrouped)
+    # The other way is allowed: a regrouped tile's tail too short to share runs its own
+    # fills (2 of 400 pairs at 8 lanes): at most one partial group per tile.
+    stranded = passing - set(shared)
+    assert other - (n - sum(map(len, old))) == len(stranded)
+    assert len(stranded) <= max(W, len(passing) // 10)
     assert regrouped != [g for g in old if cells(g) <= cap]   # the passing pairs did regroup
     out = []
     for gate in (1, "default"):
