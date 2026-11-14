@@ -298,6 +298,33 @@ struct GridFwdJob {
     T best = T(0); int best_i = 0, best_j = 0;   // out (find_best)
 };
 
+// ── Grid base block (TracebackMode::Grid) ────────────────────────────────────
+//
+// The Pointers fill over a base rectangle rows r0..r1 x columns c0..c1 (DP coordinates)
+// from its top row and left column (all three states, the GridFwdJob layout): the striped
+// Pointers kernel's recurrence with the borders taken from the lines instead of the
+// closed forms.  Writes the packed codes (M | X << 2 | Y << 4, M 3 = Local's start) of rows
+// r0+1..r1, striped: buf.gD[(i - r0 - 1) * seg * W + ((c-1) % seg) * W + (c-1) / seg] for
+// column c = j - c0 in 1..w.  Below `min_seg` segments it declines (done = 0) and the
+// aligner runs its scalar block.  Affine only; the linear Grid (one state, its own codes)
+// would take a sibling entry with this layout (see Aligner::grid_base).
+template <class T>
+struct GridBaseJob {
+    bool sat = false;   // nw_sat T past the quarter-range bound: the saturating kernel variant
+    const unsigned char* a;                 // full encoded sequences
+    const unsigned char* b;
+    const T* blk; int nalpha;
+    T go_a, ge_a, go_b, ge_b;
+    int r0, r1, c0, c1;
+    const T* top;  std::size_t top_ss, top_es;    // as GridFwdJob
+    const T* left; std::size_t left_ss, left_es;
+    DpBufferT<T>* buf;                      // writes gD; scratch prows, gprof, gbuilt, gidx
+    int local = 0;                          // Local: M clamped at 0, code 3
+    int min_seg = 2;                        // decline below this many segments
+    typename DpBufferT<T>::GVec* last = nullptr;   // out if set: row r1's M, X, Y at [s*(w+1) + c], c = 0..w
+    int done = 0, W = 0, seg = 0;           // out
+};
+
 // ── Hirschberg linear-space sweep ─────────────────────────────────────────────
 //
 // One half-sweep of a divide-and-conquer block: fill H rows keeping only rolling rows,
@@ -410,6 +437,19 @@ struct HbBaseJob {
 // Templated on the precision T (double or float32); at float32 W is twice the double
 // lane count (LevelKernels::inter_w_f) and every value, border and comparison is in T,
 // bit-identical to the scalar float fill.
+// Alphabets over 8 letters (the gather lookup, inter_kernel_impl.inl): the cap on the bytes
+// of the per-lane query profile a group builds once (InterCommon::build_profile), past
+// which the rows are gathered lane-cell by lane-cell as before.  By default NONE: nothing
+// measured favours the gather.  nighthaven (AVX2), protein, A = 40 against long B, always-
+// profile vs the first 1 MiB cap: never slower; 1 thread float32 path B = 2000 / 3000 ~21 %
+// faster (where 1 MiB gathered), the gather at B = 1500 1.13-1.14x the profile; score-only,
+// int16 path, B = 6000 and every 6-thread cell: no effect (2026-11-11).  wloczykij sse4,
+// instructions, profile / gather: L1000 float32 path 0.59, L3000 float32 score 0.54.
+// Memory needs no cap either: the profile is (letters used <= M + 1) x n x W values, below
+// the group's own three (M + 1) x (n + 1) x W tables.  solace (AVX-512, W = 16 / 32) is
+// unmeasured.  The `inter_profile_bytes` gate sets a cap for A/B runs (0: always gather).
+// A new switch for a new code path, not a fill gate retuned.
+inline constexpr int64_t kInterProfileMaxBytes = INT64_MAX;
 template <class T>
 struct InterJobT {
     const unsigned char* const* a;   // W pointers to A's codes
@@ -440,6 +480,9 @@ struct InterJobT {
     // its own (rs into `blk`, which is then the stacked block; the four gap arrays; bx0).
     // The go_*/ge_* scalars above are then unused.  ra/crow are not read: no profile here.
     const TrackJob<T>* tr = nullptr;
+    // Untracked alphabets over 8 letters: build the per-lane profile when its bytes are
+    // <= prof_max (kInterProfileMaxBytes above: no cap by default; 0: never).
+    int64_t prof_max = kInterProfileMaxBytes;
 };
 using InterJob = InterJobT<double>;
 
@@ -626,7 +669,7 @@ enum class Gate : int {
     InterGroupBytes, InterSoftBytes, InterScoreGatherCells,
     InterLinearIntGatherCells, InterLinearF32GatherCells, InterLinearF64GatherCells,
     InterGlobalLinearIntCells, InterGlobalLinearF32Cells, LinearStripedMinN, SoftF32MinCells,
-    InterMinFill, SoftCkptRows, SoftCkptMinBytes, SoftDoubleFtz, ScoreInt8, InterScoreSmallCells, InterScoreInt8, ScoreInt8MinSegs, Count_
+    InterMinFill, SoftCkptRows, SoftCkptMinBytes, SoftDoubleFtz, ScoreInt8, InterScoreSmallCells, InterScoreInt8, ScoreInt8MinSegs, InterProfileBytes, Count_
 };
 inline constexpr const char* kGateNames[] = {
     "inter_group_bytes", "inter_soft_bytes", "inter_score_gather_cells",
@@ -635,7 +678,7 @@ inline constexpr const char* kGateNames[] = {
     "inter_global_linear_f32_cells", "linear_striped_min_n", "soft_f32_min_cells",
     "inter_min_fill", "soft_ckpt_rows", "soft_ckpt_min_bytes",
     "soft_double_ftz", "score_int8", "inter_score_small_cells",
-    "inter_score_int8", "score_int8_min_segs"};
+    "inter_score_int8", "score_int8_min_segs", "inter_profile_bytes"};
 static_assert(sizeof(kGateNames) / sizeof(kGateNames[0]) == static_cast<size_t>(Gate::Count_));
 inline constexpr int64_t kGateUnset = -1;
 inline constexpr int64_t kGateOff = INT64_MAX;
@@ -752,6 +795,12 @@ inline int score_int8_lanes(int level) noexcept {
 // only while switched on (score8_count_on()), so a production run pays one relaxed load.
 struct Score8Stats { std::atomic<bool> on{false}; std::atomic<long long> runs{0}, overflows{0}; };
 inline Score8Stats& score8_stats() noexcept { static Score8Stats s; return s; }
+// The per-lane profile's byte cap (kInterProfileMaxBytes, InterJobT::prof_max) with its
+// override: kGateOff (None) = no cap, 0 = always the gather.
+inline int64_t inter_profile_max() noexcept {
+    const int64_t o = gate_override(Gate::InterProfileBytes);
+    return o < 0 ? kInterProfileMaxBytes : o;
+}
 inline bool soft_ckpt_env_check() noexcept {
     static const bool v = [] { const char* e = std::getenv("NWGRAD_SOFT_CKPT_CHECK"); return e && *e && std::strcmp(e, "0") != 0; }();
     return v;
@@ -832,6 +881,21 @@ inline constexpr bool kSoftCkptByDefault = false;
 // from 22 x 80 for double and int32 on AVX2 (the own kernel's single profile row wins once
 // B is long), and in Local mode sooner than in Global, so they are per mode; the shared
 // linear fill of int64 loses at SSE and NEON at every length.
+// float32 Global over up to 8 letters had NO cap on SSE, AVX2 and NEON: the sweep that set it
+// ran 22 x L pairs (to 22 x 200), and every long pair-sized score-only call then took the
+// shared fill.  On the M1 (spot, 2026-11-10, 1 thread, DNA L x L) striped / default time was
+// linear 0.62 / 0.59 / 0.38 at L1000 / 2000 / 3000, affine 0.78 / 0.68 / 0.64.  sse4
+// (wloczykij, instructions:u, striped / shared): linear L100 1.08, L150 1.00, L200 0.95,
+// L500 0.85, L1000-3000 0.82-0.80; affine L500 1.06, L700 1.00, L1000 0.99, L2000 0.91,
+// L3000 0.89; short A keeps the shared fill (22 x 200-3000 striped 1.19-1.52, 40 x 3000
+// linear 1.03 / affine 1.21).  nighthaven (AVX2, time): linear L300 1.07, L500 0.90, L1000
+// 0.78, L2000-3000 0.56-0.75, 22 x 3000 1.015, 100 x 3000 0.78; affine the shared fill wins
+// almost everywhere (L300-700 striped 1.08-1.50, L2000-3000 1.12-1.40, 22 / 100 x 3000
+// 1.9-2.2; L1000 alone 0.92-0.97).  spot after the cap (time): L300 1.000, L500 linear 0.755
+// / affine 0.925, 100 x 3000 0.576 / 0.846.  So per gap model (linear: f32_small_global_lin):
+// SSE linear 200000 cells (L500 on) / affine 10^6 (L1000 on, where its counts stop losing);
+// AVX2 linear 200000 / affine none; NEON 250000 for both (L500 on); AVX-512 its measured
+// 40000000 for both.
 // One thread, alphabets of up to 8 letters (2026-11-04): the integers' small one-thread
 // budgets above come from protein, whose shared fill gathers; DNA's mask-blend fill wins
 // alone through L400 on AVX2 (15 MB of affine tables; L600, 34 MB, loses) and L300 on
@@ -874,6 +938,9 @@ struct GateLevelCaps {
     SoftF32Caps f32soft_big, f32soft_small;   // float32 soft pass from: alphabets over 8 / up to 8
     uint32_t group_small_kb_1;             // hard shared fill, alphabets <= 8, n_threads == 1: KiB
                                            // floor under the type's group_kb_1 (0 = none)
+    uint32_t f32_small_global_lin;         // float32 score-only shared kernel, alphabets <= 8,
+                                           // Global, LINEAR gaps: cells (f32.score_small_global
+                                           // is the affine cap)
     template <class T> const GateTypeCaps& of() const noexcept {
         if constexpr (std::is_same_v<T, float>)        return f32;
         else if constexpr (std::is_same_v<T, double>)  return f64;
@@ -884,34 +951,34 @@ struct GateLevelCaps {
 };
 inline constexpr uint32_t kGateNoCap = 0xFFFFFFFFu;
 //                                          score_aff  score_lin  lin_gather  group_kb  group_kb_1   small_loc  small_glob   lin_small  score_aff_g score_lin_g  score_aff_1 score_aff_g1
-inline constexpr GateLevelCaps kGateCapsSse    { {       6600,     1700,      20000,     3072,      12288,       1900, kGateNoCap, kGateNoCap,       6600,       3800,       6600,       6600 },   // float32
+inline constexpr GateLevelCaps kGateCapsSse    { {       6600,     1700,      20000,     3072,      12288,       1900,    1000000, kGateNoCap,       6600,       3800,       6600,       6600 },   // float32
                                                  {          0,        0,       8000,     3072,      12288,          0,       1200, kGateNoCap,          0,          0,       1700,       1700 },   // double
                                                  {          0,     1700,       4000,     1024,       1024,       1900,       1900, kGateNoCap,          0,       1700,          0,          0 },   // int16
                                                  {          0,     3800, kGateNoCap,     3072,      12288,       1200,        800, kGateNoCap,          0,       1700,       1700,       1700 },   // int32 (its own linear fill is slow at W=4: shared to L400)
                                                  {          0,     1700,          0,     3072,      12288,          0,          0,          0,          0,       1700,       3800,       3800 },   // int64
                                                  3072, 8192, 33000,
-                                                 { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, 0 };
+                                                 { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, 0, 200000 };
 inline constexpr GateLevelCaps kGateCapsAvx2   { {      31000,     3800,      20000,     3072,      12288,       4700, kGateNoCap, kGateNoCap,      31000,      10300,      31000,      31000 },
                                                  {       6600,     1700,      20000,     3072,      12288,       1900, kGateNoCap, kGateNoCap,       6600,       6600,       6600,       6600 },
                                                  {       1700,     1700,       4000,     1024,        450,    1003000,    1003000, kGateNoCap,       1700,       1700,       1700,       1700 },   // int16: small caps L1000 (see kGateCapsSse4)
                                                  {       1700,     3800,       4000,     2560,       2048,       1900,       1900, kGateNoCap,       1700,       3800,       1700,       1700 },
                                                  {       3800,     1700,       2500,     3072,      12288,       2800,       1900, kGateNoCap,       3800,       1700,       3800,       3800 },
                                                  3072, 8192, 20000,
-                                                 { 1000, 2000, 0, 5000 }, { 0, 0, 0, 0 }, 16384 };
+                                                 { 1000, 2000, 0, 5000 }, { 0, 0, 0, 0 }, 16384, 200000 };
 inline constexpr GateLevelCaps kGateCapsAvx512 { {     520000,    31000,      33000,     3072,      18432,   30000000,   40000000, kGateNoCap,     520000,      31000,     520000,     520000 },
                                                  {     160000,    14700,      33000,     3072,      18432,   16000000,   31000000, kGateNoCap,     160000,      23000,     160000,     160000 },
                                                  {       1700,     1700,       4000,     1024,       1024, kGateNoCap, kGateNoCap, kGateNoCap,       1700,       1700,       1700,       1700 },
                                                  {       2600,     3800,       4000,     1024,       1024, kGateNoCap, kGateNoCap, kGateNoCap,       2600,       3800,       2600,       2600 },
                                                  {       1700,     3800,       6600,     1500,       2048,       4700, kGateNoCap, kGateNoCap,       1700,       3800,       1700,       1700 },
                                                  3072, 8192, 20000,
-                                                 { 7000, 10000, 1000, 7000 }, { 5000, 5000, 0, 0 }, 16384 };
-inline constexpr GateLevelCaps kGateCapsNeon   { {      10300,     1700,       8000,     5120,      12288,       2800, kGateNoCap, kGateNoCap,      14700,      10300,      10300,      14700 },
+                                                 { 7000, 10000, 1000, 7000 }, { 5000, 5000, 0, 0 }, 16384, 40000000 };
+inline constexpr GateLevelCaps kGateCapsNeon   { {      10300,     1700,       8000,     5120,      12288,       2800,     250000, kGateNoCap,      14700,      10300,      10300,      14700 },
                                                  {          0,        0,       3000,     3072,      12288,        800,       1900, kGateNoCap,          0,          0,          0,          0 },
                                                  {       1700,     1700,       8000,     3072,       1400,       4700,       4700, kGateNoCap,       1700,       1700,       1700,       1700 },
                                                  {       1700,     1700,       8000,     4608,       6144,       4700,       4700, kGateNoCap,       1700,       1700,       1700,       1700 },
                                                  {      14700,        0,          0,     4608,      12288,       2800, kGateNoCap,          0,      63100,          0,      14700,      63100 },
                                                  3072, 8192, 20000,
-                                                 { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, 0 };
+                                                 { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, 0, 250000 };
 // The small-alphabet score caps of int16 per level (score_small_local / _global), measured
 // with the inter-pair int8 tier in (proto/int8-inter; the int8 groups of int16 AND int32
 // batches take int16's caps), DNA related pairs, cap lifted / default:
@@ -991,9 +1058,12 @@ inline bool inter_score_ok(size_t nalpha, int M, int n, bool affine, bool local,
     const GateTypeCaps& c = gate_caps(level).of<T>();
     const uint32_t aff = local ? (single ? c.score_affine_1 : c.score_affine)
                                : (single ? c.score_affine_g1 : c.score_affine_g);
+    const uint32_t small = local ? c.score_small_local
+                         : (std::is_same_v<T, float> && !affine) ? gate_caps(level).f32_small_global_lin
+                                                                 : c.score_small_global;
     // Up to 8 letters its own override (inter_score_small_cells): without one, a sweep
     // that set the gather cap off still sent DNA pairs past ~L43 to their own fill.
-    const size_t cap = nalpha <= 8 ? gate_cap(Gate::InterScoreSmallCells, local ? c.score_small_local : c.score_small_global)
+    const size_t cap = nalpha <= 8 ? gate_cap(Gate::InterScoreSmallCells, small)
                                    : gate_cap(Gate::InterScoreGatherCells,
                                               affine ? aff : (local ? c.score_linear : c.score_linear_g));
     return static_cast<size_t>(M + 1) * static_cast<size_t>(n + 1) <= cap;
@@ -1140,6 +1210,8 @@ struct TypedKernels {
     int                inter_w = 0;                  // the inter-pair lane count (pairs per call)
     using grid_fn = void (*)(GridFwdJob<T>&);
     grid_fn            grid_fwd = nullptr;           // TracebackMode::Grid's forward pass
+    using gridbase_fn = void (*)(GridBaseJob<T>&);
+    gridbase_fn        grid_base = nullptr;          // Grid's base block (striped Pointers fill)
 };
 
 struct LevelKernels {
@@ -1231,7 +1303,8 @@ void register_level_inter(SimdLevel l, typename TypedKernels<T>::inter_fn inter_
 // TracebackMode::Grid's forward pass (null for a type without one: it runs as Pointers).
 template <class T>
 NWGRAD_BASELINE_ONLY
-void register_level_grid(SimdLevel l, typename TypedKernels<T>::grid_fn grid_fwd);
+void register_level_grid(SimdLevel l, typename TypedKernels<T>::grid_fn grid_fwd,
+                         typename TypedKernels<T>::gridbase_fn grid_base);
 
 NWGRAD_BASELINE_ONLY
 void register_level_common(SimdLevel l, int row_block, score8_fn score_i8);

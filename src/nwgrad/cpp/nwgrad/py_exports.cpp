@@ -1501,7 +1501,8 @@ NB_MODULE(nwgrad_ext, m) {
             {"score_int8", int64_t(kScoreInt8Default)},
             {"inter_score_small_cells", int64_t(c.i16.score_small_local)},
             {"inter_score_int8", int64_t(kInterScoreInt8Default ? 1 : 0)},
-            {"score_int8_min_segs", int64_t(score_int8_min_segs(score_int8_lanes(be < 0 ? 0 : be), false, 4))}};
+            {"score_int8_min_segs", int64_t(score_int8_min_segs(score_int8_lanes(be < 0 ? 0 : be), false, 4))},
+            {"inter_profile_bytes", int64_t(0)}};   // no cap (kInterProfileMaxBytes)
     });
 
     m.def(
