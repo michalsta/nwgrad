@@ -549,6 +549,7 @@ TEST_CASE("auto takes Grid for linear gaps past hb_cutoff", "[grid][traceback][l
         REQUIRE(c.ran_grid() == simd);
         REQUIRE(c.alignment() == cp.alignment());
     }
+}
 
 // The striped base block (grid_base_striped, 2026-11-07) against Pointers, at its edges:
 // base blocks of 1..64 cells (so most blocks are partial, many one row or one column
