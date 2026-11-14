@@ -138,6 +138,46 @@ static inline V ivlanes_(F& f, std::index_sequence<I...>) noexcept {
 template <class V, int W, class F>
 static inline V ivlanes(F f) noexcept { return ivlanes_<V>(f, std::make_index_sequence<static_cast<std::size_t>(W)>{}); }
 
+// The W x W transpose of the per-lane profile rows (InterCommon::row_profile): r[l] holds
+// lane l's W consecutive columns in, r[k] holds column k's W lanes out.  log2 W rounds of
+// interleaving the low / high halves of r[k] and r[k + W/2] (punpckl / punpckh at SSE; a
+// perfect shuffle, so after log2 W rounds element (l, k) has moved to (k, l)).  Values
+// are moved, never computed: bit-identical by construction.
+template <class V, int W, std::size_t... K>
+[[gnu::always_inline]] static inline V ivzip_lo_(V a, V b, std::index_sequence<K...>) noexcept {
+    return __builtin_shufflevector(a, b, static_cast<int>((K & 1) ? W + K / 2 : K / 2)...);
+}
+template <class V, int W, std::size_t... K>
+[[gnu::always_inline]] static inline V ivzip_hi_(V a, V b, std::index_sequence<K...>) noexcept {
+    return __builtin_shufflevector(a, b, static_cast<int>((K & 1) ? W + W / 2 + K / 2 : W / 2 + K / 2)...);
+}
+template <class V, int W, std::size_t... K>
+[[gnu::always_inline]] static inline void ivtr_round_(const V* r, V* t, std::index_sequence<K...>) noexcept {
+    using S = std::make_index_sequence<static_cast<std::size_t>(W)>;
+    ((t[2 * K] = ivzip_lo_<V, W>(r[K], r[K + W / 2], S{}),
+      t[2 * K + 1] = ivzip_hi_<V, W>(r[K], r[K + W / 2], S{})), ...);
+}
+// The rounds by recursion, alternating r and t (no loop for a compiler to leave rolled).
+template <class V, int W, int R>
+[[gnu::always_inline]] static inline void ivtr_rounds_(V* r, V* t) noexcept {
+    if constexpr (R > 0) {
+        ivtr_round_<V, W>(r, t, std::make_index_sequence<static_cast<std::size_t>(W / 2)>{});
+        ivtr_rounds_<V, W, R - 1>(t, r);
+    } else if constexpr (R < 0) {   // an odd count: the result is in t, so bring it back
+        for (int k = 0; k < W; ++k) t[k] = r[k];
+    }
+}
+template <class V, int W>
+[[gnu::always_inline]] static inline void ivtranspose(V* r) noexcept {
+    static_assert((W & (W - 1)) == 0, "lane counts are powers of two");
+    constexpr int R = std::bit_width(static_cast<unsigned>(W)) - 1;   // log2 W
+    if constexpr (R > 0) {
+        V t[W];
+        ivtr_rounds_<V, W, R>(r, t);
+        if constexpr (R & 1) for (int k = 0; k < W; ++k) r[k] = t[k];
+    }
+}
+
 // Byte lookups (kLvLut below).  A level has them where a 16-entry byte shuffle exists:
 // pshufb from SSSE3 (the sse4 level and up), tbl on NEON; the SSE2 baseline has none.
 #if defined(__SSE4_1__) || defined(__ARM_NEON)
@@ -258,9 +298,16 @@ struct InterCommon {
     bool pshuf = false, vlive = false;
     ivl mv{};
     int ord[IW];
+    // The gather path's per-lane query profile (alphabets over 8 letters, untracked):
+    // qp[qoff[l * nalpha + c] + j - 1] = score(c, lane l's b[j-1]), j = 1..npad (ragged:
+    // score(c, 0) past the lane's B, as the gather pads), for the letters c lane l reads.
+    const T* qp = nullptr;
+    const int* qoff = nullptr;
+    int npad = 0;
     explicit InterCommon(const InterJobT<T>& job) : J(job), bits(bits_buf()), srow(srow_buf()) {
         const int n = J.n;
-        if (levels < 0 && srow.size() < static_cast<size_t>(n + 1)) srow.resize(n + 1);
+        if constexpr (Lv < 0) if (!J.tr && J.prof_max > 0) build_profile();
+        if (levels < 0 && srow.size() < static_cast<size_t>(std::max(n, npad) + 1)) srow.resize(std::max(n, npad) + 1);
         if constexpr (Lv == kLvLut) {
             const int na = std::min(J.nalpha, 4), M = J.M;   // <= 4 by dispatch; says so to gcc
             std::vector<sbv>& bb = sbv_buf<0>();
@@ -360,6 +407,48 @@ struct InterCommon {
     static std::vector<unsigned char>& bt_buf() { static thread_local std::vector<unsigned char> b; return b; }
     static std::vector<ivd>& srow_buf() { static thread_local std::vector<ivd> b; return b; }
     template <int K> static std::vector<sbv>& sbv_buf() { static thread_local std::vector<sbv> b; return b; }
+    static std::vector<T>& q_buf() { static thread_local std::vector<T> b; return b; }
+    static std::vector<int>& qoff_buf() { static thread_local std::vector<int> b; return b; }
+    // The per-lane profile, once per group: Rognes' query profile, one per lane (each lane
+    // has its own B), over the letters that lane's A uses (and letter 0, which the rows
+    // past a shorter A read).  Its cost is the gather's for (letters used) rows instead of
+    // M: 20 / 100 of it on protein L100.  Out of line: once per group, and it keeps the
+    // fills' code as it was.  Leaves qp null (the gather) past prof_max bytes.
+    [[gnu::noinline]] void build_profile() {
+        const int na = J.nalpha, n = J.n;
+        const int np = (n + IW - 1) / IW * IW;   // whole W-blocks: row_profile reads past n
+        std::vector<int>& qo = qoff_buf();
+        qo.assign(static_cast<size_t>(IW) * na, -1);
+        size_t rows = 0;
+        for (int l = 0; l < IW; ++l) {
+            int* o = qo.data() + static_cast<size_t>(l) * na;
+            const unsigned char* al = J.a[l];
+            for (int i = 0; i < J.m[l]; ++i) o[al[i]] = 0;
+            if (J.m[l] < J.M) o[0] = 0;
+            for (int c = 0; c < na; ++c) if (o[c] == 0) ++rows;
+        }
+        const size_t elems = rows * static_cast<size_t>(np);
+        if (rows == 0 || static_cast<uint64_t>(elems) * sizeof(T) > static_cast<uint64_t>(J.prof_max)) return;
+        std::vector<T>& q = q_buf();
+        if (q.size() < elems) q.resize(elems);
+        T* qd = q.data();
+        size_t at = 0;
+        for (int l = 0; l < IW; ++l) {
+            int* o = qo.data() + static_cast<size_t>(l) * na;
+            const unsigned char* bl = J.b[l];
+            const int nl = J.nb ? J.nb[l] : n;
+            for (int c = 0; c < na; ++c) {
+                if (o[c] < 0) continue;
+                o[c] = static_cast<int>(at);
+                T* d = qd + at;
+                const T* pr = J.blk + static_cast<size_t>(c) * na;
+                for (int j = 0; j < nl; ++j) d[j] = pr[bl[j]];
+                for (int j = nl; j < np; ++j) d[j] = pr[0];   // ragged pad, then the block's tail
+                at += static_cast<size_t>(np);
+            }
+        }
+        qp = qd; qoff = qo.data(); npad = np;
+    }
     // The row of `blk` lane l reads at DP row i: its residue's (tracked: its stacked row),
     // row 0 past the lane's own A (those cells are computed and ignored).
     template <bool Tr>
@@ -428,11 +517,35 @@ struct InterCommon {
             for (int j = nl + 1; j <= n; ++j) sr[j][l] = pr[0];   // ragged: pad
         }
     }
+    // The profile's row (qp set): each lane's source is its contiguous profile row for its
+    // residue i, so W lanes x W columns are W vector loads and one W x W transpose into
+    // srow, where the gather took a load, an indexed load and a lane store per lane-cell
+    // (46 % of a protein L100 int16 path fill at sse4).  The same values as row_gather.
+    NWGRAD_GATHER_ROW_INLINE void row_profile(int i, ivl& live) const {
+        const int na = J.nalpha;
+        for (int l = 0; l < IW; ++l) live[l] = (i <= J.m[l]) ? -1 : 0;
+        const T* src[IW];
+        for (int l = 0; l < IW; ++l) {
+            const int c = (i <= J.m[l]) ? J.a[l][i - 1] : 0;
+            src[l] = qp + qoff[static_cast<size_t>(l) * na + c];
+        }
+        ivd* const sr = srow.data() + 1;
+        for (int jb = 0; jb < npad; jb += IW) {
+            ivd r[IW];
+            for (int l = 0; l < IW; ++l) std::memcpy(&r[l], src[l] + jb, sizeof(ivd));
+            ivtranspose<ivd, IW>(r);
+            for (int k = 0; k < IW; ++k) sr[jb + k] = r[k];
+        }
+    }
     // The tree and table rows: always_inline (in the inter TU gcc otherwise left this out of
     // line in the fills).
     template <bool Tr = false>
     [[gnu::always_inline]] void row(int i, Prof& P, ivl& live) const {
-        if constexpr (Lv < 0) { row_gather<Tr>(i, live); return; }
+        if constexpr (Lv < 0) {
+            if (!Tr && qp) row_profile(i, live);
+            else           row_gather<Tr>(i, live);
+            return;
+        }
         else {
         const int na = J.nalpha;
         if (vlive) live = ivsplat<ivl>(i) <= mv;
