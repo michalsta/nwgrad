@@ -221,6 +221,10 @@ def test_default_mode_is_local_with_a_predictor():
 
 
 def test_min_segs_gate():
+    lv = [k for k in ("sse2", "neon") if k in nwgrad.available_isa_levels()]
+    if not lv:
+        pytest.skip("no 16-lane simd level")
+    K = lv[0]   # 16 int8 lanes
     m = np.where(np.eye(4, dtype=bool), 2.0, -2.0)
     p = nwgrad.AlignParams(nwgrad.SubstMatrix(m, alphabet=DNA), 2.0, 1.0, 2.0, 1.0)
     a = "ACGTTGCA" * 4                                # 32 columns: 2 segments at 16 lanes
@@ -228,10 +232,10 @@ def test_min_segs_gate():
     for segs, runs in ((3, 0), (2, 1), (0, 1)):
         _tuning.set_gate("score_int8_min_segs", segs)
         with _tuning.override(score_int8=2):          # (a success re-arms the predictor)
-            nwgrad.sw_score_int16(a, a, p, kernel="sse2")
+            nwgrad.sw_score_int16(a, a, p, kernel=K)
         E._score8_stats(True)
-        assert nwgrad.sw_score_int16(a, a, p, kernel="sse2") == want
-        if DEFAULT_ON and "sse2" in nwgrad.available_isa_levels():
+        assert nwgrad.sw_score_int16(a, a, p, kernel=K) == want
+        if DEFAULT_ON:
             assert E._score8_stats(True)[0] == runs, segs
 
 

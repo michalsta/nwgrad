@@ -1088,13 +1088,13 @@ struct Aligner {
     int score_i8_(int backend, double& out) {
         if constexpr (nw_is_int<T>) {
             const int mode = score_int8_mode();
-            if (mode == 0 || (mode == 1 && AM != AlignMode::Local)) return 0;
-            const auto fn = level_kernels(backend).score_i8;
-            if (!fn || m_ < 1 || n_ < 1 || !ib_.prepared()) return 0;
-            if (mode == 1) {   // the row length the level's lanes need (score_int8_min_segs)
-                const int W = score_int8_lanes(backend);
+            if (mode == 0 || (mode == 1 && AM != AlignMode::Local) || m_ < 1 || n_ < 1) return 0;
+            if (mode == 1) {   // the row length the level's lanes need (score_int8_min_segs), first:
+                const int W = score_int8_lanes(backend);   // short pairs leave here, before any other test
                 if ((n_ + W - 1) / W < score_int8_min_segs(W, GM == GapModel::Linear, nalpha_)) return 0;
             }
+            const auto fn = level_kernels(backend).score_i8;
+            if (!fn || !ib_.prepared()) return 0;
             if (ib_.smax_pos > T(127) || ib_.smax_neg > T(127)) return 0;
             const bool lin = GM == GapModel::Linear;
             const long long goa = lin ? 0 : static_cast<long long>(params_->gap_open_a);
