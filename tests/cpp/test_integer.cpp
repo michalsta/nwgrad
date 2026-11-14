@@ -362,3 +362,114 @@ TEST_CASE("integer score-only equals the integer fill", "[integer][simd]") {
     }
     CHECK(bad == 0);
 }
+
+// ── Path narrowing (Aligner::narrow_viterbi_): on / off bit identity ──────────────────
+// An int32 / int64 problem the narrower type holds runs its Viterbi fill there and the
+// aligner adopts the codes or the held path.  Everything a caller reads after
+// compute_viterbi() -- the score, the aligned strings, the guide, the hard gradient --
+// must be the same bits with the narrowing forced on and off, for every gap model, mode,
+// traceback mode, Hirschberg cutoff and level; the fixture mixes problems that fit the
+// narrower type's quarter rule, only int16's saturating regime, and neither (params up to
+// several hundred), so all three routes run, and the int64 problems that fit int16 run
+// the two-step chain.
+namespace {
+template <GapModel GM, AlignMode AM, class T>
+Result run_narrow(const std::vector<uint8_t>& ea, const std::vector<uint8_t>& eb, const AlignParams& p,
+                  int backend, TracebackMode tb, int cutoff, int narrow) {
+    int_narrow_mode().store(narrow);
+    int_narrow_paths_mode().store(narrow ? (kIntNarrowOwnPath | kIntNarrowInter) : 0);
+    Result r = run_one<GM, AM, AlignBand::Full, T>(ea, eb, p, 0, {}, backend, tb, cutoff);
+    int_narrow_mode().store(-1);
+    int_narrow_paths_mode().store(-1);
+    return r;
+}
+// Per level: problems compared (both arms ran: not refused by the wide type) and how many
+// of them the narrowed arm actually ran narrowed (nw_narrow_path_runs).
+struct NarrowStats { int cases = 0, compared = 0, narrowed = 0; };
+template <GapModel GM, AlignMode AM, class T>
+void narrow_case(const std::string& A, const std::string& B, const AlignParams& p, int backend,
+                 TracebackMode tb, int cutoff, NarrowStats& st) {
+    const auto ea = p.matrix.alphabet().encode(A), eb = p.matrix.alphabet().encode(B);
+    const Result w = run_narrow<GM, AM, T>(ea, eb, p, backend, tb, cutoff, 0);
+    const unsigned long runs0 = nw_narrow_path_runs;
+    const Result n = run_narrow<GM, AM, T>(ea, eb, p, backend, tb, cutoff, 1);
+    ++st.cases;
+    if (!w.threw) ++st.compared;
+    if (nw_narrow_path_runs != runs0) ++st.narrowed;
+    INFO(nw_type_name<T>() << " GM " << static_cast<int>(GM) << " AM " << static_cast<int>(AM)
+         << " backend " << backend << " tb " << static_cast<int>(tb) << " cutoff " << cutoff
+         << " |A|=" << A.size() << " |B|=" << B.size() << " wide " << w.score
+         << (w.threw ? " (threw " + w.what + ")" : "") << " narrow " << n.score
+         << (n.threw ? " (threw " + n.what + ")" : ""));
+    CHECK(w.threw == n.threw);
+    CHECK(w.what == n.what);
+    if (!w.threw && !n.threw) {
+        CHECK(w.score == n.score);
+        CHECK(w.aligned == n.aligned);
+        CHECK(w.guide == n.guide);
+        CHECK(same_grad(w.grad, n.grad));
+    }
+}
+// Every problem at every level this host has (backends_under_test: the scalar backend,
+// which never narrows, and each simd level).
+template <class T>
+void narrow_sweep(uint64_t seed, int rounds, std::vector<NarrowStats>& stats) {
+    Rng rng(seed);
+    const Alphabet* alphas[] = {&Alphabet::get("ACGT"), &Alphabet::get("ACDEFGHIKLMNPQRSTVWY")};
+    const auto backends = backends_under_test();
+    stats.assign(backends.size(), {});
+    const TracebackMode tbs[] = {TracebackMode::Default, TracebackMode::Default, TracebackMode::Pointers,
+                                 TracebackMode::Grid, TracebackMode::Hirschberg, TracebackMode::HirschbergPmax,
+                                 TracebackMode::Scores};
+    for (int r = 0; r < rounds; ++r) {
+        const Alphabet& alpha = *alphas[rng.in(0, 1)];
+        const bool affine = rng.in(0, 2) != 0;
+        const int scale = rng.in(0, 9) < 6 ? 1 : rng.in(0, 3) ? 12 : 120;   // step ~12, ~150, ~1500
+        const AlignParams p0 = int_params(rng, alpha, affine, 1, rng.in(0, 4) == 0);
+        std::vector<double> blk(p0.matrix.data(), p0.matrix.data() + alpha.size() * alpha.size());
+        for (double& v : blk) v *= scale;
+        AlignParams p(SubstMatrix(blk.data(), alpha, 1));
+        for (int f = 0; f < 4; ++f) p.gap_ref(0, f) = p0.gap(0, f) * scale;
+        const int big = rng.in(0, 9);
+        const int la = big < 6 ? rng.in(1, 60) : big < 9 ? rng.in(60, 400) : rng.in(400, 1400);
+        const int lb = rng.in(0, 2) ? la + rng.in(-la / 4, la / 4) : rng.in(1, 2 * la + 2);
+        std::string A = random_seq(rng, alpha, la), B = random_seq(rng, alpha, std::max(1, lb));
+        if (rng.in(0, 1)) for (size_t q = 0; q < B.size() && q < A.size(); ++q) if (rng.in(0, 3)) B[q] = A[q];
+        const TracebackMode tb = tbs[rng.in(0, 6)];
+        const int cutoff = rng.in(0, 2) ? 512 : rng.in(0, 1) ? 24 : 8;
+        const int which = rng.in(0, 2) + (affine ? 0 : 3);
+        for (size_t k = 0; k < backends.size(); ++k) {
+            const int backend = backends[k];
+            NarrowStats& st = stats[k];
+            switch (which) {
+                case 0: narrow_case<GapModel::Affine, AlignMode::Global, T>(A, B, p, backend, tb, cutoff, st); break;
+                case 1: narrow_case<GapModel::Affine, AlignMode::Local,  T>(A, B, p, backend, tb, cutoff, st); break;
+                case 2: narrow_case<GapModel::Affine, AlignMode::Glocal, T>(A, B, p, backend, tb, cutoff, st); break;
+                case 3: narrow_case<GapModel::Linear, AlignMode::Global, T>(A, B, p, backend, tb, cutoff, st); break;
+                case 4: narrow_case<GapModel::Linear, AlignMode::Local,  T>(A, B, p, backend, tb, cutoff, st); break;
+                default: narrow_case<GapModel::Linear, AlignMode::Glocal, T>(A, B, p, backend, tb, cutoff, st); break;
+            }
+        }
+    }
+}
+}  // namespace
+
+TEMPLATE_TEST_CASE("integer path narrowing is bit-identical to the wide fill", "[integer][simd][narrow]",
+                   int32_t, int64_t) {
+    // One CHECK per output per problem per level; per level, the problems compared and how
+    // many ran narrowed are reported (WARN) and checked, so a level that silently stopped
+    // narrowing -- or stopped comparing -- fails instead of passing vacuously.
+    constexpr int kRounds = 400;
+    std::vector<NarrowStats> stats;
+    narrow_sweep<TestType>(0x6e61727277ULL, kRounds, stats);
+    const auto backends = backends_under_test();
+    for (size_t k = 0; k < backends.size(); ++k) {
+        const NarrowStats& st = stats[k];
+        WARN(nw_type_name<TestType>() << " backend " << backends[k] << ": " << st.cases << " problems, "
+             << st.compared << " compared, " << st.narrowed << " narrowed");
+        CHECK(st.cases == kRounds);
+        CHECK(st.compared > kRounds / 2);
+        if (backends[k] == kBackendScalar) CHECK(st.narrowed == 0);   // the scalar backend never narrows
+        else                               CHECK(st.narrowed > st.compared / 4);
+    }
+}

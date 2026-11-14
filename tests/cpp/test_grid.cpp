@@ -227,6 +227,7 @@ TEST_CASE("Grid traceback is bit-identical to Pointers (integer T, every mode)",
 }
 
 TEST_CASE("Grid traceback runs as Pointers where it is not implemented", "[grid][traceback]") {
+    IntNarrowOff narrow_off;   // checks the type's own kernel routing (narrowing tested in test_integer)
     std::mt19937 rng(7);
     long n_grid = 0;
     for (int t = 0; t < 12; ++t) {
@@ -244,6 +245,7 @@ TEST_CASE("Grid traceback runs as Pointers where it is not implemented", "[grid]
 }
 
 TEST_CASE("auto takes Grid for Glocal, and for Local above the pointer budget", "[grid][traceback]") {
+    IntNarrowOff narrow_off;   // checks the type's own kernel routing (narrowing tested in test_integer)
     // kDefaultTb (2026-11-05): Glocal past hb_cutoff (512 rows) runs Grid on every simd level (the
     // scalar backend falls back, pmax / Pointers); Local runs Pointers within
     // kAutoPointerCells and Grid above it.  Every run is Pointers' result.
@@ -300,10 +302,12 @@ TEST_CASE("auto takes Grid for Glocal, and for Local above the pointer budget", 
 }
 
 TEST_CASE("auto takes Grid for integer T where it splits", "[grid][traceback]") {
+    IntNarrowOff narrow_off;   // checks the type's own kernel routing (narrowing tested in test_integer)
     // run_tb_ (2026-11-05): integer `auto` is hirschberg_pmax; a pair that splits (past
     // hb_cutoff = 512 rows; Global int32 and Glocal have no pointer budget, Global int64 has
     // 2^25) runs Grid on a simd level, Pointers within the budget; int16 Global / Glocal too
-    // (AVX-512 Global from 2500 rows, Glocal from 600); Local (not int16) takes Grid past hb_cutoff at every size.
+    // (AVX-512 Global from 2500 rows, Glocal from 600); Local takes Grid past hb_cutoff at every
+    // size (int16 from a floor per level).
     std::mt19937 rng(20261110);
     const AlignParams p = random_int_params(rng, 0);
     auto run = [&](auto& al, TracebackMode tb, int kern, const std::string& a, const std::string& b) {
@@ -352,7 +356,22 @@ TEST_CASE("auto takes Grid for integer T where it splits", "[grid][traceback]") 
         if (simd) REQUIRE(l.alignment() == lp.alignment());
         Aligner<GapModel::Affine, AlignMode::Local, AlignBand::Full, int16_t> l16;
         run(l16, TracebackMode::Default, kern, A, B);
-        REQUIRE_FALSE(l16.ran_grid());   // int16 Local inside the budget: Pointers (a tie)
+        // int16 Local: Grid from a floor per level (local_grid_min_rows): NEON 600, AVX2 and
+        // sse 1000, AVX-512 never; 800 rows here, 1100 below
+#if defined(__aarch64__) || defined(_M_ARM64)
+        const bool g800 = simd, g1100 = simd;
+#else
+        const bool g800 = false, g1100 = simd && kern != static_cast<int>(SimdLevel::Avx512);
+#endif
+        REQUIRE(l16.ran_grid() == g800);
+        {   // ... and from it, Grid: Pointers' result
+            const std::string A2 = A + A.substr(0, 300), B2 = B + B.substr(0, 300);
+            Aligner<GapModel::Affine, AlignMode::Local, AlignBand::Full, int16_t> m16, m16p;
+            run(m16, TracebackMode::Default, kern, A2, B2); run(m16p, TracebackMode::Pointers, kern, A2, B2);
+            REQUIRE(m16.ran_grid() == g1100);
+            REQUIRE(m16.score() == m16p.score());
+            REQUIRE(m16.alignment() == m16p.alignment());
+        }
         Aligner<GapModel::Affine, AlignMode::Global, AlignBand::Full, int64_t> g64;
         run(g64, TracebackMode::Default, kern, A, B);
         REQUIRE_FALSE(g64.ran_grid());

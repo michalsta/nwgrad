@@ -1139,16 +1139,32 @@ private:
     // the whole stack and every set's gaps, and step_max), tracked or not, so a
     // non-integral parameter raises at construction / set_params() and no pair repeats
     // the checks.
+    // The inter-pair fills at half the lane width (int32 -> int16, int64 -> int32; see
+    // "Inter-pair groups at the narrower type" below): NI is that type, T itself where
+    // there is none (unused then).
+    static constexpr bool kNarrowInter = std::is_same_v<T, std::int32_t> || std::is_same_v<T, std::int64_t>;
+    using NI = std::conditional_t<kNarrowInter, nw_int_narrower_t<T>, T>;
+    using NarrowAl = Aligner<GM, AM, AlignBand::Full, NI>;
     struct OwnedParams {
         AlignParams p;
         std::vector<T> stack, gaps;
         NwIntBound<T> ib;     // integer T: the bound facts (nw_int_prepare); step_max -1 = not prepared
+        // kNarrowInter, untracked, every parameter within NI's cap: the block in NI and the
+        // bound facts in NI (nprepared); otherwise empty and not prepared.
+        std::vector<NI> nstack;
+        NwIntBound<NI> nib;
         const T* stack_or_null() const noexcept { return stack.empty() ? nullptr : stack.data(); }
+        bool nprepared() const noexcept { return nib.prepared(); }
     };
     std::shared_ptr<const OwnedParams> own_params_(const AlignParams& p) const {
-        auto o = std::make_shared<OwnedParams>(OwnedParams{p, {}, {}, {}});
+        auto o = std::make_shared<OwnedParams>(OwnedParams{p, {}, {}, {}, {}, {}});
         if constexpr (nw_is_int<T>) {
             nw_int_prepare<T>(p, p.num_sets(), o->stack, o->gaps, o->ib);
+            if constexpr (kNarrowInter)
+                if (!tracked_ && p.num_sets() == 1 && nw_int_bound_narrow(o->ib, o->nib)) {
+                    o->nstack.resize(o->stack.size());
+                    for (size_t k = 0; k < o->stack.size(); ++k) o->nstack[k] = static_cast<NI>(o->stack[k]);
+                }
             return o;
         }
         if (!tracked_) return o;   // untracked (and standalone SeqPair): no allocation
@@ -1715,10 +1731,22 @@ private:
     static Touched& touched_tls_() { static thread_local Touched t; return t; }
 
     // ── A worker's state: one buffer, one Aligner per band, gradient scratch ─────
+    struct NarrowLanes {   // a narrow inter-pair group's lanes (narrow_job_)
+        std::vector<const unsigned char*> a, b;
+        std::vector<int> m, nb, bi, bj;
+        std::vector<NI> best;
+        int M = 0, n = 0;
+        bool ragged = false;
+    };
     struct Work {
         DpBuffer buf;
         FullAl full;
         BandAl band;
+        // narrow inter-pair groups: their tables, the lane's aligner and lanes (an empty
+        // member for the types never narrowed: no aligner or buffer to build per Work)
+        struct NarrowWork { DpBufferT<NI> nbuf; NarrowAl nfull; NarrowLanes nl; };
+        struct NoNarrowWork {};
+        [[no_unique_address]] std::conditional_t<kNarrowInter, NarrowWork, NoNarrowWork> nw;
         AlignParams g;
         std::vector<int> gj;
         std::vector<FullAl> lanes;           // tracked inter-pair: one aligner per lane
@@ -2302,70 +2330,168 @@ public:
     // sweeps, to see where the gates routed the pairs.  (The score-only gather gate,
     // inter_score_ok, acts per group inside the call and is not reflected here.)
     std::array<size_t, 3> inter_plan_counts(bool score_only = false) {
-        const InterPlan& P = ensure_plan_(score_only && grad_mode_ == GradMode::None);
-        return {P.elig.size(), P.other.size(), P.groups.size()};
+        const bool rows = score_only && grad_mode_ == GradMode::None;
+        const InterPlan& P = ensure_plan_(rows, narrow_inter_on_());
+        return {P.elig.size() + P.nelig.size(), P.other.size(), P.groups.size() + P.ngroups.size()};
     }
 private:
     struct InterPlan {
         int default_backend = -1000, hb_cutoff = -1;   // what it was built for
         unsigned gate_epoch = ~0u;                      // ... and under which gate overrides
+        NwIntBound<T> ib;                               // ... and bound facts (integer T)
         int backend = -1;                               // every group's vector backend
         std::vector<size_t> elig, other;
         std::vector<std::pair<size_t, size_t>> groups;   // [start, end) into elig
+        // Narrow plans only: the groups that run at the narrower type NI, on nbackend.
+        int nbackend = -1;
+        std::vector<size_t> nelig;
+        std::vector<std::pair<size_t, size_t>> ngroups;  // [start, end) into nelig
     };
     // Two plans: plan_ for the fills that keep tables (score_and_grad_inter_, the band
     // groups), plan_rows_ for score_only_ (no byte budget: its kernel keeps rows).  Both
-    // only differ for grad_mode None; plan_rows_ stays empty otherwise.
-    InterPlan plan_, plan_rows_;
+    // only differ for grad_mode None; plan_rows_ stays empty otherwise.  nplan_ and
+    // nplan_rows_: the same with the narrow groups split off (narrow_inter_on_()); the
+    // band groups keep plan_ (a banded fill is not narrowed).
+    InterPlan plan_, plan_rows_, nplan_, nplan_rows_;
+    static bool same_bound_(const NwIntBound<T>& x, const NwIntBound<T>& y) noexcept {
+        return x.step_max == y.step_max && x.smax_pos == y.smax_pos && x.smax_neg == y.smax_neg &&
+               x.gain == y.gain && x.goneg == y.goneg && x.goa_pos == y.goa_pos &&
+               x.gob_pos == y.gob_pos && x.gea_pos == y.gea_pos && x.geb_pos == y.geb_pos;
+    }
+
+    // ── Inter-pair groups at the narrower type (int32 -> int16, int64 -> int32) ──────
+    // The inter-pair counterpart of Aligner::narrow_viterbi_ / narrow_score_: an untracked
+    // integer batch's pairs that pass the narrower type's QUARTER RULE (the inter-pair
+    // kernels have no saturating regime) form their own groups of NI's width W_NI (twice
+    // T's lanes) and run NI's inter-pair kernels; each lane is adopted by an Aligner of NI
+    // (Work::nfull), whose walk gives the score, the path, the guide and the hard gradient.
+    // Exact: under the quarter rule every table value of the narrow fill equals the wide
+    // own fill's, so every comparison and every walk step does; the inter-pair tables are
+    // bit-identical to a pair's own fill (the inter-pair contract), and the own fill is the
+    // Pointers class -- which a pair joins a group only for (not a splitting Hirschberg
+    // pair: the same hb_splits test as T's groups).  The gates are NI's own (byte budget,
+    // linear cap, score-only cap: inter_pair_fits / inter_linear_cap / inter_score_ok at NI
+    // and W_NI; no new gate).  A pair NI cannot hold, or left in an under-filled narrow
+    // group, takes T's plan as before.  Off: NWGRAD_INT_NARROW=0, NWGRAD_INT_NARROW_PATHS=0
+    // / =own, a tracked batch, soft (integer batches have none), the scalar backend.
+    bool narrow_inter_on_() const noexcept {
+        if constexpr (!kNarrowInter) return false;
+        else {
+            if (tracked_ || grad_mode_ == GradMode::Soft || !params_ || !params_->nprepared()) return false;
+            const int m = int_narrow_mode().load(std::memory_order_relaxed);
+            const bool on = m >= 0 ? m != 0 : FullAl::int_narrow_env();
+            return on && (int_narrow_paths() & kIntNarrowInter);
+        }
+    }
+    int narrow_inter_backend_() const {
+        const int backend = (kernel_ == kBackendAuto) ? global_default_backend() : kernel_;
+        if (backend < 0) return -1;
+        const LevelKernels& K = level_kernels(backend);
+        const TypedKernels<NI>& KN = K.template of<NI>();
+        if (!KN.inter_fill || KN.inter_w <= 0) return -1;
+        if (GM == GapModel::Linear && AM != AlignMode::Local && KN.inter_w < 4) return -1;   // linear_fill_ok_ at NI
+        return backend;
+    }
+    bool narrow_eligible_(size_t i, const LevelKernels& K, bool rows) const {
+        const size_t la = len_a(i), lb = len_b(i);
+        if (la == 0 || lb == 0) return false;
+        if (nw_int_bound_check<NI, AM == AlignMode::Local, false>(params_->nib, static_cast<int>(la), static_cast<int>(lb)) != 0)
+            return false;
+        const int Wn = K.template of<NI>().inter_w;
+        if (!rows &&
+            !inter_pair_fits<NI>(la, lb, GM == GapModel::Affine, false, Wn, K.d.inter_w, s_.n_threads == 1,
+                                 K.level, alpha_->size() <= 8, threads_share_cores(s_.n_threads)))
+            return false;
+        if constexpr (GM == GapModel::Linear)
+            if ((la + 1) * (lb + 1) > inter_linear_cap<NI, AM != AlignMode::Local>(alpha_->size(), K.level))
+                return false;
+        return !hb_splits(own_tb_(tracked_), s_.traceback == TracebackMode::Default ? FullAl::kAutoPointerCells : 0, s_.hb_cutoff, la, lb);
+    }
 
     // Built once and reused until the default ISA changes, the Hirschberg cutoff moves or
     // a fill gate is overridden (nwgrad._tuning):
     // re-sorting 2.5M pairs every training iteration was ~0.9 s of serial work per call.
     // Groups: len B runs of len-A-sorted pairs, cut every W and wherever len B outgrows
     // the group's shortest past ragged_ok().
-    const InterPlan& ensure_plan_(bool rows = false) {
-        InterPlan& dst = rows ? plan_rows_ : plan_;
+    // The bound facts are part of the key for an integer T (set_params() may move a pair
+    // across a bound: int16's saturating regime has no inter-pair kernel, nor has a pair
+    // past NI's quarter rule a narrow group); a floating T's are never prepared.
+    const InterPlan& ensure_plan_(bool rows = false, bool narrow = false) {
+        InterPlan& dst = narrow ? (rows ? nplan_rows_ : nplan_) : (rows ? plan_rows_ : plan_);
         const int def_backend = global_default_backend();
         const unsigned epoch = gate_epoch();
+        // (floating T: never prepared, so the key compares constants; skipped at compile time)
+        const NwIntBound<T> ib = (nw_is_int<T> && params_) ? params_->ib : NwIntBound<T>{};
         if (dst.default_backend == def_backend && dst.hb_cutoff == s_.hb_cutoff &&
-            dst.gate_epoch == epoch) return dst;
+            dst.gate_epoch == epoch && (!nw_is_int<T> || same_bound_(dst.ib, ib))) return dst;
         const size_t N = size();
         InterPlan P;
-        P.default_backend = def_backend; P.hb_cutoff = s_.hb_cutoff; P.gate_epoch = epoch;
+        P.default_backend = def_backend; P.hb_cutoff = s_.hb_cutoff; P.gate_epoch = epoch; P.ib = ib;
         P.backend = inter_backend_();
-        if (P.backend < 0) {
+        P.nbackend = narrow ? narrow_inter_backend_() : -1;
+        if (P.backend < 0 && P.nbackend < 0) {
             P.other.resize(N);
             std::iota(P.other.begin(), P.other.end(), size_t{0});
             dst = std::move(P);
             return dst;
         }
-        const LevelKernels& K = level_kernels(P.backend);
         struct Key { size_t len_b, len_a, i; };
-        std::vector<Key> keys;
-        keys.reserve(N);
-        for (size_t i = 0; i < N; ++i) {
-            if (!inter_eligible_(i, K, rows)) { P.other.push_back(i); continue; }
-            keys.push_back({len_b(i), len_a(i), i});
-        }
-        std::sort(keys.begin(), keys.end(), [](const Key& x, const Key& y) {
+        auto by_len = [](const Key& x, const Key& y) {
             if (x.len_b != y.len_b) return x.len_b < y.len_b;
             if (x.len_a != y.len_a) return x.len_a < y.len_a;
             return x.i < y.i;
-        });
-        // A group of mostly padding lanes runs its pairs' own fills (inter_group_filled).
-        P.elig.reserve(keys.size());
-        const size_t W = static_cast<size_t>(inter_w_(K));
-        for (size_t s = 0; s < keys.size();) {
-            size_t e = s + 1;
-            while (e < keys.size() && e - s < W && ragged_ok(keys[s].len_b, keys[e].len_b)) ++e;
-            if (inter_group_filled(e - s, W)) {
-                P.groups.emplace_back(P.elig.size(), P.elig.size() + (e - s));
-                for (size_t k = s; k < e; ++k) P.elig.push_back(keys[k].i);
-            } else {
-                for (size_t k = s; k < e; ++k) P.other.push_back(keys[k].i);
+        };
+        // Groups: len B runs of the sorted keys, cut every W and wherever len B outgrows the
+        // group's shortest; a group of mostly padding lanes runs its pairs' own fills
+        // (inter_group_filled) -- `left` takes them.
+        auto cut = [](const std::vector<Key>& keys, size_t W, std::vector<size_t>& elig,
+                      std::vector<std::pair<size_t, size_t>>& groups, auto&& left) {
+            elig.reserve(keys.size());
+            for (size_t s = 0; s < keys.size();) {
+                size_t e = s + 1;
+                while (e < keys.size() && e - s < W && ragged_ok(keys[s].len_b, keys[e].len_b)) ++e;
+                if (inter_group_filled(e - s, W)) {
+                    groups.emplace_back(elig.size(), elig.size() + (e - s));
+                    for (size_t k = s; k < e; ++k) elig.push_back(keys[k].i);
+                } else {
+                    for (size_t k = s; k < e; ++k) left(keys[k].i);
+                }
+                s = e;
             }
-            s = e;
+        };
+        std::vector<Key> keys, nkeys;
+        keys.reserve(N);
+        std::vector<size_t> back;   // narrow candidates the narrow groups left: T's plan
+        if (P.nbackend >= 0) {
+            const LevelKernels& KN = level_kernels(P.nbackend);
+            std::vector<size_t> rest;
+            for (size_t i = 0; i < N; ++i) {
+                if (narrow_eligible_(i, KN, rows)) nkeys.push_back({len_b(i), len_a(i), i});
+                else rest.push_back(i);
+            }
+            std::sort(nkeys.begin(), nkeys.end(), by_len);
+            cut(nkeys, static_cast<size_t>(KN.template of<NI>().inter_w), P.nelig, P.ngroups,
+                [&](size_t i) { rest.push_back(i); });
+            back = std::move(rest);
+        } else {
+            back.resize(N);
+            std::iota(back.begin(), back.end(), size_t{0});
         }
+        if (P.backend < 0) {
+            P.other = std::move(back);
+            std::sort(P.other.begin(), P.other.end());
+            dst = std::move(P);
+            return dst;
+        }
+        const LevelKernels& K = level_kernels(P.backend);
+        std::sort(back.begin(), back.end());
+        for (size_t i : back) {
+            if (!inter_eligible_(i, K, rows)) { P.other.push_back(i); continue; }
+            keys.push_back({len_b(i), len_a(i), i});
+        }
+        std::sort(keys.begin(), keys.end(), by_len);
+        cut(keys, static_cast<size_t>(inter_w_(K)), P.elig, P.groups,
+            [&](size_t i) { P.other.push_back(i); });
         dst = std::move(P);
         return dst;
     }
@@ -2374,11 +2500,15 @@ private:
     // tables for score, path and gradient; the other pairs run their own fill.  One
     // atomic counter over all tasks.  (SeqPairBatch::score_and_grad_inter_.)
     void score_and_grad_inter_(bool keep) {
-        ensure_plan_();
-        const auto& elig = plan_.elig;
-        const auto& other = plan_.other;
-        const auto& groups = plan_.groups;
-        const size_t G = groups.size(), tasks = G + other.size();
+        // (a type never narrowed: plan_ and no narrow groups, NG a constant 0, so the worker
+        // below is main's -- nighthaven measured +1.2-1.5 % instructions on double linear
+        // Global miRNA path at 4 lanes with the narrow dispatch in the loop)
+        const InterPlan& PL = kNarrowInter ? ensure_plan_(false, narrow_inter_on_()) : ensure_plan_();
+        const auto& elig = PL.elig;
+        const auto& other = PL.other;
+        const auto& groups = PL.groups;
+        const size_t NG = kNarrowInter ? PL.ngroups.size() : 0;
+        const size_t G = groups.size(), tasks = NG + G + other.size();
         const bool soft = grad_mode_ == GradMode::Soft;
         // A lazy-guide soft group needs no Viterbi at all, nor a posterior-guide one.
         const bool no_viterbi = soft && (s_.soft_guide_lazy || s_.soft_guide_posterior) && !keep;
@@ -2395,14 +2525,18 @@ private:
             std::vector<double> slogz, scnt, sgap;
             std::vector<int> cM_;   // tracked soft: each lane's chunk M (its row stride)
             while (true) {
-                const size_t t = idx.fetch_add(1, std::memory_order_relaxed);
+                size_t t = idx.fetch_add(1, std::memory_order_relaxed);
                 if (t >= tasks) break;
+                if constexpr (kNarrowInter) {
+                    if (t < NG) { run_narrow_group_(PL, PL.ngroups[t].first, PL.ngroups[t].second, w, keep); continue; }
+                    t -= NG;
+                }
                 if (t >= G) { run_full_(other[t - G], w, keep); continue; }
                 // (not a structured binding: the soft pass's lambda captures s, and clang
                 // cannot capture a structured binding inside an OpenMP region)
                 const size_t s = groups[t].first, e = groups[t].second;
                 const size_t real = e - s;
-                const LevelKernels& K = level_kernels(plan_.backend);
+                const LevelKernels& K = level_kernels(PL.backend);
                 const int W = inter_w_(K);
                 a.assign(W, nullptr); b.assign(W, nullptr); m.assign(W, 0);
                 bi.assign(W, 0); bj.assign(W, 0); best.assign(W, T(0));
@@ -2546,6 +2680,7 @@ private:
     struct BandGroups {
         size_t full_calls = static_cast<size_t>(-1);
         int default_backend = -1000, hb_cutoff = -1;
+        NwIntBound<T> ib;
         std::vector<size_t> elig, other;
         std::vector<std::pair<size_t, size_t>> groups;
     };
@@ -2555,11 +2690,11 @@ private:
     void ensure_band_groups_() {
         ensure_plan_();
         if (band_.full_calls == full_calls_ && band_.default_backend == plan_.default_backend &&
-            band_.hb_cutoff == plan_.hb_cutoff)
+            band_.hb_cutoff == plan_.hb_cutoff && same_bound_(band_.ib, plan_.ib))
             return;
         BandGroups Bg;
         Bg.full_calls = full_calls_;
-        Bg.default_backend = plan_.default_backend; Bg.hb_cutoff = plan_.hb_cutoff;
+        Bg.default_backend = plan_.default_backend; Bg.hb_cutoff = plan_.hb_cutoff; Bg.ib = plan_.ib;
         Bg.other = plan_.other;
         const bool shared = GM == GapModel::Affine && grad_mode_ != GradMode::Soft;
         std::vector<size_t> E;
@@ -2667,6 +2802,114 @@ private:
         else banded_grad_dynamic_(bandwidth, false);
     }
 
+    // A narrow group's lanes and its job (the narrow groups' common part): every lane's
+    // codes and lengths (spare lanes repeat the last pair), the params in NI.
+    void narrow_job_(const InterPlan& PL, size_t s, size_t e, int W, NarrowLanes& L, InterJobT<NI>& job) const {
+        const size_t real = e - s;
+        L.a.assign(W, nullptr); L.b.assign(W, nullptr); L.m.assign(W, 0); L.nb.assign(W, 0);
+        L.bi.assign(W, 0); L.bj.assign(W, 0); L.best.assign(W, NI(0));
+        L.M = 0; L.n = 0; L.ragged = false;
+        for (int l = 0; l < W; ++l) {
+            const size_t i = PL.nelig[s + std::min<size_t>(static_cast<size_t>(l), real - 1)];
+            L.a[l] = codes_a(i).data(); L.b[l] = codes_b(i).data();
+            L.m[l] = static_cast<int>(len_a(i)); L.nb[l] = static_cast<int>(len_b(i));
+            L.M = std::max(L.M, L.m[l]); L.n = std::max(L.n, L.nb[l]);
+            L.ragged |= L.nb[l] != L.nb[0];
+        }
+        const AlignParams& P = params_->p;
+        job = InterJobT<NI>{};
+        job.a = L.a.data(); job.m = L.m.data(); job.b = L.b.data(); job.n = L.n; job.M = L.M;
+        job.align_mode = (AM == AlignMode::Local) ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
+        if (L.ragged) job.nb = L.nb.data();
+        job.blk = params_->nstack.data(); job.nalpha = P.matrix.size();
+        job.go_a = static_cast<NI>(P.gap_open_a); job.ge_a = static_cast<NI>(P.gap_extend_a);
+        job.go_b = static_cast<NI>(P.gap_open_b); job.ge_b = static_cast<NI>(P.gap_extend_b);
+        job.linear = GM == GapModel::Linear ? 1 : 0;
+    }
+    // A narrow group of the hard / path call (score_and_grad_inter_): the NI fill, then each
+    // lane adopted by Work::nfull and walked once for gradient, guide and path -- what
+    // run_interleaved_ does at T (untracked; no soft).
+    void run_narrow_group_(const InterPlan& PL, size_t s, size_t e, Work& w, bool keep) {
+        if constexpr (kNarrowInter) {
+            const LevelKernels& K = level_kernels(PL.nbackend);
+            const int W = K.template of<NI>().inter_w;
+            NarrowLanes& L = w.nw.nl;
+            InterJobT<NI> job;
+            narrow_job_(PL, s, e, W, L, job);
+            const size_t sz = static_cast<size_t>(L.M + 1) * (L.n + 1) * W;
+            if constexpr (GM == GapModel::Linear) {
+                if (w.nw.nbuf.H.size() < sz) w.nw.nbuf.H.resize(sz);
+                job.VM = w.nw.nbuf.H.data();
+            } else {
+                for (auto* v : {&w.nw.nbuf.VM, &w.nw.nbuf.VX, &w.nw.nbuf.VY}) if (v->size() < sz) v->resize(sz);
+                job.VM = w.nw.nbuf.VM.data(); job.VX = w.nw.nbuf.VX.data(); job.VY = w.nw.nbuf.VY.data();
+            }
+            job.best = L.best.data(); job.best_i = L.bi.data(); job.best_j = L.bj.data();
+            K.template of<NI>().inter_fill(job);
+            const size_t gstride = L.ragged ? static_cast<size_t>(L.n) + 1 : 0;
+            NarrowAl& al = w.nw.nfull;
+            for (size_t l = 0; l < e - s; ++l) {
+                const size_t i = PL.nelig[s + l];
+                flags_[i] &= static_cast<uint8_t>(~(kScore | kGrad | kStored));
+                al.set_problem(codes_a(i), codes_b(i), params_->p, 0, {}, {}, {},
+                               params_->nstack.data(), nullptr, &params_->nib);
+                al.adopt_interleaved(w.nw.nbuf, W, static_cast<int>(l), L.best[l], L.bi[l], L.bj[l], gstride);
+                score_[i] = al.score();
+                if (grad_mode_ == GradMode::Hard) {
+                    with_path_(i, al, keep, [&](auto&& mv) {
+                        w.g.zero();
+                        al.hard_grad_and_guide(w.nw.nbuf, w.g, w.gj, mv);
+                        store_grad_(i, w.g);
+                        store_guide_(i, w.gj);
+                    });
+                } else {
+                    with_path_(i, al, keep, [&](auto&& mv) { al.path_and_guide(w.nw.nbuf, mv, w.gj); });
+                    store_guide_(i, w.gj);
+                }
+                finish_(i, false, false);
+            }
+        } else {
+            (void)PL; (void)s; (void)e; (void)w; (void)keep;
+        }
+    }
+    // A narrow group of score_only_: NI's inter-pair score kernel under NI's score-only cap
+    // (inter_score_ok); false = not run here (the caller runs each pair's own score, which
+    // narrows by itself: Aligner::narrow_score_).
+    bool narrow_score_group_(const InterPlan& PL, size_t s, size_t e, Work& w) {
+        if constexpr (kNarrowInter) {
+            const LevelKernels& K = level_kernels(PL.nbackend);
+            const TypedKernels<NI>& KN = K.template of<NI>();
+            if (!KN.inter_score) return false;
+            const int W = KN.inter_w;
+            NarrowLanes& L = w.nw.nl;
+            InterJobT<NI> job;
+            narrow_job_(PL, s, e, W, L, job);
+            if (!inter_score_ok<NI>(alpha_->size(), L.M, L.n, GM == GapModel::Affine, AM == AlignMode::Local,
+                                    s_.n_threads == 1, PL.nbackend))
+                return false;
+            const size_t sz = static_cast<size_t>(L.n + 1) * W;
+            if constexpr (GM == GapModel::Linear) {
+                if (w.nw.nbuf.H.size() < sz) w.nw.nbuf.H.resize(sz);
+                job.VM = w.nw.nbuf.H.data();
+            } else {
+                for (auto* v : {&w.nw.nbuf.VM, &w.nw.nbuf.VX, &w.nw.nbuf.VY}) if (v->size() < sz) v->resize(sz);
+                job.VM = w.nw.nbuf.VM.data(); job.VX = w.nw.nbuf.VX.data(); job.VY = w.nw.nbuf.VY.data();
+            }
+            job.best = L.best.data();
+            KN.inter_score(job);
+            for (size_t l = 0; l < e - s; ++l) {
+                const size_t i = PL.nelig[s + l];
+                flags_[i] &= static_cast<uint8_t>(~kStored);
+                score_[i] = static_cast<double>(L.best[l]);
+                finish_(i, false, true);
+            }
+            return true;
+        } else {
+            (void)PL; (void)s; (void)e; (void)w;
+            return false;
+        }
+    }
+
     // ── Own-fill schedulers (SeqPairBatch's, unchanged in substance) ─────────
 
     // grad_mode None without stored paths: scores only — compute_score per pair, the
@@ -2679,9 +2922,10 @@ private:
         gparams_ = params_;
         const size_t N = size();
         const bool inter = s_.inter_fill;
-        const InterPlan& PL = inter ? ensure_plan_(true) : plan_;
+        const InterPlan& PL = inter ? (kNarrowInter ? ensure_plan_(true, narrow_inter_on_()) : ensure_plan_(true)) : plan_;
         const size_t G = inter ? PL.groups.size() : 0;
-        const size_t tasks = inter ? G + PL.other.size() : N;
+        const size_t NG = (kNarrowInter && inter) ? PL.ngroups.size() : 0;
+        const size_t tasks = inter ? NG + G + PL.other.size() : N;
         std::atomic<size_t> idx{0};
         auto worker = [&]() {
             WorkLease lease(*this);
@@ -2697,6 +2941,13 @@ private:
             };
             for (size_t t; (t = idx.fetch_add(1, std::memory_order_relaxed)) < tasks; ) {
                 if (!inter) { own(t); continue; }
+                if (t < NG) {
+                    const auto [ns, ne] = PL.ngroups[t];
+                    if (!narrow_score_group_(PL, ns, ne, w))
+                        for (size_t l = ns; l < ne; ++l) own(PL.nelig[l]);
+                    continue;
+                }
+                t -= NG;
                 if (t >= G) { own(PL.other[t - G]); continue; }
                 const auto [s, e] = PL.groups[t];
                 const size_t real = e - s;

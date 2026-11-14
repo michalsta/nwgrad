@@ -3057,6 +3057,71 @@ instructions (cycles +7-15 %); L100 0.93-0.97 and int32 / int64 held.  So:
   same score.
 Not re-measured after this round: everything above (nighthaven int16, the spot window).
 
+### Narrowing for paths and inter-pair groups (branch `proto/narrow-paths`, 2026-11-10)
+
+Review r2 proposal 1: the half-width lanes of `narrow_score_` extended to every
+path-producing fill.  Bit-identical by the same argument (under the narrower type's bound
+every reachable value is the wide fill's integer, so every comparison, code, walk step, tie,
+guide and gradient count is too); the outputs are converted back (score widened, codes and
+held paths type-free).
+- **Own fill** (`Aligner::narrow_viterbi_`, aligner.hpp): an untracked Full int32 / int64
+  problem that passes `nw_int_bound_check<N>` (plain or int16's saturating regime) runs its
+  Viterbi fill as a per-thread `Aligner<..., N>`; the wide aligner adopts the direction codes
+  (swapped into the caller's buffer, with the layout and dense flag the narrow kernel chose)
+  or the held path (Grid / Hirschberg `hops_`), the end cell and state, and the score.  The
+  narrow run must take an algorithm of the same class (`path_class_`): Pointers / Grid /
+  unsplit Hirschberg (one result) or the same splitting Hirschberg mode.  `auto` resolves per
+  type, so where the narrow type's own choice leaves the class it is told: Grid (int16 Global
+  `auto` is pmax, a different tie-break) or the wide aligner's Hirschberg mode.  Linear runs
+  the code fill (explicit Pointers) where `auto` keeps the H table.  int64 fitting int16
+  narrows twice (chained).  Not narrowed: tracked, banded, scalar backend, Scores / rowwise
+  tables, empty sides.
+- **Inter-pair** (`BatchEngine`, "Inter-pair groups at the narrower type"): the pairs passing
+  the narrower type's QUARTER rule (the inter-pair kernels have no saturating regime) form
+  groups at NI's width under NI's own gates (`inter_pair_fits` / `inter_linear_cap` /
+  `inter_score_ok` at NI); each lane is adopted by `Work::nfull` (an `Aligner<NI>`) and walked
+  for gradient, guide and path; score-only groups run NI's inter score kernel.  Separate plans
+  (`nplan_`, `nplan_rows_`); the band groups keep `plan_`.  Untracked, hard / none only.
+  The plans are now also keyed on the params' bound facts (`same_bound_`): set_params() could
+  move a pair across a bound (a latent hole for int16's saturating regime, whose pairs must
+  not join a group).
+- Switches: `NWGRAD_INT_NARROW=0` turns off all narrowing; `NWGRAD_INT_NARROW_PATHS` = `0`
+  (score-only narrowing only), `own`, `inter` (one of the two), unset = both
+  (`int_narrow_paths()`; `int_narrow_paths_mode()` for the tests; `IntNarrowOff` scoped in the
+  routing tests, which check a type's own kernels).  An int8 tier (score-only) would extend
+  `nw_int_narrower` for `narrow_score_` only: the path / inter kernels stop at int16.
+- Tests: `[narrow]` in test_integer.cpp (on / off, 700 problems per type, every gap model,
+  mode, traceback, cutoff 8 / 24 / 512, every level here, params from step ~12 to ~1500);
+  `results/tools/int_path_ab.py` (on / off over whole batches at sse4 / sse2 / scalar_fallback,
+  mixed fitting / non-fitting pairs, every output incl. banded and set_params).
+- Not done: the streaming align (`align_stream`) inter fills.  Given up on the narrowed
+  problems: the dense codes (int16 never writes them) and int16 Local's `auto` Grid (it runs
+  Pointers); measure on AVX2 / NEON at L >= 2000.
+
+Measured (wloczykij, Piledriver sse4, user instructions per cell, two rep counts differenced,
+A = `NWGRAD_INT_NARROW=0`, A' = A again, B = on; 1 thread; BLOSUM62 11/1 or 0/4, DNA 2/-4 4/2):
+
+| config | A | A' | B | B/A |
+|---|---|---|---|---|
+| int64 protein L1000 affine Global path (Pointers -> int16 Grid, chained) | 49.99 | 49.97 | 8.79 | 0.18 |
+| int64 protein L1000 linear Global path | 30.11 | 30.12 | 6.74 | 0.22 |
+| int64 DNA L1000 linear Global path | 30.11 | 30.10 | 6.74 | 0.22 |
+| int32 protein L1000 affine Global path, auto (Grid) | 12.31 | 12.30 | 8.79 | 0.71 |
+| int32 protein L1000 affine Global path, grid | 12.30 | 12.30 | 8.81 | 0.72 |
+| int32 protein L1000 linear Global path | 13.83 | 13.87 | 6.70 | 0.48 |
+| int32 protein L1000 affine Local path | 14.89 | 14.90 | 13.10 | 0.88 |
+| int32 miRNA 22x50 score (256 pairs, interpair) | 12.36 | 11.77 | 4.19 | 0.34 |
+| int32 miRNA path | 12.19 | 12.62 | 8.09 | 0.66 |
+| int32 miRNA hard | 12.32 | 12.31 | 8.26 | 0.67 |
+| int32 DNA L100 path (64 pairs, interpair) | 9.29 | 9.28 | 5.17 | 0.56 |
+| int64 DNA L100 path | 24.94 | 25.05 | 9.18 | 0.37 |
+| int32 protein L100 path | 16.02 | 15.98 | 12.78 | 0.80 |
+| int64 protein L100 path | 31.78 | 31.70 | 16.09 | 0.51 |
+| int64 DNA L100 linear Global path | 16.45 | 16.44 | 4.95 | 0.30 |
+
+The narrowed numbers are the int16 batch's own (review: miRNA int16 score 4.19, path 8.18;
+int16 Grid 8.79).  Instruction counts only; AVX2 / AVX-512 / NEON compiled, not run.
+
 ### The soft path: scaled probability space (2026-10-05)
 
 **The scaled path flushes denormals to zero in double too** (default since 2026-11-06,

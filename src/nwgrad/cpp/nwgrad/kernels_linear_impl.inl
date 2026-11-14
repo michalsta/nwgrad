@@ -229,7 +229,10 @@ static void striped_linear_full(ViterbiJob<T>& job) {
 
             // ── the carry: Y[c] = max(open[c-1], Y[c-1] - ge_a) along each lane ──
             if constexpr (nw_is_int<T> && W >= 4) {
-                int_pmax_carry<T, W>(ov, nullptr, nbOpen, static_cast<T>(0),
+                // Sat forwarded: in the saturating regime the opens sit near lowest() and a
+                // negative ge_a ramps them below it (the plain carry wrapped: UBSan, int16 linear
+                // Glocal at 32 lanes, -32744 + -2160).
+                int_pmax_carry<T, W, false, 2, Sat>(ov, nullptr, nbOpen, static_cast<T>(0),
                                      K_NINF, ge_a, seg, yv, nullptr, nullptr);
             } else {
                 // The open into Y at segment q: `t - ge_a`, t still in cH until pass 2 -- the same
@@ -521,7 +524,7 @@ static void lhb_striped_impl(LhbJob<T>& job) {
             }
 
             if constexpr (nw_is_int<T> && W >= 4) {
-                int_pmax_carry<T, W>(ov, nullptr, nbOpen, static_cast<T>(0),
+                int_pmax_carry<T, W, false, 2, Sat>(ov, nullptr, nbOpen, static_cast<T>(0),   // Sat: see the full kernel
                                      K_NINF, ga, seg, yv, nullptr, nullptr);
             } else {
                 // The open into Y at segment q: `t - ge_a`, t still in cH until pass 2 -- the same
