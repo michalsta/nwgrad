@@ -960,7 +960,7 @@ inline constexpr GateLevelCaps kGateCapsSse    { {       6600,     1700,      20
                                                  { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, 0, 200000 };
 inline constexpr GateLevelCaps kGateCapsAvx2   { {      31000,     3800,      20000,     3072,      12288,       4700, kGateNoCap, kGateNoCap,      31000,      10300,      31000,      31000 },
                                                  {       6600,     1700,      20000,     3072,      12288,       1900, kGateNoCap, kGateNoCap,       6600,       6600,       6600,       6600 },
-                                                 {       1700,     1700,       4000,     1024,        450,    1003000,    1003000, kGateNoCap,       1700,       1700,       1700,       1700 },   // int16: small caps L1000 (see kGateCapsSse4)
+                                                 {       1700,     1700,       4000,     1024,        450,       4700,       4700, kGateNoCap,       1700,       1700,       1700,       1700 },   // int16: main's small caps (see kGateCapsSse4)
                                                  {       1700,     3800,       4000,     2560,       2048,       1900,       1900, kGateNoCap,       1700,       3800,       1700,       1700 },
                                                  {       3800,     1700,       2500,     3072,      12288,       2800,       1900, kGateNoCap,       3800,       1700,       3800,       3800 },
                                                  3072, 8192, 20000,
@@ -983,8 +983,11 @@ inline constexpr GateLevelCaps kGateCapsNeon   { {      10300,     1700,       8
 // with the inter-pair int8 tier in (proto/int8-inter; the int8 groups of int16 AND int32
 // batches take int16's caps), DNA related pairs, cap lifted / default:
 //   AVX2 (nighthaven, time, 1 and 6 threads): L100 0.13-0.48, L300 0.69-0.80, L500 0.70-0.89,
-//     L1000 affine 1.00 / linear 0.87-0.91 -> 1003000 (L1000; affine is at par there, so
-//     not removed: past it unmeasured on AVX2).
+//     L1000 affine 1.00 / linear 0.87-0.91 on uniform batches -- but a mixed batch (mixmir:
+//     half 22 x 50 miRNA, half related DNA L300-500 of random length) lost under the raise,
+//     int16 Local score 1.24 affine / 1.15 linear, int32 through the narrowed groups 1.23, and
+//     a lane-length uniformity rule past L200 left t6 at 1.23 and cost uniform L500 1.14.  So
+//     AVX2 keeps main's 4700 (both modes: Global's raise was not checked on mixed batches).
 //   SSE4 (wloczykij, instructions, A/A 0.94-1.05): L60 0.29-0.43, L100 0.42-0.69, L150-L500
 //     affine 0.72-0.85, linear Global 0.77-0.94, linear Local 0.88 / 0.99 / 1.03 / 1.04 at
 //     L150 / 200 / 300 / 500 -> 41000 (L200) both modes.
@@ -992,33 +995,6 @@ inline constexpr GateLevelCaps kGateCapsNeon   { {      10300,     1700,       8
 //     loses in linear (1.10-1.55) -> Local 10500 (L100), Global 3800 (L60).
 // int32's own caps stay: its inter-pair kernel loses from L100 Global on (SSE4 1.33-2.10,
 // SSE2 2.5-4.5).  AVX-512 int16 has no cap; NEON keeps its own.
-// Past these cells a group of int16 small-alphabet score pairs runs shared only if its
-// lanes' lengths are homogeneous (inter_raised_ok, below).  The AVX2 raise to L1000 was
-// measured on uniform-length batches; a mixed one (mixmir: half 22 x 50 miRNA, half related
-// DNA L300-500 of random length) lost under it on nighthaven (AVX2, int16 Local score 1.24
-// affine / 1.15 linear, +31 % instructions linear; int32 through the narrowed groups 1.23).
-// 41000 = L200, the extent the SSE4 raise was measured to and mixmir's long pairs exceed.
-// SSE2 / SSE4 (raised to L100 / L200 only; mixmir at parity there), AVX-512 (main had no
-// cap) and NEON (not raised): no condition.
-inline uint32_t i16_small_base_cap(int level) noexcept {
-#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64)
-    return static_cast<SimdLevel>(level) == SimdLevel::Avx2 ? 41000u : kGateNoCap;
-#else
-    (void)level; return kGateNoCap;
-#endif
-}
-// A group past i16_small_base_cap shares only with every lane within 1/32 of the longest
-// in both lengths (the padding the raise was measured with: none).
-inline bool inter_raised_ok(int level, const int* m, const int* nb, int lanes) noexcept {
-    if (i16_small_base_cap(level) == kGateNoCap) return true;
-    int M = 0, N = 0, m0 = 1 << 30, n0 = 1 << 30;
-    for (int l = 0; l < lanes; ++l) {
-        M = std::max(M, m[l]); N = std::max(N, nb[l]);
-        m0 = std::min(m0, m[l]); n0 = std::min(n0, nb[l]);
-    }
-    if (static_cast<size_t>(M + 1) * static_cast<size_t>(N + 1) <= i16_small_base_cap(level)) return true;
-    return (M - m0) * 32 <= M && (N - n0) * 32 <= N;
-}
 inline constexpr GateLevelCaps kGateCapsSse4 = [] {
     GateLevelCaps c = kGateCapsSse;
     c.i16.score_small_local = 41000; c.i16.score_small_global = 41000;
