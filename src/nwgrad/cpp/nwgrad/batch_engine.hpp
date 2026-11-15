@@ -39,6 +39,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -2362,7 +2363,7 @@ public:
         return {P.elig.size() + P.nelig.size(), P.other.size(), P.groups.size() + P.ngroups.size()};
     }
     // The plan's groups at T as pair indices, in group order (nwgrad._tuning, tests); the
-    // narrow groups (int32 / int64, kept in the old grouping) are not listed.
+    // narrow groups (int32 / int64 at the narrower type) are not listed.
     std::vector<std::vector<size_t>> inter_plan_groups(bool score_only = false) {
         const InterPlan& P = ensure_plan_(score_only && grad_mode_ == GradMode::None, narrow_inter_on_());
         std::vector<std::vector<size_t>> g;
@@ -2493,6 +2494,43 @@ private:
                                  }
                              });
         };
+        // The groups of one pass (T's, or the narrow NI's): tiles (inter_group_tiles), and for
+        // score only the score gate's old routing kept (score_ok: the pass's inter_score_ok,
+        // or null where its score kernel does not run).
+        // Score only (rows): score_only_ sends a group past inter_score_ok's cell cap to its
+        // pairs' own fills, a cap tuned on the old groups.  Tighter groups pass it more often:
+        // protein float32 Local score-only (U[50,300] lengths) moved 13 % -> 29 % of the
+        // cells onto the shared gather kernel on AVX2 and lost there (nighthaven, 2026-11-13:
+        // 1.038x time, 1.11x instructions at 1 thread; 1.029x / 1.08x at 6).  So the pairs
+        // whose OLD group fails the cap keep that group (score_only_ runs their own fills, as
+        // before), and only the pairs it shared are regrouped: none moves from its own fill
+        // to the shared one.  (The other way, a regrouped tile's tail too short for
+        // inter_group_filled runs its own fills, as in every regrouped plan: 2 of 400 pairs
+        // at 8 lanes in test_score_only_plan_keeps_the_gated_groups; nighthaven 2026-11-14,
+        // mixprot float32 score-only 0.92-0.95x of main's time with the fix.)
+        auto plan_cut = [&](std::vector<Key>& keys, size_t W, auto score_ok, std::vector<size_t>& elig,
+                            std::vector<std::pair<size_t, size_t>>& groups, auto&& left) {
+            const size_t tile = inter_group_tiles(keys.size(), W);
+            if (score_ok && tile > 1) {
+                std::vector<Key> old = keys, keep;
+                keep.reserve(keys.size());
+                inter_cut_groups(old, W, 1, [](const Key& k) { return k.len_a; }, [](const Key& k) { return k.len_b; },
+                                 [&](size_t g, size_t e, bool filled) {
+                                     size_t M = 0, n = 0;
+                                     for (size_t k = g; k < e; ++k) { M = std::max(M, old[k].len_a); n = std::max(n, old[k].len_b); }
+                                     if (filled && score_ok(static_cast<int>(M), static_cast<int>(n))) {
+                                         keep.insert(keep.end(), old.begin() + g, old.begin() + e);
+                                         return;
+                                     }
+                                     if (filled) groups.emplace_back(elig.size(), elig.size() + (e - g));
+                                     for (size_t k = g; k < e; ++k) {
+                                         if (filled) elig.push_back(old[k].i); else left(old[k].i);
+                                     }
+                                 });
+                keys.swap(keep);   // still in (len B, len A, index) order
+            }
+            cut(keys, W, tile, elig, groups, left);
+        };
         std::vector<Key> keys, nkeys;
         keys.reserve(N);
         std::vector<size_t> back;   // narrow candidates the narrow groups left: T's plan
@@ -2504,9 +2542,14 @@ private:
                 else rest.push_back(i);
             }
             std::sort(nkeys.begin(), nkeys.end(), by_len);
-            // (the narrow groups keep the old grouping: not measured regrouped)
-            cut(nkeys, static_cast<size_t>(KN.template of<NI>().inter_w), 1, P.nelig, P.ngroups,
-                [&](size_t i) { rest.push_back(i); });
+            plan_cut(nkeys, static_cast<size_t>(KN.template of<NI>().inter_w),
+                     (rows && KN.template of<NI>().inter_score)
+                         ? std::function<bool(int, int)>([&](int M, int n) {
+                               return inter_score_ok<NI>(alpha_->size(), M, n, GM == GapModel::Affine, AM == AlignMode::Local,
+                                                         s_.n_threads == 1, P.nbackend);
+                           })
+                         : std::function<bool(int, int)>(),
+                     P.nelig, P.ngroups, [&](size_t i) { rest.push_back(i); });
             back = std::move(rest);
         } else {
             back.resize(N);
@@ -2525,36 +2568,15 @@ private:
             keys.push_back({len_b(i), len_a(i), i});
         }
         std::sort(keys.begin(), keys.end(), by_len);
-        const size_t W = static_cast<size_t>(inter_w_(K));
-        const size_t tile = inter_group_tiles(keys.size(), W);
-        // Score only (rows): score_only_ sends a group past inter_score_ok's cell cap to its
-        // pairs' own fills, a cap tuned on the old groups.  Tighter groups pass it more often:
-        // protein float32 Local score-only (U[50,300] lengths) moved 13 % -> 29 % of the
-        // cells onto the shared gather kernel on AVX2 and lost there (nighthaven, 2026-11-13:
-        // 1.038x time, 1.11x instructions at 1 thread; 1.029x / 1.08x at 6).  So the pairs
-        // whose OLD group fails the cap keep that group (score_only_ runs their own fills, as
-        // before), and only the pairs it shared are regrouped: none moves from its own fill
-        // to the shared one.  (The other way, a regrouped tile's tail too short for
-        // inter_group_filled runs its own fills, as in every regrouped plan: 2 of 400 pairs
-        // at 8 lanes in test_score_only_plan_keeps_the_gated_groups; nighthaven 2026-11-14,
-        // mixprot float32 score-only 0.92-0.95x of main's time with the fix.)
-        if (rows && tile > 1 && has_inter_score_(K) && linear_fill_ok_(K)) {
-            std::vector<Key> old = keys, keep;
-            keep.reserve(keys.size());
-            inter_cut_groups(old, W, 1, [](const Key& k) { return k.len_a; }, [](const Key& k) { return k.len_b; },
-                             [&](size_t g, size_t e, bool filled) {
-                                 size_t M = 0, n = 0;
-                                 for (size_t k = g; k < e; ++k) { M = std::max(M, old[k].len_a); n = std::max(n, old[k].len_b); }
-                                 const bool shared = filled &&
-                                     inter_score_ok<T>(alpha_->size(), static_cast<int>(M), static_cast<int>(n), GM == GapModel::Affine,
-                                                       AM == AlignMode::Local, s_.n_threads == 1, P.backend);
-                                 if (shared) { keep.insert(keep.end(), old.begin() + g, old.begin() + e); return; }
-                                 if (filled) P.groups.emplace_back(P.elig.size(), P.elig.size() + (e - g));
-                                 for (size_t k = g; k < e; ++k) (filled ? P.elig : P.other).push_back(old[k].i);
-                             });
-            keys.swap(keep);   // still in (len B, len A, index) order
-        }
-        cut(keys, W, tile, P.elig, P.groups, [&](size_t i) { P.other.push_back(i); });
+        using ScoreOk = std::function<bool(int, int)>;
+        plan_cut(keys, static_cast<size_t>(inter_w_(K)),
+                 (rows && has_inter_score_(K) && linear_fill_ok_(K))
+                     ? ScoreOk([&](int M, int n) {
+                           return inter_score_ok<T>(alpha_->size(), M, n, GM == GapModel::Affine, AM == AlignMode::Local,
+                                                    s_.n_threads == 1, P.backend);
+                       })
+                     : ScoreOk(),
+                 P.elig, P.groups, [&](size_t i) { P.other.push_back(i); });
         dst = std::move(P);
         return dst;
     }
