@@ -2887,6 +2887,8 @@ private:
             narrow_job_(PL, s, e, W, L, job);
             if (!inter_score_ok<NI>(alpha_->size(), L.M, L.n, GM == GapModel::Affine, AM == AlignMode::Local,
                                     s_.n_threads == 1, PL.nbackend) ||
+                (std::is_same_v<NI, int16_t> && alpha_->size() <= 8 &&
+                 !inter_raised_ok(PL.nbackend, L.m.data(), L.nb.data(), static_cast<int>(e - s))) ||
                 int8_own_(PL.nbackend, L.nb.data(), static_cast<int>(e - s), w.full))   // rows the int8 tier takes
                 return false;
             const size_t sz = static_cast<size_t>(L.n + 1) * W;
@@ -2995,6 +2997,8 @@ private:
                 // (int8_own_: a group of long rows the per-pair int8 tier would take; the
                 // int8 groups' pairs, <= 127 columns, are never that long)
                 if (!inter_score_ok<T>(alpha_->size(), M, n, GM == GapModel::Affine, AM == AlignMode::Local, s_.n_threads == 1, PL.backend) ||
+                    (std::is_same_v<T, int16_t> && alpha_->size() <= 8 &&   // the raised int16 caps: homogeneous groups only
+                     !inter_raised_ok(PL.backend, m.data(), nb.data(), static_cast<int>(real))) ||
                     int8_own_(PL.backend, nb.data(), static_cast<int>(real), w.full)) {   // short pairs only
                     for (size_t l = 0; l < real; ++l) own(ids[l]);
                     return;

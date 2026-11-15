@@ -992,6 +992,33 @@ inline constexpr GateLevelCaps kGateCapsNeon   { {      10300,     1700,       8
 //     loses in linear (1.10-1.55) -> Local 10500 (L100), Global 3800 (L60).
 // int32's own caps stay: its inter-pair kernel loses from L100 Global on (SSE4 1.33-2.10,
 // SSE2 2.5-4.5).  AVX-512 int16 has no cap; NEON keeps its own.
+// Past these cells a group of int16 small-alphabet score pairs runs shared only if its
+// lanes' lengths are homogeneous (inter_raised_ok, below).  The AVX2 raise to L1000 was
+// measured on uniform-length batches; a mixed one (mixmir: half 22 x 50 miRNA, half related
+// DNA L300-500 of random length) lost under it on nighthaven (AVX2, int16 Local score 1.24
+// affine / 1.15 linear, +31 % instructions linear; int32 through the narrowed groups 1.23).
+// 41000 = L200, the extent the SSE4 raise was measured to and mixmir's long pairs exceed.
+// SSE2 / SSE4 (raised to L100 / L200 only; mixmir at parity there), AVX-512 (main had no
+// cap) and NEON (not raised): no condition.
+inline uint32_t i16_small_base_cap(int level) noexcept {
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64)
+    return static_cast<SimdLevel>(level) == SimdLevel::Avx2 ? 41000u : kGateNoCap;
+#else
+    (void)level; return kGateNoCap;
+#endif
+}
+// A group past i16_small_base_cap shares only with every lane within 1/32 of the longest
+// in both lengths (the padding the raise was measured with: none).
+inline bool inter_raised_ok(int level, const int* m, const int* nb, int lanes) noexcept {
+    if (i16_small_base_cap(level) == kGateNoCap) return true;
+    int M = 0, N = 0, m0 = 1 << 30, n0 = 1 << 30;
+    for (int l = 0; l < lanes; ++l) {
+        M = std::max(M, m[l]); N = std::max(N, nb[l]);
+        m0 = std::min(m0, m[l]); n0 = std::min(n0, nb[l]);
+    }
+    if (static_cast<size_t>(M + 1) * static_cast<size_t>(N + 1) <= i16_small_base_cap(level)) return true;
+    return (M - m0) * 32 <= M && (N - n0) * 32 <= N;
+}
 inline constexpr GateLevelCaps kGateCapsSse4 = [] {
     GateLevelCaps c = kGateCapsSse;
     c.i16.score_small_local = 41000; c.i16.score_small_global = 41000;
