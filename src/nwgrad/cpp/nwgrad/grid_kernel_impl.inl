@@ -825,7 +825,8 @@ static void grid_base_striped(GridBaseJob<T>& J) {
         T* const sub = buf.gprof.data() + (std::size_t)ai * sw;
         if (!buf.gbuilt[ai]) {
             buf.gbuilt[ai] = 1;
-            striped_profile_row_idx(sub, J.blk + (std::size_t)ai * nalpha, buf.gidx.data(), w, seg, W, nalpha);
+            striped_profile_row_idx(sub, J.blk + (std::size_t)ai * nalpha, buf.gidx.data(), sw, nalpha);
+            striped_profile_pad(sub, 1, w, seg, W);   // the padding slots (columns w+1..sw)
         }
         unsigned char* const dP = D + (std::size_t)(ii - 1) * sw;
         const T lM = left(0, ii), lX = left(1, ii), lY = left(2, ii);
