@@ -392,6 +392,9 @@ TEST_CASE("auto takes Grid for integer T where it splits", "[grid][traceback]") 
 // (min_seg -1), which stays the reference.  Every type, every mode.
 template <AlignMode AM, class T>
 void grid_base_edges(std::uint32_t seed, long iters, bool ints) {
+    // Counts this type's own striped blocks: int32 / int64 path narrowing (#44) would run
+    // them in the narrowed int16 aligner instead (on NEON, most of these problems).
+    IntNarrowOff narrow_off;   // checks the type's own kernel routing (narrowing tested in test_integer)
     std::mt19937 rng(seed);
     long n_grid = 0, striped = 0, scalar_striped = 0;
     const long long cells[] = {1, 2, 7, 16, 64, 300, 4096};
