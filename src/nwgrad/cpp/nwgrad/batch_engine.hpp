@@ -2928,16 +2928,15 @@ private:
         // them: then the plan is plan8_'s split of the unnarrowed plan (an int8 group beats the
         // narrower type's; the pairs left over run at T); else the narrowed plan (main's
         // inter-pair groups at the narrower type, "Inter-pair groups at the narrower type").
-        const InterPlan& PL0 = inter ? ensure_plan_(true) : plan_;
+        const InterPlan& PB = inter ? (kNarrowInter ? ensure_plan_(true, narrow_inter_on_()) : ensure_plan_(true)) : plan_;
         Inter8Call c8;
-        const Inter8Plan* P8 = inter ? ensure_plan8_(PL0, c8) : nullptr;
+        const Inter8Plan* P8 = inter ? ensure_plan8_(PB, c8) : nullptr;
         if (P8 && P8->groups8.empty()) P8 = nullptr;
-        const bool nar = inter && !P8 && kNarrowInter;
-        const InterPlan& PL = nar ? ensure_plan_(true, narrow_inter_on_()) : PL0;
-        const std::vector<size_t>& elig = P8 ? P8->elig16 : PL.elig;
-        const std::vector<size_t>& other = P8 ? P8->other : PL.other;
-        const auto& groups = P8 ? P8->groups16 : PL.groups;
-        const size_t NG = nar ? PL.ngroups.size() : 0;
+        const InterPlan& PL = P8 ? P8->rest : PB;   // main's plan for every pair not in an int8 group
+        const std::vector<size_t>& elig = PL.elig;
+        const std::vector<size_t>& other = PL.other;
+        const auto& groups = PL.groups;
+        const size_t NG = (inter && kNarrowInter) ? PL.ngroups.size() : 0;
         const size_t G8 = P8 ? P8->groups8.size() : 0;
         const size_t G = inter ? groups.size() : 0;
         const size_t tasks = inter ? NG + G8 + G + other.size() : N;
@@ -3081,8 +3080,9 @@ private:
         const InterPlan* base = nullptr;   // the plan it splits, and that plan's identity
         int base_backend = -1000, base_hb = -1; unsigned base_epoch = ~0u;
         int lmin = -1;
-        std::vector<size_t> elig8, elig16, other;
-        std::vector<std::pair<size_t, size_t>> groups8, groups16;
+        std::vector<size_t> elig8;
+        std::vector<std::pair<size_t, size_t>> groups8;
+        InterPlan rest;   // everything else: the base plan's own groups, narrow groups and others
     };
     Inter8Plan plan8_;
     // The int8 predictor's fail fraction (score_only_), in 1/kFailQ, shared by the workers
@@ -3144,42 +3144,66 @@ private:
         if (!inter8_call_(PL, c)) return nullptr;
         Inter8Plan& P = plan8_;
         if (P.base == &PL && P.base_backend == PL.default_backend && P.base_hb == PL.hb_cutoff &&
-            P.base_epoch == PL.gate_epoch && P.lmin == c.lmin) return &P;
+            P.base_epoch == PL.gate_epoch && P.lmin == c.lmin &&
+            (!nw_is_int<T> || same_bound_(P.rest.ib, PL.ib))) return &P;
         P = Inter8Plan{};
         P.base = &PL; P.base_backend = PL.default_backend; P.base_hb = PL.hb_cutoff;
         P.base_epoch = PL.gate_epoch; P.lmin = c.lmin;
         const LevelKernels& K = level_kernels(PL.backend);
         struct Key { size_t len_b, len_a, i; };
-        std::vector<Key> k8, k16;
-        for (size_t i : PL.elig) {
+        std::vector<Key> k8;
+        auto ok8 = [&](size_t i) {
             const size_t la = len_a(i), lb = len_b(i);
-            if (std::max(la, lb) <= 127 && std::min(la, lb) <= static_cast<size_t>(c.lmin)) k8.push_back({lb, la, i});
-            else k16.push_back({lb, la, i});
+            return std::max(la, lb) <= 127 && std::min(la, lb) <= static_cast<size_t>(c.lmin);
+        };
+        // The pairs left out of the int8 groups take exactly the base plan's route (main's,
+        // narrowing included): only WHOLE base groups whose pairs all fit int8 move, the
+        // others stay as they were.  Regrouping the leftovers (the first form) moved a mixed
+        // batch's long pairs off main's groups: mixmir (half miRNA, half DNA L300-500) int16
+        // Local score 1.15-1.24 on nighthaven (linear +30 % instructions).
+        InterPlan& R = P.rest;
+        R.default_backend = PL.default_backend; R.hb_cutoff = PL.hb_cutoff; R.gate_epoch = PL.gate_epoch;
+        R.ib = PL.ib; R.backend = PL.backend; R.nbackend = PL.nbackend;
+        auto take = [&](const std::vector<size_t>& elig, const std::vector<std::pair<size_t, size_t>>& groups,
+                        std::vector<size_t>& relig, std::vector<std::pair<size_t, size_t>>& rgroups) {
+            for (const auto& [gs, ge] : groups) {
+                bool all = true;
+                for (size_t k = gs; k < ge && all; ++k) all = ok8(elig[k]);
+                if (all) {
+                    for (size_t k = gs; k < ge; ++k) k8.push_back({len_b(elig[k]), len_a(elig[k]), elig[k]});
+                } else {
+                    rgroups.emplace_back(relig.size(), relig.size() + (ge - gs));
+                    relig.insert(relig.end(), elig.begin() + static_cast<std::ptrdiff_t>(gs),
+                                 elig.begin() + static_cast<std::ptrdiff_t>(ge));
+                }
+            }
+        };
+        take(PL.elig, PL.groups, R.elig, R.groups);
+        take(PL.nelig, PL.ngroups, R.nelig, R.ngroups);
+        for (size_t i : PL.other) {
+            if (ok8(i)) k8.push_back({len_b(i), len_a(i), i});
+            else R.other.push_back(i);
         }
         auto by_len = [](const Key& x, const Key& y) {
             if (x.len_b != y.len_b) return x.len_b < y.len_b;
             if (x.len_a != y.len_a) return x.len_a < y.len_a;
             return x.i < y.i;
         };
-        // ensure_plan_'s grouping: len B runs cut every W and where ragged_ok() fails.
-        auto group = [&](std::vector<Key>& keys, size_t W, std::vector<size_t>& elig,
-                         std::vector<std::pair<size_t, size_t>>& groups, auto&& reject) {
-            std::sort(keys.begin(), keys.end(), by_len);
-            for (size_t s = 0; s < keys.size();) {
-                size_t e = s + 1;
-                while (e < keys.size() && e - s < W && ragged_ok(keys[s].len_b, keys[e].len_b)) ++e;
-                if (inter_group_filled(e - s, W)) {
-                    groups.emplace_back(elig.size(), elig.size() + (e - s));
-                    for (size_t k = s; k < e; ++k) elig.push_back(keys[k].i);
-                } else {
-                    for (size_t k = s; k < e; ++k) reject(keys[k]);
-                }
-                s = e;
+        // ensure_plan_'s grouping: len B runs cut every W8 and where ragged_ok() fails; a
+        // group too empty to fill runs its pairs' own fills.
+        std::sort(k8.begin(), k8.end(), by_len);
+        const size_t W8 = static_cast<size_t>(K.inter_w8);
+        for (size_t s0 = 0; s0 < k8.size();) {
+            size_t e = s0 + 1;
+            while (e < k8.size() && e - s0 < W8 && ragged_ok(k8[s0].len_b, k8[e].len_b)) ++e;
+            if (inter_group_filled(e - s0, W8)) {
+                P.groups8.emplace_back(P.elig8.size(), P.elig8.size() + (e - s0));
+                for (size_t k = s0; k < e; ++k) P.elig8.push_back(k8[k].i);
+            } else {
+                for (size_t k = s0; k < e; ++k) R.other.push_back(k8[k].i);
             }
-        };
-        group(k8, static_cast<size_t>(K.inter_w8), P.elig8, P.groups8, [&](const Key& k) { k16.push_back(k); });
-        group(k16, static_cast<size_t>(inter_w_(K)), P.elig16, P.groups16, [&](const Key& k) { P.other.push_back(k.i); });
-        P.other.insert(P.other.end(), PL.other.begin(), PL.other.end());
+            s0 = e;
+        }
         return &P;
     }
     // The fail fraction above which a group skips its int8 run, per int8 lane count.  An
