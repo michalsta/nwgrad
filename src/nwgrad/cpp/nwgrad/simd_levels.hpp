@@ -296,6 +296,9 @@ struct GridFwdJob {
     int local = 0;                          // Local: M clamped at 0 (the walk stops at a start)
     int find_best = 0;                      // Local, top level: the best M cell (strict >, row then column order)
     T best = T(0); int best_i = 0, best_j = 0;   // out (find_best)
+    // Linear gaps: one state, H (grid_linear_fwd_impl): top / left give H alone (s = 0),
+    // rows hold (w+1) values a saved row, cols (h+1) x W a set, last row r1's H
+    int linear = 0;
 };
 
 // ── Grid base block (TracebackMode::Grid) ────────────────────────────────────
@@ -1215,6 +1218,10 @@ struct TypedKernels {
     grid_fn            grid_fwd = nullptr;           // TracebackMode::Grid's forward pass
     using gridbase_fn = void (*)(GridBaseJob<T>&);
     gridbase_fn        grid_base = nullptr;          // Grid's base block (striped Pointers fill)
+    // Test hook: the level's striped profile build (kernels_impl.inl, profile_build_entry).
+    using profile_fn = void (*)(T*, const T*, int, const unsigned char*, int, int, int,
+                                const uint32_t*, int);
+    profile_fn         profile_build = nullptr;
 };
 
 struct LevelKernels {
@@ -1308,6 +1315,10 @@ template <class T>
 NWGRAD_BASELINE_ONLY
 void register_level_grid(SimdLevel l, typename TypedKernels<T>::grid_fn grid_fwd,
                          typename TypedKernels<T>::gridbase_fn grid_base);
+// The profile-build test hook.
+template <class T>
+NWGRAD_BASELINE_ONLY
+void register_level_profile(SimdLevel l, typename TypedKernels<T>::profile_fn profile_build);
 
 NWGRAD_BASELINE_ONLY
 void register_level_common(SimdLevel l, int row_block, score8_fn score_i8);
