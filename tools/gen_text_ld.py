@@ -24,9 +24,13 @@ import sys
 UNIT_OFFSET = [("py_exports", 0), ("level_baseline", 192), ("level_sse4", 3712), ("level_avx2", 640),
                ("level_avx512", 3584), ("level_baseline_soft", 1760), ("level_sse4_soft", 4032),
                ("level_avx2_soft", 2080), ("level_avx512_soft", 2048), ("level_baseline_inter", 2080),
-               ("level_sse4_inter", 160), ("level_avx2_inter", 2144), ("level_avx512_inter", 1376)]
+               ("level_sse4_inter", 160), ("level_avx2_inter", 2144), ("level_avx512_inter", 1376),
+               ("batch_soft_defer", 0)]
+# batch_soft_defer (BatchEngine's soft full calls, 2026-11-17): a unit added after the measurement, last, so
+# it moves nothing above; no measured offset.
 # AArch64 (its own script: a `. += N` for a unit that is not linked still pads).  No measured offsets.
-UNIT_OFFSET_AARCH64 = [("py_exports", 0), ("level_neon", 0), ("level_neon_soft", 0), ("level_neon_inter", 0)]
+UNIT_OFFSET_AARCH64 = [("py_exports", 0), ("level_neon", 0), ("level_neon_soft", 0), ("level_neon_inter", 0),
+                       ("batch_soft_defer", 0)]
 
 TYPES = ["f", "d", "s", "i", "l"]                 # float, double, int16, int32, int64 (Itanium codes)
 LEVELS = ["avx2", "avx512", "sse4", "baseline", "neon"]
@@ -90,6 +94,7 @@ def groups():
                 grp = "KEEP(*(.text.nwgrad_placement_shift_grp)) " if (lv, u, t) == ("avx2", "_inter", "f") else ""
                 out.append(f"    . = ALIGN(4096);{at(GROUP_OFFSET.get((lv, u, t), 0))} {grp}{obj}(.text._Z*[a-z_]I{t}[LE]*)")
             out.append(f"    . = ALIGN(4096); {obj}(.text._Z*)")
+    out.append("    . = ALIGN(4096); *batch_soft_defer.cpp.o(.text._Z*)")
     out.append(TAIL)
     return out
 

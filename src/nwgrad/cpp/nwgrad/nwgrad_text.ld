@@ -27,6 +27,7 @@ SECTIONS
     . = ALIGN(4096); . += 160; *level_sse4_inter.cpp.o(.text._Z*)
     . = ALIGN(4096); . += 2144; *level_avx2_inter.cpp.o(.text._Z*)
     . = ALIGN(4096); . += 1376; *level_avx512_inter.cpp.o(.text._Z*)
+    . = ALIGN(4096); *batch_soft_defer.cpp.o(.text._Z*)
     . = ALIGN(4096);
   }
 }

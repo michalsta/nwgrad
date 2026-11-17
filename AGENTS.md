@@ -3286,7 +3286,8 @@ functions:
 - `SeqPairBatch.soft_guide` (`SeqPair::set_soft_guide_lazy`): `"eager"` (default) — the
   guide is the Viterbi path under the params the soft `score_and_grad()` SCORED. Since
   2026-11-10 it is computed on first use (`guide_j`, `banded_align`, `banded_grad`) from a
-  snapshot of those params (`BatchEngine::gparams_`, flag `kSnap`; the snapshot is the old
+  snapshot of those params (`BatchEngine::gparams_`; a pending guide without `kLazy` belongs to
+  it, one with `kLazy` follows the current params; the snapshot is the old
   `OwnedParams` shared_ptr that `set_params()` replaces, so no copy), bit-identical to the
   eager fill (resolution is the pair's own hard fill; the inter-pair fill's lanes equal it).
   A call that never asks skips the fill: an inter-pair soft group runs no Viterbi at all.
@@ -3294,7 +3295,7 @@ functions:
   re-snapshots; a single pair's `score_and_grad(keep_paths=False)` on a batch view defers
   only when the batch's snapshot is the current params (else it computes its guide now,
   so other pending pairs keep theirs); a call that throws resolves its unfinished pairs'
-  guides under the previous snapshot (`settle_unfinished_`). Gate `soft_guide_defer` /
+  guides under the previous snapshot (`SoftCall::done`). Gate `soft_guide_defer` /
   `NWGRAD_SOFT_GUIDE_DEFER` = 0 runs the Viterbi inside the call as before (A/B).
   Under fill "interpair" a deferred guide resolves with its whole plan group from one
   shared fill (`resolve_group_`; `banded_grad` resolves every group first, in parallel,
@@ -3340,7 +3341,16 @@ functions:
   1 thread: none 0.70-0.76, all 0.997-1.002 (0.997-1.003), alt 0.84-0.88;
   8 threads (7 rounds): none 0.69-0.80, all 0.93-1.02 (0.99-1.24), alt 0.81-1.00
   (0.96-1.25); gate 2 (always defer) at 8 threads, all: 1.01-1.29.
-  Tests: `test_soft_guide_defer.py`. `"lazy"` — it does not, and the guide
+  Tests: `test_soft_guide_defer.py`.
+  2026-11-17: all of this lives in `batch_soft_defer.inl`, compiled for the extension in its
+  own unit (`batch_soft_defer.cpp`; header-only users get it from `batch_engine.hpp`), behind
+  four entry points (`soft_score_and_grad_`, `soft_one_`, `soft_banded_prep_`,
+  `resolve_caller_`); the engine's own fills are main's, reached with `soft_guide_lazy` set
+  for the call when it defers, and `SoftCall` fixes the per-pair state up around them. Why:
+  in the header it changed gcc's inlining in py_exports.cpp and so moved the hard engine
+  code against the kernels (protein L100 float32 affine Local path 1.13-1.14 on nighthaven
+  at equal instructions, on both layouts; see "Code placement").
+  `"lazy"` — it does not, and the guide
   is computed on first use (`guide_j`, `banded_align`, `banded_grad`) under the params
   CURRENT THEN. Deliberately opt-in: `score_and_grad(); set_params(params + lr*g); banded_grad()`
   is the ordinary training step, and a lazy default
@@ -3771,6 +3781,10 @@ starts at a fixed offset within a page: the offset that unit had in main df4ae0a
 batch_engine.hpp) moves the engine code within that unit, and so changes its offset from every kernel.
 Main's 448-byte case was exactly that kind of relative move. Treat any cell that such a branch moves
 by under ~10-13 % as unproven. Instead, compare it on two layouts: the knob below.
+The remedy for new engine code that hard, path and score-only calls never run: put it in a unit of its
+own, behind out-of-line entry points the header only declares, and link that unit LAST (the engine
+functions both units instantiate are then taken from py_exports.cpp, whose code stays main's). Example:
+the soft guide deferral, `batch_soft_defer.cpp` (`NWGRAD_SOFT_DEFER_EXTERN`; added to `UNIT_OFFSET`).
 
 **The finer alternative ("groups", `nwgrad_text_groups.ld`).** Each of these is page-anchored:
 - the engine and aligner code of one (scalar type, gap model, mode);

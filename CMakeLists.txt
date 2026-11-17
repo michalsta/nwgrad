@@ -208,7 +208,13 @@ nanobind_add_module(nwgrad_ext
     src/nwgrad/cpp/nwgrad/py_exports.cpp
     src/nwgrad/cpp/nwgrad/logistic/py_logistic.cpp
     ${NWGRAD_PLACEMENT_SOURCES_MID}
-    ${NWGRAD_LEVEL_SOURCES})
+    ${NWGRAD_LEVEL_SOURCES}
+    # BatchEngine's soft full calls (batch_soft_defer.inl), out of the bindings unit so
+    # that their code leaves its engine code as it was.  Linked last: the engine functions
+    # both units instantiate are taken from py_exports.cpp (the first copy wins), so its
+    # unit's code and layout are what they would be without this one.
+    src/nwgrad/cpp/nwgrad/batch_soft_defer.cpp)
+target_compile_definitions(nwgrad_ext PRIVATE NWGRAD_SOFT_DEFER_EXTERN)
 if (DEFINED NWGRAD_JCC_GNU_OPTS)
     target_compile_options(nwgrad_ext PRIVATE "$<$<CXX_COMPILER_ID:GNU>:${NWGRAD_JCC_GNU_OPTS}>")
 endif()
@@ -261,7 +267,7 @@ set(NWGRAD_SCALAR_TU_CLANG_OPTS -fno-slp-vectorize)
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64|i.86")
     list(APPEND NWGRAD_SCALAR_TU_CLANG_OPTS -mllvm -x86-cmov-converter=false)
 endif()
-set_source_files_properties(src/nwgrad/cpp/nwgrad/py_exports.cpp PROPERTIES
+set_source_files_properties(src/nwgrad/cpp/nwgrad/py_exports.cpp src/nwgrad/cpp/nwgrad/batch_soft_defer.cpp PROPERTIES
     COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:Clang,AppleClang>:${NWGRAD_SCALAR_TU_CLANG_OPTS}>")
 
 # MinGW: link the gcc runtime (libstdc++, libgcc, winpthread) statically, so the .pyd
@@ -296,7 +302,7 @@ endif()
 
 install(TARGETS nwgrad_ext LIBRARY DESTINATION nwgrad)
 install(DIRECTORY src/nwgrad/cpp/nwgrad DESTINATION nwgrad/cpp
-    FILES_MATCHING PATTERN "*.hpp" PATTERN "*.h")
+    FILES_MATCHING PATTERN "*.hpp" PATTERN "*.h" PATTERN "*.inl")
 
 # ── Sanitizers (opt-in; CI builds the C++ tests with these) ──────────────────
 #
