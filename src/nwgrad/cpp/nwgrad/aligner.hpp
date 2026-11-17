@@ -2338,6 +2338,25 @@ private:
     template <class V> typename V::value_type rat(const V& t, int i, int j) const {
         return t[cell_index(i, j)];
     }
+    // The semi-global code's table reads (the runtime-ends instantiations, SGR, and the end
+    // searches): the same access through its own functions, so at() / rat() keep main's
+    // callers and gcc's inlining of them stays main's.  With the sg callers on rat itself,
+    // gcc stopped inlining rat into the Global / Local walks (sse4 instructions, miRNA
+    // float32 linear Global hard +2.6-2.9 %, int32 linear Local path +2.8-3.3 %: rat called
+    // out of line, 2816 call sites against main's 2041).  rat_<false> / at_<false> are
+    // always_inline (resolved before the IPA inliner): the callgraph main has.
+    template <class V> typename V::value_type& at_sg_(V& t, int i, int j) const {
+        return t[cell_index(i, j)];
+    }
+    template <class V> typename V::value_type rat_sg_(const V& t, int i, int j) const {
+        return t[cell_index(i, j)];
+    }
+    template <bool SGR, class V> [[gnu::always_inline]] typename V::value_type& at_(V& t, int i, int j) const {
+        if constexpr (SGR) return at_sg_(t, i, j); else return at(t, i, j);
+    }
+    template <bool SGR, class V> [[gnu::always_inline]] typename V::value_type rat_(const V& t, int i, int j) const {
+        if constexpr (SGR) return rat_sg_(t, i, j); else return rat(t, i, j);
+    }
     // The forward-backward tables (F/B, FM..BY) are ALWAYS row-major, whatever layout
     // the Viterbi fill left VM/VX/VY or DM/DX/DY in.  They get their own accessors so
     // the soft path never has to touch tables_striped_ / pointers_: those describe the
@@ -2602,11 +2621,11 @@ private:
                 if (k == 3) break;
             } else {
                 if constexpr (AM == AlignMode::Local)
-                    if (rat(buf.H, i, j) <= 0.0) break;
+                    if (rat_<SGR>(buf.H, i, j) <= 0.0) break;
                 if (i > 0 && j > 0 &&
-                    rat(buf.H, i, j) == rat(buf.H, i-1, j-1) + (Tr ? subT(i, j) : subTu(i, j)))
+                    rat_<SGR>(buf.H, i, j) == rat_<SGR>(buf.H, i-1, j-1) + (Tr ? subT(i, j) : subTu(i, j)))
                     k = 0;
-                else if (i > 0 && (j == 0 || rat(buf.H, i, j) == rat(buf.H, i-1, j) -
+                else if (i > 0 && (j == 0 || rat_<SGR>(buf.H, i, j) == rat_<SGR>(buf.H, i-1, j) -
                                                  (Tr ? tgeb_[static_cast<size_t>(i)]
                                                      : static_cast<T>(params_->gap_extend_b))))
                     k = 1;
@@ -2753,7 +2772,7 @@ private:
                 if constexpr (Ptr) c = affine_codes(buf.DM, i, j);
                 if (tbl == TBTable::M) {
                     if constexpr (Ptr) { if ((c & 3) == 3) break; }
-                    else               { if (rat(buf.VM, i, j) <= 0.0) break; }
+                    else               { if (rat_<SGR>(buf.VM, i, j) <= 0.0) break; }
                 }
             } else {
                 if (i == 0) {
@@ -3284,35 +3303,35 @@ private:
         banded_fill(buf.H);
 
         if constexpr (AM != AlignMode::Local) {
-            at(buf.H, 0, 0) = 0.0;
+            at_<SGR>(buf.H, 0, 0) = 0.0;
             const int bi = border_rows(), bj = border_cols();
             if constexpr (Tr) {
-                for (int i = 1; i <= bi; ++i) at(buf.H, i, 0) = tbx0_[static_cast<size_t>(i)];
+                for (int i = 1; i <= bi; ++i) at_<SGR>(buf.H, i, 0) = tbx0_[static_cast<size_t>(i)];
                 if constexpr (AM == AlignMode::Global)
-                    for (int j = 1; j <= bj; ++j) at(buf.H, 0, j) = -static_cast<T>(j) * tgea_[0];
+                    for (int j = 1; j <= bj; ++j) at_<SGR>(buf.H, 0, j) = -static_cast<T>(j) * tgea_[0];
             } else {
-                for (int i = 1; i <= bi; ++i) at(buf.H, i, 0) = -static_cast<T>(i) * static_cast<T>(params_->gap_extend_b);
+                for (int i = 1; i <= bi; ++i) at_<SGR>(buf.H, i, 0) = -static_cast<T>(i) * static_cast<T>(params_->gap_extend_b);
                 if constexpr (AM == AlignMode::Global)
-                    for (int j = 1; j <= bj; ++j) at(buf.H, 0, j) = -static_cast<T>(j) * static_cast<T>(params_->gap_extend_a);
+                    for (int j = 1; j <= bj; ++j) at_<SGR>(buf.H, 0, j) = -static_cast<T>(j) * static_cast<T>(params_->gap_extend_a);
             }
             if constexpr (AM == AlignMode::Glocal) {
                 if (sgt_bb_<SGR>()) {   // row 0: a free start at any column
-                    for (int j = 0; j <= n_; ++j) at(buf.H, 0, j) = 0.0;
+                    for (int j = 0; j <= n_; ++j) at_<SGR>(buf.H, 0, j) = 0.0;
                 } else {          // Global's chain along row 0
                     for (int j = 1; j <= bj; ++j)
-                        at(buf.H, 0, j) = -static_cast<T>(j) * (Tr ? tgea_[0] : static_cast<T>(params_->gap_extend_a));
+                        at_<SGR>(buf.H, 0, j) = -static_cast<T>(j) * (Tr ? tgea_[0] : static_cast<T>(params_->gap_extend_a));
                 }
                 if (sgt_ab_<SGR>())     // column 0: a free start at any row
-                    for (int i = 1; i <= m_; ++i) at(buf.H, i, 0) = 0.0;
+                    for (int i = 1; i <= m_; ++i) at_<SGR>(buf.H, i, 0) = 0.0;
             }
         } else {
-            for (int i = 0; i <= m_; ++i) at(buf.H, i, 0) = 0.0;
-            for (int j = 0; j <= n_; ++j) at(buf.H, 0, j) = 0.0;
+            for (int i = 0; i <= m_; ++i) at_<SGR>(buf.H, i, 0) = 0.0;
+            for (int j = 0; j <= n_; ++j) at_<SGR>(buf.H, 0, j) = 0.0;
         }
 
         best_i_ = 0; best_j_ = 0;
         T best_local = T(0);
-        // Row pointers, not rat()/at(): run_viterbi cleared the layout flags, so H is
+        // Row pointers, not rat_<SGR>()/at_<SGR>(): run_viterbi cleared the layout flags, so H is
         // row-major here, and cell_index()'s layout switch inside the loop is dead weight
         // that gcc unswitches and clang does not (clang/gcc 1.77x on this fill).  The
         // gap costs and the substitution row are hoisted per row for the same reason;
@@ -3366,7 +3385,7 @@ private:
                 }
         }
 
-        if constexpr (AM == AlignMode::Global)      viterbi_score_ = rat(buf.H, m_, n_);
+        if constexpr (AM == AlignMode::Global)      viterbi_score_ = rat_<SGR>(buf.H, m_, n_);
         else if constexpr (AM == AlignMode::Glocal) sg_end_linear_(buf);
         else                                        viterbi_score_ = best_local;
     }
@@ -5641,41 +5660,41 @@ private:
         T ge_b = static_cast<T>(params_->gap_extend_b);
 
         if constexpr (AM != AlignMode::Local) {
-            at(buf.VM, 0, 0) = static_cast<T>(0);
+            at_<SGR>(buf.VM, 0, 0) = static_cast<T>(0);
             const int bi = border_rows(), bj = border_cols();
             if constexpr (Tr) {
-                for (int i = 1; i <= bi; ++i) at(buf.VX, i, 0) = tbx0_[static_cast<size_t>(i)];
+                for (int i = 1; i <= bi; ++i) at_<SGR>(buf.VX, i, 0) = tbx0_[static_cast<size_t>(i)];
                 if constexpr (AM == AlignMode::Global)
-                    for (int j = 1; j <= bj; ++j) at(buf.VY, 0, j) = -(tgoa_[0] + static_cast<T>(j) * tgea_[0]);
+                    for (int j = 1; j <= bj; ++j) at_<SGR>(buf.VY, 0, j) = -(tgoa_[0] + static_cast<T>(j) * tgea_[0]);
             } else {
             // VX along column 0: all gaps in B (consuming A), uses gap_b params
             for (int i = 1; i <= bi; ++i)
-                at(buf.VX, i, 0) = -(go_b + static_cast<T>(i) * ge_b);
+                at_<SGR>(buf.VX, i, 0) = -(go_b + static_cast<T>(i) * ge_b);
             // VY along row 0: all gaps in A (consuming B), uses gap_a params
             if constexpr (AM == AlignMode::Global)
                 for (int j = 1; j <= bj; ++j)
-                    at(buf.VY, 0, j) = -(go_a + static_cast<T>(j) * ge_a);
+                    at_<SGR>(buf.VY, 0, j) = -(go_a + static_cast<T>(j) * ge_a);
             }
             if constexpr (AM == AlignMode::Glocal) {
                 if (sgt_bb_<SGR>()) {   // row 0: a free start at any column
-                    for (int j = 0; j <= n_; ++j) at(buf.VM, 0, j) = static_cast<T>(0);
+                    for (int j = 0; j <= n_; ++j) at_<SGR>(buf.VM, 0, j) = static_cast<T>(0);
                 } else {          // Global's Y chain along row 0
                     for (int j = 1; j <= bj; ++j)
-                        at(buf.VY, 0, j) = Tr ? -(tgoa_[0] + static_cast<T>(j) * tgea_[0])
+                        at_<SGR>(buf.VY, 0, j) = Tr ? -(tgoa_[0] + static_cast<T>(j) * tgea_[0])
                                               : -(go_a + static_cast<T>(j) * ge_a);
                 }
                 if (sgt_ab_<SGR>())     // column 0: a free start at any row, no X chain
-                    for (int i = 1; i <= m_; ++i) { at(buf.VM, i, 0) = static_cast<T>(0); at(buf.VX, i, 0) = NINF(); }
+                    for (int i = 1; i <= m_; ++i) { at_<SGR>(buf.VM, i, 0) = static_cast<T>(0); at_<SGR>(buf.VX, i, 0) = NINF(); }
             }
         } else {
-            for (int i = 0; i <= m_; ++i) at(buf.VM, i, 0) = static_cast<T>(0);
-            for (int j = 0; j <= n_; ++j) at(buf.VM, 0, j) = static_cast<T>(0);
+            for (int i = 0; i <= m_; ++i) at_<SGR>(buf.VM, i, 0) = static_cast<T>(0);
+            for (int j = 0; j <= n_; ++j) at_<SGR>(buf.VM, 0, j) = static_cast<T>(0);
         }
 
         best_i_ = 0; best_j_ = 0; best_tbl_ = TBTable::M;
         T best_local = static_cast<T>(0);
 
-        // Row pointers, not rat()/at(): run_viterbi cleared the layout flags, so the
+        // Row pointers, not rat_<SGR>()/at_<SGR>(): run_viterbi cleared the layout flags, so the
         // tables are row-major here, and cell_index()'s layout switch inside the loop is
         // dead weight that gcc unswitches and clang does not.  The left cell rides in
         // registers (clang re-loaded the cells it had just stored), the substitution row
@@ -5721,7 +5740,7 @@ private:
         }
 
         if constexpr (AM == AlignMode::Global) {
-            T vm = rat(buf.VM, m_, n_), vx = rat(buf.VX, m_, n_), vy = rat(buf.VY, m_, n_);
+            T vm = rat_<SGR>(buf.VM, m_, n_), vx = rat_<SGR>(buf.VX, m_, n_), vy = rat_<SGR>(buf.VY, m_, n_);
             viterbi_score_ = std::max({vm, vx, vy});
             best_i_ = m_; best_j_ = n_;
             if      (vm >= vx && vm >= vy) best_tbl_ = TBTable::M;
@@ -5811,8 +5830,8 @@ private:
         if (sg_is_glocal_()) { glocal_end_affine_(buf); return; }
         SgEnd e;
         if (sg_ae_())
-            for (int i = 0; i < m_; ++i) e.offer(i, n_, rat(buf.VM, i, n_), rat(buf.VX, i, n_), rat(buf.VY, i, n_));
-        auto cell = [&](int j) { e.offer(m_, j, rat(buf.VM, m_, j), rat(buf.VX, m_, j), rat(buf.VY, m_, j)); };
+            for (int i = 0; i < m_; ++i) e.offer(i, n_, rat_sg_(buf.VM, i, n_), rat_sg_(buf.VX, i, n_), rat_sg_(buf.VY, i, n_));
+        auto cell = [&](int j) { e.offer(m_, j, rat_sg_(buf.VM, m_, j), rat_sg_(buf.VX, m_, j), rat_sg_(buf.VY, m_, j)); };
         if (sg_be_()) { for (int j = 0; j <= n_; ++j) cell(j); }
         else          cell(n_);
         sg_take_(e);
@@ -5829,9 +5848,9 @@ private:
         if (sg_is_glocal_()) { glocal_end_linear_(buf); return; }
         SgEnd e; const T ninf = NINF();
         if (sg_ae_())
-            for (int i = 0; i < m_; ++i) e.offer(i, n_, rat(buf.H, i, n_), ninf, ninf);
-        if (sg_be_()) { for (int j = 0; j <= n_; ++j) e.offer(m_, j, rat(buf.H, m_, j), ninf, ninf); }
-        else          e.offer(m_, n_, rat(buf.H, m_, n_), ninf, ninf);
+            for (int i = 0; i < m_; ++i) e.offer(i, n_, rat_sg_(buf.H, i, n_), ninf, ninf);
+        if (sg_be_()) { for (int j = 0; j <= n_; ++j) e.offer(m_, j, rat_sg_(buf.H, m_, j), ninf, ninf); }
+        else          e.offer(m_, n_, rat_sg_(buf.H, m_, n_), ninf, ninf);
         sg_take_(e);
     }
 
