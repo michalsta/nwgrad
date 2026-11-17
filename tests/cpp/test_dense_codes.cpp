@@ -157,6 +157,7 @@ bool gate_writes(Rng& rng, int len, int backend) {
 
 TEMPLATE_TEST_CASE("dense direction codes reproduce the one-byte codes bit for bit",
                    "[dense][pointers]", float, double, int32_t, int64_t, int16_t) {
+    IntNarrowOff narrow_off;   // checks the type's own kernel routing (narrowing tested in test_integer)
     sweep<GapModel::Affine, AlignMode::Global, TestType>(11);
     sweep<GapModel::Affine, AlignMode::Local, TestType>(12);
     sweep<GapModel::Linear, AlignMode::Global, TestType>(13);
@@ -168,6 +169,7 @@ TEMPLATE_TEST_CASE("dense direction codes reproduce the one-byte codes bit for b
 // exercise at a test-friendly size.  NWGRAD_DENSE_CODES, if set in the environment, would
 // override auto: skip then.
 TEST_CASE("dense codes: the auto gate engages by pair size", "[dense][pointers]") {
+    IntNarrowOff narrow_off;   // checks the type's own kernel routing (narrowing tested in test_integer)
     if (std::getenv("NWGRAD_DENSE_CODES")) { WARN("NWGRAD_DENSE_CODES overrides the gate: skipped"); return; }
     Rng rng(99);
     // the unmeasured levels and the scalar fill never write them
