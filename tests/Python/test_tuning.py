@@ -25,7 +25,8 @@ OWN = dict(inter_group_bytes=0, inter_soft_bytes=0, inter_score_gather_cells=0,
            soft_f32_min_cells=0,   # (float32 at any size, as with the gate off: one precision)
            inter_min_fill=100,
            soft_ckpt_rows=0, soft_ckpt_min_bytes=0,   # (soft only: the hard results below ignore them)
-           soft_double_ftz=0)
+           soft_double_ftz=0,
+           inter_profile_bytes=0)   # (the protein lookup's form: gathered, not the profile)
 # Every gate off: the shared fill wherever it can run, the striped linear kernel always.
 OFF = {g: None for g in OWN}
 
