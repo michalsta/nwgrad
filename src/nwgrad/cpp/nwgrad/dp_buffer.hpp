@@ -252,6 +252,8 @@ struct DpBufferT {
     GVec gtop, gleft, glast;   // glast: row m of a Glocal grid (its end column)
     std::vector<unsigned char> gbuilt;   // profile rows built for the current rectangle
     GVec gbM, gbX, gbY;
+    GVec gbH;   // the linear base block's values (grid_base_linear): its own, as the affine
+                // block grows gbM..gdY together, keyed on gbM's size
     GBVec gdM, gdX, gdY;
     GBVec gD;                  // the striped base block's packed codes (GridBaseJob)
     GVec glast3;               // its last row, three states (the end cell's argmax, Glocal's pick)
