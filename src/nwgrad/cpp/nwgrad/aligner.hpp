@@ -2599,7 +2599,7 @@ private:
     template <class Emit>
     void walk_linear(const DpBuffer& buf, Emit&& emit) const {
         if constexpr (AM == AlignMode::Glocal)
-            if (!sg_is_glocal_()) { if (tr_) walk_linear_impl<true, true>(buf, emit); else walk_linear_impl<false, true>(buf, emit); return; }   // the other ends: runtime flags (SGR)
+            if (!sg_is_glocal_()) { sg_cold_([&] { if (tr_) walk_linear_impl<true, true>(buf, emit); else walk_linear_impl<false, true>(buf, emit); }); return; }   // the other ends: runtime flags (SGR)
         if (tr_) walk_linear_impl<true>(buf, emit);
         else     walk_linear_impl<false>(buf, emit);
     }
@@ -2735,7 +2735,7 @@ private:
     template <class Emit>
     void walk_affine(const DpBuffer& buf, Emit&& emit) const {
         if constexpr (AM == AlignMode::Glocal)
-            if (!sg_is_glocal_()) { walk_affine_sgr_(buf, emit); return; }   // the other ends: runtime flags (SGR)
+            if (!sg_is_glocal_()) { sg_cold_([&] { walk_affine_sgr_(buf, emit); }); return; }   // the other ends: runtime flags (SGR)
         if (tr_) {
             if (pointers_) walk_affine_impl<true, true>(buf, emit);
             else           walk_affine_impl<false, true>(buf, emit);
@@ -3293,7 +3293,7 @@ private:
     // At T=double every cast here is the identity: results are unchanged bit for bit.
     void viterbi_linear(DpBuffer& buf) {
         if constexpr (AM == AlignMode::Glocal)
-            if (!sg_is_glocal_()) { sat_dispatch_([&]<bool Tr, bool Sat>() { viterbi_linear_impl<Tr, Sat, true>(buf); }); return; }   // the other ends: runtime flags (SGR)
+            if (!sg_is_glocal_()) { sg_cold_([&] { sat_dispatch_([&]<bool Tr, bool Sat>() { viterbi_linear_impl<Tr, Sat, true>(buf); }); }); return; }   // the other ends: runtime flags (SGR)
         sat_dispatch_([&]<bool Tr, bool Sat>() { viterbi_linear_impl<Tr, Sat>(buf); });
     }
     // Tr: each row's penalties and substitution row from the track arrays (the same
@@ -3401,7 +3401,7 @@ private:
     // <= 0 (the H walk's stop test); borders stop (Local), go up / left (Global).
     void viterbi_linear_ptr(DpBuffer& buf) {
         if constexpr (AM == AlignMode::Glocal)
-            if (!sg_is_glocal_()) { sat_dispatch_([&]<bool Tr, bool Sat>() { viterbi_linear_ptr_impl<Tr, Sat, true>(buf); }); return; }   // the other ends: runtime flags (SGR)
+            if (!sg_is_glocal_()) { sg_cold_([&] { sat_dispatch_([&]<bool Tr, bool Sat>() { viterbi_linear_ptr_impl<Tr, Sat, true>(buf); }); }); return; }   // the other ends: runtime flags (SGR)
         sat_dispatch_([&]<bool Tr, bool Sat>() { viterbi_linear_ptr_impl<Tr, Sat>(buf); });
     }
     template <bool Tr, bool Sat, bool SGR = false>
@@ -3601,7 +3601,7 @@ private:
     // those cells are border-initialised, never visited by the main loop.
     void viterbi_affine_ptr(DpBuffer& buf) {
         if constexpr (AM == AlignMode::Glocal)
-            if (!sg_is_glocal_()) { sat_dispatch_([&]<bool Tr, bool Sat>() { viterbi_affine_ptr_impl<Tr, Sat, true>(buf); }); return; }   // the other ends: runtime flags (SGR)
+            if (!sg_is_glocal_()) { sg_cold_([&] { sat_dispatch_([&]<bool Tr, bool Sat>() { viterbi_affine_ptr_impl<Tr, Sat, true>(buf); }); }); return; }   // the other ends: runtime flags (SGR)
         sat_dispatch_([&]<bool Tr, bool Sat>() { viterbi_affine_ptr_impl<Tr, Sat>(buf); });
     }
     template <bool Tr, bool Sat, bool SGR = false>
@@ -5480,7 +5480,7 @@ private:
 
     double score_affine_scalar(DpBuffer& buf) const {
         if constexpr (AM == AlignMode::Glocal)
-            if (!sg_is_glocal_()) { return sat_dispatch_([&]<bool Tr, bool Sat>() { return score_affine_scalar_impl<Tr, Sat, true>(buf); }); }   // the other ends: runtime flags (SGR)
+            if (!sg_is_glocal_()) { return sg_cold_([&] { return sat_dispatch_([&]<bool Tr, bool Sat>() { return score_affine_scalar_impl<Tr, Sat, true>(buf); }); }); }   // the other ends: runtime flags (SGR)
         return sat_dispatch_([&]<bool Tr, bool Sat>() { return score_affine_scalar_impl<Tr, Sat>(buf); });
     }
     template <bool Tr, bool Sat, bool SGR = false>
@@ -5558,7 +5558,7 @@ private:
 
     double score_linear_scalar(DpBuffer& buf) const {
         if constexpr (AM == AlignMode::Glocal)
-            if (!sg_is_glocal_()) { return sat_dispatch_([&]<bool Tr, bool Sat>() { return score_linear_scalar_impl<Tr, Sat, true>(buf); }); }   // the other ends: runtime flags (SGR)
+            if (!sg_is_glocal_()) { return sg_cold_([&] { return sat_dispatch_([&]<bool Tr, bool Sat>() { return score_linear_scalar_impl<Tr, Sat, true>(buf); }); }); }   // the other ends: runtime flags (SGR)
         return sat_dispatch_([&]<bool Tr, bool Sat>() { return score_linear_scalar_impl<Tr, Sat>(buf); });
     }
     template <bool Tr, bool Sat, bool SGR = false>
@@ -5640,7 +5640,7 @@ private:
 
     void viterbi_affine(DpBuffer& buf) {
         if constexpr (AM == AlignMode::Glocal)
-            if (!sg_is_glocal_()) { sat_dispatch_([&]<bool Tr, bool Sat>() { viterbi_affine_impl<Tr, Sat, true>(buf); }); return; }   // the other ends: runtime flags (SGR)
+            if (!sg_is_glocal_()) { sg_cold_([&] { sat_dispatch_([&]<bool Tr, bool Sat>() { viterbi_affine_impl<Tr, Sat, true>(buf); }); }); return; }   // the other ends: runtime flags (SGR)
         sat_dispatch_([&]<bool Tr, bool Sat>() { viterbi_affine_impl<Tr, Sat>(buf); });
     }
     template <bool Tr, bool Sat, bool SGR = false>
@@ -5800,6 +5800,13 @@ private:
     bool sg_bb_() const noexcept { return AM == AlignMode::Glocal && (sg_ & kSgFreeBBegin); }
     bool sg_be_() const noexcept { return AM == AlignMode::Glocal && (sg_ & kSgFreeBEnd); }
     bool sg_is_glocal_() const noexcept { return AM != AlignMode::Glocal || sg_ == kSgGlocal; }
+    // Every runtime-ends (SGR) path is entered through this cold, out-of-line trampoline.
+    // py_exports sits at gcc's --param inline-unit-growth limit on main already: inlining
+    // spent growing the semi-global instantiations came out of the hot ones' budget (rat
+    // went out of line in the Global / Local walks: miRNA float32 linear Global hard +2.7 %,
+    // int32 linear Local path +3 % sse4 instructions; -fopt-info-inline-missed).  Code
+    // reached only from a cold function is optimized for size and not grown by inlining.
+    template <class F> [[gnu::cold, gnu::noinline]] static decltype(auto) sg_cold_(F&& f) { return f(); }
     // The ends as the fills and walks read them: SGR (runtime ends, other than glocal's) the
     // flags, else glocal's fixed at compile time.  The flags read at every step / row cost
     // the glocal linear path 2-3 % on NEON (M1: miRNA, DNA L100) against main's constants.
@@ -5828,6 +5835,7 @@ private:
     // other ends than glocal's is refused: check_problem).
     void sg_end_affine_(const DpBuffer& buf) {
         if (sg_is_glocal_()) { glocal_end_affine_(buf); return; }
+        sg_cold_([&] {
         SgEnd e;
         if (sg_ae_())
             for (int i = 0; i < m_; ++i) e.offer(i, n_, rat_sg_(buf.VM, i, n_), rat_sg_(buf.VX, i, n_), rat_sg_(buf.VY, i, n_));
@@ -5835,6 +5843,7 @@ private:
         if (sg_be_()) { for (int j = 0; j <= n_; ++j) cell(j); }
         else          cell(n_);
         sg_take_(e);
+        });
     }
     // Every end cell once (the soft path's Z and backward seeds): row m's band (a free B
     // end) or (m, n), and column n of rows 0..m-1 (a free A end; Full band only).
@@ -5846,12 +5855,14 @@ private:
     }
     void sg_end_linear_(const DpBuffer& buf) {
         if (sg_is_glocal_()) { glocal_end_linear_(buf); return; }
+        sg_cold_([&] {
         SgEnd e; const T ninf = NINF();
         if (sg_ae_())
             for (int i = 0; i < m_; ++i) e.offer(i, n_, rat_sg_(buf.H, i, n_), ninf, ninf);
         if (sg_be_()) { for (int j = 0; j <= n_; ++j) e.offer(m_, j, rat_sg_(buf.H, m_, j), ninf, ninf); }
         else          e.offer(m_, n_, rat_sg_(buf.H, m_, n_), ninf, ninf);
         sg_take_(e);
+        });
     }
 
     // ═════════════════════════════════════════════════════════════════════════
