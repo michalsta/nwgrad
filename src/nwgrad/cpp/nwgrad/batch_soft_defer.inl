@@ -105,7 +105,7 @@ struct BatchEngine<T, GM, AM>::SoftCall {
         auto cur = e.gparams_;
         e.gparams_ = prev;
         for (size_t i : settle) {
-            if (prev) e.resolve_guide_(i, e.solo_work_());
+            if (prev) e.soft_resolve_(i, e.solo_work_());
             else e.flags_[i] &= static_cast<uint8_t>(~(kPath | kPending));
         }
         e.gparams_ = std::move(cur);
@@ -161,12 +161,39 @@ void BatchEngine<T, GM, AM>::soft_one_(size_t i, bool keep) {
     if (pend == kPending) gparams_ = params_;
 }
 
-// banded_grad of a soft batch: its guides count as read, and the deferred ones are
-// resolved per inter-pair group before the pass (resolve_groups_).
+// banded_grad of a soft batch: its guides count as read, the deferred ones are resolved
+// per inter-pair group before the pass (resolve_groups_), and lazy ones too while a
+// snapshot is set (the pass's own resolve_guide_ takes gparams_ when there is one).
 template<class T, GapModel GM, AlignMode AM>
 void BatchEngine<T, GM, AM>::soft_banded_prep_() {
     guide_reads_ += size();
     resolve_groups_();
+    if (!gparams_) return;
+    std::vector<size_t> lazy;
+    for (size_t i = 0; i < size(); ++i)
+        if ((flags_[i] & (kPending | kLazy)) == (kPending | kLazy)) lazy.push_back(i);
+    if (lazy.empty()) return;
+    std::atomic<size_t> idx{0};
+    auto worker = [&]() {
+        WorkLease lease(*this);
+        for (size_t k; (k = idx.fetch_add(1, std::memory_order_relaxed)) < lazy.size(); )
+            soft_resolve_(lazy[k], *lease);
+    };
+    run_workers_(lazy.size(), worker);
+}
+
+// resolve_guide_ by the pair's own kind: a lazy guide (kLazy) under the params current
+// now, a deferred one under gparams_.  The same hard fill the eager path runs, so a
+// deferred guide is the eager one, bit for bit.  Only the worker that owns pair i
+// resolves it, so no lock is needed.
+template<class T, GapModel GM, AlignMode AM>
+void BatchEngine<T, GM, AM>::soft_resolve_(size_t i, Work& w) {
+    if (!guide_pending(i)) return;
+    w.full.set_kernel(kernel_);
+    problem_(w.full, i, (flags_[i] & kLazy) || !gparams_ ? *params_ : *gparams_, 0, {});
+    w.full.compute_viterbi(w.buf);
+    store_guide_(i, w.full.guide_j_from_viterbi(w.buf));
+    flags_[i] &= static_cast<uint8_t>(~(kPending | kLazy | kStored));
 }
 
 // Deferred guides in bulk.  An eager soft call under fill "interpair" took its guides
@@ -196,7 +223,7 @@ void BatchEngine<T, GM, AM>::resolve_caller_(size_t i) {
         resolve_all_snap_();
         if (!guide_pending(i)) return;
     }
-    resolve_guide_(i, solo_work_());
+    soft_resolve_(i, solo_work_());
 }
 
 // Every snapshot-pending guide: the inter-pair groups (resolve_groups_), then the rest
@@ -212,7 +239,7 @@ void BatchEngine<T, GM, AM>::resolve_all_snap_() {
     auto worker = [&]() {
         WorkLease lease(*this);
         for (size_t k; (k = idx.fetch_add(1, std::memory_order_relaxed)) < rest.size(); )
-            resolve_guide_(rest[k], *lease);
+            soft_resolve_(rest[k], *lease);
     };
     run_workers_(rest.size(), worker);
 }

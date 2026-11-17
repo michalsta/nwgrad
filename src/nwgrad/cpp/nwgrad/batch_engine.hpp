@@ -347,6 +347,7 @@ public:
             throw std::logic_error("nwgrad: alignment not computed; call align() first");
         ++guide_reads_;
         if (guide_pending(i)) resolve_caller_(i);
+        if (guide_pending(i)) resolve_guide_(i, solo_work_());
         const int* g = guide_ptr_(i);
         return {g, g + len_a(i) + 1};
     }
@@ -2010,17 +2011,15 @@ private:
     }
 
     // SeqPair::resolve_guide: the pending guide, under the params it belongs to (gparams_;
-    // a lazy soft guide, kLazy: the params current now).  The same hard fill the eager
-    // path runs, so a deferred guide is the eager one, bit for bit.  Only the worker that
-    // owns pair i resolves it (banded passes hand each pair to one worker; guide_j() runs
-    // on the calling thread), so no lock is needed.
+    // a lazy soft guide: the params current now).  A lazy guide (kLazy) while gparams_ is
+    // set never reaches this: batch_soft_defer.inl resolves those first (soft_resolve_).
     void resolve_guide_(size_t i, Work& w) {
         if (!guide_pending(i)) return;
         w.full.set_kernel(kernel_);
-        problem_(w.full, i, (flags_[i] & kLazy) || !gparams_ ? *params_ : *gparams_, 0, {});
+        problem_(w.full, i, gparams_ ? *gparams_ : *params_, 0, {});
         w.full.compute_viterbi(w.buf);
         store_guide_(i, w.full.guide_j_from_viterbi(w.buf));
-        flags_[i] &= static_cast<uint8_t>(~(kPending | kLazy | kStored));
+        flags_[i] &= static_cast<uint8_t>(~(kPending | kStored));
     }
 
     // SeqPair::banded_grad_with_dp.
@@ -3195,6 +3194,7 @@ private:
     void resolve_groups_();
     bool resolve_group_(size_t t, Work& w);
     bool group_resolve_ok_() const noexcept;
+    void soft_resolve_(size_t i, Work& w);
     bool snap_pending_(size_t i) const noexcept {
         return (flags_[i] & (kPending | kLazy)) == kPending;
     }

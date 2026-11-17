@@ -1463,17 +1463,21 @@ NB_MODULE(nwgrad_ext, m) {
     // Raw: -1 = no override (the compiled default), INT64_MAX = the cap never rejects.
     // nwgrad/_tuning.py maps these to Python values; use that, not these.
     auto gate_of = [](const std::string& name) {
-        for (int g = 0; g < static_cast<int>(Gate::Count_); ++g)
+        for (int g = 0; g < static_cast<int>(Gate::CountAll_); ++g)
             if (name == kGateNames[g]) return static_cast<Gate>(g);
         throw nb::value_error(("unknown fill gate: " + name).c_str());
     };
     m.def("_gate_names", []() {
         return std::vector<std::string>(std::begin(kGateNames), std::end(kGateNames));
     });
-    m.def("_gate_get", [gate_of](const std::string& name) { return gate_override(gate_of(name)); },
-          nb::arg("name"));
+    m.def("_gate_get", [gate_of](const std::string& name) {
+              const Gate g = gate_of(name);
+              return g == Gate::SoftGuideDefer ? soft_guide_defer_gate().load() : gate_override(g);
+          }, nb::arg("name"));
     m.def("_gate_set", [gate_of](const std::string& name, int64_t v) {
-              set_gate_override(gate_of(name), v);
+              const Gate g = gate_of(name);
+              if (g == Gate::SoftGuideDefer) soft_guide_defer_gate().store(v < 0 ? kGateUnset : v);
+              else set_gate_override(g, v);
           }, nb::arg("name"), nb::arg("value"));
     m.def("_gate_off_value", []() { return kGateOff; });
     // The compiled defaults of the single-valued caps (0 = no cap);

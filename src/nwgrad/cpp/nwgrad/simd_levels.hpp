@@ -652,8 +652,10 @@ enum class Gate : int {
     InterGroupBytes, InterSoftBytes, InterScoreGatherCells,
     InterLinearIntGatherCells, InterLinearF32GatherCells, InterLinearF64GatherCells,
     InterGlobalLinearIntCells, InterGlobalLinearF32Cells, LinearStripedMinN, SoftF32MinCells,
-    InterMinFill, SoftCkptRows, SoftCkptMinBytes, SoftDoubleFtz, InterProfileBytes,
-    SoftGuideDefer, Count_
+    InterMinFill, SoftCkptRows, SoftCkptMinBytes, SoftDoubleFtz, InterProfileBytes, Count_,
+    // Switches kept out of GateTable (their own override, soft_guide_defer_gate()): growing
+    // the table moved its epoch and changed every gate reader's code in the bindings unit.
+    SoftGuideDefer = Count_, CountAll_
 };
 inline constexpr const char* kGateNames[] = {
     "inter_group_bytes", "inter_soft_bytes", "inter_score_gather_cells",
@@ -662,7 +664,7 @@ inline constexpr const char* kGateNames[] = {
     "inter_global_linear_f32_cells", "linear_striped_min_n", "soft_f32_min_cells",
     "inter_min_fill", "soft_ckpt_rows", "soft_ckpt_min_bytes",
     "soft_double_ftz", "inter_profile_bytes", "soft_guide_defer"};
-static_assert(sizeof(kGateNames) / sizeof(kGateNames[0]) == static_cast<size_t>(Gate::Count_));
+static_assert(sizeof(kGateNames) / sizeof(kGateNames[0]) == static_cast<size_t>(Gate::CountAll_));
 inline constexpr int64_t kGateUnset = -1;
 inline constexpr int64_t kGateOff = INT64_MAX;
 struct GateTable {
@@ -728,8 +730,12 @@ inline bool soft_double_ftz() noexcept {
 // deferred guides' separate resolve pass 4-9 % slower than main with every guide read;
 // the earlier gate 1 (a streak of one step) lost the read-every-other-step loop.  The
 // gate wins over the environment.
+inline std::atomic<int64_t>& soft_guide_defer_gate() noexcept {
+    static std::atomic<int64_t> v{kGateUnset};
+    return v;
+}
 inline int soft_guide_defer() noexcept {
-    const int64_t o = gate_override(Gate::SoftGuideDefer);
+    const int64_t o = soft_guide_defer_gate().load(std::memory_order_relaxed);
     if (o >= 0) return o >= 2 ? 2 : static_cast<int>(o);
     static const int64_t v = env_nonneg_int("NWGRAD_SOFT_GUIDE_DEFER");
     return v < 0 ? 1 : (v >= 2 ? 2 : static_cast<int>(v));   // unset (-1): the default, adaptive
