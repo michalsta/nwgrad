@@ -197,6 +197,46 @@ struct InterScoreGate {
     });
 }
 
+// The int8 groups of one origin (BatchEngine::ensure_plan8_): `keys` sorted, then len B
+// runs cut every W8 and where BatchEngine::ragged_ok() fails.  WN > 0: the keys are pairs
+// of the rows plan's narrow groups (int32 / int64; their groups fall back to the narrow
+// type), and a run too empty for an int8 group goes back to narrow groups of WN where it
+// fills one; else (or WN = 0) to `other`, its pairs' own fills.  Out of line and not a
+// template for the reason given at inter_plan_cut: with this cut as a lambda (two inlined
+// std::sort per BatchEngine instance) gcc took Aligner::rat() out of line in the narrowed
+// int32 linear Local traceback (run_narrow_group_): nighthaven AVX2 int32 linear Local
+// path +3.9-4.5 % instructions on DNA L100 / miRNA (2026-11-19).
+[[gnu::noinline]] inline void inter8_plan_cut(std::vector<InterKey>& keys, size_t W8, size_t WN,
+                                              std::vector<size_t>& elig8, std::vector<std::pair<size_t, size_t>>& groups8,
+                                              std::vector<size_t>& nelig,
+                                              std::vector<std::pair<size_t, size_t>>& ngroups, std::vector<size_t>& other) {
+    std::sort(keys.begin(), keys.end(), [](const InterKey& x, const InterKey& y) {
+        if (x.len_b != y.len_b) return x.len_b < y.len_b;
+        if (x.len_a != y.len_a) return x.len_a < y.len_a;
+        return x.i < y.i;
+    });
+    for (size_t s0 = 0; s0 < keys.size();) {
+        size_t e = s0 + 1;
+        while (e < keys.size() && e - s0 < W8 && keys[e].len_b * 4 <= keys[s0].len_b * 5 + 16) ++e;   // BatchEngine::ragged_ok
+        if (inter_group_filled(e - s0, W8)) {
+            groups8.emplace_back(elig8.size(), elig8.size() + (e - s0));
+            for (size_t k = s0; k < e; ++k) elig8.push_back(keys[k].i);
+        } else {
+            for (size_t k = s0; k < e;) {
+                const size_t ke = WN > 0 ? std::min(e, k + WN) : e;
+                if (WN > 0 && inter_group_filled(ke - k, WN)) {
+                    ngroups.emplace_back(nelig.size(), nelig.size() + (ke - k));
+                    for (size_t q = k; q < ke; ++q) nelig.push_back(keys[q].i);
+                } else {
+                    for (size_t q = k; q < ke; ++q) other.push_back(keys[q].i);
+                }
+                k = ke;
+            }
+        }
+        s0 = e;
+    }
+}
+
 template<class T, GapModel GM, AlignMode AM>
 class BatchEngine {
 public:
@@ -2895,10 +2935,30 @@ private:
     // A narrow group's lanes and its job (the narrow groups' common part): every lane's
     // codes and lengths (spare lanes repeat the last pair), the params in NI.
     void narrow_job_(const InterPlan& PL, size_t s, size_t e, int W, NarrowLanes& L, InterJobT<NI>& job) const {
-        narrow_job_(PL.nelig.data() + s, e - s, W, L, job);
+        const size_t real = e - s;
+        L.a.assign(W, nullptr); L.b.assign(W, nullptr); L.m.assign(W, 0); L.nb.assign(W, 0);
+        L.bi.assign(W, 0); L.bj.assign(W, 0); L.best.assign(W, NI(0));
+        L.M = 0; L.n = 0; L.ragged = false;
+        for (int l = 0; l < W; ++l) {
+            const size_t i = PL.nelig[s + std::min<size_t>(static_cast<size_t>(l), real - 1)];
+            L.a[l] = codes_a(i).data(); L.b[l] = codes_b(i).data();
+            L.m[l] = static_cast<int>(len_a(i)); L.nb[l] = static_cast<int>(len_b(i));
+            L.M = std::max(L.M, L.m[l]); L.n = std::max(L.n, L.nb[l]);
+            L.ragged |= L.nb[l] != L.nb[0];
+        }
+        const AlignParams& P = params_->p;
+        job = InterJobT<NI>{};
+        job.a = L.a.data(); job.m = L.m.data(); job.b = L.b.data(); job.n = L.n; job.M = L.M;
+        job.align_mode = (AM == AlignMode::Local) ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
+        if (L.ragged) job.nb = L.nb.data();
+        job.blk = params_->nstack.data(); job.nalpha = P.matrix.size();
+        job.go_a = static_cast<NI>(P.gap_open_a); job.ge_a = static_cast<NI>(P.gap_extend_a);
+        job.go_b = static_cast<NI>(P.gap_open_b); job.ge_b = static_cast<NI>(P.gap_extend_b);
+        job.linear = GM == GapModel::Linear ? 1 : 0;
     }
-    // ids[0..real): the lanes' pairs (a narrow group's, or an int8 group's fallback).
-    void narrow_job_(const size_t* ids, size_t real, int W, NarrowLanes& L, InterJobT<NI>& job) const {
+    // ids[0..real): the lanes' pairs (score only: a narrow group's, or an int8 group's fallback; the
+    // hard / path groups keep the PL form above, main's code).
+    void narrow_job_ids_(const size_t* ids, size_t real, int W, NarrowLanes& L, InterJobT<NI>& job) const {
         L.a.assign(W, nullptr); L.b.assign(W, nullptr); L.m.assign(W, 0); L.nb.assign(W, 0);
         L.bi.assign(W, 0); L.bj.assign(W, 0); L.best.assign(W, NI(0));
         L.M = 0; L.n = 0; L.ragged = false;
@@ -2970,7 +3030,7 @@ private:
     // narrows by itself: Aligner::narrow_score_).
     // ids[0..real) on nbackend's NI score kernel (a narrow group of the plan, or the
     // fallback of an int8 group made of narrow-group pairs); false: run their own fills.
-    bool narrow_score_group_(int nbackend, const size_t* ids, size_t real, Work& w) {
+    [[gnu::noinline]] bool narrow_score_group_(int nbackend, const size_t* ids, size_t real, Work& w) {
         if constexpr (kNarrowInter) {
             const LevelKernels& K = level_kernels(nbackend);
             const TypedKernels<NI>& KN = K.template of<NI>();
@@ -2978,7 +3038,7 @@ private:
             const int W = KN.inter_w;
             NarrowLanes& L = w.nw.nl;
             InterJobT<NI> job;
-            narrow_job_(ids, real, W, L, job);
+            narrow_job_ids_(ids, real, W, L, job);
             if (!inter_score_ok<NI>(alpha_->size(), L.M, L.n, GM == GapModel::Affine, AM == AlignMode::Local,
                                     s_.n_threads == 1, nbackend) ||
                 int8_own_(nbackend, L.nb.data(), static_cast<int>(real), w.full))   // rows the int8 tier takes
@@ -3042,7 +3102,7 @@ private:
             std::vector<int> m, nb;
             std::vector<T> best, blkT;
             // int8 lanes that may have saturated: re-run at T (spill) or, for a group of the
-            // base plan's narrow-group pairs (Inter8Plan::narrow8), at NI as main runs them (nspill)
+            // base plan's narrow-group pairs (Inter8Plan::narrow_from), at NI as main runs them (nspill)
             std::vector<size_t> spill, nspill;
             // Predictor: skip the int8 run of a group while the fail fraction of the recent
             // groups (an average halved per group, over the lanes that failed or, run at T,
@@ -3132,7 +3192,7 @@ private:
                     // A group of narrow-group pairs falls back to main's route for them, the
                     // NI kernel (int32 -> int16): at T, related DNA L100 int32 affine Local
                     // (every group predicted to overflow) read 1.84-1.89x main on solace.
-                    const bool nar = WN > 0 && P8->narrow8[t];
+                    const bool nar = WN > 0 && t >= P8->narrow_from;
                     const size_t W = nar ? WN : static_cast<size_t>(inter_w_(*Kp));
                     std::vector<size_t>& sp = nar ? nspill : spill;
                     auto back = [&](const std::vector<size_t>& vec, size_t s0, size_t real) {
@@ -3196,9 +3256,11 @@ private:
         int lmin = -1;
         std::vector<size_t> elig8;
         std::vector<std::pair<size_t, size_t>> groups8;
-        // per group: its pairs came from the base plan's narrow groups (fallback at NI), else
-        // from its T groups or own fills (fallback at T); a group never mixes the two
-        std::vector<uint8_t> narrow8;
+        // groups8[narrow_from ..): pairs of the base plan's narrow groups (fallback at NI);
+        // the ones before it: of its T groups or own fills (fallback at T).  An index, not a
+        // per-group vector: a new member's destructor and moves grew every BatchEngine
+        // instance of the bindings TU and moved gcc's inliner (see inter_plan_cut).
+        size_t narrow_from = ~size_t{0};
         InterPlan rest;   // everything else: the base plan's own groups, narrow groups and others
     };
     Inter8Plan plan8_;
@@ -3267,7 +3329,7 @@ private:
         P.base = &PL; P.base_backend = PL.default_backend; P.base_hb = PL.hb_cutoff;
         P.base_epoch = PL.gate_epoch; P.lmin = c.lmin;
         const LevelKernels& K = level_kernels(PL.backend);
-        struct Key { size_t len_b, len_a, i; };
+        using Key = InterKey;
         std::vector<Key> k8, k8n;   // k8n: the narrow groups' pairs
         auto ok8 = [&](size_t i) {
             const size_t la = len_a(i), lb = len_b(i);
@@ -3301,44 +3363,13 @@ private:
             if (ok8(i)) k8.push_back({len_b(i), len_a(i), i});
             else R.other.push_back(i);
         }
-        auto by_len = [](const Key& x, const Key& y) {
-            if (x.len_b != y.len_b) return x.len_b < y.len_b;
-            if (x.len_a != y.len_a) return x.len_a < y.len_a;
-            return x.i < y.i;
-        };
-        // ensure_plan_'s grouping: len B runs cut every W8 and where ragged_ok() fails; a
-        // group too empty to fill runs its pairs' own fills -- or, narrow-group pairs, main's
-        // narrow groups again where they fill one (NI is half int8's width).
         const size_t W8 = static_cast<size_t>(K.inter_w8);
         size_t WN = 0;
         if constexpr (kNarrowInter)
             if (PL.nbackend >= 0) WN = static_cast<size_t>(level_kernels(PL.nbackend).template of<NI>().inter_w);
-        auto cut8 = [&](std::vector<Key>& ks, bool nar) {
-            std::sort(ks.begin(), ks.end(), by_len);
-            for (size_t s0 = 0; s0 < ks.size();) {
-                size_t e = s0 + 1;
-                while (e < ks.size() && e - s0 < W8 && ragged_ok(ks[s0].len_b, ks[e].len_b)) ++e;
-                if (inter_group_filled(e - s0, W8)) {
-                    P.groups8.emplace_back(P.elig8.size(), P.elig8.size() + (e - s0));
-                    P.narrow8.push_back(nar ? 1 : 0);
-                    for (size_t k = s0; k < e; ++k) P.elig8.push_back(ks[k].i);
-                } else {
-                    for (size_t k = s0; k < e;) {
-                        const size_t ke = nar && WN > 0 ? std::min(e, k + WN) : e;
-                        if (nar && WN > 0 && inter_group_filled(ke - k, WN)) {
-                            R.ngroups.emplace_back(R.nelig.size(), R.nelig.size() + (ke - k));
-                            for (size_t q = k; q < ke; ++q) R.nelig.push_back(ks[q].i);
-                        } else {
-                            for (size_t q = k; q < ke; ++q) R.other.push_back(ks[q].i);
-                        }
-                        k = ke;
-                    }
-                }
-                s0 = e;
-            }
-        };
-        cut8(k8, false);
-        cut8(k8n, true);
+        inter8_plan_cut(k8, W8, 0, P.elig8, P.groups8, R.nelig, R.ngroups, R.other);
+        P.narrow_from = P.groups8.size();
+        inter8_plan_cut(k8n, W8, WN, P.elig8, P.groups8, R.nelig, R.ngroups, R.other);
         return &P;
     }
     // The fail fraction above which a group skips its int8 run, per int8 lane count.  An
