@@ -957,6 +957,11 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
              "the plan of a grad_mode \"none\" call without keep_paths (no byte budget:\n"
              "its score kernel keeps rows); else the plan of a call that keeps tables.  The\n"
              "score-only gather gate acts per group inside the call and is not reflected.")
+        .def("_inter_groups",
+             [](SPB& self, bool score_only) { return self.inter_plan_groups(score_only); },
+             nb::arg("score_only") = false,
+             "UNSTABLE (nwgrad._tuning): the plan's shared groups as lists of pair\n"
+             "indices, in the order the call runs them (see _inter_plan).")
         .def_prop_ro(
             "alphabet",
             [](const SPB& self) { return self.alphabet().symbols(); },
@@ -1502,7 +1507,8 @@ NB_MODULE(nwgrad_ext, m) {
             {"inter_score_small_cells", int64_t(c.i16.score_small_local)},
             {"inter_score_int8", int64_t(kInterScoreInt8Default ? 1 : 0)},
             {"score_int8_min_segs", int64_t(score_int8_min_segs(score_int8_lanes(be < 0 ? 0 : be), false, 4))},
-            {"inter_profile_bytes", int64_t(0)}};   // no cap (kInterProfileMaxBytes)
+            {"inter_profile_bytes", int64_t(0)},   // no cap (kInterProfileMaxBytes)
+            {"inter_group_tiles", int64_t(0)}};   // (auto: _tuning.defaults() says so)
     });
 
     m.def(
