@@ -84,6 +84,36 @@ def test_local_straddles_127(gm):
     _tuning.set_gate("inter_score_small_cells", None)
     got = _check(A, B, p, "int16", gm, "local")
     assert got == [float(len(a)) for a in A]
+    assert _check(A, B, p, "int32", gm, "local") == got   # int32: the re-runs at int16 (narrow groups)
+
+
+@pytest.mark.parametrize("gm", ["affine", "linear"])
+@pytest.mark.parametrize("threads", [1, 3])
+def test_int32_overflowing_groups_fall_back_narrow(gm, threads):
+    # related DNA L100 Local (scores far above 127): the predictor declines the int8 runs and
+    # the groups of narrow-group pairs run main's int16 kernel; a few unrelated pairs mixed in
+    go = 0.0 if gm == "linear" else 4.0
+    p = nwgrad.AlignParams(_matrix(DNA, 2, -4), go, 2.0, go, 2.0)
+    rng = np.random.default_rng(6)
+    A, B = [], []
+    for k in range(400):
+        a = rng.choice(list(DNA), 100 + int(rng.integers(-3, 4)))
+        b = a.copy()
+        m = rng.random(len(b)) < (0.6 if k % 9 == 0 else 0.1)
+        b[m] = rng.choice(list(DNA), int(m.sum()))
+        A.append("".join(a)); B.append("".join(b))
+    prev = nwgrad.get_isa_level()
+    for level in nwgrad.available_isa_levels():
+        if level == "scalar_fallback":
+            continue
+        nwgrad.set_isa_level(level)
+        try:
+            for gate in (1, 2):
+                on = _scores(A, B, p, "int32", gm, "local", gate, threads=threads)
+                assert on == _scores(A, B, p, "int32", gm, "local", 0, threads=threads)
+                assert on == _scores(A, B, p, "int16", gm, "local", gate, threads=threads)
+        finally:
+            nwgrad.set_isa_level(prev)
 
 
 @pytest.mark.parametrize("gm", ["affine", "linear"])

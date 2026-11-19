@@ -3240,7 +3240,11 @@ so a saturated value never leaks and the score is the int16 / int32 integer bit 
   split from the rows plan (`ensure_plan8_`).  Lane by lane the same proof as above: Local
   a lane maximum < 127, Global / Glocal G <= 126 per pair up front and a score > G - 128.
   A lane that fails re-runs at T, in a full T group once a worker has W of them, else its
-  own fill.  An exact predictor (the T scores say whether int8 would have held) skips the
+  own fill -- except for int32 / int64, whose int8 groups are built apart from the pairs of
+  the rows plan's narrow groups: those fall back (failed lanes and declined groups) to the
+  narrow NI kernel, main's route for them.  At T the fallback cost related DNA L100 int32
+  affine Local score 1.84-1.89x main on solace (AVX-512, every group declined: int32 there
+  holds half of int16's lanes).  An exact predictor (the T scores say whether int8 would have held) skips the
   int8 run of a group after one where over half the lanes failed.  Preconditions: untracked,
   <= 8 letters, the int8 parameter limits above, both lengths <= 127 (int8 lane compares);
   groups under int16's score caps.  Gate `inter_score_int8` / `NWGRAD_INTER_INT8`: 0 off,
