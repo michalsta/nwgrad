@@ -272,7 +272,7 @@ using score8_fn = void (*)(Score8Job&);
 // gates, the int8 cast and the job setup stay out of the bindings / engine TU, which is
 // at gcc 15's inline-unit-growth limit (see Aligner::score_i8_).
 //   score8_try  (Aligner::compute_score): 1 = the int8 score in `score`; 0 = not run (or
-//               mode 2's overflow); -1 = Local at mode 1, predicted or found to overflow
+//               mode 2's overflow); -1 = Local at mode 1, held off by the predictor or overflowed
 //               (the caller notes the wide score in score8_pred()).
 //   score8_own  (BatchEngine::int8_own_): every row of nb[0..real) long enough for the
 //               int8 tier and the problem within its preconditions, the predictor
@@ -820,12 +820,13 @@ inline int score_int8_lanes(int level) noexcept {
 struct Score8Stats { std::atomic<bool> on{false}; std::atomic<long long> runs{0}, overflows{0}; };
 inline Score8Stats& score8_stats() noexcept { static Score8Stats s; return s; }
 // The int8 tier's predictor (score8_try): per thread and problem type (score8_key: the
-// integer type's size, the gap model, the mode), whether the last Local problem's score
-// reached 127.
+// integer type's size, the gap model, the mode), the last Local problem's score (the int8
+// run's, or the wide kernel's when int8 was skipped or overflowed); score8_try compares it
+// with its threshold (score8_pred_cap in simd_levels.cpp).
 inline constexpr int score8_key(int tbytes, bool linear, int align_mode) noexcept {
     return ((tbytes == 2 ? 0 : tbytes == 4 ? 1 : 2) * 2 + (linear ? 1 : 0)) * 3 + align_mode;
 }
-struct Score8Pred { bool last_over[18]; };
+struct Score8Pred { float last[18]; };
 inline Score8Pred& score8_pred() noexcept { static thread_local Score8Pred p{}; return p; }
 // The per-lane profile's byte cap (kInterProfileMaxBytes, InterJobT::prof_max) with its
 // override: kGateOff (None) = no cap, 0 = always the gather.

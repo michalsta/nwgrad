@@ -45,7 +45,9 @@ pairs and batches) run the narrowest lanes that are provably exact:
 
 An int8 run that overflows is wasted work (a Local run stops at the row where it reaches
 127), so a thread tries the int8 tier only when its previous Local problem of the same
-type scored below 127 (the wide kernel's score tells exactly whether int8 would have held). Switches, process-wide: `NWGRAD_INT8`
+type scored below 127 (the wide kernel's score tells exactly whether int8 would have held).
+At 16 lanes (SSE2 / SSE4 / NEON) affine Local is capped at 64: there an int8 run pays only on
+low scores (DNA L100, 20 %-mutated pairs, median score 114, cost 1.25x under the 127 cap). Switches, process-wide: `NWGRAD_INT8`
 or `_tuning.set_gate("score_int8", v)`: 0 off, 1 Local with the predictor (the default on x86; AArch64 defaults to 0, where the
 int8 kernel measured slower than int16 even on pairs that fit), 2 every
 mode and every problem; `NWGRAD_INT_NARROW=0` turns off all narrowing, the int8 tier included.

@@ -201,7 +201,7 @@ def test_default_mode_is_local_with_a_predictor():
     _tuning.set_gate("score_int8_min_segs", 0)   # short rows: below the 32 / 64-lane minimum
     m = np.where(np.eye(4, dtype=bool), 2.0, -2.0)
     p = nwgrad.AlignParams(nwgrad.SubstMatrix(m, alphabet=DNA), 2.0, 1.0, 2.0, 1.0)
-    a = "ACGTTGCA" * 4
+    a = "ACGTTGCA" * 3                                 # Local score 48: below every predictor cap
     K = "auto"   # explicit, so a NWGRAD_FORCE_KERNEL=scalar_fallback sweep keeps SIMD here
     with _tuning.override(score_int8=2):   # a success clears this thread's back-off
         nwgrad.sw_score_int16(a, a, p, kernel=K)
@@ -216,8 +216,15 @@ def test_default_mode_is_local_with_a_predictor():
         assert len(set(got)) == 1 and got[0] == nwgrad.sw_score_double(big, big, p)
         assert E._score8_stats(True) == (1, 1)       # tried once, then predicted to overflow
         nwgrad.sw_score_int16(a, a, p, kernel=K)     # skipped (the last score was >= 127) ...
-        nwgrad.sw_score_int16(a, a, p, kernel=K)     # ... and its score 64 re-arms int8
+        nwgrad.sw_score_int16(a, a, p, kernel=K)     # ... and its score 48 re-arms int8
         assert E._score8_stats(True) == (1, 0)
+        # The cap: affine at 16 lanes (sse2 / sse4 / neon) tries int8 only after a score < 64,
+        # elsewhere < 127 (simd_levels.cpp, score8_pred_cap).  A run scoring 96 holds it off there.
+        mid = "ACGTTGCA" * 6                           # Local score 96
+        nwgrad.sw_score_int16(mid, mid, p, kernel=K)
+        nwgrad.sw_score_int16(a, a, p, kernel=K)
+        lanes16 = nwgrad.get_isa_level() in ("sse2", "sse4", "neon")
+        assert E._score8_stats(True) == ((1, 0) if lanes16 else (2, 0))
 
 
 def test_min_segs_gate():
