@@ -24,9 +24,15 @@ import sys
 UNIT_OFFSET = [("py_exports", 0), ("level_baseline", 192), ("level_sse4", 3712), ("level_avx2", 640),
                ("level_avx512", 3584), ("level_baseline_soft", 1760), ("level_sse4_soft", 4032),
                ("level_avx2_soft", 2080), ("level_avx512_soft", 2048), ("level_baseline_inter", 2080),
-               ("level_sse4_inter", 160), ("level_avx2_inter", 2144), ("level_avx512_inter", 1376)]
+               ("level_sse4_inter", 160), ("level_avx2_inter", 2144), ("level_avx512_inter", 1376),
+               # the semi-global runtime-ends units (level_<name>_sg.cpp): last, so they move nothing above;
+               # offset 0 (not in main's link, nothing measured; only non-glocal free ends run them)
+               ("level_baseline_sg", 0), ("level_sse4_sg", 0), ("level_avx2_sg", 0), ("level_avx512_sg", 0),
+               # the engine's semi-global runtime-ends code (aligner_sg.cpp), last for the same reason
+               ("aligner_sg", 0)]
 # AArch64 (its own script: a `. += N` for a unit that is not linked still pads).  No measured offsets.
-UNIT_OFFSET_AARCH64 = [("py_exports", 0), ("level_neon", 0), ("level_neon_soft", 0), ("level_neon_inter", 0)]
+UNIT_OFFSET_AARCH64 = [("py_exports", 0), ("level_neon", 0), ("level_neon_soft", 0), ("level_neon_inter", 0),
+                       ("level_neon_sg", 0), ("aligner_sg", 0)]
 
 TYPES = ["f", "d", "s", "i", "l"]                 # float, double, int16, int32, int64 (Itanium codes)
 LEVELS = ["avx2", "avx512", "sse4", "baseline", "neon"]

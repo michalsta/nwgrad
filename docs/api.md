@@ -156,6 +156,41 @@ along the last row; the soft gradient's ensemble is that same set of paths. `ali
 returns the window of B the alignment covers; `coordinates()` starts where the path
 starts.
 
+### Semi-global modes: free ends
+
+| `mode` | free flanks |
+|---|---|
+| `"semiglobal"`, `free_ends=...` | any of A's beginning / end, B's beginning / end (16 sets) |
+| `"overlap"` | all four (= `free_ends=("a_begin", "a_end", "b_begin", "b_end")`) |
+| `"glocal"` | B's beginning and end (= `free_ends=("b_begin", "b_end")`) |
+| `"global"` | none (= `free_ends=()`) |
+
+```python
+nwgrad.SeqPair(a, b, P, mode="semiglobal", free_ends=(True, False, False, True))  # (a_begin, a_end, b_begin, b_end)
+nwgrad.SeqPair(a, b, P, mode="semiglobal", free_ends=("a_begin", "b_end"))         # the same, by name
+nwgrad.SeqPairBatch(A, B, P, mode="overlap")
+nwgrad.semiglobal_score(a, b, P, ("a_end", "b_begin"))   # also _grad, _soft_grad, _double
+sp.free_ends   # (a_begin, a_end, b_begin, b_end) booleans; None for local
+sp.mode        # "glocal" / "overlap" for those sets, else "semiglobal"
+```
+
+A free flank's residues are left unaligned at no cost (they are not gap moves). In the DP
+(A = rows i, B = columns j): a free **A begin** makes column 0 a free start (M = 0 at every
+row, no gap chain down it), a free **B begin** row 0 (glocal's); a free **A end** makes every
+cell of column n an end, a free **B end** every cell of row m (glocal's); (m, n) is always
+an end. Ends include the border cells, so `("a_begin", "b_end")` with nothing in common
+scores 0 (the empty overlap), as glocal's (m, 0) is an end. Among equal optima the end is
+the **first candidate cell in row-major order** (A's index, then B's), the state by
+M > X > Y: glocal's rule (row m's first best column) and Local's, extended; the same at
+every ISA level and in both exact tracebacks.
+
+What runs (other ends than glocal's): every simd level's striped fills (Scores, Pointers,
+linear) and score-only kernels, bit-identical to the scalar fill; traceback `pointers` /
+`scores` (`auto`, `grid` and the Hirschberg modes run as Pointers: O(m*n) direction bytes);
+hard gradients; the soft path (scaled and log; the scaled per-pair kernels, not the
+inter-pair one); each pair's own fill in a batch (`fill="interpair"` falls back). A guide
+band (`banded_align`, `banded_grad`) raises.
+
 ### Parameter sets and tracks
 
 An `AlignParams` may hold **K parameter sets**, each a full substitution matrix plus the
