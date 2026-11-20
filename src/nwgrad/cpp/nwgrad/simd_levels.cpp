@@ -76,9 +76,95 @@ NWGRAD_INSTANTIATE_REGISTER(int32_t)
 NWGRAD_INSTANTIATE_REGISTER(int64_t)
 #undef NWGRAD_INSTANTIATE_REGISTER
 
+// ── The int8 score tier's gates (Aligner::score_i8_, BatchEngine::int8_own_) ─────
+// Out of line, here, for the bindings / engine TU's inline budget (see Score8Req).  AlignMode
+// values: 0 Global, 1 Local, 2 Glocal.
+namespace {
+constexpr int kScore8Local = 1;
+
+int score8_try_impl(const Score8Req& q, int& score) {
+    const int mode = q.mode;
+    if (q.m < 1 || q.n < 1) return 0;
+    if (mode == 1) {   // the row length the level's lanes need (score_int8_min_segs), first:
+        const int W = score_int8_lanes(q.backend);   // short pairs leave here, before any other test
+        if ((q.n + W - 1) / W < score_int8_min_segs(W, q.linear != 0, q.nalpha)) return 0;
+    }
+    const score8_fn fn = level_kernels(q.backend).score_i8;
+    if (!fn || q.smax_pos < 0) return 0;
+    if (q.smax_pos > 127 || q.smax_neg > 127) return 0;
+    const long long goa = q.linear ? 0 : static_cast<long long>(q.go_a);
+    const long long gob = q.linear ? 0 : static_cast<long long>(q.go_b);
+    const long long gea = static_cast<long long>(q.ge_a);
+    const long long geb = static_cast<long long>(q.ge_b);
+    if (goa < 0 || gob < 0 || gea < 0 || geb < 0 || goa + gea > 127 || gob + geb > 127) return 0;
+    const long long gain = static_cast<long long>(std::min(q.m, q.n)) * q.smax_pos;
+    if (q.am != kScore8Local && gain > 126) return 0;
+    // Predictor: a Local run that overflows is wasted (up to the row that reached
+    // 127), and related pairs overflow in runs -- protein L100 30 %-mutated Local
+    // cost 2.0x the int16 instructions trying every pair (skynet sse4); a geometric
+    // back-off (skip 1, 3, ... 63 after an overflow) still left 1.01-1.03.  The
+    // wide kernel's score says exactly whether int8 would have held (Local: score
+    // < 127), so the thread tries int8 only when its previous Local problem of this
+    // type scored below 127: an all-overflowing batch pays one wasted run per
+    // thread, an i.i.d. mix p(1-p) of its pairs.
+    Score8Pred& pr = score8_pred();
+    if (mode == 1 && pr.last_over[q.key]) return -1;
+    // Per-thread scratch: the int8 block (cast per problem) and the kernel's rows.
+    struct Scratch { std::vector<int8_t> blk, rows; };
+    static thread_local Scratch sc;
+    const std::size_t nn = static_cast<std::size_t>(q.nalpha) * q.nalpha;
+    sc.blk.resize(nn);
+    switch (q.tbytes) {
+    case 2: { const auto* s = static_cast<const int16_t*>(q.blk);
+              for (std::size_t k = 0; k < nn; ++k) sc.blk[k] = static_cast<int8_t>(s[k]); } break;
+    case 4: { const auto* s = static_cast<const int32_t*>(q.blk);
+              for (std::size_t k = 0; k < nn; ++k) sc.blk[k] = static_cast<int8_t>(s[k]); } break;
+    default: { const auto* s = static_cast<const int64_t*>(q.blk);
+              for (std::size_t k = 0; k < nn; ++k) sc.blk[k] = static_cast<int8_t>(s[k]); } break;
+    }
+    Score8Job job{};
+    job.a = q.a; job.m = q.m;
+    job.b = q.b; job.n = q.n;
+    job.blk = sc.blk.data(); job.nalpha = q.nalpha;
+    job.go_a = static_cast<int8_t>(goa); job.ge_a = static_cast<int8_t>(gea);
+    job.go_b = static_cast<int8_t>(gob); job.ge_b = static_cast<int8_t>(geb);
+    job.local = q.am;
+    job.linear = q.linear ? 1 : 0;
+    job.gain = static_cast<int>(std::min<long long>(gain, 126));
+    job.scratch = &sc.rows;
+    fn(job);
+    Score8Stats& st = score8_stats();
+    if (st.on.load(std::memory_order_relaxed)) {
+        st.runs.fetch_add(1, std::memory_order_relaxed);
+        if (job.overflow) st.overflows.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (job.overflow) return mode == 2 ? 0 : -1;   // gate 2: every problem tried
+    pr.last_over[q.key] = false;
+    score = job.score;
+    return 1;
+}
+
+bool score8_own_impl(const Score8Req& q) {
+    {   // the row lengths first: a group of short rows (the shared kernel's own case) leaves here
+        const int W = score_int8_lanes(q.backend);
+        const int segs = std::max(16, score_int8_min_segs(W, q.linear != 0, q.nalpha));
+        for (int l = 0; l < q.real; ++l)
+            if ((q.nb[l] + W - 1) / W < segs) return false;
+    }
+    if (score_int8_mode() != 1) return false;
+    if (!level_kernels(q.backend).score_i8 || score8_pred().last_over[q.key]) return false;
+    if (q.smax_pos < 0 || q.smax_pos > 127 || q.smax_neg > 127) return false;
+    const double goa = q.linear ? 0.0 : q.go_a, gob = q.linear ? 0.0 : q.go_b;
+    return goa >= 0 && gob >= 0 && q.ge_a >= 0 && q.ge_b >= 0 &&
+           goa + q.ge_a <= 127 && gob + q.ge_b <= 127;
+}
+}   // namespace
+
 void register_level_common(SimdLevel l, int row_block, score8_fn score_i8) {
     LevelKernels& k = level_table()[(int)l];
     k.score_i8  = score_i8;
+    k.score8_try = &score8_try_impl;
+    k.score8_own = &score8_own_impl;
     k.level     = static_cast<int>(l);
     k.row_block = row_block;
 }

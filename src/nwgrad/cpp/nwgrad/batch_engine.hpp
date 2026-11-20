@@ -3098,28 +3098,27 @@ private:
     // preconditions, the thread's predictor not expecting an overflow) and every pair's row
     // is at least max(16, score_int8_min_segs) int8 segments: shorter groups stay shared
     // (they are what the shared kernel is for, and an int8 form of it is a separate tier).
+    // The test itself is out of line (score8_own in simd_levels.cpp): this TU's inline
+    // budget (see Aligner::score_i8_).
     template <class Al>
     bool int8_own_(int backend, const int* nb, int real, const Al&) const {
         if constexpr (!nw_is_int<T> || AM != AlignMode::Local) {
             (void)backend; (void)nb; (void)real; return false;
         } else {
-            if (tracked_ || backend < 0) return false;
-            {   // the row lengths first: a group of short rows (the shared kernel's own case) leaves here
-                const int W = score_int8_lanes(backend);
-                const int segs = std::max(16, score_int8_min_segs(W, GM == GapModel::Linear, static_cast<int>(alpha_->size())));
-                for (int l = 0; l < real; ++l)
-                    if ((nb[l] + W - 1) / W < segs) return false;
-            }
-            if (!Al::int_narrow_env() || score_int8_mode() != 1) return false;
-            if (!level_kernels(backend).score_i8 || Al::score8_tl().last_over) return false;
+            if (tracked_ || backend < 0 || !Al::int_narrow_env()) return false;
+            const auto f = level_kernels(backend).score8_own;
+            if (!f) return false;
             const NwIntBound<T>& ib = params_->ib;
-            if (!ib.prepared() || ib.smax_pos > T(127) || ib.smax_neg > T(127)) return false;
             const AlignParams& p = params_->p;
-            const bool lin = GM == GapModel::Linear;
-            const double goa = lin ? 0.0 : p.gap_open_a, gob = lin ? 0.0 : p.gap_open_b;
-            if (!(goa >= 0 && gob >= 0 && p.gap_extend_a >= 0 && p.gap_extend_b >= 0 &&
-                  goa + p.gap_extend_a <= 127 && gob + p.gap_extend_b <= 127)) return false;
-            return true;
+            Score8Req q;
+            q.nalpha = static_cast<int>(alpha_->size());
+            q.go_a = p.gap_open_a; q.ge_a = p.gap_extend_a;
+            q.go_b = p.gap_open_b; q.ge_b = p.gap_extend_b;
+            q.smax_pos = ib.prepared() ? static_cast<long long>(ib.smax_pos) : -1;
+            q.smax_neg = static_cast<long long>(ib.smax_neg);
+            q.backend = backend; q.linear = GM == GapModel::Linear; q.key = Al::kScore8Key;
+            q.nb = nb; q.real = real;
+            return f(q);
         }
     }
 
