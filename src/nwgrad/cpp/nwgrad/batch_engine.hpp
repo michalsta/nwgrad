@@ -340,7 +340,7 @@ public:
     // The semi-global free ends (Glocal batches; any other mode accepts kSgGlocal only, a
     // no-op).  Changes what every pair computes: drops scores, gradients, paths and guides.
     void set_free_ends(int f) {
-        FullAl probe; probe.set_free_ends(f);   // validates (range, mode)
+        FullAl::check_free_ends(f);   // validates (range, mode)
         if (f == s_.free_ends) return;
         s_.free_ends = f;
         for (auto& fl : flags_) fl = 0;
@@ -785,7 +785,7 @@ private:
     template<AlignBand AB>
     void configure_stream_(Aligner<GM, AM, AB, T>& al, int kernel) const {
         al.set_kernel(kernel);
-        al.set_free_ends(s_.free_ends);
+        al.set_free_ends_trusted(s_.free_ends);
         al.set_soft_impl(s_.soft_impl);
         al.set_soft_f32(s_.soft_f32);
         al.set_soft_temperature(s_.soft_temperature);
@@ -1882,8 +1882,8 @@ private:
         explicit Work(const BatchEngine& e) : g(e.alphabet(), e.nsets_) { configure(e); }
         // The batch's settings, (re)applied: a reused Work follows setting changes.
         void configure(const BatchEngine& e) {
-            full.set_free_ends(e.s_.free_ends);
-            band.set_free_ends(e.s_.free_ends);
+            full.set_free_ends_trusted(e.s_.free_ends);
+            band.set_free_ends_trusted(e.s_.free_ends);
             full.set_traceback(e.s_.traceback);
             full.set_hb_cutoff(e.s_.hb_cutoff);
             full.set_rowwise_full(e.s_.rowwise_full);
@@ -2335,7 +2335,7 @@ private:
         return ok;
     }
     void configure_lane_(FullAl& al) const {
-        al.set_free_ends(s_.free_ends);
+        al.set_free_ends_trusted(s_.free_ends);
         al.set_traceback(s_.traceback);
         al.set_hb_cutoff(s_.hb_cutoff);
         al.set_rowwise_full(s_.rowwise_full);
@@ -2344,7 +2344,7 @@ private:
         al.set_soft_temperature(s_.soft_temperature);
     }
     void configure_lane_(BandAl& al) const {
-        al.set_free_ends(s_.free_ends);
+        al.set_free_ends_trusted(s_.free_ends);
         al.set_traceback(TracebackMode::Scores);
         al.set_soft_impl(s_.soft_impl);
         al.set_soft_f32(s_.soft_f32);

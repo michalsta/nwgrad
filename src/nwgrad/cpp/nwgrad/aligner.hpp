@@ -466,6 +466,15 @@ inline std::atomic<size_t>& track_profile_bytes() {
 // the gradient or guide AND the stored path; otherwise this, which compiles away.
 struct NoMoves { void operator()(uint8_t) const noexcept {} };
 
+// set_free_ends' throws (Aligner::check_free_ends), out of line: one copy, not one per
+// instantiation inlined into every configure path.
+[[noreturn, gnu::cold, gnu::noinline]] inline void nw_bad_free_ends(int f) {
+    if (f < 0 || f > kSgAll)
+        throw std::invalid_argument("nwgrad: free_ends must be a 4-bit flag set (0..15), got " +
+                                    std::to_string(f));
+    throw std::invalid_argument("nwgrad: free ends apply to the semi-global modes only");
+}
+
 template<GapModel GM, AlignMode AM, AlignBand AB = AlignBand::Full, class T = double>
 struct Aligner {
 
@@ -787,17 +796,21 @@ struct Aligner {
     // other mode accepts only its own fixed ends' word, kSgGlocal (a no-op), and throws on
     // anything else.  Like set_traceback: it decides what the next fill computes.
     void set_free_ends(int f) {
-        if (f < 0 || f > kSgAll)
-            throw std::invalid_argument("nwgrad: free_ends must be a 4-bit flag set (0..15), got " +
-                                        std::to_string(f));
-        if constexpr (AM != AlignMode::Glocal) {
-            if (f != kSgGlocal)
-                throw std::invalid_argument("nwgrad: free ends apply to the semi-global modes only");
-        } else {
-            sg_ = f;
-        }
+        check_free_ends(f);
+        if constexpr (AM == AlignMode::Glocal) sg_ = f;
+    }
+    // The checks alone (BatchEngine::set_free_ends); the throws out of line (nw_bad_free_ends).
+    static void check_free_ends(int f) {
+        if (f < 0 || f > kSgAll || (AM != AlignMode::Glocal && f != kSgGlocal))
+            nw_bad_free_ends(f);
     }
     int free_ends() const noexcept { return sg_; }
+    // The batch engine's setter, for ends it validated already (BatchEngine::set_free_ends):
+    // no checks, so outside Glocal it is no code at all -- the configure paths main had
+    // (set_free_ends' throws, inlined there, grew every mode's per-lane setup).
+    void set_free_ends_trusted(int f) noexcept {
+        if constexpr (AM == AlignMode::Glocal) sg_ = f; else (void)f;
+    }
     // Whether the last Viterbi run took the Grid traceback (tests: Grid falls back to
     // Pointers silently where it does not apply, with the same result).
     bool ran_grid() const noexcept { return grid_; }
@@ -1019,16 +1032,25 @@ struct Aligner {
             compute_viterbi(buf);
             return viterbi_score_;
         } else {
+            if constexpr (AM == AlignMode::Glocal)   // the other semi-global ends: out of line (sg_compute_score_)
+                if (!sg_is_glocal_()) [[unlikely]] return sg_compute_score_(buf);
+            return compute_score_impl_<false>(buf);
+        }
+    }
+    // SGR: the semi-global runtime ends (only instantiated by sg_compute_score_, aligner_sg.cpp).
+    // always_inline: resolved before the IPA inliner, so compute_score is main's one body.
+    template <bool SGR>
+    [[gnu::always_inline]] double compute_score_impl_(DpBuffer& buf) {
+        {
             const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
             if (backend != kBackendScalar) {
-                if constexpr (std::is_same_v<T, std::int32_t> || std::is_same_v<T, std::int64_t>) {
+                if constexpr (!SGR && (std::is_same_v<T, std::int32_t> || std::is_same_v<T, std::int64_t>)) {
                     double r;
                     if (!tr_ && int_narrow_env() && narrow_score_(backend, r)) return r;
                 }
-                const LevelKernels& KL = level_kernels(backend);
-                auto fn = KL.template of<T>().score;
-                if constexpr (AM == AlignMode::Glocal)   // semi-global runtime ends: the sg unit's
-                    if (!sg_is_glocal_()) fn = KL.template sg_of<T>().score_sg;
+                typename TypedKernels<T>::score_fn fn;   // SGR: the sg unit's
+                if constexpr (SGR) fn = level_kernels(backend).template sg_of<T>().score_sg;
+                else               fn = level_kernels(backend).template of<T>().score;
                 if (fn) {
                     ScoreJob<T> job{}; job.sat = sat_;
                     job.a = a_idx_.data(); job.m = m_;
@@ -1040,7 +1062,7 @@ struct Aligner {
                     job.go_b = lin ? T(0) : static_cast<T>(params_->gap_open_b);
                     job.ge_b = static_cast<T>(params_->gap_extend_b);
                     job.local = AM == AlignMode::Local ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
-                    if constexpr (AM == AlignMode::Glocal) job.sg = sg_;
+                    if constexpr (SGR) job.sg = sg_;
                     job.variant = score_variant_env();
 #if defined(__aarch64__) || defined(_M_ARM64)
                     job.linear = lin && linear_score_one_row(backend, n_, nalpha_);
@@ -1053,8 +1075,8 @@ struct Aligner {
                     return static_cast<double>(job.score);
                 }
             }
-            if constexpr (GM == GapModel::Linear) return score_linear_scalar(buf);
-            else                                   return score_affine_scalar(buf);
+            if constexpr (GM == GapModel::Linear) return score_linear_scalar<SGR>(buf);
+            else                                   return score_affine_scalar<SGR>(buf);
         }
     }
     double compute_score() {
@@ -1088,7 +1110,6 @@ struct Aligner {
     bool narrow_score_(int backend, double& out) {
         if constexpr (std::is_same_v<T, std::int32_t> || std::is_same_v<T, std::int64_t>) {
             using N = nw_int_narrower_t<T>;
-            if (!sg_is_glocal_()) return false;   // the narrow kernels have glocal's ends only
             NwIntBound<N> nb;
             if (!nw_int_bound_narrow(ib_, nb)) return false;
 #if defined(__aarch64__) || defined(_M_ARM64)
@@ -1188,7 +1209,6 @@ struct Aligner {
             using N = nw_int_narrower_t<T>;
             if (tr_ || m_ == 0 || n_ == 0 || rowwise_full_ || !int_narrow_env() ||
                 !(int_narrow_paths() & kIntNarrowOwnPath)) return false;
-            if (!sg_is_glocal_()) return false;   // semi-global ends: not narrowed (glocal's bound and kernels only)
             if (!tb_auto_ && tb_ == TracebackMode::Scores) return false;
             const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
             if (backend == kBackendScalar) return false;
@@ -2145,9 +2165,11 @@ private:
         // glocal's end (row m) and start (row 0) only, so these run Pointers -- the exact
         // path, O(m*n) direction bytes.  Requested explicitly or by `auto` alike, as Grid
         // already falls back where it does not apply.
+        // Nor do they take the `auto` upgrades below (linear auto Pointers -> Grid: the Grid
+        // fill has glocal's borders; m > hb_cutoff ran it with these ends before).
         if constexpr (AM == AlignMode::Glocal)
-            if (!sg_is_glocal_() && (tb_ == TracebackMode::Grid || is_hirschberg(tb_)))
-                return TracebackMode::Pointers;
+            if (!sg_is_glocal_())
+                return (tb_ == TracebackMode::Grid || is_hirschberg(tb_)) ? TracebackMode::Pointers : tb_;
         // Local affine `auto` where the ONE-PASS Grid applies (every gap parameter >= 0, so
         // the top-level forward finds the end cell itself; untracked, a simd level, m >
         // hb_cutoff: grid_ok_): Grid at every size, the pointer budget no longer consulted.
@@ -2598,8 +2620,8 @@ private:
     // fill's max chose it, so both give the same walk, ties included.
     template <class Emit>
     void walk_linear(const DpBuffer& buf, Emit&& emit) const {
-        if constexpr (AM == AlignMode::Glocal)
-            if (!sg_is_glocal_()) { sg_cold_([&] { if (tr_) walk_linear_impl<true, true>(buf, emit); else walk_linear_impl<false, true>(buf, emit); }); return; }   // the other ends: runtime flags (SGR)
+        if constexpr (AM == AlignMode::Glocal && AB == AlignBand::Full)   // the other semi-global ends: walked out of line
+            if (!sg_is_glocal_()) [[unlikely]] { sg_walk_replay_(buf, emit); return; }   // (sg_walk_record_; banded: refused)
         if (tr_) walk_linear_impl<true>(buf, emit);
         else     walk_linear_impl<false>(buf, emit);
     }
@@ -2734,8 +2756,8 @@ private:
     }
     template <class Emit>
     void walk_affine(const DpBuffer& buf, Emit&& emit) const {
-        if constexpr (AM == AlignMode::Glocal)
-            if (!sg_is_glocal_()) { sg_cold_([&] { walk_affine_sgr_(buf, emit); }); return; }   // the other ends: runtime flags (SGR)
+        if constexpr (AM == AlignMode::Glocal && AB == AlignBand::Full)   // the other semi-global ends: walked out of line
+            if (!sg_is_glocal_()) [[unlikely]] { sg_walk_replay_(buf, emit); return; }   // (sg_walk_record_; banded: refused)
         if (tr_) {
             if (pointers_) walk_affine_impl<true, true>(buf, emit);
             else           walk_affine_impl<false, true>(buf, emit);
@@ -2932,7 +2954,17 @@ private:
     // vectorize linear ACROSS pairs instead — SeqPairBatch fill="interpair", one pair per
     // lane, bit-identical — which sidesteps the chain.)
     void run_viterbi(DpBuffer& buf) {
-        if (narrow_viterbi_(buf)) return;   // an integer problem the narrower type holds
+        if constexpr (AM == AlignMode::Glocal && AB == AlignBand::Full)   // the other semi-global ends: out of line
+            if (!sg_is_glocal_()) [[unlikely]] { sg_run_viterbi_(buf); return; }   // (aligner_sg.cpp; banded: refused)
+        run_viterbi_impl_<false>(buf);
+    }
+    // SGR: the semi-global runtime ends (Glocal with ends other than glocal's), only ever
+    // instantiated by sg_run_viterbi_ in aligner_sg.cpp; SGR = false is main's dispatch.
+    // always_inline: resolved before the IPA inliner, so run_viterbi is main's one body.
+    template <bool SGR>
+    [[gnu::always_inline]] void run_viterbi_impl_(DpBuffer& buf) {
+        if constexpr (!SGR)
+            if (narrow_viterbi_(buf)) return;   // an integer problem the narrower type holds
         // `auto` resolved to Grid where Grid does not apply: this run takes the previous
         // default (kGridFallbackTb) — its memory bound — and tb_ is restored after it.
         struct TbRestore {
@@ -3017,18 +3049,23 @@ private:
                 }
                 if (backend != kBackendScalar && n_ >= linear_striped_min_n(backend)) {
                     const LevelKernels& K = level_kernels(backend);
-                    const TypedKernels<T>& KT = K.template of<T>();
-                    // semi-global runtime ends: the level's sg fills (their own unit)
-                    const bool sgk = !sg_is_glocal_();
-                    if (lin_ptr ? (sgk ? K.template sg_of<T>().linear_ptr_sg : KT.linear_ptr) != nullptr
-                                : (sgk ? K.template sg_of<T>().linear_sg : KT.linear) != nullptr) {
-                        run_dispatched_linear(buf, K, lin_ptr);
-                        return;
+                    if constexpr (SGR) {   // semi-global runtime ends: the level's sg fills (their own unit)
+                        const SgTypedKernels<T>& KS = K.template sg_of<T>();
+                        if ((lin_ptr ? KS.linear_ptr_sg : KS.linear_sg) != nullptr) {
+                            run_dispatched_linear<true>(buf, K, lin_ptr);
+                            return;
+                        }
+                    } else {
+                        const TypedKernels<T>& KT = K.template of<T>();
+                        if (lin_ptr ? KT.linear_ptr != nullptr : KT.linear != nullptr) {
+                            run_dispatched_linear(buf, K, lin_ptr);
+                            return;
+                        }
                     }
                 }
             }
-            if (lin_ptr) { viterbi_linear_ptr(buf); return; }
-            viterbi_linear(buf);
+            if (lin_ptr) { viterbi_linear_ptr<SGR>(buf); return; }
+            viterbi_linear<SGR>(buf);
             return;
         }
         // Resolve this aligner's backend: auto -> the global default, then scalar or a level.
@@ -3038,7 +3075,7 @@ private:
         const bool use_ptr = (tb_ == TracebackMode::Pointers || is_hirschberg(tb_) ||
                               tb_ == TracebackMode::Grid) && (AB == AlignBand::Full);
         if (backend == kBackendScalar) {
-            if (use_ptr) viterbi_affine_ptr(buf); else viterbi_affine(buf);
+            if (use_ptr) viterbi_affine_ptr<SGR>(buf); else viterbi_affine<SGR>(buf);
             return;
         }
         // Grid: where it is implemented (grid_ok_), else Pointers below — the same result.
@@ -3055,12 +3092,20 @@ private:
         if constexpr (AB == AlignBand::Full) {
             // Opt-in row-wise fill (set_rowwise_full): score tables, row-major, read back
             // by the Scores traceback whatever tb_ says — the paths are identical.
+            if constexpr (SGR) {   // semi-global runtime ends: the sg unit's kernels (no row-wise: glocal's borders only)
+                const SgTypedKernels<T>& KS = K.template sg_of<T>();
+                if (use_ptr && KS.viterbi_ptr_sg) { run_dispatched_affine<true>(buf, K, true);  return; }
+                if (KS.viterbi_sg)                { run_dispatched_affine<true>(buf, K, false); return; }
+                if (use_ptr) { viterbi_affine_ptr<true>(buf); return; }
+                viterbi_affine<true>(buf);   // (Full only: a banded problem with these ends is refused)
+                return;
+            } else {
             if (uses_rowwise_full()) { viterbi_affine_simd(buf, K); return; }
             // The striped Full kernel, this level's instantiation for T.
-            const bool sgk = !sg_is_glocal_();   // semi-global runtime ends: the sg unit's kernels
-            if (use_ptr && (sgk ? K.template sg_of<T>().viterbi_ptr_sg : KT.viterbi_ptr)) { run_dispatched_affine(buf, K, true);  return; }
-            if (sgk ? K.template sg_of<T>().viterbi_sg : KT.viterbi)                      { run_dispatched_affine(buf, K, false); return; }
+            if (use_ptr && KT.viterbi_ptr) { run_dispatched_affine(buf, K, true);  return; }
+            if (KT.viterbi)                { run_dispatched_affine(buf, K, false); return; }
             if (use_ptr) { viterbi_affine_ptr(buf); return; }   // level lacks the ptr kernel
+            }
         }
         // The row-wise banded kernel (every T); a level without it falls back to the
         // scalar fill.
@@ -3071,6 +3116,7 @@ private:
     // Build a plain ViterbiJob from Aligner state, run the dispatched (leveled) kernel,
     // and copy its scalar results back.  The kernel fills buf.VM/VX/VY in STRIPED layout
     // (table_layout == 1) and reports seg/width; rat/at then read them striped.
+    template <bool SGR = false>   // SGR: the sg unit's kernels and the job's ends (aligner_sg.cpp only)
     void run_dispatched_affine(DpBuffer& buf, const LevelKernels& K, bool use_ptr = false) {
         ViterbiJob<T> job{}; job.sat = sat_;
         job.a = a_idx_.data(); job.m = m_;
@@ -3081,18 +3127,16 @@ private:
         job.go_a = static_cast<T>(params_->gap_open_a);   job.ge_a = static_cast<T>(params_->gap_extend_a);
         job.go_b = static_cast<T>(params_->gap_open_b);   job.ge_b = static_cast<T>(params_->gap_extend_b);
         job.align_mode = (AM == AlignMode::Local) ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
-        if constexpr (AM == AlignMode::Glocal) job.sg = sg_;
+        if constexpr (SGR) job.sg = sg_;
         job.align_band = 0; job.band = 0;
         job.guide_j = nullptr; job.guide_len = 0;
         job.buf = &buf;
         if (tr_) fill_track_job_(job.tr, true, static_cast<size_t>(n_) + 16);
         const TypedKernels<T>& KT = K.template of<T>();
         job.dense = (use_ptr && want_dense_()) ? 1 : 0;
-        if constexpr (AM == AlignMode::Glocal) {
-            if (!sg_is_glocal_()) {   // the sg unit's
-                const SgTypedKernels<T>& KS = K.template sg_of<T>();
-                if (use_ptr) KS.viterbi_ptr_sg(job); else KS.viterbi_sg(job);
-            } else if (use_ptr) KT.viterbi_ptr(job); else KT.viterbi(job);
+        if constexpr (SGR) {   // the sg unit's
+            const SgTypedKernels<T>& KS = K.template sg_of<T>();
+            if (use_ptr) KS.viterbi_ptr_sg(job); else KS.viterbi_sg(job);
         } else {
             if (use_ptr) KT.viterbi_ptr(job); else KT.viterbi(job);
         }
@@ -3226,6 +3270,7 @@ private:
 
     // The leveled linear kernel (Full): H in STRIPED layout (or direction bytes in it),
     // read back through cell_index like the affine tables.  No gap opens in the job.
+    template <bool SGR = false>   // SGR: the sg unit's kernels and the job's ends (aligner_sg.cpp only)
     void run_dispatched_linear(DpBuffer& buf, const LevelKernels& K, bool use_ptr) {
         ViterbiJob<T> job{}; job.sat = sat_;
         job.a = a_idx_.data(); job.m = m_;
@@ -3234,18 +3279,16 @@ private:
         job.go_a = static_cast<T>(0); job.ge_a = static_cast<T>(params_->gap_extend_a);
         job.go_b = static_cast<T>(0); job.ge_b = static_cast<T>(params_->gap_extend_b);
         job.align_mode = (AM == AlignMode::Local) ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
-        if constexpr (AM == AlignMode::Glocal) job.sg = sg_;
+        if constexpr (SGR) job.sg = sg_;
         job.align_band = 0; job.band = 0;
         job.guide_j = nullptr; job.guide_len = 0;
         job.buf = &buf;
         if (tr_) fill_track_job_(job.tr, true, static_cast<size_t>(n_) + 16, true);
         const TypedKernels<T>& KT = K.template of<T>();
         job.dense = (use_ptr && want_dense_()) ? 1 : 0;
-        if constexpr (AM == AlignMode::Glocal) {
-            if (!sg_is_glocal_()) {   // the sg unit's
-                const SgTypedKernels<T>& KS = K.template sg_of<T>();
-                if (use_ptr) KS.linear_ptr_sg(job); else KS.linear_sg(job);
-            } else if (use_ptr) KT.linear_ptr(job); else KT.linear(job);
+        if constexpr (SGR) {   // the sg unit's
+            const SgTypedKernels<T>& KS = K.template sg_of<T>();
+            if (use_ptr) KS.linear_ptr_sg(job); else KS.linear_sg(job);
         } else {
             if (use_ptr) KT.linear_ptr(job); else KT.linear(job);
         }
@@ -3291,10 +3334,9 @@ private:
     // matched the stored float for a non-representable cost, every test fell through
     // to "gap in A", and the returned path was not the one scored (-18.7 vs -7.9).
     // At T=double every cast here is the identity: results are unchanged bit for bit.
+    template <bool SGR = false>   // SGR: the semi-global runtime ends (aligner_sg.cpp only)
     void viterbi_linear(DpBuffer& buf) {
-        if constexpr (AM == AlignMode::Glocal)
-            if (!sg_is_glocal_()) { sg_cold_([&] { sat_dispatch_([&]<bool Tr, bool Sat>() { viterbi_linear_impl<Tr, Sat, true>(buf); }); }); return; }   // the other ends: runtime flags (SGR)
-        sat_dispatch_([&]<bool Tr, bool Sat>() { viterbi_linear_impl<Tr, Sat>(buf); });
+        sat_dispatch_([&]<bool Tr, bool Sat>() { viterbi_linear_impl<Tr, Sat, SGR>(buf); });
     }
     // Tr: each row's penalties and substitution row from the track arrays (the same
     // expressions with the row's values, so equal sets reproduce the untracked fill).
@@ -3386,7 +3428,7 @@ private:
         }
 
         if constexpr (AM == AlignMode::Global)      viterbi_score_ = rat_<SGR>(buf.H, m_, n_);
-        else if constexpr (AM == AlignMode::Glocal) sg_end_linear_(buf);
+        else if constexpr (AM == AlignMode::Glocal) { if constexpr (SGR) sg_end_linear_(buf); else glocal_end_linear_(buf); }
         else                                        viterbi_score_ = best_local;
     }
 
@@ -3399,10 +3441,9 @@ private:
     // the initializer list does, and the H walk tests the same three in the same order by
     // equality — so both pick the first largest.  Local: stop where the clamped value is
     // <= 0 (the H walk's stop test); borders stop (Local), go up / left (Global).
+    template <bool SGR = false>   // SGR: the semi-global runtime ends (aligner_sg.cpp only)
     void viterbi_linear_ptr(DpBuffer& buf) {
-        if constexpr (AM == AlignMode::Glocal)
-            if (!sg_is_glocal_()) { sg_cold_([&] { sat_dispatch_([&]<bool Tr, bool Sat>() { viterbi_linear_ptr_impl<Tr, Sat, true>(buf); }); }); return; }   // the other ends: runtime flags (SGR)
-        sat_dispatch_([&]<bool Tr, bool Sat>() { viterbi_linear_ptr_impl<Tr, Sat>(buf); });
+        sat_dispatch_([&]<bool Tr, bool Sat>() { viterbi_linear_ptr_impl<Tr, Sat, SGR>(buf); });
     }
     template <bool Tr, bool Sat, bool SGR = false>
     void viterbi_linear_ptr_impl(DpBuffer& buf) {
@@ -3599,10 +3640,9 @@ private:
     // Borders are recorded too, not just the recurrence interior: the traceback
     // walks column 0 and row 0 (X at (1,0) resolves to M, at (i>1,0) to X), and
     // those cells are border-initialised, never visited by the main loop.
+    template <bool SGR = false>   // SGR: the semi-global runtime ends (aligner_sg.cpp only)
     void viterbi_affine_ptr(DpBuffer& buf) {
-        if constexpr (AM == AlignMode::Glocal)
-            if (!sg_is_glocal_()) { sg_cold_([&] { sat_dispatch_([&]<bool Tr, bool Sat>() { viterbi_affine_ptr_impl<Tr, Sat, true>(buf); }); }); return; }   // the other ends: runtime flags (SGR)
-        sat_dispatch_([&]<bool Tr, bool Sat>() { viterbi_affine_ptr_impl<Tr, Sat>(buf); });
+        sat_dispatch_([&]<bool Tr, bool Sat>() { viterbi_affine_ptr_impl<Tr, Sat, SGR>(buf); });
     }
     template <bool Tr, bool Sat, bool SGR = false>
     void viterbi_affine_ptr_impl(DpBuffer& buf) {
@@ -5478,10 +5518,9 @@ private:
 #endif
     }
 
+    template <bool SGR = false>   // SGR: the semi-global runtime ends (aligner_sg.cpp only)
     double score_affine_scalar(DpBuffer& buf) const {
-        if constexpr (AM == AlignMode::Glocal)
-            if (!sg_is_glocal_()) { return sg_cold_([&] { return sat_dispatch_([&]<bool Tr, bool Sat>() { return score_affine_scalar_impl<Tr, Sat, true>(buf); }); }); }   // the other ends: runtime flags (SGR)
-        return sat_dispatch_([&]<bool Tr, bool Sat>() { return score_affine_scalar_impl<Tr, Sat>(buf); });
+        return sat_dispatch_([&]<bool Tr, bool Sat>() { return score_affine_scalar_impl<Tr, Sat, SGR>(buf); });
     }
     template <bool Tr, bool Sat, bool SGR = false>
     double score_affine_scalar_impl(DpBuffer& buf) const {
@@ -5556,10 +5595,9 @@ private:
         else return static_cast<double>(std::max({pM[n_], pX[n_], pY[n_]}));
     }
 
+    template <bool SGR = false>   // SGR: the semi-global runtime ends (aligner_sg.cpp only)
     double score_linear_scalar(DpBuffer& buf) const {
-        if constexpr (AM == AlignMode::Glocal)
-            if (!sg_is_glocal_()) { return sg_cold_([&] { return sat_dispatch_([&]<bool Tr, bool Sat>() { return score_linear_scalar_impl<Tr, Sat, true>(buf); }); }); }   // the other ends: runtime flags (SGR)
-        return sat_dispatch_([&]<bool Tr, bool Sat>() { return score_linear_scalar_impl<Tr, Sat>(buf); });
+        return sat_dispatch_([&]<bool Tr, bool Sat>() { return score_linear_scalar_impl<Tr, Sat, SGR>(buf); });
     }
     template <bool Tr, bool Sat, bool SGR = false>
     double score_linear_scalar_impl(DpBuffer& buf) const {
@@ -5638,10 +5676,9 @@ private:
         else                                         best_tbl_ = TBTable::Y;
     }
 
+    template <bool SGR = false>   // SGR: the semi-global runtime ends (aligner_sg.cpp only)
     void viterbi_affine(DpBuffer& buf) {
-        if constexpr (AM == AlignMode::Glocal)
-            if (!sg_is_glocal_()) { sg_cold_([&] { sat_dispatch_([&]<bool Tr, bool Sat>() { viterbi_affine_impl<Tr, Sat, true>(buf); }); }); return; }   // the other ends: runtime flags (SGR)
-        sat_dispatch_([&]<bool Tr, bool Sat>() { viterbi_affine_impl<Tr, Sat>(buf); });
+        sat_dispatch_([&]<bool Tr, bool Sat>() { viterbi_affine_impl<Tr, Sat, SGR>(buf); });
     }
     template <bool Tr, bool Sat, bool SGR = false>
     void viterbi_affine_impl(DpBuffer& buf) {
@@ -5747,7 +5784,7 @@ private:
             else if (vx >= vy)             best_tbl_ = TBTable::X;
             else                            best_tbl_ = TBTable::Y;
         } else if constexpr (AM == AlignMode::Glocal) {
-            sg_end_affine_(buf);
+            if constexpr (SGR) sg_end_affine_(buf); else glocal_end_affine_(buf);
         } else {
             viterbi_score_ = best_local;
         }
@@ -5800,13 +5837,31 @@ private:
     bool sg_bb_() const noexcept { return AM == AlignMode::Glocal && (sg_ & kSgFreeBBegin); }
     bool sg_be_() const noexcept { return AM == AlignMode::Glocal && (sg_ & kSgFreeBEnd); }
     bool sg_is_glocal_() const noexcept { return AM != AlignMode::Glocal || sg_ == kSgGlocal; }
-    // Every runtime-ends (SGR) path is entered through this cold, out-of-line trampoline.
-    // py_exports sits at gcc's --param inline-unit-growth limit on main already: inlining
-    // spent growing the semi-global instantiations came out of the hot ones' budget (rat
-    // went out of line in the Global / Local walks: miRNA float32 linear Global hard +2.7 %,
-    // int32 linear Local path +3 % sse4 instructions; -fopt-info-inline-missed).  Code
-    // reached only from a cold function is optimized for size and not grown by inlining.
-    template <class F> [[gnu::cold, gnu::noinline]] static decltype(auto) sg_cold_(F&& f) { return f(); }
+    // ── The runtime-ends (SGR) code lives in aligner_sg.cpp, not in the bindings' unit ──
+    // Every path for ends other than glocal's leaves the hot functions through one call to an
+    // out-of-line entry below, defined after the class and compiled in aligner_sg.cpp only
+    // (py_exports.cpp defines NWGRAD_SG_OUT_OF_LINE and sees the declarations); every SGR
+    // instantiation (the fills, walks, score paths and end searches with SGR = true) is made
+    // there.  Why: py_exports sits at gcc's --param inline-unit-growth limit, and any code it
+    // instantiates moves that unit's inlining: entered through cold in-unit trampolines
+    // (4ff2b30), the SGR code still made gcc re-decide inlining across the Glocal engine --
+    // int16 linear glocal path +3.3 % instructions on nighthaven (miRNA; path_and_guide out
+    // of line, fill_guide_gaps, the inter-pair worker 18.8 -> 20.1 KB).  Header-only users
+    // and the C++ tests get the definitions inline, as before.
+    void sg_run_viterbi_(DpBuffer& buf);                 // run_viterbi, SGR
+    double sg_compute_score_(DpBuffer& buf);             // compute_score (Full), SGR
+    // The SGR walk (linear: walk_linear_impl's moves; affine: walk_affine_impl's), recorded
+    // into a per-thread buffer that sg_walk_replay_ hands to the caller's emit, last move
+    // first as the walks emit them.
+    struct SgStep { int i, j, k; TBTable t; bool open; };
+    const std::vector<SgStep>& sg_walk_record_(const DpBuffer& buf) const;
+    template <class Emit>
+    [[gnu::cold, gnu::noinline]] void sg_walk_replay_(const DpBuffer& buf, Emit& emit) const {
+        for (const SgStep& s : sg_walk_record_(buf)) {
+            if constexpr (GM == GapModel::Linear) emit(s.k, s.i, s.j);
+            else                                  emit(s.t, s.i, s.j, s.open);
+        }
+    }
     // The ends as the fills and walks read them: SGR (runtime ends, other than glocal's) the
     // flags, else glocal's fixed at compile time.  The flags read at every step / row cost
     // the glocal linear path 2-3 % on NEON (M1: miRNA, DNA L100) against main's constants.
@@ -5833,9 +5888,8 @@ private:
     }
     // Over the retained tables (any layout: rat).  Full band only (a banded problem with
     // other ends than glocal's is refused: check_problem).
-    void sg_end_affine_(const DpBuffer& buf) {
+    void sg_end_affine_(const DpBuffer& buf) {   // (SGR fills only)
         if (sg_is_glocal_()) { glocal_end_affine_(buf); return; }
-        sg_cold_([&] {
         SgEnd e;
         if (sg_ae_())
             for (int i = 0; i < m_; ++i) e.offer(i, n_, rat_sg_(buf.VM, i, n_), rat_sg_(buf.VX, i, n_), rat_sg_(buf.VY, i, n_));
@@ -5843,7 +5897,6 @@ private:
         if (sg_be_()) { for (int j = 0; j <= n_; ++j) cell(j); }
         else          cell(n_);
         sg_take_(e);
-        });
     }
     // Every end cell once (the soft path's Z and backward seeds): row m's band (a free B
     // end) or (m, n), and column n of rows 0..m-1 (a free A end; Full band only).
@@ -5853,16 +5906,14 @@ private:
         else          f(m_, n_);
         if (sg_ae_()) for (int i = 0; i < m_; ++i) f(i, n_);
     }
-    void sg_end_linear_(const DpBuffer& buf) {
+    void sg_end_linear_(const DpBuffer& buf) {   // (SGR fills only)
         if (sg_is_glocal_()) { glocal_end_linear_(buf); return; }
-        sg_cold_([&] {
         SgEnd e; const T ninf = NINF();
         if (sg_ae_())
             for (int i = 0; i < m_; ++i) e.offer(i, n_, rat_sg_(buf.H, i, n_), ninf, ninf);
         if (sg_be_()) { for (int j = 0; j <= n_; ++j) e.offer(m_, j, rat_sg_(buf.H, m_, j), ninf, ninf); }
         else          e.offer(m_, n_, rat_sg_(buf.H, m_, n_), ninf, ninf);
         sg_take_(e);
-        });
     }
 
     // ═════════════════════════════════════════════════════════════════════════
@@ -6565,7 +6616,7 @@ private:
         J.a = a_idx_.data(); J.b = b_idx_.data();
         J.P = tr_ ? sc.qp.data() : build_profile<SF>(buf, w);
         J.local = (AM == AlignMode::Local) ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
-        J.sg = sg_;
+        if constexpr (AM == AlignMode::Glocal) J.sg = sg_;   // (the job defaults to kSgGlocal)
         J.full = (AB == AlignBand::Full) ? 1 : 0;
         J.bi = border_rows(); J.bj = border_cols();
         J.jlo = bl; J.jhi = bl + mm; J.jlo0 = bl + 2 * mm; J.jhi0 = bl + 3 * mm;
@@ -6611,6 +6662,43 @@ private:
         return true;
     }
 };
+
+// ── The semi-global runtime-ends entries (see Aligner::sg_run_viterbi_) ─────────────
+// Compiled in aligner_sg.cpp, which instantiates them for every Glocal Full aligner;
+// py_exports.cpp defines NWGRAD_SG_OUT_OF_LINE and links against those.  Any other user
+// of this header gets them here, as ordinary (implicitly instantiated) members.  Only
+// AlignBand::Full: a guide band with these ends is refused (check_problem).
+#if !defined(NWGRAD_SG_OUT_OF_LINE)
+template<GapModel GM, AlignMode AM, AlignBand AB, class T>
+void Aligner<GM, AM, AB, T>::sg_run_viterbi_(DpBuffer& buf) {
+    if constexpr (AM == AlignMode::Glocal && AB == AlignBand::Full) run_viterbi_impl_<true>(buf);
+    else (void)buf;
+}
+template<GapModel GM, AlignMode AM, AlignBand AB, class T>
+double Aligner<GM, AM, AB, T>::sg_compute_score_(DpBuffer& buf) {
+    if constexpr (AM == AlignMode::Glocal && AB == AlignBand::Full) return compute_score_impl_<true>(buf);
+    else { (void)buf; return 0.0; }
+}
+template<GapModel GM, AlignMode AM, AlignBand AB, class T>
+const std::vector<typename Aligner<GM, AM, AB, T>::SgStep>&
+Aligner<GM, AM, AB, T>::sg_walk_record_(const DpBuffer& buf) const {
+    thread_local std::vector<SgStep> rec;
+    rec.clear();
+    if constexpr (AM == AlignMode::Glocal && AB == AlignBand::Full) {
+        if constexpr (GM == GapModel::Linear) {
+            auto em = [&](int k, int i, int j) { rec.push_back({i, j, k, TBTable::M, false}); };
+            if (tr_) walk_linear_impl<true, true>(buf, em);
+            else     walk_linear_impl<false, true>(buf, em);
+        } else {
+            auto em = [&](TBTable t, int i, int j, bool open) { rec.push_back({i, j, 0, t, open}); };
+            walk_affine_sgr_(buf, em);
+        }
+    } else {
+        (void)buf;
+    }
+    return rec;
+}
+#endif
 
 // The inter-pair soft pass's weights (InterSoftJob es/oa/ea/ob/eb, linear) for `P` at
 // temperature T: exp(score / T), exp(-(go+ge)/T), exp(-ge/T).  False when one overflows

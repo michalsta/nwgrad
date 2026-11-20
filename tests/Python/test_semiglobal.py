@@ -311,15 +311,19 @@ def test_scaled_soft_matches_log(gmatrix, gap_model, cls):
             np.testing.assert_allclose(r["scaled"][2], r["log"][2], rtol=tol, atol=tol * 10)
 
 
+@pytest.mark.parametrize("gap_model", ["affine", "linear"])
 @pytest.mark.parametrize("traceback", ["auto", "grid", "hirschberg", "hirschberg_pmax"])
-def test_other_tracebacks_run_pointers(gmatrix, traceback):
-    p = _params(gmatrix, 2.0, 0.7, 1.5, 0.5)
+def test_other_tracebacks_run_pointers(gmatrix, imatrix, gap_model, traceback):
+    # linear `auto` too: it upgrades Pointers to Grid past hb_cutoff, whose fill has glocal's
+    # borders -- these ends ran it once (overlap scored 387 for 391 on a 700 x 600 pair)
+    aff = gap_model == "affine"
     rng = random.Random(81)
-    for cls in (nwgrad.SeqPairDouble, nwgrad.SeqPair):
+    for cls in (nwgrad.SeqPairDouble, nwgrad.SeqPair, nwgrad.SeqPairInt32):
+        p = _class_params(cls.__name__, gmatrix, imatrix, aff)
         for _ in range(4):
             a, b = _rand(rng, 600, 700), _rand(rng, 600, 900)   # past hb_cutoff
             for flags in [(True, True, True, True), (True, False, False, True), (False, True, False, False)]:
-                kw = dict(mode="semiglobal", free_ends=flags)
+                kw = dict(mode="semiglobal", free_ends=flags, gap_model=gap_model)
                 assert _same(_run(cls, a, b, p, traceback="pointers", **kw), _run(cls, a, b, p, traceback=traceback, **kw))
 
 

@@ -208,7 +208,9 @@ nanobind_add_module(nwgrad_ext
     src/nwgrad/cpp/nwgrad/py_exports.cpp
     src/nwgrad/cpp/nwgrad/logistic/py_logistic.cpp
     ${NWGRAD_PLACEMENT_SOURCES_MID}
-    ${NWGRAD_LEVEL_SOURCES})
+    ${NWGRAD_LEVEL_SOURCES}
+    # the engine's semi-global runtime-ends code, out of the bindings' unit (Aligner::sg_run_viterbi_)
+    src/nwgrad/cpp/nwgrad/aligner_sg.cpp)
 if (DEFINED NWGRAD_JCC_GNU_OPTS)
     target_compile_options(nwgrad_ext PRIVATE "$<$<CXX_COMPILER_ID:GNU>:${NWGRAD_JCC_GNU_OPTS}>")
 endif()

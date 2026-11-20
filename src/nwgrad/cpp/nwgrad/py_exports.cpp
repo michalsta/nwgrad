@@ -12,6 +12,9 @@
 #include <string>
 #include <vector>
 
+// The Aligner's semi-global runtime-ends entries are compiled in aligner_sg.cpp, not here
+// (see Aligner::sg_run_viterbi_): this unit's inlining stays main's.
+#define NWGRAD_SG_OUT_OF_LINE 1
 #include "align_params.hpp"
 #include "aligner.hpp"
 #include "seq_pair_batch.hpp"
