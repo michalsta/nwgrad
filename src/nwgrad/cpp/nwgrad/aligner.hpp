@@ -2620,38 +2620,42 @@ private:
     // fill's max chose it, so both give the same walk, ties included.
     template <class Emit>
     void walk_linear(const DpBuffer& buf, Emit&& emit) const {
-        if constexpr (AM == AlignMode::Glocal && AB == AlignBand::Full)   // the other semi-global ends: walked out of line
-            if (!sg_is_glocal_()) [[unlikely]] { sg_walk_replay_(buf, emit); return; }   // (banded: refused)
         if (tr_) walk_linear_impl<true>(buf, emit);
         else     walk_linear_impl<false>(buf, emit);
     }
     // Tr: read each row's extend (row_ge_b) rather than one hoisted value — a template
     // parameter, so the untracked walk is the code it always was.
-    template <bool Tr, bool SGR = false, class Emit>
+    // Glocal: every semi-global end set walks here (no SGR instantiation, no out-of-line
+    // replay), its free starts tested only where a border is reached, never per step: row 0
+    // stops with a free B begin (glocal's), else its leftward chain is walked (i == 0: the
+    // tests below give k = 2); column 0 stops with a free A begin -- Pointers: the fills
+    // record a stop (3) there; the H walk: inside its j == 0 branch.  An out-of-line SGR walk
+    // or replay handed `emit` to a call, so the locals its closure captures by reference
+    // (path_walk_'s ci / cj, the guide, the path sink) lived in memory in the hot walk too:
+    // int16 linear glocal path / hard +1.3-2.8 % instructions (sse4, gcc 15 and 16).
+    template <bool Tr, class Emit>
     void walk_linear_impl(const DpBuffer& buf, Emit& emit) const {
         int i = (AM == AlignMode::Global) ? m_ : best_i_;
         int j = (AM == AlignMode::Global) ? n_ : best_j_;
         while (true) {
             if (i == 0 && j == 0) break;
-            if constexpr (AM == AlignMode::Glocal) {   // the semi-global free starts
-                if (i == 0 && sgt_bb_<SGR>()) break;          // row 0 (glocal's)
-                if (j == 0 && sgt_ab_<SGR>()) break;          // column 0
-            }
+            if constexpr (AM == AlignMode::Glocal) if (i == 0) { if (sg_bb_()) break; }   // row 0: a free start
             int k;
             if (pointers_) {
                 k = dense_ ? dense_code(buf.DM, i, j, 1, 0) : dcode(buf.DM, i, j);
                 if (k == 3) break;
             } else {
                 if constexpr (AM == AlignMode::Local)
-                    if (rat_<SGR>(buf.H, i, j) <= 0.0) break;
+                    if (rat(buf.H, i, j) <= 0.0) break;
                 if (i > 0 && j > 0 &&
-                    rat_<SGR>(buf.H, i, j) == rat_<SGR>(buf.H, i-1, j-1) + (Tr ? subT(i, j) : subTu(i, j)))
+                    rat(buf.H, i, j) == rat(buf.H, i-1, j-1) + (Tr ? subT(i, j) : subTu(i, j)))
                     k = 0;
-                else if (i > 0 && (j == 0 || rat_<SGR>(buf.H, i, j) == rat_<SGR>(buf.H, i-1, j) -
+                else if (i > 0 && (j == 0 || rat(buf.H, i, j) == rat(buf.H, i-1, j) -
                                                  (Tr ? tgeb_[static_cast<size_t>(i)]
-                                                     : static_cast<T>(params_->gap_extend_b))))
+                                                     : static_cast<T>(params_->gap_extend_b)))) {
+                    if constexpr (AM == AlignMode::Glocal) if (j == 0 && sg_ab_()) break;   // column 0: a free start
                     k = 1;
-                else
+                } else
                     k = 2;
             }
             emit(k, i, j);
@@ -6690,16 +6694,10 @@ const std::vector<typename Aligner<GM, AM, AB, T>::SgStep>&
 Aligner<GM, AM, AB, T>::sg_walk_record_(const DpBuffer& buf) const {
     thread_local std::vector<SgStep> rec;
     rec.clear();
-    if constexpr (AM == AlignMode::Glocal && AB == AlignBand::Full) {
-        if constexpr (GM == GapModel::Linear) {
-            auto em = [&](int k, int i, int j) { rec.push_back({i, j, k, TBTable::M, false}); };
-            if (tr_) walk_linear_impl<true, true>(buf, em);
-            else     walk_linear_impl<false, true>(buf, em);
-        } else {
-            auto em = [&](TBTable t, int i, int j, bool open) { rec.push_back({i, j, 0, t, open}); };
-            walk_affine_sgr_(buf, em);
-        }
-    } else {
+    if constexpr (AM == AlignMode::Glocal && AB == AlignBand::Full && GM == GapModel::Affine) {
+        auto em = [&](TBTable t, int i, int j, bool open) { rec.push_back({i, j, 0, t, open}); };
+        walk_affine_sgr_(buf, em);
+    } else {   // (the linear walk takes every end set itself: walk_linear_impl)
         (void)buf;
     }
     return rec;

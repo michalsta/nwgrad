@@ -222,7 +222,7 @@ static void striped_linear_full(ViterbiJob<T>& job) {
         unsigned char* dM = nullptr;
         if constexpr (Ptr) {
             dM = buf.DM.data() + (std::size_t)i * drow;
-            dM[0] = Local ? 3 : 1;                       // column 0: up (Global) / stop
+            dM[0] = (Local || sg_ab) ? 3 : 1;             // column 0: up (Global) / stop (Local, a free A begin: the walk stops on it)
             dM += off;
         }
 
