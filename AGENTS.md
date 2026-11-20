@@ -3793,6 +3793,49 @@ pair).  qemu instructions, batch, R6-R1: Local linear float32 protein L300 1.000
 double 1.0001.  Overlap (all four) / global 0.85-0.99, a_end
 0.99-1.04.
 
+**The runtime-ends code left the bindings' unit (2026-11-20).** After the merge with a0aea9b,
+nighthaven's short glocal cells read code: miRNA int16 linear glocal path 1.12 (+3.3 %
+instructions), DNA L100 int16 linear glocal path 1.04-1.05 (+3.1 %), miRNA float32 affine glocal
+path 1.03 (+3.0 %); +1.3-4.8 % at 4ff2b30 already.  No glocal code had changed: py_exports.cpp
+still instantiated every runtime-ends (SGR) fill, walk and score path behind the cold trampolines,
+the unit sits at gcc's `--param inline-unit-growth` limit, and gcc re-decided inlining across the
+engine (gcc 16, int16 linear glocal: the inter-pair worker 18.8 -> 20.1 KB, `path_and_guide` and
+`score_and_grad_inter_` out of line, `hard_grad` 2.7 -> 3.9 KB; 908 Glocal and 1057 Global / Local
+functions of another size).  `fill_guide_gaps`' extra samples were that, not more calls (one call
+a pair on both sides, results bit-identical).  The trampolines also handed each walk's `emit` to
+an out-of-line call: a closure that reaches a call takes the address of every local it captures by
+reference (path_walk_'s ci / cj, the guide, the path sink), so those lived in memory in the hot
+glocal walks too.  Now:
+- Every runtime-ends fill and score path leaves the hot code through one call to an out-of-line
+  entry, `sg_run_viterbi_` / `sg_compute_score_`, compiled in `aligner_sg.cpp` (explicit
+  instantiations, Glocal Full only).  py_exports.cpp defines `NWGRAD_SG_OUT_OF_LINE` and sees the
+  declarations only; header-only users and the C++ tests get the definitions as before.  The
+  dispatch (`run_viterbi_impl_<SGR>`, `compute_score_impl_<SGR>`, `run_dispatched_*<SGR>`, the
+  fills' `<SGR>`) is one template whose SGR = false body is main's.
+- The **linear walk takes every end set itself**, with no SGR instantiation and no test per step:
+  row 0 stops with a free B begin (`if (i == 0) { if (sg_bb_()) break; }`, else the tests walk its
+  leftward chain); column 0 stops with a free A begin -- the Pointers fills record a stop code (3)
+  there, the H walk tests it inside its `j == 0` branch.  Tried first and dropped: the SGR walk out
+  of line with a replay (out of line: the closure escapes; inline but cold: emit called out of
+  line, it escapes again; flattened: the walk grew and `rat` went out of line), int16 linear glocal
+  path / hard +1.3-2.8 % each time.
+- The affine walk keeps its SGR instantiation in aligner_sg.cpp: `sg_walk_record_` records the
+  moves and a flattened replay in `walk_affine`'s cold branch hands them to emit (emit and all it
+  calls inlined there, so nothing escapes).  The same border tests as the linear walk's, tried
+  instead, moved other cells through the unit's inlining (int32 linear Local path +2.7 % gcc 16,
+  int16 linear Global path +3.6 % gcc 15); so did forcing Pointers for these ends to keep the H
+  walk main's (int32 linear glocal hard +1.5 %, float32 linear glocal path +0.9-2.0 %).  Every
+  variant moves some int32 / int16 linear cell by 0.5-3 % this way: the unit stays at its growth
+  limit, and which marginal call gcc inlines depends on all the code in it.
+- The engine's configure paths set the ends with `set_free_ends_trusted` (no checks: no code
+  outside Glocal); the validation throws are one out-of-line function (`nw_bad_free_ends`;
+  `BatchEngine::set_free_ends` built a whole Aligner to validate, 2.8 KB per engine).
+
+**Bug found on the way:** linear `auto` upgrades Pointers to Grid past hb_cutoff, and `run_tb_`
+let the other semi-global ends take that upgrade.  The Grid fill has glocal's borders, so a 700 x
+600 overlap pair scored 387 instead of 391 (float32, double, int32; 24 of 48 checked cases wrong).
+These ends take no `auto` upgrade now; `test_other_tracebacks_run_pointers` covers linear and int32.
+
 **Tests** (`tests/Python/test_semiglobal.py`): a Python 3-state reference of the 4-flag
 DP (scores and end cells under the tie rule, exact with integer-valued parameters), itself
 checked against Biopython's PairwiseAligner with zero end-gap scores (an independent

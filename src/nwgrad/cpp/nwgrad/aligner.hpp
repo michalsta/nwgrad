@@ -2628,13 +2628,11 @@ private:
     // Glocal: every semi-global end set walks here (no SGR instantiation, no out-of-line
     // replay), its free starts tested only where a border is reached, never per step: row 0
     // stops with a free B begin (glocal's), else its leftward chain is walked (i == 0: the
-    // tests below give k = 2); column 0 stops with a free A begin through the stop code (3)
-    // the Pointers fills record there (a free A begin always fills Pointers:
-    // run_viterbi_impl_<true>), so the H walk is main's.  An out-of-line SGR walk or replay
-    // handed `emit` to a call, so the locals its closure captures by reference (path_walk_'s
-    // ci / cj, the guide, the path sink) lived in memory in the hot walk too: int16 linear
-    // glocal path / hard +1.3-2.8 % instructions (sse4, gcc 15 and 16); a column-0 test in
-    // the H walk cost int32 linear glocal hard +0.6 % (gcc 16).
+    // tests below give k = 2); column 0 stops with a free A begin -- Pointers: the fills
+    // record a stop (3) there; the H walk: inside its j == 0 branch.  An out-of-line SGR walk
+    // or replay handed `emit` to a call, so the locals its closure captures by reference
+    // (path_walk_'s ci / cj, the guide, the path sink) lived in memory in the hot walk too:
+    // int16 linear glocal path / hard +1.3-2.8 % instructions (sse4, gcc 15 and 16).
     template <bool Tr, class Emit>
     void walk_linear_impl(const DpBuffer& buf, Emit& emit) const {
         int i = (AM == AlignMode::Global) ? m_ : best_i_;
@@ -2654,9 +2652,10 @@ private:
                     k = 0;
                 else if (i > 0 && (j == 0 || rat(buf.H, i, j) == rat(buf.H, i-1, j) -
                                                  (Tr ? tgeb_[static_cast<size_t>(i)]
-                                                     : static_cast<T>(params_->gap_extend_b))))
+                                                     : static_cast<T>(params_->gap_extend_b)))) {
+                    if constexpr (AM == AlignMode::Glocal) if (j == 0 && sg_ab_()) break;   // column 0: a free start
                     k = 1;
-                else
+                } else
                     k = 2;
             }
             emit(k, i, j);
@@ -3044,9 +3043,7 @@ private:
             // so.  Full: the leveled striped linear kernel (kernels_linear_impl.inl) when
             // the backend has one — bit-exact with the scalar fills below, which remain
             // the scalar backend's, the banded path's and the header-only build's.
-            // SGR with a free A begin: the Pointers fill, whose stop code (3) in column 0 ends
-            // the walk there; the H walk has no column-0 stop (walk_linear_impl).
-            const bool lin_ptr = (SGR && sg_ab_()) ? true : linear_ptr_fill();
+            const bool lin_ptr = linear_ptr_fill();
             if constexpr (AB == AlignBand::Full) {
                 const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
                 // Grid: where it applies (grid_ok_), else the Pointers fill below -- the same result.
