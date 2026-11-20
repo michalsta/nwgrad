@@ -267,6 +267,28 @@ struct Score8Job {
     int overflow;                           // out: 1 = re-run wider
 };
 using score8_fn = void (*)(Score8Job&);
+// The int8 tier's out-of-line entries (simd_levels.cpp), one request for both: the
+// problem as the caller holds it (block of any integer type, gaps as doubles), so the
+// gates, the int8 cast and the job setup stay out of the bindings / engine TU, which is
+// at gcc 15's inline-unit-growth limit (see Aligner::score_i8_).
+//   score8_try  (Aligner::compute_score): 1 = the int8 score in `score`; 0 = not run (or
+//               mode 2's overflow); -1 = Local at mode 1, predicted or found to overflow
+//               (the caller notes the wide score in score8_pred()).
+//   score8_own  (BatchEngine::int8_own_): every row of nb[0..real) long enough for the
+//               int8 tier and the problem within its preconditions, the predictor
+//               expecting no overflow -- the group runs its own fills.
+struct Score8Req {
+    const unsigned char* a = nullptr; const unsigned char* b = nullptr;
+    const void* blk = nullptr;              // nalpha^2 block of int16 / int32 / int64
+    int m = 0, n = 0, nalpha = 0, tbytes = 0;   // tbytes: the block's element size
+    double go_a = 0, ge_a = 0, go_b = 0, ge_b = 0;   // the problem's gaps (linear: opens unused)
+    long long smax_pos = -1, smax_neg = 0;   // NwIntBound: smax_pos < 0 = not prepared
+    int backend = 0, mode = 0;              // mode: score_int8_mode()
+    int am = 0, linear = 0, key = 0;        // AlignMode, GapModel::Linear, score8_key
+    const int* nb = nullptr; int real = 0;  // score8_own: the group's row lengths
+};
+using score8_try_fn = int (*)(const Score8Req&, int& score);
+using score8_own_fn = bool (*)(const Score8Req&);
 
 // ── Grid forward pass (TracebackMode::Grid) ──────────────────────────────────
 //
@@ -799,6 +821,14 @@ inline int score_int8_lanes(int level) noexcept {
 // only while switched on (score8_count_on()), so a production run pays one relaxed load.
 struct Score8Stats { std::atomic<bool> on{false}; std::atomic<long long> runs{0}, overflows{0}; };
 inline Score8Stats& score8_stats() noexcept { static Score8Stats s; return s; }
+// The int8 tier's predictor (score8_try): per thread and problem type (score8_key: the
+// integer type's size, the gap model, the mode), whether the last Local problem's score
+// reached 127.
+inline constexpr int score8_key(int tbytes, bool linear, int align_mode) noexcept {
+    return ((tbytes == 2 ? 0 : tbytes == 4 ? 1 : 2) * 2 + (linear ? 1 : 0)) * 3 + align_mode;
+}
+struct Score8Pred { bool last_over[18]; };
+inline Score8Pred& score8_pred() noexcept { static thread_local Score8Pred p{}; return p; }
 // The per-lane profile's byte cap (kInterProfileMaxBytes, InterJobT::prof_max) with its
 // override: kGateOff (None) = no cap, 0 = always the gather.
 inline int64_t inter_profile_max() noexcept {
@@ -1260,6 +1290,8 @@ struct LevelKernels {
     // inter-pair score only in saturating int8 lanes (inter8_kernel_impl.inl), inter_w8 pairs per call
     void (*inter_score_i8)(InterJobT<int8_t>&) = nullptr;
     int           inter_w8 = 0;
+    score8_try_fn score8_try = nullptr;         // its gates and run (simd_levels.cpp), set with score_i8
+    score8_own_fn score8_own = nullptr;         // BatchEngine::int8_own_'s test (simd_levels.cpp)
     inter_soft_fn inter_soft = nullptr;         // inter-pair soft pass, double (W = d.inter_w)
     soft_pair_fn  soft_pair_linear = nullptr;   // per-pair scaled forward-backward ↓
     soft_pair_fn  soft_pair_affine = nullptr;
