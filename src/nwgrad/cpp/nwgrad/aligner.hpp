@@ -2625,14 +2625,16 @@ private:
     }
     // Tr: read each row's extend (row_ge_b) rather than one hoisted value — a template
     // parameter, so the untracked walk is the code it always was.
-    // Glocal: every semi-global end set walks here, with no SGR instantiation: its free starts
-    // are tested only where a border is reached, never per step.  Row 0 stops with a free B
-    // begin (glocal's), else its leftward chain is walked (i == 0: the tests below give
-    // k = 2); column 0 stops with a free A begin -- Pointers: the fills record a stop (3)
-    // there; the H walk: inside its j == 0 branch.  An out-of-line SGR walk or replay (the
-    // earlier forms) handed `emit` to a call, so the locals its closure captures by
-    // reference (path_walk_'s ci / cj, the guide, the path sink) lived in memory in the hot
-    // walk too: int16 linear glocal path / hard +1.3-2.8 % instructions (sse4, gcc 15, 16).
+    // Glocal: every semi-global end set walks here (no SGR instantiation, no out-of-line
+    // replay), its free starts tested only where a border is reached, never per step: row 0
+    // stops with a free B begin (glocal's), else its leftward chain is walked (i == 0: the
+    // tests below give k = 2); column 0 stops with a free A begin through the stop code (3)
+    // the Pointers fills record there (a free A begin always fills Pointers:
+    // run_viterbi_impl_<true>), so the H walk is main's.  An out-of-line SGR walk or replay
+    // handed `emit` to a call, so the locals its closure captures by reference (path_walk_'s
+    // ci / cj, the guide, the path sink) lived in memory in the hot walk too: int16 linear
+    // glocal path / hard +1.3-2.8 % instructions (sse4, gcc 15 and 16); a column-0 test in
+    // the H walk cost int32 linear glocal hard +0.6 % (gcc 16).
     template <bool Tr, class Emit>
     void walk_linear_impl(const DpBuffer& buf, Emit& emit) const {
         int i = (AM == AlignMode::Global) ? m_ : best_i_;
@@ -2652,10 +2654,9 @@ private:
                     k = 0;
                 else if (i > 0 && (j == 0 || rat(buf.H, i, j) == rat(buf.H, i-1, j) -
                                                  (Tr ? tgeb_[static_cast<size_t>(i)]
-                                                     : static_cast<T>(params_->gap_extend_b)))) {
-                    if constexpr (AM == AlignMode::Glocal) if (j == 0 && sg_ab_()) break;   // column 0: a free start
+                                                     : static_cast<T>(params_->gap_extend_b))))
                     k = 1;
-                } else
+                else
                     k = 2;
             }
             emit(k, i, j);
@@ -2749,7 +2750,19 @@ private:
     // "A"*22 vs "C"*87 at band<=32).  At a border only one move is legal; forcing it is
     // what a well-formed DP would have chosen anyway.
     template <class Emit>
+    void walk_affine_sgr_(const DpBuffer& buf, Emit& emit) const {
+        if (tr_) {
+            if (pointers_) walk_affine_impl<true, true, true>(buf, emit);
+            else           walk_affine_impl<false, true, true>(buf, emit);
+        } else {
+            if (pointers_) walk_affine_impl<true, false, true>(buf, emit);
+            else           walk_affine_impl<false, false, true>(buf, emit);
+        }
+    }
+    template <class Emit>
     void walk_affine(const DpBuffer& buf, Emit&& emit) const {
+        if constexpr (AM == AlignMode::Glocal && AB == AlignBand::Full)   // the other semi-global ends: walked out of line
+            if (!sg_is_glocal_()) [[unlikely]] { sg_walk_replay_(buf, emit); return; }   // (banded: refused)
         if (tr_) {
             if (pointers_) walk_affine_impl<true, true>(buf, emit);
             else           walk_affine_impl<false, true>(buf, emit);
@@ -2761,10 +2774,7 @@ private:
 
     // Tr: each move reads the penalties of its own row (a gap in B the row it enters, a
     // gap in A the row it lies in); otherwise the four are hoisted, as they always were.
-    // Glocal: every semi-global end set walks here (see walk_linear_impl), its free starts
-    // tested inside the border branches only: row 0 stops with a free B begin (glocal's),
-    // else walks Global's leftward chain; column 0 stops with a free A begin.
-    template <bool Ptr, bool Tr, class Emit>
+    template <bool Ptr, bool Tr, bool SGR = false, class Emit>
     void walk_affine_impl(const DpBuffer& buf, Emit& emit) const {
         auto from_code = [](unsigned char c) {
             return c == 1 ? TBTable::X : (c == 2 ? TBTable::Y : TBTable::M);
@@ -2789,16 +2799,16 @@ private:
                 if constexpr (Ptr) c = affine_codes(buf.DM, i, j);
                 if (tbl == TBTable::M) {
                     if constexpr (Ptr) { if ((c & 3) == 3) break; }
-                    else               { if (rat(buf.VM, i, j) <= 0.0) break; }
+                    else               { if (rat_<SGR>(buf.VM, i, j) <= 0.0) break; }
                 }
             } else {
                 if (i == 0) {
-                    if constexpr (AM == AlignMode::Glocal) if (sg_bb_()) break;   // row 0: a free start
+                    if constexpr (AM == AlignMode::Glocal) if (sgt_bb_<SGR>()) break;   // row 0: a free start
                     for (; j > 0; --j) emit(TBTable::Y, 0, j, j == 1);
                     break;
                 }
                 if (j == 0) {
-                    if constexpr (AM == AlignMode::Glocal) if (sg_ab_()) break;   // column 0: a free start
+                    if constexpr (AM == AlignMode::Glocal) if (sgt_ab_<SGR>()) break;   // column 0: a free start
                     for (; i > 0; --i) emit(TBTable::X, i, 0, i == 1);
                     break;
                 }
@@ -3034,7 +3044,9 @@ private:
             // so.  Full: the leveled striped linear kernel (kernels_linear_impl.inl) when
             // the backend has one — bit-exact with the scalar fills below, which remain
             // the scalar backend's, the banded path's and the header-only build's.
-            const bool lin_ptr = linear_ptr_fill();
+            // SGR with a free A begin: the Pointers fill, whose stop code (3) in column 0 ends
+            // the walk there; the H walk has no column-0 stop (walk_linear_impl).
+            const bool lin_ptr = (SGR && sg_ab_()) ? true : linear_ptr_fill();
             if constexpr (AB == AlignBand::Full) {
                 const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
                 // Grid: where it applies (grid_ok_), else the Pointers fill below -- the same result.
@@ -5833,17 +5845,34 @@ private:
     bool sg_be_() const noexcept { return AM == AlignMode::Glocal && (sg_ & kSgFreeBEnd); }
     bool sg_is_glocal_() const noexcept { return AM != AlignMode::Glocal || sg_ == kSgGlocal; }
     // ── The runtime-ends (SGR) code lives in aligner_sg.cpp, not in the bindings' unit ──
-    // Every fill and score path for ends other than glocal's leaves the hot functions through
-    // one call to an out-of-line entry below, defined after the class and compiled in
-    // aligner_sg.cpp only (py_exports.cpp defines NWGRAD_SG_OUT_OF_LINE and sees the
-    // declarations); every SGR instantiation is made there.  Why: py_exports sits at gcc's
-    // --param inline-unit-growth limit, and any code it instantiates moves that unit's
-    // inlining: entered through cold in-unit trampolines (4ff2b30), the SGR code still made
-    // gcc re-decide inlining across the engine -- int16 linear glocal path +3.3 %
-    // instructions on nighthaven (miRNA; path_and_guide out of line, the inter-pair worker
-    // 18.8 -> 20.1 KB).  Header-only users and the C++ tests get the definitions inline.
+    // Every path for ends other than glocal's leaves the hot functions through one call to an
+    // out-of-line entry below, defined after the class and compiled in aligner_sg.cpp only
+    // (py_exports.cpp defines NWGRAD_SG_OUT_OF_LINE and sees the declarations); every SGR
+    // instantiation (the fills, walks, score paths and end searches with SGR = true) is made
+    // there.  Why: py_exports sits at gcc's --param inline-unit-growth limit, and any code it
+    // instantiates moves that unit's inlining: entered through cold in-unit trampolines
+    // (4ff2b30), the SGR code still made gcc re-decide inlining across the Glocal engine --
+    // int16 linear glocal path +3.3 % instructions on nighthaven (miRNA; path_and_guide out
+    // of line, fill_guide_gaps, the inter-pair worker 18.8 -> 20.1 KB).  Header-only users
+    // and the C++ tests get the definitions inline, as before.
     void sg_run_viterbi_(DpBuffer& buf);                 // run_viterbi, SGR
     double sg_compute_score_(DpBuffer& buf);             // compute_score (Full), SGR
+    // The affine SGR walk (walk_affine_impl<SGR>), recorded into a per-thread buffer that
+    // walk_affine's cold branch replays into the caller's emit, last move first as the walk
+    // emits them.  The replay is inlined there and flattened (emit and all it calls inlined
+    // too): a closure that reaches an out-of-line call -- emit handed to a cold trampoline
+    // (4ff2b30), or called out of line from the cold branch -- takes the address of every
+    // local it captures by reference, which then lives in memory in the hot walk as well.
+    // (The linear walk takes every end set itself, at the borders: walk_linear_impl.)
+    struct SgStep { int i, j, k; TBTable t; bool open; };
+    const std::vector<SgStep>& sg_walk_record_(const DpBuffer& buf) const;
+    template <class Emit>
+    [[gnu::always_inline, gnu::flatten]] void sg_walk_replay_(const DpBuffer& buf, Emit& emit) const {
+        for (const SgStep& s : sg_walk_record_(buf)) {
+            if constexpr (GM == GapModel::Linear) emit(s.k, s.i, s.j);
+            else                                  emit(s.t, s.i, s.j, s.open);
+        }
+    }
     // The ends as the fills and walks read them: SGR (runtime ends, other than glocal's) the
     // flags, else glocal's fixed at compile time.  The flags read at every step / row cost
     // the glocal linear path 2-3 % on NEON (M1: miRNA, DNA L100) against main's constants.
@@ -6660,6 +6689,19 @@ template<GapModel GM, AlignMode AM, AlignBand AB, class T>
 double Aligner<GM, AM, AB, T>::sg_compute_score_(DpBuffer& buf) {
     if constexpr (AM == AlignMode::Glocal && AB == AlignBand::Full) return compute_score_impl_<true>(buf);
     else { (void)buf; return 0.0; }
+}
+template<GapModel GM, AlignMode AM, AlignBand AB, class T>
+const std::vector<typename Aligner<GM, AM, AB, T>::SgStep>&
+Aligner<GM, AM, AB, T>::sg_walk_record_(const DpBuffer& buf) const {
+    thread_local std::vector<SgStep> rec;
+    rec.clear();
+    if constexpr (AM == AlignMode::Glocal && AB == AlignBand::Full && GM == GapModel::Affine) {
+        auto em = [&](TBTable t, int i, int j, bool open) { rec.push_back({i, j, 0, t, open}); };
+        walk_affine_sgr_(buf, em);
+    } else {   // (the linear walk takes every end set itself: walk_linear_impl)
+        (void)buf;
+    }
+    return rec;
 }
 #endif
 
