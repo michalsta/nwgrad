@@ -2626,20 +2626,22 @@ private:
     // Tr: read each row's extend (row_ge_b) rather than one hoisted value — a template
     // parameter, so the untracked walk is the code it always was.
     // Glocal: every semi-global end set walks here (no SGR instantiation, no out-of-line
-    // replay), its free starts tested only where a border is reached, never per step: row 0
-    // stops with a free B begin (glocal's), else its leftward chain is walked (i == 0: the
-    // tests below give k = 2); column 0 stops with a free A begin -- Pointers: the fills
-    // record a stop (3) there; the H walk: inside its j == 0 branch.  An out-of-line SGR walk
+    // replay).  The other ends always fill Pointers (run_viterbi_impl_<true>), so the H walk
+    // is glocal's alone and main's code; the Pointers walk tests the free B begin only where
+    // row 0 is reached (else it follows row 0's leftward codes), and a free A begin is a stop
+    // code (3) the fills record in column 0.  No test runs per step.  An out-of-line SGR walk
     // or replay handed `emit` to a call, so the locals its closure captures by reference
     // (path_walk_'s ci / cj, the guide, the path sink) lived in memory in the hot walk too:
-    // int16 linear glocal path / hard +1.3-2.8 % instructions (sse4, gcc 15 and 16).
+    // int16 linear glocal path / hard +1.3-2.8 % instructions (sse4, gcc 15 and 16); a
+    // column-0 test inside the H walk cost int32 linear glocal hard +0.6 % (gcc 16).
     template <bool Tr, class Emit>
     void walk_linear_impl(const DpBuffer& buf, Emit& emit) const {
         int i = (AM == AlignMode::Global) ? m_ : best_i_;
         int j = (AM == AlignMode::Global) ? n_ : best_j_;
         while (true) {
             if (i == 0 && j == 0) break;
-            if constexpr (AM == AlignMode::Glocal) if (i == 0) { if (sg_bb_()) break; }   // row 0: a free start
+            // row 0: a free start (glocal's; the H walk, which only glocal's ends run, always)
+            if constexpr (AM == AlignMode::Glocal) if (i == 0 && (!pointers_ || sg_bb_())) break;
             int k;
             if (pointers_) {
                 k = dense_ ? dense_code(buf.DM, i, j, 1, 0) : dcode(buf.DM, i, j);
@@ -2652,10 +2654,9 @@ private:
                     k = 0;
                 else if (i > 0 && (j == 0 || rat(buf.H, i, j) == rat(buf.H, i-1, j) -
                                                  (Tr ? tgeb_[static_cast<size_t>(i)]
-                                                     : static_cast<T>(params_->gap_extend_b)))) {
-                    if constexpr (AM == AlignMode::Glocal) if (j == 0 && sg_ab_()) break;   // column 0: a free start
+                                                     : static_cast<T>(params_->gap_extend_b))))
                     k = 1;
-                } else
+                else
                     k = 2;
             }
             emit(k, i, j);
@@ -3043,7 +3044,9 @@ private:
             // so.  Full: the leveled striped linear kernel (kernels_linear_impl.inl) when
             // the backend has one — bit-exact with the scalar fills below, which remain
             // the scalar backend's, the banded path's and the header-only build's.
-            const bool lin_ptr = linear_ptr_fill();
+            // SGR: always the Pointers fill, whose walk takes these ends at the borders
+            // (walk_linear_impl); the H walk is glocal's only.
+            const bool lin_ptr = SGR ? true : linear_ptr_fill();
             if constexpr (AB == AlignBand::Full) {
                 const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
                 // Grid: where it applies (grid_ok_), else the Pointers fill below -- the same result.
@@ -5842,35 +5845,28 @@ private:
     bool sg_be_() const noexcept { return AM == AlignMode::Glocal && (sg_ & kSgFreeBEnd); }
     bool sg_is_glocal_() const noexcept { return AM != AlignMode::Glocal || sg_ == kSgGlocal; }
     // ── The runtime-ends (SGR) code lives in aligner_sg.cpp, not in the bindings' unit ──
-    // Every path for ends other than glocal's leaves the hot functions through one call to an
-    // out-of-line entry below, defined after the class and compiled in aligner_sg.cpp only
-    // (py_exports.cpp defines NWGRAD_SG_OUT_OF_LINE and sees the declarations); every SGR
-    // instantiation (the fills, walks, score paths and end searches with SGR = true) is made
-    // there.  Why: py_exports sits at gcc's --param inline-unit-growth limit, and any code it
-    // instantiates moves that unit's inlining: entered through cold in-unit trampolines
-    // (4ff2b30), the SGR code still made gcc re-decide inlining across the Glocal engine --
-    // int16 linear glocal path +3.3 % instructions on nighthaven (miRNA; path_and_guide out
-    // of line, fill_guide_gaps, the inter-pair worker 18.8 -> 20.1 KB).  Header-only users
-    // and the C++ tests get the definitions inline, as before.
+    // Every fill and score path for ends other than glocal's leaves the hot functions through
+    // one call to an out-of-line entry below, defined after the class and compiled in
+    // aligner_sg.cpp only (py_exports.cpp defines NWGRAD_SG_OUT_OF_LINE and sees the
+    // declarations); every SGR instantiation is made there.  Why: py_exports sits at gcc's
+    // --param inline-unit-growth limit, and any code it instantiates moves that unit's
+    // inlining: entered through cold in-unit trampolines (4ff2b30), the SGR code still made
+    // gcc re-decide inlining across the engine -- int16 linear glocal path +3.3 %
+    // instructions on nighthaven (miRNA; path_and_guide out of line, the inter-pair worker
+    // 18.8 -> 20.1 KB).  Header-only users and the C++ tests get the definitions inline.
     void sg_run_viterbi_(DpBuffer& buf);                 // run_viterbi, SGR
     double sg_compute_score_(DpBuffer& buf);             // compute_score (Full), SGR
-    // The SGR walk (linear: walk_linear_impl's moves; affine: walk_affine_impl's), recorded
-    // into a per-thread buffer that walk_linear / walk_affine replay into the caller's emit,
-    // last move first as the walks emit them.  The replay is inlined into the walk and
-    // flattened: emit, and everything emit calls (the path sink, the gradient's add), inlined
-    // into it, because a closure that reaches an out-of-line call -- emit handed to a cold
-    // trampoline (4ff2b30), or called out of line from the cold branch -- takes the address
-    // of every local it captures by reference, so path_walk_'s ci / cj, the guide and the
-    // OpsSink's run state lived in memory in the hot glocal walk as well (int16 linear glocal
-    // path +1.3-2 % instructions at sse4, gcc 15 and 16).
-    struct SgStep { int i, j, k; TBTable t; bool open; };
+    // The affine SGR walk (walk_affine_impl's moves), recorded into a per-thread buffer that
+    // walk_affine's cold branch replays into the caller's emit, last move first as the walk
+    // emits them.  The replay is inlined there and flattened (emit and all it calls inlined
+    // too): a closure that reaches an out-of-line call takes the address of every local it
+    // captures by reference, and those then live in memory in the hot walk as well.  (The
+    // linear walk takes every end set itself, tested at the borders only: walk_linear_impl.)
+    struct SgStep { int i, j, k; TBTable t; bool open; };   // (k: unused since the linear walk needs no replay)
     const std::vector<SgStep>& sg_walk_record_(const DpBuffer& buf) const;
     template <class Emit>
     [[gnu::always_inline, gnu::flatten]] void sg_walk_replay_(const DpBuffer& buf, Emit& emit) const {
-        for (const SgStep& s : sg_walk_record_(buf)) {
-            if constexpr (GM == GapModel::Linear) emit(s.k, s.i, s.j);
-            else                                  emit(s.t, s.i, s.j, s.open);
-        }
+        for (const SgStep& s : sg_walk_record_(buf)) emit(s.t, s.i, s.j, s.open);
     }
     // The ends as the fills and walks read them: SGR (runtime ends, other than glocal's) the
     // flags, else glocal's fixed at compile time.  The flags read at every step / row cost
