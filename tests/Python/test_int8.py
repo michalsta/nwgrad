@@ -219,12 +219,19 @@ def test_default_mode_is_local_with_a_predictor():
         nwgrad.sw_score_int16(a, a, p, kernel=K)     # ... and its score 48 re-arms int8
         assert E._score8_stats(True) == (1, 0)
         # The cap: affine at 16 lanes (sse2 / sse4 / neon) tries int8 only after a score < 64,
-        # elsewhere < 127 (simd_levels.cpp, score8_pred_cap).  A run scoring 96 holds it off there.
+        # elsewhere < 127 (simd_levels.cpp, score8_pred_cap).  A run scoring 96 holds it off there;
+        # linear (sw_score_int16) keeps 127 at every level.
         mid = "ACGTTGCA" * 6                           # Local score 96
-        nwgrad.sw_score_int16(mid, mid, p, kernel=K)
-        nwgrad.sw_score_int16(a, a, p, kernel=K)
+        with _tuning.override(score_int8=2):          # re-arm the affine type's predictor (48)
+            nwgrad.sw_score_affine_int16(a, a, p, kernel=K)
+        E._score8_stats(True)
+        nwgrad.sw_score_affine_int16(mid, mid, p, kernel=K)
+        nwgrad.sw_score_affine_int16(a, a, p, kernel=K)
         lanes16 = nwgrad.get_isa_level() in ("sse2", "sse4", "neon")
         assert E._score8_stats(True) == ((1, 0) if lanes16 else (2, 0))
+        nwgrad.sw_score_int16(mid, mid, p, kernel=K)
+        nwgrad.sw_score_int16(a, a, p, kernel=K)
+        assert E._score8_stats(True) == (2, 0)
 
 
 def test_min_segs_gate():
@@ -265,8 +272,8 @@ def test_shared_groups_of_long_rows_take_the_int8_tier():
             _tuning.set_gate("inter_score_gather_cells", None)
             _tuning.set_gate("score_int8", gate)
             b = nwgrad.SeqPairBatchInt32(A, B, p, mode="local", grad_mode="none", n_threads=1, kernel="sse2")
-            with _tuning.override(score_int8=2):          # re-arm this thread's predictor
-                nwgrad.sw_score_int32("ARND", "ARND", p, kernel="sse2")
+            with _tuning.override(score_int8=2):          # re-arm this thread's predictor (affine, as the batch)
+                nwgrad.sw_score_affine_int32("ARND", "ARND", p, kernel="sse2")
             E._score8_stats(True)
             b.score_and_grad()
             got[gate] = (list(b.scores()), E._score8_stats(True)[0])
