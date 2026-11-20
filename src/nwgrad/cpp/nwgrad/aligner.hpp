@@ -1146,7 +1146,7 @@ struct Aligner {
                                                  static_cast<int>(AM));
     static double score8_noted_(bool note, double r) {
         if constexpr (nw_is_int<T>) {
-            if (note) [[unlikely]] score8_pred().last_over[kScore8Key] = r >= 127.0;
+            if (note) [[unlikely]] score8_pred().last[kScore8Key] = static_cast<float>(r);
         }
         return r;
     }

@@ -82,6 +82,20 @@ NWGRAD_INSTANTIATE_REGISTER(int64_t)
 namespace {
 constexpr int kScore8Local = 1;
 
+// The predictor's cap: score8_try runs a Local problem in int8 only while the thread's previous
+// problem of its type scored below it.  127 = "would have overflowed".  At 16 lanes (SSE2 /
+// SSE4 / NEON) affine Local is capped at 64: there an int8 run pays only on low scores
+// (wloczykij sse4, DNA L100 affine Local score, int8 run / int16 instructions: unrelated
+// (scores ~12) 0.47, 40 % mutated (median 40) 0.63, 30 % (72) 0.83, 20 % (114) 1.00; an
+// overflowing run costs 1.1x an int16 run before the int16 re-run), so the 127 cap cost 20 %
+// mutated pairs 1.22x (median 114, 27 % >= 127; wall 1.25x) and 10 % mutated 1.04x.  Replaying
+// those score sequences through that cost model: cap 64 -> 1.000 / 1.001, 30 % 0.94, unrelated
+// 0.53; cap 96 still 1.046 at 20 %.  Linear's one-row int8 kernel gained at every rate there
+// (0.69-0.86 at scores 20-90), and 32 / 64 lanes take L100 only past score_int8_min_segs: 127.
+inline float score8_pred_cap(int lanes, bool linear) noexcept {
+    return (lanes < 32 && !linear) ? 64.0f : 127.0f;
+}
+
 int score8_try_impl(const Score8Req& q, int& score) {
     const int mode = q.mode;
     if (q.m < 1 || q.n < 1) return 0;
@@ -108,7 +122,7 @@ int score8_try_impl(const Score8Req& q, int& score) {
     // type scored below 127: an all-overflowing batch pays one wasted run per
     // thread, an i.i.d. mix p(1-p) of its pairs.
     Score8Pred& pr = score8_pred();
-    if (mode == 1 && pr.last_over[q.key]) return -1;
+    if (mode == 1 && pr.last[q.key] >= score8_pred_cap(score_int8_lanes(q.backend), q.linear != 0)) return -1;
     // Per-thread scratch: the int8 block (cast per problem) and the kernel's rows.
     struct Scratch { std::vector<int8_t> blk, rows; };
     static thread_local Scratch sc;
@@ -139,7 +153,7 @@ int score8_try_impl(const Score8Req& q, int& score) {
         if (job.overflow) st.overflows.fetch_add(1, std::memory_order_relaxed);
     }
     if (job.overflow) return mode == 2 ? 0 : -1;   // gate 2: every problem tried
-    pr.last_over[q.key] = false;
+    pr.last[q.key] = static_cast<float>(job.score);
     score = job.score;
     return 1;
 }
@@ -152,7 +166,8 @@ bool score8_own_impl(const Score8Req& q) {
             if ((q.nb[l] + W - 1) / W < segs) return false;
     }
     if (score_int8_mode() != 1) return false;
-    if (!level_kernels(q.backend).score_i8 || score8_pred().last_over[q.key]) return false;
+    if (!level_kernels(q.backend).score_i8 ||
+        score8_pred().last[q.key] >= score8_pred_cap(score_int8_lanes(q.backend), q.linear != 0)) return false;
     if (q.smax_pos < 0 || q.smax_pos > 127 || q.smax_neg > 127) return false;
     const double goa = q.linear ? 0.0 : q.go_a, gob = q.linear ? 0.0 : q.go_b;
     return goa >= 0 && gob >= 0 && q.ge_a >= 0 && q.ge_b >= 0 &&

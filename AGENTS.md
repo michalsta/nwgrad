@@ -3218,7 +3218,10 @@ so a saturated value never leaks and the score is the int16 / int32 integer bit 
   1 (the x86 default) Local only with a per-thread predictor
   (try int8 only if the previous Local problem of this type, on this thread, scored < 127 --
   the wide kernel's score answers it exactly; it replaced a geometric back-off, skip 1, 3,
-  ... 63 after an overflow, which left the overflowing cells at 1.01-1.03), 2 every mode,
+  ... 63 after an overflow, which left the overflowing cells at 1.01-1.03; affine at 16 lanes
+  < 64: there an int8 run costs about an int16 run at score ~110 and an overflow 2.1x, so
+  related DNA L100 affine Local, median 114, read 1.22x instructions / 1.25x wall at sse4
+  under the 127 cap; see score8_pred_cap), 2 every mode,
   every problem (tests).  `NWGRAD_INT_NARROW=0` turns it off with the other narrowing.
 - **Minimum row** `score_int8_min_segs` (gate 1 only): none at 16 lanes, 32 segments at 32
   and 64 lanes.  nighthaven AVX2 (87356da, Local score, tier on / off) lost on SHORT rows of
