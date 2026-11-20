@@ -2621,7 +2621,10 @@ private:
     template <class Emit>
     void walk_linear(const DpBuffer& buf, Emit&& emit) const {
         if constexpr (AM == AlignMode::Glocal && AB == AlignBand::Full)   // the other semi-global ends: walked out of line
-            if (!sg_is_glocal_()) [[unlikely]] { sg_walk_replay_(buf, emit); return; }   // (sg_walk_record_; banded: refused)
+            if (!sg_is_glocal_()) [[unlikely]] {   // (sg_walk_record_; banded: refused)
+                for (const SgStep& s : sg_walk_record_(buf)) emit(s.k, s.i, s.j);
+                return;
+            }
         if (tr_) walk_linear_impl<true>(buf, emit);
         else     walk_linear_impl<false>(buf, emit);
     }
@@ -2757,7 +2760,10 @@ private:
     template <class Emit>
     void walk_affine(const DpBuffer& buf, Emit&& emit) const {
         if constexpr (AM == AlignMode::Glocal && AB == AlignBand::Full)   // the other semi-global ends: walked out of line
-            if (!sg_is_glocal_()) [[unlikely]] { sg_walk_replay_(buf, emit); return; }   // (sg_walk_record_; banded: refused)
+            if (!sg_is_glocal_()) [[unlikely]] {   // (sg_walk_record_; banded: refused)
+                for (const SgStep& s : sg_walk_record_(buf)) emit(s.t, s.i, s.j, s.open);
+                return;
+            }
         if (tr_) {
             if (pointers_) walk_affine_impl<true, true>(buf, emit);
             else           walk_affine_impl<false, true>(buf, emit);
@@ -5851,17 +5857,13 @@ private:
     void sg_run_viterbi_(DpBuffer& buf);                 // run_viterbi, SGR
     double sg_compute_score_(DpBuffer& buf);             // compute_score (Full), SGR
     // The SGR walk (linear: walk_linear_impl's moves; affine: walk_affine_impl's), recorded
-    // into a per-thread buffer that sg_walk_replay_ hands to the caller's emit, last move
-    // first as the walks emit them.
+    // into a per-thread buffer that walk_linear / walk_affine replay into the caller's emit,
+    // last move first as the walks emit them.  The replay stays inline there: handing emit
+    // to an out-of-line function (the earlier cold trampoline) takes the address of every
+    // local its closure captures by reference (path_walk_'s ci / cj, the guide, the sink),
+    // so they lived in memory in the hot glocal walk as well.
     struct SgStep { int i, j, k; TBTable t; bool open; };
     const std::vector<SgStep>& sg_walk_record_(const DpBuffer& buf) const;
-    template <class Emit>
-    [[gnu::cold, gnu::noinline]] void sg_walk_replay_(const DpBuffer& buf, Emit& emit) const {
-        for (const SgStep& s : sg_walk_record_(buf)) {
-            if constexpr (GM == GapModel::Linear) emit(s.k, s.i, s.j);
-            else                                  emit(s.t, s.i, s.j, s.open);
-        }
-    }
     // The ends as the fills and walks read them: SGR (runtime ends, other than glocal's) the
     // flags, else glocal's fixed at compile time.  The flags read at every step / row cost
     // the glocal linear path 2-3 % on NEON (M1: miRNA, DNA L100) against main's constants.
