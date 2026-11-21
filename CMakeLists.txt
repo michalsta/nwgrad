@@ -214,6 +214,15 @@ set(NWGRAD_ENGINE_SOURCES
     ${NWGRAD_LEVEL_DIR}/engine_i32.cpp
     ${NWGRAD_LEVEL_DIR}/engine_i64.cpp)
 
+# gcc's whole-unit inlining budget for the engine units (--param inline-unit-growth, gcc's
+# default 40 %).  Empty: gcc's default.
+set(NWGRAD_ENGINE_INLINE_UNIT_GROWTH "" CACHE STRING
+    "gcc --param inline-unit-growth for the engine units (empty = gcc's default)")
+if (NOT NWGRAD_ENGINE_INLINE_UNIT_GROWTH STREQUAL "")
+    set_property(SOURCE ${NWGRAD_ENGINE_SOURCES} APPEND PROPERTY COMPILE_OPTIONS
+        "$<$<CXX_COMPILER_ID:GNU>:--param=inline-unit-growth=${NWGRAD_ENGINE_INLINE_UNIT_GROWTH}>")
+endif()
+
 nanobind_add_module(nwgrad_ext
     NB_STATIC NOMINSIZE
     ${NWGRAD_PLACEMENT_SOURCES}
@@ -254,7 +263,7 @@ if (NWGRAD_KERNEL_LAYOUT MATCHES "^(units|groups)$" AND NOT APPLE AND NOT WIN32
     endif()
 endif()
 
-# clang's SLP vectorizer, in the TUs that hold the scalar code (the engine units) (every Aligner fill,
+# clang's SLP vectorizer, in the TUs that hold the scalar code, the engine units (every Aligner fill,
 # traceback and walk; scalar_fallback; the linear Pointers fill at every level): it packs
 # pairs of independent scalar chains (the X and Y updates, the argmax operands) into
 # 2-wide vectors with shuffles on the serial carry, or extracts a packed max through a
