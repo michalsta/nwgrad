@@ -789,13 +789,17 @@ inline int score_int8_mode() noexcept {
     return kScoreInt8Default;
 }
 // The int8 tier's minimum row length in int8 segments (ceil(n / lanes)), by lane count:
-// none at 16 lanes, 32 segments at 32 and 64 lanes.  At 32 lanes a short row is a few
+// 32 segments at 16 and 32 lanes, 16 (or 32) at 64 lanes.  At 32 lanes a short row is a few
 // segments, so lazy-F's carries across 32 lane boundaries and the per-row costs outweigh
 // the doubled width: nighthaven (AVX2) Local score, pairs that fit int8, tier on / off,
 // L100 (4 segments) protein unrelated 1.70, DNA related 1.66; L300 (10) 1.33 / 1.06;
-// L1000 (32) 0.64 / 1.00, DNA unrelated 0.45; L3000 0.36.  At 16 lanes (SSE4, skynet,
-// instructions) L100 (7 segments) already gained: DNA related 0.81, unrelated 0.48,
-// protein unrelated 0.97.  At 64 lanes (AVX-512, solace, Local score int16, tier on / off,
+// L1000 (32) 0.64 / 1.00, DNA unrelated 0.45; L3000 0.36.  At 16 lanes (SSE2 / SSE4 / NEON)
+// the instruction counts (skynet, wloczykij: L100 DNA related 0.81, unrelated 0.48) hid a wall
+// loss: nighthaven with the level forced to sse4, DNA int16 Local score, tier on / off, cycles:
+// L100 (7 segments) affine 20 % mutated 1.13 (wall 1.009 under the score cap), 27-30 %
+// 1.06-1.10 wall, linear 1.05-1.11 wall, unrelated 0.77-0.92; L150-L300 related mixes still
+// 1.01-1.33 here and there; from L500 (32 segments) unrelated 0.49-0.59 and related 0.94-1.01.
+// So 32 there too.  At 64 lanes (AVX-512, solace, Local score int16, tier on / off,
 // 87356da) 16 segments (L1000) already gained for affine and for <= 8 letters -- DNA
 // 0.45-0.55, protein affine 0.74 -- but not protein linear (1.02-1.06, control 1.02); 5
 // segments (L300) lost 1.30-1.84; from 32 (L2048) every cell gained (DNA 0.38-0.40,
@@ -805,7 +809,7 @@ inline int score_int8_min_segs(int lanes, bool linear, int nalpha) noexcept {
     const int64_t o = gate_override(Gate::ScoreInt8MinSegs);
     if (o >= 0) return o > (1 << 20) ? (1 << 20) : static_cast<int>(o);
     if (lanes >= 64) return (linear && nalpha > 8) ? 32 : 16;
-    return lanes >= 32 ? 32 : 0;
+    return 32;
 }
 // The int8 kernel's lane count at a level (score8_kernel_impl.inl: native_simd<int8_t>).
 inline int score_int8_lanes(int level) noexcept {

@@ -3223,8 +3223,11 @@ so a saturated value never leaks and the score is the int16 / int32 integer bit 
   related DNA L100 affine Local, median 114, read 1.22x instructions / 1.25x wall at sse4
   under the 127 cap; see score8_pred_cap), 2 every mode,
   every problem (tests).  `NWGRAD_INT_NARROW=0` turns it off with the other narrowing.
-- **Minimum row** `score_int8_min_segs` (gate 1 only): none at 16 lanes, 32 segments at 32
-  and 64 lanes.  nighthaven AVX2 (87356da, Local score, tier on / off) lost on SHORT rows of
+- **Minimum row** `score_int8_min_segs` (gate 1 only): 32 segments at 16 and 32 lanes, 16
+  (32 for linear over > 8 letters) at 64 lanes.  16 lanes had none until 2026-11-21: sse4
+  instruction counts gained at L100, but nighthaven with the level forced to sse4 lost in wall
+  time (related DNA L100 affine 1.06-1.10 at 27-30 % mutated, linear int16 1.05-1.11; L150-L300
+  mixes up to 1.33 in cycles), and from L500 (32 segments) every fixture was <= 1.01.  nighthaven AVX2 (87356da, Local score, tier on / off) lost on SHORT rows of
   pairs that fit int8 -- protein unrelated L100 1.70 / L300 1.33, DNA related L100 1.66 /
   L300 1.06 (6 threads the same) -- and gained from L1000 (32 segments: 0.45-1.00; L3000
   0.11-0.36).  At 4-10 segments lazy-F carries across 32 lane boundaries per row and the
