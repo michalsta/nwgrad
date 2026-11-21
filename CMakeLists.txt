@@ -145,7 +145,7 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
     # nighthaven geomean 1.002 over 116 cells (worst 0.966), solace 0.98-1.02.
     #
     # Under gcc it covers every TU of the extension (applied to the target below), not only
-    # the level TUs: the scalar fills in py_exports.cpp have the same exposure, and padding
+    # the level TUs: the scalar fills in the engine units have the same exposure, and padding
     # only the level TUs moves them by itself.  Every TU vs level TUs only: oldsolace 1.007
     # (42 cells faster, none slower), nighthaven 1.000 (worst 0.986).  Under clang it stays on
     # the level TUs: its padding is NOPs, some inside hot loops, and the gain is a reshuffle —
@@ -202,9 +202,22 @@ if (NWGRAD_PLACEMENT_SHIFT_AT STREQUAL "mid")
     set(NWGRAD_PLACEMENT_SOURCES "")
 endif()
 
+# The engine: one unit per scalar type (engine_common.inc), apart from the bindings
+# (py_exports.cpp), which only call it: gcc budgets inlining per unit, so code added to the
+# bindings no longer changes how the engine is inlined (seq_pair_batch.hpp, "Where the
+# member bodies are compiled").  Linked ahead of the bindings, so the engine's own copy of a
+# function both use (a std::vector helper, an inline header function) is the one kept.
+set(NWGRAD_ENGINE_SOURCES
+    ${NWGRAD_LEVEL_DIR}/engine_f32.cpp
+    ${NWGRAD_LEVEL_DIR}/engine_f64.cpp
+    ${NWGRAD_LEVEL_DIR}/engine_i16.cpp
+    ${NWGRAD_LEVEL_DIR}/engine_i32.cpp
+    ${NWGRAD_LEVEL_DIR}/engine_i64.cpp)
+
 nanobind_add_module(nwgrad_ext
     NB_STATIC NOMINSIZE
     ${NWGRAD_PLACEMENT_SOURCES}
+    ${NWGRAD_ENGINE_SOURCES}
     src/nwgrad/cpp/nwgrad/py_exports.cpp
     src/nwgrad/cpp/nwgrad/logistic/py_logistic.cpp
     ${NWGRAD_PLACEMENT_SOURCES_MID}
@@ -241,7 +254,7 @@ if (NWGRAD_KERNEL_LAYOUT MATCHES "^(units|groups)$" AND NOT APPLE AND NOT WIN32
     endif()
 endif()
 
-# clang's SLP vectorizer, in the TU that holds the scalar code (every Aligner fill,
+# clang's SLP vectorizer, in the TUs that hold the scalar code (the engine units) (every Aligner fill,
 # traceback and walk; scalar_fallback; the linear Pointers fill at every level): it packs
 # pairs of independent scalar chains (the X and Y updates, the argmax operands) into
 # 2-wide vectors with shuffles on the serial carry, or extracts a packed max through a
@@ -261,7 +274,7 @@ set(NWGRAD_SCALAR_TU_CLANG_OPTS -fno-slp-vectorize)
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64|i.86")
     list(APPEND NWGRAD_SCALAR_TU_CLANG_OPTS -mllvm -x86-cmov-converter=false)
 endif()
-set_source_files_properties(src/nwgrad/cpp/nwgrad/py_exports.cpp PROPERTIES
+set_source_files_properties(src/nwgrad/cpp/nwgrad/py_exports.cpp ${NWGRAD_ENGINE_SOURCES} PROPERTIES
     COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:Clang,AppleClang>:${NWGRAD_SCALAR_TU_CLANG_OPTS}>")
 
 # MinGW: link the gcc runtime (libstdc++, libgcc, winpthread) statically, so the .pyd
