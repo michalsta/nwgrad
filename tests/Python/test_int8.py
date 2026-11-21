@@ -271,6 +271,7 @@ def test_shared_groups_of_long_rows_take_the_int8_tier():
             _tuning.reset_gates()
             _tuning.set_gate("inter_score_gather_cells", None)
             _tuning.set_gate("score_int8", gate)
+            _tuning.set_gate("score_int8_min_segs", 16)   # the own-group route's floor (max(16, this)), not the default
             b = nwgrad.SeqPairBatchInt32(A, B, p, mode="local", grad_mode="none", n_threads=1, kernel="sse2")
             with _tuning.override(score_int8=2):          # re-arm this thread's predictor (affine, as the batch)
                 nwgrad.sw_score_affine_int32("ARND", "ARND", p, kernel="sse2")
