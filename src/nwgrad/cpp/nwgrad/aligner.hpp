@@ -641,10 +641,7 @@ struct Aligner {
         } else {
             ci = best_i_; cj = best_j_;
             if (gj) guide_affine_init(*gj);
-            // noinline: out of line, as gcc kept it when its unit was at the inline-unit-growth
-            // limit.  Inlined into the walk's steps, the int16/int32 affine Global/Glocal path walks
-            // ran 2-3 % more instructions (sse4, mirna / dna100; see "The engine units" in AGENTS.md).
-            walk_affine(buf, [&](TBTable st, int i, int j, bool) __attribute__((noinline)) {
+            walk_affine(buf, [&](TBTable st, int i, int j, bool) {
                 const uint8_t k = st == TBTable::M ? 0 : st == TBTable::X ? 1 : 2;
                 emit(k);
                 if (gj) {
@@ -2738,6 +2735,18 @@ private:
         }
     }
 
+    // A Global path's last run, along row 0 (Y moves) or column 0 (X moves) to the origin,
+    // opened at its last move.  noinline: with emit inlined into these two loops as well as
+    // into the three moves below, gcc's register allocation of the walk's loop got worse:
+    // the int16 / int32 affine Global and Glocal path cells ran 1.5-3 % more instructions
+    // (sse4, mirna / dna100) once the engine units' inlining budget no longer stopped it
+    // ("The engine units" in AGENTS.md).  One call per pair.
+    template <class Emit>
+    [[gnu::noinline]] static void emit_border_run_(Emit& emit, TBTable s, int i, int j) {
+        if (s == TBTable::Y) { for (; j > 0; --j) emit(TBTable::Y, 0, j, j == 1); }
+        else                 { for (; i > 0; --i) emit(TBTable::X, i, 0, i == 1); }
+    }
+
     // Tr: each move reads the penalties of its own row (a gap in B the row it enters, a
     // gap in A the row it lies in); otherwise the four are hoisted, as they always were.
     template <bool Ptr, bool Tr, class Emit>
@@ -2770,9 +2779,9 @@ private:
             } else {
                 if (i == 0) {
                     if constexpr (AM == AlignMode::Glocal) break;   // row 0: a free start
-                    else { for (; j > 0; --j) emit(TBTable::Y, 0, j, j == 1); break; }
+                    else { emit_border_run_(emit, TBTable::Y, i, j); break; }
                 }
-                if (j == 0) { for (; i > 0; --i) emit(TBTable::X, i, 0, i == 1); break; }
+                if (j == 0) { emit_border_run_(emit, TBTable::X, i, j); break; }
                 if constexpr (Ptr) c = affine_codes(buf.DM, i, j);
             }
             if      (i == 0) tbl = TBTable::Y;   // row 0: only leftward moves remain
