@@ -695,7 +695,7 @@ enum class Gate : int {
     InterGroupBytes, InterSoftBytes, InterScoreGatherCells,
     InterLinearIntGatherCells, InterLinearF32GatherCells, InterLinearF64GatherCells,
     InterGlobalLinearIntCells, InterGlobalLinearF32Cells, LinearStripedMinN, SoftF32MinCells,
-    InterMinFill, SoftCkptRows, SoftCkptMinBytes, SoftDoubleFtz, ScoreInt8, ScoreInt8MinSegs, InterProfileBytes, InterGroupTiles, Count_
+    InterMinFill, SoftCkptRows, SoftCkptMinBytes, SoftDoubleFtz, ScoreInt8, InterScoreSmallCells, InterScoreInt8, ScoreInt8MinSegs, InterProfileBytes, InterGroupTiles, Count_
 };
 inline constexpr const char* kGateNames[] = {
     "inter_group_bytes", "inter_soft_bytes", "inter_score_gather_cells",
@@ -703,8 +703,8 @@ inline constexpr const char* kGateNames[] = {
     "inter_linear_f64_gather_cells", "inter_global_linear_int_cells",
     "inter_global_linear_f32_cells", "linear_striped_min_n", "soft_f32_min_cells",
     "inter_min_fill", "soft_ckpt_rows", "soft_ckpt_min_bytes",
-    "soft_double_ftz", "score_int8", "score_int8_min_segs", "inter_profile_bytes",
-    "inter_group_tiles"};
+    "soft_double_ftz", "score_int8", "inter_score_small_cells",
+    "inter_score_int8", "score_int8_min_segs", "inter_profile_bytes", "inter_group_tiles"};
 static_assert(sizeof(kGateNames) / sizeof(kGateNames[0]) == static_cast<size_t>(Gate::Count_));
 inline constexpr int64_t kGateUnset = -1;
 inline constexpr int64_t kGateOff = INT64_MAX;
@@ -778,8 +778,10 @@ inline bool soft_double_ftz() noexcept {
 // protein L300 1.41 / 1.75; only DNA L1000 affine 0.91).
 #if defined(__aarch64__) || defined(_M_ARM64)
 inline constexpr int kScoreInt8Default = 0;
+inline constexpr bool kInterScoreInt8Default = false;   // the batch's inter-pair int8 tier (untimed there)
 #else
 inline constexpr int kScoreInt8Default = 1;
+inline constexpr bool kInterScoreInt8Default = true;
 #endif
 inline int score_int8_mode() noexcept {
     const int64_t o = gate_override(Gate::ScoreInt8);
@@ -997,7 +999,7 @@ inline constexpr GateLevelCaps kGateCapsSse    { {       6600,     1700,      20
                                                  { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, 0, 200000 };
 inline constexpr GateLevelCaps kGateCapsAvx2   { {      31000,     3800,      20000,     3072,      12288,       4700, kGateNoCap, kGateNoCap,      31000,      10300,      31000,      31000 },
                                                  {       6600,     1700,      20000,     3072,      12288,       1900, kGateNoCap, kGateNoCap,       6600,       6600,       6600,       6600 },
-                                                 {       1700,     1700,       4000,     1024,        450,       4700,       4700, kGateNoCap,       1700,       1700,       1700,       1700 },
+                                                 {       1700,     1700,       4000,     1024,        450,       4700,       4700, kGateNoCap,       1700,       1700,       1700,       1700 },   // int16: main's small caps (see kGateCapsSse4)
                                                  {       1700,     3800,       4000,     2560,       2048,       1900,       1900, kGateNoCap,       1700,       3800,       1700,       1700 },
                                                  {       3800,     1700,       2500,     3072,      12288,       2800,       1900, kGateNoCap,       3800,       1700,       3800,       3800 },
                                                  3072, 8192, 20000,
@@ -1016,12 +1018,40 @@ inline constexpr GateLevelCaps kGateCapsNeon   { {      10300,     1700,       8
                                                  {      14700,        0,          0,     4608,      12288,       2800, kGateNoCap,          0,      63100,          0,      14700,      63100 },
                                                  3072, 8192, 20000,
                                                  { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, 0, 250000 };
+// The small-alphabet score caps of int16 per level (score_small_local / _global), measured
+// with the inter-pair int8 tier in (proto/int8-inter; the int8 groups of int16 AND int32
+// batches take int16's caps), DNA related pairs, cap lifted / default:
+//   AVX2 (nighthaven, time, 1 and 6 threads): L100 0.13-0.48, L300 0.69-0.80, L500 0.70-0.89,
+//     L1000 affine 1.00 / linear 0.87-0.91 on uniform batches -- but a mixed batch (mixmir:
+//     half 22 x 50 miRNA, half related DNA L300-500 of random length) lost under the raise,
+//     int16 Local score 1.24 affine / 1.15 linear, int32 through the narrowed groups 1.23, and
+//     a lane-length uniformity rule past L200 left t6 at 1.23 and cost uniform L500 1.14.  So
+//     AVX2 keeps main's 4700 (both modes: Global's raise was not checked on mixed batches).
+//   SSE4 (wloczykij, instructions, A/A 0.94-1.05): L60 0.29-0.43, L100 0.42-0.69, L150-L500
+//     affine 0.72-0.85, linear Global 0.77-0.94, linear Local 0.88 / 0.99 / 1.03 / 1.04 at
+//     L150 / 200 / 300 / 500 -> 41000 (L200) both modes.
+//   SSE2 (the same): L60 0.55-0.71; L100 Local 0.57-0.82 (int8), Global 0.98-1.06; L150 on
+//     loses in linear (1.10-1.55) -> Local 10500 (L100), Global 3800 (L60).
+// int32's own caps stay: its inter-pair kernel loses from L100 Global on (SSE4 1.33-2.10,
+// SSE2 2.5-4.5).  AVX-512 int16 has no cap; NEON keeps its own.
+inline constexpr GateLevelCaps kGateCapsSse4 = [] {
+    GateLevelCaps c = kGateCapsSse;
+    c.i16.score_small_local = 41000; c.i16.score_small_global = 41000;
+    return c;
+}();
+inline constexpr GateLevelCaps kGateCapsSse2 = [] {
+    GateLevelCaps c = kGateCapsSse;
+    c.i16.score_small_local = 10500; c.i16.score_small_global = 3800;
+    return c;
+}();
 inline const GateLevelCaps& gate_caps(int level) noexcept {
 #if defined(__aarch64__) || defined(_M_ARM64)
     (void)level; return kGateCapsNeon;
 #else
     switch (static_cast<SimdLevel>(level)) {
         case SimdLevel::Avx2:   return kGateCapsAvx2;
+        case SimdLevel::Sse4:   return kGateCapsSse4;
+        case SimdLevel::Baseline: return kGateCapsSse2;
         case SimdLevel::Avx512: return kGateCapsAvx512;
         default:                return kGateCapsSse;
     }
@@ -1096,7 +1126,9 @@ inline bool inter_score_ok(size_t nalpha, int M, int n, bool affine, bool local,
     const uint32_t small = local ? c.score_small_local
                          : (std::is_same_v<T, float> && !affine) ? gate_caps(level).f32_small_global_lin
                                                                  : c.score_small_global;
-    const size_t cap = nalpha <= 8 ? size_t(small)
+    // Up to 8 letters its own override (inter_score_small_cells): without one, a sweep
+    // that set the gather cap off still sent DNA pairs past ~L43 to their own fill.
+    const size_t cap = nalpha <= 8 ? gate_cap(Gate::InterScoreSmallCells, small)
                                    : gate_cap(Gate::InterScoreGatherCells,
                                               affine ? aff : (local ? c.score_linear : c.score_linear_g));
     return static_cast<size_t>(M + 1) * static_cast<size_t>(n + 1) <= cap;
@@ -1260,6 +1292,9 @@ struct LevelKernels {
     int           row_block = 0;                // columns per interleaved block (per-µarch)
     int           level = 0;                    // this level's SimdLevel id (the gates read it)
     score8_fn     score_i8 = nullptr;           // score only in int8 lanes (score8_kernel_impl.inl)
+    // inter-pair score only in saturating int8 lanes (inter8_kernel_impl.inl), inter_w8 pairs per call
+    void (*inter_score_i8)(InterJobT<int8_t>&) = nullptr;
+    int           inter_w8 = 0;
     score8_try_fn score8_try = nullptr;         // its gates and run (simd_levels.cpp), set with score_i8
     score8_own_fn score8_own = nullptr;         // BatchEngine::int8_own_'s test (simd_levels.cpp)
     inter_soft_fn inter_soft = nullptr;         // inter-pair soft pass, double (W = d.inter_w)
@@ -1348,6 +1383,9 @@ void register_level_profile(SimdLevel l, typename TypedKernels<T>::profile_fn pr
 
 NWGRAD_BASELINE_ONLY
 void register_level_common(SimdLevel l, int row_block, score8_fn score_i8);
+// The inter-pair int8 score kernel, from the level's inter TU.
+NWGRAD_BASELINE_ONLY
+void register_level_inter8(SimdLevel l, void (*inter_score_i8)(InterJobT<int8_t>&), int inter_w8);
 // The soft kernels, from the level's soft TU (level_<name>_soft.cpp; see level_common.inc).
 NWGRAD_BASELINE_ONLY
 void register_level_soft(SimdLevel l, inter_soft_fn inter_soft,
