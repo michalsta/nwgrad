@@ -283,7 +283,7 @@ set(NWGRAD_SCALAR_TU_CLANG_OPTS -fno-slp-vectorize)
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64|i.86")
     list(APPEND NWGRAD_SCALAR_TU_CLANG_OPTS -mllvm -x86-cmov-converter=false)
 endif()
-set_source_files_properties(src/nwgrad/cpp/nwgrad/py_exports.cpp ${NWGRAD_ENGINE_SOURCES} PROPERTIES
+set_property(SOURCE src/nwgrad/cpp/nwgrad/py_exports.cpp ${NWGRAD_ENGINE_SOURCES} APPEND PROPERTY
     COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:Clang,AppleClang>:${NWGRAD_SCALAR_TU_CLANG_OPTS}>")
 
 # MinGW: link the gcc runtime (libstdc++, libgcc, winpthread) statically, so the .pyd
