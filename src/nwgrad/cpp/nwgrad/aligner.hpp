@@ -641,7 +641,10 @@ struct Aligner {
         } else {
             ci = best_i_; cj = best_j_;
             if (gj) guide_affine_init(*gj);
-            walk_affine(buf, [&](TBTable st, int i, int j, bool) {
+            // noinline: out of line, as gcc kept it when its unit was at the inline-unit-growth
+            // limit.  Inlined into the walk's steps, the int16/int32 affine Global/Glocal path walks
+            // ran 2-3 % more instructions (sse4, mirna / dna100; see "The engine units" in AGENTS.md).
+            walk_affine(buf, [&](TBTable st, int i, int j, bool) __attribute__((noinline)) {
                 const uint8_t k = st == TBTable::M ? 0 : st == TBTable::X ? 1 : 2;
                 emit(k);
                 if (gj) {

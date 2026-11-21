@@ -214,9 +214,15 @@ set(NWGRAD_ENGINE_SOURCES
     ${NWGRAD_LEVEL_DIR}/engine_i32.cpp
     ${NWGRAD_LEVEL_DIR}/engine_i64.cpp)
 
-# gcc's whole-unit inlining budget for the engine units (--param inline-unit-growth, gcc's
-# default 40 %).  Empty: gcc's default.
-set(NWGRAD_ENGINE_INLINE_UNIT_GROWTH "" CACHE STRING
+# gcc's whole-unit inlining budget for the engine units (--param inline-unit-growth; gcc's
+# default, 40 %, lets a unit grow to 1.4x its size by inlining, then refuses every further
+# inline in it).  At 40 % each engine unit sits at that limit as the old bindings unit did
+# (7,500-9,300 refusals per unit), so any engine change would again move inlining all over its
+# unit.  At 1000 no refusal is left: each decision depends on the caller and callee alone.
+# Measured (sse4 instructions, 216 short cells vs main ea93737): 40 % lost up to 12 % (mirna
+# double linear Global hard: rat() outlined in the walk), 1000 is 0.996 geomean.  Costs: .so
+# +26 % (46 -> 58 MB), engine units' compile time +25 %.  Empty: gcc's default.
+set(NWGRAD_ENGINE_INLINE_UNIT_GROWTH "1000" CACHE STRING
     "gcc --param inline-unit-growth for the engine units (empty = gcc's default)")
 if (NOT NWGRAD_ENGINE_INLINE_UNIT_GROWTH STREQUAL "")
     set_property(SOURCE ${NWGRAD_ENGINE_SOURCES} APPEND PROPERTY COMPILE_OPTIONS
