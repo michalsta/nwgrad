@@ -1004,10 +1004,19 @@ struct Aligner {
             return viterbi_score_;
         } else {
             const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
+            [[maybe_unused]] bool note8 = false;   // the int8 tier's predictor wants this score
+            if constexpr (nw_is_int<T>) {
+                if (backend != kBackendScalar && !tr_ && int_narrow_env()) {
+                    double r8;
+                    const int e = score_i8_(backend, r8);
+                    if (e > 0) return r8;
+                    note8 = e < 0;
+                }
+            }
             if (backend != kBackendScalar) {
                 if constexpr (std::is_same_v<T, std::int32_t> || std::is_same_v<T, std::int64_t>) {
                     double r;
-                    if (!tr_ && int_narrow_env() && narrow_score_(backend, r)) return r;
+                    if (!tr_ && int_narrow_env() && narrow_score_(backend, r)) return score8_noted_(note8, r);
                 }
                 const auto fn = level_kernels(backend).template of<T>().score;
                 if (fn) {
@@ -1030,11 +1039,11 @@ struct Aligner {
                     job.buf = &buf;
                     if (tr_) fill_track_job_(job.tr, true, static_cast<size_t>(n_) + 16, lin);
                     fn(job);
-                    return static_cast<double>(job.score);
+                    return score8_noted_(note8, static_cast<double>(job.score));
                 }
             }
-            if constexpr (GM == GapModel::Linear) return score_linear_scalar(buf);
-            else                                   return score_affine_scalar(buf);
+            if constexpr (GM == GapModel::Linear) return score8_noted_(note8, score_linear_scalar(buf));
+            else                                   return score8_noted_(note8, score_affine_scalar(buf));
         }
     }
     double compute_score() {
@@ -1113,6 +1122,60 @@ struct Aligner {
         } else {
             (void)backend; (void)out;
             return false;
+        }
+    }
+
+    // ── Score-only in int8 lanes (any integer T; score8_kernel_impl.inl) ─────────
+    // Tried first, before the half-width narrowing: four times int32's lanes.  The kernel
+    // proves its own result (see the file's head): Local exact unless its maximum reached
+    // 127, Global / Glocal exact when the score clears G - 128 with G = min(m, n) *
+    // smax_pos <= 126 -- the a-priori part, checked here.  On `overflow` this returns
+    // false and the caller runs the wider kernel, so the score is always the integer the
+    // int16 / int32 kernels give.  Preconditions (else false, nothing run): untracked,
+    // m, n >= 1, gap parameters >= 0 with go + ge <= 127 per side (the kernel subtracts
+    // only, and opens in one saturating step), every substitution within [-127, 127].
+    // All of it -- the gates, the block's int8 cast, the run, the predictor -- is one
+    // out-of-line call (score8_try in simd_levels.cpp, through LevelKernels so a
+    // header-only build has none): this TU holds the bindings and the engine, and is at
+    // gcc 15's --param inline-unit-growth limit there; an inline tier here (and the
+    // compute_score split it took) put Aligner::rat() out of line in the int16 linear
+    // Global inter-pair traceback (13 -> 14 call sites; solace WSL path 1.09-1.17, sse4
+    // instructions miRNA 1.063, DNA L100 1.036).
+    // The predictor's state is per thread and problem type (kScore8Key).
+    static constexpr int kScore8Key = score8_key(static_cast<int>(sizeof(T)), GM == GapModel::Linear,
+                                                 static_cast<int>(AM));
+    static double score8_noted_(bool note, double r) {
+        if constexpr (nw_is_int<T>) {
+            if (note) [[unlikely]] score8_pred().last[kScore8Key] = static_cast<float>(r);
+        }
+        return r;
+    }
+    // 1: the int8 score in `out`; 0: not run (the tier off, the problem not eligible, or
+    // gate 2's overflow); -1: Local at gate 1, predicted to overflow or overflowed -- the
+    // caller passes the wide score to score8_noted_.
+    int score_i8_(int backend, double& out) {
+        if constexpr (nw_is_int<T>) {
+            const int mode = score_int8_mode();
+            if (mode == 0 || (mode == 1 && AM != AlignMode::Local)) return 0;
+            const auto f = level_kernels(backend).score8_try;
+            if (!f) return 0;
+            Score8Req q;
+            q.a = a_idx_.data(); q.m = m_;
+            q.b = b_idx_.data(); q.n = n_;
+            q.blk = blkT_; q.tbytes = static_cast<int>(sizeof(T)); q.nalpha = nalpha_;
+            q.go_a = params_->gap_open_a; q.ge_a = params_->gap_extend_a;
+            q.go_b = params_->gap_open_b; q.ge_b = params_->gap_extend_b;
+            q.smax_pos = ib_.prepared() ? static_cast<long long>(ib_.smax_pos) : -1;
+            q.smax_neg = static_cast<long long>(ib_.smax_neg);
+            q.backend = backend; q.mode = mode; q.am = static_cast<int>(AM);
+            q.linear = GM == GapModel::Linear; q.key = kScore8Key;
+            int sc;
+            const int e = f(q, sc);
+            out = static_cast<double>(sc);
+            return e;
+        } else {
+            (void)backend; (void)out;
+            return 0;
         }
     }
 

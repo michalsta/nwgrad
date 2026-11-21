@@ -53,6 +53,16 @@ from .nwgrad_ext import (
     SeqPairInt32, SeqPairBatchInt32,
     SeqPairInt64, SeqPairBatchInt64,
 )
+# int8: int16 with parameters that fit a signed byte (checked; ValueError otherwise).
+# Score-only runs the int8 kernel where it can prove its result, the int16 one otherwise
+# (the same integer); paths and gradients run at int16.  See nwgrad/_int8.py.
+from ._int8 import (
+    SeqPairInt8, SeqPairBatchInt8,
+    nw_score_int8, sw_score_int8, nw_score_affine_int8, sw_score_affine_int8,
+    glocal_score_int8, glocal_score_affine_int8,
+    nw_grad_int8, sw_grad_int8, nw_affine_grad_int8, sw_affine_grad_int8,
+    glocal_grad_int8, glocal_affine_grad_int8,
+)
 from . import matrices
 
 from importlib.metadata import version as _version

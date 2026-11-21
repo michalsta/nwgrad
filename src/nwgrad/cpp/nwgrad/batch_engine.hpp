@@ -2975,7 +2975,8 @@ private:
             InterJobT<NI> job;
             narrow_job_(PL, s, e, W, L, job);
             if (!inter_score_ok<NI>(alpha_->size(), L.M, L.n, GM == GapModel::Affine, AM == AlignMode::Local,
-                                    s_.n_threads == 1, PL.nbackend))
+                                    s_.n_threads == 1, PL.nbackend) ||
+                int8_own_(PL.nbackend, L.nb.data(), static_cast<int>(e - s), w.full))   // rows the int8 tier takes
                 return false;
             const size_t sz = static_cast<size_t>(L.n + 1) * W;
             if constexpr (GM == GapModel::Linear) {
@@ -3060,7 +3061,8 @@ private:
                     n = std::max(n, nb[l]);
                     ragged |= nb[l] != nb[0];
                 }
-                if (!inter_score_ok<T>(alpha_->size(), M, n, GM == GapModel::Affine, AM == AlignMode::Local, s_.n_threads == 1, PL.backend)) {   // short pairs only
+                if (!inter_score_ok<T>(alpha_->size(), M, n, GM == GapModel::Affine, AM == AlignMode::Local, s_.n_threads == 1, PL.backend) ||
+                    int8_own_(PL.backend, nb.data(), static_cast<int>(real), w.full)) {   // short pairs only
                     for (size_t l = 0; l < real; ++l) own(PL.elig[s + l]);
                     continue;
                 }
@@ -3085,6 +3087,39 @@ private:
             }
         };
         run_workers_(tasks, worker);
+    }
+
+    // A score-only group the per-pair int8 tier (Aligner::score_i8_) would take instead: its
+    // own fills then.  The shared kernel holds one pair per lane of T; the int8 striped
+    // kernel 16-64 cells of one pair, so for long rows it wins: solace (AVX-512) DNA L1000
+    // Local int32, 48 unrelated pairs, the shared route (small alphabets have no cell cap
+    // there) read 1.01 of main while fill="striped" (own fills, int8) read 0.37-0.40.  Only
+    // where the tier would run (gate 1, Local, untracked, the params within its
+    // preconditions, the thread's predictor not expecting an overflow) and every pair's row
+    // is at least max(16, score_int8_min_segs) int8 segments: shorter groups stay shared
+    // (they are what the shared kernel is for, and an int8 form of it is a separate tier).
+    // The test itself is out of line (score8_own in simd_levels.cpp): this TU's inline
+    // budget (see Aligner::score_i8_).
+    template <class Al>
+    bool int8_own_(int backend, const int* nb, int real, const Al&) const {
+        if constexpr (!nw_is_int<T> || AM != AlignMode::Local) {
+            (void)backend; (void)nb; (void)real; return false;
+        } else {
+            if (tracked_ || backend < 0 || !Al::int_narrow_env()) return false;
+            const auto f = level_kernels(backend).score8_own;
+            if (!f) return false;
+            const NwIntBound<T>& ib = params_->ib;
+            const AlignParams& p = params_->p;
+            Score8Req q;
+            q.nalpha = static_cast<int>(alpha_->size());
+            q.go_a = p.gap_open_a; q.ge_a = p.gap_extend_a;
+            q.go_b = p.gap_open_b; q.ge_b = p.gap_extend_b;
+            q.smax_pos = ib.prepared() ? static_cast<long long>(ib.smax_pos) : -1;
+            q.smax_neg = static_cast<long long>(ib.smax_neg);
+            q.backend = backend; q.linear = GM == GapModel::Linear; q.key = Al::kScore8Key;
+            q.nb = nb; q.real = real;
+            return f(q);
+        }
     }
 
     void score_and_grad_dynamic_(bool keep) {

@@ -514,6 +514,29 @@ f(seq_a, seq_b, params, band=0, aligned_a="", aligned_b="", kernel="auto")
 Each also exists with a `_double` suffix (`nw_score_double`, `nw_affine_grad_double`,
 …) that runs the DP in float64 — see [Precision](tuning.md#precision).
 
+<a id="scalar-types"></a>**Scalar types.** The suffix (and the class name: `SeqPairInt16`,
+`SeqPairBatchInt8`, …) picks the DP's scalar type; integer types take integral parameters
+only (`ValueError` otherwise) and have no soft path. Every integer result equals the
+float64 one, bit for bit. See [Precision](tuning.md#integer-types).
+
+| Suffix / class | DP arithmetic | Parameters | Refused problems |
+|---|---|---|---|
+| (none) / `SeqPair` | float32 | any | — |
+| `_double` / `*Double` | float64 | any | — |
+| `_int64` / `*Int64` | int64 | integers within ±(2⁶¹−1) | bound (m+n+66)·step > 2⁶¹−1: `OverflowError` |
+| `_int32` / `*Int32` | int32 | integers within ±(2²⁹−1) | bound (m+n+66)·step > 2²⁹−1: `OverflowError` |
+| `_int16` / `*Int16` | int16 (saturating past the quarter rule) | integers within ±8191 | past the saturating bound: `OverflowError` |
+| `_int8` / `*Int8` | score-only: int8 where provably exact, else int16; paths and gradients: int16 | integers within ±127 (`ValueError` otherwise) | as int16 |
+
+The int8 names are int16 with the parameter range checked up front: score-only work
+runs the int8 kernel first (Local by default on x86; off by default on AArch64) and re-runs at int16 whenever it cannot prove its result (a
+Local score reaching 127; Global / Glocal see [Precision](tuning.md#integer-types)), so
+the score is the int16 one either way; paths, guides and hard gradients are computed at
+int16 (there is no int8 traceback). They take the same arguments as the int16 names,
+including `nw_grad_int8` … `glocal_affine_grad_int8`; there is no `_int8` soft function.
+The int16 / int32 / int64 score-only paths try the same int8 kernel by themselves when
+the parameters fit (gate `score_int8`, [Fill gates](tuning.md#fill-gates)).
+
 `band > 0` (or a non-empty `aligned_a` / `aligned_b` guide pair) runs a banded DP
 instead of the full one. The sequences are plain `str` and are validated and
 encoded against `params`'s alphabet on the way in.
