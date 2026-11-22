@@ -2754,8 +2754,11 @@ private:
 
     // Tr: each move reads the penalties of its own row (a gap in B the row it enters, a
     // gap in A the row it lies in); otherwise the four are hoisted, as they always were.
+    // noinline: its own function, as gcc kept it at the old unit's inline limit.  Inlined into
+    // the inter-pair worker (score_and_grad_inter_'s lambda) it made that lambda spill and
+    // outline rat(): float32 / double affine Local path cells +1-2 % instructions (sse4).
     template <bool Ptr, bool Tr, class Emit>
-    void walk_affine_impl(const DpBuffer& buf, Emit& emit) const {
+    [[gnu::noinline]] void walk_affine_impl(const DpBuffer& buf, Emit& emit) const {
         auto from_code = [](unsigned char c) {
             return c == 1 ? TBTable::X : (c == 2 ? TBTable::Y : TBTable::M);
         };
