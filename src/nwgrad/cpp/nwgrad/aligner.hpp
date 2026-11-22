@@ -2735,12 +2735,17 @@ private:
         }
     }
 
-    // A Global path's last run, along row 0 (Y moves) or column 0 (X moves) to the origin,
-    // opened at its last move.  noinline: with emit inlined into these two loops as well as
-    // into the three moves below, gcc's register allocation of the walk's loop got worse:
-    // the int16 / int32 affine Global and Glocal path cells ran 1.5-3 % more instructions
-    // (sse4, mirna / dna100) once the engine units' inlining budget no longer stopped it
-    // ("The engine units" in AGENTS.md).  One call per pair.
+    // The walk's emits other than the M move's, out of line: a Global path's last run along
+    // row 0 (Y moves) or column 0 (X moves) to the origin, and each gap move.  With emit
+    // (a path sink, a guide, a gradient) inlined at all five sites, gcc spilled the walk's
+    // loop state to the stack (118 stack accesses in the int16 affine Global path walk vs
+    // 16): the int16 / int32 affine Global and Glocal path cells ran 1.5-3.5 % more
+    // instructions (sse4, mirna / dna100) once the engine units' inlining budget no longer
+    // kept it out of line ("The engine units" in AGENTS.md).  All five out of line cost 5 %.
+    template <class Emit>
+    [[gnu::noinline]] static void emit_gap_(Emit& emit, TBTable s, int i, int j, bool open) {
+        emit(s, i, j, open);
+    }
     template <class Emit>
     [[gnu::noinline]] static void emit_border_run_(Emit& emit, TBTable s, int i, int j) {
         if (s == TBTable::Y) { for (; j > 0; --j) emit(TBTable::Y, 0, j, j == 1); }
@@ -2801,7 +2806,7 @@ private:
                        prev = argmax(nw_sub(nw_sub(buf.VM[k], go_b), ge_b),
                                      nw_sub(buf.VX[k], ge_b),
                                      nw_sub(nw_sub(buf.VY[k], go_b), ge_b)); }
-                emit(TBTable::X, i, j, prev != TBTable::X);
+                emit_gap_(emit, TBTable::X, i, j, prev != TBTable::X);
                 --i;
             } else {                          // gap in A: advance j, gap_a penalties
                 if constexpr (Tr) { go_a = tgoa_[static_cast<size_t>(i)]; ge_a = tgea_[static_cast<size_t>(i)]; }
@@ -2810,7 +2815,7 @@ private:
                        prev = argmax(nw_sub(nw_sub(buf.VM[k], go_a), ge_a),
                                      nw_sub(nw_sub(buf.VX[k], go_a), ge_a),
                                      nw_sub(buf.VY[k], ge_a)); }
-                emit(TBTable::Y, i, j, prev != TBTable::Y);
+                emit_gap_(emit, TBTable::Y, i, j, prev != TBTable::Y);
                 --j;
             }
             tbl = prev;
