@@ -162,6 +162,12 @@ inline constexpr bool hb_splits(TracebackMode tb, std::size_t auto_cells, int cu
 // guide_j[i] = round(i * n / m) is used, tracking the main diagonal of the
 // rectangular DP matrix.
 
+// gj = n entries of -1: a walk's guide before it fills the rows it crosses.  noinline: one
+// out-of-line call per walk, as gcc's unit budget used to leave it (a vector<int>::_M_fill_assign
+// clone).  Inlined at each walk inside the inter-pair worker, the path cells (int16 linear
+// Glocal, int32 linear Local, float32 linear Global) ran 1-2.5 % more instructions (AVX2).
+[[gnu::noinline]] inline void nw_guide_reset(std::vector<int>& gj, size_t n) { gj.assign(n, -1); }
+
 inline std::vector<int> guide_j_from_aligned(std::string_view a_aligned,
                                               std::string_view b_aligned) {
     if (a_aligned.size() != b_aligned.size())
@@ -623,7 +629,7 @@ struct Aligner {
             ci = (AM == AlignMode::Global) ? m_ : best_i_;
             cj = (AM == AlignMode::Global) ? n_ : best_j_;
             if (gj) {
-                gj->assign(static_cast<size_t>(m_ + 1), -1);
+                nw_guide_reset(*gj, static_cast<size_t>(m_ + 1));
                 (*gj)[0] = 0;
                 (*gj)[static_cast<size_t>(m_)] = n_;
                 const int i_end = (AM == AlignMode::Global) ? m_ : best_i_;
@@ -690,7 +696,7 @@ struct Aligner {
         }
         if constexpr (GM == GapModel::Linear) {
             if (gj) {
-                gj->assign(static_cast<size_t>(m_ + 1), -1);
+                nw_guide_reset(*gj, static_cast<size_t>(m_ + 1));
                 (*gj)[0] = 0;
                 (*gj)[static_cast<size_t>(m_)] = n_;
                 const int i_end = (AM == AlignMode::Global) ? m_ : best_i_;
@@ -2829,7 +2835,7 @@ private:
     // stay in the row), the end cell, row 0 and row m; fill_guide_gaps interpolates the
     // rows a Local path does not cover.
     void guide_affine_init(std::vector<int>& gj) const {
-        gj.assign(static_cast<size_t>(m_ + 1), -1);
+        nw_guide_reset(gj, static_cast<size_t>(m_ + 1));
         gj[0] = 0;
         gj[static_cast<size_t>(m_)] = n_;
         gj[static_cast<size_t>(best_i_)] = best_j_;
@@ -3497,7 +3503,7 @@ private:
                           Mv&& mv = Mv{}) const {
         double* gblk = grad_block(grad);
         if (gj) {
-            gj->assign(static_cast<size_t>(m_ + 1), -1);
+            nw_guide_reset(*gj, static_cast<size_t>(m_ + 1));
             (*gj)[0] = 0;
             (*gj)[static_cast<size_t>(m_)] = n_;
             const int i0 = (AM == AlignMode::Global) ? m_ : best_i_;
