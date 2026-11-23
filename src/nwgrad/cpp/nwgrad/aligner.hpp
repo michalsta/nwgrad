@@ -623,20 +623,23 @@ struct Aligner {
     // The walk of both: emit(k) for each move, LAST move first; the start cell into
     // (i0, j0) and the guide into gj.
     //
-    // Global / Glocal: out of line (path_walk_ool_), as gcc kept path_and_guide at the old
-    // unit's inline limit.  Inlined into the inter-pair worker (score_and_grad_inter_'s
+    // Linear Global / Glocal: out of line (path_walk_ool_), as gcc kept path_and_guide at the
+    // old unit's inline limit.  Inlined into the inter-pair worker (score_and_grad_inter_'s
     // lambda) the walk took that function's register allocation: the int16 linear Glocal and
     // double linear Global path cells ran 1-2.4 % more instructions than main (AVX2), the
     // same loop with more moves around each rat() call; out of line they run 2-12 % fewer.
     // Local stays inline: there the walk is short and the path sink's run state, reached
     // through the caller's reference out of line, was loaded and stored at every move (int32
     // linear Local path +5-6 %; a local copy of the sink won back only part of it and cost
-    // the Global cells their gain).
+    // the Global cells their gain).  Affine stays inline: its walk (walk_affine_impl) is out
+    // of line already, and the extra layer cost int32 affine Global path +0.5-1 %.
     template <class Emit>
     [[gnu::always_inline]] void path_walk_(const DpBuffer& buf, Emit&& emit, int& i0, int& j0,
                                            std::vector<int>* gj) const {
-        if constexpr (AM == AlignMode::Local) path_walk_body_(buf, emit, i0, j0, gj);
-        else                                  path_walk_ool_(buf, emit, i0, j0, gj);
+        if constexpr (GM == GapModel::Linear && AM != AlignMode::Local)
+            path_walk_ool_(buf, emit, i0, j0, gj);
+        else
+            path_walk_body_(buf, emit, i0, j0, gj);
     }
     template <class Emit>
     [[gnu::noinline]] void path_walk_ool_(const DpBuffer& buf, Emit& emit, int& i0, int& j0,
