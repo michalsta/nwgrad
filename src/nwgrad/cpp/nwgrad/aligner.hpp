@@ -2655,6 +2655,14 @@ private:
     }
     template <bool Tr, class Emit>
     [[gnu::noinline]] void walk_linear_ool_(const DpBuffer& buf, Emit& emit) const { walk_linear_impl<Tr>(buf, emit); }
+    // The walk's diagonal H read, always inline.  gcc 15 outlined rat() there in the int16
+    // Local inter-pair walk (refused for large-function-growth in the worker): a call and four
+    // spills a step, dna100 int16 linear Local path +3.2 % instructions (1.08-1.10x on solace).
+    // All five H reads inline instead cost more (int32 linear Local +5 %, gcc 16).
+    template <class V>
+    [[gnu::always_inline]] typename V::value_type hat_(const V& t, int i, int j) const {
+        return t[cell_index(i, j)];
+    }
     // Tr: read each row's extend (row_ge_b) rather than one hoisted value — a template
     // parameter, so the untracked walk is the code it always was.
     template <bool Tr, class Emit>
@@ -2672,7 +2680,7 @@ private:
                 if constexpr (AM == AlignMode::Local)
                     if (rat(buf.H, i, j) <= 0.0) break;
                 if (i > 0 && j > 0 &&
-                    rat(buf.H, i, j) == rat(buf.H, i-1, j-1) + (Tr ? subT(i, j) : subTu(i, j)))
+                    rat(buf.H, i, j) == hat_(buf.H, i-1, j-1) + (Tr ? subT(i, j) : subTu(i, j)))
                     k = 0;
                 else if (i > 0 && (j == 0 || rat(buf.H, i, j) == rat(buf.H, i-1, j) -
                                                  (Tr ? tgeb_[static_cast<size_t>(i)]
