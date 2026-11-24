@@ -411,14 +411,17 @@ endif()
 
 if (NWGRAD_BUILD_TESTS)
     # ── C++ unit tests (Catch2 v2, vendored single header) ───────────────────────
-    # Sanitizer builds under Ninja compile the level TUs one at a time (a job pool of 1)
+    # gcc sanitizer builds under Ninja compile the level TUs one at a time (a job pool of 1)
     # while the tests build beside them: under ASan+UBSan at -O0 each level TU peaks at
-    # 6-8 GB (gcc 16: level_avx512 8.0, level_avx2 7.2, level_baseline 6.5, level_sse4
-    # 6.2 GB), so -j2 pairing two of them exhausted the 16 GB CI runner ("lost
-    # communication with the server", or make "Terminated").  Release builds and other
-    # generators compile them as before.
+    # 6-8 GB with gcc (16: level_avx512 8.0, level_avx2 7.2, level_baseline 6.5,
+    # level_sse4 6.2 GB), so -j2 pairing two of them exhausted the 16 GB CI runner ("lost
+    # communication with the server", or make "Terminated").  Not clang: its level TUs
+    # peak at 4.5 GB (22: level_avx512 4.3, level_avx2 4.0), and those two take hours each,
+    # so serializing them doubled its CI build (1h51 -> 3h37, then the 6 h job limit).
+    # Release builds and other generators compile them as before.
     set(NWGRAD_TEST_LEVEL_SOURCES ${NWGRAD_LEVEL_SOURCES})
-    if (NWGRAD_SANITIZE AND CMAKE_GENERATOR MATCHES "Ninja" AND NWGRAD_LEVEL_SOURCES)
+    if (NWGRAD_SANITIZE AND CMAKE_GENERATOR MATCHES "Ninja" AND NWGRAD_LEVEL_SOURCES
+        AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
         set_property(GLOBAL APPEND PROPERTY JOB_POOLS nwgrad_san_levels=1)
         add_library(nwgrad_tests_levels OBJECT ${NWGRAD_LEVEL_SOURCES})
         set_property(TARGET nwgrad_tests_levels PROPERTY JOB_POOL_COMPILE nwgrad_san_levels)
