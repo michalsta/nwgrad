@@ -636,7 +636,14 @@ struct Aligner {
     template <class Emit>
     [[gnu::always_inline]] void path_walk_(const DpBuffer& buf, Emit&& emit, int& i0, int& j0,
                                            std::vector<int>* gj) const {
+#if defined(__aarch64__) || defined(_M_ARM64)
+        // aarch64: the linear Global walk stays in its caller, its loop in a function of its own
+        // (walk_linear_ool_), main's shape there: out of line here, protein L100 int32 linear
+        // Global path ran 1.017x main on M1 with the same instruction count.
+        if constexpr (GM == GapModel::Linear && AM == AlignMode::Glocal)
+#else
         if constexpr (GM == GapModel::Linear && AM != AlignMode::Local)
+#endif
             path_walk_ool_(buf, emit, i0, j0, gj);
         else
             path_walk_body_(buf, emit, i0, j0, gj);
@@ -2636,9 +2643,18 @@ private:
     // fill's max chose it, so both give the same walk, ties included.
     template <class Emit>
     void walk_linear(const DpBuffer& buf, Emit&& emit) const {
+#if defined(__aarch64__) || defined(_M_ARM64)
+        if constexpr (AM == AlignMode::Global) {   // aarch64: the walk its own function, as main's (see path_walk_)
+            if (tr_) walk_linear_ool_<true>(buf, emit);
+            else     walk_linear_ool_<false>(buf, emit);
+            return;
+        }
+#endif
         if (tr_) walk_linear_impl<true>(buf, emit);
         else     walk_linear_impl<false>(buf, emit);
     }
+    template <bool Tr, class Emit>
+    [[gnu::noinline]] void walk_linear_ool_(const DpBuffer& buf, Emit& emit) const { walk_linear_impl<Tr>(buf, emit); }
     // Tr: read each row's extend (row_ge_b) rather than one hoisted value — a template
     // parameter, so the untracked walk is the code it always was.
     template <bool Tr, class Emit>
