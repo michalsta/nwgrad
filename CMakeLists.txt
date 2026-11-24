@@ -411,6 +411,27 @@ endif()
 
 if (NWGRAD_BUILD_TESTS)
     # ── C++ unit tests (Catch2 v2, vendored single header) ───────────────────────
+    # Sanitizer builds under Ninja compile the level TUs one at a time (a job pool of 1)
+    # while the tests build beside them: under ASan+UBSan at -O0 each level TU peaks at
+    # 6-8 GB (gcc 16: level_avx512 8.0, level_avx2 7.2, level_baseline 6.5, level_sse4
+    # 6.2 GB), so -j2 pairing two of them exhausted the 16 GB CI runner ("lost
+    # communication with the server", or make "Terminated").  Release builds and other
+    # generators compile them as before.
+    set(NWGRAD_TEST_LEVEL_SOURCES ${NWGRAD_LEVEL_SOURCES})
+    if (NWGRAD_SANITIZE AND CMAKE_GENERATOR MATCHES "Ninja" AND NWGRAD_LEVEL_SOURCES)
+        set_property(GLOBAL APPEND PROPERTY JOB_POOLS nwgrad_san_levels=1)
+        add_library(nwgrad_tests_levels OBJECT ${NWGRAD_LEVEL_SOURCES})
+        set_property(TARGET nwgrad_tests_levels PROPERTY JOB_POOL_COMPILE nwgrad_san_levels)
+        target_include_directories(nwgrad_tests_levels PRIVATE src/nwgrad/cpp/nwgrad tests/cpp)
+        target_compile_features(nwgrad_tests_levels PRIVATE cxx_std_20)
+        target_compile_options(nwgrad_tests_levels PRIVATE
+            $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall -Wextra> ${NWGRAD_SANITIZE_FLAGS})
+        target_compile_definitions(nwgrad_tests_levels PRIVATE
+            _GLIBCXX_ASSERTIONS
+            $<$<CXX_COMPILER_ID:Clang,AppleClang>:_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_DEBUG>
+            ${NWGRAD_SANITIZE_DEFS})
+        set(NWGRAD_TEST_LEVEL_SOURCES $<TARGET_OBJECTS:nwgrad_tests_levels>)
+    endif()
     add_executable(nwgrad_tests
         tests/cpp/main.cpp
         tests/cpp/test_subst_matrix.cpp
@@ -443,7 +464,7 @@ if (NWGRAD_BUILD_TESTS)
         tests/cpp/test_linear_striped.cpp
         tests/cpp/test_grid.cpp
         tests/cpp/test_profile_build.cpp
-        ${NWGRAD_LEVEL_SOURCES}   # per-ISA kernel TUs, so kernel="simd" exercises the dispatched striped path
+        ${NWGRAD_TEST_LEVEL_SOURCES}   # per-ISA kernel TUs, so kernel="simd" exercises the dispatched striped path
     )
     target_include_directories(nwgrad_tests PRIVATE
         src/nwgrad/cpp/nwgrad
