@@ -3889,6 +3889,14 @@ did at the limit, and the walks got slower. So the split pins those choices in t
   inline for Local. Out of line, int32 linear Local path costs +5-6 % instructions: the sink's run state
   is loaded and stored at every move. Inline in the inter-pair worker, Global/Glocal cost +1-2.4 %: register
   moves around each `rat()` call.
+- The affine Glocal path walk in float32 / double (x86) is a walk of its own, `walk_affine_glocal_`
+  (out of line, `kPathWalkGlocalOwn_`). Through `walk_affine_impl`, gcc 15 ran float32 affine Glocal path
+  +2.1-2.3 % instructions over main on solace (AVX-512). The walk reloaded the score tables' pointers at every
+  move, because the path sink's stores may alias them, and it stored the start cell at every move. Its own
+  walk keeps the tables and the emit in locals and returns the start cell: 1.7-3.9 % under main (sse4, gcc 15
+  and 16). Inlined into the inter-pair worker, with every emit inline as main had it, the walk cost +1.5-2 %
+  instead. The other walks keep `walk_affine_impl`: routing it through a shared always-inline body changed
+  how gcc compiled every walk. aarch64 keeps `walk_affine_impl` too, as gated on M1.
 
 ### Python bindings (`py_exports.cpp`)
 
