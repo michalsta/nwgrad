@@ -648,15 +648,13 @@ struct Aligner {
         else
             path_walk_body_(buf, emit, i0, j0, gj);
     }
-    // Floating-point affine Glocal (x86): the walk inline, emits included, as in main.  Out of
-    // line (walk_affine_impl) the path sink's run state and the start cell (ci, cj), reached
-    // through the emit's references, were loaded and stored at every move, plus a call per gap
-    // move: float32 affine Glocal path +2.3 % instructions on mirna, +2.1 % dna100 (gcc 15,
-    // AVX-512; the same ~650 instructions per dna100 pair at every level), double +0.5-0.7 %.
+    // Affine Glocal in the floating types: the path walk is walk_affine_glocal_ (see there).  x86
+    // only: aarch64 keeps walk_affine_impl, as gated on M1.
 #if defined(__aarch64__) || defined(_M_ARM64)
-    static constexpr bool kPathWalkAffineInline_ = false;
+    static constexpr bool kPathWalkGlocalOwn_ = false;
 #else
-    static constexpr bool kPathWalkAffineInline_ = std::is_floating_point_v<T> && AM == AlignMode::Glocal;
+    static constexpr bool kPathWalkGlocalOwn_ = std::is_floating_point_v<T> && GM == GapModel::Affine &&
+                                                AM == AlignMode::Glocal;
 #endif
     template <class Emit>
     [[gnu::noinline]] void path_walk_ool_(const DpBuffer& buf, Emit& emit, int& i0, int& j0,
@@ -686,10 +684,22 @@ struct Aligner {
                 ci = (k == 2) ? i : i - 1;
                 cj = (k == 1) ? j : j - 1;
             });
+        } else if constexpr (kPathWalkGlocalOwn_) {
+            if (gj) guide_affine_init(*gj);
+            int* const g = gj ? gj->data() : nullptr;
+            const std::pair<int, int> end = walk_affine_glocal_path_(buf, [&emit, g](TBTable st, int i, int j, bool) {
+                const uint8_t k = st == TBTable::M ? 0 : st == TBTable::X ? 1 : 2;
+                emit(k);
+                if (g) {
+                    if (k == 0)      g[i - 1] = j - 1;
+                    else if (k == 1) g[i - 1] = j;
+                }
+            });
+            ci = end.first; cj = end.second;
         } else {
             ci = best_i_; cj = best_j_;
             if (gj) guide_affine_init(*gj);
-            walk_affine<kPathWalkAffineInline_>(buf, [&](TBTable st, int i, int j, bool) {
+            walk_affine(buf, [&](TBTable st, int i, int j, bool) {
                 const uint8_t k = st == TBTable::M ? 0 : st == TBTable::X ? 1 : 2;
                 emit(k);
                 if (gj) {
@@ -2789,27 +2799,14 @@ private:
     // end of the table.  That was a segfault, not a suboptimal score (realign_banded:
     // "A"*22 vs "C"*87 at band<=32).  At a border only one move is legal; forcing it is
     // what a well-formed DP would have chosen anyway.
-    //
-    // Inl: the walk in its caller, every emit inline (main's shape before the engine units),
-    // for a caller that keeps the emit's state in registers (path_walk_body_, see there).
-    template <bool Inl = false, class Emit>
+    template <class Emit>
     void walk_affine(const DpBuffer& buf, Emit&& emit) const {
-        if constexpr (Inl) {
-            if (tr_) {
-                if (pointers_) walk_affine_body_<true, true, true>(buf, emit);
-                else           walk_affine_body_<false, true, true>(buf, emit);
-            } else {
-                if (pointers_) walk_affine_body_<true, false, true>(buf, emit);
-                else           walk_affine_body_<false, false, true>(buf, emit);
-            }
+        if (tr_) {
+            if (pointers_) walk_affine_impl<true, true>(buf, emit);
+            else           walk_affine_impl<false, true>(buf, emit);
         } else {
-            if (tr_) {
-                if (pointers_) walk_affine_impl<true, true>(buf, emit);
-                else           walk_affine_impl<false, true>(buf, emit);
-            } else {
-                if (pointers_) walk_affine_impl<true, false>(buf, emit);
-                else           walk_affine_impl<false, false>(buf, emit);
-            }
+            if (pointers_) walk_affine_impl<true, false>(buf, emit);
+            else           walk_affine_impl<false, false>(buf, emit);
         }
     }
 
@@ -2837,10 +2834,6 @@ private:
     // outline rat(): float32 / double affine Local path cells +1-2 % instructions (sse4).
     template <bool Ptr, bool Tr, class Emit>
     [[gnu::noinline]] void walk_affine_impl(const DpBuffer& buf, Emit& emit) const {
-        walk_affine_body_<Ptr, Tr, false>(buf, emit);
-    }
-    template <bool Ptr, bool Tr, bool Inl, class Emit>
-    [[gnu::always_inline]] void walk_affine_body_(const DpBuffer& buf, Emit& emit) const {
         auto from_code = [](unsigned char c) {
             return c == 1 ? TBTable::X : (c == 2 ? TBTable::Y : TBTable::M);
         };
@@ -2891,8 +2884,7 @@ private:
                        prev = argmax(nw_sub(nw_sub(buf.VM[k], go_b), ge_b),
                                      nw_sub(buf.VX[k], ge_b),
                                      nw_sub(nw_sub(buf.VY[k], go_b), ge_b)); }
-                if constexpr (Inl) emit(TBTable::X, i, j, prev != TBTable::X);
-                else               emit_gap_(emit, TBTable::X, i, j, prev != TBTable::X);
+                emit_gap_(emit, TBTable::X, i, j, prev != TBTable::X);
                 --i;
             } else {                          // gap in A: advance j, gap_a penalties
                 if constexpr (Tr) { go_a = tgoa_[static_cast<size_t>(i)]; ge_a = tgea_[static_cast<size_t>(i)]; }
@@ -2901,12 +2893,91 @@ private:
                        prev = argmax(nw_sub(nw_sub(buf.VM[k], go_a), ge_a),
                                      nw_sub(nw_sub(buf.VX[k], go_a), ge_a),
                                      nw_sub(buf.VY[k], ge_a)); }
-                if constexpr (Inl) emit(TBTable::Y, i, j, prev != TBTable::Y);
-                else               emit_gap_(emit, TBTable::Y, i, j, prev != TBTable::Y);
+                emit_gap_(emit, TBTable::Y, i, j, prev != TBTable::Y);
                 --j;
             }
             tbl = prev;
         }
+    }
+
+    // The Glocal walk of path_walk_body_ in the floating types (kPathWalkGlocalOwn_): walk_affine's
+    // moves, returning the start cell (where the last move left from) instead of the emit tracking it.
+    // Its own function, so walk_affine_impl and every other walk compile as before.  Against
+    // walk_affine_impl with path_walk_body_'s emit, sse4 instructions per pair vs main ea93737
+    // (mirna / dna100): float32 Glocal path +0.8 / +0.6 % -> -3.0 / -1.7 % (gcc 15), +0.1 / +0.3 %
+    // -> -3.9 / -2.0 % (gcc 16); double +0.0 / +0.1 % -> -2.2 / -1.1 % (gcc 15).  The ~600
+    // instructions per dna100 pair it saves are the same at every level (the walk is scalar), so
+    // a larger share at AVX-512, where gcc 15 had the cell +2.1 %.  What it saves:
+    // - the score tables' data pointers held in locals (vm, vx, vy): read through buf, they were
+    //   reloaded at every move, since the path sink's stores (a pointer among them) may alias them;
+    // - the emit copied into a local (e), which no call sees, so its captures stay in registers;
+    // - no (ci, cj) stores at every move, and the guide's data pointer captured by value.
+    // Inline in the inter-pair worker, and with all of walk_affine_impl's emits inline there (main's
+    // shape), it ran +1.5-2 % instead.
+    template <class Emit>
+    std::pair<int, int> walk_affine_glocal_path_(const DpBuffer& buf, Emit&& emit) const {
+        if (tr_) {
+            if (pointers_) return walk_affine_glocal_<true, true>(buf, emit);
+            else           return walk_affine_glocal_<false, true>(buf, emit);
+        } else {
+            if (pointers_) return walk_affine_glocal_<true, false>(buf, emit);
+            else           return walk_affine_glocal_<false, false>(buf, emit);
+        }
+    }
+    template <bool Ptr, bool Tr, class Emit>
+    [[gnu::noinline]] std::pair<int, int> walk_affine_glocal_(const DpBuffer& buf, Emit& emit) const {
+        static_assert(AM == AlignMode::Glocal);
+        auto from_code = [](unsigned char c) {
+            return c == 1 ? TBTable::X : (c == 2 ? TBTable::Y : TBTable::M);
+        };
+        auto argmax = [](T vm, T vx, T vy) {
+            if (vm >= vx && vm >= vy) return TBTable::M;
+            return vx >= vy ? TBTable::X : TBTable::Y;
+        };
+        T go_a = static_cast<T>(params_->gap_open_a);
+        T ge_a = static_cast<T>(params_->gap_extend_a);
+        T go_b = static_cast<T>(params_->gap_open_b);
+        T ge_b = static_cast<T>(params_->gap_extend_b);
+
+        const T* const vm = buf.VM.data();
+        const T* const vx = buf.VX.data();
+        const T* const vy = buf.VY.data();
+        Emit e = emit;
+        int i = best_i_, j = best_j_;
+        TBTable tbl = best_tbl_;
+        while (i != 0) {                      // row 0: a free start
+            if (j == 0) { emit_border_run_(emit, TBTable::X, i, j); return {0, 0}; }   // column 0: up to the origin
+            unsigned char c = 0;
+            if constexpr (Ptr) c = affine_codes(buf.DM, i, j);
+            TBTable prev;
+            if (tbl == TBTable::M) {
+                if constexpr (Ptr) prev = from_code(c & 3);
+                else { const size_t k = cell_index(i-1, j-1);
+                       prev = argmax(vm[k], vx[k], vy[k]); }
+                e(TBTable::M, i, j, false);
+                --i; --j;
+            } else if (tbl == TBTable::X) {   // gap in B: advance i, gap_b penalties
+                if constexpr (Tr) { go_b = tgob_[static_cast<size_t>(i)]; ge_b = tgeb_[static_cast<size_t>(i)]; }
+                if constexpr (Ptr) prev = from_code((c >> 2) & 3);
+                else { const size_t k = cell_index(i-1, j);
+                       prev = argmax(nw_sub(nw_sub(vm[k], go_b), ge_b),
+                                     nw_sub(vx[k], ge_b),
+                                     nw_sub(nw_sub(vy[k], go_b), ge_b)); }
+                e(TBTable::X, i, j, false);
+                --i;
+            } else {                          // gap in A: advance j, gap_a penalties
+                if constexpr (Tr) { go_a = tgoa_[static_cast<size_t>(i)]; ge_a = tgea_[static_cast<size_t>(i)]; }
+                if constexpr (Ptr) prev = from_code(c >> 4);
+                else { const size_t k = cell_index(i, j-1);
+                       prev = argmax(nw_sub(nw_sub(vm[k], go_a), ge_a),
+                                     nw_sub(nw_sub(vx[k], go_a), ge_a),
+                                     nw_sub(vy[k], ge_a)); }
+                e(TBTable::Y, i, j, false);
+                --j;
+            }
+            tbl = prev;
+        }
+        return {i, j};
     }
 
     // gj[i] = the column after consuming i residues of A: set by M and X moves (Y moves
