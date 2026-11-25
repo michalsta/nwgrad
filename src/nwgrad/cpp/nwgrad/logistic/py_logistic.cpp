@@ -5,6 +5,8 @@
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/string.h>   // __repr__ returns std::string
 
+// The batch's members are compiled in engine_<type>.cpp (see seq_pair_batch.hpp).
+#define NWGRAD_ENGINE_EXTERN 1
 #include "logistic.hpp"
 
 namespace nb = nanobind;

@@ -3823,8 +3823,8 @@ starts at a fixed offset within a page: the offset that unit had in main df4ae0a
   growing, cold code or static constructors changing: none of them moves another unit's kernels.
 - Each block costs at most 4 KiB of padding.
 
-**What "units" does not fix: changes inside a unit.** A branch that edits py_exports.cpp (aligner.hpp,
-batch_engine.hpp) moves the engine code within that unit, and so changes its offset from every kernel.
+**What "units" does not fix: changes inside a unit.** A branch that edits the engine (aligner.hpp,
+batch_engine.hpp; since 2026-11-21 compiled in the engine units, "The engine units" below) moves the engine code within that unit, and so changes its offset from every kernel.
 Main's 448-byte case was exactly that kind of relative move. Treat any cell that such a branch moves
 by under ~10-13 % as unproven. Instead, compare it on two layouts: the knob below.
 
@@ -3854,6 +3854,49 @@ An A/A control run from one wrapper cannot see this. Compare builds through iden
 - `text`: at the head of the bindings;
 - `mid`: between the bindings and the level units;
 - `grp`: at the head of the avx2 inter-pair float32 group (groups layout).
+
+### The engine units (`engine_<type>.cpp`, branch `proto/engine-tu`, 2026-11-21)
+
+The Python extension compiles the engine apart from the bindings:
+- `py_exports.cpp` defines `NWGRAD_ENGINE_EXTERN` before its includes. It then sees only the
+  *declarations* of `SeqPairBatchT` / `SeqPairT`'s engine-facing members (seq_pair_batch.hpp) and of the
+  single-pair convenience entries `pair_score` / `pair_hard_grad` / `pair_soft_grad` (pair_entry.hpp),
+  plus `extern template` for the five scalar types. It instantiates no BatchEngine or Aligner code.
+  `logistic/py_logistic.cpp` does the same.
+- `engine_f32.cpp`, `engine_f64.cpp`, `engine_i16.cpp`, `engine_i32.cpp`, `engine_i64.cpp` (body
+  `engine_common.inc`) explicitly instantiate those classes and entries, one scalar type per unit. Every
+  BatchEngine, Aligner, scalar fill, walk and traceback the extension runs is compiled there.
+- A plain `#include "seq_pair_batch.hpp"` (header-only consumers, the C++ tests) sees the bodies too:
+  they are in the header's second half, `inline` as when they were written in the class.
+- Linked ahead of the bindings, so the engine's copy of a COMDAT function both use is the one kept.
+- Layout (`tools/gen_text_ld.py`): the five engine units share ONE block, where py_exports' block was,
+  with the placement knob's pad at its start, so `NWGRAD_PLACEMENT_SHIFT_AT=mid` still moves all of the
+  engine against the kernels. The bindings have a block of their own after it.
+
+**Why.** gcc decides inlining against a whole-unit budget (`--param inline-unit-growth`, 40 %: the unit
+may grow to 1.4x its size before inlining). The bindings unit used to hold the engine and sat at that
+limit, so any code a change added to it made gcc outline hot engine calls in code the change never
+touched: `Aligner::rat()` in the inter-pair tracebacks, +0.5-1 % instructions and 1-2 % time in
+unrelated cells (#43, #50, #52, #53 each hit it; each was worked around by moving its own new code to
+another unit). Now the bindings' code takes no part in the engine's inlining decisions.
+
+**Kept as at the old unit's limit.** The engine units are compiled with `--param inline-unit-growth=1000`
+(gcc, `NWGRAD_ENGINE_INLINE_UNIT_GROWTH`). With that much room gcc inlines more of the path walks than it
+did at the limit, and the walks got slower. So the split pins those choices in the source:
+- The affine walk is out of line (`walk_affine_impl`, plus `emit_border_run_` and `emit_gap_`), and so is
+  the guide reset (`nw_guide_reset`).
+- The linear path walk is out of line for Global and Glocal (`path_walk_ool_`, sink by reference), and
+  inline for Local. Out of line, int32 linear Local path costs +5-6 % instructions: the sink's run state
+  is loaded and stored at every move. Inline in the inter-pair worker, Global/Glocal cost +1-2.4 %: register
+  moves around each `rat()` call.
+- The affine Glocal path walk in float32 / double (x86) is a walk of its own, `walk_affine_glocal_`
+  (out of line, `kPathWalkGlocalOwn_`). Through `walk_affine_impl`, gcc 15 ran float32 affine Glocal path
+  +2.1-2.3 % instructions over main on solace (AVX-512). The walk reloaded the score tables' pointers at every
+  move, because the path sink's stores may alias them, and it stored the start cell at every move. Its own
+  walk keeps the tables and the emit in locals and returns the start cell: 1.7-3.9 % under main (sse4, gcc 15
+  and 16). Inlined into the inter-pair worker, with every emit inline as main had it, the walk cost +1.5-2 %
+  instead. The other walks keep `walk_affine_impl`: routing it through a shared always-inline body changed
+  how gcc compiled every walk. aarch64 keeps `walk_affine_impl` too, as gated on M1.
 
 ### Python bindings (`py_exports.cpp`)
 
