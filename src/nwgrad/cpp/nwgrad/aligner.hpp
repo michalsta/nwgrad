@@ -648,6 +648,16 @@ struct Aligner {
         else
             path_walk_body_(buf, emit, i0, j0, gj);
     }
+    // Floating-point affine Glocal (x86): the walk inline, emits included, as in main.  Out of
+    // line (walk_affine_impl) the path sink's run state and the start cell (ci, cj), reached
+    // through the emit's references, were loaded and stored at every move, plus a call per gap
+    // move: float32 affine Glocal path +2.3 % instructions on mirna, +2.1 % dna100 (gcc 15,
+    // AVX-512; the same ~650 instructions per dna100 pair at every level), double +0.5-0.7 %.
+#if defined(__aarch64__) || defined(_M_ARM64)
+    static constexpr bool kPathWalkAffineInline_ = false;
+#else
+    static constexpr bool kPathWalkAffineInline_ = std::is_floating_point_v<T> && AM == AlignMode::Glocal;
+#endif
     template <class Emit>
     [[gnu::noinline]] void path_walk_ool_(const DpBuffer& buf, Emit& emit, int& i0, int& j0,
                                           std::vector<int>* gj) const {
@@ -679,7 +689,7 @@ struct Aligner {
         } else {
             ci = best_i_; cj = best_j_;
             if (gj) guide_affine_init(*gj);
-            walk_affine(buf, [&](TBTable st, int i, int j, bool) {
+            walk_affine<kPathWalkAffineInline_>(buf, [&](TBTable st, int i, int j, bool) {
                 const uint8_t k = st == TBTable::M ? 0 : st == TBTable::X ? 1 : 2;
                 emit(k);
                 if (gj) {
@@ -2779,14 +2789,27 @@ private:
     // end of the table.  That was a segfault, not a suboptimal score (realign_banded:
     // "A"*22 vs "C"*87 at band<=32).  At a border only one move is legal; forcing it is
     // what a well-formed DP would have chosen anyway.
-    template <class Emit>
+    //
+    // Inl: the walk in its caller, every emit inline (main's shape before the engine units),
+    // for a caller that keeps the emit's state in registers (path_walk_body_, see there).
+    template <bool Inl = false, class Emit>
     void walk_affine(const DpBuffer& buf, Emit&& emit) const {
-        if (tr_) {
-            if (pointers_) walk_affine_impl<true, true>(buf, emit);
-            else           walk_affine_impl<false, true>(buf, emit);
+        if constexpr (Inl) {
+            if (tr_) {
+                if (pointers_) walk_affine_body_<true, true, true>(buf, emit);
+                else           walk_affine_body_<false, true, true>(buf, emit);
+            } else {
+                if (pointers_) walk_affine_body_<true, false, true>(buf, emit);
+                else           walk_affine_body_<false, false, true>(buf, emit);
+            }
         } else {
-            if (pointers_) walk_affine_impl<true, false>(buf, emit);
-            else           walk_affine_impl<false, false>(buf, emit);
+            if (tr_) {
+                if (pointers_) walk_affine_impl<true, true>(buf, emit);
+                else           walk_affine_impl<false, true>(buf, emit);
+            } else {
+                if (pointers_) walk_affine_impl<true, false>(buf, emit);
+                else           walk_affine_impl<false, false>(buf, emit);
+            }
         }
     }
 
@@ -2814,6 +2837,10 @@ private:
     // outline rat(): float32 / double affine Local path cells +1-2 % instructions (sse4).
     template <bool Ptr, bool Tr, class Emit>
     [[gnu::noinline]] void walk_affine_impl(const DpBuffer& buf, Emit& emit) const {
+        walk_affine_body_<Ptr, Tr, false>(buf, emit);
+    }
+    template <bool Ptr, bool Tr, bool Inl, class Emit>
+    [[gnu::always_inline]] void walk_affine_body_(const DpBuffer& buf, Emit& emit) const {
         auto from_code = [](unsigned char c) {
             return c == 1 ? TBTable::X : (c == 2 ? TBTable::Y : TBTable::M);
         };
@@ -2864,7 +2891,8 @@ private:
                        prev = argmax(nw_sub(nw_sub(buf.VM[k], go_b), ge_b),
                                      nw_sub(buf.VX[k], ge_b),
                                      nw_sub(nw_sub(buf.VY[k], go_b), ge_b)); }
-                emit_gap_(emit, TBTable::X, i, j, prev != TBTable::X);
+                if constexpr (Inl) emit(TBTable::X, i, j, prev != TBTable::X);
+                else               emit_gap_(emit, TBTable::X, i, j, prev != TBTable::X);
                 --i;
             } else {                          // gap in A: advance j, gap_a penalties
                 if constexpr (Tr) { go_a = tgoa_[static_cast<size_t>(i)]; ge_a = tgea_[static_cast<size_t>(i)]; }
@@ -2873,7 +2901,8 @@ private:
                        prev = argmax(nw_sub(nw_sub(buf.VM[k], go_a), ge_a),
                                      nw_sub(nw_sub(buf.VX[k], go_a), ge_a),
                                      nw_sub(buf.VY[k], ge_a)); }
-                emit_gap_(emit, TBTable::Y, i, j, prev != TBTable::Y);
+                if constexpr (Inl) emit(TBTable::Y, i, j, prev != TBTable::Y);
+                else               emit_gap_(emit, TBTable::Y, i, j, prev != TBTable::Y);
                 --j;
             }
             tbl = prev;
