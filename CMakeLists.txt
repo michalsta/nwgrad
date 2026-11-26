@@ -392,6 +392,24 @@ if (NWGRAD_SANITIZE OR NWGRAD_SANITIZE_EXT)
         # every TU touching the vector must agree, and here all do.
         list(APPEND NWGRAD_SANITIZE_DEFS _GLIBCXX_SANITIZE_VECTOR)
     endif()
+
+    # The sanitizer test binary (not the extension) is linked with section GC under gcc.
+    # gcc puts every UBSan check's static data (.Lubsan_data: source location and type
+    # descriptors) in the TU's one .data.rel.local, outside the COMDAT group of the inline
+    # function it belongs to.  The linker keeps one copy of each header template the test
+    # TUs share, but every TU's check data for all of them: under -O0 ASan+UBSan that data
+    # was the largest part of nwgrad_tests (test_interpair.o: 58.7 MB of it, 35 MB of
+    # code), and with the semi-global level TUs the image passed 2 GiB, which a
+    # PC-relative reference from the start of .text to the end of .bss cannot span (gcc
+    # 15, ubuntu-26.04: libgcc's __cpu_indicator_init -> __cpu_model, "relocation
+    # truncated to fit").  -fdata-sections gives each datum its own section, so
+    # --gc-sections drops those of the discarded copies.
+    set(NWGRAD_SANITIZE_TEST_GC_FLAGS "")
+    set(NWGRAD_SANITIZE_TEST_GC_LINK "")
+    if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        set(NWGRAD_SANITIZE_TEST_GC_FLAGS -ffunction-sections -fdata-sections)
+        set(NWGRAD_SANITIZE_TEST_GC_LINK -Wl,--gc-sections)
+    endif()
 endif()
 
 if (NWGRAD_SANITIZE_EXT)
@@ -428,7 +446,8 @@ if (NWGRAD_BUILD_TESTS)
         target_include_directories(nwgrad_tests_levels PRIVATE src/nwgrad/cpp/nwgrad tests/cpp)
         target_compile_features(nwgrad_tests_levels PRIVATE cxx_std_20)
         target_compile_options(nwgrad_tests_levels PRIVATE
-            $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall -Wextra> ${NWGRAD_SANITIZE_FLAGS})
+            $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall -Wextra> ${NWGRAD_SANITIZE_FLAGS}
+            ${NWGRAD_SANITIZE_TEST_GC_FLAGS})
         target_compile_definitions(nwgrad_tests_levels PRIVATE
             _GLIBCXX_ASSERTIONS
             $<$<CXX_COMPILER_ID:Clang,AppleClang>:_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_DEBUG>
@@ -507,8 +526,10 @@ if (NWGRAD_BUILD_TESTS)
 
         # Sanitizers must be passed to both the compile and the link step.
         if (NWGRAD_SANITIZE)
-            target_compile_options(${test_target} PRIVATE ${NWGRAD_SANITIZE_FLAGS})
-            target_link_options(${test_target} PRIVATE ${NWGRAD_SANITIZE_FLAGS})
+            target_compile_options(${test_target} PRIVATE ${NWGRAD_SANITIZE_FLAGS}
+                ${NWGRAD_SANITIZE_TEST_GC_FLAGS})
+            target_link_options(${test_target} PRIVATE ${NWGRAD_SANITIZE_FLAGS}
+                ${NWGRAD_SANITIZE_TEST_GC_LINK})
             target_compile_definitions(${test_target} PRIVATE ${NWGRAD_SANITIZE_DEFS})
         endif()
     endforeach()
