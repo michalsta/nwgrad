@@ -649,14 +649,28 @@ struct Aligner {
         // aarch64: the linear Global walk stays in its caller, its loop in a function of its own
         // (walk_linear_ool_), main's shape there: out of line here, protein L100 int32 linear
         // Global path ran 1.017x main on M1 with the same instruction count.
-        if constexpr (GM == GapModel::Linear && AM == AlignMode::Glocal)
+        // Linear Glocal: the end set chosen here, each walk its own out-of-line function, so
+        // glocal's is main's function (its fixed-ends loop alone).  With both walks in one
+        // function (9.8 KB instead of 5.4) the M1 ran mirna int16 linear Glocal path 1.0-1.6 %
+        // slower than main at the same instructions and taken branches.
+        if constexpr (GM == GapModel::Linear && AM == AlignMode::Glocal) {
+            if (sg_is_glocal_()) path_walk_ool_ws_<0>(buf, emit, i0, j0, gj);
+            else                 path_walk_ool_ws_<1>(buf, emit, i0, j0, gj);
+        } else
+            path_walk_body_(buf, emit, i0, j0, gj);
+    }
+    template <int WS, class Emit>
+    [[gnu::noinline]] void path_walk_ool_ws_(const DpBuffer& buf, Emit& emit, int& i0, int& j0,
+                                             std::vector<int>* gj) const {
+        path_walk_body_<WS>(buf, emit, i0, j0, gj);
+    }
 #else
         if constexpr (GM == GapModel::Linear && AM != AlignMode::Local)
-#endif
             path_walk_ool_(buf, emit, i0, j0, gj);
         else
             path_walk_body_(buf, emit, i0, j0, gj);
     }
+#endif
     // Affine Glocal in the floating types: the path walk is walk_affine_glocal_ (see there).  x86
     // only: aarch64 keeps walk_affine_impl, as gated on M1.  The other semi-global ends: their
     // replayed walk (walk_affine_glocal_path_).
@@ -671,7 +685,13 @@ struct Aligner {
                                           std::vector<int>* gj) const {
         path_walk_body_(buf, emit, i0, j0, gj);
     }
+    // WS (aarch64): the linear walk's end set, -1 = chosen in walk_linear (at run time), 0 =
+    // glocal's (fixed), 1 = the runtime free ends (path_walk_ool_ws_).
+#if defined(__aarch64__) || defined(_M_ARM64)
+    template <int WS = -1, class Emit>
+#else
     template <class Emit>
+#endif
     [[gnu::always_inline]] void path_walk_body_(const DpBuffer& buf, Emit& emit, int& i0, int& j0,
                                                 std::vector<int>* gj) const {
         int ci = 0, cj = 0;   // the cell the last emitted move left from
@@ -685,6 +705,22 @@ struct Aligner {
                 const int i_end = (AM == AlignMode::Global) ? m_ : best_i_;
                 (*gj)[static_cast<size_t>(i_end)] = (AM == AlignMode::Global) ? n_ : best_j_;
             }
+#if defined(__aarch64__) || defined(_M_ARM64)
+            auto step = [&](int k, int i, int j) {
+                emit(static_cast<uint8_t>(k));
+                if (gj) {
+                    if (k == 0)      (*gj)[static_cast<size_t>(i - 1)] = j - 1;
+                    else if (k == 1) (*gj)[static_cast<size_t>(i - 1)] = j;
+                }
+                ci = (k == 2) ? i : i - 1;
+                cj = (k == 1) ? j : j - 1;
+            };
+            if constexpr (WS >= 0) {
+                if (tr_) walk_linear_impl<true, WS != 0>(buf, step);
+                else     walk_linear_impl<false, WS != 0>(buf, step);
+            } else
+                walk_linear(buf, std::move(step));
+#else   // (the same step, written in the call: a named closure changed gcc 16's x86 code)
             walk_linear(buf, [&](int k, int i, int j) {
                 emit(static_cast<uint8_t>(k));
                 if (gj) {
@@ -694,6 +730,7 @@ struct Aligner {
                 ci = (k == 2) ? i : i - 1;
                 cj = (k == 1) ? j : j - 1;
             });
+#endif
         } else if constexpr (kPathWalkGlocalOwn_) {
             if (gj) guide_affine_init(*gj);
             int* const g = gj ? gj->data() : nullptr;
