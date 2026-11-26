@@ -92,6 +92,20 @@ namespace NWGRAD_LVL_NAME {
 }
 #undef NWGRAD_LEVEL_NS
 
+// NWGRAD_LEVEL_PART (the C++ test build only, CMakeLists.txt NWGRAD_TEST_LEVEL_PARTS): a bit
+// mask selecting which instantiations this compile of the unit registers, so a big level unit
+// can be compiled as several smaller ones whose union is the whole unit.  Bits 0-4 are the
+// value types double, float, int16, int32, int64; bit 5 the type-free entries (int8 score
+// only, int8 inter-pair, the row block).  The kernels are function templates with internal
+// linkage, instantiated only through the addresses taken below, so a part compiles only its
+// own types' kernels.  Not defined (the extension, the wheels, every benchmark build): the
+// whole unit, exactly as before.  The soft unit is small and is never split.
+#if defined(NWGRAD_LEVEL_PART)
+#  define NWGRAD_LVL_PART_HAS(bit) ((NWGRAD_LEVEL_PART >> (bit)) & 1)
+#else
+#  define NWGRAD_LVL_PART_HAS(bit) 1
+#endif
+
 namespace {
 struct NwgradLevelRegistrar {
     // Pass bare function addresses (scalar `lea`s), never a locally-built struct: this
@@ -142,18 +156,40 @@ struct NwgradLevelRegistrar {
     }
     NwgradLevelRegistrar() {
 #if defined(NWGRAD_LEVEL_SG_TU)
+#  if NWGRAD_LVL_PART_HAS(0)
         sg<double>();
+#  endif
+#  if NWGRAD_LVL_PART_HAS(1)
         sg<float>();
+#  endif
+#  if NWGRAD_LVL_PART_HAS(2)
         sg<int16_t>();
+#  endif
+#  if NWGRAD_LVL_PART_HAS(3)
         sg<int32_t>();
+#  endif
+#  if NWGRAD_LVL_PART_HAS(4)
         sg<int64_t>();
+#  endif
 #elif defined(NWGRAD_LEVEL_INTER_TU)
+#  if NWGRAD_LVL_PART_HAS(0)
         inter<double>();
+#  endif
+#  if NWGRAD_LVL_PART_HAS(1)
         inter<float>();
+#  endif
+#  if NWGRAD_LVL_PART_HAS(2)
         inter<int16_t>();
+#  endif
+#  if NWGRAD_LVL_PART_HAS(3)
         inter<int32_t>();
+#  endif
+#  if NWGRAD_LVL_PART_HAS(4)
         inter<int64_t>();
+#  endif
+#  if NWGRAD_LVL_PART_HAS(5)
         register_level_inter8(NWGRAD_LVL_ENUM, &NWGRAD_LVL_NAME::inter8_score_entry, NWGRAD_LVL_NAME::I8W);
+#  endif
 #elif defined(NWGRAD_LEVEL_SOFT_TU)
         register_level_soft(NWGRAD_LVL_ENUM,
                             &NWGRAD_LVL_NAME::inter_soft_entry,     // inter-pair soft pass, double
@@ -163,12 +199,24 @@ struct NwgradLevelRegistrar {
                             &NWGRAD_LVL_NAME::soft_pair_linear_f,
                             &NWGRAD_LVL_NAME::soft_pair_affine_f);
 #else
+#  if NWGRAD_LVL_PART_HAS(0)
         typed<double>();
+#  endif
+#  if NWGRAD_LVL_PART_HAS(1)
         typed<float>();
+#  endif
+#  if NWGRAD_LVL_PART_HAS(2)
         typed<int16_t>();
+#  endif
+#  if NWGRAD_LVL_PART_HAS(3)
         typed<int32_t>();
+#  endif
+#  if NWGRAD_LVL_PART_HAS(4)
         typed<int64_t>();
+#  endif
+#  if NWGRAD_LVL_PART_HAS(5)
         register_level_common(NWGRAD_LVL_ENUM, NWGRAD_LVL_NAME::ROW_BLOCK, &NWGRAD_LVL_NAME::score8_entry);
+#  endif
 #endif
     }
 };
