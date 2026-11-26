@@ -12,11 +12,13 @@
 #include <string>
 #include <vector>
 
-// The Aligner's semi-global runtime-ends entries are compiled in aligner_sg.cpp, not here
-// (see Aligner::sg_run_viterbi_): this unit's inlining stays main's.
-#define NWGRAD_SG_OUT_OF_LINE 1
+// The engine is compiled in engine_<type>.cpp, not here: this unit sees the declarations of
+// SeqPairBatchT's / SeqPairT's members and of the convenience entries only, so the
+// bindings' code never enters the engine's inlining decisions (see seq_pair_batch.hpp).
+#define NWGRAD_ENGINE_EXTERN 1
 #include "align_params.hpp"
 #include "aligner.hpp"
+#include "pair_entry.hpp"
 #include "seq_pair_batch.hpp"
 
 namespace nb = nanobind;
@@ -92,7 +94,7 @@ static nb::object numpy_copy(const double* src, size_t n, std::initializer_list<
 #  define NWGRAD_COMPILER "unknown"
 #endif
 
-// ── Aligner factory: picks Full or GuideBanded at runtime. ───────────────────
+// ── Single-pair convenience functions ─────────────────────────────────────────
 
 // The `kernel=` string names the Viterbi backend: "auto" (default; best simd the CPU
 // runs), "scalar_fallback", or a named simd level ("sse2"/"sse4"/"avx2"/"avx512"/"neon").  Every
@@ -101,27 +103,10 @@ static nb::object numpy_copy(const double* src, size_t n, std::initializer_list<
 // and throws on anything unrecognised or a level this CPU cannot run — a typo that
 // silently gave you the wrong path would be undetectable.
 
-// TYPE is the Viterbi precision (float32 by default in the Python surface, double via
-// the _double-suffixed variant).  The DP buffer and Aligner take that precision; params
-// and the returned gradient stay double.
-#define WITH_ALIGNER_T(TYPE, GM, AM, band, guide_j, body)                                \
-    do {                                                                                  \
-        DpBufferT<TYPE> _buf;                                                             \
-        const int _kern = parse_backend(kernel);                                          \
-        if ((band) > 0 || !(guide_j).empty()) {                                          \
-            Aligner<GapModel::GM, AlignMode::AM, AlignBand::GuideBanded, TYPE> al;       \
-            al.set_kernel(_kern);                                                          \
-            body                                                                           \
-        } else {                                                                           \
-            Aligner<GapModel::GM, AlignMode::AM, AlignBand::Full, TYPE> al;              \
-            al.set_kernel(_kern);                                                          \
-            body                                                                           \
-        }                                                                                  \
-    } while (0)
-
-// Back-compat alias: the double-precision convenience functions still spell it this way.
-#define WITH_ALIGNER(GM, AM, band, guide_j, body) \
-    WITH_ALIGNER_T(double, GM, AM, band, guide_j, body)
+// T is the Viterbi precision (float32 by default in the Python surface, double via the
+// _double-suffixed variant, the integer types via _int16 / _int32 / _int64): pair_entry.hpp
+// runs one Aligner<GM, AM, Full or GuideBanded, T>.  Params and the returned gradient stay
+// double.
 
 // The convenience functions still take plain `str`: they validate and encode
 // against the params' alphabet here, at the boundary.  An out-of-alphabet
@@ -494,28 +479,26 @@ static void bind_convenience(nb::module_& m, const std::string& sfx) {
     "(len(seq_a)+1 entries; default: row 0 -> track[0], row i -> track[i-1]).  See\n" \
     "SeqPairBatch(seqs_a, seqs_b, params, tracks=..., gap_tracks=...).  With several sets\n" \
     "the gradient has as many."
+#define NWG_PROBLEM \
+            auto gj = make_guide(aligned_a, aligned_b); EncodedPair enc(a, b, params); \
+            const auto tk = to_track(track, "track"), gt = to_track(gap_track, "gap_track"); \
+            const PairProblem pp{enc.a, enc.b, params, band, gj, tk, gt, parse_backend(kernel)};
 #define NWG_SCORE(FN, GM, AM, DOC) \
     m.def((std::string(FN) + sfx).c_str(), \
         [](const std::string& a, const std::string& b, const AlignParams& params, int band, \
            const std::string& aligned_a, const std::string& aligned_b, const std::string& kernel, \
            nb::handle track, nb::handle gap_track) { \
-            auto gj = make_guide(aligned_a, aligned_b); EncodedPair enc(a, b, params); \
-            const auto tk = to_track(track, "track"), gt = to_track(gap_track, "gap_track"); \
-            WITH_ALIGNER_T(T, GM, AM, band, gj, { \
-                al.set_problem(enc.a, enc.b, params, band, gj, tk, gt); \
-                return al.compute_score(_buf); }); \
+            NWG_PROBLEM \
+            return pair_score<T>(GapModel::GM, AlignMode::AM, pp); \
         }, NWG_CONV_ARGS, DOC NWG_TRACK_DOC)
 #define NWG_HARD(FN, GM, AM, DOC) \
     m.def((std::string(FN) + sfx).c_str(), \
         [](const std::string& a, const std::string& b, const AlignParams& params, int band, \
            const std::string& aligned_a, const std::string& aligned_b, const std::string& kernel, \
            nb::handle track, nb::handle gap_track) { \
-            auto gj = make_guide(aligned_a, aligned_b); EncodedPair enc(a, b, params); \
-            const auto tk = to_track(track, "track"), gt = to_track(gap_track, "gap_track"); \
-            WITH_ALIGNER_T(T, GM, AM, band, gj, { \
-                al.set_problem(enc.a, enc.b, params, band, gj, tk, gt); al.compute_viterbi(_buf); \
-                AlignParams grad = AlignParams::zeros_like(params); al.hard_grad(_buf, grad); \
-                return nb::make_tuple(al.score(), grad); }); \
+            NWG_PROBLEM \
+            auto [score, grad] = pair_hard_grad<T>(GapModel::GM, AlignMode::AM, pp); \
+            return nb::make_tuple(score, std::move(grad)); \
         }, NWG_CONV_ARGS, DOC NWG_TRACK_DOC)
 #define NWG_SOFT(FN, GM, AM, DOC) \
     m.def((std::string(FN) + sfx).c_str(), \
@@ -526,11 +509,9 @@ static void bind_convenience(nb::module_& m, const std::string& sfx) {
             auto gj = make_guide(aligned_a, aligned_b); EncodedPair enc(a, b, params); \
             const auto tk = to_track(track, "track"), gt = to_track(gap_track, "gap_track"); \
             const SoftImpl si = parse_soft_impl(soft_impl); \
-            WITH_ALIGNER_T(T, GM, AM, band, gj, { \
-                al.set_soft_impl(si); al.set_soft_temperature(temperature); \
-                al.set_problem(enc.a, enc.b, params, band, gj, tk, gt); al.compute_forward_back(_buf); \
-                AlignParams grad = AlignParams::zeros_like(params); al.soft_grad(_buf, grad); \
-                return nb::make_tuple(al.log_z(), grad); }); \
+            const PairProblem pp{enc.a, enc.b, params, band, gj, tk, gt, parse_backend(kernel)}; \
+            auto [log_z, grad] = pair_soft_grad<T>(GapModel::GM, AlignMode::AM, pp, si, temperature); \
+            return nb::make_tuple(log_z, std::move(grad)); \
         }, NWG_BASE_ARGS, nb::arg("soft_impl") = "scaled", nb::arg("temperature") = 1.0, NWG_TRACK_ARGS, \
         DOC "\n\nsoft_impl: \"scaled\" (default) | \"scaled_or_log\" | \"log\" -- " \
         "see SeqPairBatch.soft_impl.\ntemperature: T > 0; returns (T*log Z(params/T), " \
@@ -561,6 +542,7 @@ static void bind_convenience(nb::module_& m, const std::string& sfx) {
     NWG_SOFT("glocal_affine_soft_grad", Affine, Glocal, "Glocal: returns (log_Z, AlignParams grad) — soft gradient (affine gap).");
     }
 #undef NWG_SCORE
+#undef NWG_PROBLEM
 #undef NWG_HARD
 #undef NWG_SOFT
 #undef NWG_CONV_ARGS
@@ -1568,6 +1550,15 @@ NB_MODULE(nwgrad_ext, m) {
               set_gate_override(gate_of(name), v);
           }, nb::arg("name"), nb::arg("value"));
     m.def("_gate_off_value", []() { return kGateOff; });
+    // The int8 score tier's counters (tests): (problems run in int8, of which overflowed).
+    // reset=True zeroes them; count=True/False switches counting (off by default).
+    m.def("_score8_stats", [](bool reset, nb::handle count) {
+              Score8Stats& st = score8_stats();
+              const auto r = std::make_pair(st.runs.load(), st.overflows.load());
+              if (reset) { st.runs.store(0); st.overflows.store(0); }
+              if (!count.is_none()) st.on.store(nb::cast<bool>(count));
+              return r;
+          }, nb::arg("reset") = false, nb::arg("count").none() = nb::none());
     // The compiled defaults of the single-valued caps (0 = no cap);
     // linear_striped_min_n is per mode, type and level (Aligner::kLinearStripedMinN).
     m.def("_gate_defaults", []() {
@@ -1589,6 +1580,10 @@ NB_MODULE(nwgrad_ext, m) {
             {"soft_ckpt_rows", int64_t(0)},   // (auto: _tuning.defaults() says so)
             {"soft_ckpt_min_bytes", int64_t(kSoftCkptMinBytes)},
             {"soft_double_ftz", int64_t(1)},
+            {"score_int8", int64_t(kScoreInt8Default)},
+            {"inter_score_small_cells", int64_t(c.i16.score_small_local)},
+            {"inter_score_int8", int64_t(kInterScoreInt8Default ? 1 : 0)},
+            {"score_int8_min_segs", int64_t(score_int8_min_segs(score_int8_lanes(be < 0 ? 0 : be), false, 4))},
             {"inter_profile_bytes", int64_t(0)},   // no cap (kInterProfileMaxBytes)
             {"inter_group_tiles", int64_t(0)}};   // (auto: _tuning.defaults() says so)
     });

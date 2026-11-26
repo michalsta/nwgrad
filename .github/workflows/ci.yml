@@ -275,15 +275,15 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install nanobind
-        run: pip install "nanobind>=3.0"
+      - name: Install nanobind and ninja
+        run: pip install "nanobind>=3.0" ninja
 
       # The DP indexes a raw double* with encoded sequence indices and the batch
       # code hands spans across threads, so out-of-bounds reads here would be
       # silent. ASan and UBSan are what make them loud.
       - name: Configure
         run: >
-          cmake -S . -B build-san -DCMAKE_BUILD_TYPE=Debug
+          cmake -S . -B build-san -G Ninja -DCMAKE_BUILD_TYPE=Debug
           -DNWGRAD_SANITIZE=ON
           -Dnanobind_DIR="$(python -m nanobind --cmake_dir)"
 
@@ -291,7 +291,11 @@ jobs:
         # -j2, not nproc: the four level TUs compiled side by side under ASan+UBSan
         # exhaust the 4-core runner's memory once the kernels grow (2026-11-05: the
         # build was killed at ~11 min on three branches that add kernel instantiations;
-        # make reports "Terminated", the job "cancelled"), where -j2 fits.
+        # make reports "Terminated", the job "cancelled"), where -j2 fits.  And -j2 itself
+        # once two of them ran together: they peak at 6-8 GB each, and the runner has 16 GB
+        # (2026-11-24, #58: "lost communication with the server").  Under Ninja, gcc's level
+        # TUs go through a job pool of 1 (CMakeLists.txt, nwgrad_tests_levels), the tests
+        # build beside them; clang's (4.5 GB at most) do not.
         run: cmake --build build-san --target nwgrad_tests -j2
 
       - name: Test

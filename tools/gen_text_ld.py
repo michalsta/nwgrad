@@ -9,8 +9,8 @@ units:  every translation unit's functions in their own block, the block startin
         a 4 KiB page: the offset each unit had in main df4ae0a's own link (UNIT_OFFSET below).  Inside a
         unit the order is the compiler's, as before, so at adoption every function of these units sits at
         exactly main's address mod 4096; afterwards a change in one unit no longer moves any other.
-groups: finer: the engine code of each (scalar type, gap model, mode), the bindings' std:: code, the rest of
-        the bindings, and each level unit's kernels of one scalar type, each group on its own page
+groups: finer: the engine code of each (scalar type, gap model, mode), the engine units' std:: code, the rest
+        of the engine units, the bindings, and each level unit's kernels of one scalar type, each group on its own page
         boundary (GROUP_OFFSET where measured).  Protects against more (a change in the bindings no longer
         moves the engines), but it is a different layout from main's: measured on nighthaven it loses
         2-8 % on some cells (AGENTS.md).
@@ -19,20 +19,23 @@ constructors and the runtime/library objects stay in .text.  A function matched 
 """
 import sys
 
+# The engine units (engine_<type>.cpp, split from py_exports.cpp): ONE block, in link order, starting where
+# py_exports started.  One block, so the placement knob's pad, at its start, moves all of the engine
+# against the kernels (the comparison the two-layout rule makes); a change in one type's unit moves the
+# others' code, as when they were all one unit.
+ENGINE = ("engine_f32", "engine_f64", "engine_i16", "engine_i32", "engine_i64")
 # Offset of each unit's first function mod 4096 in main df4ae0a (release-wheel flags, gcc 16.2.1, ld 2.47,
 # nighthaven's toolchain; read from the link map, unit order as on the link line).
-UNIT_OFFSET = [("py_exports", 0), ("level_baseline", 192), ("level_sse4", 3712), ("level_avx2", 640),
+UNIT_OFFSET = [(ENGINE, 0), ("py_exports", 0), ("level_baseline", 192), ("level_sse4", 3712), ("level_avx2", 640),
                ("level_avx512", 3584), ("level_baseline_soft", 1760), ("level_sse4_soft", 4032),
                ("level_avx2_soft", 2080), ("level_avx512_soft", 2048), ("level_baseline_inter", 2080),
                ("level_sse4_inter", 160), ("level_avx2_inter", 2144), ("level_avx512_inter", 1376),
                # the semi-global runtime-ends units (level_<name>_sg.cpp): last, so they move nothing above;
                # offset 0 (not in main's link, nothing measured; only non-glocal free ends run them)
-               ("level_baseline_sg", 0), ("level_sse4_sg", 0), ("level_avx2_sg", 0), ("level_avx512_sg", 0),
-               # the engine's semi-global runtime-ends code (aligner_sg.cpp), last for the same reason
-               ("aligner_sg", 0)]
+               ("level_baseline_sg", 0), ("level_sse4_sg", 0), ("level_avx2_sg", 0), ("level_avx512_sg", 0)]
 # AArch64 (its own script: a `. += N` for a unit that is not linked still pads).  No measured offsets.
-UNIT_OFFSET_AARCH64 = [("py_exports", 0), ("level_neon", 0), ("level_neon_soft", 0), ("level_neon_inter", 0),
-                       ("level_neon_sg", 0), ("aligner_sg", 0)]
+UNIT_OFFSET_AARCH64 = [(ENGINE, 0), ("py_exports", 0), ("level_neon", 0), ("level_neon_soft", 0), ("level_neon_inter", 0),
+                       ("level_neon_sg", 0)]
 
 TYPES = ["f", "d", "s", "i", "l"]                 # float, double, int16, int32, int64 (Itanium codes)
 LEVELS = ["avx2", "avx512", "sse4", "baseline", "neon"]
@@ -52,7 +55,7 @@ HEAD = """/* Code layout for GNU ld (ELF), passed with -Wl,-T: see "Code placeme
    each block below starts at a fixed offset within a page, so its code keeps its address mod 4096
    whatever the other blocks do.
    Cost: at most 4 KiB of padding per block.  The experiment knob's pads (placement_shift.cpp) go first
-   and at the start of the bindings{grpnote}. */
+   and at the start of the engine units{grpnote}. */
 SECTIONS
 {{
   .text.nwgrad ALIGN(4096) :
@@ -71,9 +74,12 @@ def at(off):
 def units(table=UNIT_OFFSET, mode="units"):
     out = [HEAD.format(mode=mode, grpnote="")]
     for u, off in table:
+        if u == ENGINE:
+            objs = " ".join(f"*{e}.cpp.o(.text._Z*)" for e in ENGINE)
+            out.append(f"    . = ALIGN(4096);{at(off)} KEEP(*(.text.nwgrad_placement_shift)) {objs}")
+            continue
         pat = ".text._Z* .text.Py*" if u == "py_exports" else ".text._Z*"
-        knob = " KEEP(*(.text.nwgrad_placement_shift))" if u == "py_exports" else ""
-        out.append(f"    . = ALIGN(4096);{at(off)}{knob} *{u}.cpp.o({pat})")
+        out.append(f"    . = ALIGN(4096);{at(off)} *{u}.cpp.o({pat})")
     out.append(TAIL)
     return out
 
@@ -83,12 +89,13 @@ def groups():
     for t in TYPES:
         for g in "01":
             for m in "012":
-                out.append(f"    . = ALIGN(4096); *py_exports.cpp.o(.text._Z*BatchEngineI{t}L8GapModel{g}EL9AlignMode{m}E* "
+                out.append(f"    . = ALIGN(4096); *engine_*.cpp.o(.text._Z*BatchEngineI{t}L8GapModel{g}EL9AlignMode{m}E* "
                            f".text._Z*AlignerIL8GapModel{g}EL9AlignMode{m}EL9AlignBand?E{t}E*)")
     # the standard-library instantiations the engines call per pair (std::vector resize / assign / erase),
     # apart from the bindings, whose code changes most
-    out.append("    . = ALIGN(4096); *py_exports.cpp.o(.text._ZNSt* .text._ZNKSt* .text._ZSt* .text._ZN9__gnu_cxx*)")
-    out.append("    . = ALIGN(4096); KEEP(*(.text.nwgrad_placement_shift)) *py_exports.cpp.o(.text._Z* .text.Py*)")
+    out.append("    . = ALIGN(4096); *engine_*.cpp.o(.text._ZNSt* .text._ZNKSt* .text._ZSt* .text._ZN9__gnu_cxx*)")
+    out.append("    . = ALIGN(4096); KEEP(*(.text.nwgrad_placement_shift)) *engine_*.cpp.o(.text._Z*)")
+    out.append("    . = ALIGN(4096); *py_exports.cpp.o(.text._Z* .text.Py*)")
     for lv in LEVELS:
         for u in UNITS:
             obj = f"*level_{lv}{u}.cpp.o"

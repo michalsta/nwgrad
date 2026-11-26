@@ -145,7 +145,7 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
     # nighthaven geomean 1.002 over 116 cells (worst 0.966), solace 0.98-1.02.
     #
     # Under gcc it covers every TU of the extension (applied to the target below), not only
-    # the level TUs: the scalar fills in py_exports.cpp have the same exposure, and padding
+    # the level TUs: the scalar fills in the engine units have the same exposure, and padding
     # only the level TUs moves them by itself.  Every TU vs level TUs only: oldsolace 1.007
     # (42 cells faster, none slower), nighthaven 1.000 (worst 0.986).  Under clang it stays on
     # the level TUs: its padding is NOPs, some inside hot loops, and the gain is a reshuffle —
@@ -202,15 +202,41 @@ if (NWGRAD_PLACEMENT_SHIFT_AT STREQUAL "mid")
     set(NWGRAD_PLACEMENT_SOURCES "")
 endif()
 
+# The engine: one unit per scalar type (engine_common.inc), apart from the bindings
+# (py_exports.cpp), which only call it: gcc budgets inlining per unit, so code added to the
+# bindings no longer changes how the engine is inlined (seq_pair_batch.hpp, "Where the
+# member bodies are compiled").  Linked ahead of the bindings, so the engine's own copy of a
+# function both use (a std::vector helper, an inline header function) is the one kept.
+set(NWGRAD_ENGINE_SOURCES
+    ${NWGRAD_LEVEL_DIR}/engine_f32.cpp
+    ${NWGRAD_LEVEL_DIR}/engine_f64.cpp
+    ${NWGRAD_LEVEL_DIR}/engine_i16.cpp
+    ${NWGRAD_LEVEL_DIR}/engine_i32.cpp
+    ${NWGRAD_LEVEL_DIR}/engine_i64.cpp)
+
+# gcc's whole-unit inlining budget for the engine units (--param inline-unit-growth; gcc's
+# default, 40 %, lets a unit grow to 1.4x its size by inlining, then refuses every further
+# inline in it).  At 40 % each engine unit sits at that limit as the old bindings unit did
+# (7,500-9,300 refusals per unit), so any engine change would again move inlining all over its
+# unit.  At 1000 no refusal is left: each decision depends on the caller and callee alone.
+# Measured (sse4 instructions, 216 short cells vs main ea93737): 40 % lost up to 12 % (mirna
+# double linear Global hard: rat() outlined in the walk), 1000 is 0.996 geomean.  Costs: .so
+# +26 % (46 -> 58 MB), engine units' compile time +25 %.  Empty: gcc's default.
+set(NWGRAD_ENGINE_INLINE_UNIT_GROWTH "1000" CACHE STRING
+    "gcc --param inline-unit-growth for the engine units (empty = gcc's default)")
+if (NOT NWGRAD_ENGINE_INLINE_UNIT_GROWTH STREQUAL "")
+    set_property(SOURCE ${NWGRAD_ENGINE_SOURCES} APPEND PROPERTY COMPILE_OPTIONS
+        "$<$<CXX_COMPILER_ID:GNU>:--param=inline-unit-growth=${NWGRAD_ENGINE_INLINE_UNIT_GROWTH}>")
+endif()
+
 nanobind_add_module(nwgrad_ext
     NB_STATIC NOMINSIZE
     ${NWGRAD_PLACEMENT_SOURCES}
+    ${NWGRAD_ENGINE_SOURCES}
     src/nwgrad/cpp/nwgrad/py_exports.cpp
     src/nwgrad/cpp/nwgrad/logistic/py_logistic.cpp
     ${NWGRAD_PLACEMENT_SOURCES_MID}
-    ${NWGRAD_LEVEL_SOURCES}
-    # the engine's semi-global runtime-ends code, out of the bindings' unit (Aligner::sg_run_viterbi_)
-    src/nwgrad/cpp/nwgrad/aligner_sg.cpp)
+    ${NWGRAD_LEVEL_SOURCES})
 if (DEFINED NWGRAD_JCC_GNU_OPTS)
     target_compile_options(nwgrad_ext PRIVATE "$<$<CXX_COMPILER_ID:GNU>:${NWGRAD_JCC_GNU_OPTS}>")
 endif()
@@ -243,7 +269,7 @@ if (NWGRAD_KERNEL_LAYOUT MATCHES "^(units|groups)$" AND NOT APPLE AND NOT WIN32
     endif()
 endif()
 
-# clang's SLP vectorizer, in the TU that holds the scalar code (every Aligner fill,
+# clang's SLP vectorizer, in the TUs that hold the scalar code, the engine units (every Aligner fill,
 # traceback and walk; scalar_fallback; the linear Pointers fill at every level): it packs
 # pairs of independent scalar chains (the X and Y updates, the argmax operands) into
 # 2-wide vectors with shuffles on the serial carry, or extracts a packed max through a
@@ -263,7 +289,7 @@ set(NWGRAD_SCALAR_TU_CLANG_OPTS -fno-slp-vectorize)
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64|i.86")
     list(APPEND NWGRAD_SCALAR_TU_CLANG_OPTS -mllvm -x86-cmov-converter=false)
 endif()
-set_source_files_properties(src/nwgrad/cpp/nwgrad/py_exports.cpp PROPERTIES
+set_property(SOURCE src/nwgrad/cpp/nwgrad/py_exports.cpp ${NWGRAD_ENGINE_SOURCES} APPEND PROPERTY
     COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:Clang,AppleClang>:${NWGRAD_SCALAR_TU_CLANG_OPTS}>")
 
 # MinGW: link the gcc runtime (libstdc++, libgcc, winpthread) statically, so the .pyd
@@ -385,6 +411,30 @@ endif()
 
 if (NWGRAD_BUILD_TESTS)
     # ── C++ unit tests (Catch2 v2, vendored single header) ───────────────────────
+    # gcc sanitizer builds under Ninja compile the level TUs one at a time (a job pool of 1)
+    # while the tests build beside them: under ASan+UBSan at -O0 each level TU peaks at
+    # 6-8 GB with gcc (16: level_avx512 8.0, level_avx2 7.2, level_baseline 6.5,
+    # level_sse4 6.2 GB), so -j2 pairing two of them exhausted the 16 GB CI runner ("lost
+    # communication with the server", or make "Terminated").  Not clang: its level TUs
+    # peak at 4.5 GB (22: level_avx512 4.3, level_avx2 4.0), and those two take hours each,
+    # so serializing them doubled its CI build (1h51 -> 3h37, then the 6 h job limit).
+    # Release builds and other generators compile them as before.
+    set(NWGRAD_TEST_LEVEL_SOURCES ${NWGRAD_LEVEL_SOURCES})
+    if (NWGRAD_SANITIZE AND CMAKE_GENERATOR MATCHES "Ninja" AND NWGRAD_LEVEL_SOURCES
+        AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        set_property(GLOBAL APPEND PROPERTY JOB_POOLS nwgrad_san_levels=1)
+        add_library(nwgrad_tests_levels OBJECT ${NWGRAD_LEVEL_SOURCES})
+        set_property(TARGET nwgrad_tests_levels PROPERTY JOB_POOL_COMPILE nwgrad_san_levels)
+        target_include_directories(nwgrad_tests_levels PRIVATE src/nwgrad/cpp/nwgrad tests/cpp)
+        target_compile_features(nwgrad_tests_levels PRIVATE cxx_std_20)
+        target_compile_options(nwgrad_tests_levels PRIVATE
+            $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall -Wextra> ${NWGRAD_SANITIZE_FLAGS})
+        target_compile_definitions(nwgrad_tests_levels PRIVATE
+            _GLIBCXX_ASSERTIONS
+            $<$<CXX_COMPILER_ID:Clang,AppleClang>:_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_DEBUG>
+            ${NWGRAD_SANITIZE_DEFS})
+        set(NWGRAD_TEST_LEVEL_SOURCES $<TARGET_OBJECTS:nwgrad_tests_levels>)
+    endif()
     add_executable(nwgrad_tests
         tests/cpp/main.cpp
         tests/cpp/test_subst_matrix.cpp
@@ -409,6 +459,7 @@ if (NWGRAD_BUILD_TESTS)
         tests/cpp/test_logistic.cpp
         tests/cpp/test_scan_fixes.cpp
         tests/cpp/test_score_only.cpp
+        tests/cpp/test_int8_inter.cpp
         tests/cpp/test_simd_bitexact.cpp
         tests/cpp/test_simd_bitexact_f32.cpp
         tests/cpp/test_tracks.cpp
@@ -416,7 +467,7 @@ if (NWGRAD_BUILD_TESTS)
         tests/cpp/test_linear_striped.cpp
         tests/cpp/test_grid.cpp
         tests/cpp/test_profile_build.cpp
-        ${NWGRAD_LEVEL_SOURCES}   # per-ISA kernel TUs, so kernel="simd" exercises the dispatched striped path
+        ${NWGRAD_TEST_LEVEL_SOURCES}   # per-ISA kernel TUs, so kernel="simd" exercises the dispatched striped path
     )
     target_include_directories(nwgrad_tests PRIVATE
         src/nwgrad/cpp/nwgrad
