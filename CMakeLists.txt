@@ -393,22 +393,24 @@ if (NWGRAD_SANITIZE OR NWGRAD_SANITIZE_EXT)
         list(APPEND NWGRAD_SANITIZE_DEFS _GLIBCXX_SANITIZE_VECTOR)
     endif()
 
-    # The sanitizer test binary (not the extension) is linked with section GC under gcc.
-    # gcc puts every UBSan check's static data (.Lubsan_data: source location and type
-    # descriptors) in the TU's one .data.rel.local, outside the COMDAT group of the inline
-    # function it belongs to.  The linker keeps one copy of each header template the test
-    # TUs share, but every TU's check data for all of them: under -O0 ASan+UBSan that data
-    # was the largest part of nwgrad_tests (test_interpair.o: 58.7 MB of it, 35 MB of
-    # code), and with the semi-global level TUs the image passed 2 GiB, which a
-    # PC-relative reference from the start of .text to the end of .bss cannot span (gcc
-    # 15, ubuntu-26.04: libgcc's __cpu_indicator_init -> __cpu_model, "relocation
-    # truncated to fit").  -fdata-sections gives each datum its own section, so
-    # --gc-sections drops those of the discarded copies.
-    set(NWGRAD_SANITIZE_TEST_GC_FLAGS "")
-    set(NWGRAD_SANITIZE_TEST_GC_LINK "")
-    if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-        set(NWGRAD_SANITIZE_TEST_GC_FLAGS -ffunction-sections -fdata-sections)
-        set(NWGRAD_SANITIZE_TEST_GC_LINK -Wl,--gc-sections)
+    # The gcc sanitizer test binaries (not the extension) put their data in the x86-64
+    # large-data sections, past .bss.  Under -O0 ASan+UBSan gcc gives every UBSan check
+    # static data (.Lubsan_data, in .data.rel.local), and nwgrad_tests carries 2.3 GiB of
+    # text, rodata and data (cc195c9, gcc 15.2: .text 833 MiB, .rodata 243 MiB, .data
+    # 1308 MiB).  The default layout is .text, .rodata, .data, .bss, and libgcc's
+    # __cpu_indicator_init (.text.startup, at the start of .text) reaches __cpu_model (the
+    # end of .bss) with a 32-bit PC-relative reference: past 2 GiB the link fails,
+    # "relocation truncated to fit" (the semi-global level TUs took the span from 1.70 to
+    # 2.33 GiB).  -mcmodel=medium -mlarge-data-threshold=0 sends all data and rodata to
+    # .ldata / .lrodata, which the linker places after .bss, leaving .text alone in the
+    # span; code reaches large data with 64-bit addressing.  The level TUs' own size is not
+    # trimmed: their -O0 instrumentation is what the build exists to run.
+    # (-fdata-sections + --gc-sections would drop the UBSan data of the discarded COMDAT
+    # copies in the test TUs, but gas ran out of memory on the level TUs'
+    # millions of sections.)
+    set(NWGRAD_SANITIZE_TEST_FLAGS "")
+    if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
+        set(NWGRAD_SANITIZE_TEST_FLAGS -mcmodel=medium -mlarge-data-threshold=0)
     endif()
 endif()
 
@@ -447,7 +449,7 @@ if (NWGRAD_BUILD_TESTS)
         target_compile_features(nwgrad_tests_levels PRIVATE cxx_std_20)
         target_compile_options(nwgrad_tests_levels PRIVATE
             $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall -Wextra> ${NWGRAD_SANITIZE_FLAGS}
-            ${NWGRAD_SANITIZE_TEST_GC_FLAGS})
+            ${NWGRAD_SANITIZE_TEST_FLAGS})
         target_compile_definitions(nwgrad_tests_levels PRIVATE
             _GLIBCXX_ASSERTIONS
             $<$<CXX_COMPILER_ID:Clang,AppleClang>:_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_DEBUG>
@@ -527,9 +529,8 @@ if (NWGRAD_BUILD_TESTS)
         # Sanitizers must be passed to both the compile and the link step.
         if (NWGRAD_SANITIZE)
             target_compile_options(${test_target} PRIVATE ${NWGRAD_SANITIZE_FLAGS}
-                ${NWGRAD_SANITIZE_TEST_GC_FLAGS})
-            target_link_options(${test_target} PRIVATE ${NWGRAD_SANITIZE_FLAGS}
-                ${NWGRAD_SANITIZE_TEST_GC_LINK})
+                ${NWGRAD_SANITIZE_TEST_FLAGS})
+            target_link_options(${test_target} PRIVATE ${NWGRAD_SANITIZE_FLAGS})
             target_compile_definitions(${test_target} PRIVATE ${NWGRAD_SANITIZE_DEFS})
         endif()
     endforeach()
