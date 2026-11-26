@@ -99,7 +99,8 @@ namespace NWGRAD_LVL_NAME {
 // only, int8 inter-pair, the row block).  The kernels are function templates with internal
 // linkage, instantiated only through the addresses taken below, so a part compiles only its
 // own types' kernels.  Not defined (the extension, the wheels, every benchmark build): the
-// whole unit, exactly as before.  The soft unit is small and is never split.
+// whole unit, exactly as before.  The soft unit ignores it; the test build compiles it and
+// the small inter unit whole.
 #if defined(NWGRAD_LEVEL_PART)
 #  define NWGRAD_LVL_PART_HAS(bit) ((NWGRAD_LEVEL_PART >> (bit)) & 1)
 #else

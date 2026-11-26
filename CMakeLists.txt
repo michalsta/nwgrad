@@ -432,16 +432,20 @@ endif()
 if (NWGRAD_BUILD_TESTS)
     # ── C++ unit tests (Catch2 v2, vendored single header) ───────────────────────
     # ── The level TUs of the test binary, compiled in parts ──────────────────────
-    # Each big level unit (level_<isa>.cpp, _inter, _sg; the soft units are small) is
-    # compiled once per entry of NWGRAD_TEST_LEVEL_PARTS, with NWGRAD_LEVEL_PART set to
-    # that entry: a mask of the value types the compile registers (level_common.inc;
-    # bits 0-4 double, float, int16, int32, int64, bit 5 the type-free entries).  The
-    # masks must partition 63, so the parts together hold every kernel exactly once.
-    # Unsplit, one level unit took 7-15 min and 6-8 GB in a -O0 ASan+UBSan build, and the
-    # build's tail was one such compile after another.  The extension, the wheels and the
-    # benchmarks never see NWGRAD_LEVEL_PART and compile each unit whole, as before.
-    # Empty: the test binary compiles the units whole too.
-    set(NWGRAD_TEST_LEVEL_PARTS "1;2;4;8;16;32" CACHE STRING
+    # The two big level units of each ISA (level_<isa>.cpp and level_<isa>_sg.cpp) are
+    # compiled once per entry of NWGRAD_TEST_LEVEL_PARTS, with NWGRAD_LEVEL_PART set to that
+    # entry: a mask of the value types the compile registers (level_common.inc; bits 0-4
+    # double, float, int16, int32, int64, bit 5 the type-free entries).  The masks must
+    # partition 63, so the parts together hold every kernel exactly once.  Whole, one such
+    # unit took 7-15 min and 6-8 GB in a -O0 ASan+UBSan gcc build, and the gcc ones went
+    # through a job pool of 1 (below), so the build's tail was one such compile after
+    # another.  The default, 3 parts: int16 + the type-free entries (int16 alone is ~35 %
+    # of a unit's compile time: its saturating variants), double + int64, float + int32;
+    # each part costs ~12 s of parsing again, so the small units (_inter, _soft) stay
+    # whole.  gcc 15.2, -O0 ASan+UBSan: the longest part 8 min / 4.8 GB (avx512, int16).
+    # The extension, the wheels and the benchmarks never see NWGRAD_LEVEL_PART and compile
+    # each unit whole, as before.  Empty: the test binary compiles them whole too.
+    set(NWGRAD_TEST_LEVEL_PARTS "36;17;10" CACHE STRING
         "NWGRAD_LEVEL_PART masks the test build compiles each big level TU with (empty: unsplit)")
     set(_parts_union 0)
     foreach(mask ${NWGRAD_TEST_LEVEL_PARTS})
@@ -455,19 +459,19 @@ if (NWGRAD_BUILD_TESTS)
         message(FATAL_ERROR "NWGRAD_TEST_LEVEL_PARTS must cover every bit of 63 (got ${_parts_union})")
     endif()
 
-    # gcc sanitizer builds under Ninja compile the level TUs in a job pool
-    # (NWGRAD_SAN_LEVEL_JOBS at a time) while the tests build beside them: under ASan+UBSan
-    # at -O0 each whole level TU peaks at 6-8 GB with gcc (16: level_avx512 8.0, level_avx2
-    # 7.2, level_baseline 6.5, level_sse4 6.2 GB), so -j2 pairing two of them exhausted the
-    # 16 GB CI runner ("lost communication with the server", or make "Terminated").  Not
-    # clang: its level TUs peak at 4.5 GB (22: level_avx512 4.3, level_avx2 4.0), and those
-    # two take hours each, so serializing them doubled its CI build (1h51 -> 3h37, then the
-    # 6 h job limit).  Release builds and other generators compile them as before.
-    set(NWGRAD_SAN_LEVEL_JOBS 1 CACHE STRING
-        "gcc sanitizer Ninja builds: level TU compiles at a time")
+    # Unsplit, gcc sanitizer builds under Ninja compile the level TUs one at a time (a job
+    # pool of 1) while the tests build beside them: under ASan+UBSan at -O0 each whole level
+    # TU peaks at 6-8 GB with gcc (16: level_avx512 8.0, level_avx2 7.2, level_baseline 6.5,
+    # level_sse4 6.2 GB), so -j2 pairing two of them exhausted the 16 GB CI runner ("lost
+    # communication with the server", or make "Terminated").  Split, no part exceeds 5 GB
+    # (no more than the largest test TUs) and the parts build freely.  Not clang: its whole
+    # level TUs peak at 4.5 GB (22: level_avx512 4.3, level_avx2 4.0), and those two took
+    # hours each, so serializing them doubled its CI build (1h51 -> 3h37, then the 6 h job
+    # limit).  Release builds and other generators compile them as before.
     set(_level_pool "")
-    if (NWGRAD_SANITIZE AND CMAKE_GENERATOR MATCHES "Ninja" AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-        set_property(GLOBAL APPEND PROPERTY JOB_POOLS nwgrad_san_levels=${NWGRAD_SAN_LEVEL_JOBS})
+    if (NOT NWGRAD_TEST_LEVEL_PARTS AND NWGRAD_SANITIZE AND CMAKE_GENERATOR MATCHES "Ninja"
+        AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        set_property(GLOBAL APPEND PROPERTY JOB_POOLS nwgrad_san_levels=1)
         set(_level_pool nwgrad_san_levels)
     endif()
     # An object library of level TUs with the test binary's flags (below), the part mask
@@ -498,7 +502,7 @@ if (NWGRAD_BUILD_TESTS)
         set(_split "")
         if (NWGRAD_TEST_LEVEL_PARTS)
             set(_split ${NWGRAD_LEVEL_SOURCES})
-            list(FILTER _split INCLUDE REGEX "/level_[a-z0-9]+(_inter|_sg)?\\.cpp$")
+            list(FILTER _split INCLUDE REGEX "/level_[a-z0-9]+(_sg)?\\.cpp$")
             list(REMOVE_ITEM _whole ${_split})
         endif()
         nwgrad_test_level_objects(nwgrad_tests_levels "" ${_whole})
