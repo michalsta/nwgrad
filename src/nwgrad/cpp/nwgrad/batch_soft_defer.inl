@@ -34,6 +34,13 @@
 // params scored (kPending: "eager").  The value is the pending state a pair the call
 // finishes ends in.
 template<class T, GapModel GM, AlignMode AM>
+size_t BatchEngine<T, GM, AM>::guides_pending() const noexcept {
+    size_t n = 0;
+    for (size_t i = 0; i < size(); ++i) n += guide_pending(i);
+    return n;
+}
+
+template<class T, GapModel GM, AlignMode AM>
 uint8_t BatchEngine<T, GM, AM>::soft_pend_(bool keep, bool read) const noexcept {
     if (grad_mode_ != GradMode::Soft || keep || s_.soft_guide_posterior) return 0;
     if (s_.soft_guide_lazy) return static_cast<uint8_t>(kPending | kLazy);

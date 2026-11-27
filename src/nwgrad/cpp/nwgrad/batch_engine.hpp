@@ -316,6 +316,7 @@ public:
     // A stored alignment path (aligned(), coordinates()) — kept only on request.
     bool path_stored(size_t i) const noexcept { return flags_[i] & kStored; }
     bool guide_pending(size_t i) const noexcept { return flags_[i] & kPending; }
+    size_t guides_pending() const noexcept;   // how many (tests; batch_soft_defer.inl)
 
     double score(size_t i) const {
         if (!score_valid(i))

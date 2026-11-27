@@ -8,7 +8,8 @@
     template double BatchEngine<T, GapModel::G, AlignMode::A>::soft_score_and_grad_(bool); \
     template void BatchEngine<T, GapModel::G, AlignMode::A>::soft_one_(size_t, bool);      \
     template void BatchEngine<T, GapModel::G, AlignMode::A>::soft_banded_prep_();          \
-    template void BatchEngine<T, GapModel::G, AlignMode::A>::resolve_caller_(size_t);
+    template void BatchEngine<T, GapModel::G, AlignMode::A>::resolve_caller_(size_t);     \
+    template size_t BatchEngine<T, GapModel::G, AlignMode::A>::guides_pending() const noexcept;
 #define NWGRAD_SOFT_DEFER_INST_T(T)                                                   \
     NWGRAD_SOFT_DEFER_INST(T, Linear, Global) NWGRAD_SOFT_DEFER_INST(T, Linear, Local) \
     NWGRAD_SOFT_DEFER_INST(T, Affine, Global) NWGRAD_SOFT_DEFER_INST(T, Affine, Local) \

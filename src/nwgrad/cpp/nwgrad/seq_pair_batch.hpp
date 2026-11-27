@@ -93,11 +93,7 @@ public:
     }
     // How many pairs' guides are pending (computed on first use); for tests.
     size_t guides_pending() const noexcept {
-        return visit([](const auto& e) {
-            size_t n = 0;
-            for (size_t i = 0; i < e.size(); ++i) n += e.guide_pending(i);
-            return n;
-        });
+        return visit([](const auto& e) { return e.guides_pending(); });
     }
     bool tracked() const noexcept { return visit([](const auto& e) { return e.tracked(); }); }
     int num_sets() const noexcept { return visit([](const auto& e) { return e.num_sets(); }); }
