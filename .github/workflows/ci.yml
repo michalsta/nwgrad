@@ -293,9 +293,9 @@ jobs:
         # build was killed at ~11 min on three branches that add kernel instantiations;
         # make reports "Terminated", the job "cancelled"), where -j2 fits.  And -j2 itself
         # once two of them ran together: they peak at 6-8 GB each, and the runner has 16 GB
-        # (2026-11-24, #58: "lost communication with the server").  Under Ninja, gcc's level
-        # TUs go through a job pool of 1 (CMakeLists.txt, nwgrad_tests_levels), the tests
-        # build beside them; clang's (4.5 GB at most) do not.
+        # (2026-11-24, #58: "lost communication with the server").  The test build now
+        # compiles the big level TUs in parts (CMakeLists.txt, NWGRAD_TEST_LEVEL_PARTS), none
+        # above 5 GB, so two at a time fit and they no longer need gcc's job pool of 1.
         run: cmake --build build-san --target nwgrad_tests -j2
 
       # In parallel: the 17 ctest entries are separate processes (one per ISA x tag

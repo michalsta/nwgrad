@@ -431,30 +431,105 @@ endif()
 
 if (NWGRAD_BUILD_TESTS)
     # ── C++ unit tests (Catch2 v2, vendored single header) ───────────────────────
-    # gcc sanitizer builds under Ninja compile the level TUs one at a time (a job pool of 1)
-    # while the tests build beside them: under ASan+UBSan at -O0 each level TU peaks at
-    # 6-8 GB with gcc (16: level_avx512 8.0, level_avx2 7.2, level_baseline 6.5,
+    # ── The level TUs of the test binary, compiled in parts ──────────────────────
+    # The two big level units of each ISA (level_<isa>.cpp and level_<isa>_sg.cpp) are
+    # compiled once per entry of NWGRAD_TEST_LEVEL_PARTS, with NWGRAD_LEVEL_PART set to that
+    # entry: a mask of the value types the compile registers (level_common.inc; bits 0-4
+    # double, float, int16, int32, int64, bit 5 the type-free entries).  The masks must
+    # partition 63, so the parts together hold every kernel exactly once.  Whole, one such
+    # unit took 7-15 min and 6-8 GB in a -O0 ASan+UBSan gcc build, and the gcc ones went
+    # through a job pool of 1 (below), so the build's tail was one such compile after
+    # another.  The default, 3 parts: int16 + the type-free entries (int16 alone is ~35 %
+    # of a unit's compile time: its saturating variants), double + int64, float + int32;
+    # each part costs ~12 s of parsing again, so the small units (_inter, _soft) stay
+    # whole.  gcc 15.2, -O0 ASan+UBSan: the longest part 8 min / 4.8 GB (avx512, int16).
+    # The extension, the wheels and the benchmarks never see NWGRAD_LEVEL_PART and compile
+    # each unit whole, as before.  Empty: the test binary compiles them whole too.
+    set(NWGRAD_TEST_LEVEL_PARTS "36;17;10" CACHE STRING
+        "NWGRAD_LEVEL_PART masks the test build compiles each big level TU with (empty: unsplit)")
+    set(_parts_union 0)
+    foreach(mask ${NWGRAD_TEST_LEVEL_PARTS})
+        math(EXPR _overlap "${_parts_union} & ${mask}")
+        if (_overlap OR mask LESS 1 OR mask GREATER 63)
+            message(FATAL_ERROR "NWGRAD_TEST_LEVEL_PARTS: ${mask} overlaps another part or is out of 1..63")
+        endif()
+        math(EXPR _parts_union "${_parts_union} | ${mask}")
+    endforeach()
+    if (NWGRAD_TEST_LEVEL_PARTS AND NOT _parts_union EQUAL 63)
+        message(FATAL_ERROR "NWGRAD_TEST_LEVEL_PARTS must cover every bit of 63 (got ${_parts_union})")
+    endif()
+
+    # Unsplit, gcc sanitizer builds under Ninja compile the level TUs one at a time (a job
+    # pool of 1) while the tests build beside them: under ASan+UBSan at -O0 each whole level
+    # TU peaks at 6-8 GB with gcc (16: level_avx512 8.0, level_avx2 7.2, level_baseline 6.5,
     # level_sse4 6.2 GB), so -j2 pairing two of them exhausted the 16 GB CI runner ("lost
-    # communication with the server", or make "Terminated").  Not clang: its level TUs
-    # peak at 4.5 GB (22: level_avx512 4.3, level_avx2 4.0), and those two take hours each,
-    # so serializing them doubled its CI build (1h51 -> 3h37, then the 6 h job limit).
-    # Release builds and other generators compile them as before.
-    set(NWGRAD_TEST_LEVEL_SOURCES ${NWGRAD_LEVEL_SOURCES})
-    if (NWGRAD_SANITIZE AND CMAKE_GENERATOR MATCHES "Ninja" AND NWGRAD_LEVEL_SOURCES
+    # communication with the server", or make "Terminated").  Split, no part exceeds 5 GB
+    # (no more than the largest test TUs) and the parts build freely.  Not clang: its whole
+    # level TUs peak at 4.5 GB (22: level_avx512 4.3, level_avx2 4.0), and those two took
+    # hours each, so serializing them doubled its CI build (1h51 -> 3h37, then the 6 h job
+    # limit).  Release builds and other generators compile them as before.
+    set(_level_pool "")
+    if (NOT NWGRAD_TEST_LEVEL_PARTS AND NWGRAD_SANITIZE AND CMAKE_GENERATOR MATCHES "Ninja"
         AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
         set_property(GLOBAL APPEND PROPERTY JOB_POOLS nwgrad_san_levels=1)
-        add_library(nwgrad_tests_levels OBJECT ${NWGRAD_LEVEL_SOURCES})
-        set_property(TARGET nwgrad_tests_levels PROPERTY JOB_POOL_COMPILE nwgrad_san_levels)
-        target_include_directories(nwgrad_tests_levels PRIVATE src/nwgrad/cpp/nwgrad tests/cpp)
-        target_compile_features(nwgrad_tests_levels PRIVATE cxx_std_20)
-        target_compile_options(nwgrad_tests_levels PRIVATE
-            $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall -Wextra> ${NWGRAD_SANITIZE_FLAGS}
-            ${NWGRAD_SANITIZE_TEST_FLAGS})
-        target_compile_definitions(nwgrad_tests_levels PRIVATE
+        set(_level_pool nwgrad_san_levels)
+    endif()
+    # An object library of level TUs with the test binary's flags (below), the part mask
+    # given (or none).
+    function(nwgrad_test_level_objects name part)
+        add_library(${name} OBJECT ${ARGN})
+        if (_level_pool)
+            set_property(TARGET ${name} PROPERTY JOB_POOL_COMPILE ${_level_pool})
+        endif()
+        target_include_directories(${name} PRIVATE src/nwgrad/cpp/nwgrad tests/cpp)
+        target_compile_features(${name} PRIVATE cxx_std_20)
+        target_compile_options(${name} PRIVATE $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall -Wextra>)
+        target_compile_definitions(${name} PRIVATE
             _GLIBCXX_ASSERTIONS
-            $<$<CXX_COMPILER_ID:Clang,AppleClang>:_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_DEBUG>
-            ${NWGRAD_SANITIZE_DEFS})
-        set(NWGRAD_TEST_LEVEL_SOURCES $<TARGET_OBJECTS:nwgrad_tests_levels>)
+            $<$<CXX_COMPILER_ID:Clang,AppleClang>:_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_DEBUG>)
+        if (NWGRAD_SANITIZE)
+            target_compile_options(${name} PRIVATE ${NWGRAD_SANITIZE_FLAGS} ${NWGRAD_SANITIZE_TEST_FLAGS})
+            target_compile_definitions(${name} PRIVATE ${NWGRAD_SANITIZE_DEFS})
+        endif()
+        if (NOT part STREQUAL "")
+            target_compile_definitions(${name} PRIVATE NWGRAD_LEVEL_PART=${part})
+        endif()
+    endfunction()
+
+    set(NWGRAD_TEST_LEVEL_SOURCES "")
+    if (NWGRAD_LEVEL_SOURCES AND NOT NWGRAD_TEST_LEVEL_PARTS)
+        nwgrad_test_level_objects(nwgrad_tests_levels "" ${NWGRAD_LEVEL_SOURCES})
+        list(APPEND NWGRAD_TEST_LEVEL_SOURCES $<TARGET_OBJECTS:nwgrad_tests_levels>)
+    elseif (NWGRAD_LEVEL_SOURCES)
+        # Linked level by level, in NWGRAD_LEVEL_SOURCES' order (baseline first): at -O0 the
+        # level objects carry out-of-line copies of the std::simd inline functions, compiled
+        # with their own -m flags, and the linker keeps the first.  Part by part instead (all
+        # ISAs of the double part, then all of the float part, ...), the avx2 double part's
+        # VEX-encoded _SimdWrapper<uchar, 4> constructor came before the baseline float
+        # part's and baseline code ran it: SIGILL on a CPU without AVX (clang ASan, Westmere).
+        set(_isas "")
+        foreach(src ${NWGRAD_LEVEL_SOURCES})
+            if (src MATCHES "/level_([a-z0-9]+)(_soft|_inter|_sg)?\\.cpp$")
+                list(APPEND _isas ${CMAKE_MATCH_1})
+            endif()
+        endforeach()
+        list(REMOVE_DUPLICATES _isas)
+        set(_other ${NWGRAD_LEVEL_SOURCES})   # simd_levels.cpp
+        list(FILTER _other EXCLUDE REGEX "/level_[a-z0-9]+(_soft|_inter|_sg)?\\.cpp$")
+        nwgrad_test_level_objects(nwgrad_tests_levels "" ${_other})
+        list(APPEND NWGRAD_TEST_LEVEL_SOURCES $<TARGET_OBJECTS:nwgrad_tests_levels>)
+        foreach(isa ${_isas})
+            set(_split ${NWGRAD_LEVEL_SOURCES})
+            list(FILTER _split INCLUDE REGEX "/level_${isa}(_sg)?\\.cpp$")
+            foreach(mask ${NWGRAD_TEST_LEVEL_PARTS})
+                nwgrad_test_level_objects(nwgrad_tests_levels_${isa}_p${mask} ${mask} ${_split})
+                list(APPEND NWGRAD_TEST_LEVEL_SOURCES $<TARGET_OBJECTS:nwgrad_tests_levels_${isa}_p${mask}>)
+            endforeach()
+            set(_whole ${NWGRAD_LEVEL_SOURCES})
+            list(FILTER _whole INCLUDE REGEX "/level_${isa}_(soft|inter)\\.cpp$")
+            nwgrad_test_level_objects(nwgrad_tests_levels_${isa} "" ${_whole})
+            list(APPEND NWGRAD_TEST_LEVEL_SOURCES $<TARGET_OBJECTS:nwgrad_tests_levels_${isa}>)
+        endforeach()
     endif()
     add_executable(nwgrad_tests
         tests/cpp/main.cpp
