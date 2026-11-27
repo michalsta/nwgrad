@@ -3692,10 +3692,10 @@ private:
     }
 
     // ── Soft guide deferral (batch_soft_defer.inl) ──────────────────────────────
-    // Defined out of this header: the Python extension compiles them in their own unit
-    // (batch_soft_defer.cpp), so that adding to them leaves the code of the engine units
-    // (engine_<type>.cpp) -- every hard, path and score-only call -- as it was (AGENTS.md,
-    // "Code placement": a change inside a unit moves its engine code against the kernels).  Last in the class, members included, for the same reason.
+    // Defined out of this header: the extension compiles them in their own unit
+    // (batch_soft_defer.cpp), so the engine units' code (engine_<type>.cpp: every hard,
+    // path and score-only call) stays main's (AGENTS.md, "Code placement").  Last in the
+    // class, members included, for the same reason.
     double soft_score_and_grad_(bool keep);
     void soft_one_(size_t i, bool keep);
     void soft_banded_prep_();
