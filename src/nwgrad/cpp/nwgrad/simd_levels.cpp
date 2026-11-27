@@ -39,6 +39,20 @@ void register_level_typed(SimdLevel l,
 }
 
 template <class T>
+void register_level_sg(SimdLevel l, typename TypedKernels<T>::viterbi_fn linear_sg,
+                       typename TypedKernels<T>::viterbi_fn linear_ptr_sg,
+                       typename TypedKernels<T>::viterbi_fn viterbi_sg,
+                       typename TypedKernels<T>::viterbi_fn viterbi_ptr_sg,
+                       typename TypedKernels<T>::score_fn score_sg) {
+    SgTypedKernels<T>& k = level_table()[(int)l].template sg_of<T>();
+    k.linear_sg      = linear_sg;
+    k.linear_ptr_sg  = linear_ptr_sg;
+    k.viterbi_sg     = viterbi_sg;
+    k.viterbi_ptr_sg = viterbi_ptr_sg;
+    k.score_sg       = score_sg;
+}
+
+template <class T>
 void register_level_inter(SimdLevel l, typename TypedKernels<T>::inter_fn inter_fill,
                           typename TypedKernels<T>::inter_fn inter_score, int inter_w) {
     TypedKernels<T>& k = level_table()[(int)l].template of<T>();
@@ -65,6 +79,9 @@ void register_level_profile(SimdLevel l, typename TypedKernels<T>::profile_fn pr
         void (*)(LhbJob<T>&), banded_row_fn_t<T>, banded_row_fn_t<T>, \
         TypedKernels<T>::hb_fn, TypedKernels<T>::hb_fn, TypedKernels<T>::hbbase_fn, \
         TypedKernels<T>::hbscan_fn, TypedKernels<T>::score_fn); \
+    template void register_level_sg<T>(SimdLevel, TypedKernels<T>::viterbi_fn, \
+        TypedKernels<T>::viterbi_fn, TypedKernels<T>::viterbi_fn, TypedKernels<T>::viterbi_fn, \
+        TypedKernels<T>::score_fn); \
     template void register_level_inter<T>(SimdLevel, TypedKernels<T>::inter_fn, \
         TypedKernels<T>::inter_fn, int); \
     template void register_level_grid<T>(SimdLevel, TypedKernels<T>::grid_fn, TypedKernels<T>::gridbase_fn); \

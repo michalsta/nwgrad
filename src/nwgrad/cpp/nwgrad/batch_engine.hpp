@@ -81,6 +81,10 @@ struct BatchSettings {
     // move, replayed on demand); true, its sparse field counts (faster to sum, ~10x the
     // memory).  See BatchEngine, "Tracked hard gradients".
     bool   track_counts = false;
+    // AlignMode::Glocal: the semi-global free ends (kSgFree*, simd_levels.hpp); kSgGlocal is
+    // "glocal".  The inter-pair fills are wired for kSgGlocal only: other ends run each
+    // pair's own fill (inter_fill_()).
+    int    free_ends = kSgGlocal;
 
     void set_hb_cutoff(int rows) {
         if (rows < 1) throw std::invalid_argument("nwgrad: hb_cutoff must be >= 1");
@@ -373,6 +377,19 @@ public:
     }
 
     void set_n_threads(int n) { s_.set_n_threads(n); }
+    // The semi-global free ends (Glocal batches; any other mode accepts kSgGlocal only, a
+    // no-op).  Changes what every pair computes: drops scores, gradients, paths and guides.
+    void set_free_ends(int f) {
+        FullAl::check_free_ends(f);   // validates (range, mode)
+        if (f == s_.free_ends) return;
+        s_.free_ends = f;
+        for (auto& fl : flags_) fl = 0;
+    }
+    int free_ends() const noexcept { return s_.free_ends; }
+    // Whether the shared (inter-pair) fills run: fill="interpair" and ends they implement.
+    bool inter_fill_() const noexcept {
+        return s_.inter_fill && (AM != AlignMode::Glocal || s_.free_ends == kSgGlocal);
+    }
     void set_hb_cutoff(int rows) { s_.set_hb_cutoff(rows); }
     void set_fill(bool rowwise, bool inter) noexcept { s_.set_fill(rowwise, inter); }
     // soft_impl changes results within tolerance only and invalidates nothing (as
@@ -594,7 +611,7 @@ public:
         ++full_calls_;   // guides may have moved: the banded grouping is stale
         tc_begin_full_();
         if (grad_mode_ == GradMode::None && !keep_paths) score_only_();
-        else if (s_.inter_fill)      score_and_grad_inter_(keep_paths);
+        else if (inter_fill_())      score_and_grad_inter_(keep_paths);
         else if (s_.sorted_schedule) score_and_grad_sorted_(keep_paths);
         else                      score_and_grad_dynamic_(keep_paths);
         return sum_scores_();
@@ -615,7 +632,7 @@ public:
                     "nwgrad: banded_grad() needs a guide path; run score_and_grad() first");
         prepare_paths_(keep_paths);
         tc_begin_full_();
-        if (s_.inter_fill && !keep_paths) banded_grad_inter_(bandwidth);
+        if (inter_fill_() && !keep_paths) banded_grad_inter_(bandwidth);
         else if (s_.sorted_schedule)      banded_grad_lpt_(bandwidth, keep_paths);
         else                           banded_grad_dynamic_(bandwidth, keep_paths);
         return sum_scores_();
@@ -756,7 +773,7 @@ public:
             throw std::invalid_argument("nwgrad: align() needs one gap_track per problem");
         check_tracks_(st.tracks, [&](size_t i) { return problems[i].seq_a.size(); }, K, "track");
         check_tracks_(st.gap_tracks, [&](size_t i) { return problems[i].seq_a.size() + 1; }, K, "gap_track");
-        if (s_.inter_fill) {
+        if (inter_fill_()) {
             const int be = stream_inter_backend_(params, kernel, banded);
             if (be >= 0) {
                 if (soft_f32_()) {
@@ -808,6 +825,7 @@ private:
     template<AlignBand AB>
     void configure_stream_(Aligner<GM, AM, AB, T>& al, int kernel) const {
         al.set_kernel(kernel);
+        al.set_free_ends_trusted(s_.free_ends);
         al.set_soft_impl(s_.soft_impl);
         al.set_soft_f32(s_.soft_f32);
         al.set_soft_temperature(s_.soft_temperature);
@@ -1904,6 +1922,8 @@ private:
         explicit Work(const BatchEngine& e) : g(e.alphabet(), e.nsets_) { configure(e); }
         // The batch's settings, (re)applied: a reused Work follows setting changes.
         void configure(const BatchEngine& e) {
+            full.set_free_ends_trusted(e.s_.free_ends);
+            band.set_free_ends_trusted(e.s_.free_ends);
             full.set_traceback(e.s_.traceback);
             full.set_hb_cutoff(e.s_.hb_cutoff);
             full.set_rowwise_full(e.s_.rowwise_full);
@@ -2355,6 +2375,7 @@ private:
         return ok;
     }
     void configure_lane_(FullAl& al) const {
+        al.set_free_ends_trusted(s_.free_ends);
         al.set_traceback(s_.traceback);
         al.set_hb_cutoff(s_.hb_cutoff);
         al.set_rowwise_full(s_.rowwise_full);
@@ -2363,6 +2384,7 @@ private:
         al.set_soft_temperature(s_.soft_temperature);
     }
     void configure_lane_(BandAl& al) const {
+        al.set_free_ends_trusted(s_.free_ends);
         al.set_traceback(TracebackMode::Scores);
         al.set_soft_impl(s_.soft_impl);
         al.set_soft_f32(s_.soft_f32);
@@ -3077,7 +3099,7 @@ private:
     void score_only_() {
         gparams_ = params_;
         const size_t N = size();
-        const bool inter = s_.inter_fill;
+        const bool inter = inter_fill_();
         // The int8 groups (inter8_kernel_impl.inl) when the call qualifies and has pairs for
         // them: then the plan is plan8_'s split of the unnarrowed plan (an int8 group beats the
         // narrower type's; the pairs left over run at T); else the narrowed plan (main's

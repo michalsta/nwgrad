@@ -110,10 +110,10 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
         ${NWGRAD_LEVEL_DIR}/level_avx2_soft.cpp
         ${NWGRAD_LEVEL_DIR}/level_avx512_soft.cpp
         # the inter-pair hard kernels of each level, their own TU (NWGRAD_LEVEL_INTER_TU)
-        ${NWGRAD_LEVEL_DIR}/level_baseline_inter.cpp
-        ${NWGRAD_LEVEL_DIR}/level_sse4_inter.cpp
-        ${NWGRAD_LEVEL_DIR}/level_avx2_inter.cpp
-        ${NWGRAD_LEVEL_DIR}/level_avx512_inter.cpp)
+        ${NWGRAD_LEVEL_DIR}/level_baseline_inter.cpp ${NWGRAD_LEVEL_DIR}/level_baseline_sg.cpp
+        ${NWGRAD_LEVEL_DIR}/level_sse4_inter.cpp ${NWGRAD_LEVEL_DIR}/level_sse4_sg.cpp
+        ${NWGRAD_LEVEL_DIR}/level_avx2_inter.cpp ${NWGRAD_LEVEL_DIR}/level_avx2_sg.cpp
+        ${NWGRAD_LEVEL_DIR}/level_avx512_inter.cpp ${NWGRAD_LEVEL_DIR}/level_avx512_sg.cpp)
     # baseline is the x86-64 default (SSE2); the other levels get their flags per-file.
     # sse4 is the x86-64-v2 feature set (SSE4.2 + POPCNT), spelled as -m flags like the
     # others so no -march/-mtune change rides along.
@@ -129,9 +129,9 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
     # and 1 the same.  On cudak (Westmere; not a target) NOPs cost up to 1.15x, the cap at 2
     # less: baseline worst 1.05, sse4 1.14 in one arm, 10 of 60 above 1.03.
     set(NWGRAD_PAD_CAP_OPTS "$<$<CXX_COMPILER_ID:GNU>:-Wa,-malign-branch-prefix-size=2>")
-    set_source_files_properties(${NWGRAD_LEVEL_DIR}/level_baseline.cpp ${NWGRAD_LEVEL_DIR}/level_baseline_soft.cpp ${NWGRAD_LEVEL_DIR}/level_baseline_inter.cpp PROPERTIES
+    set_source_files_properties(${NWGRAD_LEVEL_DIR}/level_baseline.cpp ${NWGRAD_LEVEL_DIR}/level_baseline_soft.cpp ${NWGRAD_LEVEL_DIR}/level_baseline_inter.cpp ${NWGRAD_LEVEL_DIR}/level_baseline_sg.cpp PROPERTIES
         COMPILE_OPTIONS "${NWGRAD_PAD_CAP_OPTS}")
-    set_source_files_properties(${NWGRAD_LEVEL_DIR}/level_sse4.cpp ${NWGRAD_LEVEL_DIR}/level_sse4_soft.cpp ${NWGRAD_LEVEL_DIR}/level_sse4_inter.cpp PROPERTIES
+    set_source_files_properties(${NWGRAD_LEVEL_DIR}/level_sse4.cpp ${NWGRAD_LEVEL_DIR}/level_sse4_soft.cpp ${NWGRAD_LEVEL_DIR}/level_sse4_inter.cpp ${NWGRAD_LEVEL_DIR}/level_sse4_sg.cpp PROPERTIES
         COMPILE_OPTIONS "-msse4.2;-mpopcnt;${NWGRAD_PAD_CAP_OPTS}")
     # The avx2 and avx512 levels are the ones Skylake-derived cores run (6th-10th gen Core,
     # Skylake-SP/Cascade Lake Xeons), whose JCC-erratum microcode keeps any jump that crosses
@@ -154,9 +154,9 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
     set(NWGRAD_JCC_GNU_OPTS
         "-Wa,-mbranches-within-32B-boundaries;-falign-functions=32;-falign-loops=1;-falign-jumps=1;-falign-labels=1")
     set(NWGRAD_JCC_CLANG_OPTS "$<$<CXX_COMPILER_ID:Clang,AppleClang>:-mbranches-within-32B-boundaries>")
-    set_source_files_properties(${NWGRAD_LEVEL_DIR}/level_avx2.cpp ${NWGRAD_LEVEL_DIR}/level_avx2_soft.cpp ${NWGRAD_LEVEL_DIR}/level_avx2_inter.cpp PROPERTIES
+    set_source_files_properties(${NWGRAD_LEVEL_DIR}/level_avx2.cpp ${NWGRAD_LEVEL_DIR}/level_avx2_soft.cpp ${NWGRAD_LEVEL_DIR}/level_avx2_inter.cpp ${NWGRAD_LEVEL_DIR}/level_avx2_sg.cpp PROPERTIES
         COMPILE_OPTIONS "-mavx2;-mfma;${NWGRAD_JCC_CLANG_OPTS}")
-    set_source_files_properties(${NWGRAD_LEVEL_DIR}/level_avx512.cpp ${NWGRAD_LEVEL_DIR}/level_avx512_soft.cpp ${NWGRAD_LEVEL_DIR}/level_avx512_inter.cpp PROPERTIES
+    set_source_files_properties(${NWGRAD_LEVEL_DIR}/level_avx512.cpp ${NWGRAD_LEVEL_DIR}/level_avx512_soft.cpp ${NWGRAD_LEVEL_DIR}/level_avx512_inter.cpp ${NWGRAD_LEVEL_DIR}/level_avx512_sg.cpp PROPERTIES
         COMPILE_OPTIONS "-mavx512f;-mavx512dq;-mavx512vl;-mavx512bw;${NWGRAD_JCC_CLANG_OPTS}")
     # MinGW: the Win64 ABI only guarantees a 16-byte-aligned stack, and older gcc spilled
     # 32- and 64-byte vectors there with ALIGNED moves (vmovapd / vmovdqa64; GCC PR 54412)
@@ -178,7 +178,7 @@ elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
         ${NWGRAD_LEVEL_DIR}/simd_levels.cpp
         ${NWGRAD_LEVEL_DIR}/level_neon.cpp
         ${NWGRAD_LEVEL_DIR}/level_neon_soft.cpp
-        ${NWGRAD_LEVEL_DIR}/level_neon_inter.cpp)
+        ${NWGRAD_LEVEL_DIR}/level_neon_inter.cpp ${NWGRAD_LEVEL_DIR}/level_neon_sg.cpp)
 endif()
 
 # Placement experiment knob (off by default; see placement_shift.cpp): shifts all of the
@@ -392,6 +392,26 @@ if (NWGRAD_SANITIZE OR NWGRAD_SANITIZE_EXT)
         # every TU touching the vector must agree, and here all do.
         list(APPEND NWGRAD_SANITIZE_DEFS _GLIBCXX_SANITIZE_VECTOR)
     endif()
+
+    # The gcc sanitizer test binaries (not the extension) put their data in the x86-64
+    # large-data sections, past .bss.  Under -O0 ASan+UBSan gcc gives every UBSan check
+    # static data (.Lubsan_data, in .data.rel.local), and nwgrad_tests carries 2.3 GiB of
+    # text, rodata and data (cc195c9, gcc 15.2: .text 833 MiB, .rodata 243 MiB, .data
+    # 1308 MiB).  The default layout is .text, .rodata, .data, .bss, and libgcc's
+    # __cpu_indicator_init (.text.startup, at the start of .text) reaches __cpu_model (the
+    # end of .bss) with a 32-bit PC-relative reference: past 2 GiB the link fails,
+    # "relocation truncated to fit" (the semi-global level TUs took the span from 1.70 to
+    # 2.33 GiB).  -mcmodel=medium -mlarge-data-threshold=0 sends all data and rodata to
+    # .ldata / .lrodata, which the linker places after .bss, leaving .text alone in the
+    # span; code reaches large data with 64-bit addressing.  The level TUs' own size is not
+    # trimmed: their -O0 instrumentation is what the build exists to run.
+    # (-fdata-sections + --gc-sections would drop the UBSan data of the discarded COMDAT
+    # copies in the test TUs, but gas ran out of memory on the level TUs'
+    # millions of sections.)
+    set(NWGRAD_SANITIZE_TEST_FLAGS "")
+    if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
+        set(NWGRAD_SANITIZE_TEST_FLAGS -mcmodel=medium -mlarge-data-threshold=0)
+    endif()
 endif()
 
 if (NWGRAD_SANITIZE_EXT)
@@ -428,7 +448,8 @@ if (NWGRAD_BUILD_TESTS)
         target_include_directories(nwgrad_tests_levels PRIVATE src/nwgrad/cpp/nwgrad tests/cpp)
         target_compile_features(nwgrad_tests_levels PRIVATE cxx_std_20)
         target_compile_options(nwgrad_tests_levels PRIVATE
-            $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall -Wextra> ${NWGRAD_SANITIZE_FLAGS})
+            $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall -Wextra> ${NWGRAD_SANITIZE_FLAGS}
+            ${NWGRAD_SANITIZE_TEST_FLAGS})
         target_compile_definitions(nwgrad_tests_levels PRIVATE
             _GLIBCXX_ASSERTIONS
             $<$<CXX_COMPILER_ID:Clang,AppleClang>:_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_DEBUG>
@@ -507,7 +528,8 @@ if (NWGRAD_BUILD_TESTS)
 
         # Sanitizers must be passed to both the compile and the link step.
         if (NWGRAD_SANITIZE)
-            target_compile_options(${test_target} PRIVATE ${NWGRAD_SANITIZE_FLAGS})
+            target_compile_options(${test_target} PRIVATE ${NWGRAD_SANITIZE_FLAGS}
+                ${NWGRAD_SANITIZE_TEST_FLAGS})
             target_link_options(${test_target} PRIVATE ${NWGRAD_SANITIZE_FLAGS})
             target_compile_definitions(${test_target} PRIVATE ${NWGRAD_SANITIZE_DEFS})
         endif()
