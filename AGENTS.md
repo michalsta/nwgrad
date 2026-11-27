@@ -3424,7 +3424,7 @@ functions:
   "lazy" used: 125.7 (miRNA double Global), 110.3 (protein double Global) -- per pair.
   Gate 1, ADAPTIVE (the default 2026-11-10, an option since 2026-11-11): a soft call fills its guides in the
   call, as eager did, when at least half the batch's guides were read (`guide_j`,
-  `banded_grad`; `guide_reads_`) since its previous soft call, and defers them otherwise;
+  `banded_grad`; counted per batch, `soft_note_reads_`) since its previous soft call, and defers them otherwise;
   gate 2 always defers, 0 never. The first step of a loop defers and decides the next.
   Measured as above with two warm-up steps (the first eager step after a deferred one
   allocates the workers' Viterbi tables once, ~500k instructions), adaptive vs eager,
@@ -3447,21 +3447,29 @@ functions:
   sweep over the batch after the call, 4-9 % over main with every guide read at 8 threads
   (solace), so the DEFAULT is gate 1 again with a STREAK rule: fill in the call when the
   guides were read (half or more, `guide_j` / `banded_grad`) after each of the last TWO
-  soft calls (`read_streak_`, `kReadStreak`), defer otherwise; one unread step drops back.
+  soft calls (`soft_read_streak_`), defer otherwise; one unread step drops back.
   Timed with `results/tools/soft_steps_ab.py` (use none / all / alt = every other step),
   cudak (idle; Westmere sse4), new / main, controls main2/main in brackets:
   1 thread: none 0.70-0.76, all 0.997-1.002 (0.997-1.003), alt 0.84-0.88;
   8 threads (7 rounds): none 0.69-0.80, all 0.93-1.02 (0.99-1.24), alt 0.81-1.00
   (0.96-1.25); gate 2 (always defer) at 8 threads, all: 1.01-1.29.
   Tests: `test_soft_guide_defer.py`.
-  2026-11-17: all of this lives in `batch_soft_defer.inl`, compiled for the extension in its
-  own unit (`batch_soft_defer.cpp`; header-only users get it from `batch_engine.hpp`), behind
-  four entry points (`soft_score_and_grad_`, `soft_one_`, `soft_banded_prep_`,
-  `resolve_caller_`); the engine's own fills are main's, reached with `soft_guide_lazy` set
-  for the call when it defers, and `SoftCall` fixes the per-pair state up around them. Why:
-  in the header it changed gcc's inlining in py_exports.cpp and so moved the hard engine
-  code against the kernels (protein L100 float32 affine Local path 1.13-1.14 on nighthaven
-  at equal instructions, on both layouts; see "Code placement").
+  2026-11-17 / 11-28: all of this lives in `batch_soft_defer.inl`, compiled for the extension
+  in its own unit (`batch_soft_defer.cpp`; header-only users get it from `batch_engine.hpp`).
+  The engine's own fills are main's, reached with `soft_guide_lazy` set for the call when it
+  defers, and `SoftCall` fixes the per-pair state up around them. In the extension
+  (`NWGRAD_SOFT_DEFER_EXTERN`) BatchEngine has neither the hooks nor any new member: the
+  bindings send a soft batch (or a pair of one) to `nwgrad_soft_score_and_grad` /
+  `_banded_grad` / `_align` / `_banded_align` / `_guide_j` (seq_pair_batch.hpp, compiled in that
+  unit), which run the deferral's part and then the engine's own call; the adaptive rule's
+  per-batch read count sits in a table in that unit (`soft_read_entry`), not in the engine.
+  So the engine units are main's, byte for byte. A header-only build runs the same code from
+  hooks in the engine's entry points. Why: in the header it changed gcc's inlining in the
+  engine's unit and so moved the hard engine code against the kernels (protein L100 float32
+  affine Local path 1.13-1.14 on nighthaven at equal instructions, on both layouts; see
+  "Code placement"); with only the hooks moved out (the first form, 2026-11-17) the two new
+  members and the hooks still changed every engine constructor and entry point and shifted
+  nearly all engine code mod 4096.
   `"lazy"` — it does not, and the guide
   is computed on first use (`guide_j`, `banded_align`, `banded_grad`) under the params
   CURRENT THEN. Deliberately opt-in: `score_and_grad(); set_params(params + lr*g); banded_grad()`
@@ -4064,9 +4072,9 @@ The remedy for new engine code that hard, path and score-only calls never run: p
 own, behind out-of-line entry points the header only declares, and link that unit LAST (the engine
 functions both instantiate are then taken from the engine units, whose code stays main's). Example:
 the soft guide deferral, `batch_soft_defer.cpp` (`NWGRAD_SOFT_DEFER_EXTERN`, set for the whole extension;
-the unit defines `NWGRAD_SOFT_DEFER_UNIT`; added last to `UNIT_OFFSET`). The engine units then differ
-from main's only in the few entry points that branch to it (`score_and_grad`, `banded_grad`,
-`score_and_grad_one`, `banded_align_one`, `guide_j`).
+the unit defines `NWGRAD_SOFT_DEFER_UNIT`; added last to `UNIT_OFFSET`). Nothing in the engine units may
+call into it, not even a branch: the bindings choose (`nwgrad_soft_*`, seq_pair_batch.hpp), and its state
+is not a BatchEngine member (a member changes every constructor). Then the engine units are main's.
 
 **The finer alternative ("groups", `nwgrad_text_groups.ld`).** Each of these is page-anchored:
 - the engine and aligner code of one (scalar type, gap model, mode);
