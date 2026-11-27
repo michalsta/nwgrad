@@ -277,15 +277,36 @@ static inline size_t sp_row(const SoftPairJobT<SF>& J, int i) noexcept {
     if constexpr (Tr) return static_cast<size_t>(i - 1);
     else              return static_cast<size_t>(J.a[i - 1]);
 }
-// Z = 2^ze·zr from per-row sums (Local), row m's sum (Glocal) or the (m, n) cell
-// (Global), zr normalized into [1, 2).  Returns false if Z is not positive and finite (handled by caller).
+// The semi-global ends other than glocal's (J.local 2, J.sg != kSgGlocal): row i's end
+// mass into rs[i], in the row's stored units -- column n's cell of a row < m (a free A end;
+// else 0), row m's sum (a free B end) or its (m, n) cell.  tot: the row's all-state sums.
+template <class SF>
+static inline void sp_row_ends(const SoftPairJobT<SF>& J, int i, const SF* tot, SF* rs) noexcept {
+    const int sg = J.sg;
+    if (i < J.m) { rs[i] = (sg & kSgFreeAEnd) ? tot[J.n] : SF(0); return; }
+    if (!(sg & kSgFreeBEnd)) { rs[i] = tot[J.n]; return; }
+    SF s = 0.0;
+    for (int j = J.jlo0[i]; j <= J.jhi0[i]; ++j) s += tot[j];
+    rs[i] = s;
+}
+// Z = 2^ze·zr from per-row sums (Local), row m's sum (Glocal), each row's end mass (the
+// other semi-global ends: sp_row_ends) or the (m, n) cell (Global), zr normalized into [1, 2).  Returns false if Z is not positive and finite (handled by caller).
 template <class SF>
 static inline bool sp_log_z(SoftPairJobT<SF>& J, const int* S, const SF* rowsum_or_null,
                             SF corner, int& ze, double& izr) noexcept {
     double zr;
     if (!J.local) { ze = S[J.m]; zr = corner; }
-    else if (J.local == 2) { ze = S[J.m]; zr = rowsum_or_null[J.m]; }
-    else {
+    else if (J.local == 2 && J.sg == kSgGlocal) { ze = S[J.m]; zr = rowsum_or_null[J.m]; }
+    else if (J.local == 2) {
+        // the other semi-global ends: rowsum holds each row's end mass (0 for a row
+        // without ends), Local's sum over the rows that have some
+        ze = std::numeric_limits<int>::min();
+        for (int i = 0; i <= J.m; ++i) if (rowsum_or_null[i] > 0) ze = std::max(ze, S[i]);
+        zr = 0.0;
+        if (ze != std::numeric_limits<int>::min())
+            for (int i = 0; i <= J.m; ++i)
+                if (rowsum_or_null[i] > 0) zr += sp_ldexp(rowsum_or_null[i], S[i] - ze);
+    } else {
         ze = S[0];
         for (int i = 1; i <= J.m; ++i) ze = std::max(ze, S[i]);
         zr = 0.0;
@@ -358,6 +379,7 @@ NWGRAD_SP_FMA_FN NWGRAD_SP_NOINLINE static bool sp_linear_fwd(const SoftPairJobT
     NWGRAD_SP_FMA_BODY
     const int m = J.m;
     const bool L = J.local == 1, G = J.local == 2;
+    const bool GX = G && J.sg != kSgGlocal, AB = G && (J.sg & kSgFreeABegin);   // see sp_row_ends
     SF ea = J.ea, eb = J.eb;
     const SF* RW = J.rw;
     const size_t st = J.stride, w = static_cast<size_t>(J.n) + 2;
@@ -373,7 +395,7 @@ NWGRAD_SP_FMA_FN NWGRAD_SP_NOINLINE static bool sp_linear_fwd(const SoftPairJobT
         if constexpr (Tr) { ea = RW[4 * i + 1]; eb = RW[4 * i + 3]; }
         SF fr = 0.0;
         if (L) { fr = sp_ldexp(SF(1), -S[i - 1]); r[0] = fr; }
-        else   r[0] = (i <= J.bi) ? p[0] * eb : 0.0;
+        else   r[0] = AB ? sp_ldexp(SF(1), -S[i - 1]) : (i <= J.bi) ? p[0] * eb : 0.0;   // AB: a free start
         const SF* __restrict pr = P + sp_row<Tr>(J, i) * w;
         const int lo = J.jlo[i], hi = J.jhi[i];
         for (int j = lo; j <= hi; ++j) r[j] = p[j - 1] * pr[j] + p[j] * eb + fr;
@@ -384,7 +406,8 @@ NWGRAD_SP_FMA_FN NWGRAD_SP_NOINLINE static bool sp_linear_fwd(const SoftPairJobT
         S[i] = S[i - 1] + sp_lazy(mx, J.slo[i], J.shi[i], bad, r);
         if (bad) return false;
         mf[i] = mx;
-        if (L || (G && i == m)) {
+        if (GX) sp_row_ends(J, i, r, rs);
+        else if (L || (G && i == m)) {
             SF s = 0.0;
             NWGRAD_SP_SUM(s)
             for (int j = J.jlo0[i]; j <= J.jhi0[i]; ++j) s += r[j];
@@ -422,9 +445,15 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear_t(SoftPairJobT<SF>& J) noexcept {
     const int m = J.m, n = J.n;
     // Glocal (local == 2): row 0 a free start (no moves along it), column 0 Global's
     // chain, no free start inside, Z = row m's sum, the backward seeded along row m.
+    // The other semi-global ends (J.sg): row 0 free only with a free B begin (else Global's
+    // chain), column 0 a free start with a free A begin (sp_linear_fwd), each row's end mass
+    // in rs (sp_row_ends), the backward seeded at every end cell.
     const bool L = J.local == 1, G = J.local == 2;
-    const int kmin = (L || G) ? 1 : 0;    // first row whose horizontal moves count
-    const int kmin0 = L ? 1 : 0;          // first row whose column-0 vertical move counts
+    const bool GX = G && J.sg != kSgGlocal;
+    const bool BB = G && (J.sg & kSgFreeBBegin), BE = G && (J.sg & kSgFreeBEnd);
+    const bool AE = G && (J.sg & kSgFreeAEnd), AB = G && (J.sg & kSgFreeABegin);
+    const int kmin = (L || BB) ? 1 : 0;   // first row whose horizontal moves count
+    const int kmin0 = (L || AB) ? 1 : 0;  // first row whose column-0 vertical move counts
     SF ea = J.ea, eb = J.eb;
     const SF* RW = J.rw;
     if constexpr (Tr) {
@@ -443,7 +472,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear_t(SoftPairJobT<SF>& J) noexcept {
     const int ck = Ck ? J.ck : 0;
     const int nb = (ck && m) ? (m + ck - 1) / ck : 1;   // blocks (one: the full table)
     if (!J.full) for (int j = J.slo[0]; j <= J.shi[0]; ++j) F[j] = 0.0;
-    if (L || G) { for (int j = 0; j <= n; ++j) F[j] = 1.0; }
+    if (L || BB) { for (int j = 0; j <= n; ++j) F[j] = 1.0; }
     else {
         if (J.full) for (int j = 0; j <= n; ++j) F[j] = 0.0;
         F[0] = 1.0;
@@ -454,7 +483,8 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear_t(SoftPairJobT<SF>& J) noexcept {
         SF mx = 0.0;
         for (int j = J.slo[0]; j <= J.shi[0]; ++j) mx = NWGRAD_SP_VMAX(mx, F[j]);
         mf[0] = mx;
-        if (L || (G && m == 0)) { SF s = 0.0; for (int j = J.jlo0[0]; j <= J.jhi0[0]; ++j) s += F[j]; rs[0] = s; }
+        if (GX) sp_row_ends(J, 0, F, rs);
+        else if (L || (G && m == 0)) { SF s = 0.0; for (int j = J.jlo0[0]; j <= J.jhi0[0]; ++j) s += F[j]; rs[0] = s; }
     }
     if constexpr (!Ck) { if (!sp_linear_fwd<SF, Tr>(J, F, 0, 1, m)) return; }
     else
@@ -501,10 +531,11 @@ NWGRAD_SP_FMA_FN static void soft_pair_linear_t(SoftPairJobT<SF>& J) noexcept {
             SF* __restrict c = cur;
             const SF* __restrict nx = nxt;
             for (int j = lo0; j <= hi0; ++j) c[j] = pn[j + 1] * nx[j + 1] + nx[j] * ebn + init;
+            if (AE) cur[n] += sp_ldexp(SF(1), -Tn);   // column n: an end
         } else {
-            const SF e = G ? SF(1) : init;   // Glocal: every cell of row m an end
+            const SF e = (G && (BE || !GX)) ? SF(1) : init;   // Glocal: every cell of row m an end
             for (int j = lo0; j <= hi0; ++j) cur[j] = e;
-            if (!L && !G && n >= lo0 && n <= hi0) cur[n] = 1.0;
+            if (!L && !(G && (BE || !GX)) && n >= lo0 && n <= hi0) cur[n] = 1.0;
         }
         if (lo0 <= hi0) sp_carry_bwd(cur, lo0, hi0, ea);
         clo = lo0; chi = hi0;
@@ -615,6 +646,7 @@ NWGRAD_SP_FMA_FN NWGRAD_SP_NOINLINE static bool sp_affine_fwd(const SoftPairJobT
     NWGRAD_SP_FMA_BODY
     const int m = J.m;
     const bool L = J.local == 1, G = J.local == 2;
+    const bool GX = G && J.sg != kSgGlocal, AB = G && (J.sg & kSgFreeABegin);   // see sp_row_ends
     SF oa = J.oa, ea = J.ea, ob = J.ob, eb = J.eb;
     const SF* RW = J.rw;
     const size_t st = J.stride, w = static_cast<size_t>(J.n) + 2;
@@ -633,6 +665,7 @@ NWGRAD_SP_FMA_FN NWGRAD_SP_NOINLINE static bool sp_affine_fwd(const SoftPairJobT
         if constexpr (Tr) { oa = RW[4 * i]; ea = RW[4 * i + 1]; ob = RW[4 * i + 2]; eb = RW[4 * i + 3]; }
         SF fr = 0.0;
         if (L) { fr = sp_ldexp(SF(1), -S[i - 1]); rM[0] = fr; rX[0] = 0.0; rY[0] = 0.0; }
+        else if (AB) { rM[0] = sp_ldexp(SF(1), -S[i - 1]); rX[0] = 0.0; rY[0] = 0.0; }   // a free start
         else {
             rM[0] = 0.0; rY[0] = 0.0;
             rX[0] = (i <= J.bi) ? (pM[0] + pY[0]) * ob + pX[0] * eb : 0.0;
@@ -663,7 +696,8 @@ NWGRAD_SP_FMA_FN NWGRAD_SP_NOINLINE static bool sp_affine_fwd(const SoftPairJobT
         S[i] = S[i - 1] + sp_lazy(mx, J.slo[i], J.shi[i], bad, rM, rX, rY, tp);
         if (bad) return false;
         mf[i] = mx;
-        if (L || (G && i == m)) {
+        if (GX) sp_row_ends(J, i, tp, rs);
+        else if (L || (G && i == m)) {
             SF s = 0.0;
             NWGRAD_SP_SUM(s)
             for (int j = J.jlo0[i]; j <= J.jhi0[i]; ++j) s += tp[j];
@@ -701,9 +735,13 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine_t(SoftPairJobT<SF>& J) noexcept {
     const int m = J.m, n = J.n;
     // Glocal (local == 2): row 0 a free start (no moves along it), column 0 Global's
     // chain, no free start inside, Z = row m's sum, the backward seeded along row m.
+    // The other semi-global ends (J.sg): as soft_pair_linear_t.
     const bool L = J.local == 1, G = J.local == 2;
-    const int kmin = (L || G) ? 1 : 0;    // first row whose horizontal moves count
-    const int kmin0 = L ? 1 : 0;          // first row whose column-0 vertical move counts
+    const bool GX = G && J.sg != kSgGlocal;
+    const bool BB = G && (J.sg & kSgFreeBBegin), BE = G && (J.sg & kSgFreeBEnd);
+    const bool AE = G && (J.sg & kSgFreeAEnd), AB = G && (J.sg & kSgFreeABegin);
+    const int kmin = (L || BB) ? 1 : 0;   // first row whose horizontal moves count
+    const int kmin0 = (L || AB) ? 1 : 0;  // first row whose column-0 vertical move counts
     SF oa = J.oa, ea = J.ea, ob = J.ob, eb = J.eb;
     const SF* RW = J.rw;
     if constexpr (Tr) {
@@ -728,7 +766,7 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine_t(SoftPairJobT<SF>& J) noexcept {
 
     if (!J.full) for (int j = J.slo[0]; j <= J.shi[0]; ++j) { FM[j] = 0.0; FX[j] = 0.0; FY[j] = 0.0; }
     else for (int j = 0; j <= n; ++j) { FM[j] = 0.0; FX[j] = 0.0; FY[j] = 0.0; }
-    if (L || G) { for (int j = 0; j <= n; ++j) FM[j] = 1.0; }
+    if (L || BB) { for (int j = 0; j <= n; ++j) FM[j] = 1.0; }
     else {
         FM[0] = 1.0;
         if (J.bj >= 1) FY[1] = oa;
@@ -743,7 +781,8 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine_t(SoftPairJobT<SF>& J) noexcept {
         mf[0] = mx;
     }
     S[0] = 0;
-    if (L || (G && m == 0)) { SF s = 0.0; for (int j = J.jlo0[0]; j <= J.jhi0[0]; ++j) s += tp[j]; rs[0] = s; }
+    if (GX) sp_row_ends(J, 0, tp, rs);
+    else if (L || (G && m == 0)) { SF s = 0.0; for (int j = J.jlo0[0]; j <= J.jhi0[0]; ++j) s += tp[j]; rs[0] = s; }
     if constexpr (!Ck) { if (!sp_affine_fwd<SF, Tr>(J, FM, FX, FY, 0, 1, m, tp, uy)) return; }
     else
         for (int c = 0; c < nb; ++c) {
@@ -806,10 +845,11 @@ NWGRAD_SP_FMA_FN static void soft_pair_affine_t(SoftPairJobT<SF>& J) noexcept {
                     const SF v1 = d + v * obn;
                     b1[j] = v1; b2[j] = d + v * ebn; y[j] = v1;
                 }
+                if (AE) { const SF e = sp_ldexp(SF(1), -Tn); b1[n] += e; b2[n] += e; y[n] += e; }   // column n: an end
             } else {
-                const SF e = G ? SF(1) : init;   // Glocal: every cell of row m an end
+                const SF e = (G && (BE || !GX)) ? SF(1) : init;   // Glocal: every cell of row m an end
                 for (int j = lo0; j <= hi0; ++j) { b1[j] = e; b2[j] = e; y[j] = e; }
-                if (!L && !G && n >= lo0 && n <= hi0) { b1[n] = 1.0; b2[n] = 1.0; y[n] = 1.0; }
+                if (!L && !(G && (BE || !GX)) && n >= lo0 && n <= hi0) { b1[n] = 1.0; b2[n] = 1.0; y[n] = 1.0; }
             }
         }
         if (lo0 <= hi0) sp_carry_bwd(cY, lo0, hi0, ea);

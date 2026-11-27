@@ -8,16 +8,18 @@
    each block below starts at a fixed offset within a page, so its code keeps its address mod 4096
    whatever the other blocks do.
    Cost: at most 4 KiB of padding per block.  The experiment knob's pads (placement_shift.cpp) go first
-   and at the start of the bindings. */
+   and at the start of the engine units. */
 SECTIONS
 {
   .text.nwgrad ALIGN(4096) :
   {
     KEEP(*(.text.unlikely.nwgrad_placement_shift))
-    . = ALIGN(4096); KEEP(*(.text.nwgrad_placement_shift)) *py_exports.cpp.o(.text._Z* .text.Py*)
+    . = ALIGN(4096); KEEP(*(.text.nwgrad_placement_shift)) *engine_f32.cpp.o(.text._Z*) *engine_f64.cpp.o(.text._Z*) *engine_i16.cpp.o(.text._Z*) *engine_i32.cpp.o(.text._Z*) *engine_i64.cpp.o(.text._Z*)
+    . = ALIGN(4096); *py_exports.cpp.o(.text._Z* .text.Py*)
     . = ALIGN(4096); *level_neon.cpp.o(.text._Z*)
     . = ALIGN(4096); *level_neon_soft.cpp.o(.text._Z*)
     . = ALIGN(4096); *level_neon_inter.cpp.o(.text._Z*)
+    . = ALIGN(4096); *level_neon_sg.cpp.o(.text._Z*)
     . = ALIGN(4096); *batch_soft_defer.cpp.o(.text._Z*)
     . = ALIGN(4096);
   }

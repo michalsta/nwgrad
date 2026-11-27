@@ -20,6 +20,7 @@
 // feature of the built extension, where CMake compiles the level TUs with flags.
 
 #include <algorithm>
+#include <cmath>
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
@@ -166,6 +167,20 @@ struct TrackJob {
     bool on() const noexcept { return go_a != nullptr; }
 };
 
+// ── Semi-global free ends (AlignMode::Glocal's runtime refinement) ────────────
+// The Glocal template mode is the whole semi-global family: four runtime flags say which
+// flanks are free (unaligned residues, not gap moves).  A = the rows (i), B = the columns
+// (j).  kSgFreeABegin: column 0 a free start (M = 0, no X chain down it); kSgFreeAEnd: every
+// cell of column n an end; kSgFreeBBegin: row 0 a free start (M = 0, no Y chain along it);
+// kSgFreeBEnd: every cell of row m an end.  "glocal" (A within B) is kSgGlocal; no flag is
+// Global's DP exactly.  The end cell, among equal maxima: the FIRST candidate in row-major
+// order (i ascending, then j), the state by M > X > Y -- glocal's rule (the first column of
+// row m) and Local's, extended.  Every job struct defaults to kSgGlocal, so a caller that
+// predates the flags runs glocal.
+inline constexpr int kSgFreeABegin = 1, kSgFreeAEnd = 2, kSgFreeBBegin = 4, kSgFreeBEnd = 8;
+inline constexpr int kSgGlocal = kSgFreeBBegin | kSgFreeBEnd;
+inline constexpr int kSgAll = 15;
+
 // Everything a forward pass needs, and everything it produces — no std::simd, no
 // Aligner: the only currency that crosses a level boundary.  Templated on the Viterbi
 // precision T (double or float32): the substitution block, gap penalties and DP buffer
@@ -198,6 +213,9 @@ struct ViterbiJob {
     // 0.75 B/cell affine).  Out: 1 if the kernel wrote them, 0 if it wrote one byte a cell
     // (it clears the request it cannot honour: int16 lanes).
     int dense = 0;
+    // align_mode 2: the free ends (kSgFree*).  Last, so every member before it keeps main's
+    // offset: inserted beside align_mode it moved the code of kernels that never read it.
+    int sg = kSgGlocal;
 };
 
 // The dense direction codes' geometry, shared by the kernels and the walks.  Per DP row:
@@ -245,7 +263,50 @@ struct ScoreJob {
     DpBufferT<T>* buf;
     T score;                                // out
     TrackJob<T> tr;                         // tracked rows (tr.on()), else untracked
+    int sg = kSgGlocal;                     // local 2: the free ends (kSgFree*); last, as ViterbiJob's
 };
+
+// ── Score only at int8 (score8_kernel_impl.inl) ───────────────────────────────
+// An integer problem's score in saturating int8 lanes, tried before the int16 / int32
+// kernels (Aligner::score_i8_); `overflow` set = the result may have saturated, so the
+// caller runs the wider kernel.  Gap parameters >= 0, go + ge <= 127 per side, every
+// substitution within [-127, 127]; Global / Glocal `gain` = min(m, n) * smax_pos <= 126
+// (the bound the overflow test rests on).  Scratch grows in `scratch`.
+struct Score8Job {
+    const unsigned char* a; int m;
+    const unsigned char* b; int n;
+    const int8_t* blk; int nalpha;
+    int8_t go_a, ge_a, go_b, ge_b;
+    int local;                              // 0 = Global, 1 = Local, 2 = Glocal
+    int linear;                             // 1: linear gaps (go_a = go_b = 0)
+    int gain;                               // Global / Glocal: min(m, n) * smax_pos
+    std::vector<int8_t>* scratch;
+    int score;                              // out
+    int overflow;                           // out: 1 = re-run wider
+};
+using score8_fn = void (*)(Score8Job&);
+// The int8 tier's out-of-line entries (simd_levels.cpp), one request for both: the
+// problem as the caller holds it (block of any integer type, gaps as doubles), so the
+// gates, the int8 cast and the job setup stay out of the bindings / engine TU, which is
+// at gcc 15's inline-unit-growth limit (see Aligner::score_i8_).
+//   score8_try  (Aligner::compute_score): 1 = the int8 score in `score`; 0 = not run (or
+//               mode 2's overflow); -1 = Local at mode 1, held off by the predictor or overflowed
+//               (the caller notes the wide score in score8_pred()).
+//   score8_own  (BatchEngine::int8_own_): every row of nb[0..real) long enough for the
+//               int8 tier and the problem within its preconditions, the predictor
+//               expecting no overflow -- the group runs its own fills.
+struct Score8Req {
+    const unsigned char* a = nullptr; const unsigned char* b = nullptr;
+    const void* blk = nullptr;              // nalpha^2 block of int16 / int32 / int64
+    int m = 0, n = 0, nalpha = 0, tbytes = 0;   // tbytes: the block's element size
+    double go_a = 0, ge_a = 0, go_b = 0, ge_b = 0;   // the problem's gaps (linear: opens unused)
+    long long smax_pos = -1, smax_neg = 0;   // NwIntBound: smax_pos < 0 = not prepared
+    int backend = 0, mode = 0;              // mode: score_int8_mode()
+    int am = 0, linear = 0, key = 0;        // AlignMode, GapModel::Linear, score8_key
+    const int* nb = nullptr; int real = 0;  // score8_own: the group's row lengths
+};
+using score8_try_fn = int (*)(const Score8Req&, int& score);
+using score8_own_fn = bool (*)(const Score8Req&);
 
 // ── Grid forward pass (TracebackMode::Grid) ──────────────────────────────────
 //
@@ -524,6 +585,7 @@ struct SoftPairJobT {
     const F* P;
     F oa, ea, ob, eb;               // linear: ea, eb only
     int local, full, bi, bj;        // bi/bj: Global border rows/cols
+    int sg = kSgGlocal;             // local 2: the semi-global free ends (kSgFree*)
     const int *jlo, *jhi, *jlo0, *jhi0, *slo, *shi;   // m+1 each
     size_t stride;                  // n+1
     F *FM, *FX, *FY;                // forward tables (linear: FM only)
@@ -652,9 +714,9 @@ enum class Gate : int {
     InterGroupBytes, InterSoftBytes, InterScoreGatherCells,
     InterLinearIntGatherCells, InterLinearF32GatherCells, InterLinearF64GatherCells,
     InterGlobalLinearIntCells, InterGlobalLinearF32Cells, LinearStripedMinN, SoftF32MinCells,
-    InterMinFill, SoftCkptRows, SoftCkptMinBytes, SoftDoubleFtz, InterProfileBytes, Count_,
+    InterMinFill, SoftCkptRows, SoftCkptMinBytes, SoftDoubleFtz, ScoreInt8, InterScoreSmallCells, InterScoreInt8, ScoreInt8MinSegs, InterProfileBytes, InterGroupTiles, Count_,
     // Switches kept out of GateTable (their own override, soft_guide_defer_gate()): growing
-    // the table moved its epoch and changed every gate reader's code in the bindings unit.
+    // the table moved its epoch and changed every gate reader's code in the engine units.
     SoftGuideDefer = Count_, CountAll_
 };
 inline constexpr const char* kGateNames[] = {
@@ -663,7 +725,9 @@ inline constexpr const char* kGateNames[] = {
     "inter_linear_f64_gather_cells", "inter_global_linear_int_cells",
     "inter_global_linear_f32_cells", "linear_striped_min_n", "soft_f32_min_cells",
     "inter_min_fill", "soft_ckpt_rows", "soft_ckpt_min_bytes",
-    "soft_double_ftz", "inter_profile_bytes", "soft_guide_defer"};
+    "soft_double_ftz", "score_int8", "inter_score_small_cells",
+    "inter_score_int8", "score_int8_min_segs", "inter_profile_bytes", "inter_group_tiles",
+    "soft_guide_defer"};
 static_assert(sizeof(kGateNames) / sizeof(kGateNames[0]) == static_cast<size_t>(Gate::CountAll_));
 inline constexpr int64_t kGateUnset = -1;
 inline constexpr int64_t kGateOff = INT64_MAX;
@@ -721,6 +785,78 @@ inline bool soft_double_ftz() noexcept {
     static const int64_t v = env_nonneg_int("NWGRAD_SOFT_DOUBLE_FTZ");
     return v != 0;   // unset (-1): the default, on
 }
+// The int8 score tier (Aligner::score_i8_, score8_kernel_impl.inl): score_int8 /
+// NWGRAD_INT8.  0: never; 1 (the default): Local only, skipped after a problem that
+// overflowed
+// (Aligner::score_i8_'s predictor); 2: every mode and every problem.
+// Exact at every value (an int8 run that may have saturated is re-run wider), so it moves
+// speed only.  Global / Glocal are off by default: their rows fall away from column 0 and
+// lazy-F then carries F across every lane boundary of every row (16+ passes), so miRNA x
+// target (22 x 50, the case short enough for their G <= 126 precondition) ran 2.2x the
+// int16 instructions (skynet sse4, 2026-11-07).  NWGRAD_INT_NARROW=0 turns it off too
+// (every narrowing).  The gate wins over the environment.
+// The default (neither the gate nor NWGRAD_INT8 set): 1 on x86; 0 on AArch64, where the int8
+// kernel lost to int16 even on pairs that fit (spot, M1, 44a8679, Local score-only, best of
+// 5, controls 0.995-1.002: unrelated DNA L100 1.26 / 1.35 affine / linear, L300 1.11 / 1.70,
+// protein L300 1.41 / 1.75; only DNA L1000 affine 0.91).
+#if defined(__aarch64__) || defined(_M_ARM64)
+inline constexpr int kScoreInt8Default = 0;
+inline constexpr bool kInterScoreInt8Default = false;   // the batch's inter-pair int8 tier (untimed there)
+#else
+inline constexpr int kScoreInt8Default = 1;
+inline constexpr bool kInterScoreInt8Default = true;
+#endif
+inline int score_int8_mode() noexcept {
+    const int64_t o = gate_override(Gate::ScoreInt8);
+    if (o >= 0) return o >= 2 ? 2 : static_cast<int>(o);
+    static const int64_t v = env_nonneg_int("NWGRAD_INT8");
+    if (v >= 0) return v >= 2 ? 2 : static_cast<int>(v);
+    return kScoreInt8Default;
+}
+// The int8 tier's minimum row length in int8 segments (ceil(n / lanes)), by lane count:
+// 32 segments at 16 and 32 lanes, 16 (or 32) at 64 lanes.  At 32 lanes a short row is a few
+// segments, so lazy-F's carries across 32 lane boundaries and the per-row costs outweigh
+// the doubled width: nighthaven (AVX2) Local score, pairs that fit int8, tier on / off,
+// L100 (4 segments) protein unrelated 1.70, DNA related 1.66; L300 (10) 1.33 / 1.06;
+// L1000 (32) 0.64 / 1.00, DNA unrelated 0.45; L3000 0.36.  At 16 lanes (SSE2 / SSE4 / NEON)
+// the instruction counts (skynet, wloczykij: L100 DNA related 0.81, unrelated 0.48) hid a wall
+// loss: nighthaven with the level forced to sse4, DNA int16 Local score, tier on / off, cycles:
+// L100 (7 segments) affine 20 % mutated 1.13 (wall 1.009 under the score cap), 27-30 %
+// 1.06-1.10 wall, linear 1.05-1.11 wall, unrelated 0.77-0.92; L150-L300 related mixes still
+// 1.01-1.33 here and there; from L500 (32 segments) unrelated 0.49-0.59 and related 0.94-1.01.
+// So 32 there too.  At 64 lanes (AVX-512, solace, Local score int16, tier on / off,
+// 87356da) 16 segments (L1000) already gained for affine and for <= 8 letters -- DNA
+// 0.45-0.55, protein affine 0.74 -- but not protein linear (1.02-1.06, control 1.02); 5
+// segments (L300) lost 1.30-1.84; from 32 (L2048) every cell gained (DNA 0.38-0.40,
+// protein affine 0.56, int32 0.15-0.33).  So 16 there, except linear over > 8 letters: 32.
+// score_int8_min_segs overrides it at every level.
+inline int score_int8_min_segs(int lanes, bool linear, int nalpha) noexcept {
+    const int64_t o = gate_override(Gate::ScoreInt8MinSegs);
+    if (o >= 0) return o > (1 << 20) ? (1 << 20) : static_cast<int>(o);
+    if (lanes >= 64) return (linear && nalpha > 8) ? 32 : 16;
+    return 32;
+}
+// The int8 kernel's lane count at a level (score8_kernel_impl.inl: native_simd<int8_t>).
+inline int score_int8_lanes(int level) noexcept {
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64)
+    return level == static_cast<int>(SimdLevel::Avx512) ? 64 : level == static_cast<int>(SimdLevel::Avx2) ? 32 : 16;
+#else
+    (void)level; return 16;
+#endif
+}
+// Counters of the int8 tier (problems run, of which overflowed), for the tests; counted
+// only while switched on (score8_count_on()), so a production run pays one relaxed load.
+struct Score8Stats { std::atomic<bool> on{false}; std::atomic<long long> runs{0}, overflows{0}; };
+inline Score8Stats& score8_stats() noexcept { static Score8Stats s; return s; }
+// The int8 tier's predictor (score8_try): per thread and problem type (score8_key: the
+// integer type's size, the gap model, the mode), the last Local problem's score (the int8
+// run's, or the wide kernel's when int8 was skipped or overflowed); score8_try compares it
+// with its threshold (score8_pred_cap in simd_levels.cpp).
+inline constexpr int score8_key(int tbytes, bool linear, int align_mode) noexcept {
+    return ((tbytes == 2 ? 0 : tbytes == 4 ? 1 : 2) * 2 + (linear ? 1 : 0)) * 3 + align_mode;
+}
+struct Score8Pred { float last[18]; };
+inline Score8Pred& score8_pred() noexcept { static thread_local Score8Pred p{}; return p; }
 // soft_guide "eager"'s guide Viterbi: soft_guide_defer / NWGRAD_SOFT_GUIDE_DEFER.
 // 1 (DEFAULT, 2026-11-13): adaptive -- defer it to first use, under the params the soft
 // call scored (BatchEngine::soft_pend_), unless the guides were read after each of the
@@ -905,7 +1041,7 @@ inline constexpr GateLevelCaps kGateCapsSse    { {       6600,     1700,      20
                                                  { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, 0, 200000 };
 inline constexpr GateLevelCaps kGateCapsAvx2   { {      31000,     3800,      20000,     3072,      12288,       4700, kGateNoCap, kGateNoCap,      31000,      10300,      31000,      31000 },
                                                  {       6600,     1700,      20000,     3072,      12288,       1900, kGateNoCap, kGateNoCap,       6600,       6600,       6600,       6600 },
-                                                 {       1700,     1700,       4000,     1024,        450,       4700,       4700, kGateNoCap,       1700,       1700,       1700,       1700 },
+                                                 {       1700,     1700,       4000,     1024,        450,       4700,       4700, kGateNoCap,       1700,       1700,       1700,       1700 },   // int16: main's small caps (see kGateCapsSse4)
                                                  {       1700,     3800,       4000,     2560,       2048,       1900,       1900, kGateNoCap,       1700,       3800,       1700,       1700 },
                                                  {       3800,     1700,       2500,     3072,      12288,       2800,       1900, kGateNoCap,       3800,       1700,       3800,       3800 },
                                                  3072, 8192, 20000,
@@ -924,12 +1060,40 @@ inline constexpr GateLevelCaps kGateCapsNeon   { {      10300,     1700,       8
                                                  {      14700,        0,          0,     4608,      12288,       2800, kGateNoCap,          0,      63100,          0,      14700,      63100 },
                                                  3072, 8192, 20000,
                                                  { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, 0, 250000 };
+// The small-alphabet score caps of int16 per level (score_small_local / _global), measured
+// with the inter-pair int8 tier in (proto/int8-inter; the int8 groups of int16 AND int32
+// batches take int16's caps), DNA related pairs, cap lifted / default:
+//   AVX2 (nighthaven, time, 1 and 6 threads): L100 0.13-0.48, L300 0.69-0.80, L500 0.70-0.89,
+//     L1000 affine 1.00 / linear 0.87-0.91 on uniform batches -- but a mixed batch (mixmir:
+//     half 22 x 50 miRNA, half related DNA L300-500 of random length) lost under the raise,
+//     int16 Local score 1.24 affine / 1.15 linear, int32 through the narrowed groups 1.23, and
+//     a lane-length uniformity rule past L200 left t6 at 1.23 and cost uniform L500 1.14.  So
+//     AVX2 keeps main's 4700 (both modes: Global's raise was not checked on mixed batches).
+//   SSE4 (wloczykij, instructions, A/A 0.94-1.05): L60 0.29-0.43, L100 0.42-0.69, L150-L500
+//     affine 0.72-0.85, linear Global 0.77-0.94, linear Local 0.88 / 0.99 / 1.03 / 1.04 at
+//     L150 / 200 / 300 / 500 -> 41000 (L200) both modes.
+//   SSE2 (the same): L60 0.55-0.71; L100 Local 0.57-0.82 (int8), Global 0.98-1.06; L150 on
+//     loses in linear (1.10-1.55) -> Local 10500 (L100), Global 3800 (L60).
+// int32's own caps stay: its inter-pair kernel loses from L100 Global on (SSE4 1.33-2.10,
+// SSE2 2.5-4.5).  AVX-512 int16 has no cap; NEON keeps its own.
+inline constexpr GateLevelCaps kGateCapsSse4 = [] {
+    GateLevelCaps c = kGateCapsSse;
+    c.i16.score_small_local = 41000; c.i16.score_small_global = 41000;
+    return c;
+}();
+inline constexpr GateLevelCaps kGateCapsSse2 = [] {
+    GateLevelCaps c = kGateCapsSse;
+    c.i16.score_small_local = 10500; c.i16.score_small_global = 3800;
+    return c;
+}();
 inline const GateLevelCaps& gate_caps(int level) noexcept {
 #if defined(__aarch64__) || defined(_M_ARM64)
     (void)level; return kGateCapsNeon;
 #else
     switch (static_cast<SimdLevel>(level)) {
         case SimdLevel::Avx2:   return kGateCapsAvx2;
+        case SimdLevel::Sse4:   return kGateCapsSse4;
+        case SimdLevel::Baseline: return kGateCapsSse2;
         case SimdLevel::Avx512: return kGateCapsAvx512;
         default:                return kGateCapsSse;
     }
@@ -969,6 +1133,29 @@ inline bool inter_group_filled(size_t real, size_t W) noexcept {
                      : o == kGateOff ? 0 : static_cast<size_t>(std::min<int64_t>(o, 100));
     return real * 100 >= W * pct;
 }
+// Inter-pair grouping (BatchEngine::ensure_plan_).  A group computes W x max(len A) x
+// max(len B) cells, so the pairs of a group should agree in BOTH lengths.  Sorting by
+// (len B, len A) and cutting every W gives groups of one len B but, when the lengths are
+// independent (all-vs-all, family screens), a third of the len-A range each: lane
+// utilisation 0.89 / 0.81 / 0.69 at W = 8 / 16 / 32 on U[50,300] x U[50,300] (simulated;
+// solace AVX-512 measured time per useful cell 1.42-1.47x of a uniform batch at W = 32,
+// 1.22-1.27x at W = 16, time following computed cells to 0-2 %).  So the sorted pairs are
+// cut into TILES of k groups (k*W pairs, and within ragged_ok of the tile's shortest B),
+// and each tile is re-sorted by (len A, len B) before its groups are cut: a tile spans
+// ~k*W/N of the len-B range, a group ~1/k of the tile's len-A range, balanced at
+// k = sqrt(N / W) (simulated 0.98 / 0.97 / 0.95; correlated lengths and miRNA-like batches
+// 0.97-1.00, never below the old grouping by more than noise; small batches N = 300-2000
+// gain too).  Fill and ragged rules are unchanged, and each lane's result does not depend
+// on its group, so the regrouping changes speed only (bit-identical results, output order
+// unchanged).  Override (inter_group_tiles): k; 0 or 1 = the old (len B, len A) grouping
+// (one group per tile), for A/B; off = one tile per ragged window.
+inline size_t inter_group_tiles(size_t n_elig, size_t W) noexcept {
+    const int64_t o = gate_override(Gate::InterGroupTiles);
+    if (o == kGateOff) return SIZE_MAX / (W ? W : 1);
+    if (o >= 0) return o < 1 ? 1 : static_cast<size_t>(std::min<int64_t>(o, int64_t(SIZE_MAX / (W ? W : 1))));
+    const double k = std::sqrt(static_cast<double>(n_elig) / static_cast<double>(W ? W : 1));
+    return k < 1.5 ? 1 : static_cast<size_t>(k + 0.5);
+}
 // Score only: the shared score kernel pays only for short pairs -- over 8 letters it
 // gathers (the InterScoreGatherCells override applies), up to 8 it blends on masks and
 // loses to the own fill from a length of its own, per mode.  Hard fills are not gated
@@ -981,7 +1168,9 @@ inline bool inter_score_ok(size_t nalpha, int M, int n, bool affine, bool local,
     const uint32_t small = local ? c.score_small_local
                          : (std::is_same_v<T, float> && !affine) ? gate_caps(level).f32_small_global_lin
                                                                  : c.score_small_global;
-    const size_t cap = nalpha <= 8 ? size_t(small)
+    // Up to 8 letters its own override (inter_score_small_cells): without one, a sweep
+    // that set the gather cap off still sent DNA pairs past ~L43 to their own fill.
+    const size_t cap = nalpha <= 8 ? gate_cap(Gate::InterScoreSmallCells, small)
                                    : gate_cap(Gate::InterScoreGatherCells,
                                               affine ? aff : (local ? c.score_linear : c.score_linear_g));
     return static_cast<size_t>(M + 1) * static_cast<size_t>(n + 1) <= cap;
@@ -1136,6 +1325,19 @@ struct TypedKernels {
     profile_fn         profile_build = nullptr;
 };
 
+// The semi-global runtime ends (job.sg != kSgGlocal), from the level's sg unit.  Not in
+// TypedKernels: there they moved every later slot (and the per-type tables) against main,
+// and the Global / Local / glocal dispatch reads those slots on every pair.  Kept at the
+// end of LevelKernels instead (sg_of<T>()).
+template <class T>
+struct SgTypedKernels {
+    typename TypedKernels<T>::viterbi_fn linear_sg = nullptr;       // linear, H table
+    typename TypedKernels<T>::viterbi_fn linear_ptr_sg = nullptr;   // ... recording direction bytes
+    typename TypedKernels<T>::viterbi_fn viterbi_sg = nullptr;      // affine Full, Scores
+    typename TypedKernels<T>::viterbi_fn viterbi_ptr_sg = nullptr;  // ... Pointers
+    typename TypedKernels<T>::score_fn   score_sg = nullptr;        // score only
+};
+
 struct LevelKernels {
     TypedKernels<double>  d;
     TypedKernels<float>   f;
@@ -1144,6 +1346,12 @@ struct LevelKernels {
     TypedKernels<int64_t> i64;
     int           row_block = 0;                // columns per interleaved block (per-µarch)
     int           level = 0;                    // this level's SimdLevel id (the gates read it)
+    score8_fn     score_i8 = nullptr;           // score only in int8 lanes (score8_kernel_impl.inl)
+    // inter-pair score only in saturating int8 lanes (inter8_kernel_impl.inl), inter_w8 pairs per call
+    void (*inter_score_i8)(InterJobT<int8_t>&) = nullptr;
+    int           inter_w8 = 0;
+    score8_try_fn score8_try = nullptr;         // its gates and run (simd_levels.cpp), set with score_i8
+    score8_own_fn score8_own = nullptr;         // BatchEngine::int8_own_'s test (simd_levels.cpp)
     inter_soft_fn inter_soft = nullptr;         // inter-pair soft pass, double (W = d.inter_w)
     soft_pair_fn  soft_pair_linear = nullptr;   // per-pair scaled forward-backward ↓
     soft_pair_fn  soft_pair_affine = nullptr;
@@ -1166,6 +1374,21 @@ struct LevelKernels {
     }
     template <class T> TypedKernels<T>& of() noexcept {
         return const_cast<TypedKernels<T>&>(static_cast<const LevelKernels*>(this)->of<T>());
+    }
+    SgTypedKernels<double>  sg_d;   // last: see SgTypedKernels
+    SgTypedKernels<float>   sg_f;
+    SgTypedKernels<int16_t> sg_i16;
+    SgTypedKernels<int32_t> sg_i32;
+    SgTypedKernels<int64_t> sg_i64;
+    template <class T> const SgTypedKernels<T>& sg_of() const {
+        if constexpr (std::is_same_v<T, double>)        return sg_d;
+        else if constexpr (std::is_same_v<T, float>)    return sg_f;
+        else if constexpr (std::is_same_v<T, int16_t>)  return sg_i16;
+        else if constexpr (std::is_same_v<T, int32_t>)  return sg_i32;
+        else { static_assert(std::is_same_v<T, int64_t>, "unsupported scalar type"); return sg_i64; }
+    }
+    template <class T> SgTypedKernels<T>& sg_of() {
+        return const_cast<SgTypedKernels<T>&>(static_cast<const LevelKernels*>(this)->sg_of<T>());
     }
 };
 
@@ -1215,6 +1438,13 @@ void register_level_typed(SimdLevel l,
 // level_common.inc).
 template <class T>
 NWGRAD_BASELINE_ONLY
+void register_level_sg(SimdLevel l, typename TypedKernels<T>::viterbi_fn linear_sg,
+                       typename TypedKernels<T>::viterbi_fn linear_ptr_sg,
+                       typename TypedKernels<T>::viterbi_fn viterbi_sg,
+                       typename TypedKernels<T>::viterbi_fn viterbi_ptr_sg,
+                       typename TypedKernels<T>::score_fn score_sg);
+template <class T>
+NWGRAD_BASELINE_ONLY
 void register_level_inter(SimdLevel l, typename TypedKernels<T>::inter_fn inter_fill,
                           typename TypedKernels<T>::inter_fn inter_score, int inter_w);
 
@@ -1229,7 +1459,10 @@ NWGRAD_BASELINE_ONLY
 void register_level_profile(SimdLevel l, typename TypedKernels<T>::profile_fn profile_build);
 
 NWGRAD_BASELINE_ONLY
-void register_level_common(SimdLevel l, int row_block);
+void register_level_common(SimdLevel l, int row_block, score8_fn score_i8);
+// The inter-pair int8 score kernel, from the level's inter TU.
+NWGRAD_BASELINE_ONLY
+void register_level_inter8(SimdLevel l, void (*inter_score_i8)(InterJobT<int8_t>&), int inter_w8);
 // The soft kernels, from the level's soft TU (level_<name>_soft.cpp; see level_common.inc).
 NWGRAD_BASELINE_ONLY
 void register_level_soft(SimdLevel l, inter_soft_fn inter_soft,

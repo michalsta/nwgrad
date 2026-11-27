@@ -5,10 +5,10 @@
 // Included at the end of batch_engine.hpp (header-only use), or compiled into its own
 // unit, batch_soft_defer.cpp, for the Python extension (NWGRAD_SOFT_DEFER_EXTERN).  Why
 // a unit of its own: on Alder Lake a kernel's speed depends on where the engine code
-// that drives it sits mod 4 KiB (AGENTS.md, "Code placement"), and any new code in the
-// bindings unit changes gcc's inlining there and moves that engine code.  With the soft
-// calls' bookkeeping here, the bindings unit's hard, path and score-only engine code is
-// main's.  The engine's own fills know nothing of it: a soft call reaches them with
+// that drives it sits mod 4 KiB (AGENTS.md, "Code placement"), and any new code in an
+// engine unit (engine_<type>.cpp) changes gcc's inlining there and moves that engine
+// code.  With the soft calls' bookkeeping here, the engine units' hard, path and
+// score-only code is main's.  The engine's own fills know nothing of it: a soft call reaches them with
 // settings().soft_guide_lazy set when it defers (their "no Viterbi, guide pending" path)
 // and fixes the per-pair state up afterwards (SoftCall).
 //
@@ -29,10 +29,7 @@
 
 #include <climits>
 
-// A soft call's guides: computed in the call (0: keep_paths, posterior, or the deferral
-// switched off or not wanted), lazy (kPending | kLazy: "lazy"), or deferred under the
-// params scored (kPending: "eager").  The value is the pending state a pair the call
-// finishes ends in.
+// How many pairs' guides are pending (tests: SeqPairBatch._guides_pending).
 template<class T, GapModel GM, AlignMode AM>
 size_t BatchEngine<T, GM, AM>::guides_pending() const noexcept {
     size_t n = 0;
@@ -40,6 +37,10 @@ size_t BatchEngine<T, GM, AM>::guides_pending() const noexcept {
     return n;
 }
 
+// A soft call's guides: computed in the call (0: keep_paths, posterior, or the deferral
+// switched off or not wanted), lazy (kPending | kLazy: "lazy"), or deferred under the
+// params scored (kPending: "eager").  The value is the pending state a pair the call
+// finishes ends in.
 template<class T, GapModel GM, AlignMode AM>
 uint8_t BatchEngine<T, GM, AM>::soft_pend_(bool keep, bool read) const noexcept {
     if (grad_mode_ != GradMode::Soft || keep || s_.soft_guide_posterior) return 0;

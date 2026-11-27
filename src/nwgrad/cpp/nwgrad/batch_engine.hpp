@@ -81,6 +81,10 @@ struct BatchSettings {
     // move, replayed on demand); true, its sparse field counts (faster to sum, ~10x the
     // memory).  See BatchEngine, "Tracked hard gradients".
     bool   track_counts = false;
+    // AlignMode::Glocal: the semi-global free ends (kSgFree*, simd_levels.hpp); kSgGlocal is
+    // "glocal".  The inter-pair fills are wired for kSgGlocal only: other ends run each
+    // pair's own fill (inter_fill_()).
+    int    free_ends = kSgGlocal;
 
     void set_hb_cutoff(int rows) {
         if (rows < 1) throw std::invalid_argument("nwgrad: hb_cutoff must be >= 1");
@@ -104,6 +108,138 @@ struct BatchSettings {
         n_threads = n > 0 ? n : default_thread_count();
     }
 };
+
+// The inter-pair groups of `keys` (sorted by len B, then len A, then index): tiles of up
+// to `tile` groups within the ragged len-B window of the tile's shortest, each tile
+// stable-sorted by (len A, len B) and cut every W; emit(s, e, filled) per group, a range
+// of the reordered keys.  tile = 1 is the grouping before 2026-11-10 exactly.  A tile
+// that the ragged window ends on a partial group too empty to share gives that tail back
+// to the next tile.  Both planners (ensure_plan_, stream_inter_) cut through this one
+// function: the soft results' last bits follow the group, and the batch and the stream
+// must keep agreeing (test_batch_constructor, test_tracks_batch).
+template<class Key, class LenA, class LenB, class Emit>
+void inter_cut_groups(std::vector<Key>& keys, size_t W, size_t tile, LenA la, LenB lb, Emit emit) {
+    const size_t tmax = tile > SIZE_MAX / W ? SIZE_MAX : tile * W;
+    for (size_t s = 0; s < keys.size();) {
+        size_t t = s + 1;
+        while (t < keys.size() && t - s < tmax && lb(keys[t]) * 4 <= lb(keys[s]) * 5 + 16) ++t;   // ragged_ok
+        if (tile > 1 && t < keys.size() && t - s > W && !inter_group_filled((t - s) % W, W))
+            t = s + (t - s) / W * W;
+        if (tile > 1)
+            std::stable_sort(keys.begin() + s, keys.begin() + t, [&](const Key& x, const Key& y) {
+                return la(x) != la(y) ? la(x) < la(y) : lb(x) < lb(y);
+            });
+        for (size_t g = s; g < t; g += W) {
+            const size_t e = std::min(t, g + W);
+            emit(g, e, inter_group_filled(e - g, W));
+        }
+        s = t;
+    }
+}
+
+// The batch plan's key: one pair by its lengths (ensure_plan_).
+struct InterKey { size_t len_b, len_a, i; };
+// The score-only gate of one plan pass (inter_score_ok at the pass's type; ok = nullptr:
+// no gate, the pass's score kernel does not run).
+struct InterScoreGate {
+    bool (*ok)(size_t, int, int, bool, bool, bool, int) noexcept;
+    size_t nalpha; bool affine, local, single; int level;
+};
+// The groups of one pass (T's, or the narrow NI's): tiles (inter_group_tiles), and for
+// score only the score gate's old routing kept (gate: the pass's inter_score_ok, or none
+// where its score kernel does not run).
+// Score only (rows): score_only_ sends a group past inter_score_ok's cell cap to its
+// pairs' own fills, a cap tuned on the old groups.  Tighter groups pass it more often:
+// protein float32 Local score-only (U[50,300] lengths) moved 13 % -> 29 % of the
+// cells onto the shared gather kernel on AVX2 and lost there (nighthaven, 2026-11-13:
+// 1.038x time, 1.11x instructions at 1 thread; 1.029x / 1.08x at 6).  So the pairs
+// whose OLD group fails the cap keep that group (score_only_ runs their own fills, as
+// before), and only the pairs it shared are regrouped: none moves from its own fill
+// to the shared one.  (The other way, a regrouped tile's tail too short for
+// inter_group_filled runs its own fills, as in every regrouped plan: 2 of 400 pairs
+// at 8 lanes in test_score_only_plan_keeps_the_gated_groups; nighthaven 2026-11-14,
+// mixprot float32 score-only 0.92-0.95x of main's time with the fix.)
+// Out of line and not a template on purpose, for both planners (ensure_plan_ and
+// stream_inter_): as lambdas they instantiated inter_cut_groups (and its stable_sort) in
+// every BatchEngine of the bindings TU, which sits at gcc's --param inline-unit-growth;
+// the extra code moved where the inliner gave up -- Aligner::rat() went out of line in
+// the narrowed int32 linear Local traceback (walk_linear_impl in run_narrow_group_):
+// +3 % instructions per call on miRNA 22x50 at sse4, +1-1.5 % on DNA L100 (2026-11-17;
+// nighthaven +1.5-3.6 % time).  With one copy here, run_narrow_group_ for int32 linear
+// Local is instruction-identical to main's again.  `left` takes the pairs the pass
+// leaves to their own fills (or, for the narrow pass, to T's plan).
+[[gnu::noinline]] inline void inter_plan_cut(std::vector<InterKey>& keys, size_t W, const InterScoreGate& gate,
+                                             std::vector<size_t>& elig, std::vector<std::pair<size_t, size_t>>& groups,
+                                             std::vector<size_t>& left) {
+    auto la = [](const InterKey& k) { return k.len_a; };
+    auto lb = [](const InterKey& k) { return k.len_b; };
+    const size_t tile = inter_group_tiles(keys.size(), W);
+    elig.reserve(elig.size() + keys.size());
+    if (gate.ok && tile > 1) {
+        std::vector<InterKey> old = keys, keep;
+        keep.reserve(keys.size());
+        inter_cut_groups(old, W, 1, la, lb, [&](size_t g, size_t e, bool filled) {
+            size_t M = 0, n = 0;
+            for (size_t k = g; k < e; ++k) { M = std::max(M, old[k].len_a); n = std::max(n, old[k].len_b); }
+            if (filled && gate.ok(gate.nalpha, static_cast<int>(M), static_cast<int>(n), gate.affine, gate.local,
+                                  gate.single, gate.level)) {
+                keep.insert(keep.end(), old.begin() + g, old.begin() + e);
+                return;
+            }
+            if (filled) groups.emplace_back(elig.size(), elig.size() + (e - g));
+            for (size_t k = g; k < e; ++k) (filled ? elig : left).push_back(old[k].i);
+        });
+        keys.swap(keep);   // still in (len B, len A, index) order
+    }
+    // Groups: tiles of up to `tile` groups (inter_cut_groups; inter_group_tiles,
+    // simd_levels.hpp; tile = 1: len B runs of the sorted keys, cut every W and wherever
+    // len B outgrows the group's shortest); a group of mostly padding lanes runs its
+    // pairs' own fills (inter_group_filled) -- `left` takes them.
+    inter_cut_groups(keys, W, tile, la, lb, [&](size_t g, size_t e, bool filled) {
+        if (filled) groups.emplace_back(elig.size(), elig.size() + (e - g));
+        for (size_t k = g; k < e; ++k) (filled ? elig : left).push_back(keys[k].i);
+    });
+}
+
+// The int8 groups of one origin (BatchEngine::ensure_plan8_): `keys` sorted, then len B
+// runs cut every W8 and where BatchEngine::ragged_ok() fails.  WN > 0: the keys are pairs
+// of the rows plan's narrow groups (int32 / int64; their groups fall back to the narrow
+// type), and a run too empty for an int8 group goes back to narrow groups of WN where it
+// fills one; else (or WN = 0) to `other`, its pairs' own fills.  Out of line and not a
+// template for the reason given at inter_plan_cut: with this cut as a lambda (two inlined
+// std::sort per BatchEngine instance) gcc took Aligner::rat() out of line in the narrowed
+// int32 linear Local traceback (run_narrow_group_): nighthaven AVX2 int32 linear Local
+// path +3.9-4.5 % instructions on DNA L100 / miRNA (2026-11-19).
+[[gnu::noinline]] inline void inter8_plan_cut(std::vector<InterKey>& keys, size_t W8, size_t WN,
+                                              std::vector<size_t>& elig8, std::vector<std::pair<size_t, size_t>>& groups8,
+                                              std::vector<size_t>& nelig,
+                                              std::vector<std::pair<size_t, size_t>>& ngroups, std::vector<size_t>& other) {
+    std::sort(keys.begin(), keys.end(), [](const InterKey& x, const InterKey& y) {
+        if (x.len_b != y.len_b) return x.len_b < y.len_b;
+        if (x.len_a != y.len_a) return x.len_a < y.len_a;
+        return x.i < y.i;
+    });
+    for (size_t s0 = 0; s0 < keys.size();) {
+        size_t e = s0 + 1;
+        while (e < keys.size() && e - s0 < W8 && keys[e].len_b * 4 <= keys[s0].len_b * 5 + 16) ++e;   // BatchEngine::ragged_ok
+        if (inter_group_filled(e - s0, W8)) {
+            groups8.emplace_back(elig8.size(), elig8.size() + (e - s0));
+            for (size_t k = s0; k < e; ++k) elig8.push_back(keys[k].i);
+        } else {
+            for (size_t k = s0; k < e;) {
+                const size_t ke = WN > 0 ? std::min(e, k + WN) : e;
+                if (WN > 0 && inter_group_filled(ke - k, WN)) {
+                    ngroups.emplace_back(nelig.size(), nelig.size() + (ke - k));
+                    for (size_t q = k; q < ke; ++q) nelig.push_back(keys[q].i);
+                } else {
+                    for (size_t q = k; q < ke; ++q) other.push_back(keys[q].i);
+                }
+                k = ke;
+            }
+        }
+        s0 = e;
+    }
+}
 
 template<class T, GapModel GM, AlignMode AM>
 class BatchEngine {
@@ -241,6 +377,19 @@ public:
     }
 
     void set_n_threads(int n) { s_.set_n_threads(n); }
+    // The semi-global free ends (Glocal batches; any other mode accepts kSgGlocal only, a
+    // no-op).  Changes what every pair computes: drops scores, gradients, paths and guides.
+    void set_free_ends(int f) {
+        FullAl::check_free_ends(f);   // validates (range, mode)
+        if (f == s_.free_ends) return;
+        s_.free_ends = f;
+        for (auto& fl : flags_) fl = 0;
+    }
+    int free_ends() const noexcept { return s_.free_ends; }
+    // Whether the shared (inter-pair) fills run: fill="interpair" and ends they implement.
+    bool inter_fill_() const noexcept {
+        return s_.inter_fill && (AM != AlignMode::Glocal || s_.free_ends == kSgGlocal);
+    }
     void set_hb_cutoff(int rows) { s_.set_hb_cutoff(rows); }
     void set_fill(bool rowwise, bool inter) noexcept { s_.set_fill(rowwise, inter); }
     // soft_impl changes results within tolerance only and invalidates nothing (as
@@ -469,7 +618,7 @@ public:
         ++full_calls_;   // guides may have moved: the banded grouping is stale
         tc_begin_full_();
         if (grad_mode_ == GradMode::None && !keep_paths) score_only_();
-        else if (s_.inter_fill)      score_and_grad_inter_(keep_paths);
+        else if (inter_fill_())      score_and_grad_inter_(keep_paths);
         else if (s_.sorted_schedule) score_and_grad_sorted_(keep_paths);
         else                      score_and_grad_dynamic_(keep_paths);
         return sum_scores_();
@@ -491,7 +640,7 @@ public:
         prepare_paths_(keep_paths);
         tc_begin_full_();
         if (grad_mode_ == GradMode::Soft) soft_banded_prep_();
-        if (s_.inter_fill && !keep_paths) banded_grad_inter_(bandwidth);
+        if (inter_fill_() && !keep_paths) banded_grad_inter_(bandwidth);
         else if (s_.sorted_schedule)      banded_grad_lpt_(bandwidth, keep_paths);
         else                           banded_grad_dynamic_(bandwidth, keep_paths);
         return sum_scores_();
@@ -634,7 +783,7 @@ public:
             throw std::invalid_argument("nwgrad: align() needs one gap_track per problem");
         check_tracks_(st.tracks, [&](size_t i) { return problems[i].seq_a.size(); }, K, "track");
         check_tracks_(st.gap_tracks, [&](size_t i) { return problems[i].seq_a.size() + 1; }, K, "gap_track");
-        if (s_.inter_fill) {
+        if (inter_fill_()) {
             const int be = stream_inter_backend_(params, kernel, banded);
             if (be >= 0) {
                 if (soft_f32_()) {
@@ -686,6 +835,7 @@ private:
     template<AlignBand AB>
     void configure_stream_(Aligner<GM, AM, AB, T>& al, int kernel) const {
         al.set_kernel(kernel);
+        al.set_free_ends_trusted(s_.free_ends);
         al.set_soft_impl(s_.soft_impl);
         al.set_soft_f32(s_.soft_f32);
         al.set_soft_temperature(s_.soft_temperature);
@@ -863,7 +1013,7 @@ private:
             return -1;
         return backend;
     }
-    // Problems grouped W at a time, sorted by len B then len A (counting sorts: each call
+    // Problems sorted by len B then len A, then grouped as the batch plan (inter_cut_groups; counting sorts: each call
     // brings new problems, nothing is cached).  The rest run their own path in the same
     // pass: empty sequences, and Full pairs the traceback would split (Hirschberg past
     // the cutoff).  A guided band-0 call is GuideBanded and stays so.
@@ -917,14 +1067,13 @@ private:
         csort([&](size_t i) { return problems[i].seq_a.size(); }, maxa);
         csort([&](size_t i) { return problems[i].seq_b.size(); }, maxb);
         std::vector<std::pair<size_t, size_t>> groups;
-        for (size_t s = 0; s < elig.size();) {
-            const size_t lb = problems[elig[s]].seq_b.size();
-            size_t e = s + 1;
-            while (e < elig.size() && e - s < static_cast<size_t>(W) &&
-                   problems[elig[e]].seq_b.size() * 4 <= lb * 5 + 16) ++e;
-            if (inter_group_filled(e - s, static_cast<size_t>(W))) groups.emplace_back(s, e);
-            else other.insert(other.end(), elig.begin() + s, elig.begin() + e);   // mostly padding
-            s = e;
+        {   // the batch plan's cut (inter_plan_cut, out of line), no score gate: groups index
+            // the filled pairs, the mostly padding ones join `other`
+            std::vector<InterKey> keys;
+            keys.reserve(elig.size());
+            for (size_t i : elig) keys.push_back({problems[i].seq_b.size(), problems[i].seq_a.size(), i});
+            elig.clear();
+            inter_plan_cut(keys, static_cast<size_t>(W), InterScoreGate{}, elig, groups, other);
         }
         // Tracked lanes (per-lane rows into the kernels): params with sets, or any track.
         const bool trk = params.num_sets() > 1 || st.any();
@@ -1789,6 +1938,8 @@ private:
         explicit Work(const BatchEngine& e) : g(e.alphabet(), e.nsets_) { configure(e); }
         // The batch's settings, (re)applied: a reused Work follows setting changes.
         void configure(const BatchEngine& e) {
+            full.set_free_ends_trusted(e.s_.free_ends);
+            band.set_free_ends_trusted(e.s_.free_ends);
             full.set_traceback(e.s_.traceback);
             full.set_hb_cutoff(e.s_.hb_cutoff);
             full.set_rowwise_full(e.s_.rowwise_full);
@@ -2241,6 +2392,7 @@ private:
         return ok;
     }
     void configure_lane_(FullAl& al) const {
+        al.set_free_ends_trusted(s_.free_ends);
         al.set_traceback(s_.traceback);
         al.set_hb_cutoff(s_.hb_cutoff);
         al.set_rowwise_full(s_.rowwise_full);
@@ -2249,6 +2401,7 @@ private:
         al.set_soft_temperature(s_.soft_temperature);
     }
     void configure_lane_(BandAl& al) const {
+        al.set_free_ends_trusted(s_.free_ends);
         al.set_traceback(TracebackMode::Scores);
         al.set_soft_impl(s_.soft_impl);
         al.set_soft_f32(s_.soft_f32);
@@ -2352,6 +2505,15 @@ public:
         const InterPlan& P = ensure_plan_(rows, narrow_inter_on_());
         return {P.elig.size() + P.nelig.size(), P.other.size(), P.groups.size() + P.ngroups.size()};
     }
+    // The plan's groups at T as pair indices, in group order (nwgrad._tuning, tests); the
+    // narrow groups (int32 / int64 at the narrower type) are not listed.
+    std::vector<std::vector<size_t>> inter_plan_groups(bool score_only = false) {
+        const InterPlan& P = ensure_plan_(score_only && grad_mode_ == GradMode::None, narrow_inter_on_());
+        std::vector<std::vector<size_t>> g;
+        g.reserve(P.groups.size());
+        for (auto [s, e] : P.groups) g.emplace_back(P.elig.begin() + s, P.elig.begin() + e);
+        return g;
+    }
 private:
     struct InterPlan {
         int default_backend = -1000, hb_cutoff = -1;   // what it was built for
@@ -2429,8 +2591,9 @@ private:
     // Built once and reused until the default ISA changes, the Hirschberg cutoff moves or
     // a fill gate is overridden (nwgrad._tuning):
     // re-sorting 2.5M pairs every training iteration was ~0.9 s of serial work per call.
-    // Groups: len B runs of len-A-sorted pairs, cut every W and wherever len B outgrows
-    // the group's shortest past ragged_ok().
+    // Groups: see the tiles below (default) -- or, with inter_group_tiles = 1, len B runs
+    // of len-A-sorted pairs, cut every W and wherever len B outgrows the group's shortest
+    // past ragged_ok().
     // The bound facts are part of the key for an integer T (set_params() may move a pair
     // across a bound: int16's saturating regime has no inter-pair kernel, nor has a pair
     // past NI's quarter rule a narrow group); a floating T's are never prepared.
@@ -2453,29 +2616,11 @@ private:
             dst = std::move(P);
             return dst;
         }
-        struct Key { size_t len_b, len_a, i; };
+        using Key = InterKey;
         auto by_len = [](const Key& x, const Key& y) {
             if (x.len_b != y.len_b) return x.len_b < y.len_b;
             if (x.len_a != y.len_a) return x.len_a < y.len_a;
             return x.i < y.i;
-        };
-        // Groups: len B runs of the sorted keys, cut every W and wherever len B outgrows the
-        // group's shortest; a group of mostly padding lanes runs its pairs' own fills
-        // (inter_group_filled) -- `left` takes them.
-        auto cut = [](const std::vector<Key>& keys, size_t W, std::vector<size_t>& elig,
-                      std::vector<std::pair<size_t, size_t>>& groups, auto&& left) {
-            elig.reserve(keys.size());
-            for (size_t s = 0; s < keys.size();) {
-                size_t e = s + 1;
-                while (e < keys.size() && e - s < W && ragged_ok(keys[s].len_b, keys[e].len_b)) ++e;
-                if (inter_group_filled(e - s, W)) {
-                    groups.emplace_back(elig.size(), elig.size() + (e - s));
-                    for (size_t k = s; k < e; ++k) elig.push_back(keys[k].i);
-                } else {
-                    for (size_t k = s; k < e; ++k) left(keys[k].i);
-                }
-                s = e;
-            }
         };
         std::vector<Key> keys, nkeys;
         keys.reserve(N);
@@ -2488,8 +2633,11 @@ private:
                 else rest.push_back(i);
             }
             std::sort(nkeys.begin(), nkeys.end(), by_len);
-            cut(nkeys, static_cast<size_t>(KN.template of<NI>().inter_w), P.nelig, P.ngroups,
-                [&](size_t i) { rest.push_back(i); });
+            inter_plan_cut(nkeys, static_cast<size_t>(KN.template of<NI>().inter_w),
+                           InterScoreGate{(rows && KN.template of<NI>().inter_score) ? &inter_score_ok<NI> : nullptr,
+                                          static_cast<size_t>(alpha_->size()), GM == GapModel::Affine, AM == AlignMode::Local,
+                                          s_.n_threads == 1, P.nbackend},
+                           P.nelig, P.ngroups, rest);
             back = std::move(rest);
         } else {
             back.resize(N);
@@ -2508,8 +2656,11 @@ private:
             keys.push_back({len_b(i), len_a(i), i});
         }
         std::sort(keys.begin(), keys.end(), by_len);
-        cut(keys, static_cast<size_t>(inter_w_(K)), P.elig, P.groups,
-            [&](size_t i) { P.other.push_back(i); });
+        inter_plan_cut(keys, static_cast<size_t>(inter_w_(K)),
+                       InterScoreGate{(rows && has_inter_score_(K) && linear_fill_ok_(K)) ? &inter_score_ok<T> : nullptr,
+                                      static_cast<size_t>(alpha_->size()), GM == GapModel::Affine, AM == AlignMode::Local,
+                                      s_.n_threads == 1, P.backend},
+                       P.elig, P.groups, P.other);
         dst = std::move(P);
         return dst;
     }
@@ -2844,6 +2995,29 @@ private:
         job.go_b = static_cast<NI>(P.gap_open_b); job.ge_b = static_cast<NI>(P.gap_extend_b);
         job.linear = GM == GapModel::Linear ? 1 : 0;
     }
+    // ids[0..real): the lanes' pairs (score only: a narrow group's, or an int8 group's fallback; the
+    // hard / path groups keep the PL form above, main's code).
+    void narrow_job_ids_(const size_t* ids, size_t real, int W, NarrowLanes& L, InterJobT<NI>& job) const {
+        L.a.assign(W, nullptr); L.b.assign(W, nullptr); L.m.assign(W, 0); L.nb.assign(W, 0);
+        L.bi.assign(W, 0); L.bj.assign(W, 0); L.best.assign(W, NI(0));
+        L.M = 0; L.n = 0; L.ragged = false;
+        for (int l = 0; l < W; ++l) {
+            const size_t i = ids[std::min<size_t>(static_cast<size_t>(l), real - 1)];
+            L.a[l] = codes_a(i).data(); L.b[l] = codes_b(i).data();
+            L.m[l] = static_cast<int>(len_a(i)); L.nb[l] = static_cast<int>(len_b(i));
+            L.M = std::max(L.M, L.m[l]); L.n = std::max(L.n, L.nb[l]);
+            L.ragged |= L.nb[l] != L.nb[0];
+        }
+        const AlignParams& P = params_->p;
+        job = InterJobT<NI>{};
+        job.a = L.a.data(); job.m = L.m.data(); job.b = L.b.data(); job.n = L.n; job.M = L.M;
+        job.align_mode = (AM == AlignMode::Local) ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
+        if (L.ragged) job.nb = L.nb.data();
+        job.blk = params_->nstack.data(); job.nalpha = P.matrix.size();
+        job.go_a = static_cast<NI>(P.gap_open_a); job.ge_a = static_cast<NI>(P.gap_extend_a);
+        job.go_b = static_cast<NI>(P.gap_open_b); job.ge_b = static_cast<NI>(P.gap_extend_b);
+        job.linear = GM == GapModel::Linear ? 1 : 0;
+    }
     // A narrow group of the hard / path call (score_and_grad_inter_): the NI fill, then each
     // lane adopted by Work::nfull and walked once for gradient, guide and path -- what
     // run_interleaved_ does at T (untracked; no soft).
@@ -2893,17 +3067,20 @@ private:
     // A narrow group of score_only_: NI's inter-pair score kernel under NI's score-only cap
     // (inter_score_ok); false = not run here (the caller runs each pair's own score, which
     // narrows by itself: Aligner::narrow_score_).
-    bool narrow_score_group_(const InterPlan& PL, size_t s, size_t e, Work& w) {
+    // ids[0..real) on nbackend's NI score kernel (a narrow group of the plan, or the
+    // fallback of an int8 group made of narrow-group pairs); false: run their own fills.
+    [[gnu::noinline]] bool narrow_score_group_(int nbackend, const size_t* ids, size_t real, Work& w) {
         if constexpr (kNarrowInter) {
-            const LevelKernels& K = level_kernels(PL.nbackend);
+            const LevelKernels& K = level_kernels(nbackend);
             const TypedKernels<NI>& KN = K.template of<NI>();
             if (!KN.inter_score) return false;
             const int W = KN.inter_w;
             NarrowLanes& L = w.nw.nl;
             InterJobT<NI> job;
-            narrow_job_(PL, s, e, W, L, job);
+            narrow_job_ids_(ids, real, W, L, job);
             if (!inter_score_ok<NI>(alpha_->size(), L.M, L.n, GM == GapModel::Affine, AM == AlignMode::Local,
-                                    s_.n_threads == 1, PL.nbackend))
+                                    s_.n_threads == 1, nbackend) ||
+                int8_own_(nbackend, L.nb.data(), static_cast<int>(real), w.full))   // rows the int8 tier takes
                 return false;
             const size_t sz = static_cast<size_t>(L.n + 1) * W;
             if constexpr (GM == GapModel::Linear) {
@@ -2915,15 +3092,15 @@ private:
             }
             job.best = L.best.data();
             KN.inter_score(job);
-            for (size_t l = 0; l < e - s; ++l) {
-                const size_t i = PL.nelig[s + l];
+            for (size_t l = 0; l < real; ++l) {
+                const size_t i = ids[l];
                 flags_[i] &= static_cast<uint8_t>(~kStored);
                 score_[i] = static_cast<double>(L.best[l]);
                 finish_(i, false, true);
             }
             return true;
         } else {
-            (void)PL; (void)s; (void)e; (void)w;
+            (void)nbackend; (void)ids; (void)real; (void)w;
             return false;
         }
     }
@@ -2939,11 +3116,23 @@ private:
     void score_only_() {
         gparams_ = params_;
         const size_t N = size();
-        const bool inter = s_.inter_fill;
-        const InterPlan& PL = inter ? (kNarrowInter ? ensure_plan_(true, narrow_inter_on_()) : ensure_plan_(true)) : plan_;
-        const size_t G = inter ? PL.groups.size() : 0;
-        const size_t NG = (kNarrowInter && inter) ? PL.ngroups.size() : 0;
-        const size_t tasks = inter ? NG + G + PL.other.size() : N;
+        const bool inter = inter_fill_();
+        // The int8 groups (inter8_kernel_impl.inl) when the call qualifies and has pairs for
+        // them: then the plan is plan8_'s split of the unnarrowed plan (an int8 group beats the
+        // narrower type's; the pairs left over run at T); else the narrowed plan (main's
+        // inter-pair groups at the narrower type, "Inter-pair groups at the narrower type").
+        const InterPlan& PB = inter ? (kNarrowInter ? ensure_plan_(true, narrow_inter_on_()) : ensure_plan_(true)) : plan_;
+        Inter8Call c8;
+        const Inter8Plan* P8 = inter ? ensure_plan8_(PB, c8) : nullptr;
+        if (P8 && P8->groups8.empty()) P8 = nullptr;
+        const InterPlan& PL = P8 ? P8->rest : PB;   // main's plan for every pair not in an int8 group
+        const std::vector<size_t>& elig = PL.elig;
+        const std::vector<size_t>& other = PL.other;
+        const auto& groups = PL.groups;
+        const size_t NG = (inter && kNarrowInter) ? PL.ngroups.size() : 0;
+        const size_t G8 = P8 ? P8->groups8.size() : 0;
+        const size_t G = inter ? groups.size() : 0;
+        const size_t tasks = inter ? NG + G8 + G + other.size() : N;
         std::atomic<size_t> idx{0};
         auto worker = [&]() {
             WorkLease lease(*this);
@@ -2951,28 +3140,42 @@ private:
             std::vector<const unsigned char*> a, b;
             std::vector<int> m, nb;
             std::vector<T> best, blkT;
+            // int8 lanes that may have saturated: re-run at T (spill) or, for a group of the
+            // base plan's narrow-group pairs (Inter8Plan::narrow_from), at NI as main runs them (nspill)
+            std::vector<size_t> spill, nspill;
+            // Predictor: skip the int8 run of a group while the fail fraction of the recent
+            // groups (an average halved per group, over the lanes that failed or, run at T,
+            // would have failed the int8 test -- exact from the T scores) is above the
+            // break-even of the level's lane count (inter8_max_fail_).  A group whose lanes
+            // cannot overflow at all (inter8_safe_) runs int8 regardless.  The estimate is
+            // the batch's, shared by the workers and kept across calls (inter8_fail_q_):
+            // per worker and per call, every worker of every call paid one blind int8 group,
+            // which at 64 lanes (solace, 8 threads) cost 1.11-1.13 on related DNA L100 Local.
+            auto fail8 = [this] { return std::atomic_ref<int>(inter8_fail_q_).load(std::memory_order_relaxed) * (1.0 / kFailQ); };
+            auto note8 = [this](size_t fails, size_t real) {
+                std::atomic_ref<int> q(inter8_fail_q_);
+                const int f = static_cast<int>(static_cast<double>(fails) / static_cast<double>(real) * kFailQ + 0.5);
+                q.store((q.load(std::memory_order_relaxed) + f) / 2, std::memory_order_relaxed);   // races only blur it
+            };
             auto own = [&](size_t i) {
                 flags_[i] &= static_cast<uint8_t>(~kStored);
                 set_problem_(w.full, i);
                 score_[i] = w.full.compute_score(w.buf);
                 finish_(i, false, true);
             };
-            for (size_t t; (t = idx.fetch_add(1, std::memory_order_relaxed)) < tasks; ) {
-                if (!inter) { own(t); continue; }
-                if (t < NG) {
-                    const auto [ns, ne] = PL.ngroups[t];
-                    if (!narrow_score_group_(PL, ns, ne, w))
-                        for (size_t l = ns; l < ne; ++l) own(PL.nelig[l]);
-                    continue;
-                }
-                t -= NG;
-                if (t >= G) { own(PL.other[t - G]); continue; }
-                const auto [s, e] = PL.groups[t];
-                const size_t real = e - s;
-                const LevelKernels& K = level_kernels(PL.backend);
+            const LevelKernels* Kp = inter ? &level_kernels(PL.backend) : nullptr;
+            const double max_fail = Kp && P8 ? inter8_max_fail_(Kp->inter_w8) : 0.0;
+            // NI's lane count for the narrow fallbacks (0: none in this call)
+            size_t WN = 0;
+            if constexpr (kNarrowInter)
+                if (P8 && PL.nbackend >= 0) WN = static_cast<size_t>(level_kernels(PL.nbackend).template of<NI>().inter_w);
+            // One group of `real` pairs vec[s0 .. s0 + real) on the T score kernel.
+            auto run16 = [&](const std::vector<size_t>& vec, size_t s0, size_t real) {
+                const size_t* ids = vec.data() + s0;
+                const LevelKernels& K = *Kp;
                 if (!has_inter_score_(K) || !linear_fill_ok_(K)) {
-                    for (size_t l = 0; l < real; ++l) own(PL.elig[s + l]);
-                    continue;
+                    for (size_t l = 0; l < real; ++l) own(ids[l]);
+                    return;
                 }
                 const int W = inter_w_(K);
                 a.assign(W, nullptr); b.assign(W, nullptr); m.assign(W, 0); nb.assign(W, 0);
@@ -2980,7 +3183,7 @@ private:
                 int M = 0, n = 0;
                 bool ragged = false;
                 for (int l = 0; l < W; ++l) {
-                    const size_t i = PL.elig[s + std::min<size_t>(l, real - 1)];
+                    const size_t i = ids[std::min<size_t>(l, real - 1)];
                     a[l] = codes_a(i).data(); b[l] = codes_b(i).data();
                     m[l] = static_cast<int>(len_a(i));
                     nb[l] = static_cast<int>(len_b(i));
@@ -2988,16 +3191,19 @@ private:
                     n = std::max(n, nb[l]);
                     ragged |= nb[l] != nb[0];
                 }
-                if (!inter_score_ok<T>(alpha_->size(), M, n, GM == GapModel::Affine, AM == AlignMode::Local, s_.n_threads == 1, PL.backend)) {   // short pairs only
-                    for (size_t l = 0; l < real; ++l) own(PL.elig[s + l]);
-                    continue;
+                // (int8_own_: a group of long rows the per-pair int8 tier would take; the
+                // int8 groups' pairs, <= 127 columns, are never that long)
+                if (!inter_score_ok<T>(alpha_->size(), M, n, GM == GapModel::Affine, AM == AlignMode::Local, s_.n_threads == 1, PL.backend) ||
+                    int8_own_(PL.backend, nb.data(), static_cast<int>(real), w.full)) {   // short pairs only
+                    for (size_t l = 0; l < real; ++l) own(ids[l]);
+                    return;
                 }
                 InterJobT<T> job{};
                 job.a = a.data(); job.m = m.data(); job.b = b.data(); job.n = n; job.M = M;
                 job.align_mode = (AM == AlignMode::Local) ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
                 if (ragged) job.nb = nb.data();
                 if (tracked_) {
-                    tracked_lanes_(w, w.lanes, W, real, PL.elig, s);
+                    tracked_lanes_(w, w.lanes, W, real, vec, s0);
                     job.tr = w.tjobs.data();
                 }
                 block_for_(job, blkT);
@@ -3005,14 +3211,320 @@ private:
                 job.best = best.data();
                 run_inter_score_(K, job);
                 for (size_t l = 0; l < real; ++l) {
-                    const size_t i = PL.elig[s + l];
+                    const size_t i = ids[l];
                     flags_[i] &= static_cast<uint8_t>(~kStored);
                     score_[i] = static_cast<double>(best[l]);
                     finish_(i, false, true);
                 }
+            };
+            for (size_t t; (t = idx.fetch_add(1, std::memory_order_relaxed)) < tasks; ) {
+                if (!inter) { own(t); continue; }
+                if (t < NG) {   // a narrow group (narrow_score_group_), else its pairs' own scores
+                    const auto [ns, ne] = PL.ngroups[t];
+                    if (!narrow_score_group_(PL.nbackend, PL.nelig.data() + ns, ne - ns, w))
+                        for (size_t l = ns; l < ne; ++l) own(PL.nelig[l]);
+                    continue;
+                }
+                t -= NG;
+                if (t < G8) {
+                    const auto [s, e] = P8->groups8[t];
+                    // A group of narrow-group pairs falls back to main's route for them, the
+                    // NI kernel (int32 -> int16): at T, related DNA L100 int32 affine Local
+                    // (every group predicted to overflow) read 1.84-1.89x main on solace.
+                    const bool nar = WN > 0 && t >= P8->narrow_from;
+                    const size_t W = nar ? WN : static_cast<size_t>(inter_w_(*Kp));
+                    std::vector<size_t>& sp = nar ? nspill : spill;
+                    auto back = [&](const std::vector<size_t>& vec, size_t s0, size_t real) {
+                        if (!nar) { run16(vec, s0, real); return; }
+                        if (!narrow_score_group_(PL.nbackend, vec.data() + s0, real, w))
+                            for (size_t l = 0; l < real; ++l) own(vec[s0 + l]);
+                    };
+                    const size_t* ids8 = P8->elig8.data() + s;
+                    const bool safe = inter8_safe_(ids8, e - s, c8);
+                    if (!safe && fail8() > max_fail) {   // predicted to overflow: main's kernel, W at a time
+                        for (size_t k = s; k < e; k += W) back(P8->elig8, k, std::min(W, e - k));
+                        note8(inter8_fails_(ids8, e - s, c8), e - s);
+                        continue;
+                    }
+                    const size_t before = sp.size();
+                    run8_(ids8, e - s, c8, *Kp, sp, own);
+                    if (!safe) note8(sp.size() - before, e - s);
+                    while (sp.size() >= W) {   // a full group of re-runs
+                        back(sp, sp.size() - W, W);
+                        sp.resize(sp.size() - W);
+                    }
+                    continue;
+                }
+                if (t >= G8 + G) { own(other[t - G8 - G]); continue; }
+                const auto [s, e] = groups[t - G8];
+                run16(elig, s, e - s);
+            }
+            // The last re-runs: a group if it fills one (inter_group_filled), else their own fills.
+            if (!spill.empty()) {
+                if (inter_group_filled(spill.size(), static_cast<size_t>(inter_w_(*Kp)))) run16(spill, 0, spill.size());
+                else for (size_t i : spill) own(i);
+            }
+            if (!nspill.empty()) {
+                if (!inter_group_filled(nspill.size(), WN) || !narrow_score_group_(PL.nbackend, nspill.data(), nspill.size(), w))
+                    for (size_t i : nspill) own(i);
             }
         };
         run_workers_(tasks, worker);
+    }
+
+    // ── The inter-pair int8 score tier (inter8_kernel_impl.inl) ──────────────────
+    // A score-only call of an integer batch first runs its short pairs in groups of
+    // inter_w8 int8 lanes (twice int16's, four times int32's), proving each lane's score as
+    // the striped int8 tier does (score8_kernel_impl.inl): Local exact below 127, Global /
+    // Glocal exact above G - 128 with G = min(m, n) * smax_pos <= 126 required up front.
+    // A lane that fails runs again at T, in a group of the T kernel's width once a worker
+    // has gathered enough of them (else its own fill), so every score is the T kernel's
+    // integer.  Preconditions (else the call runs as before): an integer T, untracked, at
+    // most 8 letters, every substitution within [-127, 127], gaps >= 0 with go + ge <= 127
+    // per side, the level's kernel present; per pair: both lengths <= 127 (the kernel's
+    // lane compares are int8) and, Global / Glocal, the gain bound.  Gate inter_score_int8.
+    struct Inter8Call {
+        std::vector<int8_t> blk;
+        int8_t go_a = 0, ge_a = 0, go_b = 0, ge_b = 0;
+        int smax_pos = 0;
+        int lmin = 0;   // the largest min(m, n) a pair may have (Global / Glocal gain bound)
+    };
+    struct Inter8Plan {
+        const InterPlan* base = nullptr;   // the plan it splits, and that plan's identity
+        int base_backend = -1000, base_hb = -1; unsigned base_epoch = ~0u;
+        int lmin = -1;
+        std::vector<size_t> elig8;
+        std::vector<std::pair<size_t, size_t>> groups8;
+        // groups8[narrow_from ..): pairs of the base plan's narrow groups (fallback at NI);
+        // the ones before it: of its T groups or own fills (fallback at T).  An index, not a
+        // per-group vector: a new member's destructor and moves grew every BatchEngine
+        // instance of the bindings TU and moved gcc's inliner (see inter_plan_cut).
+        size_t narrow_from = ~size_t{0};
+        InterPlan rest;   // everything else: the base plan's own groups, narrow groups and others
+    };
+    Inter8Plan plan8_;
+    // The int8 predictor's fail fraction (score_only_), in 1/kFailQ, shared by the workers
+    // through std::atomic_ref (a plain int: the engine is moved, an atomic member cannot be).
+    static constexpr int kFailQ = 1 << 12;
+    int inter8_fail_q_ = 0;
+    static int inter8_mode_() noexcept {
+        const int64_t o = gate_override(Gate::InterScoreInt8);
+        if (o >= 0) return o >= 2 ? 2 : static_cast<int>(o);
+        static const int64_t v = env_nonneg_int("NWGRAD_INTER_INT8");
+        return v < 0 ? 1 : v >= 2 ? 2 : static_cast<int>(v);
+    }
+    // The call's int8 parameters, or false (the tier does not apply).
+    bool inter8_call_(const InterPlan& PL, Inter8Call& c) const {
+        if constexpr (!nw_is_int<T>) { (void)PL; (void)c; return false; }
+        else {
+            const int mode = inter8_mode_();
+            if (mode == 0 || (mode == 1 && !kInter8Default)) return false;
+            if (PL.backend < 0 || tracked_ || grad_mode_ != GradMode::None || alpha_->size() > 8) return false;
+            const LevelKernels& K = level_kernels(PL.backend);
+            if (!K.inter_score_i8 || !has_inter_score_(K) || !linear_fill_ok_(K)) return false;
+            const AlignParams& P = params_->p;
+            if (P.num_sets() != 1) return false;
+            auto i8 = [](double v, int lo, int hi, int& out) {
+                if (!(v >= lo && v <= hi) || v != std::floor(v)) return false;
+                out = static_cast<int>(v); return true;
+            };
+            const size_t nn = static_cast<size_t>(P.matrix.size()) * P.matrix.size();
+            c.blk.resize(nn);
+            int smax = 0;
+            for (size_t k = 0; k < nn; ++k) {
+                int v;
+                if (!i8(P.matrix.data()[k], -127, 127, v)) return false;
+                c.blk[k] = static_cast<int8_t>(v);
+                smax = std::max(smax, v);
+            }
+            constexpr bool lin = GM == GapModel::Linear;
+            int goa = 0, gob = 0, gea, geb;
+            if (!lin && (!i8(P.gap_open_a, 0, 127, goa) || !i8(P.gap_open_b, 0, 127, gob))) return false;
+            if (!i8(P.gap_extend_a, 0, 127, gea) || !i8(P.gap_extend_b, 0, 127, geb)) return false;
+            if (goa + gea > 127 || gob + geb > 127) return false;
+            c.go_a = static_cast<int8_t>(goa); c.ge_a = static_cast<int8_t>(gea);
+            c.go_b = static_cast<int8_t>(gob); c.ge_b = static_cast<int8_t>(geb);
+            c.smax_pos = smax;
+            c.lmin = (AM == AlignMode::Local || smax == 0) ? 127 : std::min(127, 126 / smax);
+            return true;
+        }
+    }
+    // Gate value 1 (the default): on in every mode.  Instructions per pair, tier on / off,
+    // miRNA 22 x 50 score only, wloczykij sse4, 1 thread (A/A 0.91-1.07): int16 affine
+    // Global / Local / Glocal 0.51-0.53 / 0.47-0.49 / 0.48-0.54, linear 0.48-0.61; int32
+    // 0.22-0.28.  Where every lane overflows (Local match 8; Global unrelated, go 10 /
+    // ge 3), the predictor keeps it at 0.99-1.015 (1.22-1.51 without one).
+    // AArch64: off, as the per-pair int8 tier (kScoreInt8Default): that kernel lost to int16 on
+    // spot (M1) and this one is untimed there.
+    static constexpr bool kInter8Default = kInterScoreInt8Default;
+    // plan8_ for this call (rebuilt when PL or the length bound changed), or nullptr.
+    const Inter8Plan* ensure_plan8_(const InterPlan& PL, Inter8Call& c) {
+        if (!inter8_call_(PL, c)) return nullptr;
+        Inter8Plan& P = plan8_;
+        if (P.base == &PL && P.base_backend == PL.default_backend && P.base_hb == PL.hb_cutoff &&
+            P.base_epoch == PL.gate_epoch && P.lmin == c.lmin &&
+            (!nw_is_int<T> || same_bound_(P.rest.ib, PL.ib))) return &P;
+        P = Inter8Plan{};
+        P.base = &PL; P.base_backend = PL.default_backend; P.base_hb = PL.hb_cutoff;
+        P.base_epoch = PL.gate_epoch; P.lmin = c.lmin;
+        const LevelKernels& K = level_kernels(PL.backend);
+        using Key = InterKey;
+        std::vector<Key> k8, k8n;   // k8n: the narrow groups' pairs
+        auto ok8 = [&](size_t i) {
+            const size_t la = len_a(i), lb = len_b(i);
+            return std::max(la, lb) <= 127 && std::min(la, lb) <= static_cast<size_t>(c.lmin);
+        };
+        // The pairs left out of the int8 groups take exactly the base plan's route (main's,
+        // narrowing included): only WHOLE base groups whose pairs all fit int8 move, the
+        // others stay as they were.  Regrouping the leftovers (the first form) moved a mixed
+        // batch's long pairs off main's groups: mixmir (half miRNA, half DNA L300-500) int16
+        // Local score 1.15-1.24 on nighthaven (linear +30 % instructions).
+        InterPlan& R = P.rest;
+        R.default_backend = PL.default_backend; R.hb_cutoff = PL.hb_cutoff; R.gate_epoch = PL.gate_epoch;
+        R.ib = PL.ib; R.backend = PL.backend; R.nbackend = PL.nbackend;
+        auto take = [&](const std::vector<size_t>& elig, const std::vector<std::pair<size_t, size_t>>& groups,
+                        std::vector<size_t>& relig, std::vector<std::pair<size_t, size_t>>& rgroups, std::vector<Key>& to) {
+            for (const auto& [gs, ge] : groups) {
+                bool all = true;
+                for (size_t k = gs; k < ge && all; ++k) all = ok8(elig[k]);
+                if (all) {
+                    for (size_t k = gs; k < ge; ++k) to.push_back({len_b(elig[k]), len_a(elig[k]), elig[k]});
+                } else {
+                    rgroups.emplace_back(relig.size(), relig.size() + (ge - gs));
+                    relig.insert(relig.end(), elig.begin() + static_cast<std::ptrdiff_t>(gs),
+                                 elig.begin() + static_cast<std::ptrdiff_t>(ge));
+                }
+            }
+        };
+        take(PL.elig, PL.groups, R.elig, R.groups, k8);
+        take(PL.nelig, PL.ngroups, R.nelig, R.ngroups, k8n);
+        for (size_t i : PL.other) {
+            if (ok8(i)) k8.push_back({len_b(i), len_a(i), i});
+            else R.other.push_back(i);
+        }
+        const size_t W8 = static_cast<size_t>(K.inter_w8);
+        size_t WN = 0;
+        if constexpr (kNarrowInter)
+            if (PL.nbackend >= 0) WN = static_cast<size_t>(level_kernels(PL.nbackend).template of<NI>().inter_w);
+        inter8_plan_cut(k8, W8, 0, P.elig8, P.groups8, R.nelig, R.ngroups, R.other);
+        P.narrow_from = P.groups8.size();
+        inter8_plan_cut(k8n, W8, WN, P.elig8, P.groups8, R.nelig, R.ngroups, R.other);
+        return &P;
+    }
+    // The fail fraction above which a group skips its int8 run, per int8 lane count.  An
+    // int8 group costs r of the T kernel and each failed lane re-runs at about k: break-even
+    // at f = (1 - r) / k.  SSE4 (16 lanes; wloczykij instructions, related DNA L100 Local,
+    // the fail fraction swept by mutation): r = 0.44-0.45, f 0.07 / 0.28 / 0.39 / 0.97 read
+    // 0.48-0.53 / 0.73 / 0.93 / 1.01-1.03 (k ~ 1.0-1.2): break-even ~0.45 -> 0.4 (0.3 gave
+    // up the gain at f 0.28-0.39: 0.84 / 1.02).  At 64 lanes (solace AVX-512) the tier's own
+    // gain is smaller (unrelated DNA L100 int16 0.89), and related DNA L100 Local read
+    // 1.12-1.15 with the old 1/2 -> 0.08.  32 lanes (AVX2, nighthaven): no loss seen under
+    // 1/2, unswept -> 0.3.
+    static double inter8_max_fail_(int w8) noexcept {
+        return w8 <= 16 ? 0.4 : w8 <= 32 ? 0.3 : 0.08;
+    }
+    // Local: no lane of the group can reach 127 (smax_pos * min(m, n) < 127), so its int8
+    // run cannot fail -- miRNA x site at match 2 (44) never consults the predictor.
+    bool inter8_safe_(const size_t* ids, size_t real, const Inter8Call& c) const {
+        if (AM != AlignMode::Local) return false;
+        for (size_t l = 0; l < real; ++l)
+            if (static_cast<long long>(std::min(len_a(ids[l]), len_b(ids[l]))) * c.smax_pos >= 127) return false;
+        return true;
+    }
+    // How many of ids[0..real), already scored at T, the int8 test would have refused:
+    // Local a score >= 127, Global / Glocal a score <= G - 128 (exact both ways: see
+    // inter8_kernel_impl.inl's head).
+    size_t inter8_fails_(const size_t* ids, size_t real, const Inter8Call& c) const {
+        size_t f = 0;
+        for (size_t l = 0; l < real; ++l) {
+            const size_t i = ids[l];
+            const double v = score_[i];
+            const long long g = static_cast<long long>(std::min(len_a(i), len_b(i))) * c.smax_pos;
+            f += AM == AlignMode::Local ? v >= 127.0 : v <= static_cast<double>(g - 128);
+        }
+        return f;
+    }
+    // One int8 group: ids[0..real); proven lanes scored, the rest appended to `spill`.
+    template <class Own>
+    void run8_(const size_t* ids, size_t real, const Inter8Call& c, const LevelKernels& K,
+               std::vector<size_t>& spill, Own&& own) {
+        struct alignas(64) Blk { int8_t v[64]; };
+        static thread_local std::vector<Blk> rows;
+        static thread_local std::vector<const unsigned char*> a, b;
+        static thread_local std::vector<int> m, nb;
+        static thread_local std::vector<int8_t> best;
+        const int W = K.inter_w8;
+        a.assign(W, nullptr); b.assign(W, nullptr); m.assign(W, 0); nb.assign(W, 0); best.assign(W, 0);
+        int M = 0, n = 0;
+        bool ragged = false;
+        for (int l = 0; l < W; ++l) {
+            const size_t i = ids[std::min<size_t>(l, real - 1)];
+            a[l] = codes_a(i).data(); b[l] = codes_b(i).data();
+            m[l] = static_cast<int>(len_a(i));
+            nb[l] = static_cast<int>(len_b(i));
+            M = std::max(M, m[l]);
+            n = std::max(n, nb[l]);
+            ragged |= nb[l] != nb[0];
+        }
+        // the T kernel's own short-pair gate, at int16's caps (the int8 kernel's are unmeasured)
+        if (!inter_score_ok<int16_t>(alpha_->size(), M, n, GM == GapModel::Affine, AM == AlignMode::Local, s_.n_threads == 1, K.level)) {
+            for (size_t l = 0; l < real; ++l) own(ids[l]);
+            return;
+        }
+        InterJobT<int8_t> job{};
+        job.a = a.data(); job.m = m.data(); job.b = b.data(); job.n = n; job.M = M;
+        job.align_mode = (AM == AlignMode::Local) ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
+        job.linear = GM == GapModel::Linear ? 1 : 0;
+        if (ragged) job.nb = nb.data();
+        job.blk = c.blk.data(); job.nalpha = static_cast<int>(alpha_->size());
+        job.go_a = c.go_a; job.ge_a = c.ge_a; job.go_b = c.go_b; job.ge_b = c.ge_b;
+        const size_t row = (static_cast<size_t>(n + 1) * W + sizeof(Blk) - 1) / sizeof(Blk);
+        if (rows.size() < 2 * row) rows.resize(2 * row);
+        job.VM = rows[0].v; job.VX = rows[row].v;
+        job.best = best.data();
+        K.inter_score_i8(job);
+        for (size_t l = 0; l < real; ++l) {
+            const size_t i = ids[l];
+            const int v = best[l];
+            const int g = std::min(m[l], nb[l]) * c.smax_pos;
+            if (AM == AlignMode::Local ? v >= 127 : v <= g - 128) { spill.push_back(i); continue; }
+            flags_[i] &= static_cast<uint8_t>(~kStored);
+            score_[i] = static_cast<double>(v);
+            finish_(i, false, true);
+        }
+    }
+
+    // A score-only group the per-pair int8 tier (Aligner::score_i8_) would take instead: its
+    // own fills then.  The shared kernel holds one pair per lane of T; the int8 striped
+    // kernel 16-64 cells of one pair, so for long rows it wins: solace (AVX-512) DNA L1000
+    // Local int32, 48 unrelated pairs, the shared route (small alphabets have no cell cap
+    // there) read 1.01 of main while fill="striped" (own fills, int8) read 0.37-0.40.  Only
+    // where the tier would run (gate 1, Local, untracked, the params within its
+    // preconditions, the thread's predictor not expecting an overflow) and every pair's row
+    // is at least max(16, score_int8_min_segs) int8 segments: shorter groups stay shared
+    // (they are what the shared kernel is for, and an int8 form of it is a separate tier).
+    // The test itself is out of line (score8_own in simd_levels.cpp): this TU's inline
+    // budget (see Aligner::score_i8_).
+    template <class Al>
+    bool int8_own_(int backend, const int* nb, int real, const Al&) const {
+        if constexpr (!nw_is_int<T> || AM != AlignMode::Local) {
+            (void)backend; (void)nb; (void)real; return false;
+        } else {
+            if (tracked_ || backend < 0 || !Al::int_narrow_env()) return false;
+            const auto f = level_kernels(backend).score8_own;
+            if (!f) return false;
+            const NwIntBound<T>& ib = params_->ib;
+            const AlignParams& p = params_->p;
+            Score8Req q;
+            q.nalpha = static_cast<int>(alpha_->size());
+            q.go_a = p.gap_open_a; q.ge_a = p.gap_extend_a;
+            q.go_b = p.gap_open_b; q.ge_b = p.gap_extend_b;
+            q.smax_pos = ib.prepared() ? static_cast<long long>(ib.smax_pos) : -1;
+            q.smax_neg = static_cast<long long>(ib.smax_neg);
+            q.backend = backend; q.linear = GM == GapModel::Linear; q.key = Al::kScore8Key;
+            q.nb = nb; q.real = real;
+            return f(q);
+        }
     }
 
     void score_and_grad_dynamic_(bool keep) {
@@ -3181,10 +3693,9 @@ private:
 
     // ── Soft guide deferral (batch_soft_defer.inl) ──────────────────────────────
     // Defined out of this header: the Python extension compiles them in their own unit
-    // (batch_soft_defer.cpp), so that adding to them leaves the engine code of the
-    // bindings unit -- every hard, path and score-only call -- as it was (AGENTS.md,
-    // "Code placement": a change inside that unit moves its engine code against the
-    // kernels).  Last in the class, members included, for the same reason.
+    // (batch_soft_defer.cpp), so that adding to them leaves the code of the engine units
+    // (engine_<type>.cpp) -- every hard, path and score-only call -- as it was (AGENTS.md,
+    // "Code placement": a change inside a unit moves its engine code against the kernels).  Last in the class, members included, for the same reason.
     double soft_score_and_grad_(bool keep);
     void soft_one_(size_t i, bool keep);
     void soft_banded_prep_();

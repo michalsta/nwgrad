@@ -549,6 +549,29 @@ the best of nwgrad's own variants — is in [benchmarks-cells.md](benchmarks-cel
 - scikit-bio and DeepBLAST on spot and solace (metered connections: their dependency stacks
   are hundreds of MB).
 
+## Semi-global modes (not yet measured against competitors)
+
+Since `proto/semiglobal` nwgrad aligns every free-end set (`mode="semiglobal",
+free_ends=(a_begin, a_end, b_begin, b_end)`, `"overlap"` for all four), so the competitors'
+semi-global cells become comparable, nwgrad's A = their query / first sequence:
+
+| tool | their mode | nwgrad `free_ends` |
+|---|---|---|
+| parasail | `sg` | all four (`mode="overlap"`) |
+| parasail | `sg_qb` / `sg_qe` / `sg_qx` | `a_begin` / `a_end` / both |
+| parasail | `sg_db` / `sg_de` / `sg_dx` | `b_begin` / `b_end` / both (`sg_dx` = `"glocal"`) |
+| parasail | `sg_qb_de` / `sg_qe_db` | `a_begin, b_end` / `a_end, b_begin` |
+| Biopython | `PairwiseAligner` end-gap scores 0 | target = A: free target end gaps = B's free flanks, free query end gaps = A's (checked by score in test_semiglobal.py) |
+
+Scores agree with parasail's (checked by hand, parasail 2.6.1, `sg_dx`, `sg_qx`, `sg_db`,
+`sg_de`, `sg_qb`, `sg_qe`) except where the best alignment is empty or ends on a border cell:
+nwgrad's ends include row 0 / column 0 ((m, 0) and (0, n), as glocal's (m, 0)), parasail's
+do not, so a dovetail of two unrelated sequences scores 0 in nwgrad and the best negative
+one-cell overlap in parasail (`sg_qb_de` of AAA vs CCCCAAACCCC: 0 vs -1).  A competitor
+arm would compare on pairs with a real overlap.  The modes other than glocal's run each
+pair's own striped fill (not the inter-pair one) and the Pointers traceback; their cost
+relative to global is in AGENTS.md ("Semi-global free ends").
+
 ## Reproducing
 
 See [`tools/fleetbench/README.md`](../tools/fleetbench/README.md). In short:

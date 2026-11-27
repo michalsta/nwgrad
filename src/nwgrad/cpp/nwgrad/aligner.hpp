@@ -162,6 +162,12 @@ inline constexpr bool hb_splits(TracebackMode tb, std::size_t auto_cells, int cu
 // guide_j[i] = round(i * n / m) is used, tracking the main diagonal of the
 // rectangular DP matrix.
 
+// gj = n entries of -1: a walk's guide before it fills the rows it crosses.  noinline: one
+// out-of-line call per walk, as gcc's unit budget used to leave it (a vector<int>::_M_fill_assign
+// clone).  Inlined at each walk inside the inter-pair worker, the path cells (int16 linear
+// Glocal, int32 linear Local, float32 linear Global) ran 1-2.5 % more instructions (AVX2).
+[[gnu::noinline]] inline void nw_guide_reset(std::vector<int>& gj, size_t n) { gj.assign(n, -1); }
+
 inline std::vector<int> guide_j_from_aligned(std::string_view a_aligned,
                                               std::string_view b_aligned) {
     if (a_aligned.size() != b_aligned.size())
@@ -466,6 +472,15 @@ inline std::atomic<size_t>& track_profile_bytes() {
 // the gradient or guide AND the stored path; otherwise this, which compiles away.
 struct NoMoves { void operator()(uint8_t) const noexcept {} };
 
+// set_free_ends' throws (Aligner::check_free_ends), out of line: one copy, not one per
+// instantiation inlined into every configure path.
+[[noreturn, gnu::cold, gnu::noinline]] inline void nw_bad_free_ends(int f) {
+    if (f < 0 || f > kSgAll)
+        throw std::invalid_argument("nwgrad: free_ends must be a 4-bit flag set (0..15), got " +
+                                    std::to_string(f));
+    throw std::invalid_argument("nwgrad: free ends apply to the semi-global modes only");
+}
+
 template<GapModel GM, AlignMode AM, AlignBand AB = AlignBand::Full, class T = double>
 struct Aligner {
 
@@ -616,19 +631,96 @@ struct Aligner {
     }
     // The walk of both: emit(k) for each move, LAST move first; the start cell into
     // (i0, j0) and the guide into gj.
+    //
+    // Linear Global / Glocal: out of line (path_walk_ool_), as gcc kept path_and_guide at the
+    // old unit's inline limit.  Inlined into the inter-pair worker (score_and_grad_inter_'s
+    // lambda) the walk took that function's register allocation: the int16 linear Glocal and
+    // double linear Global path cells ran 1-2.4 % more instructions than main (AVX2), the
+    // same loop with more moves around each rat() call; out of line they run 2-12 % fewer.
+    // Local stays inline: there the walk is short and the path sink's run state, reached
+    // through the caller's reference out of line, was loaded and stored at every move (int32
+    // linear Local path +5-6 %; a local copy of the sink won back only part of it and cost
+    // the Global cells their gain).  Affine stays inline: its walk (walk_affine_impl) is out
+    // of line already, and the extra layer cost int32 affine Global path +0.5-1 %.
     template <class Emit>
-    void path_walk_(const DpBuffer& buf, Emit&& emit, int& i0, int& j0, std::vector<int>* gj) const {
+    [[gnu::always_inline]] void path_walk_(const DpBuffer& buf, Emit&& emit, int& i0, int& j0,
+                                           std::vector<int>* gj) const {
+#if defined(__aarch64__) || defined(_M_ARM64)
+        // aarch64: the linear Global walk stays in its caller, its loop in a function of its own
+        // (walk_linear_ool_), main's shape there: out of line here, protein L100 int32 linear
+        // Global path ran 1.017x main on M1 with the same instruction count.
+        // Linear Glocal: the end set chosen here, each walk its own out-of-line function, so
+        // glocal's is main's function (its fixed-ends loop alone).  With both walks in one
+        // function (9.8 KB instead of 5.4) the M1 ran mirna int16 linear Glocal path 1.0-1.6 %
+        // slower than main at the same instructions and taken branches.
+        if constexpr (GM == GapModel::Linear && AM == AlignMode::Glocal) {
+            if (sg_is_glocal_()) path_walk_ool_ws_<0>(buf, emit, i0, j0, gj);
+            else                 path_walk_ool_ws_<1>(buf, emit, i0, j0, gj);
+        } else
+            path_walk_body_(buf, emit, i0, j0, gj);
+    }
+    template <int WS, class Emit>
+    [[gnu::noinline]] void path_walk_ool_ws_(const DpBuffer& buf, Emit& emit, int& i0, int& j0,
+                                             std::vector<int>* gj) const {
+        path_walk_body_<WS>(buf, emit, i0, j0, gj);
+    }
+#else
+        if constexpr (GM == GapModel::Linear && AM != AlignMode::Local)
+            path_walk_ool_(buf, emit, i0, j0, gj);
+        else
+            path_walk_body_(buf, emit, i0, j0, gj);
+    }
+#endif
+    // Affine Glocal in the floating types: the path walk is walk_affine_glocal_ (see there).  x86
+    // only: aarch64 keeps walk_affine_impl, as gated on M1.  The other semi-global ends: their
+    // replayed walk (walk_affine_glocal_path_).
+#if defined(__aarch64__) || defined(_M_ARM64)
+    static constexpr bool kPathWalkGlocalOwn_ = false;
+#else
+    static constexpr bool kPathWalkGlocalOwn_ = std::is_floating_point_v<T> && GM == GapModel::Affine &&
+                                                AM == AlignMode::Glocal;
+#endif
+    template <class Emit>
+    [[gnu::noinline]] void path_walk_ool_(const DpBuffer& buf, Emit& emit, int& i0, int& j0,
+                                          std::vector<int>* gj) const {
+        path_walk_body_(buf, emit, i0, j0, gj);
+    }
+    // WS (aarch64): the linear walk's end set, -1 = chosen in walk_linear (at run time), 0 =
+    // glocal's (fixed), 1 = the runtime free ends (path_walk_ool_ws_).
+#if defined(__aarch64__) || defined(_M_ARM64)
+    template <int WS = -1, class Emit>
+#else
+    template <class Emit>
+#endif
+    [[gnu::always_inline]] void path_walk_body_(const DpBuffer& buf, Emit& emit, int& i0, int& j0,
+                                                std::vector<int>* gj) const {
         int ci = 0, cj = 0;   // the cell the last emitted move left from
         if constexpr (GM == GapModel::Linear) {
             ci = (AM == AlignMode::Global) ? m_ : best_i_;
             cj = (AM == AlignMode::Global) ? n_ : best_j_;
             if (gj) {
-                gj->assign(static_cast<size_t>(m_ + 1), -1);
+                nw_guide_reset(*gj, static_cast<size_t>(m_ + 1));
                 (*gj)[0] = 0;
                 (*gj)[static_cast<size_t>(m_)] = n_;
                 const int i_end = (AM == AlignMode::Global) ? m_ : best_i_;
                 (*gj)[static_cast<size_t>(i_end)] = (AM == AlignMode::Global) ? n_ : best_j_;
             }
+#if defined(__aarch64__) || defined(_M_ARM64)
+            auto step = [&](int k, int i, int j) {
+                emit(static_cast<uint8_t>(k));
+                if (gj) {
+                    if (k == 0)      (*gj)[static_cast<size_t>(i - 1)] = j - 1;
+                    else if (k == 1) (*gj)[static_cast<size_t>(i - 1)] = j;
+                }
+                ci = (k == 2) ? i : i - 1;
+                cj = (k == 1) ? j : j - 1;
+            };
+            if constexpr (WS >= 0) {
+                if (tr_) walk_linear_impl<true, WS != 0>(buf, step);
+                else     walk_linear_impl<false, WS != 0>(buf, step);
+            } else
+                walk_linear(buf, std::move(step));
+#else   // (the same step, written in the call: a named closure changed gcc 16's x86 code)
             walk_linear(buf, [&](int k, int i, int j) {
                 emit(static_cast<uint8_t>(k));
                 if (gj) {
@@ -638,6 +730,19 @@ struct Aligner {
                 ci = (k == 2) ? i : i - 1;
                 cj = (k == 1) ? j : j - 1;
             });
+#endif
+        } else if constexpr (kPathWalkGlocalOwn_) {
+            if (gj) guide_affine_init(*gj);
+            int* const g = gj ? gj->data() : nullptr;
+            const std::pair<int, int> end = walk_affine_glocal_path_(buf, [&emit, g](TBTable st, int i, int j, bool) {
+                const uint8_t k = st == TBTable::M ? 0 : st == TBTable::X ? 1 : 2;
+                emit(k);
+                if (g) {
+                    if (k == 0)      g[i - 1] = j - 1;
+                    else if (k == 1) g[i - 1] = j;
+                }
+            });
+            ci = end.first; cj = end.second;
         } else {
             ci = best_i_; cj = best_j_;
             if (gj) guide_affine_init(*gj);
@@ -690,7 +795,7 @@ struct Aligner {
         }
         if constexpr (GM == GapModel::Linear) {
             if (gj) {
-                gj->assign(static_cast<size_t>(m_ + 1), -1);
+                nw_guide_reset(*gj, static_cast<size_t>(m_ + 1));
                 (*gj)[0] = 0;
                 (*gj)[static_cast<size_t>(m_)] = n_;
                 const int i_end = (AM == AlignMode::Global) ? m_ : best_i_;
@@ -782,6 +887,26 @@ struct Aligner {
         tb_ = tb_auto_ ? kDefaultTb : t;
     }
     TracebackMode traceback() const noexcept { return tb_; }
+    // The semi-global free ends (AlignMode::Glocal only; kSgFree* bits, simd_levels.hpp):
+    // kSgGlocal (the default) is "glocal", 0 is Global's DP, kSgAll "overlap".  Every
+    // other mode accepts only its own fixed ends' word, kSgGlocal (a no-op), and throws on
+    // anything else.  Like set_traceback: it decides what the next fill computes.
+    void set_free_ends(int f) {
+        check_free_ends(f);
+        if constexpr (AM == AlignMode::Glocal) sg_ = f;
+    }
+    // The checks alone (BatchEngine::set_free_ends); the throws out of line (nw_bad_free_ends).
+    static void check_free_ends(int f) {
+        if (f < 0 || f > kSgAll || (AM != AlignMode::Glocal && f != kSgGlocal))
+            nw_bad_free_ends(f);
+    }
+    int free_ends() const noexcept { return sg_; }
+    // The batch engine's setter, for ends it validated already (BatchEngine::set_free_ends):
+    // no checks, so outside Glocal it is no code at all -- the configure paths main had
+    // (set_free_ends' throws, inlined there, grew every mode's per-lane setup).
+    void set_free_ends_trusted(int f) noexcept {
+        if constexpr (AM == AlignMode::Glocal) sg_ = f; else (void)f;
+    }
     // Whether the last Viterbi run took the Grid traceback (tests: Grid falls back to
     // Pointers silently where it does not apply, with the same result).
     bool ran_grid() const noexcept { return grid_; }
@@ -1003,13 +1128,34 @@ struct Aligner {
             compute_viterbi(buf);
             return viterbi_score_;
         } else {
+            if constexpr (AM == AlignMode::Glocal)   // the other semi-global ends: out of line (sg_compute_score_)
+                if (!sg_is_glocal_()) [[unlikely]] return sg_compute_score_(buf);
+            return compute_score_impl_<false>(buf);
+        }
+    }
+    // SGR: the semi-global runtime ends (only instantiated by sg_compute_score_).
+    // always_inline: resolved before the IPA inliner, so compute_score is main's one body.
+    template <bool SGR>
+    [[gnu::always_inline]] double compute_score_impl_(DpBuffer& buf) {
+        {
             const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
-            if (backend != kBackendScalar) {
-                if constexpr (std::is_same_v<T, std::int32_t> || std::is_same_v<T, std::int64_t>) {
-                    double r;
-                    if (!tr_ && int_narrow_env() && narrow_score_(backend, r)) return r;
+            [[maybe_unused]] bool note8 = false;   // the int8 tier's predictor wants this score
+            if constexpr (nw_is_int<T> && !SGR) {   // the int8 tier knows glocal's ends only
+                if (backend != kBackendScalar && !tr_ && int_narrow_env()) {
+                    double r8;
+                    const int e = score_i8_(backend, r8);
+                    if (e > 0) return r8;
+                    note8 = e < 0;
                 }
-                const auto fn = level_kernels(backend).template of<T>().score;
+            }
+            if (backend != kBackendScalar) {
+                if constexpr (!SGR && (std::is_same_v<T, std::int32_t> || std::is_same_v<T, std::int64_t>)) {
+                    double r;
+                    if (!tr_ && int_narrow_env() && narrow_score_(backend, r)) return score8_noted_(note8, r);
+                }
+                typename TypedKernels<T>::score_fn fn;   // SGR: the sg unit's
+                if constexpr (SGR) fn = level_kernels(backend).template sg_of<T>().score_sg;
+                else               fn = level_kernels(backend).template of<T>().score;
                 if (fn) {
                     ScoreJob<T> job{}; job.sat = sat_;
                     job.a = a_idx_.data(); job.m = m_;
@@ -1021,6 +1167,7 @@ struct Aligner {
                     job.go_b = lin ? T(0) : static_cast<T>(params_->gap_open_b);
                     job.ge_b = static_cast<T>(params_->gap_extend_b);
                     job.local = AM == AlignMode::Local ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
+                    if constexpr (SGR) job.sg = sg_;
                     job.variant = score_variant_env();
 #if defined(__aarch64__) || defined(_M_ARM64)
                     job.linear = lin && linear_score_one_row(backend, n_, nalpha_);
@@ -1030,11 +1177,11 @@ struct Aligner {
                     job.buf = &buf;
                     if (tr_) fill_track_job_(job.tr, true, static_cast<size_t>(n_) + 16, lin);
                     fn(job);
-                    return static_cast<double>(job.score);
+                    return score8_noted_(note8, static_cast<double>(job.score));
                 }
             }
-            if constexpr (GM == GapModel::Linear) return score_linear_scalar(buf);
-            else                                   return score_affine_scalar(buf);
+            if constexpr (GM == GapModel::Linear) return score8_noted_(note8, score_linear_scalar<SGR>(buf));
+            else                                   return score8_noted_(note8, score_affine_scalar<SGR>(buf));
         }
     }
     double compute_score() {
@@ -1113,6 +1260,60 @@ struct Aligner {
         } else {
             (void)backend; (void)out;
             return false;
+        }
+    }
+
+    // ── Score-only in int8 lanes (any integer T; score8_kernel_impl.inl) ─────────
+    // Tried first, before the half-width narrowing: four times int32's lanes.  The kernel
+    // proves its own result (see the file's head): Local exact unless its maximum reached
+    // 127, Global / Glocal exact when the score clears G - 128 with G = min(m, n) *
+    // smax_pos <= 126 -- the a-priori part, checked here.  On `overflow` this returns
+    // false and the caller runs the wider kernel, so the score is always the integer the
+    // int16 / int32 kernels give.  Preconditions (else false, nothing run): untracked,
+    // m, n >= 1, gap parameters >= 0 with go + ge <= 127 per side (the kernel subtracts
+    // only, and opens in one saturating step), every substitution within [-127, 127].
+    // All of it -- the gates, the block's int8 cast, the run, the predictor -- is one
+    // out-of-line call (score8_try in simd_levels.cpp, through LevelKernels so a
+    // header-only build has none): this TU holds the bindings and the engine, and is at
+    // gcc 15's --param inline-unit-growth limit there; an inline tier here (and the
+    // compute_score split it took) put Aligner::rat() out of line in the int16 linear
+    // Global inter-pair traceback (13 -> 14 call sites; solace WSL path 1.09-1.17, sse4
+    // instructions miRNA 1.063, DNA L100 1.036).
+    // The predictor's state is per thread and problem type (kScore8Key).
+    static constexpr int kScore8Key = score8_key(static_cast<int>(sizeof(T)), GM == GapModel::Linear,
+                                                 static_cast<int>(AM));
+    static double score8_noted_(bool note, double r) {
+        if constexpr (nw_is_int<T>) {
+            if (note) [[unlikely]] score8_pred().last[kScore8Key] = static_cast<float>(r);
+        }
+        return r;
+    }
+    // 1: the int8 score in `out`; 0: not run (the tier off, the problem not eligible, or
+    // gate 2's overflow); -1: Local at gate 1, predicted to overflow or overflowed -- the
+    // caller passes the wide score to score8_noted_.
+    int score_i8_(int backend, double& out) {
+        if constexpr (nw_is_int<T>) {
+            const int mode = score_int8_mode();
+            if (mode == 0 || (mode == 1 && AM != AlignMode::Local)) return 0;
+            const auto f = level_kernels(backend).score8_try;
+            if (!f) return 0;
+            Score8Req q;
+            q.a = a_idx_.data(); q.m = m_;
+            q.b = b_idx_.data(); q.n = n_;
+            q.blk = blkT_; q.tbytes = static_cast<int>(sizeof(T)); q.nalpha = nalpha_;
+            q.go_a = params_->gap_open_a; q.ge_a = params_->gap_extend_a;
+            q.go_b = params_->gap_open_b; q.ge_b = params_->gap_extend_b;
+            q.smax_pos = ib_.prepared() ? static_cast<long long>(ib_.smax_pos) : -1;
+            q.smax_neg = static_cast<long long>(ib_.smax_neg);
+            q.backend = backend; q.mode = mode; q.am = static_cast<int>(AM);
+            q.linear = GM == GapModel::Linear; q.key = kScore8Key;
+            int sc;
+            const int e = f(q, sc);
+            out = static_cast<double>(sc);
+            return e;
+        } else {
+            (void)backend; (void)out;
+            return 0;
         }
     }
 
@@ -2021,6 +2222,13 @@ private:
     void check_problem() const {
         if (!problem_set_)
             throw std::logic_error("nwgrad: call set_problem() first");
+        // Semi-global ends other than glocal's: Full band only (a guide band's end cells and
+        // borders are not wired for column n / column 0 starts).
+        if constexpr (AB == AlignBand::GuideBanded && AM == AlignMode::Glocal)
+            if (!sg_is_glocal_())
+                throw std::invalid_argument(
+                    "nwgrad: guide-banded alignment supports the semi-global ends of \"glocal\" "
+                    "only; align these free ends with the full DP");
     }
     void check_viterbi() const {
         check_problem();
@@ -2112,6 +2320,15 @@ private:
     // Local: see kLocalGridAuto below; otherwise a pair within the pointer budget runs
     // Pointers (Grid's result, faster there than the two-pass Grid).
     TracebackMode run_tb_() const {
+        // Semi-global ends other than glocal's: Grid and the Hirschberg modes are wired for
+        // glocal's end (row m) and start (row 0) only, so these run Pointers -- the exact
+        // path, O(m*n) direction bytes.  Requested explicitly or by `auto` alike, as Grid
+        // already falls back where it does not apply.
+        // Nor do they take the `auto` upgrades below (linear auto Pointers -> Grid: the Grid
+        // fill has glocal's borders; m > hb_cutoff ran it with these ends before).
+        if constexpr (AM == AlignMode::Glocal)
+            if (!sg_is_glocal_())
+                return (tb_ == TracebackMode::Grid || is_hirschberg(tb_)) ? TracebackMode::Pointers : tb_;
         // Local affine `auto` where the ONE-PASS Grid applies (every gap parameter >= 0, so
         // the top-level forward finds the end cell itself; untracked, a simd level, m >
         // hb_cutoff: grid_ok_): Grid at every size, the pointer budget no longer consulted.
@@ -2169,6 +2386,7 @@ private:
     bool uses_rowwise_full() const {
         if constexpr (GM == GapModel::Affine && AB == AlignBand::Full) {
             const TracebackMode tb = run_tb_();
+            if (!sg_is_glocal_()) return false;   // the row-wise kernel has glocal's borders only
             if (!rowwise_full_ || hb_splits(tb, tb_auto_ ? kAutoPointerCells : 0, hb_cutoff_, m_, n_) ||
                 (tb == TracebackMode::Grid && m_ > hb_cutoff_)) return false;
             const int backend = (backend_ == kBackendAuto) ? global_default_backend() : backend_;
@@ -2300,6 +2518,25 @@ private:
     }
     template <class V> typename V::value_type rat(const V& t, int i, int j) const {
         return t[cell_index(i, j)];
+    }
+    // The semi-global code's table reads (the runtime-ends instantiations, SGR, and the end
+    // searches): the same access through its own functions, so at() / rat() keep main's
+    // callers and gcc's inlining of them stays main's.  With the sg callers on rat itself,
+    // gcc stopped inlining rat into the Global / Local walks (sse4 instructions, miRNA
+    // float32 linear Global hard +2.6-2.9 %, int32 linear Local path +2.8-3.3 %: rat called
+    // out of line, 2816 call sites against main's 2041).  rat_<false> / at_<false> are
+    // always_inline (resolved before the IPA inliner): the callgraph main has.
+    template <class V> typename V::value_type& at_sg_(V& t, int i, int j) const {
+        return t[cell_index(i, j)];
+    }
+    template <class V> typename V::value_type rat_sg_(const V& t, int i, int j) const {
+        return t[cell_index(i, j)];
+    }
+    template <bool SGR, class V> [[gnu::always_inline]] typename V::value_type& at_(V& t, int i, int j) const {
+        if constexpr (SGR) return at_sg_(t, i, j); else return at(t, i, j);
+    }
+    template <bool SGR, class V> [[gnu::always_inline]] typename V::value_type rat_(const V& t, int i, int j) const {
+        if constexpr (SGR) return rat_sg_(t, i, j); else return rat(t, i, j);
     }
     // The forward-backward tables (F/B, FM..BY) are ALWAYS row-major, whatever layout
     // the Viterbi fill left VM/VX/VY or DM/DX/DY in.  They get their own accessors so
@@ -2542,18 +2779,56 @@ private:
     // fill's max chose it, so both give the same walk, ties included.
     template <class Emit>
     void walk_linear(const DpBuffer& buf, Emit&& emit) const {
+#if defined(__aarch64__) || defined(_M_ARM64)
+        if constexpr (AM == AlignMode::Global) {   // aarch64: the walk its own function, as main's (see path_walk_)
+            if (tr_) walk_linear_ool_<true>(buf, emit);
+            else     walk_linear_ool_<false>(buf, emit);
+            return;
+        }
+#endif
+#if defined(__aarch64__) || defined(_M_ARM64)
+        // aarch64: glocal's own ends walk with them fixed at compile time (main's loop).  The
+        // runtime free-end tests in the one walk cost M1 +5 % taken branches and 1.5-2.7 % time
+        // on linear Glocal path; on x86 (gcc 16) the one walk is 2 % fewer instructions than
+        // main's and the second walk would take that back.
+        if constexpr (AM == AlignMode::Glocal) {
+            if (sg_is_glocal_()) {
+                if (tr_) walk_linear_impl<true, false>(buf, emit);
+                else     walk_linear_impl<false, false>(buf, emit);
+                return;
+            }
+        }
+#endif
         if (tr_) walk_linear_impl<true>(buf, emit);
         else     walk_linear_impl<false>(buf, emit);
     }
+    template <bool Tr, class Emit>
+    [[gnu::noinline]] void walk_linear_ool_(const DpBuffer& buf, Emit& emit) const { walk_linear_impl<Tr>(buf, emit); }
+    // The walk's diagonal H read, always inline.  gcc 15 outlined rat() there in the int16
+    // Local inter-pair walk (refused for large-function-growth in the worker): a call and four
+    // spills a step, dna100 int16 linear Local path +3.2 % instructions (1.08-1.10x on solace).
+    // All five H reads inline instead cost more (int32 linear Local +5 %, gcc 16).
+    template <class V>
+    [[gnu::always_inline]] typename V::value_type hat_(const V& t, int i, int j) const {
+        return t[cell_index(i, j)];
+    }
     // Tr: read each row's extend (row_ge_b) rather than one hoisted value — a template
     // parameter, so the untracked walk is the code it always was.
-    template <bool Tr, class Emit>
+    // Glocal: every semi-global end set walks here (no SGR instantiation, no out-of-line
+    // replay), its free starts tested only where a border is reached, never per step: row 0
+    // stops with a free B begin (glocal's), else its leftward chain is walked (i == 0: the
+    // tests below give k = 2); column 0 stops with a free A begin -- Pointers: the fills
+    // record a stop (3) there; the H walk: inside its j == 0 branch.  An out-of-line SGR walk
+    // or replay handed `emit` to a call, so the locals its closure captures by reference
+    // (path_walk_'s ci / cj, the guide, the path sink) lived in memory in the hot walk too:
+    // int16 linear glocal path / hard +1.3-2.8 % instructions (sse4, gcc 15 and 16).
+    template <bool Tr, bool SG = true, class Emit>
     void walk_linear_impl(const DpBuffer& buf, Emit& emit) const {
         int i = (AM == AlignMode::Global) ? m_ : best_i_;
         int j = (AM == AlignMode::Global) ? n_ : best_j_;
         while (true) {
             if (i == 0 && j == 0) break;
-            if constexpr (AM == AlignMode::Glocal) if (i == 0) break;   // row 0: a free start
+            if constexpr (AM == AlignMode::Glocal) if (i == 0) { if (sgt_bb_<SG>()) break; }   // row 0: a free start
             int k;
             if (pointers_) {
                 k = dense_ ? dense_code(buf.DM, i, j, 1, 0) : dcode(buf.DM, i, j);
@@ -2562,13 +2837,14 @@ private:
                 if constexpr (AM == AlignMode::Local)
                     if (rat(buf.H, i, j) <= 0.0) break;
                 if (i > 0 && j > 0 &&
-                    rat(buf.H, i, j) == rat(buf.H, i-1, j-1) + (Tr ? subT(i, j) : subTu(i, j)))
+                    rat(buf.H, i, j) == hat_(buf.H, i-1, j-1) + (Tr ? subT(i, j) : subTu(i, j)))
                     k = 0;
                 else if (i > 0 && (j == 0 || rat(buf.H, i, j) == rat(buf.H, i-1, j) -
                                                  (Tr ? tgeb_[static_cast<size_t>(i)]
-                                                     : static_cast<T>(params_->gap_extend_b))))
+                                                     : static_cast<T>(params_->gap_extend_b)))) {
+                    if constexpr (AM == AlignMode::Glocal) if (j == 0 && sgt_ab_<SG>()) break;   // column 0: a free start
                     k = 1;
-                else
+                } else
                     k = 2;
             }
             emit(k, i, j);
@@ -2662,7 +2938,19 @@ private:
     // "A"*22 vs "C"*87 at band<=32).  At a border only one move is legal; forcing it is
     // what a well-formed DP would have chosen anyway.
     template <class Emit>
+    void walk_affine_sgr_(const DpBuffer& buf, Emit& emit) const {
+        if (tr_) {
+            if (pointers_) walk_affine_impl<true, true, true>(buf, emit);
+            else           walk_affine_impl<false, true, true>(buf, emit);
+        } else {
+            if (pointers_) walk_affine_impl<true, false, true>(buf, emit);
+            else           walk_affine_impl<false, false, true>(buf, emit);
+        }
+    }
+    template <class Emit>
     void walk_affine(const DpBuffer& buf, Emit&& emit) const {
+        if constexpr (AM == AlignMode::Glocal && AB == AlignBand::Full)   // the other semi-global ends: walked out of line
+            if (!sg_is_glocal_()) [[unlikely]] { sg_walk_replay_(buf, emit); return; }   // (banded: refused)
         if (tr_) {
             if (pointers_) walk_affine_impl<true, true>(buf, emit);
             else           walk_affine_impl<false, true>(buf, emit);
@@ -2672,10 +2960,30 @@ private:
         }
     }
 
+    // The walk's emits other than the M move's, out of line: a Global path's last run along
+    // row 0 (Y moves) or column 0 (X moves) to the origin, and each gap move.  With emit
+    // (a path sink, a guide, a gradient) inlined at all five sites, gcc spilled the walk's
+    // loop state to the stack (118 stack accesses in the int16 affine Global path walk vs
+    // 16): the int16 / int32 affine Global and Glocal path cells ran 1.5-3.5 % more
+    // instructions (sse4, mirna / dna100) once the engine units' inlining budget no longer
+    // kept it out of line ("The engine units" in AGENTS.md).  All five out of line cost 5 %.
+    template <class Emit>
+    [[gnu::noinline]] static void emit_gap_(Emit& emit, TBTable s, int i, int j, bool open) {
+        emit(s, i, j, open);
+    }
+    template <class Emit>
+    [[gnu::noinline]] static void emit_border_run_(Emit& emit, TBTable s, int i, int j) {
+        if (s == TBTable::Y) { for (; j > 0; --j) emit(TBTable::Y, 0, j, j == 1); }
+        else                 { for (; i > 0; --i) emit(TBTable::X, i, 0, i == 1); }
+    }
+
     // Tr: each move reads the penalties of its own row (a gap in B the row it enters, a
     // gap in A the row it lies in); otherwise the four are hoisted, as they always were.
-    template <bool Ptr, bool Tr, class Emit>
-    void walk_affine_impl(const DpBuffer& buf, Emit& emit) const {
+    // noinline: its own function, as gcc kept it at the old unit's inline limit.  Inlined into
+    // the inter-pair worker (score_and_grad_inter_'s lambda) it made that lambda spill and
+    // outline rat(): float32 / double affine Local path cells +1-2 % instructions (sse4).
+    template <bool Ptr, bool Tr, bool SGR = false, class Emit>
+    [[gnu::noinline]] void walk_affine_impl(const DpBuffer& buf, Emit& emit) const {
         auto from_code = [](unsigned char c) {
             return c == 1 ? TBTable::X : (c == 2 ? TBTable::Y : TBTable::M);
         };
@@ -2699,14 +3007,19 @@ private:
                 if constexpr (Ptr) c = affine_codes(buf.DM, i, j);
                 if (tbl == TBTable::M) {
                     if constexpr (Ptr) { if ((c & 3) == 3) break; }
-                    else               { if (rat(buf.VM, i, j) <= 0.0) break; }
+                    else               { if (rat_<SGR>(buf.VM, i, j) <= 0.0) break; }
                 }
             } else {
                 if (i == 0) {
-                    if constexpr (AM == AlignMode::Glocal) break;   // row 0: a free start
-                    else { for (; j > 0; --j) emit(TBTable::Y, 0, j, j == 1); break; }
+                    if constexpr (AM == AlignMode::Glocal) if (sgt_bb_<SGR>()) break;   // row 0: a free start
+                    emit_border_run_(emit, TBTable::Y, i, j);
+                    break;
                 }
-                if (j == 0) { for (; i > 0; --i) emit(TBTable::X, i, 0, i == 1); break; }
+                if (j == 0) {
+                    if constexpr (AM == AlignMode::Glocal) if (sgt_ab_<SGR>()) break;   // column 0: a free start
+                    emit_border_run_(emit, TBTable::X, i, j);
+                    break;
+                }
                 if constexpr (Ptr) c = affine_codes(buf.DM, i, j);
             }
             if      (i == 0) tbl = TBTable::Y;   // row 0: only leftward moves remain
@@ -2726,7 +3039,7 @@ private:
                        prev = argmax(nw_sub(nw_sub(buf.VM[k], go_b), ge_b),
                                      nw_sub(buf.VX[k], ge_b),
                                      nw_sub(nw_sub(buf.VY[k], go_b), ge_b)); }
-                emit(TBTable::X, i, j, prev != TBTable::X);
+                emit_gap_(emit, TBTable::X, i, j, prev != TBTable::X);
                 --i;
             } else {                          // gap in A: advance j, gap_a penalties
                 if constexpr (Tr) { go_a = tgoa_[static_cast<size_t>(i)]; ge_a = tgea_[static_cast<size_t>(i)]; }
@@ -2735,18 +3048,112 @@ private:
                        prev = argmax(nw_sub(nw_sub(buf.VM[k], go_a), ge_a),
                                      nw_sub(nw_sub(buf.VX[k], go_a), ge_a),
                                      nw_sub(buf.VY[k], ge_a)); }
-                emit(TBTable::Y, i, j, prev != TBTable::Y);
+                emit_gap_(emit, TBTable::Y, i, j, prev != TBTable::Y);
                 --j;
             }
             tbl = prev;
         }
     }
 
+    // The Glocal walk of path_walk_body_ in the floating types (kPathWalkGlocalOwn_): walk_affine's
+    // moves, returning the start cell (where the last move left from) instead of the emit tracking it.
+    // Its own function, so walk_affine_impl and every other walk compile as before.  Against
+    // walk_affine_impl with path_walk_body_'s emit, sse4 instructions per pair vs main ea93737
+    // (mirna / dna100): float32 Glocal path +0.8 / +0.6 % -> -3.0 / -1.7 % (gcc 15), +0.1 / +0.3 %
+    // -> -3.9 / -2.0 % (gcc 16); double +0.0 / +0.1 % -> -2.2 / -1.1 % (gcc 15).  The ~600
+    // instructions per dna100 pair it saves are the same at every level (the walk is scalar), so
+    // a larger share at AVX-512, where gcc 15 had the cell +2.1 %.  What it saves:
+    // - the score tables' data pointers held in locals (vm, vx, vy): read through buf, they were
+    //   reloaded at every move, since the path sink's stores (a pointer among them) may alias them;
+    // - the emit copied into a local (e), which no call sees, so its captures stay in registers;
+    // - no (ci, cj) stores at every move, and the guide's data pointer captured by value.
+    // Inline in the inter-pair worker, and with all of walk_affine_impl's emits inline there (main's
+    // shape), it ran +1.5-2 % instead.
+    template <class Emit>
+    std::pair<int, int> walk_affine_glocal_path_(const DpBuffer& buf, Emit&& emit) const {
+        // Its walk has glocal's ends fixed; the other semi-global ends take walk_affine's cold
+        // branch (the recorded SGR walk, replayed), the start cell tracked as walk_affine's
+        // callers do.  (Banded: other ends refused.)
+        if constexpr (AB == AlignBand::Full)
+            if (!sg_is_glocal_()) [[unlikely]] {
+                int ci = best_i_, cj = best_j_;
+                auto track = [&emit, &ci, &cj](TBTable st, int i, int j, bool open) {
+                    emit(st, i, j, open);
+                    ci = (st == TBTable::Y) ? i : i - 1;
+                    cj = (st == TBTable::X) ? j : j - 1;
+                };
+                sg_walk_replay_(buf, track);
+                return {ci, cj};
+            }
+        if (tr_) {
+            if (pointers_) return walk_affine_glocal_<true, true>(buf, emit);
+            else           return walk_affine_glocal_<false, true>(buf, emit);
+        } else {
+            if (pointers_) return walk_affine_glocal_<true, false>(buf, emit);
+            else           return walk_affine_glocal_<false, false>(buf, emit);
+        }
+    }
+    template <bool Ptr, bool Tr, class Emit>
+    [[gnu::noinline]] std::pair<int, int> walk_affine_glocal_(const DpBuffer& buf, Emit& emit) const {
+        static_assert(AM == AlignMode::Glocal);
+        auto from_code = [](unsigned char c) {
+            return c == 1 ? TBTable::X : (c == 2 ? TBTable::Y : TBTable::M);
+        };
+        auto argmax = [](T vm, T vx, T vy) {
+            if (vm >= vx && vm >= vy) return TBTable::M;
+            return vx >= vy ? TBTable::X : TBTable::Y;
+        };
+        T go_a = static_cast<T>(params_->gap_open_a);
+        T ge_a = static_cast<T>(params_->gap_extend_a);
+        T go_b = static_cast<T>(params_->gap_open_b);
+        T ge_b = static_cast<T>(params_->gap_extend_b);
+
+        const T* const vm = buf.VM.data();
+        const T* const vx = buf.VX.data();
+        const T* const vy = buf.VY.data();
+        Emit e = emit;
+        int i = best_i_, j = best_j_;
+        TBTable tbl = best_tbl_;
+        while (i != 0) {                      // row 0: a free start
+            if (j == 0) { emit_border_run_(emit, TBTable::X, i, j); return {0, 0}; }   // column 0: up to the origin
+            unsigned char c = 0;
+            if constexpr (Ptr) c = affine_codes(buf.DM, i, j);
+            TBTable prev;
+            if (tbl == TBTable::M) {
+                if constexpr (Ptr) prev = from_code(c & 3);
+                else { const size_t k = cell_index(i-1, j-1);
+                       prev = argmax(vm[k], vx[k], vy[k]); }
+                e(TBTable::M, i, j, false);
+                --i; --j;
+            } else if (tbl == TBTable::X) {   // gap in B: advance i, gap_b penalties
+                if constexpr (Tr) { go_b = tgob_[static_cast<size_t>(i)]; ge_b = tgeb_[static_cast<size_t>(i)]; }
+                if constexpr (Ptr) prev = from_code((c >> 2) & 3);
+                else { const size_t k = cell_index(i-1, j);
+                       prev = argmax(nw_sub(nw_sub(vm[k], go_b), ge_b),
+                                     nw_sub(vx[k], ge_b),
+                                     nw_sub(nw_sub(vy[k], go_b), ge_b)); }
+                e(TBTable::X, i, j, false);
+                --i;
+            } else {                          // gap in A: advance j, gap_a penalties
+                if constexpr (Tr) { go_a = tgoa_[static_cast<size_t>(i)]; ge_a = tgea_[static_cast<size_t>(i)]; }
+                if constexpr (Ptr) prev = from_code(c >> 4);
+                else { const size_t k = cell_index(i, j-1);
+                       prev = argmax(nw_sub(nw_sub(vm[k], go_a), ge_a),
+                                     nw_sub(nw_sub(vx[k], go_a), ge_a),
+                                     nw_sub(vy[k], ge_a)); }
+                e(TBTable::Y, i, j, false);
+                --j;
+            }
+            tbl = prev;
+        }
+        return {i, j};
+    }
+
     // gj[i] = the column after consuming i residues of A: set by M and X moves (Y moves
     // stay in the row), the end cell, row 0 and row m; fill_guide_gaps interpolates the
     // rows a Local path does not cover.
     void guide_affine_init(std::vector<int>& gj) const {
-        gj.assign(static_cast<size_t>(m_ + 1), -1);
+        nw_guide_reset(gj, static_cast<size_t>(m_ + 1));
         gj[0] = 0;
         gj[static_cast<size_t>(m_)] = n_;
         gj[static_cast<size_t>(best_i_)] = best_j_;
@@ -2854,7 +3261,17 @@ private:
     // vectorize linear ACROSS pairs instead — SeqPairBatch fill="interpair", one pair per
     // lane, bit-identical — which sidesteps the chain.)
     void run_viterbi(DpBuffer& buf) {
-        if (narrow_viterbi_(buf)) return;   // an integer problem the narrower type holds
+        if constexpr (AM == AlignMode::Glocal && AB == AlignBand::Full)   // the other semi-global ends: out of line
+            if (!sg_is_glocal_()) [[unlikely]] { sg_run_viterbi_(buf); return; }   // (banded: refused)
+        run_viterbi_impl_<false>(buf);
+    }
+    // SGR: the semi-global runtime ends (Glocal with ends other than glocal's), only ever
+    // instantiated by sg_run_viterbi_; SGR = false is main's dispatch.
+    // always_inline: resolved before the IPA inliner, so run_viterbi is main's one body.
+    template <bool SGR>
+    [[gnu::always_inline]] void run_viterbi_impl_(DpBuffer& buf) {
+        if constexpr (!SGR)
+            if (narrow_viterbi_(buf)) return;   // an integer problem the narrower type holds
         // `auto` resolved to Grid where Grid does not apply: this run takes the previous
         // default (kGridFallbackTb) — its memory bound — and tb_ is restored after it.
         struct TbRestore {
@@ -2939,15 +3356,23 @@ private:
                 }
                 if (backend != kBackendScalar && n_ >= linear_striped_min_n(backend)) {
                     const LevelKernels& K = level_kernels(backend);
-                    const TypedKernels<T>& KT = K.template of<T>();
-                    if (lin_ptr ? KT.linear_ptr != nullptr : KT.linear != nullptr) {
-                        run_dispatched_linear(buf, K, lin_ptr);
-                        return;
+                    if constexpr (SGR) {   // semi-global runtime ends: the level's sg fills (their own unit)
+                        const SgTypedKernels<T>& KS = K.template sg_of<T>();
+                        if ((lin_ptr ? KS.linear_ptr_sg : KS.linear_sg) != nullptr) {
+                            run_dispatched_linear<true>(buf, K, lin_ptr);
+                            return;
+                        }
+                    } else {
+                        const TypedKernels<T>& KT = K.template of<T>();
+                        if (lin_ptr ? KT.linear_ptr != nullptr : KT.linear != nullptr) {
+                            run_dispatched_linear(buf, K, lin_ptr);
+                            return;
+                        }
                     }
                 }
             }
-            if (lin_ptr) { viterbi_linear_ptr(buf); return; }
-            viterbi_linear(buf);
+            if (lin_ptr) { viterbi_linear_ptr<SGR>(buf); return; }
+            viterbi_linear<SGR>(buf);
             return;
         }
         // Resolve this aligner's backend: auto -> the global default, then scalar or a level.
@@ -2957,7 +3382,7 @@ private:
         const bool use_ptr = (tb_ == TracebackMode::Pointers || is_hirschberg(tb_) ||
                               tb_ == TracebackMode::Grid) && (AB == AlignBand::Full);
         if (backend == kBackendScalar) {
-            if (use_ptr) viterbi_affine_ptr(buf); else viterbi_affine(buf);
+            if (use_ptr) viterbi_affine_ptr<SGR>(buf); else viterbi_affine<SGR>(buf);
             return;
         }
         // Grid: where it is implemented (grid_ok_), else Pointers below — the same result.
@@ -2974,11 +3399,20 @@ private:
         if constexpr (AB == AlignBand::Full) {
             // Opt-in row-wise fill (set_rowwise_full): score tables, row-major, read back
             // by the Scores traceback whatever tb_ says — the paths are identical.
+            if constexpr (SGR) {   // semi-global runtime ends: the sg unit's kernels (no row-wise: glocal's borders only)
+                const SgTypedKernels<T>& KS = K.template sg_of<T>();
+                if (use_ptr && KS.viterbi_ptr_sg) { run_dispatched_affine<true>(buf, K, true);  return; }
+                if (KS.viterbi_sg)                { run_dispatched_affine<true>(buf, K, false); return; }
+                if (use_ptr) { viterbi_affine_ptr<true>(buf); return; }
+                viterbi_affine<true>(buf);   // (Full only: a banded problem with these ends is refused)
+                return;
+            } else {
             if (uses_rowwise_full()) { viterbi_affine_simd(buf, K); return; }
             // The striped Full kernel, this level's instantiation for T.
             if (use_ptr && KT.viterbi_ptr) { run_dispatched_affine(buf, K, true);  return; }
             if (KT.viterbi)                { run_dispatched_affine(buf, K, false); return; }
             if (use_ptr) { viterbi_affine_ptr(buf); return; }   // level lacks the ptr kernel
+            }
         }
         // The row-wise banded kernel (every T); a level without it falls back to the
         // scalar fill.
@@ -2989,6 +3423,7 @@ private:
     // Build a plain ViterbiJob from Aligner state, run the dispatched (leveled) kernel,
     // and copy its scalar results back.  The kernel fills buf.VM/VX/VY in STRIPED layout
     // (table_layout == 1) and reports seg/width; rat/at then read them striped.
+    template <bool SGR = false>   // SGR: the sg unit's kernels and the job's ends (sg_*_ entries only)
     void run_dispatched_affine(DpBuffer& buf, const LevelKernels& K, bool use_ptr = false) {
         ViterbiJob<T> job{}; job.sat = sat_;
         job.a = a_idx_.data(); job.m = m_;
@@ -2999,13 +3434,19 @@ private:
         job.go_a = static_cast<T>(params_->gap_open_a);   job.ge_a = static_cast<T>(params_->gap_extend_a);
         job.go_b = static_cast<T>(params_->gap_open_b);   job.ge_b = static_cast<T>(params_->gap_extend_b);
         job.align_mode = (AM == AlignMode::Local) ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
+        if constexpr (SGR) job.sg = sg_;
         job.align_band = 0; job.band = 0;
         job.guide_j = nullptr; job.guide_len = 0;
         job.buf = &buf;
         if (tr_) fill_track_job_(job.tr, true, static_cast<size_t>(n_) + 16);
         const TypedKernels<T>& KT = K.template of<T>();
         job.dense = (use_ptr && want_dense_()) ? 1 : 0;
-        if (use_ptr) KT.viterbi_ptr(job); else KT.viterbi(job);
+        if constexpr (SGR) {   // the sg unit's
+            const SgTypedKernels<T>& KS = K.template sg_of<T>();
+            if (use_ptr) KS.viterbi_ptr_sg(job); else KS.viterbi_sg(job);
+        } else {
+            if (use_ptr) KT.viterbi_ptr(job); else KT.viterbi(job);
+        }
         pointers_ = use_ptr;   // Pointers leaves codes, not score tables
         dense_ = use_ptr && job.dense;
         // Adopt the layout the kernel produced (striped for the Full striped kernel).
@@ -3136,6 +3577,7 @@ private:
 
     // The leveled linear kernel (Full): H in STRIPED layout (or direction bytes in it),
     // read back through cell_index like the affine tables.  No gap opens in the job.
+    template <bool SGR = false>   // SGR: the sg unit's kernels and the job's ends (sg_*_ entries only)
     void run_dispatched_linear(DpBuffer& buf, const LevelKernels& K, bool use_ptr) {
         ViterbiJob<T> job{}; job.sat = sat_;
         job.a = a_idx_.data(); job.m = m_;
@@ -3144,13 +3586,19 @@ private:
         job.go_a = static_cast<T>(0); job.ge_a = static_cast<T>(params_->gap_extend_a);
         job.go_b = static_cast<T>(0); job.ge_b = static_cast<T>(params_->gap_extend_b);
         job.align_mode = (AM == AlignMode::Local) ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
+        if constexpr (SGR) job.sg = sg_;
         job.align_band = 0; job.band = 0;
         job.guide_j = nullptr; job.guide_len = 0;
         job.buf = &buf;
         if (tr_) fill_track_job_(job.tr, true, static_cast<size_t>(n_) + 16, true);
         const TypedKernels<T>& KT = K.template of<T>();
         job.dense = (use_ptr && want_dense_()) ? 1 : 0;
-        if (use_ptr) KT.linear_ptr(job); else KT.linear(job);
+        if constexpr (SGR) {   // the sg unit's
+            const SgTypedKernels<T>& KS = K.template sg_of<T>();
+            if (use_ptr) KS.linear_ptr_sg(job); else KS.linear_sg(job);
+        } else {
+            if (use_ptr) KT.linear_ptr(job); else KT.linear(job);
+        }
         pointers_ = use_ptr;
         dense_ = use_ptr && job.dense;
         if (job.table_layout == 1) {
@@ -3193,37 +3641,46 @@ private:
     // matched the stored float for a non-representable cost, every test fell through
     // to "gap in A", and the returned path was not the one scored (-18.7 vs -7.9).
     // At T=double every cast here is the identity: results are unchanged bit for bit.
+    template <bool SGR = false>   // SGR: the semi-global runtime ends (sg_*_ entries only)
     void viterbi_linear(DpBuffer& buf) {
-        sat_dispatch_([&]<bool Tr, bool Sat>() { viterbi_linear_impl<Tr, Sat>(buf); });
+        sat_dispatch_([&]<bool Tr, bool Sat>() { viterbi_linear_impl<Tr, Sat, SGR>(buf); });
     }
     // Tr: each row's penalties and substitution row from the track arrays (the same
     // expressions with the row's values, so equal sets reproduce the untracked fill).
-    template <bool Tr, bool Sat>
+    template <bool Tr, bool Sat, bool SGR = false>
     void viterbi_linear_impl(DpBuffer& buf) {
         banded_fill(buf.H);
 
         if constexpr (AM != AlignMode::Local) {
-            at(buf.H, 0, 0) = 0.0;
+            at_<SGR>(buf.H, 0, 0) = 0.0;
             const int bi = border_rows(), bj = border_cols();
             if constexpr (Tr) {
-                for (int i = 1; i <= bi; ++i) at(buf.H, i, 0) = tbx0_[static_cast<size_t>(i)];
+                for (int i = 1; i <= bi; ++i) at_<SGR>(buf.H, i, 0) = tbx0_[static_cast<size_t>(i)];
                 if constexpr (AM == AlignMode::Global)
-                    for (int j = 1; j <= bj; ++j) at(buf.H, 0, j) = -static_cast<T>(j) * tgea_[0];
+                    for (int j = 1; j <= bj; ++j) at_<SGR>(buf.H, 0, j) = -static_cast<T>(j) * tgea_[0];
             } else {
-                for (int i = 1; i <= bi; ++i) at(buf.H, i, 0) = -static_cast<T>(i) * static_cast<T>(params_->gap_extend_b);
+                for (int i = 1; i <= bi; ++i) at_<SGR>(buf.H, i, 0) = -static_cast<T>(i) * static_cast<T>(params_->gap_extend_b);
                 if constexpr (AM == AlignMode::Global)
-                    for (int j = 1; j <= bj; ++j) at(buf.H, 0, j) = -static_cast<T>(j) * static_cast<T>(params_->gap_extend_a);
+                    for (int j = 1; j <= bj; ++j) at_<SGR>(buf.H, 0, j) = -static_cast<T>(j) * static_cast<T>(params_->gap_extend_a);
             }
-            if constexpr (AM == AlignMode::Glocal)   // row 0: a free start at any column
-                for (int j = 0; j <= n_; ++j) at(buf.H, 0, j) = 0.0;
+            if constexpr (AM == AlignMode::Glocal) {
+                if (sgt_bb_<SGR>()) {   // row 0: a free start at any column
+                    for (int j = 0; j <= n_; ++j) at_<SGR>(buf.H, 0, j) = 0.0;
+                } else {          // Global's chain along row 0
+                    for (int j = 1; j <= bj; ++j)
+                        at_<SGR>(buf.H, 0, j) = -static_cast<T>(j) * (Tr ? tgea_[0] : static_cast<T>(params_->gap_extend_a));
+                }
+                if (sgt_ab_<SGR>())     // column 0: a free start at any row
+                    for (int i = 1; i <= m_; ++i) at_<SGR>(buf.H, i, 0) = 0.0;
+            }
         } else {
-            for (int i = 0; i <= m_; ++i) at(buf.H, i, 0) = 0.0;
-            for (int j = 0; j <= n_; ++j) at(buf.H, 0, j) = 0.0;
+            for (int i = 0; i <= m_; ++i) at_<SGR>(buf.H, i, 0) = 0.0;
+            for (int j = 0; j <= n_; ++j) at_<SGR>(buf.H, 0, j) = 0.0;
         }
 
         best_i_ = 0; best_j_ = 0;
         T best_local = T(0);
-        // Row pointers, not rat()/at(): run_viterbi cleared the layout flags, so H is
+        // Row pointers, not rat_<SGR>()/at_<SGR>(): run_viterbi cleared the layout flags, so H is
         // row-major here, and cell_index()'s layout switch inside the loop is dead weight
         // that gcc unswitches and clang does not (clang/gcc 1.77x on this fill).  The
         // gap costs and the substitution row are hoisted per row for the same reason;
@@ -3277,8 +3734,8 @@ private:
                 }
         }
 
-        if constexpr (AM == AlignMode::Global)      viterbi_score_ = rat(buf.H, m_, n_);
-        else if constexpr (AM == AlignMode::Glocal) glocal_end_linear_(buf);
+        if constexpr (AM == AlignMode::Global)      viterbi_score_ = rat_<SGR>(buf.H, m_, n_);
+        else if constexpr (AM == AlignMode::Glocal) { if constexpr (SGR) sg_end_linear_(buf); else glocal_end_linear_(buf); }
         else                                        viterbi_score_ = best_local;
     }
 
@@ -3291,10 +3748,11 @@ private:
     // the initializer list does, and the H walk tests the same three in the same order by
     // equality — so both pick the first largest.  Local: stop where the clamped value is
     // <= 0 (the H walk's stop test); borders stop (Local), go up / left (Global).
+    template <bool SGR = false>   // SGR: the semi-global runtime ends (sg_*_ entries only)
     void viterbi_linear_ptr(DpBuffer& buf) {
-        sat_dispatch_([&]<bool Tr, bool Sat>() { viterbi_linear_ptr_impl<Tr, Sat>(buf); });
+        sat_dispatch_([&]<bool Tr, bool Sat>() { viterbi_linear_ptr_impl<Tr, Sat, SGR>(buf); });
     }
-    template <bool Tr, bool Sat>
+    template <bool Tr, bool Sat, bool SGR = false>
     void viterbi_linear_ptr_impl(DpBuffer& buf) {
         const size_t st = stride_;
         const size_t dsz = static_cast<size_t>(m_ + 1) * st;
@@ -3306,12 +3764,17 @@ private:
         T ge_b = static_cast<T>(params_->gap_extend_b);
         if constexpr (Tr) ge_a = tgea_[0];
         constexpr bool local = AM == AlignMode::Local;
-        constexpr bool free0 = AM != AlignMode::Global;   // row 0 a free start (Local, Glocal)
+        // row 0 a free start (Local, Glocal with a free B begin)
+        const bool free0 = AM == AlignMode::Local || (AM == AlignMode::Glocal && sgt_bb_<SGR>());
+        const bool free_col0 = AM == AlignMode::Glocal && sgt_ab_<SGR>();   // column 0 a free start
+        const bool sg_general = AM == AlignMode::Glocal && SGR;
         prev[0] = static_cast<T>(0); D[0] = 3;
         for (int j = 1; j <= n_; ++j) {
             prev[j] = free0 ? static_cast<T>(0) : -static_cast<T>(j) * ge_a;
             D[j] = free0 ? 3 : 2;
         }
+        SgEnd sge;
+        if (sg_general && sgt_ae_<SGR>() && m_ > 0) sge.offer(0, n_, prev[n_], NINF(), NINF());
         int bi = 0, bj = 0;   // locals: best_i_/best_j_ are members (see below)
         const int n = n_;     // ditto: a member bound is reloaded after every byte store
         T best_local = T(0);
@@ -3332,6 +3795,7 @@ private:
             if constexpr (Tr) cv[0] = local ? static_cast<T>(0) : tbx0_[static_cast<size_t>(i)];
             else              cv[0] = local ? static_cast<T>(0) : -static_cast<T>(i) * ge_b;
             d[0] = local ? 3 : 1;
+            if (free_col0) { cv[0] = static_cast<T>(0); d[0] = 3; }
             // Two passes, as gcc -O3 splits viterbi_linear's own loop: the carry-free
             // max(diag+s, up-ge_b) and its code vectorize across the row; only
             // max(t, left-ge_a) stays on the serial chain.  One fused loop (the code on
@@ -3383,10 +3847,19 @@ private:
                 left = v;
             }
             if constexpr (local) bi = hit ? i : bi;   // hit stays 0 on the plain form
+            if (sg_general && sgt_ae_<SGR>() && i < m_) sge.offer(i, n_, cur[n_], NINF(), NINF());
             std::swap(prev, cur);
         }
         best_i_ = bi; best_j_ = bj;
-        if constexpr (AM == AlignMode::Glocal) glocal_end_row_(prev);
+        if constexpr (AM == AlignMode::Glocal) {
+            if (!sg_general) glocal_end_row_(prev);
+            else {
+                const T ninf = NINF();
+                if (sgt_be_<SGR>()) { for (int j = 0; j <= n_; ++j) sge.offer(m_, j, prev[j], ninf, ninf); }
+                else          sge.offer(m_, n_, prev[n_], ninf, ninf);
+                sg_take_(sge);
+            }
+        }
         else viterbi_score_ = local ? best_local : prev[n_];
         pointers_ = true;
     }
@@ -3414,7 +3887,7 @@ private:
                           Mv&& mv = Mv{}) const {
         double* gblk = grad_block(grad);
         if (gj) {
-            gj->assign(static_cast<size_t>(m_ + 1), -1);
+            nw_guide_reset(*gj, static_cast<size_t>(m_ + 1));
             (*gj)[0] = 0;
             (*gj)[static_cast<size_t>(m_)] = n_;
             const int i0 = (AM == AlignMode::Global) ? m_ : best_i_;
@@ -3474,10 +3947,11 @@ private:
     // Borders are recorded too, not just the recurrence interior: the traceback
     // walks column 0 and row 0 (X at (1,0) resolves to M, at (i>1,0) to X), and
     // those cells are border-initialised, never visited by the main loop.
+    template <bool SGR = false>   // SGR: the semi-global runtime ends (sg_*_ entries only)
     void viterbi_affine_ptr(DpBuffer& buf) {
-        sat_dispatch_([&]<bool Tr, bool Sat>() { viterbi_affine_ptr_impl<Tr, Sat>(buf); });
+        sat_dispatch_([&]<bool Tr, bool Sat>() { viterbi_affine_ptr_impl<Tr, Sat, SGR>(buf); });
     }
-    template <bool Tr, bool Sat>
+    template <bool Tr, bool Sat, bool SGR = false>
     void viterbi_affine_ptr_impl(DpBuffer& buf) {
         T go_a = static_cast<T>(params_->gap_open_a);
         T ge_a = static_cast<T>(params_->gap_extend_a);
@@ -3506,8 +3980,10 @@ private:
         };
 
         // ── row 0 ────────────────────────────────────────────────────────────
+        // Glocal with row 0 charged (the semi-global ends without a free B begin): Global's row.
+        const bool free_row0 = AM == AlignMode::Local || (AM == AlignMode::Glocal && sgt_bb_<SGR>());
         for (std::size_t j = 0; j <= static_cast<std::size_t>(n_); ++j) {
-            if constexpr (AM != AlignMode::Global) { pM[j] = 0; pX[j] = NINF(); pY[j] = NINF(); }
+            if (free_row0) { pM[j] = 0; pX[j] = NINF(); pY[j] = NINF(); }
             else {
                 pM[j] = (j == 0) ? static_cast<T>(0) : NINF();
                 pX[j] = NINF();
@@ -3515,8 +3991,13 @@ private:
             }
             // row 0 is a start (M 3, X 0); Y along it extends leftward: (0,1) opens from
             // M(0,0), the rest extend Y.  Glocal: every column a start, no moves along it.
-            D[j] = (j <= 1 || AM == AlignMode::Glocal) ? 3 : 3 | 2 << 4;
+            D[j] = (j <= 1 || free_row0) ? 3 : 3 | 2 << 4;
         }
+        // Semi-global: column 0 a free start (A's prefix free); column n's cells ends.
+        const bool free_col0 = AM == AlignMode::Glocal && sgt_ab_<SGR>();
+        const bool sg_general = AM == AlignMode::Glocal && SGR;
+        SgEnd sge;
+        if (sg_general && sgt_ae_<SGR>() && m_ > 0) sge.offer(0, n_, pM[n_], pX[n_], pY[n_]);
 
         best_i_ = 0; best_j_ = 0; best_tbl_ = TBTable::M;
         T best_local = static_cast<T>(0);
@@ -3535,6 +4016,7 @@ private:
             else { cM[0] = NINF(); cX[0] = -(go_b + static_cast<T>(i) * ge_b); }
             cY[0] = NINF();
             D[rb] = (i <= 1) ? 3 : 3 | 1 << 2;   // M 3, Y 0; X: (1,0) opens from M(0,0), deeper rows extend
+            if (free_col0) { cM[0] = 0; cX[0] = NINF(); D[rb] = 3; }   // a start; the walk stops here
             T rowmax = static_cast<T>(0);   // Local: see local_row_best_
 
             for (int j = 1; j <= n_; ++j) {
@@ -3566,6 +4048,8 @@ private:
             }
             if constexpr (AM == AlignMode::Local)
                 if (rowmax > best_local) local_row_best_(cM, cX, cY, 1, rowmax, i, best_local);
+            if constexpr (AM == AlignMode::Glocal)
+                if (sg_general && sgt_ae_<SGR>() && i < m_) sge.offer(i, n_, cM[n_], cX[n_], cY[n_]);
             std::swap(pM, cM); std::swap(pX, cX); std::swap(pY, cY);
         }
 
@@ -3578,7 +4062,8 @@ private:
             else if (vx >= vy)             best_tbl_ = TBTable::X;
             else                            best_tbl_ = TBTable::Y;
         } else if constexpr (AM == AlignMode::Glocal) {
-            glocal_end_rows_(pM, pX, pY);                      // row m_ after the swap
+            if (!sg_general) glocal_end_rows_(pM, pX, pY);    // row m_ after the swap
+            else { sg_offer_last_row_(sge, pM, pX, pY); sg_take_(sge); }
         } else {
             viterbi_score_ = best_local;
         }
@@ -4335,6 +4820,11 @@ private:
     std::vector<uint32_t> lhb_rows_;
     std::vector<T> lhb_ga_, lhb_gb_, lhb_r0_, lhb_c0_;
     int lhb_runs_ = 0;   // kernel calls, for the tests' liveness check
+    // Glocal: the free ends (kSgFree*, simd_levels.hpp); the other modes ignore it.  The
+    // last member, so every other one keeps main's offset (beside tb_auto_ it moved the
+    // fields the walks and fills read by 4 bytes; protein L300 linear Local float32 path
+    // read 1.014-1.025 on M1 on four code layouts, 2026-11-13).
+    int sg_ = kSgGlocal;
     LhbJob<T> lhb_job_(DpBuffer& buf, int ncols, int nrows) {
         LhbJob<T> job{}; job.sat = sat_;
         job.b = lhb_b_.data(); job.n = ncols;
@@ -5335,10 +5825,11 @@ private:
 #endif
     }
 
+    template <bool SGR = false>   // SGR: the semi-global runtime ends (sg_*_ entries only)
     double score_affine_scalar(DpBuffer& buf) const {
-        return sat_dispatch_([&]<bool Tr, bool Sat>() { return score_affine_scalar_impl<Tr, Sat>(buf); });
+        return sat_dispatch_([&]<bool Tr, bool Sat>() { return score_affine_scalar_impl<Tr, Sat, SGR>(buf); });
     }
-    template <bool Tr, bool Sat>
+    template <bool Tr, bool Sat, bool SGR = false>
     double score_affine_scalar_impl(DpBuffer& buf) const {
         T go_a = static_cast<T>(params_->gap_open_a);
         T ge_a = static_cast<T>(params_->gap_extend_a);
@@ -5352,12 +5843,18 @@ private:
         T* cM = buf.rM.data(); T* cX = buf.rX.data(); T* cY = buf.rY.data();
         constexpr bool local = AM == AlignMode::Local;
         const T ninf = NINF();
+        // row 0 a free start: Local, Glocal with a free B begin (sg_bb_)
+        const bool free0 = AM == AlignMode::Local || (AM == AlignMode::Glocal && sgt_bb_<SGR>());
+        const bool free_col0 = AM == AlignMode::Glocal && sgt_ab_<SGR>();
+        const bool col_end = AM == AlignMode::Glocal && sgt_ae_<SGR>();
         pM[0] = static_cast<T>(0); pX[0] = ninf; pY[0] = ninf;
         for (int j = 1; j <= n_; ++j) {
-            pM[j] = (AM != AlignMode::Global) ? static_cast<T>(0) : ninf;   // Local, Glocal: a free start
+            pM[j] = free0 ? static_cast<T>(0) : ninf;
             pX[j] = ninf;
-            pY[j] = (AM != AlignMode::Global) ? ninf : -(go_a + static_cast<T>(j) * ge_a);
+            pY[j] = free0 ? ninf : -(go_a + static_cast<T>(j) * ge_a);
         }
+        // Semi-global free A end: the best of column n over rows 0..m-1 (row m below)
+        T colbest = col_end && m_ > 0 ? std::max({pM[n_], pX[n_], pY[n_]}) : ninf;
         T best = static_cast<T>(0);
         for (int i = 1; i <= m_; ++i) {
             const T* sub;
@@ -5372,6 +5869,7 @@ private:
             }
             cM[0] = local ? static_cast<T>(0) : ninf;
             cY[0] = ninf;
+            if (free_col0) { cM[0] = static_cast<T>(0); cX[0] = ninf; }
             // The left cell (j-1) rides in registers: read back from cM/cX/cY (which may
             // alias the p rows as far as the compiler knows), clang re-loaded the values
             // it had just stored, a store-forward on the Y chain.
@@ -5392,21 +5890,23 @@ private:
                 cM[j] = m_val; cX[j] = x_val; cY[j] = y_val;
                 lM = m_val; lX = x_val; lY = y_val;
             }
+            if (col_end && i < m_) colbest = std::max(colbest, std::max({cM[n_], cX[n_], cY[n_]}));
             std::swap(pM, cM); std::swap(pX, cX); std::swap(pY, cY);
         }
         if constexpr (local) return static_cast<double>(best);
-        else if constexpr (AM == AlignMode::Glocal) {   // the best cell of row m
-            T b = std::max({pM[0], pX[0], pY[0]});
-            for (int j = 1; j <= n_; ++j) b = std::max(b, std::max({pM[j], pX[j], pY[j]}));
-            return static_cast<double>(b);
+        else if constexpr (AM == AlignMode::Glocal) {   // the ends: row m (free B end) or (m, n), column n
+            T b = std::max({pM[n_], pX[n_], pY[n_]});
+            if (sgt_be_<SGR>()) for (int j = 0; j < n_; ++j) b = std::max(b, std::max({pM[j], pX[j], pY[j]}));
+            return static_cast<double>(std::max(b, colbest));
         }
         else return static_cast<double>(std::max({pM[n_], pX[n_], pY[n_]}));
     }
 
+    template <bool SGR = false>   // SGR: the semi-global runtime ends (sg_*_ entries only)
     double score_linear_scalar(DpBuffer& buf) const {
-        return sat_dispatch_([&]<bool Tr, bool Sat>() { return score_linear_scalar_impl<Tr, Sat>(buf); });
+        return sat_dispatch_([&]<bool Tr, bool Sat>() { return score_linear_scalar_impl<Tr, Sat, SGR>(buf); });
     }
-    template <bool Tr, bool Sat>
+    template <bool Tr, bool Sat, bool SGR = false>
     double score_linear_scalar_impl(DpBuffer& buf) const {
         T ge_a = static_cast<T>(params_->gap_extend_a);
         T ge_b = static_cast<T>(params_->gap_extend_b);
@@ -5416,8 +5916,12 @@ private:
         if (buf.qM.size() < w) buf.qM.resize(w);
         T* prev = buf.qM.data(); T* cur = buf.rM.data();
         constexpr bool local = AM == AlignMode::Local;
+        const bool free0 = AM == AlignMode::Local || (AM == AlignMode::Glocal && sgt_bb_<SGR>());
+        const bool free_col0 = AM == AlignMode::Glocal && sgt_ab_<SGR>();
+        const bool col_end = AM == AlignMode::Glocal && sgt_ae_<SGR>();
         prev[0] = static_cast<T>(0);
-        for (int j = 1; j <= n_; ++j) prev[j] = (AM != AlignMode::Global) ? static_cast<T>(0) : -static_cast<T>(j) * ge_a;
+        for (int j = 1; j <= n_; ++j) prev[j] = free0 ? static_cast<T>(0) : -static_cast<T>(j) * ge_a;
+        T colbest = col_end && m_ > 0 ? prev[n_] : NINF();   // semi-global: column n, rows < m
         double best = 0.0;
         for (int i = 1; i <= m_; ++i) {
             const T* sub;
@@ -5429,6 +5933,7 @@ private:
                 cur[0] = local ? static_cast<T>(0) : -static_cast<T>(i) * ge_b;
                 sub = blkT_ + static_cast<std::size_t>(a_idx_[i - 1]) * nalpha_;
             }
+            if (free_col0) cur[0] = static_cast<T>(0);
             T left = cur[0];   // in a register, as in score_affine_scalar_impl
             const uint8_t* bcode = b_idx_.data();
             T rowmax = static_cast<T>(0);
@@ -5449,12 +5954,13 @@ private:
                 left = v;
             }
             if constexpr (local) if (rowmax > best) best = rowmax;
+            if (col_end && i < m_) colbest = std::max(colbest, cur[n_]);
             std::swap(prev, cur);
         }
-        if constexpr (AM == AlignMode::Glocal) {   // the best cell of row m
-            T b = prev[0];
-            for (int j = 1; j <= n_; ++j) b = std::max(b, prev[j]);
-            return static_cast<double>(b);
+        if constexpr (AM == AlignMode::Glocal) {   // the ends: row m (free B end) or (m, n), column n
+            T b = prev[n_];
+            if (sgt_be_<SGR>()) for (int j = 0; j < n_; ++j) b = std::max(b, prev[j]);
+            return static_cast<double>(std::max(b, colbest));
         }
         return local ? best : static_cast<double>(prev[n_]);
     }
@@ -5477,10 +5983,11 @@ private:
         else                                         best_tbl_ = TBTable::Y;
     }
 
+    template <bool SGR = false>   // SGR: the semi-global runtime ends (sg_*_ entries only)
     void viterbi_affine(DpBuffer& buf) {
-        sat_dispatch_([&]<bool Tr, bool Sat>() { viterbi_affine_impl<Tr, Sat>(buf); });
+        sat_dispatch_([&]<bool Tr, bool Sat>() { viterbi_affine_impl<Tr, Sat, SGR>(buf); });
     }
-    template <bool Tr, bool Sat>
+    template <bool Tr, bool Sat, bool SGR = false>
     void viterbi_affine_impl(DpBuffer& buf) {
         band_fill(buf.VM, NINF());
         band_fill(buf.VX, NINF());
@@ -5497,32 +6004,41 @@ private:
         T ge_b = static_cast<T>(params_->gap_extend_b);
 
         if constexpr (AM != AlignMode::Local) {
-            at(buf.VM, 0, 0) = static_cast<T>(0);
+            at_<SGR>(buf.VM, 0, 0) = static_cast<T>(0);
             const int bi = border_rows(), bj = border_cols();
             if constexpr (Tr) {
-                for (int i = 1; i <= bi; ++i) at(buf.VX, i, 0) = tbx0_[static_cast<size_t>(i)];
+                for (int i = 1; i <= bi; ++i) at_<SGR>(buf.VX, i, 0) = tbx0_[static_cast<size_t>(i)];
                 if constexpr (AM == AlignMode::Global)
-                    for (int j = 1; j <= bj; ++j) at(buf.VY, 0, j) = -(tgoa_[0] + static_cast<T>(j) * tgea_[0]);
+                    for (int j = 1; j <= bj; ++j) at_<SGR>(buf.VY, 0, j) = -(tgoa_[0] + static_cast<T>(j) * tgea_[0]);
             } else {
             // VX along column 0: all gaps in B (consuming A), uses gap_b params
             for (int i = 1; i <= bi; ++i)
-                at(buf.VX, i, 0) = -(go_b + static_cast<T>(i) * ge_b);
+                at_<SGR>(buf.VX, i, 0) = -(go_b + static_cast<T>(i) * ge_b);
             // VY along row 0: all gaps in A (consuming B), uses gap_a params
             if constexpr (AM == AlignMode::Global)
                 for (int j = 1; j <= bj; ++j)
-                    at(buf.VY, 0, j) = -(go_a + static_cast<T>(j) * ge_a);
+                    at_<SGR>(buf.VY, 0, j) = -(go_a + static_cast<T>(j) * ge_a);
             }
-            if constexpr (AM == AlignMode::Glocal)   // row 0: a free start at any column
-                for (int j = 0; j <= n_; ++j) at(buf.VM, 0, j) = static_cast<T>(0);
+            if constexpr (AM == AlignMode::Glocal) {
+                if (sgt_bb_<SGR>()) {   // row 0: a free start at any column
+                    for (int j = 0; j <= n_; ++j) at_<SGR>(buf.VM, 0, j) = static_cast<T>(0);
+                } else {          // Global's Y chain along row 0
+                    for (int j = 1; j <= bj; ++j)
+                        at_<SGR>(buf.VY, 0, j) = Tr ? -(tgoa_[0] + static_cast<T>(j) * tgea_[0])
+                                              : -(go_a + static_cast<T>(j) * ge_a);
+                }
+                if (sgt_ab_<SGR>())     // column 0: a free start at any row, no X chain
+                    for (int i = 1; i <= m_; ++i) { at_<SGR>(buf.VM, i, 0) = static_cast<T>(0); at_<SGR>(buf.VX, i, 0) = NINF(); }
+            }
         } else {
-            for (int i = 0; i <= m_; ++i) at(buf.VM, i, 0) = static_cast<T>(0);
-            for (int j = 0; j <= n_; ++j) at(buf.VM, 0, j) = static_cast<T>(0);
+            for (int i = 0; i <= m_; ++i) at_<SGR>(buf.VM, i, 0) = static_cast<T>(0);
+            for (int j = 0; j <= n_; ++j) at_<SGR>(buf.VM, 0, j) = static_cast<T>(0);
         }
 
         best_i_ = 0; best_j_ = 0; best_tbl_ = TBTable::M;
         T best_local = static_cast<T>(0);
 
-        // Row pointers, not rat()/at(): run_viterbi cleared the layout flags, so the
+        // Row pointers, not rat_<SGR>()/at_<SGR>(): run_viterbi cleared the layout flags, so the
         // tables are row-major here, and cell_index()'s layout switch inside the loop is
         // dead weight that gcc unswitches and clang does not.  The left cell rides in
         // registers (clang re-loaded the cells it had just stored), the substitution row
@@ -5568,14 +6084,14 @@ private:
         }
 
         if constexpr (AM == AlignMode::Global) {
-            T vm = rat(buf.VM, m_, n_), vx = rat(buf.VX, m_, n_), vy = rat(buf.VY, m_, n_);
+            T vm = rat_<SGR>(buf.VM, m_, n_), vx = rat_<SGR>(buf.VX, m_, n_), vy = rat_<SGR>(buf.VY, m_, n_);
             viterbi_score_ = std::max({vm, vx, vy});
             best_i_ = m_; best_j_ = n_;
             if      (vm >= vx && vm >= vy) best_tbl_ = TBTable::M;
             else if (vx >= vy)             best_tbl_ = TBTable::X;
             else                            best_tbl_ = TBTable::Y;
         } else if constexpr (AM == AlignMode::Glocal) {
-            glocal_end_affine_(buf);
+            if constexpr (SGR) sg_end_affine_(buf); else glocal_end_affine_(buf);
         } else {
             viterbi_score_ = best_local;
         }
@@ -5617,6 +6133,97 @@ private:
         viterbi_score_ = best; best_i_ = m_; best_j_ = bj; best_tbl_ = TBTable::M;
     }
 
+    // ── Semi-global ends (sg_, kSgFree*) ───────────────────────────────────────
+    // The candidates are offered in row-major order and the first of the maxima wins
+    // (strict >), the state by M > X > Y: column n's cells of rows 0..m-1 (free A end),
+    // then row m -- every column (free B end) or just (m, n).  With sg_ == kSgGlocal that
+    // is exactly glocal_end_rows_ / glocal_end_affine_ (row m, the first column holding
+    // its best); with no flag, Global's (m, n).
+    bool sg_ab_() const noexcept { return AM == AlignMode::Glocal && (sg_ & kSgFreeABegin); }
+    bool sg_ae_() const noexcept { return AM == AlignMode::Glocal && (sg_ & kSgFreeAEnd); }
+    bool sg_bb_() const noexcept { return AM == AlignMode::Glocal && (sg_ & kSgFreeBBegin); }
+    bool sg_be_() const noexcept { return AM == AlignMode::Glocal && (sg_ & kSgFreeBEnd); }
+    bool sg_is_glocal_() const noexcept { return AM != AlignMode::Glocal || sg_ == kSgGlocal; }
+    // ── The runtime-ends (SGR) code: reached through one out-of-line entry ──────────────
+    // Every path for ends other than glocal's leaves the hot functions through one call to an
+    // entry below, defined after the class; every SGR instantiation (the fills, walks, score
+    // paths and end searches with SGR = true) is made from these entries, compiled with the
+    // rest of the engine (engine_<type>.cpp).  Kept as calls so the SGR code is no part of the
+    // Global / Local / glocal functions: in the old bindings unit, at gcc's inlining limit,
+    // even cold in-unit trampolines (4ff2b30) made gcc re-decide inlining across the Glocal
+    // engine (int16 linear glocal path +3.3 % instructions on nighthaven).
+    void sg_run_viterbi_(DpBuffer& buf);                 // run_viterbi, SGR
+    double sg_compute_score_(DpBuffer& buf);             // compute_score (Full), SGR
+    // The affine SGR walk (walk_affine_impl<SGR>), recorded into a per-thread buffer that
+    // walk_affine's cold branch replays into the caller's emit, last move first as the walk
+    // emits them.  The replay is inlined there and flattened (emit and all it calls inlined
+    // too): a closure that reaches an out-of-line call -- emit handed to a cold trampoline
+    // (4ff2b30), or called out of line from the cold branch -- takes the address of every
+    // local it captures by reference, which then lives in memory in the hot walk as well.
+    // (The linear walk takes every end set itself, at the borders: walk_linear_impl.)
+    struct SgStep { int i, j, k; TBTable t; bool open; };
+    const std::vector<SgStep>& sg_walk_record_(const DpBuffer& buf) const;
+    template <class Emit>
+    [[gnu::always_inline, gnu::flatten]] void sg_walk_replay_(const DpBuffer& buf, Emit& emit) const {
+        for (const SgStep& s : sg_walk_record_(buf)) {
+            if constexpr (GM == GapModel::Linear) emit(s.k, s.i, s.j);
+            else                                  emit(s.t, s.i, s.j, s.open);
+        }
+    }
+    // The ends as the fills and walks read them: SGR (runtime ends, other than glocal's) the
+    // flags, else glocal's fixed at compile time.  The flags read at every step / row cost
+    // the glocal linear path 2-3 % on NEON (M1: miRNA, DNA L100) against main's constants.
+    template <bool SGR> bool sgt_ab_() const noexcept { if constexpr (SGR) return sg_ab_(); else return false; }
+    template <bool SGR> bool sgt_ae_() const noexcept { if constexpr (SGR) return sg_ae_(); else return false; }
+    template <bool SGR> bool sgt_bb_() const noexcept { if constexpr (SGR) return sg_bb_(); else return AM == AlignMode::Glocal; }
+    template <bool SGR> bool sgt_be_() const noexcept { if constexpr (SGR) return sg_be_(); else return AM == AlignMode::Glocal; }
+    struct SgEnd {
+        T best{}; int i = -1, j = 0; TBTable t = TBTable::M;
+        void offer(int ci, int cj, T vm, T vx, T vy) noexcept {
+            const T v = std::max({vm, vx, vy});
+            if (i >= 0 && !(v > best)) return;
+            best = v; i = ci; j = cj;
+            t = (vm >= vx && vm >= vy) ? TBTable::M : (vx >= vy ? TBTable::X : TBTable::Y);
+        }
+    };
+    void sg_take_(const SgEnd& e) noexcept {
+        viterbi_score_ = e.best; best_i_ = e.i; best_j_ = e.j; best_tbl_ = e.t;
+    }
+    // Row m's candidates from its (Full, row-major) rows rM/rX/rY, columns 0..n.
+    void sg_offer_last_row_(SgEnd& e, const T* rM, const T* rX, const T* rY) const noexcept {
+        if (sg_be_()) { for (int j = 0; j <= n_; ++j) e.offer(m_, j, rM[j], rX[j], rY[j]); }
+        else          e.offer(m_, n_, rM[n_], rX[n_], rY[n_]);
+    }
+    // Over the retained tables (any layout: rat).  Full band only (a banded problem with
+    // other ends than glocal's is refused: check_problem).
+    void sg_end_affine_(const DpBuffer& buf) {   // (SGR fills only)
+        if (sg_is_glocal_()) { glocal_end_affine_(buf); return; }
+        SgEnd e;
+        if (sg_ae_())
+            for (int i = 0; i < m_; ++i) e.offer(i, n_, rat_sg_(buf.VM, i, n_), rat_sg_(buf.VX, i, n_), rat_sg_(buf.VY, i, n_));
+        auto cell = [&](int j) { e.offer(m_, j, rat_sg_(buf.VM, m_, j), rat_sg_(buf.VX, m_, j), rat_sg_(buf.VY, m_, j)); };
+        if (sg_be_()) { for (int j = 0; j <= n_; ++j) cell(j); }
+        else          cell(n_);
+        sg_take_(e);
+    }
+    // Every end cell once (the soft path's Z and backward seeds): row m's band (a free B
+    // end) or (m, n), and column n of rows 0..m-1 (a free A end; Full band only).
+    template <class F>
+    void sg_for_end_cells_(F&& f) const {
+        if (sg_be_()) { for (int j = jlo0(m_); j <= jhi0(m_); ++j) f(m_, j); }
+        else          f(m_, n_);
+        if (sg_ae_()) for (int i = 0; i < m_; ++i) f(i, n_);
+    }
+    void sg_end_linear_(const DpBuffer& buf) {   // (SGR fills only)
+        if (sg_is_glocal_()) { glocal_end_linear_(buf); return; }
+        SgEnd e; const T ninf = NINF();
+        if (sg_ae_())
+            for (int i = 0; i < m_; ++i) e.offer(i, n_, rat_sg_(buf.H, i, n_), ninf, ninf);
+        if (sg_be_()) { for (int j = 0; j <= n_; ++j) e.offer(m_, j, rat_sg_(buf.H, m_, j), ninf, ninf); }
+        else          e.offer(m_, n_, rat_sg_(buf.H, m_, n_), ninf, ninf);
+        sg_take_(e);
+    }
+
     // ═════════════════════════════════════════════════════════════════════════
     // Forward-backward — Linear gap model
     // ═════════════════════════════════════════════════════════════════════════
@@ -5634,8 +6241,11 @@ private:
             if constexpr (AM == AlignMode::Global)
                 for (int j = 1; j <= bj; ++j)
                     sat(buf.F, 0, j) = -static_cast<double>(j) * drow_ge_a(0);
-            if constexpr (AM == AlignMode::Glocal)   // row 0: a free start at any column
-                for (int j = 0; j <= n_; ++j) sat(buf.F, 0, j) = 0.0;
+            if constexpr (AM == AlignMode::Glocal) {
+                if (sg_bb_()) { for (int j = 0; j <= n_; ++j) sat(buf.F, 0, j) = 0.0; }   // row 0: a free start
+                else for (int j = 1; j <= bj; ++j) sat(buf.F, 0, j) = -static_cast<double>(j) * drow_ge_a(0);
+                if (sg_ab_()) for (int i = 1; i <= m_; ++i) sat(buf.F, i, 0) = 0.0;          // column 0: a free start
+            }
         } else {
             for (int i = 0; i <= m_; ++i) sat(buf.F, i, 0) = 0.0;
             for (int j = 0; j <= n_; ++j) sat(buf.F, 0, j) = 0.0;
@@ -5655,9 +6265,9 @@ private:
 
         if constexpr (AM == AlignMode::Global) {
             log_z_ = srat(buf.F, m_, n_);
-        } else if constexpr (AM == AlignMode::Glocal) {   // every cell of row m is an end
+        } else if constexpr (AM == AlignMode::Glocal) {   // the end cells (sg_end_cell_)
             log_z_ = NEG_INF;
-            for (int j = jlo0(m_); j <= jhi0(m_); ++j) log_z_ = lse2(log_z_, srat(buf.F, m_, j));
+            sg_for_end_cells_([&](int i, int j) { log_z_ = lse2(log_z_, srat(buf.F, i, j)); });
         } else {
             log_z_ = NEG_INF;
             for (int i = 0; i <= m_; ++i)
@@ -5671,7 +6281,7 @@ private:
             sat(buf.B, m_, n_) = 0.0;
         } else if constexpr (AM == AlignMode::Glocal) {
             band_fill(buf.B, NEG_INF);
-            for (int j = jlo0(m_); j <= jhi0(m_); ++j) sat(buf.B, m_, j) = 0.0;
+            sg_for_end_cells_([&](int i, int j) { sat(buf.B, i, j) = 0.0; });
         } else {
             band_fill(buf.B, 0.0);
         }
@@ -5700,8 +6310,13 @@ private:
     // fiat, not a gap move), while its column 0 is Global's charged chain: so the gap
     // targets are counted from column kGapTargetMinJ (gaps in B: Local 1) and from row
     // kGapTargetMinI (gaps in A: Local and Glocal 1).
-    static constexpr int kGapTargetMinJ = (AM == AlignMode::Local) ? 1 : 0;
-    static constexpr int kGapTargetMinI = (AM == AlignMode::Global) ? 0 : 1;
+    // The semi-global ends move them per problem: a free A begin makes column 0 a free
+    // start (gaps in B from column 1), a charged row 0 (no free B begin) holds real gap
+    // moves in A (from row 0).  Glocal's ends give the constants it always had.
+    static constexpr int kGapTargetMinJ0 = (AM == AlignMode::Local) ? 1 : 0;
+    static constexpr int kGapTargetMinI0 = (AM == AlignMode::Global) ? 0 : 1;
+    int gap_min_j_() const noexcept { return (AM == AlignMode::Glocal && sg_ab_()) ? 1 : kGapTargetMinJ0; }
+    int gap_min_i_() const noexcept { return (AM == AlignMode::Glocal && !sg_bb_()) ? 0 : kGapTargetMinI0; }
 
     void soft_grad_linear(const DpBuffer& buf, AlignParams& grad) const {
         double* gblk = grad_block(grad);
@@ -5719,7 +6334,7 @@ private:
 
         // gap_extend_b: B-gap steps (i-1,j) → (i,j), cost = -gap_extend_b
         for (int i = 1; i <= m_; ++i) {
-            for (int j = std::max(kGapTargetMinJ, jlo0(i)); j <= jhi0(i); ++j) {
+            for (int j = std::max(gap_min_j_(), jlo0(i)); j <= jhi0(i); ++j) {
                 double bval = srat(buf.B, i, j);
                 if (bval == NEG_INF) continue;
                 double fval = srat(buf.F, i-1, j);
@@ -5729,7 +6344,7 @@ private:
         }
 
         // gap_extend_a: A-gap steps (i,j-1) → (i,j), cost = -gap_extend_a
-        for (int i = kGapTargetMinI; i <= m_; ++i) {
+        for (int i = gap_min_i_(); i <= m_; ++i) {
             for (int j = std::max(1, jlo0(i)); j <= jhi0(i); ++j) {
                 double bval = srat(buf.B, i, j);
                 if (bval == NEG_INF) continue;
@@ -5760,8 +6375,13 @@ private:
             if constexpr (AM == AlignMode::Global)
                 for (int j = 1; j <= bj; ++j)
                     sat(buf.FY, 0, j) = -(drow_go_a(0) + static_cast<double>(j) * drow_ge_a(0));
-            if constexpr (AM == AlignMode::Glocal)   // row 0: a free start at any column
-                for (int j = 0; j <= n_; ++j) sat(buf.FM, 0, j) = 0.0;
+            if constexpr (AM == AlignMode::Glocal) {
+                if (sg_bb_()) { for (int j = 0; j <= n_; ++j) sat(buf.FM, 0, j) = 0.0; }   // row 0: a free start
+                else for (int j = 1; j <= bj; ++j)
+                    sat(buf.FY, 0, j) = -(drow_go_a(0) + static_cast<double>(j) * drow_ge_a(0));
+                if (sg_ab_())   // column 0: a free start
+                    for (int i = 1; i <= m_; ++i) { sat(buf.FM, i, 0) = 0.0; sat(buf.FX, i, 0) = NEG_INF; }
+            }
         } else {
             for (int i = 0; i <= m_; ++i) sat(buf.FM, i, 0) = 0.0;
             for (int j = 0; j <= n_; ++j) sat(buf.FM, 0, j) = 0.0;
@@ -5787,10 +6407,11 @@ private:
 
         if constexpr (AM == AlignMode::Global) {
             log_z_ = lse3(srat(buf.FM,m_,n_), srat(buf.FX,m_,n_), srat(buf.FY,m_,n_));
-        } else if constexpr (AM == AlignMode::Glocal) {   // every cell of row m is an end
+        } else if constexpr (AM == AlignMode::Glocal) {   // the end cells (sg_end_cell_)
             log_z_ = NEG_INF;
-            for (int j = jlo0(m_); j <= jhi0(m_); ++j)
-                log_z_ = lse2(log_z_, lse3(srat(buf.FM,m_,j), srat(buf.FX,m_,j), srat(buf.FY,m_,j)));
+            sg_for_end_cells_([&](int i, int j) {
+                log_z_ = lse2(log_z_, lse3(srat(buf.FM,i,j), srat(buf.FX,i,j), srat(buf.FY,i,j)));
+            });
         } else {
             log_z_ = NEG_INF;
             for (int i = 0; i <= m_; ++i)
@@ -5808,7 +6429,7 @@ private:
             band_fill(buf.BM, NEG_INF);
             band_fill(buf.BX, NEG_INF);
             band_fill(buf.BY, NEG_INF);
-            for (int j = jlo0(m_); j <= jhi0(m_); ++j) { sat(buf.BM,m_,j) = 0.0; sat(buf.BX,m_,j) = 0.0; sat(buf.BY,m_,j) = 0.0; }
+            sg_for_end_cells_([&](int i, int j) { sat(buf.BM,i,j) = 0.0; sat(buf.BX,i,j) = 0.0; sat(buf.BY,i,j) = 0.0; });
         } else {
             band_fill(buf.BM, 0.0);
             band_fill(buf.BX, 0.0);
@@ -5877,7 +6498,7 @@ private:
         // gap_open_b: expected # of B-gap openings (M→X or Y→X transitions).  Local
         // border X cells are unreachable (FX = -inf there), so no opening lands on one.
         for (int i = 1; i <= m_; ++i) {
-            for (int j = std::max(kGapTargetMinJ, jlo0(i)); j <= jhi0(i); ++j) {
+            for (int j = std::max(gap_min_j_(), jlo0(i)); j <= jhi0(i); ++j) {
                 double bx = srat(buf.BX, i, j);
                 if (bx == NEG_INF) continue;
                 double fm = srat(buf.FM, i-1, j), fy_prev = srat(buf.FY, i-1, j);
@@ -5889,7 +6510,7 @@ private:
         }
 
         // gap_open_a: expected # of A-gap openings (M→Y or X→Y transitions)
-        for (int i = kGapTargetMinI; i <= m_; ++i) {
+        for (int i = gap_min_i_(); i <= m_; ++i) {
             for (int j = std::max(1, jlo0(i)); j <= jhi0(i); ++j) {
                 double by = srat(buf.BY, i, j);
                 if (by == NEG_INF) continue;
@@ -6038,12 +6659,12 @@ private:
                         std::exp(srat(buf.F, i - 1, j - 1) + sub(i, j) + bval - log_z_);
                 }
             for (int i = 1; i <= m_; ++i)
-                for (int j = std::max(kGapTargetMinJ, jlo0(i)); j <= jhi0(i); ++j) {
+                for (int j = std::max(gap_min_j_(), jlo0(i)); j <= jhi0(i); ++j) {
                     const double bval = srat(buf.B, i, j), fval = srat(buf.F, i - 1, j);
                     if (bval == NEG_INF || fval == NEG_INF) continue;
                     G[4 * i + 3] -= std::exp(fval - drow_ge_b(i) + bval - log_z_);
                 }
-            for (int i = kGapTargetMinI; i <= m_; ++i)
+            for (int i = gap_min_i_(); i <= m_; ++i)
                 for (int j = std::max(1, jlo0(i)); j <= jhi0(i); ++j) {
                     const double bval = srat(buf.B, i, j), fval = srat(buf.F, i, j - 1);
                     if (bval == NEG_INF || fval == NEG_INF) continue;
@@ -6071,14 +6692,14 @@ private:
                     G[4 * i + 1] -= std::exp(fy + by - log_z_);
                 }
             for (int i = 1; i <= m_; ++i)
-                for (int j = std::max(kGapTargetMinJ, jlo0(i)); j <= jhi0(i); ++j) {
+                for (int j = std::max(gap_min_j_(), jlo0(i)); j <= jhi0(i); ++j) {
                     const double bx = srat(buf.BX, i, j);
                     if (bx == NEG_INF) continue;
                     const double lo = lse2(srat(buf.FM, i-1, j), srat(buf.FY, i-1, j))
                                       - drow_go_b(i) - drow_ge_b(i) + bx - log_z_;
                     if (lo > -700) G[4 * i + 2] -= std::exp(lo);
                 }
-            for (int i = kGapTargetMinI; i <= m_; ++i)
+            for (int i = gap_min_i_(); i <= m_; ++i)
                 for (int j = std::max(1, jlo0(i)); j <= jhi0(i); ++j) {
                     const double by = srat(buf.BY, i, j);
                     if (by == NEG_INF) continue;
@@ -6303,6 +6924,7 @@ private:
         J.a = a_idx_.data(); J.b = b_idx_.data();
         J.P = tr_ ? sc.qp.data() : build_profile<SF>(buf, w);
         J.local = (AM == AlignMode::Local) ? 1 : (AM == AlignMode::Glocal ? 2 : 0);
+        if constexpr (AM == AlignMode::Glocal) J.sg = sg_;   // (the job defaults to kSgGlocal)
         J.full = (AB == AlignBand::Full) ? 1 : 0;
         J.bi = border_rows(); J.bj = border_cols();
         J.jlo = bl; J.jhi = bl + mm; J.jlo0 = bl + 2 * mm; J.jhi0 = bl + 3 * mm;
@@ -6348,6 +6970,33 @@ private:
         return true;
     }
 };
+
+// ── The semi-global runtime-ends entries (see Aligner::sg_run_viterbi_) ─────────────
+// Ordinary (implicitly instantiated) members, compiled where the engine is (the engine
+// units).  Only AlignBand::Full: a guide band with these ends is refused (check_problem).
+template<GapModel GM, AlignMode AM, AlignBand AB, class T>
+void Aligner<GM, AM, AB, T>::sg_run_viterbi_(DpBuffer& buf) {
+    if constexpr (AM == AlignMode::Glocal && AB == AlignBand::Full) run_viterbi_impl_<true>(buf);
+    else (void)buf;
+}
+template<GapModel GM, AlignMode AM, AlignBand AB, class T>
+double Aligner<GM, AM, AB, T>::sg_compute_score_(DpBuffer& buf) {
+    if constexpr (AM == AlignMode::Glocal && AB == AlignBand::Full) return compute_score_impl_<true>(buf);
+    else { (void)buf; return 0.0; }
+}
+template<GapModel GM, AlignMode AM, AlignBand AB, class T>
+const std::vector<typename Aligner<GM, AM, AB, T>::SgStep>&
+Aligner<GM, AM, AB, T>::sg_walk_record_(const DpBuffer& buf) const {
+    thread_local std::vector<SgStep> rec;
+    rec.clear();
+    if constexpr (AM == AlignMode::Glocal && AB == AlignBand::Full && GM == GapModel::Affine) {
+        auto em = [&](TBTable t, int i, int j, bool open) { rec.push_back({i, j, 0, t, open}); };
+        walk_affine_sgr_(buf, em);
+    } else {   // (the linear walk takes every end set itself: walk_linear_impl)
+        (void)buf;
+    }
+    return rec;
+}
 
 // The inter-pair soft pass's weights (InterSoftJob es/oa/ea/ob/eb, linear) for `P` at
 // temperature T: exp(score / T), exp(-(go+ge)/T), exp(-ge/T).  False when one overflows

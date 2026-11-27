@@ -1,8 +1,10 @@
 // BatchEngine's soft full calls (batch_soft_defer.inl), compiled for the extension in a
-// unit of their own: see the note there.  Every engine the bindings instantiate
+// unit of their own: see the note there.  Every engine the extension instantiates
 // (SeqPairBatchT's six for each of the five scalar types).
+#define NWGRAD_SOFT_DEFER_UNIT 1
 #include "batch_engine.hpp"
 #include "batch_soft_defer.inl"
+#include "seq_pair_batch.hpp"
 
 #define NWGRAD_SOFT_DEFER_INST(T, G, A)                                              \
     template double BatchEngine<T, GapModel::G, AlignMode::A>::soft_score_and_grad_(bool); \
@@ -14,8 +16,10 @@
     NWGRAD_SOFT_DEFER_INST(T, Linear, Global) NWGRAD_SOFT_DEFER_INST(T, Linear, Local) \
     NWGRAD_SOFT_DEFER_INST(T, Affine, Global) NWGRAD_SOFT_DEFER_INST(T, Affine, Local) \
     NWGRAD_SOFT_DEFER_INST(T, Linear, Glocal) NWGRAD_SOFT_DEFER_INST(T, Affine, Glocal)
-NWGRAD_SOFT_DEFER_INST_T(float)
-NWGRAD_SOFT_DEFER_INST_T(double)
-NWGRAD_SOFT_DEFER_INST_T(int16_t)
-NWGRAD_SOFT_DEFER_INST_T(int32_t)
-NWGRAD_SOFT_DEFER_INST_T(int64_t)
+#define NWGRAD_SOFT_DEFER_INST_T_SPB(T) NWGRAD_SOFT_DEFER_INST_T(T) \
+    template size_t SeqPairBatchT<T>::guides_pending() const noexcept;
+NWGRAD_SOFT_DEFER_INST_T_SPB(float)
+NWGRAD_SOFT_DEFER_INST_T_SPB(double)
+NWGRAD_SOFT_DEFER_INST_T_SPB(int16_t)
+NWGRAD_SOFT_DEFER_INST_T_SPB(int32_t)
+NWGRAD_SOFT_DEFER_INST_T_SPB(int64_t)

@@ -156,6 +156,41 @@ along the last row; the soft gradient's ensemble is that same set of paths. `ali
 returns the window of B the alignment covers; `coordinates()` starts where the path
 starts.
 
+### Semi-global modes: free ends
+
+| `mode` | free flanks |
+|---|---|
+| `"semiglobal"`, `free_ends=...` | any of A's beginning / end, B's beginning / end (16 sets) |
+| `"overlap"` | all four (= `free_ends=("a_begin", "a_end", "b_begin", "b_end")`) |
+| `"glocal"` | B's beginning and end (= `free_ends=("b_begin", "b_end")`) |
+| `"global"` | none (= `free_ends=()`) |
+
+```python
+nwgrad.SeqPair(a, b, P, mode="semiglobal", free_ends=(True, False, False, True))  # (a_begin, a_end, b_begin, b_end)
+nwgrad.SeqPair(a, b, P, mode="semiglobal", free_ends=("a_begin", "b_end"))         # the same, by name
+nwgrad.SeqPairBatch(A, B, P, mode="overlap")
+nwgrad.semiglobal_score(a, b, P, ("a_end", "b_begin"))   # also _grad, _soft_grad, _double
+sp.free_ends   # (a_begin, a_end, b_begin, b_end) booleans; None for local
+sp.mode        # "glocal" / "overlap" for those sets, else "semiglobal"
+```
+
+A free flank's residues are left unaligned at no cost (they are not gap moves). In the DP
+(A = rows i, B = columns j): a free **A begin** makes column 0 a free start (M = 0 at every
+row, no gap chain down it), a free **B begin** row 0 (glocal's); a free **A end** makes every
+cell of column n an end, a free **B end** every cell of row m (glocal's); (m, n) is always
+an end. Ends include the border cells, so `("a_begin", "b_end")` with nothing in common
+scores 0 (the empty overlap), as glocal's (m, 0) is an end. Among equal optima the end is
+the **first candidate cell in row-major order** (A's index, then B's), the state by
+M > X > Y: glocal's rule (row m's first best column) and Local's, extended; the same at
+every ISA level and in both exact tracebacks.
+
+What runs (other ends than glocal's): every simd level's striped fills (Scores, Pointers,
+linear) and score-only kernels, bit-identical to the scalar fill; traceback `pointers` /
+`scores` (`auto`, `grid` and the Hirschberg modes run as Pointers: O(m*n) direction bytes);
+hard gradients; the soft path (scaled and log; the scaled per-pair kernels, not the
+inter-pair one); each pair's own fill in a batch (`fill="interpair"` falls back). A guide
+band (`banded_align`, `banded_grad`) raises.
+
 ### Parameter sets and tracks
 
 An `AlignParams` may hold **K parameter sets**, each a full substitution matrix plus the
@@ -513,6 +548,29 @@ f(seq_a, seq_b, params, band=0, aligned_a="", aligned_b="", kernel="auto")
 
 Each also exists with a `_double` suffix (`nw_score_double`, `nw_affine_grad_double`,
 …) that runs the DP in float64 — see [Precision](tuning.md#precision).
+
+<a id="scalar-types"></a>**Scalar types.** The suffix (and the class name: `SeqPairInt16`,
+`SeqPairBatchInt8`, …) picks the DP's scalar type; integer types take integral parameters
+only (`ValueError` otherwise) and have no soft path. Every integer result equals the
+float64 one, bit for bit. See [Precision](tuning.md#integer-types).
+
+| Suffix / class | DP arithmetic | Parameters | Refused problems |
+|---|---|---|---|
+| (none) / `SeqPair` | float32 | any | — |
+| `_double` / `*Double` | float64 | any | — |
+| `_int64` / `*Int64` | int64 | integers within ±(2⁶¹−1) | bound (m+n+66)·step > 2⁶¹−1: `OverflowError` |
+| `_int32` / `*Int32` | int32 | integers within ±(2²⁹−1) | bound (m+n+66)·step > 2²⁹−1: `OverflowError` |
+| `_int16` / `*Int16` | int16 (saturating past the quarter rule) | integers within ±8191 | past the saturating bound: `OverflowError` |
+| `_int8` / `*Int8` | score-only: int8 where provably exact, else int16; paths and gradients: int16 | integers within ±127 (`ValueError` otherwise) | as int16 |
+
+The int8 names are int16 with the parameter range checked up front: score-only work
+runs the int8 kernel first (Local by default on x86; off by default on AArch64) and re-runs at int16 whenever it cannot prove its result (a
+Local score reaching 127; Global / Glocal see [Precision](tuning.md#integer-types)), so
+the score is the int16 one either way; paths, guides and hard gradients are computed at
+int16 (there is no int8 traceback). They take the same arguments as the int16 names,
+including `nw_grad_int8` … `glocal_affine_grad_int8`; there is no `_int8` soft function.
+The int16 / int32 / int64 score-only paths try the same int8 kernel by themselves when
+the parameters fit (gate `score_int8`, [Fill gates](tuning.md#fill-gates)).
 
 `band > 0` (or a non-empty `aligned_a` / `aligned_b` guide pair) runs a banded DP
 instead of the full one. The sequences are plain `str` and are validated and

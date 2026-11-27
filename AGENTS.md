@@ -746,7 +746,7 @@ So: **Pointers when it fits and threads ≤ its peak; Hirschberg above the cross
 **Why.** On miRNA × target-site pairs (Manakov: 2.5M pairs, A ~22, B = 50) the striped Full kernel is the wrong tool. Its lazy-F fixpoint is data-dependent and worst when gaps are cheap: DiscrimAlign's fitted parameters (gaps at the −1e-4 cap) cost **+25%** over its starting ones on the same pairs (2.39 → 2.99 s, nighthaven, 12 threads, score-only nearly identical, so it is the fill, not the traceback). Both new fills are opt-in on `SeqPairBatch.fill` (`SeqPair.fill` takes the first two), default stays `"striped"`, and both give **bit-identical** scores, paths and gradients (`tests/Python/test_fill.py`; DiscrimAlign full fits identical to the last bit).
 
 - **`"rowwise"`** — the Full band runs the row-wise kernel (`viterbi_affine_simd`, otherwise the GuideBanded path) instead of the striped one (`Aligner::set_rowwise_full`). No lazy-F; the VY carry is a plain serial chain. Keeps VM/VX/VY (24 B/cell) even under `traceback="pointers"`, read back by the Scores traceback. Two exact fixes made it faster still: the Full path initialises only row 0 and column 0 instead of `band_fill`ing all three tables (−12%), and the Local best-cell rescan stops at the first cell equal to the row max instead of scanning the row against a moving best (−6%; it was 17% of a pair's instructions under callgrind).
-- **`"interpair"`** — `score_and_grad()` fills W pairs at once, one per vector lane (`InterJob`, `inter_kernel_impl.inl`, leveled, W = KW: 2 on SSE2/NEON, 4 on AVX2, 8 on AVX-512). Each lane runs the row-wise recurrence (same max/add/sub, same order — so each lane's table is bit-identical to the pair's own fill), the VY carry is a lane-wise chain with no cross-lane fixup, and the substitution score is a blend tree on the B residue's bits (alphabets ≤ 8; DNA = 2 levels), not a gather. Tables are interleaved per cell; the pair then `adopt_interleaved()`s its lane (a `cell_index` layout, `inter_w_`/`inter_lane_`), so the existing traceback, `guide_j` and `hard_grad` run unchanged. Pairs are grouped by (backend, mode, len B), sorted by len A; the grouping is built once and cached (`plan_`, keyed by the default ISA and `hb_cutoff`; the pairs never change) — rebuilding it per call was **~0.9 s serial on 2.5M pairs** and capped scaling at 3.4×. Pairs it cannot take (float32, alphabet > 8, scalar backend, Hirschberg past its cutoff, linear Global below 4 lanes) run their own fill in the same pass. **Linear gaps** (since 2026-10-05, `inter_fill_linear`, `InterJob.linear`; H rides in `buf.H`, which `adopt_interleaved` reads for a linear aligner): per lane exactly `viterbi_linear` — `max(diag+s, up−ge_b, left−ge_a)` in that order (an `ivmax` chain keeps the first largest, as `std::max` over an initializer list does), Local clamped at 0, the same strict-`>` best cell — so tables, paths and gradients are bit-identical (`test_fill.py::test_linear_interpair_*`, every ISA level, the tie fixture included). Measured, Manakov 100k, hard, µs/pair striped → interpair: AVX2 Local 3.38 → **1.05 (3.23×)**, Global 1.85 → **1.31 (1.41×)** (12 threads: 2.07×, 1.20×); SSE2 Local 9.54 → 6.76 (1.41×) but Global 5.44 → 7.12 (**0.76×**, a loss: the scalar global fill is already cheap and 2 lanes do not pay for the interleaving) — hence `linear_fill_ok_`: Global linear takes the fill only from 4 lanes (NEON, W=2, unmeasured, held to the same rule). Soft linear Global pairs below 4 lanes still join groups for the soft pass and skip the fill. Soft pairs DO join (since 2026-10-05): the shared fill is their guide Viterbi, and a group whose real lanes are all soft with one `soft_impl` (not `"log"`) and one temperature also shares the forward-backward (`InterSoftJob`, see "The soft path"). This is the inter-sequence layout the vectorization notes above reject *for protein alphabets*: with 4 letters the lookup is 3 blends per vector, not a gather.
+- **`"interpair"`** — `score_and_grad()` fills W pairs at once, one per vector lane (`InterJob`, `inter_kernel_impl.inl`, leveled, W = KW: 2 on SSE2/NEON, 4 on AVX2, 8 on AVX-512). Each lane runs the row-wise recurrence (same max/add/sub, same order — so each lane's table is bit-identical to the pair's own fill), the VY carry is a lane-wise chain with no cross-lane fixup, and the substitution score is a blend tree on the B residue's bits (alphabets ≤ 8; DNA = 2 levels), not a gather. Tables are interleaved per cell; the pair then `adopt_interleaved()`s its lane (a `cell_index` layout, `inter_w_`/`inter_lane_`), so the existing traceback, `guide_j` and `hard_grad` run unchanged. Pairs are sorted by (len B, len A) and cut into tiles of k groups within the ragged len-B window, each tile re-sorted by (len A, len B) before its groups of W are cut (`inter_group_tiles`, default k = sqrt(N / W); k = 1 is the old grouping by len B then len A; 2026-11-10, review r2 proposal 9: independent U[50,300] lengths simulated 0.89/0.81/0.69 -> 0.98/0.97/0.95 lane utilisation at W = 8/16/32, results bit-identical since a lane does not depend on its group); the grouping is built once and cached (`plan_`, keyed by the default ISA and `hb_cutoff`; the pairs never change) — rebuilding it per call was **~0.9 s serial on 2.5M pairs** and capped scaling at 3.4×. Pairs it cannot take (float32, alphabet > 8, scalar backend, Hirschberg past its cutoff, linear Global below 4 lanes) run their own fill in the same pass. **Linear gaps** (since 2026-10-05, `inter_fill_linear`, `InterJob.linear`; H rides in `buf.H`, which `adopt_interleaved` reads for a linear aligner): per lane exactly `viterbi_linear` — `max(diag+s, up−ge_b, left−ge_a)` in that order (an `ivmax` chain keeps the first largest, as `std::max` over an initializer list does), Local clamped at 0, the same strict-`>` best cell — so tables, paths and gradients are bit-identical (`test_fill.py::test_linear_interpair_*`, every ISA level, the tie fixture included). Measured, Manakov 100k, hard, µs/pair striped → interpair: AVX2 Local 3.38 → **1.05 (3.23×)**, Global 1.85 → **1.31 (1.41×)** (12 threads: 2.07×, 1.20×); SSE2 Local 9.54 → 6.76 (1.41×) but Global 5.44 → 7.12 (**0.76×**, a loss: the scalar global fill is already cheap and 2 lanes do not pay for the interleaving) — hence `linear_fill_ok_`: Global linear takes the fill only from 4 lanes (NEON, W=2, unmeasured, held to the same rule). Soft linear Global pairs below 4 lanes still join groups for the soft pass and skip the fill. Soft pairs DO join (since 2026-10-05): the shared fill is their guide Viterbi, and a group whose real lanes are all soft with one `soft_impl` (not `"log"`) and one temperature also shares the forward-backward (`InterSoftJob`, see "The soft path"). This is the inter-sequence layout the vectorization notes above reject *for protein alphabets*: with 4 letters the lookup is 3 blends per vector, not a gather.
 
 **Measured** (nighthaven i5-12500, AVX2, all 2.5M Manakov pairs, DiscrimAlign's fitted parameters, `score_and_grad()`):
 
@@ -3187,6 +3187,118 @@ instructions (cycles +7-15 %); L100 0.93-0.97 and int32 / int64 held.  So:
   same score.
 Not re-measured after this round: everything above (nighthaven int16, the spot window).
 
+### The int8 score tier (branch `proto/int8`, 2026-11-07)
+
+Integer score-only (int16 / int32 / int64, untracked, simd backend) first tries a score
+kernel in saturating int8 lanes (`score8_kernel_impl.inl`, `Aligner::score_i8_`; 16 lanes
+SSE / NEON, 32 AVX2, 64 AVX-512BW), then the half-width narrowing, then its own kernel.
+The int8 kernel PROVES its result or reports `overflow` and the caller runs the wider one,
+so a saturated value never leaks and the score is the int16 / int32 integer bit for bit.
+- **Kernel.** Farrar striped with lazy-F, its own (the D/X form's stored prefix forms
+  open + k*ge ramps that int8 cannot hold).  Gaps >= 0 only, so with go >= 0 the three-state
+  cell is Gotoh's two-state one (X's max(M, Y) - go - ge loses nothing to H - go - ge), and
+  sat((v - go) - ge) == sat(v - (go + ge)) (same floor), one subtraction per open.  The X row
+  starts as X(1, j) = H(0, j) - goe_b (the row holds the NEXT row's X; starting it at the
+  sentinel lost Glocal's free-start vertical opens -- caught by the A/B fuzz).  Lazy-F stops
+  when no carried F - ge beats the cell's PRE-pass H - goe (against the raised H a zero open
+  stops a step early).
+- **Bound, Local.**  M = max(H + s, 0) >= 0, X / Y only subtract, so H is exact unless an
+  add clamped at 127, which leaves H == 127; X / Y are exact or (-128, V <= -128) and never
+  win H.  Score (the max) < 127 => exact; == 127 => overflow, tested per row (early stop).
+  Padding (s = 0, row 0 = 0) never exceeds the real maximum: no mask.
+- **Bound, Global / Glocal.**  Sat ops are monotone, so S >= V; by induction S(c) <=
+  max(V(c), -128 + G), G = min(m, n) * smax_pos the most any path gains (only diagonals
+  gain).  Required G <= 126 up front (then nothing reaches 127), and S > G - 128 at the end
+  (S <= max(V, -128 + G) and S > -128 + G give S <= V).  Glocal's row max: its argmax cell
+  passes the test, every other V <= S <= max.
+- **Preconditions** (else int16 directly): params within +-127, gaps >= 0, go + ge <= 127
+  per side, m, n >= 1.
+- **Gate** `score_int8` / `NWGRAD_INT8`: 0 off (the AArch64 default: spot, M1, lost on every
+  cell but DNA L1000 unrelated affine, unrelated DNA L100 1.26-1.35, protein L300 1.41-1.75),
+  1 (the x86 default) Local only with a per-thread predictor
+  (try int8 only if the previous Local problem of this type, on this thread, scored < 127 --
+  the wide kernel's score answers it exactly; it replaced a geometric back-off, skip 1, 3,
+  ... 63 after an overflow, which left the overflowing cells at 1.01-1.03; affine at 16 lanes
+  < 64: there an int8 run costs about an int16 run at score ~110 and an overflow 2.1x, so
+  related DNA L100 affine Local, median 114, read 1.22x instructions / 1.25x wall at sse4
+  under the 127 cap; see score8_pred_cap), 2 every mode,
+  every problem (tests).  `NWGRAD_INT_NARROW=0` turns it off with the other narrowing.
+- **Minimum row** `score_int8_min_segs` (gate 1 only): 32 segments at 16 and 32 lanes, 16
+  (32 for linear over > 8 letters) at 64 lanes.  16 lanes had none until 2026-11-21: sse4
+  instruction counts gained at L100, but nighthaven with the level forced to sse4 lost in wall
+  time (related DNA L100 affine 1.06-1.10 at 27-30 % mutated, linear int16 1.05-1.11; L150-L300
+  mixes up to 1.33 in cycles), and from L500 (32 segments) every fixture was <= 1.01.  nighthaven AVX2 (87356da, Local score, tier on / off) lost on SHORT rows of
+  pairs that fit int8 -- protein unrelated L100 1.70 / L300 1.33, DNA related L100 1.66 /
+  L300 1.06 (6 threads the same) -- and gained from L1000 (32 segments: 0.45-1.00; L3000
+  0.11-0.36).  At 4-10 segments lazy-F carries across 32 lane boundaries per row and the
+  per-row costs dominate; skynet SSE4 at L100 (7 segments of 16) already gained.  At 64
+  lanes (solace AVX-512, 87356da) 16 segments (L1000) gained for affine and DNA (DNA 0.45-
+  0.55, protein affine 0.74) but not protein linear (1.02-1.06, control 1.02), L300 (5)
+  lost 1.30-1.84, L2048 gained everywhere (DNA 0.38-0.40, protein affine 0.56, int32 0.15-
+  0.33): 16 segments there, 32 for linear over > 8 letters.  AVX2 keeps 32 pending
+  nighthaven's re-timing.
+- **Python**: `*_int8` names / `SeqPairInt8` / `SeqPairBatchInt8` (`nwgrad/_int8.py`) are the
+  int16 ones with the parameter range checked (ValueError past +-127); paths and gradients
+  run at int16 (fallback, the same integers).
+- **The inter-pair int8 score kernel** (`inter8_kernel_impl.inl`, branch `proto/int8-inter`):
+  a score-only integer batch (`BatchEngine::score_only_`) first runs its short pairs in
+  groups of `inter_w8` int8 lanes (16 SSE / NEON, 32 AVX2, 64 AVX-512BW), a plan of its own
+  split from the rows plan (`ensure_plan8_`).  Lane by lane the same proof as above: Local
+  a lane maximum < 127, Global / Glocal G <= 126 per pair up front and a score > G - 128.
+  A lane that fails re-runs at T, in a full T group once a worker has W of them, else its
+  own fill -- except for int32 / int64, whose int8 groups are built apart from the pairs of
+  the rows plan's narrow groups: those fall back (failed lanes and declined groups) to the
+  narrow NI kernel, main's route for them.  At T the fallback cost related DNA L100 int32
+  affine Local score 1.84-1.89x main on solace (AVX-512, every group declined: int32 there
+  holds half of int16's lanes).  An exact predictor (the T scores say whether int8 would have held) skips the
+  int8 run of a group after one where over half the lanes failed.  Preconditions: untracked,
+  <= 8 letters, the int8 parameter limits above, both lengths <= 127 (int8 lane compares);
+  groups under int16's score caps.  Gate `inter_score_int8` / `NWGRAD_INTER_INT8`: 0 off,
+  1 (the x86 default; 0 is the AArch64 default, untimed there and the per-pair int8 kernel
+  lost on spot) and 2 every mode.  wloczykij sse4, miRNA 22 x 50, instructions per pair on /
+  off (A/A 0.91-1.07): int16 0.47-0.61, int32 0.22-0.28 in every mode and gap model;
+  all-overflowing cells 0.99-1.015 with the predictor (1.22-1.51 without).
+- **The small-alphabet score cap** (`inter_score_ok`, `score_small_local` / `_global`) has
+  its own override, `inter_score_small_cells`: before it, a sweep that switched the gather
+  cap off still sent DNA past ~L43 (int16 at SSE) to the own fill, so "DNA L100 int16 vs
+  int32 inter-pair" measured the narrowed int16 striped kernel twice (1.00).  With the cap
+  off, DNA L100 int16 / int32 inter-pair is 0.50 Global / 0.52 Local; int16 inter-pair /
+  own fill at DNA L100 Global 0.69 (instructions; the caps came from timings, untouched).
+  Since then int16's caps are per level (`kGateCapsSse2` / `kGateCapsSse4`, AVX2's row):
+  AVX2 L1000, SSE4 L200, SSE2 L100 Local / L60 Global, from nighthaven timings and wloczykij
+  instruction counts (simd_levels.hpp has the numbers); int32's, AVX-512 and NEON unchanged.
+- **ISA**: sse2 / sse4 run here (A/B fuzz, C++ [int8] case, test_int8.py at every level);
+  avx2, avx512 and neon (gcc and clang, aarch64 cross) compile only.
+
+Measured (skynet sse4, 1 thread, score-only per pair, striped fill; instructions per pair
+from perf, two rep counts differenced; A = NWGRAD_INT8=0, B = tier on in every mode with no
+back-off (the first form), A'/A 0.98-1.02; "rel" = 30 %-mutated copies (miRNA: 20 %-mutated
+site in a 50-mer), "rand" = unrelated; BLOSUM62 11/1 (linear 4), DNA 2/-4, 4/2 (linear 2)):
+
+| cell | affine G | affine L rel | affine L rand | linear G | linear L rel | linear L rand |
+|---|---|---|---|---|---|---|
+| DNA L100 | 1.00 (G > 126) | 0.81 | 0.48 | 0.99 | 0.78 | 0.65 |
+| DNA L300 | 1.00 | 1.33 | 0.35 | 0.99 | 1.27 | 0.49 |
+| DNA L1000 | 1.00 | 1.08 | 0.33 | 1.01 | 1.08 | 0.39 |
+| protein L100 | 1.00 | 1.99 | 0.97 | 1.00 | 1.74 | 0.96 |
+| protein L300 | 1.00 | 1.25 | 0.58 | 0.99 | 1.27 | 0.67 |
+| protein L1000 | 1.00 | 1.06 | 0.41 | 1.00 | 1.06 | 1.19 |
+| miRNA 22x50 | 2.23 | 0.78 | -- | 1.59 | 0.85 | -- |
+
+int32 narrowed (A: int32 -> int16, B: int32 -> int8): DNA L100 L rel 0.80, DNA L300 L rand
+0.35, protein L300 L rand 0.58, protein L1000 linear L rand 1.19, miRNA affine G 2.19, linear
+L 0.83.  Read: int8 halves the instructions where the Local score stays below 127; an
+overflowing pair costs its int8 run (1.06-2.0x), and Global / Glocal lose outright (lazy-F
+across every lane, every row).  Hence the default: Local only, with the back-off.
+With the default (wloczykij, the same sse4 core, instructions per pair, A = NWGRAD_INT8=0,
+B = default, A'/A 0.97-1.04): the overflowing cells now cost 1.01-1.03 (protein L100 Local
+rel affine 1.02 / linear 1.02, DNA L300 Local rel 1.01, protein L1000 linear Local rand
+1.02), the gains hold (DNA L300 Local rand 0.33, int32 DNA L100 Local rel 0.80, miRNA Local
+affine 0.78 / linear 0.82), miRNA Global 1.01 (not tried).
+With the predictor in place of the back-off (wloczykij, A'/A 0.99-1.01): protein L100 Local
+rel affine 1.00 / linear 0.99, DNA L300 Local rel 1.00 (A' 1.007), protein L1000 linear
+Local rand 1.01 (A' 1.00); DNA L300 Local rand 0.33, miRNA Local affine 0.79.
+
 ### Narrowing for paths and inter-pair groups (branch `proto/narrow-paths`, 2026-11-10)
 
 Review r2 proposal 1: the half-width lanes of `narrow_score_` extended to every
@@ -3746,6 +3858,173 @@ best of 5).** glocal / global:
   the scans' Glocal branches (`HbScanJob::glocal`, a runtime int) cost nothing measurable
   against Local's: no template split needed.
 
+### Semi-global free ends (branch `proto/semiglobal`, 2026-11-07)
+
+**What.** `AlignMode::Glocal` is now the whole semi-global family: a runtime word `sg_`
+(`Aligner::set_free_ends`, `BatchSettings::free_ends`, `kSgFree*` in `simd_levels.hpp`) says
+which flanks are free -- A's begin / end, B's begin / end.  `kSgGlocal` (B's two) is the
+default, so every existing glocal caller runs what it ran; 0 is Global's DP; all four is
+`mode="overlap"`.  Python: `mode="semiglobal", free_ends=(a_begin, a_end, b_begin, b_end)`
+(booleans, or the names of the free ones), `mode="overlap"`, `.free_ends`, the
+`semiglobal_*` convenience functions (`__init__.py`).  The Global and Local template
+instantiations are untouched (every new test is `if constexpr (Glocal)`-guarded or a runtime
+word read only there).
+
+**The DP.** Free B begin: row 0 M = 0, no Y chain (glocal's); else Global's row 0.  Free A
+begin: column 0 M = 0, X = -inf (Local's border), else Global's chain.  Ends: row m whole
+(free B end) or (m, n); column n of rows 0..m-1 (free A end).  Border cells are ends too
+((m, 0) as glocal's; (0, n)), so a dovetail with nothing in common scores 0.  The tie rule:
+**the first candidate in row-major order holding the maximum (strict >), the state by
+M > X > Y** -- glocal's (first column of row m) and Local's, one rule.  `SgEnd::offer` in
+the aligner, the `offer` / `offer_row` lambdas in the striped kernels (column n's slot read
+after each row's lazy-F, one scalar read per row; row m by `striped_row_best`).  The walks
+stop at row 0 under a free B begin (as before) and at column 0 under a free A begin; a
+charged border emits Global's forced gap run.  Gradients follow from the walk.  Soft (log
+path): the same borders, Z = the sum over the end cells (`sg_for_end_cells_`), the backward
+seeded there; gap targets from `gap_min_j_()` / `gap_min_i_()` (the old kGapTargetMin
+constants, now per problem: a free A begin drops column 0's vertical moves, a charged row 0
+adds its horizontal ones).  Scaled soft (`soft_kernel_impl.inl`, `SoftPairJobT::sg`): a
+free A begin seeds column 0 with Local's 2^-S[i-1] (one cell, not every cell), each row's
+end mass goes to `rowsum` (`sp_row_ends`: column n's cell for a row < m, row m's sum or
+cell) and Z sums them as Local's per-row sums; the backward adds 2^-T at column n of
+every row < m (Local's `init`, one cell); `kmin` / `kmin0` from the flags.  Glocal's ends
+take the old code exactly (`GX` false).
+
+**Where.** Scalar fills (`viterbi_affine_impl`, `viterbi_linear_impl`, both Pointers fills,
+the two score-only scalars); the striped Scores / Pointers / linear kernels; all five
+score-only kernels (the int linear one finishes a row's H one row late, so column n is
+completed there by hand: `max(U, max(P, cin) - ramp)` with the ramp summed in the lane's
+wrapping arithmetic).  **Gated** for ends other than glocal's: Grid and the Hirschberg modes
+(`run_tb_` returns Pointers: O(m*n) direction bytes), the row-wise fill
+(`uses_rowwise_full`), the inter-pair fills, hard and soft (`BatchEngine::inter_fill_()`),
+guide bands (`check_problem` throws).
+
+**Measured** (wloczykij, sse4, float32, own striped fill, traceback pointers, 1 thread;
+`instructions:u` of 3 passes, protein BLOSUM62 11/1 and DNA +2/-4 4/2, L100 / 300 / 1000;
+A/A control base vs base 0.97-1.03, one outlier cell 0.66).  new / main: global 0.990-1.018
+and local 0.994-1.012, i.e. unchanged; **glocal affine +1.4-3.6 % (hard and score-only),
+linear 0.98-1.04** -- the runtime flags in the Glocal instantiation (per-row selects and
+offers, the general end code) cost glocal ~3 % affine; a constexpr glocal instantiation
+would buy it back (not done).  The other ends / new global: overlap (all four) 0.85-0.97
+(cheaper: no Y chain in row 0, no X chain in column 0), a_end 0.98-1.05, a_begin+b_end
+0.98-1.05, none 0.98-1.04.  **After** a compile-time glocal copy of the striped Scores / Pointers
+kernels (`SG` template, ec5640e / follow-ups; tried and reverted for the linear and score-only
+kernels: it moved Local linear hard +2 % through the unit's inlining, and did not move the score
+kernels): glocal affine hard 1.000-1.015, global 0.987-1.014, local 0.978-1.011 (A/A 0.99-1.03);
+**open: glocal score-only still +1-3 % (affine 1.002-1.028, linear up to 1.028)**. **Resolved 2026-11-10/11:** the kernels with runtime ends (SG = -1) are instantiated only in a
+unit of their own per level (`level_<name>_sg.cpp`, `NWGRAD_LEVEL_SG_TU`, registered as `*_sg` table
+entries); the fixed-end kernels are main's code (`SgPick` holds the runtime end logic).  Precise
+counts (wloczykij sse4, float32, 13 vs 1 passes, PYTHONHASHSEED=0, BLAS threads 1; A/A
+0.999-1.003): new / main global 0.999-1.003, glocal 0.998-1.003 (affine and linear, hard and
+score), local 0.998-1.001 except **Local linear hard 1.017-1.019, still open**: in its Pointers
+kernel.  Not the code store: written out explicitly (main's cvttps2dq + pshufb at SSSE3) the
+count was unchanged (two packs instead: +1-3 % on every linear fill), so store_codes is main's
+again; the `movd` seen in the profile is the packed 4-byte store.  **Found 2026-11-10:** the cause
+lay not in the store but in a thing that never ran -- the linear kernel's `pick_row`, a `[&]` lambda
+over `best_local` / `best_i` / `best_j`, built in every instantiation though only SGX ones call it.
+The closure takes those locals' addresses at gimplification, and the early passes saw them as memory
+before the dead closure was swept away; gcc then laid out `striped_linear_ptr_entry<float>` (the Local
+Pointers fill inlined into it) differently (3435 of ~3780 disassembly lines differed from main).  Now
+the pick is a struct (`SgPick1::row1`, kernels_linear_impl.inl) as the affine kernels' `SgPick`: the
+function's code is main's to the instruction, differing only in branch-alignment padding and the
+`ViterbiJob` offsets moved by `sg`.  Recount (13 vs 1 passes, release-wheel flags, -O3 -g1): new / main
+0.998-1.003 in every cell of global / local / glocal x affine / linear x hard / score, protein and DNA
+L300 / L1000, Local linear hard 0.999-1.000; A/A 0.997-1.002.  The lesson: no lambda that captures by
+reference in a kernel body, even an unused one.  **On NEON it was not enough** (spot M1, 15f23a4:
+Local linear float32 path / hard 1.018-1.020, glocal linear path miRNA 1.017-1.025, DNA L100
+1.013-1.032).  I cross-compiled the level units (aarch64 gcc 16.2.1, -O3, release-wheel flags) and
+compared them function by function with main: 300 of ~400 functions in `level_neon.o` differed
+structurally, untouched Hirschberg and grid kernels among them.  Bisected by file, the whole
+disturbance came from score_kernel_impl.inl: the fixed-end Glocal kernels called
+`sg_score_col0_only` (a new function with a `[&]` lambda) for n == 0, and every kernel computed the
+column-n index `coln` (two divisions) whether it used it or not.  Both are now in the runtime-ends
+instantiations only (fixed ends: `static_assert` glocal's), and `sg` sits last in `ViterbiJob` /
+`ScoreJob`, so the other members keep main's offsets.  Result: `striped_linear_entry` /
+`striped_linear_ptr_entry` (every T), `striped_full_ptr_entry` and the Hirschberg / grid kernels
+are main's instruction for instruction on NEON (341 identical, 25 differ in register names only);
+what differs is the score-only kernels (31, small: operand order, one spill) and a few affine
+Scores fills.  On x86 sse4 the same: 597 identical, the rest score-only kernels and one int64 Pointers fill.
+**Spot on f65cdfd** then read protein affine double path / hard 1.17-1.19 (Global, Local, Glocal; DNA,
+float32, score-only 1.000).  I followed it with a static aarch64 driver of the batch engine under
+qemu, logging every translated block: the cell runs the inter-pair fill
+(`lvl_neon_inter::inter_fill_affine<double>` + `row_gather`, ~40 % of the blocks), and
+`level_neon_inter.o` is byte-identical to main's (606 / 606 functions); the hard walk in the bindings
+is main's but for the `Aligner` member offsets (+4, `sg_`).  x86 sse4 instructions on the same cell:
+1.000 (Python, 13 vs 1 passes).  So the code that runs is main's; what moved is where it sits: ld64
+(macOS) has no `nwgrad_text.ld`, so every byte the branch adds to py_exports or the level units moves
+the inter-pair kernel against the engine code (pr-placement.md: up to 13 % on byte-identical kernels).
+Even the qemu block counts moved with it (a hot loop of the identical kernel split across a 4 KiB
+page in one link and not the other: -4.8 % host instructions, an artifact).  The glocal linear
+walks and the scalar fills now take glocal's ends at compile time (`SGR`, `sgt_*_<SGR>()`): the
+glocal walk is main's code but for register names.  **5652ad2 on four layouts** (pads +0 / +1536 /
++3072 / +32 in py_exports): protein double 0.991-1.010 and DNA glocal 0.980-1.000 (placement, as
+above), miRNA glocal 1.003-1.015, but **protein L300 linear Local float32 path / hard 1.014-1.025 on
+all four**.  Its per-pair route (qemu block profile): `striped_linear_entry<float>` (the H-table
+fill, 46 % of the blocks), the profile build and the walk, each the same block count as main's.
+What still differed from main was data layout: `Aligner::sg_` sat beside `tb_auto_` (every later
+field +4: the walk's loads), and the `*_sg` kernel slots sat inside `TypedKernels` (the dispatch
+read `linear` at +40).  `sg_` is now Aligner's last member; the slots live in `SgTypedKernels`, at
+the end of `LevelKernels` (`sg_of<T>()`); `job.sg` is written for Glocal only.  The Local linear
+walk is now main's instruction for instruction (only a .rodata constant's address differs), and so
+is compute_viterbi but for the level table's stride and `ViterbiJob`'s default `sg` (one store a
+pair).  qemu instructions, batch, R6-R1: Local linear float32 protein L300 1.0003, local affine
+double 1.0001.  Overlap (all four) / global 0.85-0.99, a_end
+0.99-1.04.
+
+**The runtime-ends code left the bindings' unit (2026-11-20).** After the merge with a0aea9b,
+nighthaven's short glocal cells read code: miRNA int16 linear glocal path 1.12 (+3.3 %
+instructions), DNA L100 int16 linear glocal path 1.04-1.05 (+3.1 %), miRNA float32 affine glocal
+path 1.03 (+3.0 %); +1.3-4.8 % at 4ff2b30 already.  No glocal code had changed: py_exports.cpp
+still instantiated every runtime-ends (SGR) fill, walk and score path behind the cold trampolines,
+the unit sits at gcc's `--param inline-unit-growth` limit, and gcc re-decided inlining across the
+engine (gcc 16, int16 linear glocal: the inter-pair worker 18.8 -> 20.1 KB, `path_and_guide` and
+`score_and_grad_inter_` out of line, `hard_grad` 2.7 -> 3.9 KB; 908 Glocal and 1057 Global / Local
+functions of another size).  `fill_guide_gaps`' extra samples were that, not more calls (one call
+a pair on both sides, results bit-identical).  The trampolines also handed each walk's `emit` to
+an out-of-line call: a closure that reaches a call takes the address of every local it captures by
+reference (path_walk_'s ci / cj, the guide, the path sink), so those lived in memory in the hot
+glocal walks too.  Now:
+- Every runtime-ends fill and score path leaves the hot code through one call to an out-of-line
+  entry, `sg_run_viterbi_` / `sg_compute_score_` (Glocal Full only).  These were compiled in a unit
+  of their own, `aligner_sg.cpp`, while the engine shared the bindings' unit; with the engine units
+  (proto/engine-tu, #58) they are compiled there like every other engine member, and that unit and
+  its `NWGRAD_SG_OUT_OF_LINE` switch are gone.  The
+  dispatch (`run_viterbi_impl_<SGR>`, `compute_score_impl_<SGR>`, `run_dispatched_*<SGR>`, the
+  fills' `<SGR>`) is one template whose SGR = false body is main's.
+- The **linear walk takes every end set itself**, with no SGR instantiation and no test per step:
+  row 0 stops with a free B begin (`if (i == 0) { if (sg_bb_()) break; }`, else the tests walk its
+  leftward chain); column 0 stops with a free A begin -- the Pointers fills record a stop code (3)
+  there, the H walk tests it inside its `j == 0` branch.  Tried first and dropped: the SGR walk out
+  of line with a replay (out of line: the closure escapes; inline but cold: emit called out of
+  line, it escapes again; flattened: the walk grew and `rat` went out of line), int16 linear glocal
+  path / hard +1.3-2.8 % each time.
+- The affine walk keeps its SGR instantiation behind an entry (`sg_walk_record_`, in aligner_sg.cpp
+  before the engine units): it records the
+  moves and a flattened replay in `walk_affine`'s cold branch hands them to emit (emit and all it
+  calls inlined there, so nothing escapes).  The same border tests as the linear walk's, tried
+  instead, moved other cells through the unit's inlining (int32 linear Local path +2.7 % gcc 16,
+  int16 linear Global path +3.6 % gcc 15); so did forcing Pointers for these ends to keep the H
+  walk main's (int32 linear glocal hard +1.5 %, float32 linear glocal path +0.9-2.0 %).  Every
+  variant moves some int32 / int16 linear cell by 0.5-3 % this way: the unit stays at its growth
+  limit, and which marginal call gcc inlines depends on all the code in it.
+- The engine's configure paths set the ends with `set_free_ends_trusted` (no checks: no code
+  outside Glocal); the validation throws are one out-of-line function (`nw_bad_free_ends`;
+  `BatchEngine::set_free_ends` built a whole Aligner to validate, 2.8 KB per engine).
+
+**Bug found on the way:** linear `auto` upgrades Pointers to Grid past hb_cutoff, and `run_tb_`
+let the other semi-global ends take that upgrade.  The Grid fill has glocal's borders, so a 700 x
+600 overlap pair scored 387 instead of 391 (float32, double, int32; 24 of 48 checked cases wrong).
+These ends take no `auto` upgrade now; `test_other_tracebacks_run_pointers` covers linear and int32.
+
+**Tests** (`tests/Python/test_semiglobal.py`): a Python 3-state reference of the 4-flag
+DP (scores and end cells under the tie rule, exact with integer-valued parameters), itself
+checked against Biopython's PairwiseAligner with zero end-gap scores (an independent
+statement of the semantics); every flag set x gap model x dtype (double, float32, int32,
+int16) x level against scalar_fallback, bit for bit (score, aligned strings, gradient);
+score-only == the Pointers fill; flags () == mode "global" and (b_begin, b_end) == "glocal"
+bit for bit; path consistency (the aligned strings score the score, start and end on legal
+cells, grad . params == score); batches (both fills) == single pairs.
+
 ### Code placement: the layout script (branch `proto/placement`, 2026-11-12)
 
 The extension is linked with `src/nwgrad/cpp/nwgrad/nwgrad_text.ld` (GNU ld, ELF: Linux x86-64 and
@@ -3777,14 +4056,17 @@ starts at a fixed offset within a page: the offset that unit had in main df4ae0a
   growing, cold code or static constructors changing: none of them moves another unit's kernels.
 - Each block costs at most 4 KiB of padding.
 
-**What "units" does not fix: changes inside a unit.** A branch that edits py_exports.cpp (aligner.hpp,
-batch_engine.hpp) moves the engine code within that unit, and so changes its offset from every kernel.
+**What "units" does not fix: changes inside a unit.** A branch that edits the engine (aligner.hpp,
+batch_engine.hpp; since 2026-11-21 compiled in the engine units, "The engine units" below) moves the engine code within that unit, and so changes its offset from every kernel.
 Main's 448-byte case was exactly that kind of relative move. Treat any cell that such a branch moves
 by under ~10-13 % as unproven. Instead, compare it on two layouts: the knob below.
 The remedy for new engine code that hard, path and score-only calls never run: put it in a unit of its
 own, behind out-of-line entry points the header only declares, and link that unit LAST (the engine
-functions both units instantiate are then taken from py_exports.cpp, whose code stays main's). Example:
-the soft guide deferral, `batch_soft_defer.cpp` (`NWGRAD_SOFT_DEFER_EXTERN`; added to `UNIT_OFFSET`).
+functions both instantiate are then taken from the engine units, whose code stays main's). Example:
+the soft guide deferral, `batch_soft_defer.cpp` (`NWGRAD_SOFT_DEFER_EXTERN`, set for the whole extension;
+the unit defines `NWGRAD_SOFT_DEFER_UNIT`; added last to `UNIT_OFFSET`). The engine units then differ
+from main's only in the few entry points that branch to it (`score_and_grad`, `banded_grad`,
+`score_and_grad_one`, `banded_align_one`, `guide_j`).
 
 **The finer alternative ("groups", `nwgrad_text_groups.ld`).** Each of these is page-anchored:
 - the engine and aligner code of one (scalar type, gap model, mode);
@@ -3812,6 +4094,49 @@ An A/A control run from one wrapper cannot see this. Compare builds through iden
 - `text`: at the head of the bindings;
 - `mid`: between the bindings and the level units;
 - `grp`: at the head of the avx2 inter-pair float32 group (groups layout).
+
+### The engine units (`engine_<type>.cpp`, branch `proto/engine-tu`, 2026-11-21)
+
+The Python extension compiles the engine apart from the bindings:
+- `py_exports.cpp` defines `NWGRAD_ENGINE_EXTERN` before its includes. It then sees only the
+  *declarations* of `SeqPairBatchT` / `SeqPairT`'s engine-facing members (seq_pair_batch.hpp) and of the
+  single-pair convenience entries `pair_score` / `pair_hard_grad` / `pair_soft_grad` (pair_entry.hpp),
+  plus `extern template` for the five scalar types. It instantiates no BatchEngine or Aligner code.
+  `logistic/py_logistic.cpp` does the same.
+- `engine_f32.cpp`, `engine_f64.cpp`, `engine_i16.cpp`, `engine_i32.cpp`, `engine_i64.cpp` (body
+  `engine_common.inc`) explicitly instantiate those classes and entries, one scalar type per unit. Every
+  BatchEngine, Aligner, scalar fill, walk and traceback the extension runs is compiled there.
+- A plain `#include "seq_pair_batch.hpp"` (header-only consumers, the C++ tests) sees the bodies too:
+  they are in the header's second half, `inline` as when they were written in the class.
+- Linked ahead of the bindings, so the engine's copy of a COMDAT function both use is the one kept.
+- Layout (`tools/gen_text_ld.py`): the five engine units share ONE block, where py_exports' block was,
+  with the placement knob's pad at its start, so `NWGRAD_PLACEMENT_SHIFT_AT=mid` still moves all of the
+  engine against the kernels. The bindings have a block of their own after it.
+
+**Why.** gcc decides inlining against a whole-unit budget (`--param inline-unit-growth`, 40 %: the unit
+may grow to 1.4x its size before inlining). The bindings unit used to hold the engine and sat at that
+limit, so any code a change added to it made gcc outline hot engine calls in code the change never
+touched: `Aligner::rat()` in the inter-pair tracebacks, +0.5-1 % instructions and 1-2 % time in
+unrelated cells (#43, #50, #52, #53 each hit it; each was worked around by moving its own new code to
+another unit). Now the bindings' code takes no part in the engine's inlining decisions.
+
+**Kept as at the old unit's limit.** The engine units are compiled with `--param inline-unit-growth=1000`
+(gcc, `NWGRAD_ENGINE_INLINE_UNIT_GROWTH`). With that much room gcc inlines more of the path walks than it
+did at the limit, and the walks got slower. So the split pins those choices in the source:
+- The affine walk is out of line (`walk_affine_impl`, plus `emit_border_run_` and `emit_gap_`), and so is
+  the guide reset (`nw_guide_reset`).
+- The linear path walk is out of line for Global and Glocal (`path_walk_ool_`, sink by reference), and
+  inline for Local. Out of line, int32 linear Local path costs +5-6 % instructions: the sink's run state
+  is loaded and stored at every move. Inline in the inter-pair worker, Global/Glocal cost +1-2.4 %: register
+  moves around each `rat()` call.
+- The affine Glocal path walk in float32 / double (x86) is a walk of its own, `walk_affine_glocal_`
+  (out of line, `kPathWalkGlocalOwn_`). Through `walk_affine_impl`, gcc 15 ran float32 affine Glocal path
+  +2.1-2.3 % instructions over main on solace (AVX-512). The walk reloaded the score tables' pointers at every
+  move, because the path sink's stores may alias them, and it stored the start cell at every move. Its own
+  walk keeps the tables and the emit in locals and returns the start cell: 1.7-3.9 % under main (sse4, gcc 15
+  and 16). Inlined into the inter-pair worker, with every emit inline as main had it, the walk cost +1.5-2 %
+  instead. The other walks keep `walk_affine_impl`: routing it through a shared always-inline body changed
+  how gcc compiled every walk. aarch64 keeps `walk_affine_impl` too, as gated on M1.
 
 ### Python bindings (`py_exports.cpp`)
 

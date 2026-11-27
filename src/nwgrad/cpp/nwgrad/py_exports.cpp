@@ -12,8 +12,13 @@
 #include <string>
 #include <vector>
 
+// The engine is compiled in engine_<type>.cpp, not here: this unit sees the declarations of
+// SeqPairBatchT's / SeqPairT's members and of the convenience entries only, so the
+// bindings' code never enters the engine's inlining decisions (see seq_pair_batch.hpp).
+#define NWGRAD_ENGINE_EXTERN 1
 #include "align_params.hpp"
 #include "aligner.hpp"
+#include "pair_entry.hpp"
 #include "seq_pair_batch.hpp"
 
 namespace nb = nanobind;
@@ -89,7 +94,7 @@ static nb::object numpy_copy(const double* src, size_t n, std::initializer_list<
 #  define NWGRAD_COMPILER "unknown"
 #endif
 
-// ── Aligner factory: picks Full or GuideBanded at runtime. ───────────────────
+// ── Single-pair convenience functions ─────────────────────────────────────────
 
 // The `kernel=` string names the Viterbi backend: "auto" (default; best simd the CPU
 // runs), "scalar_fallback", or a named simd level ("sse2"/"sse4"/"avx2"/"avx512"/"neon").  Every
@@ -98,27 +103,10 @@ static nb::object numpy_copy(const double* src, size_t n, std::initializer_list<
 // and throws on anything unrecognised or a level this CPU cannot run — a typo that
 // silently gave you the wrong path would be undetectable.
 
-// TYPE is the Viterbi precision (float32 by default in the Python surface, double via
-// the _double-suffixed variant).  The DP buffer and Aligner take that precision; params
-// and the returned gradient stay double.
-#define WITH_ALIGNER_T(TYPE, GM, AM, band, guide_j, body)                                \
-    do {                                                                                  \
-        DpBufferT<TYPE> _buf;                                                             \
-        const int _kern = parse_backend(kernel);                                          \
-        if ((band) > 0 || !(guide_j).empty()) {                                          \
-            Aligner<GapModel::GM, AlignMode::AM, AlignBand::GuideBanded, TYPE> al;       \
-            al.set_kernel(_kern);                                                          \
-            body                                                                           \
-        } else {                                                                           \
-            Aligner<GapModel::GM, AlignMode::AM, AlignBand::Full, TYPE> al;              \
-            al.set_kernel(_kern);                                                          \
-            body                                                                           \
-        }                                                                                  \
-    } while (0)
-
-// Back-compat alias: the double-precision convenience functions still spell it this way.
-#define WITH_ALIGNER(GM, AM, band, guide_j, body) \
-    WITH_ALIGNER_T(double, GM, AM, band, guide_j, body)
+// T is the Viterbi precision (float32 by default in the Python surface, double via the
+// _double-suffixed variant, the integer types via _int16 / _int32 / _int64): pair_entry.hpp
+// runs one Aligner<GM, AM, Full or GuideBanded, T>.  Params and the returned gradient stay
+// double.
 
 // The convenience functions still take plain `str`: they validate and encode
 // against the params' alphabet here, at the boundary.  An out-of-alphabet
@@ -285,6 +273,74 @@ static AlignMode parse_align_mode(const std::string& name) {
          "\" (expected \"global\", \"local\" or \"glocal\")").c_str());
 }
 
+// ── Semi-global modes: the mode string and free_ends= onto (AlignMode, kSgFree* bits) ──
+// mode="semiglobal" takes free_ends: which flanks are free (their residues left unaligned
+// at no cost) -- four truth values (a_begin, a_end, b_begin, b_end), or the names of the
+// free ones ("a_begin", "a_end", "b_begin", "b_end").  "overlap" frees all four; "glocal"
+// is (b_begin, b_end); "global" none.
+static const char* const kSgFlagNames[4] = {"a_begin", "a_end", "b_begin", "b_end"};
+static constexpr int kSgFlagBits[4] = {kSgFreeABegin, kSgFreeAEnd, kSgFreeBBegin, kSgFreeBEnd};
+struct ModeSpec { AlignMode am; int sg; };
+static int parse_free_ends(nb::handle h) {
+    const char* msg = "nwgrad: free_ends must be four booleans (a_begin, a_end, b_begin, b_end) "
+                      "or the names of the free ends (\"a_begin\", \"a_end\", \"b_begin\", \"b_end\")";
+    // A lone name is a one-name set.  (Held in an object: assigning the temporary tuple to
+    // the borrowed handle left it dangling -- a use-after-free of a Python object that
+    // corrupted the interpreter's heap later, a bus error under ASan in CI.)
+    nb::object src = nb::borrow(h);
+    if (nb::isinstance<nb::str>(h)) src = nb::make_tuple(h);
+    nb::list items;
+    try { items = nb::list(nb::iter(src)); } catch (...) { throw nb::value_error(msg); }
+    const size_t k = nb::len(items);
+    if (k == 0) return 0;   // no free end: global's DP
+    bool named = k > 0;
+    for (size_t q = 0; q < k; ++q) named = named && nb::isinstance<nb::str>(items[q]);
+    int f = 0;
+    if (named) {
+        for (size_t q = 0; q < k; ++q) {
+            const std::string nm = nb::cast<std::string>(items[q]);
+            int bit = 0;
+            for (int t = 0; t < 4; ++t) if (nm == kSgFlagNames[t]) bit = kSgFlagBits[t];
+            if (!bit) throw nb::value_error(("nwgrad: unknown free end \"" + nm + "\" (expected "
+                                             "\"a_begin\", \"a_end\", \"b_begin\" or \"b_end\")").c_str());
+            f |= bit;
+        }
+        return f;
+    }
+    if (k != 4) throw nb::value_error(msg);
+    for (size_t q = 0; q < 4; ++q) {
+        if (nb::isinstance<nb::str>(items[q])) throw nb::value_error(msg);
+        if (nb::cast<bool>(items[q])) f |= kSgFlagBits[q];
+    }
+    return f;
+}
+static ModeSpec parse_mode_spec(const std::string& name, nb::handle free_ends) {
+    if (name == "semiglobal") {
+        if (free_ends.is_none())
+            throw nb::value_error("nwgrad: mode \"semiglobal\" needs free_ends=(a_begin, a_end, b_begin, b_end)");
+        return {AlignMode::Glocal, parse_free_ends(free_ends)};
+    }
+    if (!free_ends.is_none())
+        throw nb::value_error(("nwgrad: free_ends= goes with mode \"semiglobal\" (got mode \"" + name +
+                               "\", whose ends are fixed)").c_str());
+    if (name == "overlap") return {AlignMode::Glocal, kSgAll};
+    if (name == "global" || name == "local" || name == "glocal") return {parse_align_mode(name), kSgGlocal};
+    throw nb::value_error(
+        ("nwgrad: unknown mode \"" + name +
+         "\" (expected \"global\", \"local\", \"glocal\", \"overlap\" or \"semiglobal\")").c_str());
+}
+// The mode's name: "glocal" / "overlap" for their ends, else "semiglobal" (free_ends says which).
+static const char* mode_spec_name(AlignMode am, int sg) {
+    if (am != AlignMode::Glocal || sg == kSgGlocal) return align_mode_name(am);
+    return sg == kSgAll ? "overlap" : "semiglobal";
+}
+static nb::object free_ends_tuple(AlignMode am, int sg) {
+    if (am == AlignMode::Local) return nb::none();
+    if (am == AlignMode::Global) sg = 0;
+    return nb::make_tuple(bool(sg & kSgFreeABegin), bool(sg & kSgFreeAEnd),
+                          bool(sg & kSgFreeBBegin), bool(sg & kSgFreeBEnd));
+}
+
 template<class Mode>
 static Mode parse_grad_mode(const std::string& name) {
     if (name == "hard") return Mode::Hard;
@@ -423,28 +479,26 @@ static void bind_convenience(nb::module_& m, const std::string& sfx) {
     "(len(seq_a)+1 entries; default: row 0 -> track[0], row i -> track[i-1]).  See\n" \
     "SeqPairBatch(seqs_a, seqs_b, params, tracks=..., gap_tracks=...).  With several sets\n" \
     "the gradient has as many."
+#define NWG_PROBLEM \
+            auto gj = make_guide(aligned_a, aligned_b); EncodedPair enc(a, b, params); \
+            const auto tk = to_track(track, "track"), gt = to_track(gap_track, "gap_track"); \
+            const PairProblem pp{enc.a, enc.b, params, band, gj, tk, gt, parse_backend(kernel)};
 #define NWG_SCORE(FN, GM, AM, DOC) \
     m.def((std::string(FN) + sfx).c_str(), \
         [](const std::string& a, const std::string& b, const AlignParams& params, int band, \
            const std::string& aligned_a, const std::string& aligned_b, const std::string& kernel, \
            nb::handle track, nb::handle gap_track) { \
-            auto gj = make_guide(aligned_a, aligned_b); EncodedPair enc(a, b, params); \
-            const auto tk = to_track(track, "track"), gt = to_track(gap_track, "gap_track"); \
-            WITH_ALIGNER_T(T, GM, AM, band, gj, { \
-                al.set_problem(enc.a, enc.b, params, band, gj, tk, gt); \
-                return al.compute_score(_buf); }); \
+            NWG_PROBLEM \
+            return pair_score<T>(GapModel::GM, AlignMode::AM, pp); \
         }, NWG_CONV_ARGS, DOC NWG_TRACK_DOC)
 #define NWG_HARD(FN, GM, AM, DOC) \
     m.def((std::string(FN) + sfx).c_str(), \
         [](const std::string& a, const std::string& b, const AlignParams& params, int band, \
            const std::string& aligned_a, const std::string& aligned_b, const std::string& kernel, \
            nb::handle track, nb::handle gap_track) { \
-            auto gj = make_guide(aligned_a, aligned_b); EncodedPair enc(a, b, params); \
-            const auto tk = to_track(track, "track"), gt = to_track(gap_track, "gap_track"); \
-            WITH_ALIGNER_T(T, GM, AM, band, gj, { \
-                al.set_problem(enc.a, enc.b, params, band, gj, tk, gt); al.compute_viterbi(_buf); \
-                AlignParams grad = AlignParams::zeros_like(params); al.hard_grad(_buf, grad); \
-                return nb::make_tuple(al.score(), grad); }); \
+            NWG_PROBLEM \
+            auto [score, grad] = pair_hard_grad<T>(GapModel::GM, AlignMode::AM, pp); \
+            return nb::make_tuple(score, std::move(grad)); \
         }, NWG_CONV_ARGS, DOC NWG_TRACK_DOC)
 #define NWG_SOFT(FN, GM, AM, DOC) \
     m.def((std::string(FN) + sfx).c_str(), \
@@ -455,11 +509,9 @@ static void bind_convenience(nb::module_& m, const std::string& sfx) {
             auto gj = make_guide(aligned_a, aligned_b); EncodedPair enc(a, b, params); \
             const auto tk = to_track(track, "track"), gt = to_track(gap_track, "gap_track"); \
             const SoftImpl si = parse_soft_impl(soft_impl); \
-            WITH_ALIGNER_T(T, GM, AM, band, gj, { \
-                al.set_soft_impl(si); al.set_soft_temperature(temperature); \
-                al.set_problem(enc.a, enc.b, params, band, gj, tk, gt); al.compute_forward_back(_buf); \
-                AlignParams grad = AlignParams::zeros_like(params); al.soft_grad(_buf, grad); \
-                return nb::make_tuple(al.log_z(), grad); }); \
+            const PairProblem pp{enc.a, enc.b, params, band, gj, tk, gt, parse_backend(kernel)}; \
+            auto [log_z, grad] = pair_soft_grad<T>(GapModel::GM, AlignMode::AM, pp, si, temperature); \
+            return nb::make_tuple(log_z, std::move(grad)); \
         }, NWG_BASE_ARGS, nb::arg("soft_impl") = "scaled", nb::arg("temperature") = 1.0, NWG_TRACK_ARGS, \
         DOC "\n\nsoft_impl: \"scaled\" (default) | \"scaled_or_log\" | \"log\" -- " \
         "see SeqPairBatch.soft_impl.\ntemperature: T > 0; returns (T*log Z(params/T), " \
@@ -490,6 +542,7 @@ static void bind_convenience(nb::module_& m, const std::string& sfx) {
     NWG_SOFT("glocal_affine_soft_grad", Affine, Glocal, "Glocal: returns (log_Z, AlignParams grad) — soft gradient (affine gap).");
     }
 #undef NWG_SCORE
+#undef NWG_PROBLEM
 #undef NWG_HARD
 #undef NWG_SOFT
 #undef NWG_CONV_ARGS
@@ -517,20 +570,24 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
                const AlignParams& params, const std::string& gap_model,
                const std::string& mode, const std::string& grad_mode,
                const std::string& kernel, const std::string& traceback,
-               nb::handle track, nb::handle gap_track) {
+               nb::handle track, nb::handle gap_track, nb::handle free_ends) {
+                const ModeSpec ms = parse_mode_spec(mode, free_ends);
                 new (self) SP(seq_a, seq_b, params, parse_gap_model(gap_model),
-                              parse_align_mode(mode), parse_grad_mode<GradMode>(grad_mode),
+                              ms.am, parse_grad_mode<GradMode>(grad_mode),
                               parse_backend(kernel), parse_traceback(traceback),
                               to_track(track, "track"), to_track(gap_track, "gap_track"));
+                if (ms.sg != kSgGlocal) self->set_free_ends(ms.sg);
             },
             nb::arg("seq_a"), nb::arg("seq_b"), nb::arg("params"),
             nb::arg("gap_model") = "affine", nb::arg("mode") = "global",
             nb::arg("grad_mode") = "hard", nb::arg("kernel") = "auto",
             nb::arg("traceback") = "auto", nb::kw_only(),
             nb::arg("track").none() = nb::none(), nb::arg("gap_track").none() = nb::none(),
+            nb::arg("free_ends").none() = nb::none(),
             "One sequence pair, aligned on the calling thread.\n"
             "  gap_model : \"linear\" | \"affine\"\n"
-            "  mode      : \"global\" | \"local\"\n"
+            "  mode      : \"global\" | \"local\" | \"glocal\" | \"overlap\" | \"semiglobal\"\n"
+            "              (with free_ends) — see SeqPairBatch.\n"
             "  grad_mode : \"hard\" | \"soft\" | \"none\"\n"
             "  kernel    : \"auto\" (default) | \"scalar_fallback\" | \"sse2\" | \"avx2\" |\n"
             "              \"avx512\" | \"neon\" — bit-exact speed knob (Viterbi path).\n"
@@ -660,7 +717,9 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
             [](SP& s, double v) { s.set_soft_temperature(v); },
             NWGRAD_SOFT_TEMP_DOC)
         .def_prop_ro("gap_model", [](const SP& s) { return gap_model_name(s.gap_model()); })
-        .def_prop_ro("mode",      [](const SP& s) { return align_mode_name(s.align_mode()); })
+        .def_prop_ro("mode",      [](const SP& s) { return mode_spec_name(s.align_mode(), s.free_ends()); })
+        .def_prop_ro("free_ends", [](const SP& s) { return free_ends_tuple(s.align_mode(), s.free_ends()); },
+                     "(a_begin, a_end, b_begin, b_end): which flanks are free (None for local).")
         .def_prop_ro("grad_mode", [](const SP& s) { return grad_mode_name(s.grad_mode()); })
         .def_prop_ro("seq_a", [](const SP& s) { return s.seq_a(); })
         .def_prop_ro("seq_b", [](const SP& s) { return s.seq_b(); })
@@ -706,20 +765,23 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
                const SeqViews& seqs_b, const AlignParams& params,
                int n_threads, const std::string& traceback, const std::string& gap_model,
                const std::string& mode, const std::string& grad_mode, const std::string& kernel,
-               nb::handle tracks, nb::handle gap_tracks) {
+               nb::handle tracks, nb::handle gap_tracks, nb::handle free_ends) {
+                const ModeSpec ms = parse_mode_spec(mode, free_ends);
                 const auto [la, lg] = track_lengths(seqs_a.v);
                 const auto tk = to_tracks(tracks, la, "tracks");
                 const auto gk = to_tracks(gap_tracks, lg, "gap_tracks");
                 new (self) SPB(seqs_a.v, seqs_b.v, params, parse_gap_model(gap_model),
-                               parse_align_mode(mode), parse_grad_mode<GradMode>(grad_mode),
+                               ms.am, parse_grad_mode<GradMode>(grad_mode),
                                n_threads, parse_traceback(traceback), parse_backend(kernel),
                                tk.view(), gk.view());
+                if (ms.sg != kSgGlocal) self->set_free_ends(ms.sg);
             },
             nb::arg("seqs_a"), nb::arg("seqs_b"), nb::arg("params"), nb::kw_only(),
             nb::arg("n_threads") = 0, nb::arg("traceback") = "auto",
             nb::arg("gap_model") = "affine", nb::arg("mode") = "global",
             nb::arg("grad_mode") = "hard", nb::arg("kernel") = "auto",
             nb::arg("tracks").none() = nb::none(), nb::arg("gap_tracks").none() = nb::none(),
+            nb::arg("free_ends").none() = nb::none(),
             "A batch of the pairs (seqs_a[i], seqs_b[i]) under params, of ONE problem\n"
             "type, aligned in parallel.  The pairs are given here, once: sequences are\n"
             "validated and encoded in parallel (a bad character raises), and the batch\n"
@@ -732,17 +794,30 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             "__init__",
             [](SPB* self, int n_threads, const std::string& traceback,
                const std::string& gap_model, const std::string& mode,
-               const std::string& grad_mode) {
-                new (self) SPB(parse_gap_model(gap_model), parse_align_mode(mode),
+               const std::string& grad_mode, nb::handle free_ends) {
+                const ModeSpec ms = parse_mode_spec(mode, free_ends);
+                new (self) SPB(parse_gap_model(gap_model), ms.am,
                                parse_grad_mode<GradMode>(grad_mode), n_threads,
                                parse_traceback(traceback));
+                if (ms.sg != kSgGlocal) self->set_free_ends(ms.sg);
             },
             nb::arg("n_threads") = 0, nb::arg("traceback") = "auto", nb::kw_only(),
             nb::arg("gap_model") = "affine", nb::arg("mode") = "global",
-            nb::arg("grad_mode") = "hard",
+            nb::arg("grad_mode") = "hard", nb::arg("free_ends").none() = nb::none(),
             "A batch of sequence pairs of ONE problem type, aligned in parallel.\n"
             "  gap_model : \"affine\" (default) | \"linear\"\n"
-            "  mode      : \"global\" (default) | \"local\"\n"
+            "  mode      : \"global\" (default) | \"local\" | \"glocal\" | \"overlap\"\n"
+            "              | \"semiglobal\".  The semi-global family frees flanks: a free\n"
+            "              flank's residues are left unaligned at no cost.  \"semiglobal\"\n"
+            "              takes free_ends=(a_begin, a_end, b_begin, b_end) as four booleans\n"
+            "              or the names of the free ones, e.g. (\"a_begin\", \"b_end\"): any\n"
+            "              of the 16 sets.  None free is global's DP; (b_begin, b_end) is\n"
+            "              \"glocal\" (A within B); all four is \"overlap\".  The end, among\n"
+            "              equal optima, is the first candidate cell in row-major order\n"
+            "              (seq_a's index, then seq_b's), the state by M > X > Y.  Other ends\n"
+            "              than glocal's run each pair's own fill (not fill=\"interpair\"),\n"
+            "              traceback pointers (auto, grid and the hirschberg modes run as\n"
+            "              pointers), the log-space soft path, and no guide band.\n"
             "  grad_mode : \"hard\" (default) | \"soft\" | \"none\"\n"
             "     — fixed at construction, including on an empty batch.\n"
             "  n_threads=0 (default) uses the PHYSICAL core count among the CPUs this\n"
@@ -957,6 +1032,11 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
              "the plan of a grad_mode \"none\" call without keep_paths (no byte budget:\n"
              "its score kernel keeps rows); else the plan of a call that keeps tables.  The\n"
              "score-only gather gate acts per group inside the call and is not reflected.")
+        .def("_inter_groups",
+             [](SPB& self, bool score_only) { return self.inter_plan_groups(score_only); },
+             nb::arg("score_only") = false,
+             "UNSTABLE (nwgrad._tuning): the plan's shared groups as lists of pair\n"
+             "indices, in the order the call runs them (see _inter_plan).")
         .def("_guides_pending", &SPB::guides_pending,
              "UNSTABLE (tests): how many pairs' guides are pending, to be computed on\n"
              "first use (soft_guide \"eager\" and \"lazy\", grad_mode \"none\").")
@@ -966,7 +1046,9 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             "The symbols of the alphabet every pair in the batch shares.  Raises on an\n"
             "empty batch.")
         .def_prop_ro("gap_model", [](const SPB& s) { return gap_model_name(s.gap_model()); })
-        .def_prop_ro("mode", [](const SPB& s) { return align_mode_name(s.align_mode()); })
+        .def_prop_ro("mode", [](const SPB& s) { return mode_spec_name(s.align_mode(), s.free_ends()); })
+        .def_prop_ro("free_ends", [](const SPB& s) { return free_ends_tuple(s.align_mode(), s.free_ends()); },
+                     "(a_begin, a_end, b_begin, b_end): which flanks are free (None for local).")
         .def_prop_ro("grad_mode", [](const SPB& s) { return grad_mode_name(s.grad_mode()); })
         .def_prop_rw(
             "schedule",
@@ -1480,6 +1562,15 @@ NB_MODULE(nwgrad_ext, m) {
               else set_gate_override(g, v);
           }, nb::arg("name"), nb::arg("value"));
     m.def("_gate_off_value", []() { return kGateOff; });
+    // The int8 score tier's counters (tests): (problems run in int8, of which overflowed).
+    // reset=True zeroes them; count=True/False switches counting (off by default).
+    m.def("_score8_stats", [](bool reset, nb::handle count) {
+              Score8Stats& st = score8_stats();
+              const auto r = std::make_pair(st.runs.load(), st.overflows.load());
+              if (reset) { st.runs.store(0); st.overflows.store(0); }
+              if (!count.is_none()) st.on.store(nb::cast<bool>(count));
+              return r;
+          }, nb::arg("reset") = false, nb::arg("count").none() = nb::none());
     // The compiled defaults of the single-valued caps (0 = no cap);
     // linear_striped_min_n is per mode, type and level (Aligner::kLinearStripedMinN).
     m.def("_gate_defaults", []() {
@@ -1501,7 +1592,12 @@ NB_MODULE(nwgrad_ext, m) {
             {"soft_ckpt_rows", int64_t(0)},   // (auto: _tuning.defaults() says so)
             {"soft_ckpt_min_bytes", int64_t(kSoftCkptMinBytes)},
             {"soft_double_ftz", int64_t(1)},
+            {"score_int8", int64_t(kScoreInt8Default)},
+            {"inter_score_small_cells", int64_t(c.i16.score_small_local)},
+            {"inter_score_int8", int64_t(kInterScoreInt8Default ? 1 : 0)},
+            {"score_int8_min_segs", int64_t(score_int8_min_segs(score_int8_lanes(be < 0 ? 0 : be), false, 4))},
             {"inter_profile_bytes", int64_t(0)},   // no cap (kInterProfileMaxBytes)
+            {"inter_group_tiles", int64_t(0)},   // (auto: _tuning.defaults() says so)
             {"soft_guide_defer", int64_t(1)}};
     });
 
