@@ -495,8 +495,10 @@ public:
     std::vector<int> guide_j(size_t i) {
         if (!path_valid(i))
             throw std::logic_error("nwgrad: alignment not computed; call align() first");
-        ++guide_reads_;
+#ifndef NWGRAD_SOFT_DEFER_EXTERN   // (the extension: soft_guide_j, see the end of the class)
+        if (grad_mode_ == GradMode::Soft) soft_note_reads_(1);
         if (guide_pending(i)) resolve_caller_(i);
+#endif
         if (guide_pending(i)) resolve_guide_(i, solo_work_());
         const int* g = guide_ptr_(i);
         return {g, g + len_a(i) + 1};
@@ -608,12 +610,14 @@ public:
     // coordinates()); it forces the Viterbi a lazy or posterior soft guide would skip.
     // Returns the sum of scores, in pair order (bit-reproducible whatever the schedule).
     //
-    // A soft batch's call is soft_score_and_grad_ (batch_soft_defer.inl), out of this
-    // header's way: see "Soft guide deferral" there.
+    // A soft batch's call is soft_score_and_grad (batch_soft_defer.inl): see "Soft guide
+    // deferral" there and at the end of this class.
     double score_and_grad(bool keep_paths = false) {
         const size_t N = size();
         if (N == 0) return 0.0;
-        if (grad_mode_ == GradMode::Soft) return soft_score_and_grad_(keep_paths);
+#ifndef NWGRAD_SOFT_DEFER_EXTERN
+        if (grad_mode_ == GradMode::Soft) return soft_score_and_grad(keep_paths);
+#endif
         prepare_paths_(keep_paths);
         ++full_calls_;   // guides may have moved: the banded grouping is stale
         tc_begin_full_();
@@ -639,7 +643,9 @@ public:
                     "nwgrad: banded_grad() needs a guide path; run score_and_grad() first");
         prepare_paths_(keep_paths);
         tc_begin_full_();
+#ifndef NWGRAD_SOFT_DEFER_EXTERN
         if (grad_mode_ == GradMode::Soft) soft_banded_prep_();
+#endif
         if (inter_fill_() && !keep_paths) banded_grad_inter_(bandwidth);
         else if (s_.sorted_schedule)      banded_grad_lpt_(bandwidth, keep_paths);
         else                           banded_grad_dynamic_(bandwidth, keep_paths);
@@ -664,7 +670,9 @@ public:
 
     // One pair, on the calling thread (SeqPair's own operations).
     void score_and_grad_one(size_t i, bool keep_path) {
+#ifndef NWGRAD_SOFT_DEFER_EXTERN
         if (grad_mode_ == GradMode::Soft) { soft_one_(i, keep_path); return; }
+#endif
         prepare_paths_(keep_path, /*all=*/false);
         run_full_(i, solo_work_(), keep_path);
     }
@@ -672,7 +680,9 @@ public:
         if (!path_valid(i))
             throw std::logic_error("nwgrad: call align() or score_and_grad() before banded_align()");
         prepare_paths_(keep_path, /*all=*/false);
+#ifndef NWGRAD_SOFT_DEFER_EXTERN
         if (guide_pending(i)) resolve_caller_(i);
+#endif
         run_banded_(i, solo_work_(), bandwidth, keep_path);
     }
     // The cached scores, in pair order.  Throws if any pair has none.
@@ -3692,16 +3702,30 @@ private:
     }
 
     // ── Soft guide deferral (batch_soft_defer.inl) ──────────────────────────────
-    // Defined out of this header: the extension compiles them in their own unit
-    // (batch_soft_defer.cpp), so the engine units' code (engine_<type>.cpp: every hard,
-    // path and score-only call) stays main's (AGENTS.md, "Code placement").  Last in the
-    // class, members included, for the same reason.
-    double soft_score_and_grad_(bool keep);
+    // Defined out of this header.  The Python extension (NWGRAD_SOFT_DEFER_EXTERN) compiles
+    // them in a unit of their own, batch_soft_defer.cpp, and its engine units
+    // (engine_<type>.cpp) do not see the hooks above: their code -- every hard, path and
+    // score-only call, and every soft one too -- is main's, byte for byte (AGENTS.md, "Code
+    // placement").  The extension's bindings call the public entry points below for a soft
+    // batch instead (seq_pair_batch.hpp, nwgrad_soft_*).  A header-only build runs the
+    // hooks, which call the same code.  No data members: the deferral's per-batch state
+    // (soft_note_reads_) lives in that unit, so the engine's layout is main's too.
+public:
+    // score_and_grad / banded_grad / score_and_grad_one / banded_one / guide_j of a soft
+    // batch (any other batch: those calls, unchanged).
+    double soft_score_and_grad(bool keep);
+    double soft_banded_grad(int bandwidth, bool keep);
+    void soft_score_and_grad_one(size_t i, bool keep);
+    void soft_banded_one(size_t i, int bandwidth, bool keep);
+    std::vector<int> soft_guide_j(size_t i);
+private:
     void soft_one_(size_t i, bool keep);
     void soft_banded_prep_();
     void resolve_caller_(size_t i);
     struct SoftCall;
     uint8_t soft_pend_(bool keep, bool read) const noexcept;
+    void soft_note_reads_(size_t n) const;
+    bool soft_read_streak_();
     void resolve_all_snap_();
     void resolve_groups_();
     bool resolve_group_(size_t t, Work& w);
@@ -3710,11 +3734,6 @@ private:
     bool snap_pending_(size_t i) const noexcept {
         return (flags_[i] & (kPending | kLazy)) == kPending;
     }
-    // Guide reads since the last full soft call, and how many consecutive full soft calls
-    // had theirs read (soft_pend_'s `read`); the calling thread only.
-    size_t guide_reads_ = 0;
-    int read_streak_ = 0;
-    static constexpr int kReadStreak = 2;
 };
 #undef NWGRAD_HARD_GRAD_GUIDE
 

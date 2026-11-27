@@ -18,7 +18,7 @@
 // eager path runs, so it is the eager guide, bit for bit; a call that never asks for it
 // skips the hard fill, 24-26 % of a double soft step's instructions on skynet (AGENTS.md,
 // "The soft path").  Adaptive (gate 1, the default): when the batch's guides were read
-// (at least half of them: guide_j, banded_grad) after each of the last kReadStreak full
+// (at least half of them: guide_j, banded_grad) after each of the last 2 (kReadStreak) full
 // soft calls, the call runs the Viterbi itself, as eager did; any step whose guides go
 // unread drops back to deferring.  Why: resolving deferred guides after the call is a
 // second parallel pass over the batch, 4-9 % slower per step than the in-call fill when
@@ -28,6 +28,29 @@
 // did not read them (nighthaven: 0.98-1.02 of main, against 0.87-0.94 deferring).
 
 #include <climits>
+#include <mutex>
+#include <unordered_map>
+
+// The adaptive rule's state per batch: guide reads since its last full soft call and how
+// many consecutive full soft calls had theirs read.  Kept here, not in BatchEngine, so the
+// engine's members (and so every constructor the engine units compile) stay main's.  Keyed
+// by the engine's address and checked against its full-call count, so a stale entry (a
+// batch freed, another allocated at the same address; a hard full call in between) reads
+// as a fresh start.  The table only steers when to fill guides, never what they are, so
+// losing an entry (the cap below) costs at most one step's choice.
+struct SoftReadState { size_t reads = 0; int streak = 0; size_t calls = 0; };
+inline std::mutex& soft_read_mutex() noexcept { static std::mutex m; return m; }
+inline std::unordered_map<const void*, SoftReadState>& soft_read_table() noexcept {
+    static std::unordered_map<const void*, SoftReadState> t;
+    return t;
+}
+inline SoftReadState& soft_read_entry(const void* e, size_t calls) {   // under the mutex
+    auto& t = soft_read_table();
+    if (t.size() >= 4096 && !t.count(e)) t.clear();
+    SoftReadState& r = t[e];
+    if (r.calls != calls) r = SoftReadState{0, 0, calls};
+    return r;
+}
 
 // How many pairs' guides are pending (tests: SeqPairBatch._guides_pending).
 template<class T, GapModel GM, AlignMode AM>
@@ -120,22 +143,42 @@ struct BatchEngine<T, GM, AM>::SoftCall {
     }
 };
 
+// Guide reads (guide_j: 1, banded_grad: the batch) since the last full soft call.
 template<class T, GapModel GM, AlignMode AM>
-double BatchEngine<T, GM, AM>::soft_score_and_grad_(bool keep) {
+void BatchEngine<T, GM, AM>::soft_note_reads_(size_t n) const {
+    std::lock_guard<std::mutex> g(soft_read_mutex());
+    soft_read_entry(this, full_calls_).reads += n;
+}
+
+// At a full soft call (before its ++full_calls_): whether the guides were read (at least
+// half of them) after each of the last kReadStreak = 2 full soft calls; starts the count anew.
+template<class T, GapModel GM, AlignMode AM>
+bool BatchEngine<T, GM, AM>::soft_read_streak_() {
+    constexpr int kReadStreak = 2;
+    std::lock_guard<std::mutex> g(soft_read_mutex());
+    SoftReadState& r = soft_read_entry(this, full_calls_);
+    r.streak = r.reads * 2 >= size() ? r.streak + 1 : 0;
+    r.reads = 0;
+    r.calls = full_calls_ + 1;
+    return r.streak >= kReadStreak;
+}
+
+template<class T, GapModel GM, AlignMode AM>
+double BatchEngine<T, GM, AM>::soft_score_and_grad(bool keep) {
     const size_t N = size();
+    if (grad_mode_ != GradMode::Soft || N == 0) return score_and_grad(keep);
+    const bool read = soft_read_streak_();
     prepare_paths_(keep);
     ++full_calls_;   // guides may have moved: the banded grouping is stale
     tc_begin_full_();
-    read_streak_ = guide_reads_ * 2 >= N ? read_streak_ + 1 : 0;
-    guide_reads_ = 0;
-    const uint8_t pend = soft_pend_(keep, read_streak_ >= kReadStreak);
+    const uint8_t pend = soft_pend_(keep, read);
     // Every pair this call finishes defers its guide under the params scored now.  A pair
     // it does not finish (it threw) keeps the state it had (SoftCall::done).
     auto prev = gparams_;
     if (pend == kPending) gparams_ = params_;
     SoftCall c(*this, 0, N, pend, keep);
     try {
-        if (s_.inter_fill)           score_and_grad_inter_(keep);
+        if (inter_fill_())           score_and_grad_inter_(keep);
         else if (s_.sorted_schedule) score_and_grad_sorted_(keep);
         else                         score_and_grad_dynamic_(keep);
     } catch (...) {
@@ -174,7 +217,7 @@ void BatchEngine<T, GM, AM>::soft_one_(size_t i, bool keep) {
 // snapshot is set (the pass's own resolve_guide_ takes gparams_ when there is one).
 template<class T, GapModel GM, AlignMode AM>
 void BatchEngine<T, GM, AM>::soft_banded_prep_() {
-    guide_reads_ += size();
+    soft_note_reads_(size());
     resolve_groups_();
     if (!gparams_) return;
     std::vector<size_t> lazy;
@@ -188,6 +231,42 @@ void BatchEngine<T, GM, AM>::soft_banded_prep_() {
             soft_resolve_(lazy[k], *lease);
     };
     run_workers_(lazy.size(), worker);
+}
+
+// The public entry points.  In a header-only build the engine's own calls run the hooks
+// (score_and_grad etc.), so these only forward; in the extension (NWGRAD_SOFT_DEFER_EXTERN)
+// they are the hooks, run before the engine's call (main's code), which then finds every
+// guide it needs resolved.  banded_grad's and banded_one's validation runs first, as theirs.
+template<class T, GapModel GM, AlignMode AM>
+double BatchEngine<T, GM, AM>::soft_banded_grad(int bandwidth, bool keep) {
+#ifdef NWGRAD_SOFT_DEFER_EXTERN
+    bool ok = grad_mode_ == GradMode::Soft && size() > 0 && bandwidth > 0;
+    for (size_t i = 0; ok && i < size(); ++i) ok = path_valid(i);
+    if (ok) soft_banded_prep_();
+#endif
+    return banded_grad(bandwidth, keep);
+}
+template<class T, GapModel GM, AlignMode AM>
+void BatchEngine<T, GM, AM>::soft_score_and_grad_one(size_t i, bool keep) {
+    if (grad_mode_ == GradMode::Soft) soft_one_(i, keep);
+    else score_and_grad_one(i, keep);
+}
+template<class T, GapModel GM, AlignMode AM>
+void BatchEngine<T, GM, AM>::soft_banded_one(size_t i, int bandwidth, bool keep) {
+#ifdef NWGRAD_SOFT_DEFER_EXTERN
+    if (grad_mode_ == GradMode::Soft && path_valid(i) && guide_pending(i)) resolve_caller_(i);
+#endif
+    banded_one(i, bandwidth, keep);
+}
+template<class T, GapModel GM, AlignMode AM>
+std::vector<int> BatchEngine<T, GM, AM>::soft_guide_j(size_t i) {
+#ifdef NWGRAD_SOFT_DEFER_EXTERN
+    if (grad_mode_ == GradMode::Soft && path_valid(i)) {
+        soft_note_reads_(1);
+        if (guide_pending(i)) resolve_caller_(i);
+    }
+#endif
+    return guide_j(i);
 }
 
 // resolve_guide_ by the pair's own kind: a lazy guide (kLazy) under the params current
@@ -214,7 +293,7 @@ void BatchEngine<T, GM, AM>::soft_resolve_(size_t i, Work& w) {
 // what the eager call ran for them too).
 template<class T, GapModel GM, AlignMode AM>
 bool BatchEngine<T, GM, AM>::group_resolve_ok_() const noexcept {
-    return s_.inter_fill && !tracked_ && gparams_ && grad_mode_ == GradMode::Soft;
+    return inter_fill_() && !tracked_ && gparams_ && grad_mode_ == GradMode::Soft;
 }
 
 // Pair i's pending guide, on the calling thread.  A snapshot guide resolves EVERY

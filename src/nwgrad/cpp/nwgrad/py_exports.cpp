@@ -605,14 +605,33 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
             "Swap alignment parameters (a standalone pair; a batch's pair takes the\n"
             "batch's set_params).  Invalidates the score, gradient and stored path\n"
             "(aligned() raises until the next align); guide_j is kept for banded_align().")
-        .def("align", &SP::align, nb::arg("keep_paths") = true,
+        // A soft batch's pair: the soft-defer unit's entry points (seq_pair_batch.hpp,
+        // nwgrad_soft_*), which the engine units do not compile; anything else as before.
+        .def("align",
+             [](SP& self, bool keep_paths) {
+                 return self.grad_mode() == GradMode::Soft ? nwgrad_soft_align(self, keep_paths)
+                                                           : self.align(keep_paths);
+             },
+             nb::arg("keep_paths") = true,
              "Full computation. Returns the score and publishes the configured gradient\n"
              "immediately (grad is None in none mode). Stores the path by default.")
-        .def("banded_align", &SP::banded_align, nb::arg("bandwidth"),
+        .def("banded_align",
+             [](SP& self, int bandwidth, bool keep_paths) {
+                 return self.grad_mode() == GradMode::Soft
+                            ? nwgrad_soft_banded_align(self, bandwidth, keep_paths)
+                            : self.banded_align(bandwidth, keep_paths);
+             },
+             nb::arg("bandwidth"),
              nb::arg("keep_paths") = true,
              "Compute around the cached guide. Returns the score and publishes the\n"
              "configured gradient immediately. Requires an established guide.")
-        .def("score_and_grad", &SP::score_and_grad, nb::arg("keep_paths") = true,
+        .def("score_and_grad",
+             [](SP& self, bool keep_paths) {
+                 if (self.grad_mode() != GradMode::Soft) return self.score_and_grad(keep_paths);
+                 nwgrad_soft_align(self, keep_paths);
+                 return std::pair<double, AlignParams>{self.score(), self.grad()};
+             },
+             nb::arg("keep_paths") = true,
              "Full DP with immediate gradient. Returns (score, AlignParams grad).\n"
              "keep_paths=True preserves aligned()/coordinates() availability; False\n"
              "skips storing the path. Raises if grad_mode is \"none\".")
@@ -671,7 +690,8 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
             "guide_j",
             [](SP& self) -> nb::object {
                 if (!self.path_valid()) return nb::none();
-                return nb::cast(self.guide_j());
+                return nb::cast(self.grad_mode() == GradMode::Soft ? nwgrad_soft_guide_j(self)
+                                                                   : self.guide_j());
             },
             "Current alignment as a guide_j vector (length m+1), or None.")
         .def_prop_ro("traceback",
@@ -883,7 +903,10 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             "gradients and stored paths; guides stay, for banded_grad().")
         .def(
             "score_and_grad",
-            [](SPB& self, bool keep_paths) { return self.score_and_grad(keep_paths); },
+            [](SPB& self, bool keep_paths) {
+                return self.grad_mode() == GradMode::Soft ? nwgrad_soft_score_and_grad(self, keep_paths)
+                                                          : self.score_and_grad(keep_paths);
+            },
             nb::arg("keep_paths") = false,
             "Full DP on every pair: score, guide and (unless grad_mode \"none\") gradient,\n"
             "cached per pair.  keep_paths=True also stores each alignment path\n"
@@ -892,7 +915,9 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
         .def(
             "banded_grad",
             [](SPB& self, int bandwidth, bool keep_paths) {
-                return self.banded_grad(bandwidth, keep_paths);
+                return self.grad_mode() == GradMode::Soft
+                           ? nwgrad_soft_banded_grad(self, bandwidth, keep_paths)
+                           : self.banded_grad(bandwidth, keep_paths);
             },
             nb::arg("bandwidth"), nb::arg("keep_paths") = false,
             "Banded re-align + gradient around each pair's cached guide path: run\n"
