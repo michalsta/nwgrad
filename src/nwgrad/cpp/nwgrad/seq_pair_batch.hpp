@@ -105,6 +105,10 @@ public:
     bool tracked() const noexcept;
     int num_sets() const noexcept;
     const Alphabet& alphabet() const;
+    // How many pairs' guides are pending (computed on first use); for tests.  Compiled in
+    // the soft-defer unit in the extension (see nwgrad_soft_score_and_grad), not in the
+    // engine units.
+    size_t guides_pending() const noexcept;
     SeqPair operator[](size_t i);
 
     // ── Batch operations  ──────────────────
@@ -480,6 +484,42 @@ template<class T> inline int SeqPairT<T>::kernel() const {
     return ce([](const auto& x) { return x.kernel(); });
 }
 #endif  // NWGRAD_ENGINE_EXTERN
+
+// ── Soft batches' entry points for the extension's bindings ─────────────────
+// The extension's engine units compile BatchEngine without the soft deferral's hooks
+// (NWGRAD_SOFT_DEFER_EXTERN, see the end of BatchEngine), so its bindings call these for a
+// batch (or a pair of a batch) whose grad_mode is soft; they are compiled in the soft-defer
+// unit (batch_soft_defer.cpp) with the rest of the deferral.  Any other batch: the plain
+// call.  A header-only build may call either (the engine runs the hooks itself).
+template<class T> double nwgrad_soft_score_and_grad(SeqPairBatchT<T>& b, bool keep_paths);
+template<class T> double nwgrad_soft_banded_grad(SeqPairBatchT<T>& b, int bandwidth, bool keep_paths);
+template<class T> double nwgrad_soft_align(SeqPairT<T>& p, bool keep_paths);
+template<class T> double nwgrad_soft_banded_align(SeqPairT<T>& p, int bandwidth, bool keep_paths);
+template<class T> std::vector<int> nwgrad_soft_guide_j(SeqPairT<T>& p);
+
+#if !defined(NWGRAD_SOFT_DEFER_EXTERN) || defined(NWGRAD_SOFT_DEFER_UNIT)
+// How many pairs' guides are pending (tests).
+template<class T> inline size_t SeqPairBatchT<T>::guides_pending() const noexcept {
+    return visit([](const auto& e) { return e.guides_pending(); });
+}
+template<class T> inline double nwgrad_soft_score_and_grad(SeqPairBatchT<T>& b, bool keep_paths) {
+    return b.visit([&](auto& e) { return e.soft_score_and_grad(keep_paths); });
+}
+template<class T> inline double nwgrad_soft_banded_grad(SeqPairBatchT<T>& b, int bandwidth, bool keep_paths) {
+    return b.visit([&](auto& e) { return e.soft_banded_grad(bandwidth, keep_paths); });
+}
+template<class T> inline double nwgrad_soft_align(SeqPairT<T>& p, bool keep_paths) {
+    p.batch().visit([&](auto& e) { e.soft_score_and_grad_one(p.index(), keep_paths); });
+    return p.score();
+}
+template<class T> inline double nwgrad_soft_banded_align(SeqPairT<T>& p, int bandwidth, bool keep_paths) {
+    p.batch().visit([&](auto& e) { e.soft_banded_one(p.index(), bandwidth, keep_paths); });
+    return p.score();
+}
+template<class T> inline std::vector<int> nwgrad_soft_guide_j(SeqPairT<T>& p) {
+    return p.batch().visit([&](auto& e) { return e.soft_guide_j(p.index()); });
+}
+#endif
 #undef NWGRAD_BATCH_SETTERS
 
 // Default (double) aliases; Python binds the float32 classes as SeqPair / SeqPairBatch.

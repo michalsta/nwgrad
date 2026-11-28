@@ -3395,8 +3395,82 @@ functions:
   under θ/T (the θ-derivative of that score). Scaled: weights exp(·/T). Log at T ≠ 1: runs
   on a θ/T copy of the params and sweeps the gradient immediately (`soft_counts_ready_`).
   Setting it on a `SeqPair` invalidates its cached score/grad.
-- `SeqPairBatch.soft_guide` (`SeqPair::set_soft_guide_lazy`): `"eager"` (default) — a soft
-  `score_and_grad()` runs the guide Viterbi as always; `"lazy"` — it does not, and the guide
+- `SeqPairBatch.soft_guide` (`SeqPair::set_soft_guide_lazy`): `"eager"` (default) — the
+  guide is the Viterbi path under the params the soft `score_and_grad()` SCORED. Since
+  2026-11-10 it is computed on first use (`guide_j`, `banded_align`, `banded_grad`) from a
+  snapshot of those params (`BatchEngine::gparams_`; a pending guide without `kLazy` belongs to
+  it, one with `kLazy` follows the current params; the snapshot is the old
+  `OwnedParams` shared_ptr that `set_params()` replaces, so no copy), bit-identical to the
+  eager fill (resolution is the pair's own hard fill; the inter-pair fill's lanes equal it).
+  A call that never asks skips the fill: an inter-pair soft group runs no Viterbi at all.
+  Rules: the snapshot is the params of the last full soft call; a second soft call
+  re-snapshots; a single pair's `score_and_grad(keep_paths=False)` on a batch view defers
+  only when the batch's snapshot is the current params (else it computes its guide now,
+  so other pending pairs keep theirs); a call that throws resolves its unfinished pairs'
+  guides under the previous snapshot (`SoftCall::done`). Gate `soft_guide_defer` /
+  `NWGRAD_SOFT_GUIDE_DEFER` = 0 runs the Viterbi inside the call as before (A/B).
+  Under fill "interpair" a deferred guide resolves with its whole plan group from one
+  shared fill (`resolve_group_`; `banded_grad` resolves every group first, in parallel,
+  one worker a group): resolving pair by pair (each pair's own fill, as "lazy" still does)
+  cost 21-33 % MORE than eager when every guide was used, since the shared fill is the
+  cheaper one. Measured (skynet-class sse4 on wloczykij, instructions/cell of one soft
+  step, 1 thread, perf counting only the steps; A/A repeats within 0.01 %), eager /
+  deferred, guide unused | every guide read (guide_j):
+  miRNA 22x50 double Global 95.6 / 72.9 | 99.6 / 100.4, Local 99.6 / 73.2 | 103.7 / 104.4;
+  float32 Global 57.8 / 44.8 | 61.8 / 62.2, Local 59.6 / 45.4 | 63.7 / 64.1;
+  protein L300 double Global 91.1 / 67.6 | 91.4 / 91.4, Local 95.7 / 67.6 | 96.0 / 96.0;
+  float32 Global 64.4 / 48.4 | 64.6 / 64.6, Local 67.3 / 49.0 | 67.5 / 67.5.
+  So -24 to -30 % when unused, +0 to +0.7 % when used (miRNA: the per-group setup).
+  "lazy" used: 125.7 (miRNA double Global), 110.3 (protein double Global) -- per pair.
+  Gate 1, ADAPTIVE (the default 2026-11-10, an option since 2026-11-11): a soft call fills its guides in the
+  call, as eager did, when at least half the batch's guides were read (`guide_j`,
+  `banded_grad`; counted per batch, `soft_note_reads_`) since its previous soft call, and defers them otherwise;
+  gate 2 always defers, 0 never. The first step of a loop defers and decides the next.
+  Measured as above with two warm-up steps (the first eager step after a deferred one
+  allocates the workers' Viterbi tables once, ~500k instructions), adaptive vs eager,
+  used: miRNA double Global 99.65 vs 99.61 (A/A 99.65), Local 103.67 vs 103.66 (103.70);
+  float32 61.82 vs 61.82 (61.85), 63.68 vs 63.68 (63.66); protein double 91.37 vs 91.37
+  (91.37), 95.97 vs 95.96 (95.96); float32 64.60 vs 64.61 (64.60), 67.52 vs 67.52 (67.52):
+  all within the A/A spread. Unused: as "deferred" above (72.87, 73.24, 44.76, 45.35,
+  67.56, 67.64, 48.36, 49.02).
+  The DEFAULT is gate 2, always defer (2026-11-11), on wall clock: nighthaven (AVX2),
+  a rotated soft training loop (miRNA and protein L300, double/float32, Global/Local, 1
+  and 6 threads), branch / main: guides read every step, gate 0 0.989-1.009, 1
+  0.989-1.008, 2 0.986-1.009; never read, 1 and 2 0.68-0.79; read every other step, 1
+  0.984-1.017 (miRNA double Global 1.014/1.017, controls ~1.004), 2 0.87-0.94. The +0.6 %
+  instructions of deferring with guides read does not show in time, and adaptive loses
+  the alternating loop (it fills in the call for a step whose guides go unread).
+  2026-11-13: the first read of a snapshot guide resolves the WHOLE batch's on n_threads
+  (`resolve_all_snap_`: groups, then the other pairs on workers): Python reading
+  `b[i].guide_j` pair by pair had resolved them one at a time on the caller, 1.6-2.5x
+  main's step at 8 threads (solace AVX-512, wloczykij). That pass is still a second
+  sweep over the batch after the call, 4-9 % over main with every guide read at 8 threads
+  (solace), so the DEFAULT is gate 1 again with a STREAK rule: fill in the call when the
+  guides were read (half or more, `guide_j` / `banded_grad`) after each of the last TWO
+  soft calls (`soft_read_streak_`), defer otherwise; one unread step drops back.
+  Timed with `results/tools/soft_steps_ab.py` (use none / all / alt = every other step),
+  cudak (idle; Westmere sse4), new / main, controls main2/main in brackets:
+  1 thread: none 0.70-0.76, all 0.997-1.002 (0.997-1.003), alt 0.84-0.88;
+  8 threads (7 rounds): none 0.69-0.80, all 0.93-1.02 (0.99-1.24), alt 0.81-1.00
+  (0.96-1.25); gate 2 (always defer) at 8 threads, all: 1.01-1.29.
+  Tests: `test_soft_guide_defer.py`.
+  2026-11-17 / 11-28: all of this lives in `batch_soft_defer.inl`, compiled for the extension
+  in its own unit (`batch_soft_defer.cpp`; header-only users get it from `batch_engine.hpp`).
+  The engine's own fills are main's, reached with `soft_guide_lazy` set for the call when it
+  defers, and `SoftCall` fixes the per-pair state up around them. In the extension
+  (`NWGRAD_SOFT_DEFER_EXTERN`) BatchEngine has neither the hooks nor any new member: the
+  bindings send a soft batch (or a pair of one) to `nwgrad_soft_score_and_grad` /
+  `_banded_grad` / `_align` / `_banded_align` / `_guide_j` (seq_pair_batch.hpp, compiled in that
+  unit), which run the deferral's part and then the engine's own call; the adaptive rule's
+  per-batch read count sits in a table in that unit (`soft_read_entry`), not in the engine.
+  So the engine units are main's, byte for byte. A header-only build runs the same code from
+  hooks in the engine's entry points. Why: in the header it changed gcc's inlining in the
+  engine's unit and so moved the hard engine code against the kernels (protein L100 float32
+  affine Local path 1.13-1.14 on nighthaven at equal instructions, on both layouts; see
+  "Code placement"); with only the hooks moved out (the first form, 2026-11-17) the two new
+  members and the hooks still changed every engine constructor and entry point and shifted
+  nearly all engine code mod 4096.
+  `"lazy"` — it does not, and the guide
   is computed on first use (`guide_j`, `banded_align`, `banded_grad`) under the params
   CURRENT THEN. Deliberately opt-in: `score_and_grad(); set_params(params + lr*g); banded_grad()`
   is the ordinary training step, and a lazy default
@@ -3994,6 +4068,13 @@ starts at a fixed offset within a page: the offset that unit had in main df4ae0a
 batch_engine.hpp; since 2026-11-21 compiled in the engine units, "The engine units" below) moves the engine code within that unit, and so changes its offset from every kernel.
 Main's 448-byte case was exactly that kind of relative move. Treat any cell that such a branch moves
 by under ~10-13 % as unproven. Instead, compare it on two layouts: the knob below.
+The remedy for new engine code that hard, path and score-only calls never run: put it in a unit of its
+own, behind out-of-line entry points the header only declares, and link that unit LAST (the engine
+functions both instantiate are then taken from the engine units, whose code stays main's). Example:
+the soft guide deferral, `batch_soft_defer.cpp` (`NWGRAD_SOFT_DEFER_EXTERN`, set for the whole extension;
+the unit defines `NWGRAD_SOFT_DEFER_UNIT`; added last to `UNIT_OFFSET`). Nothing in the engine units may
+call into it, not even a branch: the bindings choose (`nwgrad_soft_*`, seq_pair_batch.hpp), and its state
+is not a BatchEngine member (a member changes every constructor). Then the engine units are main's.
 
 **The finer alternative ("groups", `nwgrad_text_groups.ld`).** Each of these is page-anchored:
 - the engine and aligner code of one (scalar type, gap model, mode);

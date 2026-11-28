@@ -20,6 +20,7 @@ SECTIONS
     . = ALIGN(4096); *level_neon_soft.cpp.o(.text._Z*)
     . = ALIGN(4096); *level_neon_inter.cpp.o(.text._Z*)
     . = ALIGN(4096); *level_neon_sg.cpp.o(.text._Z*)
+    . = ALIGN(4096); *batch_soft_defer.cpp.o(.text._Z*)
     . = ALIGN(4096);
   }
 }

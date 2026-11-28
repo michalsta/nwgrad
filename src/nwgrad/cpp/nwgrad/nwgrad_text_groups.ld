@@ -137,6 +137,7 @@ SECTIONS
     . = ALIGN(4096); *level_neon_soft.cpp.o(.text._Z*[a-z_]Ii[LE]*)
     . = ALIGN(4096); *level_neon_soft.cpp.o(.text._Z*[a-z_]Il[LE]*)
     . = ALIGN(4096); *level_neon_soft.cpp.o(.text._Z*)
+    . = ALIGN(4096); *batch_soft_defer.cpp.o(.text._Z*)
     . = ALIGN(4096);
   }
 }

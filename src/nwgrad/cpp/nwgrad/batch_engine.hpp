@@ -465,6 +465,7 @@ public:
     // A stored alignment path (aligned(), coordinates()) — kept only on request.
     bool path_stored(size_t i) const noexcept { return flags_[i] & kStored; }
     bool guide_pending(size_t i) const noexcept { return flags_[i] & kPending; }
+    size_t guides_pending() const noexcept;   // how many (tests; batch_soft_defer.inl)
 
     double score(size_t i) const {
         if (!score_valid(i))
@@ -489,10 +490,15 @@ public:
     }
     AlignParams grad(size_t i) const { AlignParams g(alphabet(), nsets_); grad(i, g); return g; }
 
-    // The cached guide (column after each row of A), resolving a pending lazy guide.
+    // The cached guide (column after each row of A), resolving a pending guide (a deferred
+    // one with the rest of the batch's: resolve_caller_).
     std::vector<int> guide_j(size_t i) {
         if (!path_valid(i))
             throw std::logic_error("nwgrad: alignment not computed; call align() first");
+#ifndef NWGRAD_SOFT_DEFER_EXTERN   // (the extension: soft_guide_j, see the end of the class)
+        if (grad_mode_ == GradMode::Soft) soft_note_reads_(1);
+        if (guide_pending(i)) resolve_caller_(i);
+#endif
         if (guide_pending(i)) resolve_guide_(i, solo_work_());
         const int* g = guide_ptr_(i);
         return {g, g + len_a(i) + 1};
@@ -604,9 +610,14 @@ public:
     // coordinates()); it forces the Viterbi a lazy or posterior soft guide would skip.
     // Returns the sum of scores, in pair order (bit-reproducible whatever the schedule).
     //
+    // A soft batch's call is soft_score_and_grad (batch_soft_defer.inl): see "Soft guide
+    // deferral" there and at the end of this class.
     double score_and_grad(bool keep_paths = false) {
         const size_t N = size();
         if (N == 0) return 0.0;
+#ifndef NWGRAD_SOFT_DEFER_EXTERN
+        if (grad_mode_ == GradMode::Soft) return soft_score_and_grad(keep_paths);
+#endif
         prepare_paths_(keep_paths);
         ++full_calls_;   // guides may have moved: the banded grouping is stale
         tc_begin_full_();
@@ -632,6 +643,9 @@ public:
                     "nwgrad: banded_grad() needs a guide path; run score_and_grad() first");
         prepare_paths_(keep_paths);
         tc_begin_full_();
+#ifndef NWGRAD_SOFT_DEFER_EXTERN
+        if (grad_mode_ == GradMode::Soft) soft_banded_prep_();
+#endif
         if (inter_fill_() && !keep_paths) banded_grad_inter_(bandwidth);
         else if (s_.sorted_schedule)      banded_grad_lpt_(bandwidth, keep_paths);
         else                           banded_grad_dynamic_(bandwidth, keep_paths);
@@ -656,6 +670,9 @@ public:
 
     // One pair, on the calling thread (SeqPair's own operations).
     void score_and_grad_one(size_t i, bool keep_path) {
+#ifndef NWGRAD_SOFT_DEFER_EXTERN
+        if (grad_mode_ == GradMode::Soft) { soft_one_(i, keep_path); return; }
+#endif
         prepare_paths_(keep_path, /*all=*/false);
         run_full_(i, solo_work_(), keep_path);
     }
@@ -663,6 +680,9 @@ public:
         if (!path_valid(i))
             throw std::logic_error("nwgrad: call align() or score_and_grad() before banded_align()");
         prepare_paths_(keep_path, /*all=*/false);
+#ifndef NWGRAD_SOFT_DEFER_EXTERN
+        if (guide_pending(i)) resolve_caller_(i);
+#endif
         run_banded_(i, solo_work_(), bandwidth, keep_path);
     }
     // The cached scores, in pair order.  Throws if any pair has none.
@@ -1264,6 +1284,10 @@ private:
         kStored = 32,      // path_ holds the current alignment
         kF32Refused = 64,  // the soft pass refused float32 under the current params,
                            // temperature and precision: later calls run it in double directly
+        kLazy = 128,       // with kPending: a "lazy" soft guide, under the params current at
+                           // resolution; without it a pending guide belongs to gparams_.
+                           // finish_ drops it (batch_soft_defer.inl marks a soft call's pairs
+                           // with it to see which ones the call finished)
     };
     void forget_f32_refusals_() noexcept {
         for (auto& f : flags_) f &= static_cast<uint8_t>(~kF32Refused);
@@ -1340,9 +1364,11 @@ private:
     std::vector<double>  score_;
     std::vector<uint8_t> flags_;
     std::shared_ptr<const OwnedParams> params_;
-    // The params the PENDING guides belong to: null for the lazy soft guide ("under the
-    // params current then"); set by score_only_() to the params it scored, so a deferred
-    // guide is the one the eager path would have stored.
+    // The params the PENDING guides belong to, except kLazy ones (the params current at
+    // resolution): the params the last full call scored -- score_only_(), or a soft call
+    // under soft_guide "eager" that deferred its guides (batch_soft_defer.inl) -- so a
+    // deferred guide is the one the eager path would have stored.  A shared snapshot:
+    // set_params() replaces params_ with a new object and this one stays alive, unchanged.
     std::shared_ptr<const OwnedParams> gparams_;
     int kernel_ = kBackendAuto;
     std::vector<double>  grad_;             // pair i: gstride() doubles (matrix, 4 gaps); untracked
@@ -2147,7 +2173,8 @@ private:
     }
 
     // SeqPair::resolve_guide: the pending guide, under the params it belongs to (gparams_;
-    // a lazy soft guide: the params current now).
+    // a lazy soft guide: the params current now).  A lazy guide (kLazy) while gparams_ is
+    // set never reaches this: batch_soft_defer.inl resolves those first (soft_resolve_).
     void resolve_guide_(size_t i, Work& w) {
         if (!guide_pending(i)) return;
         w.full.set_kernel(kernel_);
@@ -3673,5 +3700,45 @@ private:
         if (N == 0) return;
         run_workers_guarded(std::min<int>(s_.n_threads, static_cast<int>(std::min<size_t>(N, 1u << 30))), worker);
     }
+
+    // ── Soft guide deferral (batch_soft_defer.inl) ──────────────────────────────
+    // Defined out of this header.  The Python extension (NWGRAD_SOFT_DEFER_EXTERN) compiles
+    // them in a unit of their own, batch_soft_defer.cpp, and its engine units
+    // (engine_<type>.cpp) do not see the hooks above: their code -- every hard, path and
+    // score-only call, and every soft one too -- is main's, byte for byte (AGENTS.md, "Code
+    // placement").  The extension's bindings call the public entry points below for a soft
+    // batch instead (seq_pair_batch.hpp, nwgrad_soft_*).  A header-only build runs the
+    // hooks, which call the same code.  No data members: the deferral's per-batch state
+    // (soft_note_reads_) lives in that unit, so the engine's layout is main's too.
+public:
+    // score_and_grad / banded_grad / score_and_grad_one / banded_one / guide_j of a soft
+    // batch (any other batch: those calls, unchanged).
+    double soft_score_and_grad(bool keep);
+    double soft_banded_grad(int bandwidth, bool keep);
+    void soft_score_and_grad_one(size_t i, bool keep);
+    void soft_banded_one(size_t i, int bandwidth, bool keep);
+    std::vector<int> soft_guide_j(size_t i);
+private:
+    void soft_one_(size_t i, bool keep);
+    void soft_banded_prep_();
+    void resolve_caller_(size_t i);
+    struct SoftCall;
+    uint8_t soft_pend_(bool keep, bool read) const noexcept;
+    void soft_note_reads_(size_t n) const;
+    bool soft_read_streak_();
+    void resolve_all_snap_();
+    void resolve_groups_();
+    bool resolve_group_(size_t t, Work& w);
+    bool group_resolve_ok_() const noexcept;
+    void soft_resolve_(size_t i, Work& w);
+    bool snap_pending_(size_t i) const noexcept {
+        return (flags_[i] & (kPending | kLazy)) == kPending;
+    }
 };
 #undef NWGRAD_HARD_GRAD_GUIDE
+
+// The extension (NWGRAD_SOFT_DEFER_EXTERN, set by CMake for nwgrad_ext) instantiates these
+// in batch_soft_defer.cpp; any other includer gets them here, header-only as before.
+#ifndef NWGRAD_SOFT_DEFER_EXTERN
+#include "batch_soft_defer.inl"
+#endif

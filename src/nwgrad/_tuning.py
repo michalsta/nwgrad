@@ -29,7 +29,12 @@ soft kernels, as float32 always does; 0 restores gradual underflow, the arithmet
 2026-11-06), with ``NWGRAD_SOFT_DOUBLE_FTZ`` as its environment fallback.  And
 ``inter_group_tiles``, the inter-pair planner's tile size in groups (default: sqrt of the
 eligible pairs over W; 0 or 1: the old grouping by (len B, len A); ``None``: one tile per
-ragged len-B window), which moves only speed.  A batch regroups its
+ragged len-B window), which moves only speed.  ``soft_guide_defer`` is a switch that
+never moves results: under ``soft_guide="eager"`` a soft ``score_and_grad()`` may leave each guide to be computed on first use, under a snapshot
+of the params it scored (the same guide, bit for bit).  1 (the default): adaptive, it
+defers unless at least half the batch's guides were read after each of its last two soft
+calls; 2: always defer; 0: never, the guide inside the call as before
+(``NWGRAD_SOFT_GUIDE_DEFER`` is its environment fallback).  A batch regroups its
 cached inter-pair plan on the next call after any change.  Not thread-safe to change
 while work is in flight.
 """

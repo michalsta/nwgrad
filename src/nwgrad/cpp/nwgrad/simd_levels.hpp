@@ -714,7 +714,10 @@ enum class Gate : int {
     InterGroupBytes, InterSoftBytes, InterScoreGatherCells,
     InterLinearIntGatherCells, InterLinearF32GatherCells, InterLinearF64GatherCells,
     InterGlobalLinearIntCells, InterGlobalLinearF32Cells, LinearStripedMinN, SoftF32MinCells,
-    InterMinFill, SoftCkptRows, SoftCkptMinBytes, SoftDoubleFtz, ScoreInt8, InterScoreSmallCells, InterScoreInt8, ScoreInt8MinSegs, InterProfileBytes, InterGroupTiles, Count_
+    InterMinFill, SoftCkptRows, SoftCkptMinBytes, SoftDoubleFtz, ScoreInt8, InterScoreSmallCells, InterScoreInt8, ScoreInt8MinSegs, InterProfileBytes, InterGroupTiles, Count_,
+    // Switches kept out of GateTable (their own override, soft_guide_defer_gate()): growing
+    // the table moved its epoch and changed every gate reader's code in the engine units.
+    SoftGuideDefer = Count_, CountAll_
 };
 inline constexpr const char* kGateNames[] = {
     "inter_group_bytes", "inter_soft_bytes", "inter_score_gather_cells",
@@ -723,8 +726,9 @@ inline constexpr const char* kGateNames[] = {
     "inter_global_linear_f32_cells", "linear_striped_min_n", "soft_f32_min_cells",
     "inter_min_fill", "soft_ckpt_rows", "soft_ckpt_min_bytes",
     "soft_double_ftz", "score_int8", "inter_score_small_cells",
-    "inter_score_int8", "score_int8_min_segs", "inter_profile_bytes", "inter_group_tiles"};
-static_assert(sizeof(kGateNames) / sizeof(kGateNames[0]) == static_cast<size_t>(Gate::Count_));
+    "inter_score_int8", "score_int8_min_segs", "inter_profile_bytes", "inter_group_tiles",
+    "soft_guide_defer"};
+static_assert(sizeof(kGateNames) / sizeof(kGateNames[0]) == static_cast<size_t>(Gate::CountAll_));
 inline constexpr int64_t kGateUnset = -1;
 inline constexpr int64_t kGateOff = INT64_MAX;
 struct GateTable {
@@ -853,6 +857,25 @@ inline constexpr int score8_key(int tbytes, bool linear, int align_mode) noexcep
 }
 struct Score8Pred { float last[18]; };
 inline Score8Pred& score8_pred() noexcept { static thread_local Score8Pred p{}; return p; }
+// soft_guide "eager"'s guide Viterbi: soft_guide_defer / NWGRAD_SOFT_GUIDE_DEFER.
+// 1 (DEFAULT, 2026-11-13): adaptive -- defer it to first use, under the params the soft
+// call scored (BatchEngine::soft_pend_), unless the guides were read after each of the
+// last two soft calls (then fill them in the call, as before); 2: always defer; 0: never
+// (the Viterbi inside the soft call: the A/B switch).  Results never change.  History:
+// 2 was the default 2026-11-11..13, until solace (AVX-512, 8 threads) showed the
+// deferred guides' separate resolve pass 4-9 % slower than main with every guide read;
+// the earlier gate 1 (a streak of one step) lost the read-every-other-step loop.  The
+// gate wins over the environment.
+inline std::atomic<int64_t>& soft_guide_defer_gate() noexcept {
+    static std::atomic<int64_t> v{kGateUnset};
+    return v;
+}
+inline int soft_guide_defer() noexcept {
+    const int64_t o = soft_guide_defer_gate().load(std::memory_order_relaxed);
+    if (o >= 0) return o >= 2 ? 2 : static_cast<int>(o);
+    static const int64_t v = env_nonneg_int("NWGRAD_SOFT_GUIDE_DEFER");
+    return v < 0 ? 1 : (v >= 2 ? 2 : static_cast<int>(v));   // unset (-1): the default, adaptive
+}
 // The per-lane profile's byte cap (kInterProfileMaxBytes, InterJobT::prof_max) with its
 // override: kGateOff (None) = no cap, 0 = always the gather.
 inline int64_t inter_profile_max() noexcept {

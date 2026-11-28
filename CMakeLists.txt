@@ -213,6 +213,12 @@ set(NWGRAD_ENGINE_SOURCES
     ${NWGRAD_LEVEL_DIR}/engine_i16.cpp
     ${NWGRAD_LEVEL_DIR}/engine_i32.cpp
     ${NWGRAD_LEVEL_DIR}/engine_i64.cpp)
+# BatchEngine's soft full calls and the guide deferral (batch_soft_defer.inl), in a unit of
+# their own: the engine units only declare them (NWGRAD_SOFT_DEFER_EXTERN), so the hard,
+# path and score-only code they compile is main's.  Linked LAST: the engine functions it
+# instantiates too are taken from the engine units (the first copy wins), so their code and
+# layout are what they would be without it (AGENTS.md, "Code placement").
+set(NWGRAD_SOFT_DEFER_SOURCES src/nwgrad/cpp/nwgrad/batch_soft_defer.cpp)
 
 # gcc's whole-unit inlining budget for the engine units (--param inline-unit-growth; gcc's
 # default, 40 %, lets a unit grow to 1.4x its size by inlining, then refuses every further
@@ -225,7 +231,7 @@ set(NWGRAD_ENGINE_SOURCES
 set(NWGRAD_ENGINE_INLINE_UNIT_GROWTH "1000" CACHE STRING
     "gcc --param inline-unit-growth for the engine units (empty = gcc's default)")
 if (NOT NWGRAD_ENGINE_INLINE_UNIT_GROWTH STREQUAL "")
-    set_property(SOURCE ${NWGRAD_ENGINE_SOURCES} APPEND PROPERTY COMPILE_OPTIONS
+    set_property(SOURCE ${NWGRAD_ENGINE_SOURCES} ${NWGRAD_SOFT_DEFER_SOURCES} APPEND PROPERTY COMPILE_OPTIONS
         "$<$<CXX_COMPILER_ID:GNU>:--param=inline-unit-growth=${NWGRAD_ENGINE_INLINE_UNIT_GROWTH}>")
 endif()
 
@@ -236,7 +242,9 @@ nanobind_add_module(nwgrad_ext
     src/nwgrad/cpp/nwgrad/py_exports.cpp
     src/nwgrad/cpp/nwgrad/logistic/py_logistic.cpp
     ${NWGRAD_PLACEMENT_SOURCES_MID}
-    ${NWGRAD_LEVEL_SOURCES})
+    ${NWGRAD_LEVEL_SOURCES}
+    ${NWGRAD_SOFT_DEFER_SOURCES})   # last: see NWGRAD_SOFT_DEFER_SOURCES
+target_compile_definitions(nwgrad_ext PRIVATE NWGRAD_SOFT_DEFER_EXTERN)
 if (DEFINED NWGRAD_JCC_GNU_OPTS)
     target_compile_options(nwgrad_ext PRIVATE "$<$<CXX_COMPILER_ID:GNU>:${NWGRAD_JCC_GNU_OPTS}>")
 endif()
@@ -289,7 +297,7 @@ set(NWGRAD_SCALAR_TU_CLANG_OPTS -fno-slp-vectorize)
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64|i.86")
     list(APPEND NWGRAD_SCALAR_TU_CLANG_OPTS -mllvm -x86-cmov-converter=false)
 endif()
-set_property(SOURCE src/nwgrad/cpp/nwgrad/py_exports.cpp ${NWGRAD_ENGINE_SOURCES} APPEND PROPERTY
+set_property(SOURCE src/nwgrad/cpp/nwgrad/py_exports.cpp ${NWGRAD_ENGINE_SOURCES} ${NWGRAD_SOFT_DEFER_SOURCES} APPEND PROPERTY
     COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:Clang,AppleClang>:${NWGRAD_SCALAR_TU_CLANG_OPTS}>")
 
 # MinGW: link the gcc runtime (libstdc++, libgcc, winpthread) statically, so the .pyd
@@ -324,7 +332,7 @@ endif()
 
 install(TARGETS nwgrad_ext LIBRARY DESTINATION nwgrad)
 install(DIRECTORY src/nwgrad/cpp/nwgrad DESTINATION nwgrad/cpp
-    FILES_MATCHING PATTERN "*.hpp" PATTERN "*.h")
+    FILES_MATCHING PATTERN "*.hpp" PATTERN "*.h" PATTERN "*.inl")
 
 # ── Sanitizers (opt-in; CI builds the C++ tests with these) ──────────────────
 #

@@ -605,14 +605,42 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
             "Swap alignment parameters (a standalone pair; a batch's pair takes the\n"
             "batch's set_params).  Invalidates the score, gradient and stored path\n"
             "(aligned() raises until the next align); guide_j is kept for banded_align().")
-        .def("align", &SP::align, nb::arg("keep_paths") = true,
+        // A soft batch's pair: the soft-defer unit's entry points (seq_pair_batch.hpp,
+        // nwgrad_soft_*), which the engine units do not compile; anything else as before.
+        .def("align",
+             [](SP& self, bool keep_paths) {
+                 if constexpr (std::is_floating_point_v<T>)
+                     if (self.grad_mode() == GradMode::Soft) return nwgrad_soft_align(self, keep_paths);
+                 return self.align(keep_paths);
+             },
+             nb::arg("keep_paths") = true,
              "Full computation. Returns the score and publishes the configured gradient\n"
              "immediately (grad is None in none mode). Stores the path by default.")
-        .def("banded_align", &SP::banded_align, nb::arg("bandwidth"),
+        .def("banded_align",
+             [](SP& self, int bandwidth, bool keep_paths) {
+                 if constexpr (std::is_floating_point_v<T>)
+                     if (self.grad_mode() == GradMode::Soft)
+                         return nwgrad_soft_banded_align(self, bandwidth, keep_paths);
+                 return self.banded_align(bandwidth, keep_paths);
+             },
+             nb::arg("bandwidth"),
              nb::arg("keep_paths") = true,
              "Compute around the cached guide. Returns the score and publishes the\n"
              "configured gradient immediately. Requires an established guide.")
-        .def("score_and_grad", &SP::score_and_grad, nb::arg("keep_paths") = true,
+        // Through the member pointer, as .def(&SP::score_and_grad) did: a direct call
+        // would let this unit inline the (in-class) member, and the engine unit's copy --
+        // with what only it reaches -- would lose its last reference and be dropped by
+        // --gc-sections, moving the engine code behind it (AGENTS.md, "Code placement").
+        .def("score_and_grad",
+             [plain = &SP::score_and_grad](SP& self, bool keep_paths) {
+                 if constexpr (std::is_floating_point_v<T>)
+                     if (self.grad_mode() == GradMode::Soft) {
+                         nwgrad_soft_align(self, keep_paths);
+                         return std::pair<double, AlignParams>{self.score(), self.grad()};
+                     }
+                 return (self.*plain)(keep_paths);
+             },
+             nb::arg("keep_paths") = true,
              "Full DP with immediate gradient. Returns (score, AlignParams grad).\n"
              "keep_paths=True preserves aligned()/coordinates() availability; False\n"
              "skips storing the path. Raises if grad_mode is \"none\".")
@@ -671,6 +699,8 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
             "guide_j",
             [](SP& self) -> nb::object {
                 if (!self.path_valid()) return nb::none();
+                if constexpr (std::is_floating_point_v<T>)
+                    if (self.grad_mode() == GradMode::Soft) return nb::cast(nwgrad_soft_guide_j(self));
                 return nb::cast(self.guide_j());
             },
             "Current alignment as a guide_j vector (length m+1), or None.")
@@ -883,7 +913,11 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             "gradients and stored paths; guides stay, for banded_grad().")
         .def(
             "score_and_grad",
-            [](SPB& self, bool keep_paths) { return self.score_and_grad(keep_paths); },
+            [](SPB& self, bool keep_paths) {
+                if constexpr (std::is_floating_point_v<T>)
+                    if (self.grad_mode() == GradMode::Soft) return nwgrad_soft_score_and_grad(self, keep_paths);
+                return self.score_and_grad(keep_paths);
+            },
             nb::arg("keep_paths") = false,
             "Full DP on every pair: score, guide and (unless grad_mode \"none\") gradient,\n"
             "cached per pair.  keep_paths=True also stores each alignment path\n"
@@ -892,6 +926,9 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
         .def(
             "banded_grad",
             [](SPB& self, int bandwidth, bool keep_paths) {
+                if constexpr (std::is_floating_point_v<T>)
+                    if (self.grad_mode() == GradMode::Soft)
+                        return nwgrad_soft_banded_grad(self, bandwidth, keep_paths);
                 return self.banded_grad(bandwidth, keep_paths);
             },
             nb::arg("bandwidth"), nb::arg("keep_paths") = false,
@@ -1037,6 +1074,9 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
              nb::arg("score_only") = false,
              "UNSTABLE (nwgrad._tuning): the plan's shared groups as lists of pair\n"
              "indices, in the order the call runs them (see _inter_plan).")
+        .def("_guides_pending", &SPB::guides_pending,
+             "UNSTABLE (tests): how many pairs' guides are pending, to be computed on\n"
+             "first use (soft_guide \"eager\" and \"lazy\", grad_mode \"none\").")
         .def_prop_ro(
             "alphabet",
             [](const SPB& self) { return self.alphabet().symbols(); },
@@ -1128,7 +1168,12 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
             },
             "When soft pairs compute their guide path (the Viterbi alignment that\n"
             "banded_grad()/banded_align() band around).\n"
-            "  \"eager\" (default): score_and_grad() runs the guide Viterbi, as always.\n"
+            "  \"eager\" (default): the guide of the params scored: the Viterbi path\n"
+            "     under the params score_and_grad() ran with, even after set_params().\n"
+            "     Computed on first use (guide_j, banded_align, banded_grad) from a\n"
+            "     snapshot of those params, so a call that never asks for it pays\n"
+            "     nothing for it -- unless the guides were read after each of the last\n"
+            "     two steps, then in the call; the same guide, bit for bit, either way.\n"
             "  \"lazy\": it does not; the guide is computed on first use (guide_j,\n"
             "     banded_align, banded_grad) under the params CURRENT THEN — after\n"
             "     set_params() it follows the new params.\n"
@@ -1537,17 +1582,21 @@ NB_MODULE(nwgrad_ext, m) {
     // Raw: -1 = no override (the compiled default), INT64_MAX = the cap never rejects.
     // nwgrad/_tuning.py maps these to Python values; use that, not these.
     auto gate_of = [](const std::string& name) {
-        for (int g = 0; g < static_cast<int>(Gate::Count_); ++g)
+        for (int g = 0; g < static_cast<int>(Gate::CountAll_); ++g)
             if (name == kGateNames[g]) return static_cast<Gate>(g);
         throw nb::value_error(("unknown fill gate: " + name).c_str());
     };
     m.def("_gate_names", []() {
         return std::vector<std::string>(std::begin(kGateNames), std::end(kGateNames));
     });
-    m.def("_gate_get", [gate_of](const std::string& name) { return gate_override(gate_of(name)); },
-          nb::arg("name"));
+    m.def("_gate_get", [gate_of](const std::string& name) {
+              const Gate g = gate_of(name);
+              return g == Gate::SoftGuideDefer ? soft_guide_defer_gate().load() : gate_override(g);
+          }, nb::arg("name"));
     m.def("_gate_set", [gate_of](const std::string& name, int64_t v) {
-              set_gate_override(gate_of(name), v);
+              const Gate g = gate_of(name);
+              if (g == Gate::SoftGuideDefer) soft_guide_defer_gate().store(v < 0 ? kGateUnset : v);
+              else set_gate_override(g, v);
           }, nb::arg("name"), nb::arg("value"));
     m.def("_gate_off_value", []() { return kGateOff; });
     // The int8 score tier's counters (tests): (problems run in int8, of which overflowed).
@@ -1585,7 +1634,8 @@ NB_MODULE(nwgrad_ext, m) {
             {"inter_score_int8", int64_t(kInterScoreInt8Default ? 1 : 0)},
             {"score_int8_min_segs", int64_t(score_int8_min_segs(score_int8_lanes(be < 0 ? 0 : be), false, 4))},
             {"inter_profile_bytes", int64_t(0)},   // no cap (kInterProfileMaxBytes)
-            {"inter_group_tiles", int64_t(0)}};   // (auto: _tuning.defaults() says so)
+            {"inter_group_tiles", int64_t(0)},   // (auto: _tuning.defaults() says so)
+            {"soft_guide_defer", int64_t(1)}};
     });
 
     m.def(
