@@ -510,9 +510,12 @@ if (NWGRAD_BUILD_TESTS)
     # Seen twice before this order: part-major (the avx2 double part ahead of the baseline
     # float part) bound baseline code to an avx2 _SimdWrapper<uchar, 4> constructor (clang
     # -O0 ASan, Westmere); and with the test units after the levels, gcc -O3 bound them to
-    # an avx512 part's BVec::resize, which no baseline part emitted (SIGILL in 16 of 17
-    # ctest entries without AVX-512).  The extension links the engine and the bindings, which
-    # emit every such helper the level units share with them, ahead of its level units.
+    # the avx512 double + int64 part's BVec::resize, which no baseline level object emitted
+    # (gcc 16: SIGILL in 16 of 17 ctest entries without AVX-512; GVec::resize copies from the
+    # sse4, avx2 and avx512 levels likewise).  The extension links the engine units, which
+    # emit BVec::resize and the other helpers its level units share with baseline code, ahead
+    # of them (no copy kept from a wider level there, gcc 16, 2026-11-28); its level units
+    # themselves are not in ISA order (level_avx512.cpp before level_baseline_soft.cpp).
     set(NWGRAD_TEST_LEVEL_SOURCES "")
     if (NWGRAD_LEVEL_SOURCES)
         set(_isas "")
