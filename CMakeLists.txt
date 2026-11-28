@@ -496,42 +496,55 @@ if (NWGRAD_BUILD_TESTS)
         endif()
     endfunction()
 
+    # Link order.  Every inline function or template instance a unit calls out of line is
+    # emitted in that unit as a COMDAT copy compiled with the unit's flags, and the linker
+    # keeps the copy of the first object that has one: the level units' copies carry their
+    # level's instructions (-mavx2, -mavx512f, ...), so a baseline caller bound to one of them
+    # runs that level's code on any CPU — SIGILL where the level is missing.  An object that
+    # calls a function out of line always carries a copy of its own, so the copy kept is
+    # never wider than its narrowest caller if the objects are linked narrowest ISA first:
+    # every baseline-compiled object (the test units, simd_levels.cpp, the baseline level
+    # units), then sse4's, avx2's, avx512's.  Hence the test units are an object library
+    # linked ahead of the levels (CMake puts a target's $<TARGET_OBJECTS:> inputs ahead of
+    # its own objects), and the levels are grouped by ISA whether split or not.
+    # Seen twice before this order: part-major (the avx2 double part ahead of the baseline
+    # float part) bound baseline code to an avx2 _SimdWrapper<uchar, 4> constructor (clang
+    # -O0 ASan, Westmere); and with the test units after the levels, gcc -O3 bound them to
+    # an avx512 part's BVec::resize, which no baseline part emitted (SIGILL in 16 of 17
+    # ctest entries without AVX-512).  The extension links the engine and the bindings, which
+    # emit every such helper the level units share with them, ahead of its level units.
     set(NWGRAD_TEST_LEVEL_SOURCES "")
-    if (NWGRAD_LEVEL_SOURCES AND NOT NWGRAD_TEST_LEVEL_PARTS)
-        nwgrad_test_level_objects(nwgrad_tests_levels "" ${NWGRAD_LEVEL_SOURCES})
-        list(APPEND NWGRAD_TEST_LEVEL_SOURCES $<TARGET_OBJECTS:nwgrad_tests_levels>)
-    elseif (NWGRAD_LEVEL_SOURCES)
-        # Linked level by level, in NWGRAD_LEVEL_SOURCES' order (baseline first): at -O0 the
-        # level objects carry out-of-line copies of the std::simd inline functions, compiled
-        # with their own -m flags, and the linker keeps the first.  Part by part instead (all
-        # ISAs of the double part, then all of the float part, ...), the avx2 double part's
-        # VEX-encoded _SimdWrapper<uchar, 4> constructor came before the baseline float
-        # part's and baseline code ran it: SIGILL on a CPU without AVX (clang ASan, Westmere).
+    if (NWGRAD_LEVEL_SOURCES)
         set(_isas "")
         foreach(src ${NWGRAD_LEVEL_SOURCES})
             if (src MATCHES "/level_([a-z0-9]+)(_soft|_inter|_sg)?\\.cpp$")
                 list(APPEND _isas ${CMAKE_MATCH_1})
             endif()
         endforeach()
-        list(REMOVE_DUPLICATES _isas)
+        list(REMOVE_DUPLICATES _isas)   # NWGRAD_LEVEL_SOURCES' order: baseline, sse4, avx2, avx512
         set(_other ${NWGRAD_LEVEL_SOURCES})   # simd_levels.cpp
         list(FILTER _other EXCLUDE REGEX "/level_[a-z0-9]+(_soft|_inter|_sg)?\\.cpp$")
         nwgrad_test_level_objects(nwgrad_tests_levels "" ${_other})
         list(APPEND NWGRAD_TEST_LEVEL_SOURCES $<TARGET_OBJECTS:nwgrad_tests_levels>)
         foreach(isa ${_isas})
-            set(_split ${NWGRAD_LEVEL_SOURCES})
-            list(FILTER _split INCLUDE REGEX "/level_${isa}(_sg)?\\.cpp$")
-            foreach(mask ${NWGRAD_TEST_LEVEL_PARTS})
-                nwgrad_test_level_objects(nwgrad_tests_levels_${isa}_p${mask} ${mask} ${_split})
-                list(APPEND NWGRAD_TEST_LEVEL_SOURCES $<TARGET_OBJECTS:nwgrad_tests_levels_${isa}_p${mask}>)
-            endforeach()
-            set(_whole ${NWGRAD_LEVEL_SOURCES})
-            list(FILTER _whole INCLUDE REGEX "/level_${isa}_(soft|inter)\\.cpp$")
+            if (NWGRAD_TEST_LEVEL_PARTS)
+                set(_split ${NWGRAD_LEVEL_SOURCES})
+                list(FILTER _split INCLUDE REGEX "/level_${isa}(_sg)?\\.cpp$")
+                foreach(mask ${NWGRAD_TEST_LEVEL_PARTS})
+                    nwgrad_test_level_objects(nwgrad_tests_levels_${isa}_p${mask} ${mask} ${_split})
+                    list(APPEND NWGRAD_TEST_LEVEL_SOURCES $<TARGET_OBJECTS:nwgrad_tests_levels_${isa}_p${mask}>)
+                endforeach()
+                set(_whole ${NWGRAD_LEVEL_SOURCES})
+                list(FILTER _whole INCLUDE REGEX "/level_${isa}_(soft|inter)\\.cpp$")
+            else()
+                set(_whole ${NWGRAD_LEVEL_SOURCES})
+                list(FILTER _whole INCLUDE REGEX "/level_${isa}(_soft|_inter|_sg)?\\.cpp$")
+            endif()
             nwgrad_test_level_objects(nwgrad_tests_levels_${isa} "" ${_whole})
             list(APPEND NWGRAD_TEST_LEVEL_SOURCES $<TARGET_OBJECTS:nwgrad_tests_levels_${isa}>)
         endforeach()
     endif()
-    add_executable(nwgrad_tests
+    add_library(nwgrad_tests_main OBJECT
         tests/cpp/main.cpp
         tests/cpp/test_subst_matrix.cpp
         tests/cpp/test_align_params.cpp
@@ -562,17 +575,20 @@ if (NWGRAD_BUILD_TESTS)
         tests/cpp/test_integer.cpp
         tests/cpp/test_linear_striped.cpp
         tests/cpp/test_grid.cpp
-        tests/cpp/test_profile_build.cpp
-        ${NWGRAD_TEST_LEVEL_SOURCES}   # per-ISA kernel TUs, so kernel="simd" exercises the dispatched striped path
-    )
-    target_include_directories(nwgrad_tests PRIVATE
+        tests/cpp/test_profile_build.cpp)
+    target_include_directories(nwgrad_tests_main PRIVATE
         src/nwgrad/cpp/nwgrad
         tests/cpp
     )
-    target_compile_features(nwgrad_tests PRIVATE cxx_std_20)
+    target_compile_features(nwgrad_tests_main PRIVATE cxx_std_20)
     if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
-        target_compile_options(nwgrad_tests PRIVATE -Wall -Wextra)
+        target_compile_options(nwgrad_tests_main PRIVATE -Wall -Wextra)
     endif()
+    target_link_libraries(nwgrad_tests_main PRIVATE Threads::Threads)
+    add_executable(nwgrad_tests
+        $<TARGET_OBJECTS:nwgrad_tests_main>   # baseline: ahead of every level unit (above)
+        ${NWGRAD_TEST_LEVEL_SOURCES}   # per-ISA kernel TUs, so kernel="simd" exercises the dispatched striped path
+    )
     target_link_libraries(nwgrad_tests PRIVATE Threads::Threads)
 
     # Real header-only consumer: no ISA-level TUs or registrars are linked, so
@@ -596,7 +612,7 @@ if (NWGRAD_BUILD_TESTS)
     # macro changes the ABI.  Deliberately not -fhardened: its
     # -ftrivial-auto-var-init=zero would zero exactly the uninitialized reads a test
     # build exists to expose, and _FORTIFY_SOURCE needs optimization.
-    foreach(test_target nwgrad_tests nwgrad_header_tests)
+    foreach(test_target nwgrad_tests_main nwgrad_header_tests)
         target_compile_definitions(${test_target} PRIVATE
             _GLIBCXX_ASSERTIONS
             $<$<CXX_COMPILER_ID:Clang,AppleClang>:_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_DEBUG>)
@@ -609,6 +625,9 @@ if (NWGRAD_BUILD_TESTS)
             target_compile_definitions(${test_target} PRIVATE ${NWGRAD_SANITIZE_DEFS})
         endif()
     endforeach()
+    if (NWGRAD_SANITIZE)
+        target_link_options(nwgrad_tests PRIVATE ${NWGRAD_SANITIZE_FLAGS})
+    endif()
 
     enable_testing()
     add_test(NAME cpp_tests COMMAND nwgrad_tests)
