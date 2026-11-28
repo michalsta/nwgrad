@@ -609,27 +609,36 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
         // nwgrad_soft_*), which the engine units do not compile; anything else as before.
         .def("align",
              [](SP& self, bool keep_paths) {
-                 return self.grad_mode() == GradMode::Soft ? nwgrad_soft_align(self, keep_paths)
-                                                           : self.align(keep_paths);
+                 if constexpr (std::is_floating_point_v<T>)
+                     if (self.grad_mode() == GradMode::Soft) return nwgrad_soft_align(self, keep_paths);
+                 return self.align(keep_paths);
              },
              nb::arg("keep_paths") = true,
              "Full computation. Returns the score and publishes the configured gradient\n"
              "immediately (grad is None in none mode). Stores the path by default.")
         .def("banded_align",
              [](SP& self, int bandwidth, bool keep_paths) {
-                 return self.grad_mode() == GradMode::Soft
-                            ? nwgrad_soft_banded_align(self, bandwidth, keep_paths)
-                            : self.banded_align(bandwidth, keep_paths);
+                 if constexpr (std::is_floating_point_v<T>)
+                     if (self.grad_mode() == GradMode::Soft)
+                         return nwgrad_soft_banded_align(self, bandwidth, keep_paths);
+                 return self.banded_align(bandwidth, keep_paths);
              },
              nb::arg("bandwidth"),
              nb::arg("keep_paths") = true,
              "Compute around the cached guide. Returns the score and publishes the\n"
              "configured gradient immediately. Requires an established guide.")
+        // Through the member pointer, as .def(&SP::score_and_grad) did: a direct call
+        // would let this unit inline the (in-class) member, and the engine unit's copy --
+        // with what only it reaches -- would lose its last reference and be dropped by
+        // --gc-sections, moving the engine code behind it (AGENTS.md, "Code placement").
         .def("score_and_grad",
-             [](SP& self, bool keep_paths) {
-                 if (self.grad_mode() != GradMode::Soft) return self.score_and_grad(keep_paths);
-                 nwgrad_soft_align(self, keep_paths);
-                 return std::pair<double, AlignParams>{self.score(), self.grad()};
+             [plain = &SP::score_and_grad](SP& self, bool keep_paths) {
+                 if constexpr (std::is_floating_point_v<T>)
+                     if (self.grad_mode() == GradMode::Soft) {
+                         nwgrad_soft_align(self, keep_paths);
+                         return std::pair<double, AlignParams>{self.score(), self.grad()};
+                     }
+                 return (self.*plain)(keep_paths);
              },
              nb::arg("keep_paths") = true,
              "Full DP with immediate gradient. Returns (score, AlignParams grad).\n"
@@ -690,8 +699,9 @@ static void bind_seq_pair(nb::module_& m, const char* name) {
             "guide_j",
             [](SP& self) -> nb::object {
                 if (!self.path_valid()) return nb::none();
-                return nb::cast(self.grad_mode() == GradMode::Soft ? nwgrad_soft_guide_j(self)
-                                                                   : self.guide_j());
+                if constexpr (std::is_floating_point_v<T>)
+                    if (self.grad_mode() == GradMode::Soft) return nb::cast(nwgrad_soft_guide_j(self));
+                return nb::cast(self.guide_j());
             },
             "Current alignment as a guide_j vector (length m+1), or None.")
         .def_prop_ro("traceback",
@@ -904,8 +914,9 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
         .def(
             "score_and_grad",
             [](SPB& self, bool keep_paths) {
-                return self.grad_mode() == GradMode::Soft ? nwgrad_soft_score_and_grad(self, keep_paths)
-                                                          : self.score_and_grad(keep_paths);
+                if constexpr (std::is_floating_point_v<T>)
+                    if (self.grad_mode() == GradMode::Soft) return nwgrad_soft_score_and_grad(self, keep_paths);
+                return self.score_and_grad(keep_paths);
             },
             nb::arg("keep_paths") = false,
             "Full DP on every pair: score, guide and (unless grad_mode \"none\") gradient,\n"
@@ -915,9 +926,10 @@ static void bind_seq_pair_batch(nb::module_& m, const char* name) {
         .def(
             "banded_grad",
             [](SPB& self, int bandwidth, bool keep_paths) {
-                return self.grad_mode() == GradMode::Soft
-                           ? nwgrad_soft_banded_grad(self, bandwidth, keep_paths)
-                           : self.banded_grad(bandwidth, keep_paths);
+                if constexpr (std::is_floating_point_v<T>)
+                    if (self.grad_mode() == GradMode::Soft)
+                        return nwgrad_soft_banded_grad(self, bandwidth, keep_paths);
+                return self.banded_grad(bandwidth, keep_paths);
             },
             nb::arg("bandwidth"), nb::arg("keep_paths") = false,
             "Banded re-align + gradient around each pair's cached guide path: run\n"
